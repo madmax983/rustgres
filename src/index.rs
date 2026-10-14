@@ -68,6 +68,14 @@ pub fn index_key_cmp(a: &Value, b: &Value) -> Ordering {
         (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
         // v0.36: PG's "char" btree opclass compares the single byte.
         (Value::SingleChar(x), Value::SingleChar(y)) => x.cmp(y),
+        // v1.83: jsonb's btree opclass is PG's total order (semantic
+        // equality: 1.0 and 1.00 are the same key).
+        (Value::Jsonb(x), Value::Jsonb(y)) => {
+            match (crate::exec::parse_jsonb(x), crate::exec::parse_jsonb(y)) {
+                (Ok(va), Ok(vb)) => crate::exec::jsonb_cmp(&va, &vb),
+                _ => x.cmp(y),
+            }
+        }
         // Total fallback: values of different types can never share one
         // indexed column, but the B-tree still needs a total order.
         _ => type_tag(a).cmp(&type_tag(b)),
@@ -154,6 +162,17 @@ fn type_tag(v: &Value) -> u8 {
         Value::BitString(_) => 18,
         // v1.40: tids never index either, but stay total (append-only).
         Value::Tid(_, _) => 19,
+        // v1.83: jsonb (append-only).
+        Value::Jsonb(_) => 20,
+        // v1.85: jsonpath (append-only).
+        Value::Jsonpath(_) => 21,
+        // v1.86: time/timetz/interval (append-only).
+        Value::Time(_) => 22,
+        Value::TimeTz(_, _) => 23,
+        Value::Interval(_) => 24,
+        // v1.88: ranges (append-only).
+        Value::Range(_) => 25,
+        Value::Multirange(_) => 26,
     }
 }
 

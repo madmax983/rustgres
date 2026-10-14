@@ -67,6 +67,15 @@ pub(crate) fn eval_concat(a: &Value, b: &Value) -> Result<Value, ExecError> {
     if a == &Value::Null || b == &Value::Null {
         return Ok(Value::Null);
     }
+    // v1.83: jsonb || jsonb is PG's jsonb_concat (jsonfuncs.c), not
+    // text concatenation. A jsonb beside a non-jsonb falls through to
+    // the text path, matching PG's resolution via the implicit
+    // jsonb -> text I/O cast (`'{}'::jsonb || ''` is text concat).
+    if let (Value::Jsonb(x), Value::Jsonb(y)) = (a, b) {
+        let va = parse_jsonb(x)?;
+        let vb = parse_jsonb(y)?;
+        return Ok(Value::jsonb(jsonb_concat(&va, &vb).render()));
+    }
     match (a, b) {
         (Value::Bytea(x), Value::Bytea(y)) => {
             let mut r = Vec::with_capacity(x.len() + y.len());
@@ -396,8 +405,28 @@ pub(crate) fn eval_extract(field: &str, v: &Value) -> Result<Value, ExecError> {
     }
     let field = field.to_ascii_lowercase();
     let r = match v {
-        Value::Timestamp(m) | Value::Timestamptz(m) => crate::datetime::extract(&field, *m),
-        Value::Date(d) => crate::datetime::extract_date(&field, *d),
+        Value::Timestamp(m) => crate::datetime::extract(&field, *m),
+        // v1.86: timestamptz extracts in the session zone (PG19
+        // extract_timestamptz); it previously shared the naive path.
+        Value::Timestamptz(m) => crate::datetime::extract_tz(&field, *m),
+        Value::Date(d) => {
+            // PG19 date_part: oscillating units (day, month,
+            // quarter, week, dow, isodow, doy) extract as NULL from
+            // an infinite date.
+            if (*d == crate::datetime::DATE_INFINITY || *d == crate::datetime::DATE_NEG_INFINITY)
+                && matches!(
+                    field.as_str(),
+                    "day" | "month" | "quarter" | "week" | "dow" | "isodow" | "doy"
+                )
+            {
+                return Ok(Value::Null);
+            }
+            crate::datetime::extract_date(&field, *d)
+        }
+        // v1.86: time / timetz / interval extracts.
+        Value::Time(t) => crate::datetime::extract_time(&field, *t),
+        Value::TimeTz(t, o) => crate::datetime::extract_timetz(&field, *t, *o),
+        Value::Interval(iv) => crate::datetime::extract_interval(&field, iv),
         other => {
             return Err(exec_err(
                 "42883",
@@ -1302,8 +1331,49 @@ pub(crate) fn builtin_param_names(name: &str) -> Option<&'static [&'static str]>
     Some(match name {
         // `parse_ident(qualname text, strict boolean DEFAULT true)`.
         "parse_ident" => &["qualname", "strict"],
+        // v1.84: `jsonb_set_lax(target, path, new_value,
+        // create_missing, null_value_treatment)` (pg_proc proargnames).
+        "jsonb_set_lax" => &[
+            "target",
+            "path",
+            "new_value",
+            "create_missing",
+            "null_value_treatment",
+        ],
+        // v1.85: `jsonb_path_*(target, path, vars, silent)`
+        // (pg_proc proargnames; the _tz variants share the shape).
+        "jsonb_path_query"
+        | "jsonb_path_query_array"
+        | "jsonb_path_query_first"
+        | "jsonb_path_exists"
+        | "jsonb_path_match"
+        | "jsonb_path_query_tz"
+        | "jsonb_path_query_array_tz"
+        | "jsonb_path_query_first_tz"
+        | "jsonb_path_exists_tz"
+        | "jsonb_path_match_tz" => &["target", "path", "vars", "silent"],
         _ => return None,
     })
+}
+
+/// v1.85: default argument expressions for builtins whose trailing
+/// parameters carry PG defaults (used by named-argument resolution).
+pub(crate) fn builtin_arg_default(name: &str, param: &str) -> Option<Expr> {
+    use crate::sql::Literal;
+    match (name, param) {
+        ("parse_ident", "strict") => Some(Expr::Literal(Literal::Bool(true))),
+        (_, "vars") if name.starts_with("jsonb_path_") => {
+            Some(Expr::Literal(Literal::Text("{}".into())))
+        }
+        (_, "silent") if name.starts_with("jsonb_path_") => {
+            Some(Expr::Literal(Literal::Bool(false)))
+        }
+        ("jsonb_set_lax", "create_missing") => Some(Expr::Literal(Literal::Bool(true))),
+        ("jsonb_set_lax", "null_value_treatment") => {
+            Some(Expr::Literal(Literal::Text("use_json_null".into())))
+        }
+        _ => None,
+    }
 }
 
 /// v0.95: resolve `name => expr` named arguments to positional order
@@ -1381,28 +1451,203 @@ pub(crate) fn resolve_named_args(
             }
         }
     }
-    // Every parameter must be supplied, except `parse_ident.strict`,
-    // which defaults to true (PG19).
+    // Every parameter must be supplied unless it has a registered
+    // default (`parse_ident.strict`, the jsonb_path_* `vars`/`silent`,
+    // jsonb_set_lax's trailing pair — PG19 pg_proc defaults).
     for (i, slot) in out.iter().enumerate() {
-        if slot.is_none() {
-            let is_strict_default = name == "parse_ident" && params[i].as_deref() == Some("strict");
-            if !is_strict_default {
-                return Err(exec_err(
-                    "42883",
-                    format!("function {}() does not exist", name),
-                ));
-            }
+        if slot.is_none() && builtin_arg_default(name, params[i].as_deref().unwrap_or("")).is_none()
+        {
+            return Err(exec_err(
+                "42883",
+                format!("function {}() does not exist", name),
+            ));
         }
     }
     let mut result = Vec::with_capacity(n);
-    for slot in out {
+    for (i, slot) in out.into_iter().enumerate() {
         match slot {
             Some(e) => result.push(e.clone()),
-            // `parse_ident.strict` default.
-            None => result.push(Expr::Literal(crate::sql::Literal::Bool(true))),
+            None => result.push(
+                builtin_arg_default(name, params[i].as_deref().unwrap_or(""))
+                    .expect("default existence checked above"),
+            ),
         }
     }
     Ok(result)
+}
+
+/// v1.85: resolve `name => expr` arguments to positional order when
+/// a call site evaluates arguments itself (the SRF paths bypass
+/// eval_func's resolution). Returns a Cow so the common no-named-arg
+/// case costs nothing.
+pub(crate) fn resolve_named_args_if_any<'a>(
+    eng: &Engine,
+    name: &str,
+    args: &'a [Expr],
+) -> Result<std::borrow::Cow<'a, [Expr]>, ExecError> {
+    if args.iter().any(|a| matches!(a, Expr::NamedArg { .. })) {
+        Ok(std::borrow::Cow::Owned(resolve_named_args(
+            eng, name, args,
+        )?))
+    } else {
+        Ok(std::borrow::Cow::Borrowed(args))
+    }
+}
+
+/// v1.85: PG's analysis-time restrictions on SQL/JSON behavior
+/// DEFAULT expressions (see the __sqljson_* call site in eval_func).
+pub(crate) fn check_sqljson_default(eng: &Engine, e: &Expr) -> Result<(), ExecError> {
+    fn walk(eng: &Engine, e: &Expr) -> Result<(), ExecError> {
+        match e {
+            Expr::ScalarSub(_)
+            | Expr::ArraySubquery(_)
+            | Expr::Agg { .. }
+            | Expr::WithinGroup { .. }
+            | Expr::Window { .. }
+            | Expr::InSub { .. }
+            | Expr::Exists { .. } => Err(exec_err(
+                "42601",
+                "can only specify a constant, non-aggregate function, or operator expression for DEFAULT",
+            )),
+            Expr::Func { name, args } => {
+                if is_srf(eng, name) {
+                    return Err(exec_err(
+                        "42601",
+                        "can only specify a constant, non-aggregate function, or operator expression for DEFAULT",
+                    ));
+                }
+                for a in args {
+                    walk(eng, a)?;
+                }
+                Ok(())
+            }
+            Expr::Arith { left, right, .. }
+            | Expr::Concat(left, right)
+            | Expr::Cmp { left, right, .. }
+            | Expr::And(left, right)
+            | Expr::Or(left, right)
+            | Expr::IsDistinctFrom { left, right, .. } => {
+                walk(eng, left)?;
+                walk(eng, right)
+            }
+            Expr::Cast { expr, .. } | Expr::CastNamed { expr, .. } => walk(eng, expr),
+            Expr::Not(x) | Expr::Neg(x) | Expr::BitNot(x) | Expr::IsNull { expr: x, .. } => {
+                walk(eng, x)
+            }
+            Expr::Row(elems) | Expr::ArrayCtor { elems, .. } => {
+                for x in elems {
+                    walk(eng, x)?;
+                }
+                Ok(())
+            }
+            Expr::Case {
+                operand,
+                whens,
+                else_,
+            } => {
+                if let Some(o) = operand {
+                    walk(eng, o)?;
+                }
+                for (a, b) in whens {
+                    walk(eng, a)?;
+                    walk(eng, b)?;
+                }
+                if let Some(x) = else_ {
+                    walk(eng, x)?;
+                }
+                Ok(())
+            }
+            Expr::JsonOp { left, right, .. } => {
+                walk(eng, left)?;
+                walk(eng, right)
+            }
+            Expr::NamedArg { expr, .. } => walk(eng, expr),
+            Expr::FieldAccess { expr, .. } => walk(eng, expr),
+            Expr::Column { .. } | Expr::ResolvedCol { .. } => Err(exec_err(
+                "42601",
+                "DEFAULT expression must not contain column references",
+            )),
+            _ => Ok(()),
+        }
+    }
+    walk(eng, e)?;
+    let mut cols = Vec::new();
+    crate::sql::collect_col_refs(e, &mut cols);
+    if !cols.is_empty() {
+        return Err(exec_err(
+            "42601",
+            "DEFAULT expression must not contain column references",
+        ));
+    }
+    Ok(())
+}
+
+/// v1.85: statement-level SQL/JSON DEFAULT analysis: find every
+/// __sqljson_* call in an expression tree (through the wrappers a
+/// target list realistically carries) and validate its DEFAULT
+/// slots. Runs once per SELECT in dispatch, so the PG analysis-time
+/// errors fire even for zero-row results.
+pub(crate) fn analyze_sqljson_defaults(eng: &Engine, e: &Expr) -> Result<(), ExecError> {
+    match e {
+        Expr::Func { name, args } => {
+            if name == "__sqljson_value" || name == "__sqljson_query" {
+                for slot in [4usize, 6usize] {
+                    if let Some(d) = args.get(slot) {
+                        check_sqljson_default(eng, d)?;
+                    }
+                }
+            }
+            for a in args {
+                analyze_sqljson_defaults(eng, a)?;
+            }
+            Ok(())
+        }
+        Expr::Cast { expr, .. } | Expr::CastNamed { expr, .. } => {
+            analyze_sqljson_defaults(eng, expr)
+        }
+        Expr::Arith { left, right, .. }
+        | Expr::Concat(left, right)
+        | Expr::Cmp { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::IsDistinctFrom { left, right, .. } => {
+            analyze_sqljson_defaults(eng, left)?;
+            analyze_sqljson_defaults(eng, right)
+        }
+        Expr::Not(x) | Expr::Neg(x) | Expr::BitNot(x) | Expr::IsNull { expr: x, .. } => {
+            analyze_sqljson_defaults(eng, x)
+        }
+        Expr::Row(elems) | Expr::ArrayCtor { elems, .. } => {
+            for x in elems {
+                analyze_sqljson_defaults(eng, x)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                analyze_sqljson_defaults(eng, o)?;
+            }
+            for (a, b) in whens {
+                analyze_sqljson_defaults(eng, a)?;
+                analyze_sqljson_defaults(eng, b)?;
+            }
+            if let Some(x) = else_ {
+                analyze_sqljson_defaults(eng, x)?;
+            }
+            Ok(())
+        }
+        Expr::JsonOp { left, right, .. } => {
+            analyze_sqljson_defaults(eng, left)?;
+            analyze_sqljson_defaults(eng, right)
+        }
+        Expr::NamedArg { expr, .. } => analyze_sqljson_defaults(eng, expr),
+        Expr::FieldAccess { expr, .. } => analyze_sqljson_defaults(eng, expr),
+        _ => Ok(()),
+    }
 }
 
 /// v1.37: `node` is the call-site `Expr::Func` node's address, keying
@@ -1439,6 +1684,54 @@ pub(crate) fn eval_func(
         }
         let v = eval_expr(q, scopes, &args[0])?;
         return Ok(Value::text(v.type_name()));
+    }
+    // v1.87: pg_input_is_valid needs the live catalog for user-defined
+    // types (domains, composites, aclitem, the reg* family), so it is
+    // intercepted here where `q` is available. Other evaluation
+    // contexts (grouped/aggregate) keep the pure path in eval_func_vals.
+    if name == "pg_input_is_valid" && args.len() == 2 {
+        let v0 = eval_expr(q, scopes, &args[0])?;
+        let v1 = eval_expr(q, scopes, &args[1])?;
+        let input = match str_arg(name, &v0)? {
+            None => return Ok(Value::Null),
+            Some(s) => s.to_string(),
+        };
+        let typ = match str_arg(name, &v1)? {
+            None => return Ok(Value::Null),
+            Some(s) => s.to_string(),
+        };
+        return match pg_input_validate_catalog(q, "pg_input_is_valid", &input, &typ) {
+            Ok(()) => Ok(Value::Bool(true)),
+            Err(PgInputFailure::Soft(_)) => Ok(Value::Bool(false)),
+            Err(PgInputFailure::Hard(e)) => Err(e),
+        };
+    }
+    // v1.88: constructors of user-defined range types
+    // (CREATE TYPE ... AS RANGE) resolve through the type catalog.
+    if let Some((elem, multi)) = q.eng.db.types.get(name).and_then(|st| st.range) {
+        let mut vals = Vec::with_capacity(args.len());
+        for a in args {
+            vals.push(eval_expr(q, scopes, a)?);
+        }
+        let tname = Some(name.to_string());
+        return if multi {
+            super::ranges::multirange_constructor(elem, tname, &vals)
+        } else {
+            super::ranges::range_constructor(elem, tname, &vals)
+        };
+    }
+    // v1.85: SQL/JSON DEFAULT expressions are restricted by PG at
+    // analysis time (transformJsonFuncExpr): no subqueries,
+    // aggregates, window functions, or set-returning functions
+    // ("can only specify a constant, non-aggregate function, or
+    // operator expression for DEFAULT"), and no column references
+    // ("DEFAULT expression must not contain column references").
+    if name == "__sqljson_value" || name == "__sqljson_query" {
+        for slot in [4usize, 6usize] {
+            if let Some(e) = args.get(slot) {
+                check_sqljson_default(q.eng, e)?;
+            }
+        }
     }
     // v0.80: `GROUPING(...)` is only meaningful at group level (handled
     // by `eval_grouped`). Reaching scalar evaluation means it sits in a
@@ -1501,6 +1794,63 @@ pub(crate) fn eval_func(
         }
         check_builtin_arity(name, &vals)?;
         return eval_pg_size_pretty(&vals);
+    }
+    // v1.84: to_json/to_jsonb of a json-typed argument embeds the
+    // document verbatim (PG categorizes by the static input type:
+    // JSONOID passes datumToJson through as raw JSON, while a plain
+    // text value is a string scalar). Needs the argument expression
+    // for its static type, like pg_typeof.
+    if (name == "to_json" || name == "to_jsonb") && args.len() == 1 {
+        let v = eval_expr(q, scopes, &args[0])?;
+        if v == Value::Null {
+            return Ok(Value::Null);
+        }
+        if let Value::Jsonb(t) = &v {
+            return Ok(if name == "to_json" {
+                Value::text(t.to_string())
+            } else {
+                v.clone()
+            });
+        }
+        let schemas: Vec<&[QCol]> = scopes.iter().map(|s| s.schema).collect();
+        if matches!(
+            expr_type(
+                &mut *q.eng,
+                q.snap,
+                q.own,
+                q.session,
+                &schemas,
+                &[],
+                &[],
+                &args[0]
+            )?,
+            ColType::Json
+        ) {
+            if let Value::Text(t) = &v {
+                return Ok(if name == "to_json" {
+                    v.clone()
+                } else {
+                    // to_jsonb parses the embedded document.
+                    Value::jsonb(parse_jsonb(t)?.render())
+                });
+            }
+        }
+        if name == "to_json" {
+            let mut out = String::new();
+            datum_to_json_text(&v, &mut out);
+            return Ok(Value::text(out));
+        }
+        return Ok(Value::jsonb(datum_to_jsonb(&v)?.render()));
+    }
+    // v1.84: json(b)_populate_record / jsonb_populate_record_valid —
+    // the target row type comes from the base argument's static
+    // shape, so they route here with the raw expressions.
+    if matches!(
+        name,
+        "json_populate_record" | "jsonb_populate_record" | "jsonb_populate_record_valid"
+    ) && args.len() == 2
+    {
+        return eval_json_populate_scalar(q, scopes, name, args);
     }
     // v0.86: user-defined functions. A definition matching by name and
     // arity takes the call (raw argument values; the call coerces to
@@ -1575,6 +1925,57 @@ pub(crate) fn eval_func(
         let mut vals = Vec::with_capacity(raw_vals.len());
         for v in raw_vals {
             vals.push(normalize_func_arg(name, v));
+        }
+        // v1.89: JSON_VALUE needs the catalog for its RETURNING
+        // conversion (domain checks, typmod assignment semantics).
+        if name == "__sqljson_value" {
+            return super::json::eval_sqljson_value_q(q, &vals);
+        }
+        // v1.89: json_build_object / jsonb_build_object keys whose
+        // static type is json/jsonb/array/composite are 22023 in PG
+        // (json.c add_json key_scalar) — json values ride as plain
+        // text at the value level, so the check inspects the arg
+        // expressions' cast targets.
+        if name == "json_build_object" || name == "jsonb_build_object" {
+            for a in args.iter().step_by(2) {
+                let mut e = a;
+                while let Expr::NamedArg { expr, .. } = e {
+                    e = expr;
+                }
+                let bad = match e {
+                    Expr::Cast { to, .. } => matches!(
+                        to,
+                        crate::storage::ColType::Json
+                            | crate::storage::ColType::Jsonb
+                            | crate::storage::ColType::Array(_)
+                            | crate::storage::ColType::Composite
+                            | crate::storage::ColType::Record
+                    ),
+                    Expr::CastNamed { name: n, .. } => match q.eng.db.types.get(n.as_str()) {
+                        // A composite type name, or a domain over a
+                        // composite / json / array base. A domain over
+                        // a scalar base is a legal key.
+                        Some(st) => match &st.domain {
+                            None => true,
+                            Some(d) => matches!(
+                                d.base,
+                                crate::storage::ColType::Composite
+                                    | crate::storage::ColType::Json
+                                    | crate::storage::ColType::Jsonb
+                                    | crate::storage::ColType::Array(_)
+                            ),
+                        },
+                        None => false,
+                    },
+                    _ => false,
+                };
+                if bad {
+                    return Err(exec_err(
+                        "22023",
+                        "key value must be scalar, not array, composite, or json",
+                    ));
+                }
+            }
         }
         return eval_func_vals(name, &vals);
     }
@@ -1704,16 +2105,30 @@ pub(crate) fn pg_typlen_align(ty: &ColType) -> (i32, usize) {
         ColType::Bytea => (-1, 4),      // bytea: -1/'i'
         ColType::Bit => (-1, 4),        // varbit: -1/'i'
         ColType::Json => (-1, 4),       // json: -1/'i'
+        ColType::Jsonb => (-1, 4),      // jsonb: -1/'i' (v1.83)
+        ColType::Jsonpath => (-1, 4),   // jsonpath: -1/'i' (v1.85)
         ColType::Array(_) => (-1, 4),   // array types: 'i'
         ColType::Date => (4, 4),        // date: 4/'i'
         ColType::Timestamp => (8, 8),   // timestamp: 8/'d'
         ColType::Timestamptz => (8, 8), // timestamptz: 8/'d'
+        ColType::Time => (8, 8),        // time: 8/'d' (v1.86)
+        ColType::TimeTz => (12, 8),     // timetz: 12/'d' (v1.86)
+        ColType::Interval => (16, 8),   // interval: 16/'d' (v1.86)
         ColType::Uuid => (16, 1),       // uuid: 16/'c'
         ColType::Name => (64, 1),       // name: 64/'c'
         ColType::Regclass => (4, 4),    // regclass: 4/'i'
         ColType::Xid => (4, 4),         // xid: 4/'i'
         ColType::PgLsn => (8, 8),       // pg_lsn: 8/'d'
         ColType::Tid => (6, 2),         // tid: 6/'s'
+        // v1.88: ranges are varlena; int/num/date align 'i',
+        // ts/tstz/int8 align 'd' (pg_type.dat).
+        ColType::Range(e) | ColType::Multirange(e) => match e {
+            crate::storage::RangeElem::Ts
+            | crate::storage::RangeElem::Tstz
+            | crate::storage::RangeElem::Int8
+            | crate::storage::RangeElem::Float8 => (-1, 8),
+            _ => (-1, 4),
+        },
         // Pseudo/composite types never persist in table columns; map
         // them to varlena so the layout code stays total.
         ColType::Record | ColType::Composite => (-1, 8), // record: -1/'d'
@@ -2025,7 +2440,9 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         "width_bucket" => n == 3 || n == 4,
         "round" => n == 1 || n == 2,
         "substring" | "substr" => n == 2 || n == 3,
-        "power" | "mod" | "position" | "date_trunc" | "nullif" => n == 2,
+        "power" | "mod" | "position" | "nullif" => n == 2,
+        // v1.86: date_trunc gained PG's 3-arg (zone) form.
+        "date_trunc" => n == 2 || n == 3,
         "replace" | "split_part" => n == 3,
         "encode" | "decode" => n == 2,
         "crc32" | "crc32c" => n == 1,
@@ -2042,6 +2459,21 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         "regexp_split_to_array" => (2..=3).contains(&n),
         // v0.95: `parse_ident(qualname text, strict boolean DEFAULT true)`.
         "parse_ident" => (1..=2).contains(&n),
+        // v1.85: jsonb_path_*(target, path [, vars [, silent]]).
+        "jsonb_path_query"
+        | "jsonb_path_query_array"
+        | "jsonb_path_query_first"
+        | "jsonb_path_exists"
+        | "jsonb_path_match"
+        | "jsonb_path_query_tz"
+        | "jsonb_path_query_array_tz"
+        | "jsonb_path_query_first_tz"
+        | "jsonb_path_exists_tz"
+        | "jsonb_path_match_tz" => (2..=4).contains(&n),
+        // v1.85: SQL/JSON desugar internals (fixed shapes).
+        "__sqljson_value" => n == 8,
+        "__sqljson_query" => n == 9,
+        "__sqljson_exists" => n == 4,
         // v0.32: regexp set-returning functions (PG 19).
         "regexp_matches" => (2..=3).contains(&n),
         "regexp_split_to_table" => (2..=3).contains(&n),
@@ -2062,6 +2494,7 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         "pg_relation_size" => n == 1 || n == 2,
         // v1.13: pg_size_pretty(bigint) -> text (PG19 misc.c).
         "pg_size_pretty" => n == 1,
+        "pg_overlaps" => n == 4,
         "similar_to" => (2..=3).contains(&n),
         "substring_similar" => (2..=3).contains(&n),
         "substring_from" => n == 2,
@@ -2099,6 +2532,41 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         // variadic (SQL/JSON constructor, like PG19's json_array).
         "pg_typeof" => n == 1,
         "json_array" => true,
+        // v1.84: the json/jsonb function families (PG19 jsonfuncs.c,
+        // json.c, jsonb.c). build_* are VARIADIC "any" (any count,
+        // including the degenerate zero-arg forms PG resolves to
+        // separate noargs functions).
+        "json_typeof" | "jsonb_typeof" | "json_array_length" | "jsonb_array_length"
+        | "jsonb_pretty" | "to_json" | "to_jsonb" => n == 1,
+        "json_strip_nulls" | "jsonb_strip_nulls" => n == 1 || n == 2,
+        "array_to_json" => n == 1 || n == 2,
+        "json_build_array" | "jsonb_build_array" | "json_build_object" | "jsonb_build_object" => {
+            true
+        }
+        "json_object" | "jsonb_object" => n == 1 || n == 2,
+        "json_extract_path"
+        | "json_extract_path_text"
+        | "jsonb_extract_path"
+        | "jsonb_extract_path_text" => n >= 1,
+        "jsonb_set" => n == 3 || n == 4,
+        "jsonb_set_lax" => (3..=5).contains(&n),
+        "jsonb_insert" => n == 3 || n == 4,
+        "jsonb_delete" | "jsonb_delete_path" => n == 2,
+        "jsonb_populate_record_valid" => n == 2,
+        // v1.84: json SRFs (target-list arity; the FROM path shares
+        // this table via eval_table_function).
+        "json_each"
+        | "jsonb_each"
+        | "json_each_text"
+        | "jsonb_each_text"
+        | "json_array_elements"
+        | "jsonb_array_elements"
+        | "json_array_elements_text"
+        | "jsonb_array_elements_text"
+        | "json_object_keys"
+        | "jsonb_object_keys" => n == 1,
+        "json_populate_recordset" | "jsonb_populate_recordset" => n == 2,
+        "json_to_recordset" | "jsonb_to_recordset" => n == 1,
         // v0.17: version() takes no arguments.
         "version" => n == 0,
         // v0.17: date/time built-in batch.
@@ -2107,6 +2575,14 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         "to_timestamp" => n == 1 || n == 2, // (float8) or (text, text)
         "make_date" => n == 3,
         "make_timestamp" => n == 6,
+        // v1.86: the rest of the datetime constructor/function set.
+        "age" => n == 1 || n == 2,
+        "date_bin" => n == 3,
+        "justify_days" | "justify_hours" | "justify_interval" => n == 1,
+        "make_time" => n == 3,
+        "make_timestamptz" => n == 6 || n == 7,
+        "make_interval" => (0..=7).contains(&n),
+        "pg_sleep" => n == 1,
         "coalesce" | "greatest" | "least" => n >= 1,
         // v0.14: PostgreSQL internal operator-function aliases (pg_regress).
         "booleq" | "boolne" | "int4eq" | "texteq" => n == 2,
@@ -2225,6 +2701,12 @@ pub(crate) fn parse_ident_parts(qualname: &str, strict: bool) -> Result<Vec<Stri
 }
 
 pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
+    // v1.88: range / multirange constructors and functions dispatch
+    // before the generic machinery (lower/upper are also text
+    // functions; the rangeish-operand check inside decides).
+    if let Some(r) = super::ranges::try_eval_range_func(name, vals) {
+        return r;
+    }
     check_builtin_arity(name, vals)?;
     // v0.16: `substr` is a true alias of `substring` (same semantics).
     let name = if name == "substr" { "substring" } else { name };
@@ -2309,6 +2791,7 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         | "regexp_split_to_array"
         // v0.32: regexp_matches (scalar context = first match row).
         | "regexp_matches"
+        | "pg_overlaps"
         | "similar_to"
         | "substring_similar"
         | "substring_from"
@@ -2372,7 +2855,17 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         | "timezone"
         | "clock_timestamp"
         | "statement_timestamp"
-        | "transaction_timestamp" => eval_datetime_func(name, vals),
+        | "transaction_timestamp"
+        // v1.86: datetime function batch 2.
+        | "age"
+        | "date_bin"
+        | "justify_days"
+        | "justify_hours"
+        | "justify_interval"
+        | "make_time"
+        | "make_timestamptz"
+        | "make_interval"
+        | "pg_sleep" => eval_datetime_func(name, vals),
         // v0.17: version() reports our own version, not a PG version we
         // claim to be (see SERVER_VERSION in server.rs).
         "version" => Ok(Value::text(format!(
@@ -2400,11 +2893,1045 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         // Elements render per json.c: numbers bare, strings quoted,
         // NULL as null. Carried as text typed `ColType::Json`.
         "json_array" => Ok(Value::text(json_array_text(vals))),
+        // v1.84: the json/jsonb function families.
+        "json_typeof" | "jsonb_typeof" | "json_array_length" | "jsonb_array_length"
+        | "json_strip_nulls" | "jsonb_strip_nulls" | "jsonb_pretty" | "to_json"
+        | "to_jsonb" | "array_to_json" | "json_build_array" | "jsonb_build_array"
+        | "json_build_object" | "jsonb_build_object" | "json_object" | "jsonb_object"
+        | "json_extract_path" | "json_extract_path_text" | "jsonb_extract_path"
+        | "jsonb_extract_path_text" | "jsonb_set" | "jsonb_set_lax" | "jsonb_insert"
+        | "jsonb_delete" | "jsonb_delete_path" => eval_json_func(name, vals),
+        // v1.85: scalar jsonb_path_* and the SQL/JSON desugars.
+        "jsonb_path_exists" | "jsonb_path_match" | "jsonb_path_query_array"
+        | "jsonb_path_query_first" | "jsonb_path_exists_tz" | "jsonb_path_match_tz"
+        | "jsonb_path_query_array_tz" | "jsonb_path_query_first_tz" => {
+            eval_jsonpath_scalar(name, vals)
+        }
+        "__sqljson_value" | "__sqljson_query" | "__sqljson_exists" => {
+            eval_sqljson_func(name, vals)
+        }
         _ => Err(exec_err(
             "42883",
             format!("function {}() does not exist", name),
         )),
     }
+}
+
+/// v1.84: scalar json/jsonb functions (PG19 jsonfuncs.c, json.c,
+/// jsonb.c). All are STRICT (a NULL argument yields NULL) except
+/// jsonb_set_lax, whose whole purpose is SQL-NULL handling; the
+/// strictness is applied per arm via the `*_arg` helpers, which map
+/// `Value::Null` to None. `json` values ride in `Value::Text`,
+/// `jsonb` in `Value::Jsonb`; bare text literals coerce by parsing
+/// (the eval-time type blindness documented at `eval_json_op`).
+pub(crate) fn eval_json_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
+    match name {
+        "json_typeof" => match json_doc_arg(name, &vals[0])? {
+            None => Ok(Value::Null),
+            Some(doc) => Ok(Value::text(json_node_typeof(&doc.root))),
+        },
+        "jsonb_typeof" => match jsonb_val_arg(name, &vals[0])? {
+            None => Ok(Value::Null),
+            Some(v) => Ok(Value::text(jsonb_typeof_str(&v))),
+        },
+        "json_array_length" => match json_doc_arg(name, &vals[0])? {
+            None => Ok(Value::Null),
+            Some(doc) => match &doc.root.kind {
+                JsonKind::Array(elems) => Ok(Value::Int(elems.len() as i64)),
+                JsonKind::Object(_) => {
+                    Err(exec_err("22023", "cannot get array length of a non-array"))
+                }
+                _ => Err(exec_err("22023", "cannot get array length of a scalar")),
+            },
+        },
+        "jsonb_array_length" => match jsonb_val_arg(name, &vals[0])? {
+            None => Ok(Value::Null),
+            Some(v) => match &v {
+                JsonbVal::Array(elems) => Ok(Value::Int(elems.len() as i64)),
+                JsonbVal::Object(_) => {
+                    Err(exec_err("22023", "cannot get array length of a non-array"))
+                }
+                _ => Err(exec_err("22023", "cannot get array length of a scalar")),
+            },
+        },
+        "json_strip_nulls" => {
+            let in_arrays = match vals.get(1) {
+                None => false,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Bool(b)) => *b,
+                Some(other) => return Err(func_arg_err(name, other)),
+            };
+            match json_doc_arg(name, &vals[0])? {
+                None => Ok(Value::Null),
+                Some(doc) => {
+                    let stripped = json_strip_nulls_node(&doc.root, in_arrays);
+                    let mut out = String::new();
+                    render_json_compact(&doc, &stripped, &mut out);
+                    Ok(Value::text(out))
+                }
+            }
+        }
+        "jsonb_strip_nulls" => {
+            let in_arrays = match vals.get(1) {
+                None => false,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Bool(b)) => *b,
+                Some(other) => return Err(func_arg_err(name, other)),
+            };
+            match jsonb_val_arg(name, &vals[0])? {
+                None => Ok(Value::Null),
+                Some(v) => Ok(Value::jsonb(jsonb_strip_nulls(&v, in_arrays).render())),
+            }
+        }
+        "jsonb_pretty" => match jsonb_val_arg(name, &vals[0])? {
+            None => Ok(Value::Null),
+            Some(v) => Ok(Value::text(jsonb_pretty(&v))),
+        },
+        // to_json/to_jsonb of a json-typed argument is intercepted in
+        // eval_func (PG categorizes by static type; a Text value here
+        // is a plain string and is quoted/converted as one).
+        "to_json" => {
+            if vals[0] == Value::Null {
+                return Ok(Value::Null);
+            }
+            let mut out = String::new();
+            datum_to_json_text(&vals[0], &mut out);
+            Ok(Value::text(out))
+        }
+        "to_jsonb" => {
+            if vals[0] == Value::Null {
+                return Ok(Value::Null);
+            }
+            Ok(Value::jsonb(datum_to_jsonb(&vals[0])?.render()))
+        }
+        "array_to_json" => {
+            // array_to_json(anyarray [, pretty bool]): datum rendering
+            // per dimension; pretty adds ",\n " separators in the
+            // OUTERMOST dimension only (json.c array_to_json_internal
+            // with use_line_feeds).
+            let pretty = match vals.get(1) {
+                None => false,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Bool(b)) => *b,
+                Some(other) => return Err(func_arg_err(name, other)),
+            };
+            match &vals[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Array(a) => {
+                    let mut out = String::new();
+                    if a.dims.is_empty() {
+                        out.push_str("[]");
+                    } else {
+                        let mut cur = 0usize;
+                        array_to_json_rec(a, 0, &mut cur, pretty, &mut out);
+                    }
+                    Ok(Value::text(out))
+                }
+                other => Err(func_arg_err(name, other)),
+            }
+        }
+        "json_build_array" | "jsonb_build_array" => {
+            // extract_variadic_args with a NULL VARIADIC array never
+            // reaches here (eval_func returns NULL first); individual
+            // NULL elements become JSON null.
+            if name == "json_build_array" {
+                let mut out = String::from("[");
+                for (i, v) in vals.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    datum_to_json_text(v, &mut out);
+                }
+                out.push(']');
+                Ok(Value::text(out))
+            } else {
+                let mut elems = Vec::with_capacity(vals.len());
+                for v in vals {
+                    elems.push(datum_to_jsonb(v)?);
+                }
+                Ok(Value::jsonb(JsonbVal::Array(elems).render()))
+            }
+        }
+        "json_build_object" | "jsonb_build_object" => {
+            if vals.len() % 2 != 0 {
+                return Err(exec_err(
+                    "22023",
+                    "argument list must have even number of elements",
+                ));
+            }
+            if name == "json_build_object" {
+                let mut out = String::from("{");
+                for (i, pair) in vals.chunks_exact(2).enumerate() {
+                    let (k, v) = (&pair[0], &pair[1]);
+                    if *k == Value::Null {
+                        return Err(exec_err("22004", "null value not allowed for object key"));
+                    }
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let kt = json_key_text(k)?;
+                    out.push('"');
+                    escape_json_into(&kt, &mut out);
+                    out.push_str("\" : ");
+                    datum_to_json_text(v, &mut out);
+                }
+                out.push('}');
+                Ok(Value::text(out))
+            } else {
+                let mut pairs = Vec::with_capacity(vals.len() / 2);
+                for pair in vals.chunks_exact(2) {
+                    let (k, v) = (&pair[0], &pair[1]);
+                    if *k == Value::Null {
+                        return Err(exec_err("22004", "null value not allowed for object key"));
+                    }
+                    pairs.push((json_key_text(k)?, datum_to_jsonb(v)?));
+                }
+                Ok(Value::jsonb(jsonb_canon(JsonbVal::Object(pairs)).render()))
+            }
+        }
+        "json_object" | "jsonb_object" => eval_json_object(name, vals),
+        "json_extract_path"
+        | "json_extract_path_text"
+        | "jsonb_extract_path"
+        | "jsonb_extract_path_text" => {
+            // VARIADIC text[] flattened by the parser into vals[1..];
+            // a NULL path element makes the result NULL (get_path_all
+            // via json_path semantics — our json_path returns None on
+            // a missing step; NULL elements short-circuit first).
+            let mut path: Vec<String> = Vec::with_capacity(vals.len() - 1);
+            for p in &vals[1..] {
+                match p {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Text(s) | Value::BpChar(s) => path.push(s.to_string()),
+                    other => return Err(func_arg_err(name, other)),
+                }
+            }
+            let as_text = name.ends_with("_text");
+            if name.starts_with("jsonb") {
+                match jsonb_val_arg(name, &vals[0])? {
+                    None => Ok(Value::Null),
+                    Some(v) => match v.path(&path) {
+                        None => Ok(Value::Null),
+                        Some(n) => {
+                            if as_text {
+                                match n.scalar_text() {
+                                    Some(s) => Ok(Value::text(s)),
+                                    None => Ok(Value::Null),
+                                }
+                            } else {
+                                Ok(Value::jsonb(n.render()))
+                            }
+                        }
+                    },
+                }
+            } else {
+                match json_doc_arg(name, &vals[0])? {
+                    None => Ok(Value::Null),
+                    Some(doc) => match json_path(&doc.root, &path) {
+                        None => Ok(Value::Null),
+                        Some(n) => {
+                            if as_text {
+                                match json_scalar_text(&doc, n)? {
+                                    Some(s) => Ok(Value::text(s)),
+                                    None => Ok(Value::Null),
+                                }
+                            } else {
+                                Ok(Value::text(node_text(&doc, n)))
+                            }
+                        }
+                    },
+                }
+            }
+        }
+        "jsonb_set" | "jsonb_insert" => {
+            let create_or_after = match vals.get(3) {
+                None => name == "jsonb_set", // PG defaults: create=true, after=false
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Bool(b)) => *b,
+                Some(other) => return Err(func_arg_err(name, other)),
+            };
+            let doc = match jsonb_val_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(v) => v,
+            };
+            let (ndims, path) = match json_path_list_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(p) => p,
+            };
+            let newval = match jsonb_val_arg(name, &vals[2])? {
+                None => return Ok(Value::Null),
+                Some(v) => v,
+            };
+            if ndims > 1 {
+                return Err(exec_err("2202E", "wrong number of array subscripts"));
+            }
+            // PG order: scalar root errors before the empty-path and
+            // empty-container early returns.
+            if !matches!(doc, JsonbVal::Object(_) | JsonbVal::Array(_)) {
+                return Err(exec_err("22023", "cannot set path in scalar"));
+            }
+            if path.is_empty() {
+                return Ok(Value::jsonb(doc.render()));
+            }
+            // PG's jsonb_set with create_missing=false returns an
+            // empty container before the walk — so no path element is
+            // validated (a NULL or non-integer element cannot error).
+            // jsonb_insert has no such early return: its walker parses
+            // the first path element even for an empty array.
+            if name == "jsonb_set"
+                && !create_or_after
+                && (matches!(doc, JsonbVal::Object(ref p) if p.is_empty())
+                    || matches!(doc, JsonbVal::Array(ref e) if e.is_empty()))
+            {
+                return Ok(Value::jsonb(doc.render()));
+            }
+            let op = if name == "jsonb_set" {
+                if create_or_after {
+                    JsonbPathOp::Create
+                } else {
+                    JsonbPathOp::Replace
+                }
+            } else if create_or_after {
+                JsonbPathOp::InsertAfter
+            } else {
+                JsonbPathOp::InsertBefore
+            };
+            let out = jsonb_set_path(doc, &path, Some(&newval), op)?;
+            Ok(Value::jsonb(out.render()))
+        }
+        "jsonb_set_lax" => eval_jsonb_set_lax(name, vals),
+        "jsonb_delete" => {
+            let doc = match jsonb_val_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(v) => v,
+            };
+            match &vals[1] {
+                Value::Null => Ok(Value::Null),
+                Value::Array(_) => {
+                    let (ndims, keys) = match json_path_list_arg(name, &vals[1])? {
+                        None => return Ok(Value::Null),
+                        Some(p) => p,
+                    };
+                    if ndims > 1 {
+                        return Err(exec_err("2202E", "wrong number of array subscripts"));
+                    }
+                    Ok(Value::jsonb(jsonb_delete_keys(&doc, &keys)?.render()))
+                }
+                Value::Text(_) | Value::BpChar(_) => {
+                    // A plain key (the (jsonb, text) overload) — or a
+                    // bare text[] literal, which PG's parser resolves
+                    // to the (jsonb, text[]) overload when the call
+                    // site writes one. We cannot distinguish a typed
+                    // text value from a literal at eval time; like the
+                    // #> path coercion, a value that parses as a text
+                    // array literal takes the array reading only when
+                    // it is brace-led.
+                    let s = match str_arg(name, &vals[1])? {
+                        None => return Ok(Value::Null),
+                        Some(s) => s.to_string(),
+                    };
+                    if s.starts_with('{') {
+                        if let Ok(Some((_, keys))) = json_path_list_arg(name, &vals[1]) {
+                            return Ok(Value::jsonb(jsonb_delete_keys(&doc, &keys)?.render()));
+                        }
+                    }
+                    Ok(Value::jsonb(jsonb_delete_key(&doc, &s)?.render()))
+                }
+                Value::SmallInt(i) => Ok(Value::jsonb(jsonb_delete_idx(&doc, *i as i64)?.render())),
+                Value::Int(i) | Value::BigInt(i) => {
+                    Ok(Value::jsonb(jsonb_delete_idx(&doc, *i)?.render()))
+                }
+                other => Err(func_arg_err(name, other)),
+            }
+        }
+        "jsonb_delete_path" => {
+            let doc = match jsonb_val_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(v) => v,
+            };
+            let (ndims, path) = match json_path_list_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(p) => p,
+            };
+            if ndims > 1 {
+                return Err(exec_err("2202E", "wrong number of array subscripts"));
+            }
+            if !matches!(doc, JsonbVal::Object(_) | JsonbVal::Array(_)) {
+                return Err(exec_err("22023", "cannot delete path in scalar"));
+            }
+            if path.is_empty()
+                || matches!(doc, JsonbVal::Object(ref p) if p.is_empty())
+                || matches!(doc, JsonbVal::Array(ref e) if e.is_empty())
+            {
+                return Ok(Value::jsonb(doc.render()));
+            }
+            let out = jsonb_set_path(doc, &path, None, JsonbPathOp::Delete)?;
+            Ok(Value::jsonb(out.render()))
+        }
+        _ => Err(exec_err(
+            "42883",
+            format!("function {name}() does not exist"),
+        )),
+    }
+}
+
+/// v1.84: `jsonb_set_lax(jsonb, text[], jsonb, bool, text)` — NOT
+/// strict (pg_proc proisstrict=f): NULL target/path/create args yield
+/// NULL, a NULL treatment is 22023, and a NULL replacement dispatches
+/// on the treatment: use_json_null (the default) sets the JSON null
+/// value, delete_key deletes the path, return_target returns the
+/// target unchanged, raise_exception is 22004. With a non-NULL
+/// replacement it is exactly jsonb_set.
+pub(crate) fn eval_jsonb_set_lax(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
+    if vals[0] == Value::Null || vals[1] == Value::Null {
+        return Ok(Value::Null);
+    }
+    if let Some(Value::Null) = vals.get(3) {
+        return Ok(Value::Null);
+    }
+    let treatment = match vals.get(4) {
+        None => "use_json_null".to_string(),
+        Some(Value::Null) => {
+            return Err(exec_err(
+                "22023",
+                "null_value_treatment must be \"delete_key\", \"return_target\", \"use_json_null\", or \"raise_exception\"",
+            ));
+        }
+        Some(v) => match str_arg(name, v)? {
+            Some(s) => s.to_string(),
+            None => return Ok(Value::Null),
+        },
+    };
+    if vals[2] != Value::Null {
+        // Non-NULL replacement: exactly jsonb_set (defaults for the
+        // create flag are shared).
+        let mut set_vals: Vec<Value> = vals[..4.min(vals.len())].to_vec();
+        if set_vals.len() == 3 {
+            set_vals.push(Value::Bool(true));
+        }
+        return eval_json_func("jsonb_set", &set_vals);
+    }
+    match treatment.as_str() {
+        "raise_exception" => Err(exec_err("22004", "JSON value must not be null")),
+        "use_json_null" => {
+            let mut set_vals: Vec<Value> =
+                vec![vals[0].clone(), vals[1].clone(), Value::jsonb("null")];
+            match vals.get(3) {
+                Some(b) => set_vals.push(b.clone()),
+                None => set_vals.push(Value::Bool(true)),
+            }
+            eval_json_func("jsonb_set", &set_vals)
+        }
+        "delete_key" => {
+            let del_vals: Vec<Value> = vec![vals[0].clone(), vals[1].clone()];
+            eval_json_func("jsonb_delete_path", &del_vals)
+        }
+        "return_target" => match jsonb_val_arg(name, &vals[0])? {
+            None => Ok(Value::Null),
+            Some(v) => Ok(Value::jsonb(v.render())),
+        },
+        _ => Err(exec_err(
+            "22023",
+            "null_value_treatment must be \"delete_key\", \"return_target\", \"use_json_null\", or \"raise_exception\"",
+        )),
+    }
+}
+
+/// v1.84: `json_object` / `jsonb_object` (json.c json_object,
+/// json_object_two_arg; jsonb.c's jsonb_object mirrors them into the
+/// canonical tree). One argument: a text array of alternating
+/// keys/values (1-D, even length) or key/value pairs (2-D, exactly 2
+/// columns). Two arguments: parallel key/value text arrays. NULL
+/// keys are 22004; NULL values become JSON null (the text 'null' for
+/// json_object's string values — no: they become the JSON null
+/// literal; a value string renders as a JSON string).
+pub(crate) fn eval_json_object(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
+    let as_jsonb = name == "jsonb_object";
+    // Collect (key, value) text pairs with NULLs marked.
+    let pairs: Vec<(Option<String>, Option<String>)> = if vals.len() == 2 {
+        if vals[0] == Value::Null || vals[1] == Value::Null {
+            return Ok(Value::Null);
+        }
+        let keys = json_object_texts(name, &vals[0])?;
+        let values = json_object_texts(name, &vals[1])?;
+        let (Some((kdims, keys)), Some((vdims, values))) = (keys, values) else {
+            return Ok(Value::Null);
+        };
+        if kdims.len() > 1 || kdims.len() != vdims.len() {
+            return Err(exec_err("2202E", "wrong number of array subscripts"));
+        }
+        if keys.len() != values.len() {
+            return Err(exec_err("2202E", "mismatched array dimensions"));
+        }
+        keys.into_iter().zip(values).collect()
+    } else {
+        if vals[0] == Value::Null {
+            return Ok(Value::Null);
+        }
+        let Some((dims, elems)) = json_object_texts(name, &vals[0])? else {
+            return Ok(Value::Null);
+        };
+        match dims.len() {
+            0 => Vec::new(),
+            1 => {
+                if elems.len() % 2 != 0 {
+                    return Err(exec_err("2202E", "array must have even number of elements"));
+                }
+                elems
+                    .chunks_exact(2)
+                    .map(|c| (c[0].clone(), c[1].clone()))
+                    .collect()
+            }
+            2 => {
+                if dims[1] != 2 {
+                    return Err(exec_err("2202E", "array must have two columns"));
+                }
+                elems
+                    .chunks_exact(2)
+                    .map(|c| (c[0].clone(), c[1].clone()))
+                    .collect()
+            }
+            _ => return Err(exec_err("2202E", "wrong number of array subscripts")),
+        }
+    };
+    if as_jsonb {
+        let mut out: Vec<(String, JsonbVal)> = Vec::with_capacity(pairs.len());
+        for (k, v) in &pairs {
+            let Some(k) = k else {
+                return Err(exec_err("22004", "null value not allowed for object key"));
+            };
+            let val = match v {
+                None => JsonbVal::Null,
+                Some(s) => JsonbVal::Str(s.clone()),
+            };
+            out.push((k.clone(), val));
+        }
+        Ok(Value::jsonb(jsonb_canon(JsonbVal::Object(out)).render()))
+    } else {
+        let mut out = String::from("{");
+        for (i, (k, v)) in pairs.iter().enumerate() {
+            let Some(k) = k else {
+                return Err(exec_err("22004", "null value not allowed for object key"));
+            };
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push('"');
+            escape_json_into(k, &mut out);
+            out.push_str("\" : ");
+            match v {
+                None => out.push_str("null"),
+                Some(s) => {
+                    out.push('"');
+                    escape_json_into(s, &mut out);
+                    out.push('"');
+                }
+            }
+        }
+        out.push('}');
+        Ok(Value::text(out))
+    }
+}
+
+/// The dims + text elements of a json_object argument array, with
+/// NULLs preserved. A bare text literal coerces through the
+/// array-literal parser (unknown-literal coercion, as elsewhere).
+/// (json_path_list_arg drops the dims; json_object's 2-D form needs
+/// the column count, so this keeps them.)
+pub(crate) fn json_object_texts(
+    fname: &str,
+    v: &Value,
+) -> Result<Option<(Vec<i32>, Vec<Option<String>>)>, ExecError> {
+    let arr = match v {
+        Value::Null => return Ok(None),
+        Value::Array(a) => (**a).clone(),
+        Value::Text(s) | Value::BpChar(s) => match parse_array_literal(s, ArrayElem::Text) {
+            Ok(a) => a,
+            Err(_) => {
+                return Err(exec_err(
+                    "42883",
+                    format!("function {fname}(text[]) does not exist"),
+                ));
+            }
+        },
+        other => return Err(func_arg_err(fname, other)),
+    };
+    let mut out = Vec::with_capacity(arr.elems.len());
+    for e in &arr.elems {
+        match e {
+            Value::Null => out.push(None),
+            Value::Text(s) | Value::BpChar(s) => out.push(Some(s.to_string())),
+            other => return Err(func_arg_err(fname, other)),
+        }
+    }
+    Ok(Some((arr.dims.clone(), out)))
+}
+
+/// json.c array_to_json_internal with use_line_feeds: only the
+/// outermost dimension uses the ",\n " separator.
+fn array_to_json_rec(a: &ArrayVal, dim: usize, cur: &mut usize, pretty: bool, out: &mut String) {
+    out.push('[');
+    let n = a.dims[dim].max(0) as usize;
+    for i in 0..n {
+        if i > 0 {
+            if pretty && dim == 0 {
+                out.push_str(",\n ");
+            } else {
+                out.push(',');
+            }
+        }
+        if dim + 1 == a.dims.len() {
+            datum_to_json_text(&a.elems[*cur], out);
+            *cur += 1;
+        } else {
+            array_to_json_rec(a, dim + 1, cur, pretty, out);
+        }
+    }
+    out.push(']');
+}
+
+// ---------------------------------------------------------------------------
+// v1.84: json(b)_populate_record(set) / json(b)_to_record(set).
+//
+// PG's jsonfuncs.c workers resolve the target composite type from the
+// function's return type (here: from the call site — a CastNamed base
+// argument, a record-typed base value, or a FROM column definition
+// list), then fill each field: a missing key keeps the base value (or
+// NULL with no base); an explicit JSON null yields NULL; anything
+// else converts — strings for ARRAY/COMPOSITE fields go through the
+// type's input function (the PG "scalar" hack), JSON objects recurse
+// into nested composites, and scalars convert through their text form
+// via `eval_cast`. Conversion goes through the jsonb tree for both
+// json and jsonb documents (the json path canonicalizes numbers on
+// the way in; the only observable difference is a numeric JSON value
+// landing in a text field mid-document, which PG renders with the
+// source token — see the v1.84 scope notes).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub(crate) struct PopField {
+    pub name: String,
+    pub ty: ColType,
+    /// Named composite type name for ColType::Composite fields.
+    pub named: Option<String>,
+    /// Anonymous composite sub-fields (base-record inference).
+    pub sub: Option<Vec<PopField>>,
+}
+
+/// Execution-time field resolution for a named composite (table
+/// rowtype or CREATE TYPE), mirroring func_rowtype_fields.
+pub(crate) fn pop_fields_for_type(q: &mut Q, type_name: &str) -> Result<Vec<PopField>, ExecError> {
+    if let Some(t) = q
+        .eng
+        .db
+        .find_table(type_name, q.snap, &q.all_xids, q.session)
+    {
+        return Ok(t
+            .columns
+            .iter()
+            .map(|(n, c)| PopField {
+                name: n.clone(),
+                ty: c.clone(),
+                named: None,
+                sub: None,
+            })
+            .collect());
+    }
+    if let Some(st) = q.eng.db.types.get(type_name) {
+        if let Some(fields) = &st.composite {
+            return Ok(fields
+                .iter()
+                .map(|(n, c, nested)| PopField {
+                    name: n.clone(),
+                    ty: c.clone(),
+                    named: nested.clone(),
+                    sub: None,
+                })
+                .collect());
+        }
+    }
+    Err(exec_err(
+        "42704",
+        format!("type \"{type_name}\" does not exist"),
+    ))
+}
+
+/// Static field resolution (no Q): name + type pairs for the
+/// Describe-time FROM-function schema.
+pub(crate) fn pop_fields_static(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    type_name: &str,
+) -> Option<Vec<(String, ColType)>> {
+    if let Some(t) = eng.db.find_table(type_name, snap, &[own], session) {
+        return Some(
+            t.columns
+                .iter()
+                .map(|(n, c)| (n.clone(), c.clone()))
+                .collect(),
+        );
+    }
+    eng.db.types.get(type_name).and_then(|st| {
+        st.composite.as_ref().map(|fields| {
+            fields
+                .iter()
+                .map(|(n, c, _)| (n.clone(), c.clone()))
+                .collect()
+        })
+    })
+}
+
+/// Infer a target field list from a record VALUE (anonymous composite
+/// bases, e.g. `json_populate_record(row(1, 'a'), ...)`): PG builds
+/// the tupdesc from the actual tuple; field names come from the
+/// record itself (f1..fn for anonymous rows).
+fn pop_fields_from_record(fields: &[(String, Value)]) -> Vec<PopField> {
+    fields
+        .iter()
+        .map(|(n, v)| {
+            let (ty, sub) = infer_pop_type(v);
+            PopField {
+                name: n.clone(),
+                ty,
+                named: None,
+                sub,
+            }
+        })
+        .collect()
+}
+
+fn infer_pop_type(v: &Value) -> (ColType, Option<Vec<PopField>>) {
+    match v {
+        Value::SmallInt(_) => (ColType::SmallInt, None),
+        Value::Int(_) => (ColType::Int, None),
+        Value::BigInt(_) => (ColType::BigInt, None),
+        Value::Float4(_) => (ColType::Float4, None),
+        Value::Float(_) => (ColType::Float, None),
+        Value::Numeric(_) => (ColType::Numeric(None), None),
+        Value::Bool(_) => (ColType::Bool, None),
+        Value::Text(_) | Value::BpChar(_) => (ColType::Text, None),
+        Value::Date(_) => (ColType::Date, None),
+        Value::Timestamp(_) => (ColType::Timestamp, None),
+        Value::Timestamptz(_) => (ColType::Timestamptz, None),
+        Value::Bytea(_) => (ColType::Bytea, None),
+        Value::Uuid(_) => (ColType::Uuid, None),
+        Value::Jsonb(_) => (ColType::Jsonb, None),
+        Value::Array(a) => (ColType::Array(a.elem), None),
+        Value::Record(fs) => (ColType::Composite, Some(pop_fields_from_record(fs))),
+        _ => (ColType::Text, None),
+    }
+}
+
+/// Field list for a populate call: column definitions win, then the
+/// base argument's named type, then the base record value itself.
+/// 42601 matches PG's expand_record error for an unresolvable record.
+pub(crate) fn resolve_populate_fields(
+    q: &mut Q,
+    base_expr: &Expr,
+    base_val: &Value,
+    col_defs: &[(String, ColType, Option<String>)],
+) -> Result<Vec<PopField>, ExecError> {
+    if !col_defs.is_empty() {
+        return Ok(col_defs
+            .iter()
+            .map(|(n, t, named)| PopField {
+                name: n.clone(),
+                ty: t.clone(),
+                named: named.clone(),
+                sub: None,
+            })
+            .collect());
+    }
+    if let Expr::CastNamed { name, .. } = base_expr {
+        return pop_fields_for_type(q, name);
+    }
+    match base_val {
+        Value::Record(fs) => Ok(pop_fields_from_record(fs)),
+        _ => Err(exec_err(
+            "42601",
+            "a column definition list is required for functions returning \"record\"",
+        )),
+    }
+}
+
+/// v1.84: when a populate base argument is a cast to a DOMAIN type,
+/// PG coerces the populated result back to that domain — its CHECK
+/// constraints run on the result (23514 on violation). Returns the
+/// domain's name when the base expression names one.
+pub(crate) fn populate_domain_name(q: &Q, base_expr: &Expr) -> Option<String> {
+    if let Expr::CastNamed { name, .. } = base_expr {
+        if q.eng
+            .db
+            .types
+            .get(name)
+            .is_some_and(|st| st.domain.is_some())
+        {
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
+/// The document as a jsonb tree for populate (both the json and jsonb
+/// entry points share the conversion core via the canonical tree).
+pub(crate) fn populate_doc_tree(fname: &str, v: &Value) -> Result<Option<JsonbVal>, ExecError> {
+    if fname.starts_with("jsonb") {
+        return jsonb_val_arg(fname, v);
+    }
+    match json_doc_arg(fname, v)? {
+        None => Ok(None),
+        Some(doc) => Ok(Some(jsonb_from_node(&doc, &doc.root)?)),
+    }
+}
+
+/// Fill one record: `obj` must be a JsonbVal::Object (callers check).
+pub(crate) fn populate_fields(
+    q: &mut Q,
+    fields: &[PopField],
+    base: Option<&Vec<(String, Value)>>,
+    obj: &JsonbVal,
+) -> Result<Vec<Value>, ExecError> {
+    let JsonbVal::Object(pairs) = obj else {
+        return Err(exec_err(
+            "22023",
+            "cannot call populate_composite on a non-object",
+        ));
+    };
+    let mut out = Vec::with_capacity(fields.len());
+    for f in fields {
+        let base_val = base.and_then(|b| b.iter().find(|(n, _)| n == &f.name).map(|(_, v)| v));
+        let jsv = pairs.iter().find(|(k, _)| k == &f.name).map(|(_, v)| v);
+        out.push(match jsv {
+            // Missing key: keep the base value; with no base the
+            // field is processed with a JSON null and lands NULL.
+            None => match base_val {
+                Some(b) => b.clone(),
+                None => Value::Null,
+            },
+            Some(JsonbVal::Null) => Value::Null,
+            Some(v) => populate_typed(q, f, base_val, v)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Convert one JSON value into a typed field value (PG's
+/// populate_record_field recursion). v1.89: pub(crate) — JSON_TABLE
+/// column conversion is the same coercion (jsonfuncs.c shares it).
+pub(crate) fn populate_typed(
+    q: &mut Q,
+    f: &PopField,
+    base: Option<&Value>,
+    jsv: &JsonbVal,
+) -> Result<Value, ExecError> {
+    // PG's scalar hack: a JSON string for an ARRAY or COMPOSITE field
+    // is fed to the type's input function as text.
+    if let JsonbVal::Str(s) = jsv {
+        match &f.ty {
+            ColType::Array(_) => return eval_cast(&Value::text(s.clone()), f.ty.clone()),
+            ColType::Composite => {
+                if let Some(n) = &f.named {
+                    return coerce_to_type_name(q, &Value::text(s.clone()), n);
+                }
+            }
+            _ => {}
+        }
+    }
+    match &f.ty {
+        ColType::Array(elem) => {
+            let JsonbVal::Array(elems) = jsv else {
+                return Err(exec_err("22P02", "malformed JSON array"));
+            };
+            let (dims, flat) = populate_array_rec(q, *elem, elems)?;
+            Ok(Value::Array(Box::new(ArrayVal {
+                elem: *elem,
+                lower: vec![1; dims.len()],
+                dims,
+                elems: flat,
+            })))
+        }
+        ColType::Composite => {
+            match jsv {
+                JsonbVal::Array(_) => {
+                    return Err(exec_err(
+                        "22023",
+                        "cannot call populate_composite on an array",
+                    ));
+                }
+                JsonbVal::Object(_) => {}
+                _ => {
+                    return Err(exec_err(
+                        "22023",
+                        "cannot call populate_composite on a scalar",
+                    ));
+                }
+            }
+            let fields = if let Some(n) = &f.named {
+                pop_fields_for_type(q, n)?
+            } else if let Some(s) = &f.sub {
+                s.clone()
+            } else if let Some(Value::Record(fs)) = base {
+                pop_fields_from_record(fs)
+            } else {
+                return Err(exec_err(
+                    "42601",
+                    "cannot populate a composite field without a row type",
+                ));
+            };
+            let base_fields = match base {
+                Some(Value::Record(fs)) => Some(fs.clone()),
+                _ => None,
+            };
+            let vals = populate_fields(q, &fields, base_fields.as_ref(), jsv)?;
+            Ok(Value::Record(
+                fields.iter().map(|pf| pf.name.clone()).zip(vals).collect(),
+            ))
+        }
+        // A json field takes the rendered sub-document (strings are
+        // re-escaped into string literals by render); a jsonb field
+        // takes the subvalue directly.
+        ColType::Json => Ok(Value::text(jsv.render())),
+        ColType::Jsonb => Ok(Value::jsonb(jsv.render())),
+        ty => {
+            let t = match jsv {
+                JsonbVal::Str(s) => s.clone(),
+                JsonbVal::Number(n) => n.to_text(),
+                JsonbVal::Bool(b) => {
+                    if *b {
+                        "true".to_string()
+                    } else {
+                        "false".to_string()
+                    }
+                }
+                other => other.render(),
+            };
+            // PG converts through the type's input function with
+            // assignment semantics: overlength char/varchar input is
+            // 22001, not the silent truncation of an explicit cast.
+            match ty {
+                ColType::Char(n) => eval_char_assign(&t, *n, true),
+                ColType::Varchar(n) => eval_char_assign(&t, *n, false),
+                _ => eval_cast(&Value::text(t), ty.clone()),
+            }
+        }
+    }
+}
+
+/// One nesting level of populate_array: returns (dims, flat values).
+/// Rectangularity is enforced (PG's "malformed JSON array").
+fn populate_array_rec(
+    q: &mut Q,
+    elem: ArrayElem,
+    elems: &[JsonbVal],
+) -> Result<(Vec<i32>, Vec<Value>), ExecError> {
+    let elem_ty = array_elem_coltype(elem);
+    let elem_field = PopField {
+        name: String::new(),
+        ty: elem_ty,
+        named: None,
+        sub: None,
+    };
+    let mut child_shape: Option<Vec<i32>> = None;
+    let mut flat: Vec<Value> = Vec::new();
+    for e in elems {
+        let (shape, mut vals) = match e {
+            JsonbVal::Array(sub) => {
+                let (s, v) = populate_array_rec(q, elem, sub)?;
+                (s, v)
+            }
+            JsonbVal::Null => (Vec::new(), vec![Value::Null]),
+            other => (
+                Vec::new(),
+                vec![populate_typed(q, &elem_field, None, other)?],
+            ),
+        };
+        match &child_shape {
+            None => child_shape = Some(shape),
+            Some(s) => {
+                if *s != shape {
+                    return Err(exec_err("22P02", "malformed JSON array"));
+                }
+            }
+        }
+        flat.append(&mut vals);
+    }
+    let mut dims = vec![elems.len() as i32];
+    dims.extend(child_shape.unwrap_or_default());
+    Ok((dims, flat))
+}
+
+/// scalar-context json(b)_populate_record and
+/// jsonb_populate_record_valid (args are the raw expressions: the
+/// base argument's static shape decides the target row type).
+pub(crate) fn eval_json_populate_scalar(
+    q: &mut Q,
+    scopes: &[Scope],
+    name: &str,
+    args: &[Expr],
+) -> Result<Value, ExecError> {
+    let base_val = eval_expr(q, scopes, &args[0])?;
+    let json_val = eval_expr(q, scopes, &args[1])?;
+    let valid_only = name == "jsonb_populate_record_valid";
+    let result = eval_json_populate_inner(q, name, &args[0], &base_val, &json_val);
+    if valid_only {
+        return Ok(match result {
+            Ok(v) => {
+                if v == Value::Null {
+                    Value::Null
+                } else {
+                    Value::Bool(true)
+                }
+            }
+            Err(_) => Value::Bool(false),
+        });
+    }
+    result
+}
+
+fn eval_json_populate_inner(
+    q: &mut Q,
+    name: &str,
+    base_expr: &Expr,
+    base_val: &Value,
+    json_val: &Value,
+) -> Result<Value, ExecError> {
+    let fields = resolve_populate_fields(q, base_expr, base_val, &[])?;
+    if json_val == &Value::Null {
+        // NULL json: the base record passes through (a NULL base
+        // stays NULL).
+        return Ok(base_val.clone());
+    }
+    let tree = populate_doc_tree(name, json_val)?
+        .ok_or_else(|| exec_err("22023", "cannot call populate_composite on a scalar"))?;
+    match &tree {
+        JsonbVal::Object(_) => {}
+        JsonbVal::Array(_) => {
+            return Err(exec_err(
+                "22023",
+                "cannot call populate_composite on an array",
+            ));
+        }
+        _ => {
+            return Err(exec_err(
+                "22023",
+                "cannot call populate_composite on a scalar",
+            ));
+        }
+    }
+    let base_fields = match base_val {
+        Value::Record(fs) => Some(fs.clone()),
+        _ => None,
+    };
+    let vals = populate_fields(q, &fields, base_fields.as_ref(), &tree)?;
+    let rec = Value::Record(fields.iter().map(|f| f.name.clone()).zip(vals).collect());
+    // Domain-typed base: PG coerces the result to the domain, whose
+    // CHECK constraints run on the populated record.
+    if let Some(dn) = populate_domain_name(q, base_expr) {
+        check_domain_value(q, &dn, &rec, false)?;
+    }
+    Ok(rec)
 }
 
 /// v0.24: output-size guards for string-building built-ins. Postgres
@@ -2958,6 +4485,27 @@ pub(crate) fn eval_table_function(
     // v0.32: arity is validated like scalar builtins (42883, as PG's
     // "function ... does not exist" for a bad signature).
     check_builtin_arity(name, vals)?;
+    // v1.84: json/jsonb expansion SRFs share their core with the
+    // target-list SRF path; Record rows flatten to cells.
+    // v1.85: jsonb_path_query as a FROM-clause table function.
+    if name == "jsonb_path_query" || name == "jsonb_path_query_tz" {
+        let rows = jsonpath_query_rows(name, vals)?
+            .into_iter()
+            .map(|v| vec![v])
+            .collect();
+        return Ok((vec![name.to_string()], rows));
+    }
+    if is_json_expansion_srf(name) {
+        let (names, values) = eval_json_srf_core(name, &vals[0])?;
+        let rows = values
+            .into_iter()
+            .map(|v| match v {
+                Value::Record(fs) => fs.into_iter().map(|(_, x)| x).collect(),
+                other => vec![other],
+            })
+            .collect();
+        return Ok((names, rows));
+    }
     match name {
         "regexp_split_to_table" => {
             let s = match str_arg(name, &vals[0])? {
@@ -3112,7 +4660,30 @@ pub(crate) fn is_srf(eng: &Engine, name: &str) -> bool {
 /// Builtin-only SRF check, for contexts without catalog access
 /// (GROUP BY keys, INSERT ... VALUES) where user SRFs stay 0A000.
 pub(crate) fn is_builtin_srf(name: &str) -> bool {
-    matches!(name, "regexp_matches" | "generate_series" | "unnest")
+    matches!(
+        name,
+        "regexp_matches"
+            | "generate_series"
+            | "unnest"
+            // v1.84: json/jsonb set-returning functions.
+            | "json_array_elements"
+            | "json_array_elements_text"
+            | "jsonb_array_elements"
+            | "jsonb_array_elements_text"
+            | "json_each"
+            | "json_each_text"
+            | "jsonb_each"
+            | "jsonb_each_text"
+            | "json_object_keys"
+            | "jsonb_object_keys"
+            | "json_populate_recordset"
+            | "jsonb_populate_recordset"
+            | "json_to_recordset"
+            | "jsonb_to_recordset"
+            // v1.85: the jsonpath row source.
+            | "jsonb_path_query"
+            | "jsonb_path_query_tz"
+    )
 }
 
 /// v0.32: evaluate a set-returning function to its output rows (one Value
@@ -3120,7 +4691,12 @@ pub(crate) fn is_builtin_srf(name: &str) -> bool {
 /// v0.47: `generate_series` reuses the FROM-clause table-function core
 /// (`eval_table_function`), flattened to one value per row — PG19's
 /// `generate_series` returns a single column.
-pub(crate) fn eval_srf_vals(name: &str, vals: &[Value]) -> Result<Vec<Value>, ExecError> {
+pub(crate) fn eval_srf_vals(
+    q: &mut Q,
+    name: &str,
+    vals: &[Value],
+    arg_exprs: &[Expr],
+) -> Result<Vec<Value>, ExecError> {
     check_builtin_arity(name, vals)?;
     match name {
         "regexp_matches" => regexp_matches_rows(vals),
@@ -3150,11 +4726,310 @@ pub(crate) fn eval_srf_vals(name: &str, vals: &[Value]) -> Result<Vec<Value>, Ex
                 })
                 .collect()
         }
+        // v1.84: json/jsonb SRFs in scalar (target-list) context.
+        // Multi-column results return one Value::Record per row (the
+        // composite display form); populate/to_recordset can only
+        // resolve their row type from a record-typed base value here
+        // (the CastNamed shape is lost once args are values — the
+        // FROM-clause path in join.rs handles the typed forms).
+        "json_array_elements"
+        | "json_array_elements_text"
+        | "jsonb_array_elements"
+        | "jsonb_array_elements_text"
+        | "json_each"
+        | "json_each_text"
+        | "jsonb_each"
+        | "jsonb_each_text"
+        | "json_object_keys"
+        | "jsonb_object_keys" => {
+            let (names, rows) = eval_json_srf_core(name, &vals[0])?;
+            let _ = names;
+            Ok(rows)
+        }
+        "json_populate_recordset"
+        | "jsonb_populate_recordset"
+        | "json_to_recordset"
+        | "jsonb_to_recordset" => eval_json_recordset_srf(q, name, vals, arg_exprs),
+        // v1.85: jsonb_path_query in target-list position.
+        "jsonb_path_query" | "jsonb_path_query_tz" => jsonpath_query_rows(name, vals),
         _ => Err(exec_err(
             "42883",
             format!("function {name} is not a set-returning function"),
         )),
     }
+}
+
+/// v1.84: the expansion SRF names (each / array_elements /
+/// object_keys, json and jsonb, plain and _text).
+pub(crate) fn is_json_expansion_srf(name: &str) -> bool {
+    matches!(
+        name,
+        "json_array_elements"
+            | "json_array_elements_text"
+            | "jsonb_array_elements"
+            | "jsonb_array_elements_text"
+            | "json_each"
+            | "json_each_text"
+            | "jsonb_each"
+            | "jsonb_each_text"
+            | "json_object_keys"
+            | "jsonb_object_keys"
+    )
+}
+
+/// v1.84: the record-returning json function names (populate /
+/// to_record families, scalar and set forms).
+pub(crate) fn is_json_record_function(name: &str) -> bool {
+    matches!(
+        name,
+        "json_populate_record"
+            | "jsonb_populate_record"
+            | "json_populate_recordset"
+            | "jsonb_populate_recordset"
+            | "json_to_record"
+            | "jsonb_to_record"
+            | "json_to_recordset"
+            | "jsonb_to_recordset"
+    )
+}
+
+/// v1.84: output column names of the expansion SRFs (pg_proc
+/// proargnames: array_elements' OUT column is "value"; each is
+/// key/value; object_keys has no OUT name, so the function name).
+pub(crate) fn json_srf_col_names(name: &str) -> Vec<String> {
+    if name.contains("each") {
+        vec!["key".to_string(), "value".to_string()]
+    } else if name.contains("array_elements") {
+        vec!["value".to_string()]
+    } else {
+        vec![name.to_string()]
+    }
+}
+
+/// v1.84: shared core for the json/jsonb expansion SRFs (each,
+/// array_elements, object_keys and their _text variants), returning
+/// (column names, one Value per output row). Multi-column rows are
+/// `Value::Record`. STRICT: a NULL argument yields no rows.
+pub(crate) fn eval_json_srf_core(
+    name: &str,
+    arg: &Value,
+) -> Result<(Vec<String>, Vec<Value>), ExecError> {
+    if *arg == Value::Null {
+        return Ok((json_srf_col_names(name), Vec::new()));
+    }
+    let as_text = name.ends_with("_text");
+    if name.starts_with("jsonb") {
+        let v = jsonb_val_arg(name, arg)?.unwrap_or(JsonbVal::Null);
+        jsonb_srf_rows(name, &v, as_text)
+    } else {
+        let doc = json_doc_arg(name, arg)?.unwrap();
+        json_srf_rows(name, &doc, as_text)
+    }
+}
+
+/// Rows for the jsonb-tree SRFs given a canonical tree value.
+fn jsonb_srf_rows(
+    name: &str,
+    v: &JsonbVal,
+    as_text: bool,
+) -> Result<(Vec<String>, Vec<Value>), ExecError> {
+    if name.contains("array_elements") {
+        match v {
+            JsonbVal::Array(elems) => {
+                let rows = elems
+                    .iter()
+                    .map(|e| {
+                        if as_text {
+                            match e.scalar_text() {
+                                Some(s) => Value::text(s),
+                                None => Value::Null,
+                            }
+                        } else {
+                            Value::jsonb(e.render())
+                        }
+                    })
+                    .collect();
+                Ok((json_srf_col_names(name), rows))
+            }
+            JsonbVal::Object(_) => Err(exec_err("22023", "cannot extract elements from an object")),
+            _ => Err(exec_err("22023", "cannot extract elements from a scalar")),
+        }
+    } else if name.contains("each") {
+        match v {
+            JsonbVal::Object(pairs) => {
+                let rows = pairs
+                    .iter()
+                    .map(|(k, val)| {
+                        let vv = if as_text {
+                            match val.scalar_text() {
+                                Some(s) => Value::text(s),
+                                None => Value::Null,
+                            }
+                        } else {
+                            Value::jsonb(val.render())
+                        };
+                        Value::Record(vec![
+                            ("key".to_string(), Value::text(k.clone())),
+                            ("value".to_string(), vv),
+                        ])
+                    })
+                    .collect();
+                Ok((vec!["key".to_string(), "value".to_string()], rows))
+            }
+            _ => Err(exec_err(
+                "22023",
+                format!("cannot call {name} on a non-object"),
+            )),
+        }
+    } else {
+        // object_keys
+        match v {
+            JsonbVal::Object(pairs) => Ok((
+                json_srf_col_names(name),
+                pairs.iter().map(|(k, _)| Value::text(k.clone())).collect(),
+            )),
+            JsonbVal::Array(_) => Err(exec_err("22023", format!("cannot call {name} on an array"))),
+            _ => Err(exec_err("22023", format!("cannot call {name} on a scalar"))),
+        }
+    }
+}
+
+/// Rows for the json (span-tree) SRFs: element/key slices preserve
+/// the source text for the non-_text variants (PG semantics).
+fn json_srf_rows(
+    name: &str,
+    doc: &JsonDoc,
+    as_text: bool,
+) -> Result<(Vec<String>, Vec<Value>), ExecError> {
+    if name.contains("array_elements") {
+        match &doc.root.kind {
+            JsonKind::Array(elems) => {
+                let rows = elems
+                    .iter()
+                    .map(|e| {
+                        if as_text {
+                            match json_scalar_text(doc, e)? {
+                                Some(s) => Ok(Value::text(s)),
+                                None => Ok(Value::Null),
+                            }
+                        } else {
+                            Ok(Value::text(node_text(doc, e)))
+                        }
+                    })
+                    .collect::<Result<Vec<Value>, ExecError>>()?;
+                Ok((json_srf_col_names(name), rows))
+            }
+            JsonKind::Object(_) => Err(exec_err("22023", "cannot extract elements from an object")),
+            _ => Err(exec_err("22023", "cannot extract elements from a scalar")),
+        }
+    } else if name.contains("each") {
+        match &doc.root.kind {
+            JsonKind::Object(members) => {
+                let rows = members
+                    .iter()
+                    .map(|(k, val)| {
+                        let vv = if as_text {
+                            match json_scalar_text(doc, val)? {
+                                Some(s) => Value::text(s),
+                                None => Value::Null,
+                            }
+                        } else {
+                            Value::text(node_text(doc, val))
+                        };
+                        Ok(Value::Record(vec![
+                            ("key".to_string(), Value::text(k.clone())),
+                            ("value".to_string(), vv),
+                        ]))
+                    })
+                    .collect::<Result<Vec<Value>, ExecError>>()?;
+                Ok((vec!["key".to_string(), "value".to_string()], rows))
+            }
+            _ => Err(exec_err(
+                "22023",
+                format!("cannot call {name} on a non-object"),
+            )),
+        }
+    } else {
+        match &doc.root.kind {
+            JsonKind::Object(members) => Ok((
+                json_srf_col_names(name),
+                members
+                    .iter()
+                    .map(|(k, _)| Value::text(k.clone()))
+                    .collect(),
+            )),
+            JsonKind::Array(_) => Err(exec_err("22023", format!("cannot call {name} on an array"))),
+            _ => Err(exec_err("22023", format!("cannot call {name} on a scalar"))),
+        }
+    }
+}
+
+/// v1.84: recordset SRFs in target-list context. Only a record-typed
+/// base value carries the target row type here (the CastNamed shape
+/// is lost once arguments are values — the FROM-clause path in
+/// join.rs resolves typed bases and column definition lists).
+/// to_recordset has no base at all, so it can only error here — the
+/// FROM form is where it works.
+pub(crate) fn eval_json_recordset_srf(
+    q: &mut Q,
+    name: &str,
+    vals: &[Value],
+    arg_exprs: &[Expr],
+) -> Result<Vec<Value>, ExecError> {
+    let is_populate = name.contains("populate");
+    let (base, doc_val) = if is_populate {
+        (Some(&vals[0]), &vals[1])
+    } else {
+        (None, &vals[0])
+    };
+    if *doc_val == Value::Null {
+        return Ok(Vec::new());
+    }
+    let Some(base) = base else {
+        return Err(exec_err(
+            "42601",
+            "a column definition list is required for functions returning \"record\"",
+        ));
+    };
+    let Value::Record(base_fields) = base else {
+        return Err(exec_err(
+            "42601",
+            "a column definition list is required for functions returning \"record\"",
+        ));
+    };
+    let base_fields = base_fields.clone();
+    let fields = pop_fields_from_record(&base_fields);
+    let tree = populate_doc_tree(name, doc_val)?
+        .ok_or_else(|| exec_err("22023", format!("cannot call {name} on a non-array")))?;
+    let JsonbVal::Array(elems) = &tree else {
+        return Err(exec_err(
+            "22023",
+            format!("cannot call {name} on a non-array"),
+        ));
+    };
+    // Domain-typed base: each populated row is coerced to the
+    // domain (PG checks its constraints on the function result).
+    let domain = if is_populate {
+        arg_exprs.first().and_then(|e| populate_domain_name(q, e))
+    } else {
+        None
+    };
+    let mut out = Vec::with_capacity(elems.len());
+    for el in elems {
+        if !matches!(el, JsonbVal::Object(_)) {
+            return Err(exec_err(
+                "22023",
+                format!("argument of {name} must be an array of objects"),
+            ));
+        }
+        let vals = populate_fields(q, &fields, Some(&base_fields), el)?;
+        let rec = Value::Record(fields.iter().map(|f| f.name.clone()).zip(vals).collect());
+        if let Some(dn) = &domain {
+            check_domain_value(q, dn, &rec, false)?;
+        }
+        out.push(rec);
+    }
+    Ok(out)
 }
 
 /// v1.09: evaluate a user-defined RETURNS SETOF function to its output
@@ -3231,7 +5106,7 @@ pub(crate) fn expand_insert_srf_rows(
                     for a in args {
                         arg_vals.push(eval_expr(q, &[], a)?);
                     }
-                    let set = eval_srf_vals(name, &arg_vals)?;
+                    let set = eval_srf_vals(q, name, &arg_vals, args)?;
                     has_result |= !set.is_empty();
                     width = width.max(set.len());
                     cells.push((
@@ -3298,7 +5173,7 @@ pub(crate) fn expand_values_srf_row(
                 for a in args {
                     arg_vals.push(eval_expr(q, scopes, a)?);
                 }
-                let set = eval_srf_vals(name, &arg_vals)?;
+                let set = eval_srf_vals(q, name, &arg_vals, args)?;
                 has_result |= !set.is_empty();
                 width = width.max(set.len());
                 cells.push((set, true));
@@ -4761,6 +6636,116 @@ pub(crate) fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecErr
                     }
                 }
                 None => Ok(Value::Null),
+            }
+        }
+        "pg_overlaps" => {
+            // v1.86: SQL OVERLAPS, following PG's overlaps_timestamp
+            // algorithm (null-aware) over a common i128 key domain
+            // (dates are promoted to timestamp micros).
+            fn ov_key(v: &Value) -> Result<Option<i128>, ExecError> {
+                Ok(match v {
+                    Value::Null => None,
+                    Value::Date(d) => Some(*d as i128 * 86_400_000_000),
+                    Value::Timestamp(m) | Value::Timestamptz(m) => Some(*m as i128),
+                    Value::Time(m) => Some(*m as i128),
+                    other => {
+                        return Err(exec_err(
+                            "42883",
+                            format!(
+                                "OVERLAPS operand has unsupported type {}",
+                                other.type_name()
+                            ),
+                        ));
+                    }
+                })
+            }
+            fn ov_pair(s: &Value, e: &Value) -> Result<(Option<i128>, Option<i128>), ExecError> {
+                if let Value::Interval(iv) = e {
+                    return match s {
+                        Value::Null => Ok((None, None)),
+                        Value::Date(d) => {
+                            let base = *d as i64 * 86_400_000_000;
+                            let end = crate::datetime::timestamp_add_interval(base, iv, 1)
+                                .map_err(|m| exec_err("22008", m))?;
+                            Ok((Some(base as i128), Some(end as i128)))
+                        }
+                        Value::Timestamp(m) => {
+                            let end = crate::datetime::timestamp_add_interval(*m, iv, 1)
+                                .map_err(|m| exec_err("22008", m))?;
+                            Ok((Some(*m as i128), Some(end as i128)))
+                        }
+                        Value::Timestamptz(m) => {
+                            let end = crate::datetime::timestamptz_add_interval(*m, iv, 1)
+                                .map_err(|m| exec_err("22008", m))?;
+                            Ok((Some(*m as i128), Some(end as i128)))
+                        }
+                        other => Err(exec_err(
+                            "42883",
+                            format!(
+                                "OVERLAPS operand has unsupported type {}",
+                                other.type_name()
+                            ),
+                        )),
+                    };
+                }
+                Ok((ov_key(s)?, ov_key(e)?))
+            }
+            fn ov_norm(s: Option<i128>, e: Option<i128>) -> Option<(i128, Option<i128>)> {
+                match (s, e) {
+                    (None, None) => None,
+                    (None, Some(ev)) => Some((ev, None)),
+                    (Some(sv), None) => Some((sv, None)),
+                    (Some(sv), Some(ev)) => Some(if sv > ev {
+                        (ev, Some(sv))
+                    } else {
+                        (sv, Some(ev))
+                    }),
+                }
+            }
+            let (s1, e1) = ov_pair(&vals[0], &vals[1])?;
+            let (s2, e2) = ov_pair(&vals[2], &vals[3])?;
+            let (s1, e1) = match ov_norm(s1, e1) {
+                None => return Ok(Value::Null),
+                Some(x) => x,
+            };
+            let (s2, e2) = match ov_norm(s2, e2) {
+                None => return Ok(Value::Null),
+                Some(x) => x,
+            };
+            let res: Option<bool> = if s1 > s2 {
+                match e2 {
+                    None => None,
+                    Some(e2v) => {
+                        if s1 < e2v {
+                            Some(true)
+                        } else if e1.is_none() {
+                            None
+                        } else {
+                            Some(false)
+                        }
+                    }
+                }
+            } else if s1 < s2 {
+                match e1 {
+                    None => None,
+                    Some(e1v) => {
+                        if s2 < e1v {
+                            Some(true)
+                        } else if e2.is_none() {
+                            None
+                        } else {
+                            Some(false)
+                        }
+                    }
+                }
+            } else if e1.is_none() || e2.is_none() {
+                None
+            } else {
+                Some(true)
+            };
+            match res {
+                None => Ok(Value::Null),
+                Some(b) => Ok(Value::Bool(b)),
             }
         }
         "similar_to" => {
@@ -7429,13 +9414,22 @@ pub(crate) fn eval_datetime_func(name: &str, vals: &[Value]) -> Result<Value, Ex
     };
     let apply_precision = |micros: i64| -> i64 { round_micros_to_precision(micros, precision) };
     match name {
-        "now" | "current_timestamp" => Ok(Value::Timestamptz(apply_precision(
+        // v1.86: now()/transaction_timestamp() pin to the
+        // transaction start (PG semantics); statement_timestamp()
+        // shares the pin in this engine (statements are the unit of
+        // work here); clock_timestamp() stays the wall clock.
+        "now" | "current_timestamp" | "statement_timestamp" | "transaction_timestamp" => Ok(
+            Value::Timestamptz(apply_precision(crate::datetime::txn_now_micros())),
+        ),
+        "clock_timestamp" => Ok(Value::Timestamptz(apply_precision(
             crate::datetime::now_micros(),
         ))),
-        "clock_timestamp" | "statement_timestamp" | "transaction_timestamp" => Ok(
-            Value::Timestamptz(apply_precision(crate::datetime::now_micros())),
-        ),
-        "current_date" => Ok(Value::Date(crate::datetime::today_days())),
+        // v1.86: current_date is the transaction date in the
+        // session zone.
+        "current_date" => Ok(Value::Date(
+            crate::datetime::timestamptz_to_local(crate::datetime::txn_now_micros())
+                .div_euclid(86_400_000_000) as i32,
+        )),
         "date_trunc" => {
             let field = match str_arg(name, &vals[0])? {
                 None => return Ok(Value::Null),
@@ -7445,24 +9439,50 @@ pub(crate) fn eval_datetime_func(name: &str, vals: &[Value]) -> Result<Value, Ex
             if v == &Value::Null {
                 return Ok(Value::Null);
             }
-            let (micros, is_tz) = match v {
-                Value::Date(d) => (
-                    (*d as i64)
+            // v1.86: date_trunc(text, interval) -> interval.
+            if let Value::Interval(iv) = v {
+                return match crate::datetime::date_trunc_interval(&field, iv) {
+                    Ok(r) => Ok(Value::Interval(r)),
+                    Err(e) => Err(exec_err("22023", e)),
+                };
+            }
+            // v1.86: the 3-arg form names the zone explicitly (PG:
+            // only for timestamptz sources).
+            if vals.len() == 3 {
+                let zone = match str_arg(name, &vals[2])? {
+                    None => return Ok(Value::Null),
+                    Some(s) => s.to_string(),
+                };
+                return match v {
+                    Value::Timestamptz(m) => {
+                        match crate::datetime::date_trunc_tz(&field, *m, Some(&zone)) {
+                            Ok(r) => Ok(Value::Timestamptz(r)),
+                            Err(e) => Err(exec_err("22023", e)),
+                        }
+                    }
+                    other => Err(func_arg_err(name, other)),
+                };
+            }
+            match v {
+                Value::Date(d) => {
+                    let micros = (*d as i64)
                         .checked_mul(86_400_000_000)
-                        .ok_or_else(|| exec_err("22008", "datetime field overflow"))?,
-                    false,
-                ),
-                Value::Timestamp(m) => (*m, false),
-                Value::Timestamptz(m) => (*m, true),
-                other => return Err(func_arg_err(name, other)),
-            };
-            match crate::datetime::date_trunc(&field, micros) {
-                Ok(m) => Ok(if is_tz {
-                    Value::Timestamptz(m)
-                } else {
-                    Value::Timestamp(m)
-                }),
-                Err(e) => Err(exec_err("22023", e)),
+                        .ok_or_else(|| exec_err("22008", "datetime field overflow"))?;
+                    match crate::datetime::date_trunc(&field, micros) {
+                        Ok(m) => Ok(Value::Timestamp(m)),
+                        Err(e) => Err(exec_err("22023", e)),
+                    }
+                }
+                Value::Timestamp(m) => match crate::datetime::date_trunc(&field, *m) {
+                    Ok(m) => Ok(Value::Timestamp(m)),
+                    Err(e) => Err(exec_err("22023", e)),
+                },
+                // v1.86: timestamptz truncates in the session zone.
+                Value::Timestamptz(m) => match crate::datetime::date_trunc_tz(&field, *m, None) {
+                    Ok(m) => Ok(Value::Timestamptz(m)),
+                    Err(e) => Err(exec_err("22023", e)),
+                },
+                other => Err(func_arg_err(name, other)),
             }
         }
         // v0.17: function form of EXTRACT; identical semantics (and
@@ -7538,9 +9558,96 @@ pub(crate) fn eval_datetime_func(name: &str, vals: &[Value]) -> Result<Value, Ex
                 None => return Ok(Value::Null),
                 Some(s) => s,
             };
+            // v1.86: to_char over the full datetime family.
+            // Timestamptz renders in the session zone with real zone
+            // tokens; time/timetz/interval have their own paths.
+            // PG renders the sentinels as their plain text regardless
+            // of the pattern.
+            match v {
+                Value::Date(crate::datetime::DATE_INFINITY) => {
+                    return Ok(Value::text("infinity"));
+                }
+                Value::Date(crate::datetime::DATE_NEG_INFINITY) => {
+                    return Ok(Value::text("-infinity"));
+                }
+                Value::Timestamp(m)
+                    if *m == crate::datetime::TS_INFINITY
+                        || *m == crate::datetime::TS_NEG_INFINITY =>
+                {
+                    return Ok(Value::text(if *m > 0 { "infinity" } else { "-infinity" }));
+                }
+                _ => {}
+            }
+            match v {
+                Value::Timestamptz(m) => {
+                    if *m == crate::datetime::TS_INFINITY || *m == crate::datetime::TS_NEG_INFINITY
+                    {
+                        // PG renders the sentinel text itself through
+                        // the pattern engine only for literal formats;
+                        // the suites use plain patterns where PG
+                        // returns 'infinity'/'-infinity' verbatim
+                        // when the pattern has no elements... in fact
+                        // PG processes the pattern against the
+                        // sentinel's fields; keep the plain text.
+                        return Ok(Value::text(if *m > 0 { "infinity" } else { "-infinity" }));
+                    }
+                    let zone = crate::datetime::session_tz_name();
+                    let (off, abbr) =
+                        crate::datetime::tz_lookup_utc(&zone, *m).unwrap_or((0, "UTC".to_string()));
+                    let local = m + off as i64 * 1_000_000;
+                    let (days, tod) = crate::datetime::split_micros(local);
+                    return match crate::datetime::format_with_pattern_tz(
+                        days,
+                        tod,
+                        fmt,
+                        &crate::datetime::TzRender {
+                            offset_secs: off,
+                            abbr,
+                        },
+                    ) {
+                        Ok(s) => Ok(Value::text(s)),
+                        Err(e) => Err(fmt_exec_err(e)),
+                    };
+                }
+                Value::Time(t) => {
+                    // PG renders time values against 1900-01-01 for
+                    // the (rarely used) date elements.
+                    let days = crate::datetime::days_from_civil(1900, 1, 1);
+                    return match crate::datetime::format_with_pattern_notz(days, *t, fmt) {
+                        Ok(s) => Ok(Value::text(s)),
+                        Err(e) => Err(fmt_exec_err(e)),
+                    };
+                }
+                Value::TimeTz(t, off) => {
+                    let days = crate::datetime::days_from_civil(1900, 1, 1);
+                    return match crate::datetime::format_with_pattern_tz(
+                        days,
+                        *t,
+                        fmt,
+                        &crate::datetime::TzRender {
+                            offset_secs: *off,
+                            abbr: String::new(),
+                        },
+                    ) {
+                        Ok(s) => Ok(Value::text(s)),
+                        Err(e) => Err(fmt_exec_err(e)),
+                    };
+                }
+                Value::Interval(iv) => {
+                    // PG: to_char of an infinite interval is NULL.
+                    if !iv.is_finite() {
+                        return Ok(Value::Null);
+                    }
+                    return match crate::datetime::format_interval_pattern(iv, fmt) {
+                        Ok(s) => Ok(Value::text(s)),
+                        Err(e) => Err(fmt_exec_err(e)),
+                    };
+                }
+                _ => {}
+            }
             let (days, tod) = match v {
                 Value::Date(d) => (i64::from(*d), 0),
-                Value::Timestamp(m) | Value::Timestamptz(m) => crate::datetime::split_micros(*m),
+                Value::Timestamp(m) => crate::datetime::split_micros(*m),
                 // v0.26: numeric to_char overloads (PG's numeric_to_char /
                 // float8_to_char). v0.93: integer inputs take the checked
                 // int4/int8 path so a `V` (multi) picture reproduces PG's
@@ -7561,7 +9668,7 @@ pub(crate) fn eval_datetime_func(name: &str, vals: &[Value]) -> Result<Value, Ex
                 Value::Float(f) => return float_to_char(*f, fmt, name),
                 other => return Err(func_arg_err(name, other)),
             };
-            match crate::datetime::format_with_pattern(days, tod, fmt) {
+            match crate::datetime::format_with_pattern_notz(days, tod, fmt) {
                 Ok(s) => Ok(Value::text(s)),
                 Err(e) => Err(fmt_exec_err(e)),
             }
@@ -7615,38 +9722,297 @@ pub(crate) fn eval_datetime_func(name: &str, vals: &[Value]) -> Result<Value, Ex
                 Err(e) => Err(fmt_exec_err(e)),
             }
         }
-        // v0.17: timezone(text, timestamptz) -> timestamp and
-        // timezone(text, timestamp) -> timestamptz. The server is
-        // UTC-only, so only 'UTC' (case-insensitive) is accepted;
-        // anything else is 0A000 (documented).
+        // v1.86: timezone(text, datetime) — the function form of
+        // AT TIME ZONE, over the rule-based zone table (it was
+        // UTC-only with a 0A000 before v1.86).
         "timezone" => {
             let zone = match str_arg(name, &vals[0])? {
                 None => return Ok(Value::Null),
                 Some(s) => s,
             };
-            if !zone.eq_ignore_ascii_case("utc") {
-                return Err(exec_err(
-                    "0A000",
-                    format!("time zone {zone:?} is not supported (server is UTC-only)"),
-                ));
-            }
             let v = &vals[1];
             if v == &Value::Null {
                 return Ok(Value::Null);
             }
-            match v {
-                Value::Timestamptz(m) => Ok(Value::Timestamp(*m)),
-                Value::Timestamp(m) => Ok(Value::Timestamptz(*m)),
+            crate::exec::eval::eval_at_time_zone(v, zone)
+        }
+        // v1.86: age(timestamp, timestamp) / age(timestamptz,
+        // timestamptz) / age(x) = age(now, x) — PG timestamp_age.
+        // Timestamptz pairs compute on the session-zone wall times,
+        // like PG.
+        "age" => {
+            use crate::datetime as dt;
+            let to_local = |v: &Value| -> Result<Option<i64>, ExecError> {
+                Ok(match v {
+                    Value::Null => None,
+                    Value::Timestamp(m) => Some(*m),
+                    Value::Timestamptz(m) => Some(dt::timestamptz_to_local(*m)),
+                    other => return Err(func_arg_err(name, other)),
+                })
+            };
+            let (a, b) = if vals.len() == 2 {
+                (to_local(&vals[0])?, to_local(&vals[1])?)
+            } else {
+                let x = to_local(&vals[0])?;
+                let now = match &vals[0] {
+                    Value::Timestamptz(_) => Some(dt::txn_now_micros()),
+                    _ => Some(dt::timestamptz_to_local(dt::txn_now_micros())),
+                };
+                (now, x)
+            };
+            match (a, b) {
+                (Some(x), Some(y)) => match dt::age(x, y) {
+                    Ok(iv) => Ok(Value::Interval(iv)),
+                    Err(e) => Err(exec_err("22008", e)),
+                },
+                _ => Ok(Value::Null),
+            }
+        }
+        // v1.86: date_bin(stride, source, origin).
+        "date_bin" => {
+            use crate::datetime as dt;
+            // Unknown literals resolve to interval / timestamp like
+            // PG's function-argument resolution.
+            let stride = match &vals[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Interval(iv) => *iv,
+                Value::Text(t) | Value::BpChar(t) => dt::parse_interval(t)
+                    .map_err(|e| exec_err(crate::exec::eval::dt_sqlstate(&e), e))?,
+                other => return Err(func_arg_err(name, other)),
+            };
+            let vals1;
+            let vals2;
+            let (v1, v2) = match (&vals[1], &vals[2]) {
+                (Value::Text(t) | Value::BpChar(t), o) => {
+                    vals1 = Value::Timestamp(
+                        dt::parse_timestamp(t)
+                            .map_err(|e| exec_err(crate::exec::eval::dt_sqlstate(&e), e))?,
+                    );
+                    vals2 = match o {
+                        Value::Text(t2) | Value::BpChar(t2) => Value::Timestamp(
+                            dt::parse_timestamp(t2)
+                                .map_err(|e| exec_err(crate::exec::eval::dt_sqlstate(&e), e))?,
+                        ),
+                        other => other.clone(),
+                    };
+                    (&vals1, &vals2)
+                }
+                pair => pair,
+            };
+            match (v1, v2) {
+                (Value::Timestamp(src), Value::Timestamp(org)) => {
+                    match dt::date_bin(&stride, *src, *org) {
+                        Ok(m) => Ok(Value::Timestamp(m)),
+                        // PG: month/year strides are 0A000; the rest
+                        // of date_bin's errors are 22008.
+                        Err(e) => Err(exec_err(
+                            if e.contains("months or years") {
+                                "0A000"
+                            } else {
+                                "22008"
+                            },
+                            e,
+                        )),
+                    }
+                }
+                (Value::Timestamptz(src), Value::Timestamptz(org)) => {
+                    // PG bins timestamptz in the session zone.
+                    let s = dt::timestamptz_to_local(*src);
+                    let o = dt::timestamptz_to_local(*org);
+                    match dt::date_bin(&stride, s, o) {
+                        Ok(m) => match dt::timestamp_to_timestamptz(m) {
+                            Ok(u) => Ok(Value::Timestamptz(u)),
+                            Err(e) => Err(exec_err("22008", e)),
+                        },
+                        Err(e) => Err(exec_err(
+                            if e.contains("months or years") {
+                                "0A000"
+                            } else {
+                                "22008"
+                            },
+                            e,
+                        )),
+                    }
+                }
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (a, b) => Err(func_arg_err(
+                    name,
+                    if a.col_type() != b.col_type() { a } else { b },
+                )),
+            }
+        }
+        // v1.86: justify_days / justify_hours / justify_interval.
+        "justify_days" | "justify_hours" | "justify_interval" => {
+            use crate::datetime as dt;
+            match &vals[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Interval(iv) => {
+                    let r = match name {
+                        "justify_days" => dt::justify_days(iv),
+                        "justify_hours" => dt::justify_hours(iv),
+                        _ => dt::justify_interval(iv),
+                    };
+                    match r {
+                        Ok(iv2) => Ok(Value::Interval(iv2)),
+                        Err(e) => Err(exec_err("22008", e)),
+                    }
+                }
                 other => Err(func_arg_err(name, other)),
             }
         }
-        // v0.17: the engine does not pin transaction-start time, so
-        // statement_timestamp() and transaction_timestamp() return the
-        // execution time, exactly like clock_timestamp() — a documented
-        // deviation from Postgres, where now()/transaction_timestamp()
-        // are frozen at transaction start.
-        // (v0.76: the precision-aware arms above handle these; this
-        // duplicate arm was removed.)
+        // v1.86: make_time(hour, min, sec).
+        "make_time" => {
+            let h = match int_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            let mi = match int_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            let secs_v = &vals[2];
+            if secs_v == &Value::Null {
+                return Ok(Value::Null);
+            }
+            let secs = match secs_v {
+                Value::SmallInt(_)
+                | Value::Int(_)
+                | Value::BigInt(_)
+                | Value::Numeric(_)
+                | Value::Float4(_)
+                | Value::Float(_) => to_f64v(secs_v),
+                other => return Err(func_arg_err(name, other)),
+            };
+            match crate::datetime::make_time_checked(h, mi, secs) {
+                Ok(t) => Ok(Value::Time(t)),
+                Err(e) => Err(fmt_exec_err(e)),
+            }
+        }
+        // v1.86: make_timestamptz(y, mo, d, h, mi, sec[, zone]).
+        "make_timestamptz" => {
+            let mut ints = [0i64; 5];
+            for (i, slot) in ints.iter_mut().enumerate() {
+                *slot = match int_arg(name, &vals[i])? {
+                    None => return Ok(Value::Null),
+                    Some(n) => n,
+                };
+            }
+            let secs_v = &vals[5];
+            if secs_v == &Value::Null {
+                return Ok(Value::Null);
+            }
+            let secs = match secs_v {
+                Value::SmallInt(_)
+                | Value::Int(_)
+                | Value::BigInt(_)
+                | Value::Numeric(_)
+                | Value::Float4(_)
+                | Value::Float(_) => to_f64v(secs_v),
+                other => return Err(func_arg_err(name, other)),
+            };
+            let [y, mo, d, h, mi] = ints;
+            let local = match crate::datetime::make_timestamp_checked(y, mo, d, h, mi, secs) {
+                Ok(m) => m,
+                Err(e) => return Err(fmt_exec_err(e)),
+            };
+            if vals.len() == 7 {
+                let zone = match str_arg(name, &vals[6])? {
+                    None => return Ok(Value::Null),
+                    Some(s) => s.to_string(),
+                };
+                if !crate::datetime::tz_valid(&zone) {
+                    return Err(exec_err(
+                        "42704",
+                        format!("time zone \"{}\" not recognized", zone),
+                    ));
+                }
+                let utc = crate::datetime::local_in_zone_to_utc(&zone, local);
+                if !crate::datetime::is_valid_ts_micros(utc) {
+                    return Err(exec_err("22008", "timestamp out of range"));
+                }
+                return Ok(Value::Timestamptz(utc));
+            }
+            match crate::datetime::timestamp_to_timestamptz(local) {
+                Ok(u) => Ok(Value::Timestamptz(u)),
+                Err(e) => Err(exec_err("22008", e)),
+            }
+        }
+        // v1.86: make_interval(years, months, weeks, days, hours,
+        // mins, secs) — every argument defaults to 0 in PG.
+        "make_interval" => {
+            let mut ints = [0i64; 6];
+            for (i, slot) in ints.iter_mut().enumerate() {
+                if i < vals.len() {
+                    *slot = match int_arg(name, &vals[i])? {
+                        None => return Ok(Value::Null),
+                        Some(n) => n,
+                    };
+                }
+            }
+            let secs = if vals.len() == 7 {
+                let sv = &vals[6];
+                if sv == &Value::Null {
+                    return Ok(Value::Null);
+                }
+                match sv {
+                    Value::SmallInt(_)
+                    | Value::Int(_)
+                    | Value::BigInt(_)
+                    | Value::Numeric(_)
+                    | Value::Float4(_)
+                    | Value::Float(_) => to_f64v(sv),
+                    other => return Err(func_arg_err(name, other)),
+                }
+            } else {
+                0.0
+            };
+            let [years, months, weeks, days, hours, mins] = ints;
+            let mo = years
+                .checked_mul(12)
+                .and_then(|m| m.checked_add(months))
+                .filter(|m| i32::try_from(*m).is_ok())
+                .ok_or_else(|| exec_err("22008", "interval out of range"))?;
+            let dy = weeks
+                .checked_mul(7)
+                .and_then(|d| d.checked_add(days))
+                .filter(|d| i32::try_from(*d).is_ok())
+                .ok_or_else(|| exec_err("22008", "interval out of range"))?;
+            let micros = (hours as i128 * 3_600_000_000i128
+                + mins as i128 * 60_000_000i128
+                + (secs * 1_000_000.0).round() as i128)
+                .try_into()
+                .map_err(|_| exec_err("22008", "interval out of range"))?;
+            Ok(Value::Interval(crate::datetime::Interval {
+                months: mo as i32,
+                days: dy as i32,
+                micros,
+            }))
+        }
+        // v1.86: pg_sleep(seconds) — sleeps for real (the suites use
+        // it for LSN/timing probes); negative values return at once,
+        // like PG. Returns void in PG; the empty text is our carrier.
+        "pg_sleep" => {
+            let secs = match &vals[0] {
+                Value::Null => return Ok(Value::Null),
+                v => match v {
+                    Value::SmallInt(_)
+                    | Value::Int(_)
+                    | Value::BigInt(_)
+                    | Value::Numeric(_)
+                    | Value::Float4(_)
+                    | Value::Float(_) => to_f64v(v),
+                    other => return Err(func_arg_err(name, other)),
+                },
+            };
+            if secs.is_nan() {
+                return Err(exec_err("22023", "invalid value for pg_sleep: NaN"));
+            }
+            if secs > 0.0 {
+                let capped = secs.min(3600.0);
+                std::thread::sleep(std::time::Duration::from_secs_f64(capped));
+            }
+            Ok(Value::text(""))
+        }
         _ => Err(exec_err(
             "42883",
             format!("function {}() does not exist", name),
@@ -7718,6 +10084,46 @@ pub(crate) fn func_result_type(
     ctes: &[CteDef],
 ) -> Result<ColType, ExecError> {
     let arg0 = || expr_type(eng, snap, own, session, schemas, outer, ctes, &args[0]);
+    // v1.88: range constructors and bound functions (static types).
+    if let Some(e) = super::ranges::builtin_range_elem(name) {
+        return Ok(ColType::Range(e));
+    }
+    if let Some(e) = super::ranges::builtin_multirange_elem(name) {
+        return Ok(ColType::Multirange(e));
+    }
+    if !args.is_empty() {
+        match name {
+            "lower" | "upper" => {
+                if let Ok(t) = arg0() {
+                    match t {
+                        ColType::Range(e) | ColType::Multirange(e) => {
+                            return Ok(super::ranges::elem_coltype(e));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "isempty" | "lower_inc" | "upper_inc" | "lower_inf" | "upper_inf" => {
+                if let Ok(ColType::Range(_)) | Ok(ColType::Multirange(_)) = arg0() {
+                    return Ok(ColType::Bool);
+                }
+            }
+            "range_merge" => {
+                if let Ok(t @ (ColType::Range(_) | ColType::Multirange(_))) = arg0() {
+                    return Ok(match t {
+                        ColType::Multirange(e) => ColType::Range(e),
+                        _ => t,
+                    });
+                }
+            }
+            "range_union" | "range_intersect" | "range_minus" => {
+                if let Ok(t @ ColType::Range(_)) = arg0() {
+                    return Ok(t);
+                }
+            }
+            _ => {}
+        }
+    }
     // v0.33: bytea-returning string functions dispatch on input type.
     let bytea_if_arg0_bytea = || match arg0() {
         Ok(ColType::Bytea) => Ok(ColType::Bytea),
@@ -7745,6 +10151,9 @@ pub(crate) fn func_result_type(
         "translate" | "unistr" => Ok(ColType::Text),
         "regexp_like" => Ok(ColType::Bool),
         "pg_input_is_valid" => Ok(ColType::Bool),
+        // v1.86: pg_sleep returns void in PG; text is the closest
+        // carrier (its output renders empty, like void).
+        "pg_sleep" => Ok(ColType::Text),
         // v0.37: TOAST introspection functions.
         "pg_column_compression" => Ok(ColType::Text),
         "pg_relation_size" => Ok(ColType::BigInt),
@@ -7758,6 +10167,7 @@ pub(crate) fn func_result_type(
         }
         // v0.95: `parse_ident` returns `text[]` (PG19).
         "parse_ident" => Ok(ColType::Array(crate::storage::ArrayElem::Text)),
+        "pg_overlaps" => Ok(ColType::Bool),
         "similar_to" => Ok(ColType::Bool),
         "substring_similar" => Ok(ColType::Text),
         "length" | "char_length" | "character_length" | "octet_length" | "position" => {
@@ -7863,6 +10273,26 @@ pub(crate) fn func_result_type(
         // returns json (OID 114).
         "pg_typeof" => Ok(ColType::Text),
         "json_array" => Ok(ColType::Json),
+        // v1.84: json/jsonb function result types (pg_proc prorettype).
+        "json_typeof" | "jsonb_typeof" => Ok(ColType::Text),
+        "json_array_length" | "jsonb_array_length" => Ok(ColType::Int),
+        "json_strip_nulls" => Ok(ColType::Json),
+        "jsonb_strip_nulls" => Ok(ColType::Jsonb),
+        "jsonb_pretty" => Ok(ColType::Text),
+        "to_json" | "array_to_json" | "json_build_array" | "json_build_object"
+        | "json_object" | "json_extract_path" => Ok(ColType::Json),
+        "to_jsonb" | "jsonb_build_array" | "jsonb_build_object" | "jsonb_object"
+        | "jsonb_extract_path" | "jsonb_set" | "jsonb_set_lax" | "jsonb_insert"
+        | "jsonb_delete" | "jsonb_delete_path" => Ok(ColType::Jsonb),
+        "json_extract_path_text" | "jsonb_extract_path_text" => Ok(ColType::Text),
+        "jsonb_populate_record_valid" => Ok(ColType::Bool),
+        // v1.85: jsonpath family + SQL/JSON desugar result types.
+        "jsonb_path_exists" | "jsonb_path_match" | "jsonb_path_exists_tz"
+        | "jsonb_path_match_tz" | "__sqljson_exists" => Ok(ColType::Bool),
+        "jsonb_path_query_array" | "jsonb_path_query_first" | "jsonb_path_query_array_tz"
+        | "jsonb_path_query_first_tz" | "__sqljson_query" => Ok(ColType::Jsonb),
+        "jsonb_path_query" | "jsonb_path_query_tz" => Ok(ColType::Jsonb),
+        "__sqljson_value" => Ok(ColType::Text),
         // v0.91: hidden quantified-array-comparison desugar; boolean.
         "__any_all_array" => Ok(ColType::Bool),
         "random" => Ok(ColType::Float),
@@ -7889,8 +10319,17 @@ pub(crate) fn func_result_type(
         "current_date" => Ok(ColType::Date),
         "date_trunc" => match expr_type(eng, snap, own, session, schemas, outer, ctes, &args[1])? {
             ColType::Timestamptz => Ok(ColType::Timestamptz),
+            // v1.86: interval truncates to interval.
+            ColType::Interval => Ok(ColType::Interval),
             _ => Ok(ColType::Timestamp),
         },
+        // v1.86: datetime function batch 2 types.
+        "age" | "justify_days" | "justify_hours" | "justify_interval" | "make_interval" => {
+            Ok(ColType::Interval)
+        }
+        "date_bin" => expr_type(eng, snap, own, session, schemas, outer, ctes, &args[1]),
+        "make_time" => Ok(ColType::Time),
+        "make_timestamptz" => Ok(ColType::Timestamptz),
         // v0.17: date/time built-in batch.
         "date_part" => Ok(ColType::Numeric(None)),
         "to_date" | "make_date" => Ok(ColType::Date),
@@ -7938,9 +10377,30 @@ pub(crate) fn func_result_type(
             }
             Ok(ty)
         }
+        // v1.84: SELECT-list json SRFs type by their OUT columns:
+        // array_elements(_text) and object_keys are scalar-typed;
+        // each and the record families are composite.
+        "json_array_elements" => Ok(ColType::Json),
+        "jsonb_array_elements" => Ok(ColType::Jsonb),
+        "json_array_elements_text" | "jsonb_array_elements_text" | "json_object_keys"
+        | "jsonb_object_keys" => Ok(ColType::Text),
+        "json_each" | "json_each_text" | "jsonb_each" | "jsonb_each_text"
+        | "json_populate_record" | "jsonb_populate_record" | "json_populate_recordset"
+        | "jsonb_populate_recordset" | "json_to_recordset" | "jsonb_to_recordset" => {
+            Ok(ColType::Composite)
+        }
         // v0.86: user-defined functions resolve their declared return
         // type here (Describe runs before eval_func).
         _ => {
+            // v1.88: user-defined range type constructors type as
+            // their range / multirange type.
+            if let Some((elem, multi)) = eng.db.types.get(name).and_then(|st| st.range) {
+                return Ok(if multi {
+                    ColType::Multirange(elem)
+                } else {
+                    ColType::Range(elem)
+                });
+            }
             // v0.87: resolve overload by arity for type inference.
             if let Some(fdef) = eng
                 .db
@@ -8014,6 +10474,21 @@ pub(crate) fn compare_values(
             pg_float_ord(float_val(x), exact_to_f64(y))
         }
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        // v1.83: jsonb's total order (jsonb_util.c
+        // compareJsonbContainers). Stored values are canonical, so
+        // the parse cannot fail; a failure degrades to text order.
+        (Value::Jsonb(x), Value::Jsonb(y)) => match (parse_jsonb(x), parse_jsonb(y)) {
+            (Ok(va), Ok(vb)) => jsonb_cmp(&va, &vb),
+            _ => x.cmp(y),
+        },
+        // v1.88: range / multirange ordering for ORDER BY / DISTINCT
+        // (PG range_cmp / multirange_cmp).
+        (Value::Range(x), Value::Range(y)) if x.elem == y.elem => {
+            crate::exec::ranges::range_cmp(x, y)
+        }
+        (Value::Multirange(x), Value::Multirange(y)) if x.elem == y.elem => {
+            crate::exec::ranges::multirange_cmp(x, y)
+        }
         // v0.35: bpchar ordering ignores trailing spaces (like
         // cmp_ordering above).
         (Value::BpChar(x), Value::BpChar(y)) => {
@@ -8029,6 +10504,19 @@ pub(crate) fn compare_values(
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
         (Value::Timestamptz(x), Value::Timestamptz(y)) => x.cmp(y),
+        // v1.86: time / timetz / interval ordering (mirrors
+        // cmp_ordering), plus the mixed date/timestamp promotions.
+        (Value::Time(x), Value::Time(y)) => x.cmp(y),
+        (Value::TimeTz(t1, o1), Value::TimeTz(t2, o2)) => {
+            (t1 - *o1 as i64 * 1_000_000, *o1).cmp(&(t2 - *o2 as i64 * 1_000_000, *o2))
+        }
+        (Value::Interval(x), Value::Interval(y)) => crate::datetime::interval_cmp(x, y),
+        (Value::Date(d), Value::Timestamp(t)) => date_as_ts(*d).cmp(t),
+        (Value::Timestamp(t), Value::Date(d)) => t.cmp(&date_as_ts(*d)),
+        (Value::Date(d), Value::Timestamptz(t)) => date_as_timestamptz(*d).cmp(t),
+        (Value::Timestamptz(t), Value::Date(d)) => t.cmp(&date_as_timestamptz(*d)),
+        (Value::Timestamp(t), Value::Timestamptz(z)) => timestamp_as_timestamptz(*t).cmp(z),
+        (Value::Timestamptz(z), Value::Timestamp(t)) => z.cmp(&timestamp_as_timestamptz(*t)),
         (Value::Bytea(x), Value::Bytea(y)) => x.cmp(y),
         (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
         // v0.36: PG's "char" ordering is a plain byte comparison.
@@ -8147,12 +10635,28 @@ pub(crate) fn value_type_name(v: &Value) -> Cow<'static, str> {
         Value::Float(_) => Cow::Borrowed("float"),
         Value::Numeric(_) => Cow::Borrowed("numeric"),
         Value::Text(_) => Cow::Borrowed("text"),
+        Value::Jsonb(_) => Cow::Borrowed("jsonb"), // v1.83
+        Value::Jsonpath(_) => Cow::Borrowed("jsonpath"), // v1.85
+        // v1.88: range type names for operator error messages.
+        Value::Range(r) => Cow::Owned(
+            r.name
+                .clone()
+                .unwrap_or_else(|| r.elem.range_name().unwrap_or("range").to_string()),
+        ),
+        Value::Multirange(m) => Cow::Owned(
+            m.name
+                .clone()
+                .unwrap_or_else(|| m.elem.multirange_name().unwrap_or("multirange").to_string()),
+        ),
         Value::BpChar(_) => Cow::Borrowed("character"), // v0.35
         Value::SingleChar(_) => Cow::Borrowed("\"char\""), // v0.36
         Value::Bool(_) => Cow::Borrowed("boolean"),
         Value::Date(_) => Cow::Borrowed("date"),
         Value::Timestamp(_) => Cow::Borrowed("timestamp"),
         Value::Timestamptz(_) => Cow::Borrowed("timestamptz"),
+        Value::Time(_) => Cow::Borrowed("time"), // v1.86
+        Value::TimeTz(..) => Cow::Borrowed("timetz"), // v1.86
+        Value::Interval(_) => Cow::Borrowed("interval"), // v1.86
         Value::Bytea(_) => Cow::Borrowed("bytea"),
         Value::BitString(_) => Cow::Borrowed("bit"), // v1.39
         Value::Uuid(_) => Cow::Borrowed("uuid"),

@@ -665,6 +665,125 @@ pub(crate) fn pg_input_validate_numeric_typmod(input: &str, t: &str) -> Result<(
     Ok(())
 }
 
+/// v1.87: map a crate datetime parser error onto PG's `pg_input`
+/// error for the type (PG19 datetime_in / DecodeDateTime error
+/// selection). `pgname` is the display name used in PG messages
+/// ("date", "timestamp", "timestamp with time zone", "time",
+/// "time with time zone", "interval").
+fn pg_input_datetime_err(input: &str, pgname: &str, e: String) -> PgInputFailure {
+    let soft = |code: &'static str, message: String| {
+        PgInputFailure::Soft(PgInputError::soft(code, message))
+    };
+    // Zone recognition failures: PG lowercases the zone name in the
+    // message and uses 22023 (ERRCODE_INVALID_PARAMETER_VALUE via
+    // SelectTimeZone / check_timezone).
+    if e.contains("not recognized") {
+        if let Some(z) = e.split('"').nth(1) {
+            return soft(
+                "22023",
+                format!("time zone \"{}\" not recognized", z.to_ascii_lowercase()),
+            );
+        }
+    }
+    if let Some(rest) = e.strip_prefix("date/time field value out of range:") {
+        let _ = rest;
+        // PG distinguishes a structurally valid ISO date whose year is
+        // beyond the type's range: `<type> out of range: "<input>"`.
+        if let Some(msg) = datetime_year_out_of_range(input, pgname) {
+            return soft("22008", msg);
+        }
+        return soft("22008", e);
+    }
+    if e == "timestamp out of range" || e == "timestamp with time zone out of range" {
+        return soft("22008", format!("{pgname} out of range: \"{input}\""));
+    }
+    if e == "interval out of range" {
+        return soft("22008", e);
+    }
+    if e.starts_with("invalid input syntax for type") {
+        return soft("22007", e);
+    }
+    if e.contains("out of range") || e.contains("overflow") {
+        return soft("22008", e);
+    }
+    soft(
+        "22007",
+        format!("invalid input syntax for type {pgname}: \"{input}\""),
+    )
+}
+
+/// If `input` begins with an ISO date (YYYY-MM-DD) whose fields are
+/// individually valid but whose year is outside the PG range for the
+/// type, produce PG's `<type> out of range: "<input>"` message.
+fn datetime_year_out_of_range(input: &str, pgname: &str) -> Option<String> {
+    let s = input.trim();
+    let bytes = s.as_bytes();
+    let neg = bytes.first() == Some(&b'-');
+    let start = if neg { 1 } else { 0 };
+    let dash = s[start..].find('-')? + start;
+    let year_txt = &s[start..dash];
+    if year_txt.is_empty() || !year_txt.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let year: i64 = year_txt.parse().ok()?;
+    let year = if neg { -year } else { year };
+    let rest = &s[dash + 1..];
+    let rb = rest.as_bytes();
+    if rb.len() < 5
+        || !rb[0].is_ascii_digit()
+        || !rb[1].is_ascii_digit()
+        || rb[2] != b'-'
+        || !rb[3].is_ascii_digit()
+        || !rb[4].is_ascii_digit()
+    {
+        return None;
+    }
+    let month: i64 = rest[0..2].parse().ok()?;
+    let day: i64 = rest[3..5].parse().ok()?;
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let dim = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ][(month - 1) as usize];
+    if day < 1 || day > dim {
+        return None;
+    }
+    let max_year = if pgname == "date" { 5874897 } else { 294276 };
+    if year > max_year || year < -4713 {
+        return Some(format!("{pgname} out of range: \"{input}\""));
+    }
+    None
+}
+
+/// v1.87: `bit(n)` / `bit varying(n)` arm: parse the typmod (a malformed
+/// one is a hard 22023 from the type parser, like the char family).
+fn pg_input_bit_typmod(input: &str, t: &str, varying: bool) -> Result<(), PgInputFailure> {
+    let bad = || PgInputFailure::Hard(exec_err("22023", "invalid type modifier"));
+    let open = t.find('(').ok_or_else(bad)?;
+    let close = t.rfind(')').ok_or_else(bad)?;
+    if close < open || !t[close + 1..].trim().is_empty() {
+        return Err(bad());
+    }
+    let n: i64 = t[open + 1..close].trim().parse().map_err(|_| bad())?;
+    if n < 0 {
+        return Err(bad());
+    }
+    super::pg_input::pg_input_validate_bit(input, Some(n as i32), varying)
+}
+
 /// v0.43: shared input-validation core for `pg_input_is_valid` and
 /// `pg_input_error_info` (PG19 misc.c `pg_input_is_valid_common`). Runs the
 /// type's input function against `input`; `Ok(())` = valid input. The type
@@ -710,6 +829,26 @@ pub(crate) fn pg_input_validate(
             }
         })
     };
+    // v1.87: array types — parse the suffix structure once and validate
+    // element-wise through the shared array parser in pg_input.rs.
+    {
+        let parts = super::pg_input::parse_type_name(typ);
+        if parts.array_depth > 0 {
+            let mut elem = parts.base.clone();
+            if let Some(tm) = &parts.typmod {
+                elem.push('(');
+                elem.push_str(tm);
+                elem.push(')');
+            }
+            for _ in 1..parts.array_depth {
+                elem.push_str("[]");
+            }
+            if parts.base_quoted && parts.base == "char" {
+                elem = "\"char\"".to_string();
+            }
+            return super::pg_input::pg_input_validate_array(fn_name, input, &elem);
+        }
+    }
     match typ.to_ascii_lowercase().as_str() {
         "bytea" => crate::storage::parse_bytea(input).map(|_| ()).map_err(|e| {
             use crate::storage::ByteaParseError;
@@ -756,6 +895,121 @@ pub(crate) fn pg_input_validate(
         t if t.starts_with("numeric(") || t.starts_with("decimal(") => {
             pg_input_validate_numeric_typmod(input, t)
         }
+        // v1.86/v1.87: the datetime family validates through the same
+        // parsers as the casts; pg_input_datetime_err maps the crate
+        // error onto PG's message/code choice (22007 syntax, 22008
+        // range, 22023 unknown zone, `<type> out of range`).
+        "date" => crate::datetime::parse_date(input)
+            .map(|_| ())
+            .map_err(|e| pg_input_datetime_err(input, "date", e)),
+        "timestamp" | "timestamp without time zone" => crate::datetime::parse_timestamp(input)
+            .map(|_| ())
+            .map_err(|e| pg_input_datetime_err(input, "timestamp", e)),
+        "timestamptz" | "timestamp with time zone" => crate::datetime::parse_timestamptz(input)
+            .map(|_| ())
+            .map_err(|e| pg_input_datetime_err(input, "timestamp with time zone", e)),
+        "time" | "time without time zone" => crate::datetime::parse_time(input)
+            .map(|_| ())
+            .map_err(|e| pg_input_datetime_err(input, "time", e)),
+        "timetz" | "time with time zone" => crate::datetime::parse_timetz(input)
+            .map(|_| ())
+            .map_err(|e| pg_input_datetime_err(input, "time with time zone", e)),
+        "interval" => crate::datetime::parse_interval(input)
+            .map(|_| ())
+            .map_err(|e| pg_input_datetime_err(input, "interval", e)),
+        // v1.87: the remaining builtin families, validated by the
+        // dedicated ports in pg_input.rs.
+        "text" | "name" => Ok(()),
+        "oid" => super::pg_input::pg_input_validate_uint(input, 32, "oid"),
+        "oid8" => super::pg_input::pg_input_validate_uint(input, 64, "oid8"),
+        "xid" => super::pg_input::pg_input_validate_uint(input, 32, "xid"),
+        "xid8" => super::pg_input::pg_input_validate_uint(input, 64, "xid8"),
+        "oidvector" => super::pg_input::pg_input_validate_oidvector(input),
+        "bit" => super::pg_input::pg_input_validate_bit(input, None, false),
+        "bit varying" | "varbit" => super::pg_input::pg_input_validate_bit(input, None, true),
+        t if t.starts_with("bit(") => pg_input_bit_typmod(input, t, false),
+        t if t.starts_with("bit varying(") || t.starts_with("varbit(") => {
+            pg_input_bit_typmod(input, t, true)
+        }
+        "point" | "box" | "circle" | "line" | "lseg" | "path" | "polygon" => {
+            let name = typ.to_ascii_lowercase();
+            super::pg_input::pg_input_validate_geometry(input, name.trim())
+        }
+        "inet" => super::pg_input::pg_input_validate_network(input, false),
+        "cidr" => super::pg_input::pg_input_validate_network(input, true),
+        "macaddr" => super::pg_input::pg_input_validate_macaddr(input, false),
+        "macaddr8" => super::pg_input::pg_input_validate_macaddr(input, true),
+        "money" => super::pg_input::pg_input_validate_money(input),
+        "uuid" => super::pg_input::pg_input_validate_uuid(input),
+        "tid" => super::pg_input::pg_input_validate_tid(input),
+        "pg_lsn" => super::pg_input::pg_input_validate_pg_lsn(input),
+        "pg_snapshot" | "txid_snapshot" => super::pg_input::pg_input_validate_pg_snapshot(input),
+        "json" => super::pg_input::pg_input_validate_json(input, false),
+        "jsonb" => super::pg_input::pg_input_validate_json(input, true),
+        "jsonpath" => super::pg_input::pg_input_validate_jsonpath(input),
+        "xml" => super::pg_input::pg_input_validate_xml(input),
+        "tsvector" => super::pg_input::pg_input_validate_tsvector(input),
+        "tsquery" => super::pg_input::pg_input_validate_tsquery(input),
+        "pg_ndistinct" => super::pg_input::pg_input_validate_ndistinct(input),
+        "pg_dependencies" => super::pg_input::pg_input_validate_dependencies(input),
+        "int4range" => super::pg_input::pg_input_validate_range(
+            fn_name,
+            input,
+            super::pg_input::RangeKind::Int4,
+        ),
+        "int8range" => super::pg_input::pg_input_validate_range(
+            fn_name,
+            input,
+            super::pg_input::RangeKind::Int8,
+        ),
+        "daterange" => super::pg_input::pg_input_validate_range(
+            fn_name,
+            input,
+            super::pg_input::RangeKind::Date,
+        ),
+        "numrange" => super::pg_input::pg_input_validate_range(
+            fn_name,
+            input,
+            super::pg_input::RangeKind::Num,
+        ),
+        "tsrange" => {
+            super::pg_input::pg_input_validate_range(fn_name, input, super::pg_input::RangeKind::Ts)
+        }
+        "tstzrange" => super::pg_input::pg_input_validate_range(
+            fn_name,
+            input,
+            super::pg_input::RangeKind::Tstz,
+        ),
+        "int4multirange" => super::pg_input::pg_input_validate_multirange(
+            fn_name,
+            input,
+            super::pg_input::RangeKind::Int4,
+        ),
+        "int8multirange" => super::pg_input::pg_input_validate_multirange(
+            fn_name,
+            input,
+            super::pg_input::RangeKind::Int8,
+        ),
+        "datemultirange" => super::pg_input::pg_input_validate_multirange(
+            fn_name,
+            input,
+            super::pg_input::RangeKind::Date,
+        ),
+        "nummultirange" => super::pg_input::pg_input_validate_multirange(
+            fn_name,
+            input,
+            super::pg_input::RangeKind::Num,
+        ),
+        "tsmultirange" => super::pg_input::pg_input_validate_multirange(
+            fn_name,
+            input,
+            super::pg_input::RangeKind::Ts,
+        ),
+        "tstzmultirange" => super::pg_input::pg_input_validate_multirange(
+            fn_name,
+            input,
+            super::pg_input::RangeKind::Tstz,
+        ),
         // v0.35: character types with typmod, via the same blank-tolerant
         // input coercion as INSERT. A malformed typmod is 22023, like PG's
         // type parser (hard error, via `?`).
@@ -1085,6 +1339,42 @@ pub(crate) fn eval_cast_named(q: &mut Q, v: &Value, name: &str) -> Result<Value,
     if v == &Value::Null {
         return Ok(Value::Null);
     }
+    // v1.88: cast to a user-defined range / multirange type
+    // (CREATE TYPE ... AS RANGE registration in the type catalog).
+    if let Some((elem, multi)) = q.eng.db.types.get(name).and_then(|st| st.range) {
+        let tname = Some(name.to_string());
+        return match (multi, v) {
+            (false, Value::Text(t)) | (false, Value::BpChar(t)) => {
+                super::ranges::parse_range(elem, tname, t).map(Value::range)
+            }
+            (true, Value::Text(t)) | (true, Value::BpChar(t)) => {
+                super::ranges::parse_multirange(elem, tname, t).map(Value::multirange)
+            }
+            (false, Value::Range(r)) if r.elem == elem => {
+                let mut r = (**r).clone();
+                r.name = tname;
+                Ok(Value::range(r))
+            }
+            (true, Value::Range(r)) if r.elem == elem => {
+                let mut m = super::ranges::multi_from_range((**r).clone());
+                m.name = tname;
+                Ok(Value::multirange(m))
+            }
+            (true, Value::Multirange(m)) if m.elem == elem => {
+                let mut m = (**m).clone();
+                m.name = tname;
+                Ok(Value::multirange(m))
+            }
+            _ => Err(exec_err(
+                "42804",
+                format!(
+                    "cannot cast type {} to {}",
+                    v.type_name().to_lowercase(),
+                    name
+                ),
+            )),
+        };
+    }
     // v1.38: user-defined binary casts take precedence over the
     // composite path (a LIKE-defined target is not a composite).
     if let Some(casted) = apply_binary_cast(q, v, name)? {
@@ -1175,6 +1465,56 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
     }
     match to {
         ColType::Text => Ok(text_value_of(&[v])),
+        // v1.88: cast to a range type (PG range_in on text; a range of
+        // the same elem passes through; anything else is 42804).
+        ColType::Range(elem) => match v {
+            Value::Text(t) | Value::BpChar(t) => {
+                super::ranges::parse_range(elem, None, t).map(Value::range)
+            }
+            Value::Range(r) if r.elem == elem => Ok(v.clone()),
+            other => Err(exec_err(
+                "42804",
+                format!(
+                    "cannot cast type {} to {}",
+                    other.type_name().to_lowercase(),
+                    super::ranges::range_type_name(elem, &None)
+                ),
+            )),
+        },
+        // v1.88: cast to a multirange type (PG multirange_in on text;
+        // a single range wraps; same-elem multirange passes through).
+        ColType::Multirange(elem) => match v {
+            Value::Text(t) | Value::BpChar(t) => {
+                super::ranges::parse_multirange(elem, None, t).map(Value::multirange)
+            }
+            Value::Range(r) if r.elem == elem => Ok(Value::multirange(
+                super::ranges::multi_from_range((**r).clone()),
+            )),
+            Value::Multirange(m) if m.elem == elem => Ok(v.clone()),
+            other => Err(exec_err(
+                "42804",
+                format!(
+                    "cannot cast type {} to {}",
+                    other.type_name().to_lowercase(),
+                    super::ranges::multirange_type_name(elem, &None)
+                ),
+            )),
+        },
+        // v1.85: cast to jsonpath validates + normalizes through the
+        // jsonpath parser (PG's jsonpathin), error 22P02.
+        ColType::Jsonpath => match v {
+            Value::Text(t) | Value::BpChar(t) => {
+                let p = crate::exec::jsonpath::parse_jsonpath(t)?;
+                Ok(Value::jsonpath(crate::exec::jsonpath::render_jsonpath(&p)))
+            }
+            other => Err(exec_err(
+                "42804",
+                format!(
+                    "cannot cast type {} to jsonpath",
+                    other.type_name().to_lowercase()
+                ),
+            )),
+        },
         // v1.40: cast to tid (from text `(b,o)`, like PG's tidin).
         ColType::Tid => {
             // Identity: already a tid.
@@ -1374,40 +1714,124 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
             .and_then(|n| apply_numeric_typmod(n, tm))
             .map(Value::Numeric),
         ColType::Date => match v {
-            Value::Text(s) => crate::datetime::parse_date(s)
+            Value::Text(s) | Value::BpChar(s) => crate::datetime::parse_date(s)
                 .map(Value::Date)
-                .map_err(|e| exec_err("22P02", e)),
-            // Timestamps truncate to their UTC date (v0.7 is always UTC).
-            Value::Timestamp(m) | Value::Timestamptz(m) => {
-                Ok(Value::Date((m.div_euclid(86_400_000_000)) as i32))
+                .map_err(|e| exec_err(crate::exec::eval::dt_sqlstate(&e), e)),
+            // v1.86: timestamp -> date takes its (naive) date part;
+            // timestamptz -> date takes the date in the session zone
+            // (PG timestamp.c). Sentinels map to sentinels.
+            Value::Timestamp(m) => Ok(Value::Date(if *m == crate::datetime::TS_INFINITY {
+                crate::datetime::DATE_INFINITY
+            } else if *m == crate::datetime::TS_NEG_INFINITY {
+                crate::datetime::DATE_NEG_INFINITY
+            } else {
+                (m.div_euclid(86_400_000_000)) as i32
+            })),
+            Value::Timestamptz(m) => {
+                if *m == crate::datetime::TS_INFINITY {
+                    Ok(Value::Date(crate::datetime::DATE_INFINITY))
+                } else if *m == crate::datetime::TS_NEG_INFINITY {
+                    Ok(Value::Date(crate::datetime::DATE_NEG_INFINITY))
+                } else {
+                    Ok(Value::Date(
+                        crate::datetime::timestamptz_to_date(*m)
+                            .map_err(|e| exec_err("22008", e))?,
+                    ))
+                }
             }
             other => Err(cast_err(other, "date")),
         },
         ColType::Timestamp => match v {
-            Value::Text(s) => crate::datetime::parse_timestamp(s)
+            Value::Text(s) | Value::BpChar(s) => crate::datetime::parse_timestamp(s)
                 .map(Value::Timestamp)
-                .map_err(|e| exec_err("22P02", e)),
-            Value::Date(d) => (*d as i64)
-                .checked_mul(86_400_000_000)
-                .map(Value::Timestamp)
-                .ok_or_else(|| exec_err("22008", "datetime field overflow")),
-            // Timestamptz -> timestamp keeps the instant; v0.7 has no
-            // session timezone so this is the UTC wall-clock time.
-            Value::Timestamptz(m) => Ok(Value::Timestamp(*m)),
+                .map_err(|e| exec_err(crate::exec::eval::dt_sqlstate(&e), e)),
+            // v1.86: date -> timestamp is midnight; a finite date too
+            // large for a timestamp is 22008 (PG timestamp.c).
+            Value::Date(d) => {
+                if *d == crate::datetime::DATE_INFINITY {
+                    Ok(Value::Timestamp(crate::datetime::TS_INFINITY))
+                } else if *d == crate::datetime::DATE_NEG_INFINITY {
+                    Ok(Value::Timestamp(crate::datetime::TS_NEG_INFINITY))
+                } else {
+                    // v1.86: checked multiply — the plain product
+                    // overflowed i64 (debug panic) for extreme dates
+                    // like 2202020-10-05 before the range check ran.
+                    match (*d as i64).checked_mul(86_400_000_000) {
+                        Some(m) if crate::datetime::is_valid_ts_micros(m) => {
+                            Ok(Value::Timestamp(m))
+                        }
+                        _ => Err(exec_err("22008", "date out of range for timestamp")),
+                    }
+                }
+            }
+            // v1.86: timestamptz -> timestamp renders the instant in
+            // the session zone (PG timestamptz_timestamp).
+            Value::Timestamptz(m) => {
+                Ok(Value::Timestamp(crate::datetime::timestamptz_to_local(*m)))
+            }
+            // v1.86: date + time fields combine (PG date2timestamp via
+            // the + operator in the suites uses this cast path too).
+            Value::TimeTz(..) => Err(cast_err(v, "timestamp without time zone")),
             other => Err(cast_err(other, "timestamp without time zone")),
         },
         ColType::Timestamptz => match v {
-            Value::Text(s) => crate::datetime::parse_timestamptz(s)
+            Value::Text(s) | Value::BpChar(s) => crate::datetime::parse_timestamptz(s)
                 .map(Value::Timestamptz)
-                .map_err(|e| exec_err("22P02", e)),
-            Value::Date(d) => (*d as i64)
-                .checked_mul(86_400_000_000)
-                .map(Value::Timestamptz)
-                .ok_or_else(|| exec_err("22008", "datetime field overflow")),
-            // Timestamp -> timestamptz assumes UTC (documented: v0.7
-            // has no session timezone setting).
-            Value::Timestamp(m) => Ok(Value::Timestamptz(*m)),
+                .map_err(|e| exec_err(crate::exec::eval::dt_sqlstate(&e), e)),
+            // v1.86: date -> timestamptz is midnight in the session
+            // zone, range-checked like PG (the horology probe:
+            // '4714-11-24 BC'::date at UTC-2 is below the minimum).
+            Value::Date(d) => {
+                if *d == crate::datetime::DATE_INFINITY {
+                    Ok(Value::Timestamptz(crate::datetime::TS_INFINITY))
+                } else if *d == crate::datetime::DATE_NEG_INFINITY {
+                    Ok(Value::Timestamptz(crate::datetime::TS_NEG_INFINITY))
+                } else {
+                    Ok(Value::Timestamptz(
+                        crate::datetime::date_to_timestamptz(*d)
+                            .map_err(|e| exec_err("22008", e))?,
+                    ))
+                }
+            }
+            // v1.86: timestamp -> timestamptz interprets the naive
+            // wall time in the session zone (PG timestamp_timestamptz).
+            Value::Timestamp(m) => Ok(Value::Timestamptz(
+                crate::datetime::timestamp_to_timestamptz(*m).map_err(|e| exec_err("22008", e))?,
+            )),
             other => Err(cast_err(other, "timestamp with time zone")),
+        },
+        // v1.86: time without time zone (PG time.c).
+        ColType::Time => match v {
+            Value::Text(s) | Value::BpChar(s) => crate::datetime::parse_time(s)
+                .map(Value::Time)
+                .map_err(|e| exec_err(crate::exec::eval::dt_sqlstate(&e), e)),
+            Value::Timestamp(m) => Ok(Value::Time(crate::datetime::timestamp_time(*m))),
+            Value::Timestamptz(m) => Ok(Value::Time(crate::datetime::timestamptz_time(*m))),
+            Value::TimeTz(t, _) => Ok(Value::Time(*t)),
+            other => Err(cast_err(other, "time without time zone")),
+        },
+        // v1.86: time with time zone (PG timetzin / timetz casts).
+        ColType::TimeTz => match v {
+            Value::Text(s) | Value::BpChar(s) => crate::datetime::parse_timetz(s)
+                .map(|(t, o)| Value::TimeTz(t, o))
+                .map_err(|e| exec_err(crate::exec::eval::dt_sqlstate(&e), e)),
+            Value::Time(t) => {
+                let (off, _) =
+                    crate::datetime::tz_lookup_local(&crate::datetime::session_tz_name(), *t)
+                        .unwrap_or((0, String::new()));
+                Ok(Value::TimeTz(*t, off))
+            }
+            Value::Timestamptz(m) => crate::datetime::timestamptz_timetz(*m)
+                .map(|(t, o)| Value::TimeTz(t, o))
+                .map_err(|e| exec_err("22008", e)),
+            other => Err(cast_err(other, "time with time zone")),
+        },
+        // v1.86: interval (PG intervalin).
+        ColType::Interval => match v {
+            Value::Text(s) | Value::BpChar(s) => crate::datetime::parse_interval(s)
+                .map(Value::Interval)
+                .map_err(|e| exec_err(crate::exec::eval::dt_sqlstate(&e), e)),
+            other => Err(cast_err(other, "interval")),
         },
         ColType::Bytea => match v {
             Value::Text(s) => crate::storage::parse_bytea(s)
@@ -1479,6 +1903,9 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
         // here (they failed 42704 at resolution).
         ColType::Json => match v {
             Value::Record(fields) => Ok(Value::text(row_to_json_text(fields))),
+            // v1.83: PG's jsonb -> json cast renders the canonical
+            // jsonb text as json.
+            Value::Jsonb(s) => Ok(Value::Text(s.clone())),
             Value::Text(s) | Value::BpChar(s) => {
                 if parse_json(&s).is_err() {
                     return Err(exec_err(
@@ -1489,6 +1916,23 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
                 Ok(text_value_of(&[v]))
             }
             other => Err(cast_err(other, "json")),
+        },
+        // v1.83: PG19's jsonb input (utils/adt/jsonb.c `jsonb_in`):
+        // validate like json, then canonicalize (keys sorted by
+        // (length, bytewise) and deduplicated last-wins, numbers
+        // through numeric_in). Sources: text/bpchar (which is also how
+        // a `json` value arrives, since json rides as Value::Text —
+        // PG's json -> jsonb cast), jsonb (identity; handled by the
+        // col_type short-circuit above, kept here for direct calls),
+        // and record via row_to_json text (PG's record -> jsonb).
+        ColType::Jsonb => match v {
+            Value::Jsonb(_) => Ok(v.clone()),
+            Value::Record(fields) => {
+                let t = row_to_json_text(fields);
+                Ok(Value::jsonb(jsonb_canonical(&t)?))
+            }
+            Value::Text(s) | Value::BpChar(s) => Ok(Value::jsonb(jsonb_canonical(s)?)),
+            other => Err(cast_err(other, "jsonb")),
         },
         // v0.79: real array casts (PG19 array_in/array_out semantics).
         // Text (or bpchar) input parses as a `{...}` literal through

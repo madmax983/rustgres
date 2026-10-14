@@ -74,6 +74,14 @@ pub(crate) fn execute_inner(
             returning,
         ),
         Stmt::Select(sel) => {
+            // v1.85: SQL/JSON DEFAULT analysis-time restrictions
+            // (PG transformJsonFuncExpr) — checked once here so they
+            // fire even when the query yields zero rows.
+            for item in &sel.items {
+                if let crate::sql::SelectItem::Expr { expr, .. } = item {
+                    analyze_sqljson_defaults(eng, expr)?;
+                }
+            }
             // FOR UPDATE locks (from every query level that asked for
             // them) are collected during the scan and acquired here, while
             // the engine lock is still held — so they are atomic with the
@@ -154,7 +162,21 @@ pub(crate) fn execute_inner(
             name,
             like_base,
             composite,
-        } => exec_create_type(eng, ctx, name, like_base.as_deref(), composite.as_deref()),
+            range,
+        } => {
+            if let Some((subty, sub_named, multi_name)) = range {
+                exec_create_range_type(
+                    eng,
+                    ctx,
+                    name,
+                    *subty,
+                    sub_named.as_deref(),
+                    multi_name.as_deref(),
+                )
+            } else {
+                exec_create_type(eng, ctx, name, like_base.as_deref(), composite.as_deref())
+            }
+        }
         Stmt::DropType { names, if_exists } => exec_drop_type(eng, ctx, names, *if_exists),
         // --- v1.38: CREATE CAST (binary method only) ---
         Stmt::CreateCast {

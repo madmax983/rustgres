@@ -123,6 +123,7 @@ pub(crate) enum Token {
     PipePipe,   // v0.7: `||` concat
     Pipe,       // v0.25: `|` bitwise OR
     Amp,        // v0.25: `&` bitwise AND
+    AmpAmp,     // v1.88: `&&` overlap operator (PG19 gram.y Op)
     Hash,       // v0.25: `#` bitwise XOR
     /// v1.82: JSON operators (PG19 scan.l `right_arrow`, gram.y `Op`):
     /// `->`, `->>`, `#>`, `#>>`. Lexed longest-match-first, like PG.
@@ -130,6 +131,18 @@ pub(crate) enum Token {
     ArrowText,  // `->>`
     HashArrow,  // `#>`
     HashArrowText, // `#>>`
+    /// v1.83: jsonb operators (PG19 gram.y `Op`): `@>`, `<@`, `?`,
+    /// `?|`, `?&`. The `?` family lexes out of the v0.86 `?`-led branch
+    /// below (exact matches only; `?=` etc. stay `Op`).
+    AtGt, // `@>`
+    /// v1.85: `@?` (jsonpath exists) and `@@` (jsonpath match) —
+    /// PG19 gram.y `Op` for (jsonb, jsonpath).
+    AtQuestion, // `@?`
+    AtAt,       // `@@`
+    LtAt,       // `<@`
+    Question,   // `?`
+    QuestionPipe, // `?|`
+    QuestionAmp, // `?&`
     Tilde,      // v0.25: `~` bitwise NOT (unary)
     TildeStar,  // v0.68: `~*` POSIX regex match, case-insensitive
     BangTilde,  // v0.68: `!~` POSIX regex non-match
@@ -423,9 +436,15 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
             continue;
         }
         // v0.25: `&` bitwise AND, `#` bitwise XOR, `~` bitwise NOT.
+        // v1.88: `&&` (overlap) lexes as one token, like PG.
         if c == '&' {
-            toks.push(Token::Amp);
-            i += 1;
+            if i + 1 < chars.len() && chars[i + 1] == '&' {
+                toks.push(Token::AmpAmp);
+                i += 2;
+            } else {
+                toks.push(Token::Amp);
+                i += 1;
+            }
             continue;
         }
         // v1.82: `#>` / `#>>` lex as single tokens (PG19 gram.y `Op`);
@@ -459,9 +478,23 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
             continue;
         }
         // v0.21: `@` prefix absolute-value operator.
+        // v1.83: `@>` (jsonb containment) lexes as one token, like PG.
         if c == '@' {
-            toks.push(Token::At);
-            i += 1;
+            if i + 1 < chars.len() && chars[i + 1] == '>' {
+                toks.push(Token::AtGt);
+                i += 2;
+            } else if i + 1 < chars.len() && chars[i + 1] == '?' {
+                // v1.85: `@?` jsonpath exists operator.
+                toks.push(Token::AtQuestion);
+                i += 2;
+            } else if i + 1 < chars.len() && chars[i + 1] == '@' {
+                // v1.85: `@@` jsonpath match operator.
+                toks.push(Token::AtAt);
+                i += 2;
+            } else {
+                toks.push(Token::At);
+                i += 1;
+            }
             continue;
         }
         // `/* ... */` block comment
@@ -596,6 +629,10 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
             '<' => {
                 if i + 1 < chars.len() && chars[i + 1] == '<' {
                     toks.push(Token::Shl);
+                    i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '@' {
+                    // v1.83: `<@` jsonb contained-by.
+                    toks.push(Token::LtAt);
                     i += 2;
                 } else if i + 1 < chars.len() && chars[i + 1] == '=' {
                     toks.push(Token::LtEq);
@@ -869,7 +906,15 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
                     i += 1;
                 }
                 let op: String = chars[start..i].iter().collect();
-                toks.push(Token::Op(op));
+                // v1.83: the jsonb existence operators get dedicated
+                // tokens; every other `?`-led sequence stays a generic
+                // Op (CREATE OPERATOR names).
+                match op.as_str() {
+                    "?" => toks.push(Token::Question),
+                    "?|" => toks.push(Token::QuestionPipe),
+                    "?&" => toks.push(Token::QuestionAmp),
+                    _ => toks.push(Token::Op(op)),
+                }
             }
             _ => return Err(err(format!("unexpected character '{}'", c))),
         }
@@ -898,8 +943,12 @@ pub enum Literal {
     Date(i32),        // v0.7: days since 1970-01-01
     Timestamp(i64),   // v0.7: micros since 1970-01-01 00:00:00 UTC
     Timestamptz(i64), // v0.7: micros since epoch, UTC
-    Bytea(Vec<u8>),   // v0.7
-    Uuid([u8; 16]),   // v0.7
+    // v1.86: the rest of the datetime family as parsed constants.
+    Time(i64),        // micros since midnight
+    TimeTz(i64, i32), // micros, offset seconds
+    Interval(crate::datetime::Interval),
+    Bytea(Vec<u8>), // v0.7
+    Uuid([u8; 16]), // v0.7
     // v1.39: a validated `x'...'`/`b'...'` bit-string literal (PG19
     // `bit_in`); the marker's case was normalized by the lexer.
     BitString(crate::storage::BitString),
@@ -922,6 +971,9 @@ impl Literal {
             Literal::Date(_) => "date",
             Literal::Timestamp(_) => "timestamp without time zone",
             Literal::Timestamptz(_) => "timestamp with time zone",
+            Literal::Time(_) => "time without time zone", // v1.86
+            Literal::TimeTz(..) => "time with time zone", // v1.86
+            Literal::Interval(_) => "interval",           // v1.86
             Literal::Bytea(_) => "bytea",
             Literal::Uuid(_) => "uuid",
             Literal::BitString(_) => "bit", // v1.39
@@ -945,6 +997,9 @@ impl Literal {
             Literal::Date(_) => ColType::Date,
             Literal::Timestamp(_) => ColType::Timestamp,
             Literal::Timestamptz(_) => ColType::Timestamptz,
+            Literal::Time(_) => ColType::Time,         // v1.86
+            Literal::TimeTz(..) => ColType::TimeTz,    // v1.86
+            Literal::Interval(_) => ColType::Interval, // v1.86
             Literal::Bytea(_) => ColType::Bytea,
             Literal::Uuid(_) => ColType::Uuid,
             Literal::BitString(_) => ColType::Bit, // v1.39
@@ -977,6 +1032,9 @@ impl Literal {
             Literal::Date(d) => Value::Date(d),
             Literal::Timestamp(m) => Value::Timestamp(m),
             Literal::Timestamptz(m) => Value::Timestamptz(m),
+            Literal::Time(t) => Value::Time(t),           // v1.86
+            Literal::TimeTz(t, o) => Value::TimeTz(t, o), // v1.86
+            Literal::Interval(iv) => Value::Interval(iv), // v1.86
             Literal::Bytea(b) => Value::Bytea(b),
             Literal::Uuid(u) => Value::Uuid(u),
             Literal::BitString(b) => Value::BitString(b), // v1.39
@@ -1048,6 +1106,17 @@ pub enum AggFunc {
     // v0.91: `array_agg(x)` — collect non-null inputs into a 1-D array
     // (multidimensional when the input is itself an array, like PG).
     ArrayAgg,
+    // v1.84: JSON aggregates (json.c/jsonb.c). JsonObjectAgg and
+    // JsonbObjectAgg take (key, value) — arg2 carries the value.
+    JsonAgg,
+    JsonbAgg,
+    JsonObjectAgg,
+    JsonbObjectAgg,
+    // v1.88: range aggregates (rangetypes.c): range_agg(anyrange) ->
+    // anymultirange (also the multirange-input form), and
+    // range_intersect_agg(anyrange) -> anyrange.
+    RangeAgg,
+    RangeIntersectAgg,
 }
 
 impl AggFunc {
@@ -1065,6 +1134,12 @@ impl AggFunc {
             AggFunc::StddevSamp => "stddev",
             AggFunc::StddevPop => "stddev_pop",
             AggFunc::ArrayAgg => "array_agg",
+            AggFunc::JsonAgg => "json_agg",
+            AggFunc::JsonbAgg => "jsonb_agg",
+            AggFunc::JsonObjectAgg => "json_object_agg",
+            AggFunc::JsonbObjectAgg => "jsonb_object_agg",
+            AggFunc::RangeAgg => "range_agg",
+            AggFunc::RangeIntersectAgg => "range_intersect_agg",
         }
     }
 }
@@ -1173,6 +1248,25 @@ pub enum JsonOp {
     HashArrow,
     /// `#>>`: path as text.
     HashArrowText,
+    /// v1.83: `@>`: jsonb containment (bool).
+    Contains,
+    /// v1.83: `<@`: jsonb contained-by (bool).
+    ContainedBy,
+    /// v1.83: `?`: jsonb key/element existence (bool).
+    Exists,
+    /// v1.83: `?|`: jsonb existence, any (bool).
+    ExistsAny,
+    /// v1.83: `?&`: jsonb existence, all (bool).
+    ExistsAll,
+    /// v1.85: `@?`: jsonb @? jsonpath — path exists (bool).
+    PathExists,
+    /// v1.85: `@@`: jsonb @@ jsonpath — path predicate matches (bool).
+    PathMatch,
+    /// v1.88: `&&`: range/multirange overlap (bool). Shares the JsonOp
+    /// expression node because it sits at the same gram.y Op precedence
+    /// and has the same binary shape; evaluation dispatches on the
+    /// operand values (ranges here, jsonb for the ops above).
+    Overlaps,
 }
 
 impl JsonOp {
@@ -1182,6 +1276,14 @@ impl JsonOp {
             JsonOp::ArrowText => "->>",
             JsonOp::HashArrow => "#>",
             JsonOp::HashArrowText => "#>>",
+            JsonOp::Contains => "@>",
+            JsonOp::ContainedBy => "<@",
+            JsonOp::Exists => "?",
+            JsonOp::ExistsAny => "?|",
+            JsonOp::ExistsAll => "?&",
+            JsonOp::PathExists => "@?",
+            JsonOp::PathMatch => "@@",
+            JsonOp::Overlaps => "&&",
         }
     }
 
@@ -1189,6 +1291,21 @@ impl JsonOp {
     /// return text.
     pub fn returns_json(&self) -> bool {
         matches!(self, JsonOp::Arrow | JsonOp::HashArrow)
+    }
+
+    /// v1.83: the jsonb containment/existence family returns boolean.
+    pub fn returns_bool(&self) -> bool {
+        matches!(
+            self,
+            JsonOp::Contains
+                | JsonOp::ContainedBy
+                | JsonOp::Exists
+                | JsonOp::ExistsAny
+                | JsonOp::ExistsAll
+                | JsonOp::PathExists
+                | JsonOp::PathMatch
+                | JsonOp::Overlaps
+        )
     }
 
     /// v1.82: name used in the constraint-expression s-encoding
@@ -1201,6 +1318,14 @@ impl JsonOp {
             JsonOp::ArrowText => "arrowtext",
             JsonOp::HashArrow => "hasharrow",
             JsonOp::HashArrowText => "hasharrowtext",
+            JsonOp::Contains => "contains",
+            JsonOp::ContainedBy => "containedby",
+            JsonOp::Exists => "exists",
+            JsonOp::ExistsAny => "existsany",
+            JsonOp::ExistsAll => "existsall",
+            JsonOp::PathExists => "pathexists",
+            JsonOp::PathMatch => "pathmatch",
+            JsonOp::Overlaps => "overlaps",
         }
     }
 
@@ -1210,6 +1335,14 @@ impl JsonOp {
             "arrowtext" => Some(JsonOp::ArrowText),
             "hasharrow" => Some(JsonOp::HashArrow),
             "hasharrowtext" => Some(JsonOp::HashArrowText),
+            "contains" => Some(JsonOp::Contains),
+            "containedby" => Some(JsonOp::ContainedBy),
+            "exists" => Some(JsonOp::Exists),
+            "existsany" => Some(JsonOp::ExistsAny),
+            "existsall" => Some(JsonOp::ExistsAll),
+            "pathexists" => Some(JsonOp::PathExists),
+            "pathmatch" => Some(JsonOp::PathMatch),
+            "overlaps" => Some(JsonOp::Overlaps),
             _ => None,
         }
     }
@@ -1255,6 +1388,12 @@ pub enum Expr {
     CastNamed {
         expr: Box<Expr>,
         name: String,
+    },
+    // v1.86: `expr AT TIME ZONE zone` / `expr AT LOCAL` (zone None =
+    // the session TimeZone). PG converts timestamp<->timestamptz.
+    AtTimeZone {
+        expr: Box<Expr>,
+        zone: Option<Box<Expr>>,
     },
     /// v0.81: `ROW(a, b, ...)` row constructor. Evaluates to
     /// `Value::Record` with PG's `f1`, `f2`, ... field names.
@@ -1551,6 +1690,103 @@ pub enum SelectItem {
     },
 }
 
+/// v1.89: one SQL/JSON behavior clause (`<behavior> ON EMPTY|ON ERROR`)
+/// in a JSON_TABLE column or at JSON_TABLE level. The kind encoding
+/// matches the __sqljson_* desugar in exec/json.rs (0 ERROR, 1 NULL,
+/// 2 DEFAULT expr, 3 EMPTY, 4 EMPTY ARRAY, 5 EMPTY OBJECT, 6 TRUE,
+/// 7 FALSE) plus 8 UNKNOWN (JSON_TABLE / JSON_EXISTS only in PG19).
+#[derive(Clone, Debug, PartialEq)]
+pub struct JtBehavior {
+    pub kind: i64,
+    pub expr: Expr,
+}
+
+/// v1.89: a parsed `JSON_TABLE(...)` COLUMNS tree plus the table-level
+/// ON ERROR behavior (PG19 gram.y JsonTable). Column and nested-path
+/// names share one namespace with the root path name (kept in
+/// `FromItem::Function` args as the path string; the optional root
+/// path name is `path_name`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct JsonTableSpec {
+    pub path_name: Option<String>,
+    pub columns: Vec<JtColumn>,
+    /// Table-level ON ERROR: kinds 0 (ERROR), 3 (EMPTY), 4 (EMPTY
+    /// ARRAY), 5 (EMPTY OBJECT) only; applies to the root path
+    /// evaluation alone (PG does not propagate it to columns).
+    pub on_error: JtBehavior,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum JtColumn {
+    /// `name FOR ORDINALITY` — 1-based position within the owning
+    /// path's sequence; at most one per COLUMNS list (parser-enforced
+    /// per PG's "only one FOR ORDINALITY column is allowed").
+    Ordinality { name: String },
+    /// `name type [FORMAT JSON] [PATH '...'] [wrapper] [quotes]
+    /// [behavior ON EMPTY] [behavior ON ERROR]`. An omitted PATH is
+    /// the implicit `$."<name>"` (PG19).
+    Regular {
+        name: String,
+        ty: ColType,
+        /// Written type name when `ty` is a named (composite/domain/
+        /// user-range) type.
+        named: Option<String>,
+        /// Typmod for bit(n)/varbit(n) columns (ColType::Bit carries
+        /// no typmod, so the length rides here).
+        bit_len: Option<i32>,
+        format_json: bool,
+        path: String,
+        /// 0 = WITHOUT (default), 1 = WITH UNCONDITIONAL,
+        /// 2 = WITH CONDITIONAL.
+        wrapper: i64,
+        /// None = unspecified, Some(true) = KEEP QUOTES,
+        /// Some(false) = OMIT QUOTES.
+        quotes: Option<bool>,
+        on_empty: JtBehavior,
+        on_error: JtBehavior,
+    },
+    /// `name type EXISTS [PATH '...'] [behavior ON ERROR]` — the
+    /// jsonpath EXISTS result converted from boolean to the column
+    /// type (PG19 JsonExpr coercion rules).
+    Exists {
+        name: String,
+        ty: ColType,
+        named: Option<String>,
+        bit_len: Option<i32>,
+        path: String,
+        on_error: JtBehavior,
+    },
+    /// `NESTED PATH '...' [AS name] COLUMNS (...)`.
+    Nested {
+        path: String,
+        path_name: Option<String>,
+        columns: Vec<JtColumn>,
+    },
+}
+
+impl JsonTableSpec {
+    /// The leaf (output) columns in PG output order: within each
+    /// COLUMNS list, all plain columns (in written order) come before
+    /// the nested subtrees' leaves (in written order), recursively.
+    /// PG19 transforms a JsonTable node's columns exactly this way
+    /// (the "parent columns appear before NESTED ones" regress case).
+    pub fn flat_columns<'a>(&'a self, out: &mut Vec<&'a JtColumn>) {
+        fn walk<'a>(cols: &'a [JtColumn], out: &mut Vec<&'a JtColumn>) {
+            for c in cols {
+                if !matches!(c, JtColumn::Nested { .. }) {
+                    out.push(c);
+                }
+            }
+            for c in cols {
+                if let JtColumn::Nested { columns, .. } = c {
+                    walk(columns, out);
+                }
+            }
+        }
+        walk(&self.columns, out);
+    }
+}
+
 /// A FROM source (v0.6).
 #[derive(Clone, Debug, PartialEq)]
 pub enum FromItem {
@@ -1600,7 +1836,18 @@ pub enum FromItem {
         args: Vec<Expr>,
         alias: Option<String>,
         col_aliases: Vec<String>,
+        /// v1.84: typed column definition list (`f(...) AS t (a int,
+        /// b text)`) for record-returning functions; mutually
+        /// exclusive with `col_aliases` (the parser commits to one
+        /// reading of the parenthesized list). Entries are
+        /// (column name, type, written type name when composite).
+        col_defs: Vec<(String, ColType, Option<String>)>,
         lateral: bool,
+        /// v1.89: the parsed COLUMNS tree when this item is a
+        /// JSON_TABLE table function (name == "json_table"); `args`
+        /// then holds [doc, path-text, vars]. None for every other
+        /// table function.
+        json_table: Option<Box<JsonTableSpec>>,
     },
     Join {
         left: Box<FromItem>,
@@ -2706,6 +2953,13 @@ pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>
         Expr::Cast { expr, .. } => collect_col_refs(expr, out),
         // v0.81: composite expressions — recurse into sub-expressions.
         Expr::CastNamed { expr, .. } => collect_col_refs(expr, out),
+        // v1.86: AT TIME ZONE depends on both operands.
+        Expr::AtTimeZone { expr, zone } => {
+            collect_col_refs(expr, out);
+            if let Some(z) = zone {
+                collect_col_refs(z, out);
+            }
+        }
         Expr::Row(elems) => {
             for e in elems {
                 collect_col_refs(e, out);
@@ -4778,6 +5032,10 @@ pub enum Stmt {
         /// definition: `(field_name, ColType, composite_type_name)`.
         /// None for the shell and LIKE forms.
         composite: Option<Vec<(String, ColType, Option<String>)>>,
+        /// v1.88: `CREATE TYPE name AS RANGE (subtype = T, ...)`:
+        /// `(subtype, subtype_named, multirange_type_name)`. None for
+        /// the other forms.
+        range: Option<(ColType, Option<String>, Option<String>)>,
     },
     DropType {
         names: Vec<String>,
@@ -5429,7 +5687,33 @@ pub(crate) fn max_param_from(f: &FromItem) -> usize {
         FromItem::Table { .. } => 0,
         FromItem::Derived { sub, .. } => max_param_select(sub),
         // v0.32: table-function args may hold $n parameters.
-        FromItem::Function { args, .. } => args.iter().map(max_param_expr).max().unwrap_or(0),
+        // v1.89: JSON_TABLE DEFAULT-behavior expressions may too.
+        FromItem::Function {
+            args, json_table, ..
+        } => {
+            let mut m = args.iter().map(max_param_expr).max().unwrap_or(0);
+            if let Some(spec) = json_table {
+                fn cols_max(cols: &[JtColumn], m: &mut usize) {
+                    for c in cols {
+                        match c {
+                            JtColumn::Regular {
+                                on_empty, on_error, ..
+                            } => {
+                                *m = (*m).max(max_param_expr(&on_empty.expr));
+                                *m = (*m).max(max_param_expr(&on_error.expr));
+                            }
+                            JtColumn::Exists { on_error, .. } => {
+                                *m = (*m).max(max_param_expr(&on_error.expr));
+                            }
+                            JtColumn::Nested { columns, .. } => cols_max(columns, m),
+                            JtColumn::Ordinality { .. } => {}
+                        }
+                    }
+                }
+                cols_max(&spec.columns, &mut m);
+            }
+            m
+        }
         FromItem::Values { rows, .. } => rows
             .iter()
             .flat_map(|r| r.iter())
@@ -5465,6 +5749,11 @@ pub(crate) fn max_param_expr(e: &Expr) -> usize {
         Expr::Cmp { left, right, .. } => max_param_expr(left).max(max_param_expr(right)),
         // v0.81: composite expressions recurse into their operands.
         Expr::CastNamed { expr, .. } | Expr::FieldAccess { expr, .. } => max_param_expr(expr),
+        // v1.86: AT TIME ZONE.
+        Expr::AtTimeZone { expr, zone } => {
+            let z = zone.as_deref().map(max_param_expr).unwrap_or(0);
+            max_param_expr(expr).max(z)
+        }
         Expr::Row(elems) => elems.iter().map(max_param_expr).max().unwrap_or(0),
         // v0.79: array expressions recurse into their operands.
         Expr::ArrayCtor { elems, .. } => elems.iter().map(max_param_expr).max().unwrap_or(0),
@@ -5710,6 +5999,14 @@ pub(crate) fn tokens_to_sql(toks: &[Token]) -> String {
             Token::ArrowText => "->>".to_string(),
             Token::HashArrow => "#>".to_string(),
             Token::HashArrowText => "#>>".to_string(),
+            // v1.83: jsonb operators render back to their source text.
+            Token::AtGt => "@>".to_string(),
+            Token::AtQuestion => "@?".to_string(),
+            Token::AtAt => "@@".to_string(),
+            Token::LtAt => "<@".to_string(),
+            Token::Question => "?".to_string(),
+            Token::QuestionPipe => "?|".to_string(),
+            Token::QuestionAmp => "?&".to_string(),
             Token::Dot => ".".to_string(),
             Token::Lt => "<".to_string(),
             Token::Gt => ">".to_string(),
@@ -5720,6 +6017,7 @@ pub(crate) fn tokens_to_sql(toks: &[Token]) -> String {
             Token::PipePipe => "||".to_string(),
             Token::Pipe => "|".to_string(),
             Token::Amp => "&".to_string(),
+            Token::AmpAmp => "&&".to_string(),
             Token::Hash => "#".to_string(),
             Token::Tilde => "~".to_string(),
             Token::TildeStar => "~*".to_string(),

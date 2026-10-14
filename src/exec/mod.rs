@@ -41,17 +41,17 @@ pub(crate) use crate::sql::{
     AggFunc, AlterAction, ArithOp, CheckDef, CmpOp, ConflictAction, ConflictArbiter, CteBody,
     CteDef, CteMaterialize, DefaultExpr, ExplainFormat, Expr, FkAction, FkDef, FrameBound,
     FrameExclusion, FromItem, IndexColSpec, InsertIndirection, InsertTarget, InsertValue,
-    IsolationLevel, JoinKind, JsonOp, Literal, OnConflict, OrderTerm, OrderedSetAgg, QuantKind,
-    QuantOp, RaiseLevel, SelectItem, SelectStmt, SequenceOpts, SerialKind, SetOpKind, SetOpRoot,
-    SqlError, Stmt, TableDef, TriggerBodyStmt, TriggerDef, TriggerTiming, UniqueDef, WindowFrame,
-    WindowFunc, collect_col_refs, collect_table_refs, parse_statement, parse_trigger_body,
-    trig_event, validate_constraint_expr,
+    IsolationLevel, JoinKind, JsonOp, JsonTableSpec, JtBehavior, JtColumn, Literal, OnConflict,
+    OrderTerm, OrderedSetAgg, QuantKind, QuantOp, RaiseLevel, SelectItem, SelectStmt, SequenceOpts,
+    SerialKind, SetOpKind, SetOpRoot, SqlError, Stmt, TableDef, TriggerBodyStmt, TriggerDef,
+    TriggerTiming, UniqueDef, WindowFrame, WindowFunc, collect_col_refs, collect_table_refs,
+    parse_statement, parse_trigger_body, trig_event, validate_constraint_expr,
 };
 pub(crate) use crate::storage::index_visible;
 pub(crate) use crate::storage::{
-    ArrayElem, ArrayVal, BigDec, BitString, ColStats, ColType, Database, Engine, Numeric,
-    NumericSpecial, OperDef, Row, RowVersion, Sequence, ShellType, Snapshot, Table, TableStats,
-    Value, ViewDef, WriteOp, row_visible, toast_consts, toast_storage,
+    ArrayElem, ArrayVal, BigDec, BitString, ColStats, ColType, Database, Engine, MultiVal, Numeric,
+    NumericSpecial, OperDef, RangeElem, RangeVal, Row, RowVersion, Sequence, ShellType, Snapshot,
+    Table, TableStats, Value, ViewDef, WriteOp, row_visible, toast_consts, toast_storage,
 };
 pub(crate) use std::cell::RefCell;
 pub(crate) use std::cmp::Ordering;
@@ -84,11 +84,15 @@ mod indexes;
 mod info_schema;
 mod join;
 mod json;
+mod jsonpath;
+mod jsontable;
 mod orderby;
 mod params;
 mod partition;
+mod pg_input;
 mod privilege;
 mod project;
+pub(crate) mod ranges;
 mod reorder;
 mod roles;
 mod seq;
@@ -235,6 +239,12 @@ mod v177_nested_sje_tests;
 #[path = "test_mods/v179_sje_star_tests.rs"]
 mod v179_sje_star_tests;
 #[cfg(test)]
+#[path = "test_mods/v188_range_tests.rs"]
+mod v188_range_tests;
+#[cfg(test)]
+#[path = "test_mods/v189_jsontable_tests.rs"]
+mod v189_jsontable_tests;
+#[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;
 
@@ -266,6 +276,7 @@ pub(crate) use json::*;
 pub(crate) use orderby::*;
 pub(crate) use params::*;
 pub(crate) use partition::*;
+pub(crate) use pg_input::*;
 pub(crate) use privilege::*;
 pub(crate) use project::*;
 pub(crate) use reorder::*;

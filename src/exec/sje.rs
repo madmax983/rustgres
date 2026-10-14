@@ -1061,6 +1061,11 @@ pub(crate) fn sje_rewrite_qual(e: &Expr, from_q: &str, to_q: &str) -> Option<Exp
             to: to.clone(),
             written: written.clone(),
         },
+        // v1.86: AT TIME ZONE.
+        Expr::AtTimeZone { expr, zone } => Expr::AtTimeZone {
+            expr: rb(expr)?,
+            zone: ro(zone)?,
+        },
         Expr::CastNamed { expr, name } => Expr::CastNamed {
             expr: rb(expr)?,
             name: name.clone(),

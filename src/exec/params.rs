@@ -71,8 +71,14 @@ pub(crate) fn hint_type(
         .ok(),
         Expr::Concat(..) => Some(ColType::Text),
         // v1.82: JSON operator result types, like expr_type.
-        Expr::JsonOp { op, .. } => Some(if op.returns_json() {
-            ColType::Json
+        // v1.83: bool family + jsonb operand propagation.
+        Expr::JsonOp { op, left, .. } => Some(if op.returns_bool() {
+            ColType::Bool
+        } else if op.returns_json() {
+            match hint_type(eng, snap, own, session, schemas, left) {
+                Some(ColType::Jsonb) => ColType::Jsonb,
+                _ => ColType::Json,
+            }
         } else {
             ColType::Text
         }),
@@ -864,6 +870,26 @@ pub(crate) fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<V
                 .map(Value::Timestamptz)
                 .map_err(|_| bad(format!("\"{}\"", s)))
         }
+        // v1.86: time / timetz / interval parameters parse through
+        // the same input functions as casts.
+        ColType::Time => {
+            let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
+            crate::datetime::parse_time(s.trim())
+                .map(Value::Time)
+                .map_err(|_| bad(format!("\"{}\"", s)))
+        }
+        ColType::TimeTz => {
+            let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
+            crate::datetime::parse_timetz(s.trim())
+                .map(|(t, o)| Value::TimeTz(t, o))
+                .map_err(|_| bad(format!("\"{}\"", s)))
+        }
+        ColType::Interval => {
+            let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
+            crate::datetime::parse_interval(s.trim())
+                .map(Value::Interval)
+                .map_err(|_| bad(format!("\"{}\"", s)))
+        }
         ColType::Bytea => {
             let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
             crate::storage::parse_bytea(s.trim())
@@ -899,6 +925,32 @@ pub(crate) fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<V
             let s = std::str::from_utf8(bytes)
                 .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
             Ok(Value::text(s))
+        }
+        // v1.83: jsonb parameters arrive as text and canonicalize,
+        // like the cast path.
+        ColType::Jsonb => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
+            Ok(Value::jsonb(jsonb_canonical(s)?))
+        }
+        // v1.85: jsonpath parameters validate + normalize like the
+        // cast path.
+        ColType::Jsonpath => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
+            let p = super::jsonpath::parse_jsonpath(s)?;
+            Ok(Value::jsonpath(super::jsonpath::render_jsonpath(&p)))
+        }
+        // v1.88: range / multirange parameters parse like the cast path.
+        ColType::Range(elem) => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
+            super::ranges::parse_range(*elem, None, s).map(Value::range)
+        }
+        ColType::Multirange(elem) => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
+            super::ranges::parse_multirange(*elem, None, s).map(Value::multirange)
         }
     }
     .map_err(|e| {
@@ -1143,6 +1195,14 @@ pub(crate) fn value_to_literal(v: &Option<Value>) -> Literal {
         Some(Value::Float(f)) => Literal::Float(*f),
         Some(Value::Numeric(n)) => Literal::Numeric(n.clone()),
         Some(Value::Text(s)) => Literal::Text(s.clone()),
+        // v1.83: a jsonb parameter substitutes as its canonical text;
+        // downstream coercion re-canonicalizes for a jsonb target.
+        Some(Value::Jsonb(s)) => Literal::Text(s.clone()),
+        Some(Value::Jsonpath(s)) => Literal::Text(s.clone()), // v1.85
+        // v1.88: range parameters substitute as their canonical text;
+        // downstream coercion re-parses for a range target.
+        Some(Value::Range(r)) => Literal::Text(super::ranges::range_to_text(r).into()),
+        Some(Value::Multirange(m)) => Literal::Text(super::ranges::multirange_to_text(m).into()),
         // v0.35: a bpchar parameter substitutes as its (padded) text;
         // downstream coercion re-applies any target typmod.
         Some(Value::BpChar(s)) => Literal::Text(s.clone()),
@@ -1154,6 +1214,11 @@ pub(crate) fn value_to_literal(v: &Option<Value>) -> Literal {
         Some(Value::Date(d)) => Literal::Date(*d),
         Some(Value::Timestamp(m)) => Literal::Timestamp(*m),
         Some(Value::Timestamptz(m)) => Literal::Timestamptz(*m),
+        // v1.86: time/timetz/interval parameters substitute as their
+        // output text; downstream coercion re-parses for the target.
+        Some(Value::Time(t)) => Literal::Text(crate::datetime::format_time(*t).into()),
+        Some(Value::TimeTz(t, o)) => Literal::Text(crate::datetime::format_timetz(*t, *o).into()),
+        Some(Value::Interval(iv)) => Literal::Text(crate::datetime::format_interval(iv).into()),
         Some(Value::Bytea(b)) => Literal::Bytea(b.clone()),
         // v1.39: bit strings substitute losslessly as bit literals.
         Some(Value::BitString(b)) => Literal::BitString(b.clone()),
@@ -1218,6 +1283,13 @@ pub(crate) fn subst_expr(e: &mut Expr, params: &[Option<Value>]) -> Result<(), E
             subst_expr(right, params)?;
         }
         Expr::Cast { expr, .. } => subst_expr(expr, params)?,
+        // v1.86: AT TIME ZONE — substitute in both operands.
+        Expr::AtTimeZone { expr, zone } => {
+            subst_expr(expr, params)?;
+            if let Some(z) = zone {
+                subst_expr(z, params)?;
+            }
+        }
         // v0.86: named casts (e.g. `row($1,$2)::int8_tbl` in function bodies).
         Expr::CastNamed { expr, .. } => subst_expr(expr, params)?,
         // v0.86: parameters inside ROW(...) constructors (function
@@ -1352,6 +1424,9 @@ pub(crate) fn dummy_value(t: &ColType) -> Value {
         ColType::Date => Value::Date(0),
         ColType::Timestamp => Value::Timestamp(0),
         ColType::Timestamptz => Value::Timestamptz(0),
+        ColType::Time => Value::Time(0),        // v1.86
+        ColType::TimeTz => Value::TimeTz(0, 0), // v1.86
+        ColType::Interval => Value::Interval(crate::datetime::Interval::zero()), // v1.86
         ColType::Bytea => Value::Bytea(Vec::new()),
         // v1.39: the empty bit string.
         ColType::Bit => Value::BitString(crate::storage::BitString {
@@ -1372,6 +1447,16 @@ pub(crate) fn dummy_value(t: &ColType) -> Value {
         // types; the empty record is the honest dummy here too.
         ColType::Composite => Value::Record(Vec::new()),
         ColType::Json => Value::text(""),
+        // v1.83: the empty jsonb dummy.
+        ColType::Jsonb => Value::jsonb("null"),
+        ColType::Jsonpath => Value::jsonpath("$"), // v1.85
+        // v1.88: the empty range / empty multirange dummies.
+        ColType::Range(e) => Value::range(super::ranges::empty_range(*e, None)),
+        ColType::Multirange(e) => Value::multirange(crate::storage::MultiVal {
+            elem: *e,
+            name: None,
+            ranges: Vec::new(),
+        }),
         // v0.78: the empty array literal is the honest dummy; values
         // are carried as the `{...}` literal text.
         ColType::Array(_) => Value::text("{}"),

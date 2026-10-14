@@ -149,6 +149,44 @@ pub(crate) fn value_key(v: &Value, out: &mut Vec<u8>) {
             out.extend_from_slice(&b.to_be_bytes());
             out.extend_from_slice(&o.to_be_bytes());
         }
+        // v1.83: jsonb groups by its semantic value (PG's jsonb hash
+        // is over the canonical structure with numeric-value hashing),
+        // so 1.0 and 1.00 land in the same group. A stored value that
+        // fails to parse (unreachable via casts) keys by its text.
+        // v1.85: jsonpath groups by its rendered text.
+        Value::Jsonpath(s) => {
+            out.push(21);
+            out.extend_from_slice(s.as_bytes());
+        }
+        // v1.86: time groups by its micros; timetz by (micros,
+        // offset) (PG timetz equality includes the zone); interval
+        // groups by its comparison key (PG interval hash semantics:
+        // equal intervals hash equal, and interval_eq is cmp-based).
+        Value::Time(t) => {
+            out.push(22);
+            out.extend_from_slice(&t.to_be_bytes());
+        }
+        Value::TimeTz(t, off) => {
+            out.push(23);
+            out.extend_from_slice(&t.to_be_bytes());
+            out.extend_from_slice(&off.to_be_bytes());
+        }
+        Value::Interval(iv) => {
+            out.push(24);
+            let (span, micros) = crate::datetime::interval_cmp_key_pub(iv);
+            out.extend_from_slice(&span.to_be_bytes());
+            out.extend_from_slice(&micros.to_be_bytes());
+        }
+        Value::Jsonb(s) => {
+            out.push(20);
+            match parse_jsonb(s) {
+                Ok(v) => jsonb_semantic_key(&v, out),
+                Err(_) => {
+                    out.push(0);
+                    out.extend_from_slice(s.as_bytes());
+                }
+            }
+        }
         // v0.36: the one-byte "char" value groups by its byte.
         Value::SingleChar(b) => {
             out.push(14);
@@ -166,6 +204,32 @@ pub(crate) fn value_key(v: &Value, out: &mut Vec<u8>) {
         // v0.79: arrays group by element type, dims and element keys
         // (PG's hash_array mixes the same inputs). NULL elements hash
         // distinctly from the string "NULL", like every other type.
+        // v1.88: ranges group by (elem, name, bounds) via value keys.
+        Value::Range(r) => {
+            out.push(26);
+            out.push(r.elem.code());
+            out.extend_from_slice(r.name.as_deref().unwrap_or("").as_bytes());
+            out.push(r.empty as u8);
+            out.push(r.lo_inc as u8);
+            out.push(r.hi_inc as u8);
+            match &r.lo {
+                Some(v) => value_key(v, out),
+                None => out.push(0),
+            }
+            match &r.hi {
+                Some(v) => value_key(v, out),
+                None => out.push(0),
+            }
+        }
+        Value::Multirange(m) => {
+            out.push(27);
+            out.push(m.elem.code());
+            out.extend_from_slice(m.name.as_deref().unwrap_or("").as_bytes());
+            out.extend_from_slice(&(m.ranges.len() as u64).to_be_bytes());
+            for r in &m.ranges {
+                value_key(&Value::Range(Box::new(r.clone())), out);
+            }
+        }
         Value::Array(a) => {
             out.push(17);
             out.push(a.elem as u8);
@@ -245,11 +309,13 @@ pub(crate) fn eval_group_key_expanded(
 ) -> Result<Vec<Value>, ExecError> {
     if let Expr::Func { name, args } = key {
         if is_builtin_srf(name) {
+            let resolved = resolve_named_args_if_any(q.eng, name, args)?;
+            let args: &[Expr] = &resolved;
             let mut vals = Vec::with_capacity(args.len());
             for a in args {
                 vals.push(eval_expr(q, scopes, a)?);
             }
-            return eval_srf_vals(name, &vals);
+            return eval_srf_vals(q, name, &vals, args);
         }
     }
     Ok(vec![eval_expr(q, scopes, key)?])
@@ -946,6 +1012,13 @@ pub(crate) fn collect_target_srfs(
         | Expr::IsNull { expr, .. }
         | Expr::IsBool { expr, .. }
         | Expr::Extract { from: expr, .. } => collect_target_srfs(eng, expr, group_keys, out),
+        // v1.86: AT TIME ZONE.
+        Expr::AtTimeZone { expr, zone } => {
+            collect_target_srfs(eng, expr, group_keys, out);
+            if let Some(z) = zone {
+                collect_target_srfs(eng, z, group_keys, out);
+            }
+        }
         Expr::Row(elems) => {
             for el in elems {
                 collect_target_srfs(eng, el, group_keys, out);
@@ -1075,7 +1148,7 @@ pub(crate) fn project_group_expanded(
             )?);
         }
         fans.push(if is_builtin_srf(&slot.name) {
-            eval_srf_vals(&slot.name, &avals)?
+            eval_srf_vals(q, &slot.name, &avals, &slot.args)?
         } else {
             let mut chained: Vec<Scope> = outer.to_vec();
             chained.push(gscope);
@@ -1385,6 +1458,36 @@ pub(crate) fn eval_grouped(
                 q, outer, gscope, schema, rows, idxs, key_vals, group_by, expr,
             )?;
             eval_cast(&v, *to)
+        }
+        // v1.86: AT TIME ZONE in grouped evaluation.
+        Expr::AtTimeZone { expr, zone } => {
+            let v = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, expr,
+            )?;
+            if v == Value::Null {
+                return Ok(Value::Null);
+            }
+            let zone_name = match zone {
+                Some(z) => {
+                    match eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, z)?
+                    {
+                        Value::Text(s) | Value::BpChar(s) => s.to_string(),
+                        Value::Null => return Ok(Value::Null),
+                        other => {
+                            return Err(exec_err(
+                                "42883",
+                                format!(
+                                    "operator does not exist: {} AT TIME ZONE {}",
+                                    v.type_name().to_lowercase(),
+                                    other.type_name().to_lowercase()
+                                ),
+                            ));
+                        }
+                    }
+                }
+                None => crate::datetime::session_tz_name(),
+            };
+            crate::exec::eval::eval_at_time_zone(&v, &zone_name)
         }
         // v0.81: `ROW(a, b, ...)` — evaluates to a composite record with
         // PG's `f1`, `f2`, ... field names.
@@ -2718,11 +2821,28 @@ pub(crate) fn eval_agg_func(
             }
             vals.push(v);
             delims.push(d);
+        // v1.84: json_object_agg/jsonb_object_agg evaluate the value
+        // argument per row into `delims` (StringAgg's channel) and
+        // keep every row: a NULL key errors at finalize, a NULL value
+        // becomes a JSON null (PG19 json_objectagg_transfn).
+        } else if matches!(func, AggFunc::JsonObjectAgg | AggFunc::JsonbObjectAgg) {
+            let d = eval_expr(
+                q,
+                scopes,
+                arg2.expect("json_object_agg takes a value argument"),
+            )?;
+            vals.push(v);
+            delims.push(d);
         // v0.73: a whole-row value counts as null iff every field is
         // null (PG19: `count(t.*)` skips null-extended outer-join rows).
         // v0.92: array_agg keeps NULL inputs — PG19 "Collects all the
         // input values, including nulls, into an array".
-        } else if func == AggFunc::ArrayAgg || !crate::storage::value_is_null(&v) {
+        // v1.84: json_agg/jsonb_agg also keep NULL inputs (rendered as
+        // JSON null per row).
+        } else if func == AggFunc::ArrayAgg
+            || matches!(func, AggFunc::JsonAgg | AggFunc::JsonbAgg)
+            || !crate::storage::value_is_null(&v)
+        {
             vals.push(v);
         }
     }
@@ -2739,7 +2859,10 @@ pub(crate) fn eval_agg_func(
         for (i, v) in vals.iter().enumerate() {
             let mut k = Vec::new();
             value_key(v, &mut k);
-            if func == AggFunc::StringAgg {
+            if matches!(
+                func,
+                AggFunc::StringAgg | AggFunc::JsonObjectAgg | AggFunc::JsonbObjectAgg
+            ) {
                 if let Some(d) = delims.get(i) {
                     value_key(d, &mut k);
                 }
@@ -2833,5 +2956,168 @@ pub(crate) fn eval_agg_func(
         // array_agg(anyarray) statically); the query schema lets
         // column references resolve to array types.
         AggFunc::ArrayAgg => array_agg_final(vals, expr_is_statically_array(a, Some(schema))),
+        // v1.84: json_agg — json.c's AccumJsonArray: elements joined
+        // ", ", with an extra "\n " before non-first elements whose
+        // category is array or composite; NULLs render as null; zero
+        // rows yield NULL (no transition ever ran).
+        AggFunc::JsonAgg => {
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mut out = String::from("[");
+            for (i, v) in vals.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                    if matches!(v, Value::Array(_) | Value::Record(_)) {
+                        out.push_str("\n ");
+                    }
+                }
+                datum_to_json_text(v, &mut out);
+            }
+            out.push(']');
+            Ok(Value::text(out))
+        }
+        AggFunc::JsonbAgg => {
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mut elems = Vec::with_capacity(vals.len());
+            for v in &vals {
+                elems.push(datum_to_jsonb(v)?);
+            }
+            Ok(Value::jsonb(JsonbVal::Array(elems).render()))
+        }
+        // v1.84: json_object_agg — "{ " + `"key" : value` pairs joined
+        // ", " + "}"; a NULL key is 22004 (PG raises it in the
+        // transition function; finalize is observationally equal).
+        AggFunc::JsonObjectAgg => {
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mut out = String::from("{ ");
+            for (i, (k, v)) in vals.iter().zip(delims.iter()).enumerate() {
+                if *k == Value::Null {
+                    return Err(exec_err("22004", "null value not allowed for object key"));
+                }
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                let kt = json_key_text(k)?;
+                out.push('"');
+                escape_json_into(&kt, &mut out);
+                out.push_str("\" : ");
+                datum_to_json_text(v, &mut out);
+            }
+            out.push('}');
+            Ok(Value::text(out))
+        }
+        // v1.88: range_agg — the union of all input ranges as a
+        // multirange. vals holds only non-NULL inputs (the collector
+        // filters them, matching PG's strict transition); zero rows
+        // yield the empty multirange of the statically-known elem
+        // (PG's agginitval '{}'), falling back to int4 when the type
+        // cannot be determined.
+        AggFunc::RangeAgg => {
+            let mut ranges: Vec<RangeVal> = Vec::new();
+            let mut elem_name: Option<(RangeElem, Option<String>)> = None;
+            for v in &vals {
+                match v {
+                    Value::Range(r) => {
+                        elem_name = Some((r.elem, r.name.clone()));
+                        ranges.push((**r).clone());
+                    }
+                    Value::Multirange(m) => {
+                        elem_name = Some((m.elem, m.name.clone()));
+                        ranges.extend(m.ranges.iter().cloned());
+                    }
+                    Value::Text(t) | Value::BpChar(t) => {
+                        // Unknown literal against a statically range
+                        // column cannot reach here (bind coerces), but
+                        // a bare range_agg('[1,2)') parses as int4.
+                        let r = super::ranges::parse_range(RangeElem::Int4, None, t)?;
+                        elem_name = Some((RangeElem::Int4, None));
+                        ranges.push(r);
+                    }
+                    other => {
+                        return Err(exec_err(
+                            "42883",
+                            format!(
+                                "function range_agg({}) does not exist",
+                                other.type_name().to_lowercase()
+                            ),
+                        ));
+                    }
+                }
+            }
+            let (elem, mname) = elem_name.unwrap_or((RangeElem::Int4, None));
+            Ok(Value::multirange(super::ranges::normalize_multi(
+                elem, mname, ranges,
+            )))
+        }
+        // v1.88: range_intersect_agg — the intersection of all input
+        // ranges (or of all ranges in all input multiranges). Zero
+        // rows yield NULL (PG has no initcond for it).
+        AggFunc::RangeIntersectAgg => {
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mut acc: Option<MultiVal> = None;
+            let mut single = true;
+            for v in &vals {
+                let m = match v {
+                    Value::Range(r) => super::ranges::multi_from_range((**r).clone()),
+                    Value::Multirange(m) => {
+                        single = false;
+                        (**m).clone()
+                    }
+                    other => {
+                        return Err(exec_err(
+                            "42883",
+                            format!(
+                                "function range_intersect_agg({}) does not exist",
+                                other.type_name().to_lowercase()
+                            ),
+                        ));
+                    }
+                };
+                acc = Some(match acc {
+                    None => m,
+                    Some(a) => super::ranges::multi_intersect(&a, &m),
+                });
+            }
+            let acc = acc.unwrap();
+            if single {
+                // anyrange form: the result is a range (empty when the
+                // intersection is empty).
+                if acc.ranges.is_empty() {
+                    // The elem survives in acc even with no ranges.
+                    Ok(Value::range(super::ranges::empty_range(
+                        acc.elem,
+                        acc.name.clone(),
+                    )))
+                } else if acc.ranges.len() == 1 {
+                    Ok(Value::range(acc.ranges[0].clone()))
+                } else {
+                    // Disjoint intersection pieces cannot arise from
+                    // intersecting single ranges.
+                    Ok(Value::multirange(acc))
+                }
+            } else {
+                Ok(Value::multirange(acc))
+            }
+        }
+        AggFunc::JsonbObjectAgg => {
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mut pairs = Vec::with_capacity(vals.len());
+            for (k, v) in vals.iter().zip(delims.iter()) {
+                if *k == Value::Null {
+                    return Err(exec_err("22004", "null value not allowed for object key"));
+                }
+                pairs.push((json_key_text(k)?, datum_to_jsonb(v)?));
+            }
+            Ok(Value::jsonb(jsonb_canon(JsonbVal::Object(pairs)).render()))
+        }
     }
 }

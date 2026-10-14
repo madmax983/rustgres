@@ -1157,6 +1157,9 @@ pub(crate) fn elem_scalar_type(elem: crate::storage::ArrayElem) -> ColType {
         E::Date => ColType::Date,
         E::Timestamp => ColType::Timestamp,
         E::Timestamptz => ColType::Timestamptz,
+        E::Time => ColType::Time,         // v1.86
+        E::TimeTz => ColType::TimeTz,     // v1.86
+        E::Interval => ColType::Interval, // v1.86
         E::Numeric => ColType::Numeric(None),
         E::Uuid => ColType::Uuid,
         E::Regclass => ColType::Regclass,
@@ -1223,6 +1226,80 @@ pub(crate) fn eval_row_subquery(
 /// the table (partition leaf) that holds the current row, taken from the
 /// scope's row provenance. Returns an error if provenance is unavailable
 /// (e.g. the row comes from a subquery rather than a base table scan).
+/// v1.86: PG19 `expr AT TIME ZONE zone` on a datetime value
+/// (timestamp.c: timestamptz_zone / timestamp_zone / date_zone /
+/// time_zone / timetz_zone). `zone` is the already-resolved zone
+/// name (the session zone for AT LOCAL). Unknown zones are 42704,
+/// like PG's check_timezone.
+pub(crate) fn eval_at_time_zone(v: &Value, zone: &str) -> Result<Value, ExecError> {
+    use crate::datetime as dt;
+    if !dt::tz_valid(zone) {
+        return Err(exec_err(
+            "42704",
+            format!("time zone \"{}\" not recognized", zone),
+        ));
+    }
+    match v {
+        // Instant -> wall time in the zone.
+        Value::Timestamptz(m) => Ok(Value::Timestamp(dt::timestamptz_to_local_in(*m, zone))),
+        // Wall time in the zone -> instant.
+        Value::Timestamp(m) => {
+            if *m == dt::TS_INFINITY {
+                return Ok(Value::Timestamptz(dt::TS_INFINITY));
+            }
+            if *m == dt::TS_NEG_INFINITY {
+                return Ok(Value::Timestamptz(dt::TS_NEG_INFINITY));
+            }
+            let utc = dt::local_in_zone_to_utc(zone, *m);
+            if !dt::is_valid_ts_micros(utc) {
+                return Err(exec_err("22008", "timestamp out of range"));
+            }
+            Ok(Value::Timestamptz(utc))
+        }
+        // Date -> midnight of the date in the zone, as an instant.
+        Value::Date(d) => {
+            if *d == dt::DATE_INFINITY {
+                return Ok(Value::Timestamptz(dt::TS_INFINITY));
+            }
+            if *d == dt::DATE_NEG_INFINITY {
+                return Ok(Value::Timestamptz(dt::TS_NEG_INFINITY));
+            }
+            let local = (*d as i64)
+                .checked_mul(86_400_000_000)
+                .ok_or_else(|| exec_err("22008", "timestamp out of range"))?;
+            let utc = dt::local_in_zone_to_utc(zone, local);
+            if !dt::is_valid_ts_micros(utc) {
+                return Err(exec_err("22008", "timestamp out of range"));
+            }
+            Ok(Value::Timestamptz(utc))
+        }
+        // Time -> timetz carrying the zone's offset today (PG
+        // time_zone resolves the offset via the current date).
+        Value::Time(t) => {
+            let base = dt::txn_today_days() as i64 * 86_400_000_000 + *t;
+            let (off, _) = dt::tz_lookup_local(zone, base).unwrap_or((0, String::new()));
+            Ok(Value::TimeTz(*t, off))
+        }
+        // Timetz -> timestamptz at today's date in the zone (PG
+        // timetz_zone).
+        Value::TimeTz(t, _) => {
+            let local = dt::txn_today_days() as i64 * 86_400_000_000 + *t;
+            let utc = dt::local_in_zone_to_utc(zone, local);
+            if !dt::is_valid_ts_micros(utc) {
+                return Err(exec_err("22008", "timestamp out of range"));
+            }
+            Ok(Value::Timestamptz(utc))
+        }
+        other => Err(exec_err(
+            "42883",
+            format!(
+                "operator does not exist: {} AT TIME ZONE text",
+                other.type_name().to_lowercase()
+            ),
+        )),
+    }
+}
+
 pub(crate) fn eval_tableoid(
     q: &mut Q,
     scopes: &[Scope],
@@ -1524,6 +1601,32 @@ pub(crate) fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, 
                 return eval_regclass_cast(q, &v);
             }
             eval_cast(&v, *to)
+        }
+        // v1.86: `expr AT TIME ZONE zone` / `AT LOCAL` (PG19
+        // timestamp.c timezone conversions; see eval_at_time_zone).
+        Expr::AtTimeZone { expr, zone } => {
+            let v = eval_expr(q, scopes, expr)?;
+            if v == Value::Null {
+                return Ok(Value::Null);
+            }
+            let zone_name = match zone {
+                Some(z) => match eval_expr(q, scopes, z)? {
+                    Value::Text(s) | Value::BpChar(s) => s.to_string(),
+                    Value::Null => return Ok(Value::Null),
+                    other => {
+                        return Err(exec_err(
+                            "42883",
+                            format!(
+                                "operator does not exist: {} AT TIME ZONE {}",
+                                v.type_name().to_lowercase(),
+                                other.type_name().to_lowercase()
+                            ),
+                        ));
+                    }
+                },
+                None => crate::datetime::session_tz_name(),
+            };
+            eval_at_time_zone(&v, &zone_name)
         }
         // v0.81: `ROW(a, b, ...)` — evaluates to a composite record with
         // PG's `f1`, `f2`, ... field names.
@@ -2103,6 +2206,13 @@ pub(crate) fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
         | Expr::IsNull { expr, .. }
         | Expr::IsBool { expr, .. }
         | Expr::Extract { from: expr, .. } => walk_expr(expr, f),
+        // v1.86: AT TIME ZONE.
+        Expr::AtTimeZone { expr, zone } => {
+            walk_expr(expr, f);
+            if let Some(z) = zone {
+                walk_expr(z, f);
+            }
+        }
         // v0.81: row constructors recurse into each element.
         Expr::Row(elems) => {
             for el in elems {
@@ -3697,7 +3807,37 @@ pub(crate) fn not3(v: Option<bool>) -> Option<bool> {
 /// naturally. Mismatched non-null types are 42883, like Postgres.
 /// Date as a timestamp (midnight) for mixed date/timestamp comparisons.
 pub(crate) fn date_as_ts(d: i32) -> i64 {
-    d as i64 * 86_400_000_000
+    // v1.86: saturate instead of overflowing (debug panic) — dates
+    // beyond the timestamp range compare past every finite timestamp,
+    // which is the only observable the comparison callers need.
+    (d as i64)
+        .checked_mul(86_400_000_000)
+        .unwrap_or(if d < 0 { i64::MIN } else { i64::MAX })
+}
+
+/// v1.86: date -> timestamptz for mixed comparisons: midnight in
+/// the session zone (PG's date->timestamptz cast), sentinels mapped,
+/// out-of-range finite dates fall back to the naive midnight (the
+/// comparison then simply cannot be equal, like PG's error path
+/// being unreachable for representable pairs).
+pub(crate) fn date_as_timestamptz(d: i32) -> i64 {
+    use crate::datetime as dt;
+    match d {
+        dt::DATE_INFINITY => dt::TS_INFINITY,
+        dt::DATE_NEG_INFINITY => dt::TS_NEG_INFINITY,
+        _ => dt::date_to_timestamptz(d).unwrap_or_else(|_| date_as_ts(d)),
+    }
+}
+
+/// v1.86: timestamp -> timestamptz for mixed comparisons: the wall
+/// time read in the session zone (PG's timestamp->timestamptz cast).
+pub(crate) fn timestamp_as_timestamptz(t: i64) -> i64 {
+    use crate::datetime as dt;
+    match t {
+        dt::TS_INFINITY => dt::TS_INFINITY,
+        dt::TS_NEG_INFINITY => dt::TS_NEG_INFINITY,
+        _ => dt::timestamp_to_timestamptz(t).unwrap_or(t),
+    }
 }
 
 /// v0.81: PG19 record comparison (`record_eq`, `record_lt`, ...).
@@ -3821,6 +3961,49 @@ pub(crate) fn pg_float_ord(a: f64, b: f64) -> Ordering {
     }
 }
 
+/// v1.86: is this a datetime-family value (for unknown-literal
+/// coercion in comparisons)?
+pub(crate) fn is_datetime_value(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::Date(_)
+            | Value::Timestamp(_)
+            | Value::Timestamptz(_)
+            | Value::Time(_)
+            | Value::TimeTz(..)
+            | Value::Interval(_)
+    )
+}
+
+/// v1.86: parse unknown-literal text as the peer datetime value's
+/// type (PG's unknown-literal resolution in comparisons).
+pub(crate) fn parse_as_datetime(t: &str, peer: &Value) -> Result<Value, ExecError> {
+    use crate::datetime as dt;
+    let bad = |e: String| exec_err(dt_sqlstate(&e), e);
+    Ok(match peer {
+        Value::Date(_) => Value::Date(dt::parse_date(t).map_err(bad)?),
+        Value::Timestamp(_) => Value::Timestamp(dt::parse_timestamp(t).map_err(bad)?),
+        Value::Timestamptz(_) => Value::Timestamptz(dt::parse_timestamptz(t).map_err(bad)?),
+        Value::Time(_) => Value::Time(dt::parse_time(t).map_err(bad)?),
+        Value::TimeTz(..) => {
+            let (tod, off) = dt::parse_timetz(t).map_err(bad)?;
+            Value::TimeTz(tod, off)
+        }
+        Value::Interval(_) => Value::Interval(dt::parse_interval(t).map_err(bad)?),
+        _ => unreachable!(),
+    })
+}
+
+/// v1.86: the datetime parsers carry PG message text; range failures
+/// read "out of range" and map to 22008, everything else is 22P02.
+pub(crate) fn dt_sqlstate(msg: &str) -> &'static str {
+    if msg.contains("out of range") || msg.contains("overflow") {
+        "22008"
+    } else {
+        "22P02"
+    }
+}
+
 pub(crate) fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ordering>, ExecError> {
     // v0.82: `*=` (ImageEq) exists only for record operands. PG has no
     // such operator for scalars, so `1 *= 2` is 42883 "operator does
@@ -3837,8 +4020,54 @@ pub(crate) fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ord
             ),
         ));
     }
+    // v1.86: unknown-literal coercion for the datetime family — a
+    // text operand against a datetime operand parses as that type
+    // (PG resolves the unknown literal to the peer type; failures
+    // are the type's input error, 22P02/22008).
+    match (a, b) {
+        (Value::Text(t) | Value::BpChar(t), other) if is_datetime_value(other) => {
+            let parsed = parse_as_datetime(t, other)?;
+            return cmp_ordering(&parsed, other, op);
+        }
+        (other, Value::Text(t) | Value::BpChar(t)) if is_datetime_value(other) => {
+            let parsed = parse_as_datetime(t, other)?;
+            return cmp_ordering(other, &parsed, op);
+        }
+        _ => {}
+    }
+    // v1.88: unknown-literal coercion for ranges — a text operand
+    // against a range/multirange parses as that type (PG resolves the
+    // unknown literal to the peer type).
+    match (a, b) {
+        (Value::Text(t) | Value::BpChar(t), Value::Range(r)) => {
+            let parsed = crate::exec::ranges::parse_range(r.elem, r.name.clone(), t)?;
+            return cmp_ordering(&Value::range(parsed), b, op);
+        }
+        (Value::Range(r), Value::Text(t) | Value::BpChar(t)) => {
+            let parsed = crate::exec::ranges::parse_range(r.elem, r.name.clone(), t)?;
+            return cmp_ordering(a, &Value::range(parsed), op);
+        }
+        (Value::Text(t) | Value::BpChar(t), Value::Multirange(m)) => {
+            let parsed = crate::exec::ranges::parse_multirange(m.elem, m.name.clone(), t)?;
+            return cmp_ordering(&Value::multirange(parsed), b, op);
+        }
+        (Value::Multirange(m), Value::Text(t) | Value::BpChar(t)) => {
+            let parsed = crate::exec::ranges::parse_multirange(m.elem, m.name.clone(), t)?;
+            return cmp_ordering(a, &Value::multirange(parsed), op);
+        }
+        _ => {}
+    }
     match (a, b) {
         (Value::Null, _) | (_, Value::Null) => Ok(None),
+        // v1.88: range / multirange comparisons (PG range_cmp /
+        // multirange_cmp; range vs multirange of the same elem compare
+        // by wrapping the range — PG forbids mixing range types).
+        (Value::Range(x), Value::Range(y)) if x.elem == y.elem => {
+            Ok(Some(crate::exec::ranges::range_cmp(x, y)))
+        }
+        (Value::Multirange(x), Value::Multirange(y)) if x.elem == y.elem => {
+            Ok(Some(crate::exec::ranges::multirange_cmp(x, y)))
+        }
         (x, y) if is_exact_numeric(x) && is_exact_numeric(y) => {
             Ok(Some(match (exact_as_i64(x), exact_as_i64(y)) {
                 (Some(a), Some(b)) => a.cmp(&b),
@@ -3856,6 +4085,14 @@ pub(crate) fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ord
             Ok(Some(pg_float_ord(float_val(x), exact_to_f64(y))))
         }
         (Value::Text(x), Value::Text(y)) => Ok(Some(x.cmp(y))),
+        // v1.83: jsonb comparison operators use PG's total order
+        // (jsonb_util.c compareJsonbContainers); equality under it is
+        // semantic (key order and numeric scale irrelevant).
+        (Value::Jsonb(x), Value::Jsonb(y)) => {
+            let va = parse_jsonb(x)?;
+            let vb = parse_jsonb(y)?;
+            Ok(Some(jsonb_cmp(&va, &vb)))
+        }
         // v0.35: PG's bpcharcmp ignores trailing spaces (bcTruelen):
         // when either side is a blank-padded char, compare the
         // significant (rtrimmed) contents.
@@ -3872,16 +4109,29 @@ pub(crate) fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ord
         (Value::Date(x), Value::Date(y)) => Ok(Some(x.cmp(y))),
         (Value::Timestamp(x), Value::Timestamp(y)) => Ok(Some(x.cmp(y))),
         (Value::Timestamptz(x), Value::Timestamptz(y)) => Ok(Some(x.cmp(y))),
+        // v1.86: time compares by time of day; timetz by the UTC
+        // reading then the offset (PG timetz_cmp); intervals by
+        // PG's span comparison.
+        (Value::Time(x), Value::Time(y)) => Ok(Some(x.cmp(y))),
+        (Value::TimeTz(t1, o1), Value::TimeTz(t2, o2)) => Ok(Some(
+            (t1 - *o1 as i64 * 1_000_000, *o1).cmp(&(t2 - *o2 as i64 * 1_000_000, *o2)),
+        )),
+        (Value::Interval(x), Value::Interval(y)) => Ok(Some(crate::datetime::interval_cmp(x, y))),
         // Postgres casts date up to timestamp/timestamptz for mixed
-        // comparisons (date is midnight).
+        // comparisons (date is midnight; v1.86: in the session zone
+        // for timestamptz, like PG's cast).
         (Value::Date(d), Value::Timestamp(t)) => Ok(Some(date_as_ts(*d).cmp(t))),
         (Value::Timestamp(t), Value::Date(d)) => Ok(Some(t.cmp(&date_as_ts(*d)))),
-        (Value::Date(d), Value::Timestamptz(t)) => Ok(Some(date_as_ts(*d).cmp(t))),
-        (Value::Timestamptz(t), Value::Date(d)) => Ok(Some(t.cmp(&date_as_ts(*d)))),
-        // Postgres casts timestamp up to timestamptz (session zone; v0.7
-        // is UTC-only so this is exact).
-        (Value::Timestamp(t), Value::Timestamptz(z)) => Ok(Some(t.cmp(z))),
-        (Value::Timestamptz(z), Value::Timestamp(t)) => Ok(Some(z.cmp(t))),
+        (Value::Date(d), Value::Timestamptz(t)) => Ok(Some(date_as_timestamptz(*d).cmp(t))),
+        (Value::Timestamptz(t), Value::Date(d)) => Ok(Some(t.cmp(&date_as_timestamptz(*d)))),
+        // Postgres casts timestamp up to timestamptz in the session
+        // zone (v1.86; was a naive identity in the UTC-only engine).
+        (Value::Timestamp(t), Value::Timestamptz(z)) => {
+            Ok(Some(timestamp_as_timestamptz(*t).cmp(z)))
+        }
+        (Value::Timestamptz(z), Value::Timestamp(t)) => {
+            Ok(Some(z.cmp(&timestamp_as_timestamptz(*t))))
+        }
         (Value::Bytea(x), Value::Bytea(y)) => Ok(Some(x.cmp(y))),
         (Value::Uuid(x), Value::Uuid(y)) => Ok(Some(x.cmp(y))),
         // v0.36: PG's "char" comparison is a plain byte comparison

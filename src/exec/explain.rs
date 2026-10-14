@@ -97,6 +97,9 @@ pub(crate) fn pg_array_elem_label(e: ArrayElem) -> Option<&'static str> {
         ArrayElem::Date => "date",
         ArrayElem::Timestamp => "timestamp without time zone",
         ArrayElem::Timestamptz => "timestamp with time zone",
+        ArrayElem::Time => "time without time zone", // v1.86
+        ArrayElem::TimeTz => "time with time zone",  // v1.86
+        ArrayElem::Interval => "interval",           // v1.86
         ArrayElem::Numeric => "numeric",
         ArrayElem::Uuid => "uuid",
         ArrayElem::Regclass => "regclass",
@@ -132,6 +135,7 @@ pub(crate) fn pg_type_label(ty: ColType) -> Option<String> {
         ColType::Uuid => Some("uuid".to_string()),
         ColType::Name => Some("name".to_string()),
         ColType::Json => Some("json".to_string()),
+        ColType::Jsonb => Some("jsonb".to_string()), // v1.83
         ColType::Array(e) => Some(format!("{}[]", pg_array_elem_label(e)?)),
         _ => None,
     }
@@ -194,7 +198,8 @@ pub(crate) fn pg_coerced_text(s: &str, ty: ColType) -> Option<String> {
         | ColType::Timestamptz
         | ColType::Uuid
         | ColType::Bytea
-        | ColType::Json => Some(format!("{}::{label}", pg_quote_literal(s))),
+        | ColType::Json
+        | ColType::Jsonb => Some(format!("{}::{label}", pg_quote_literal(s))),
         ColType::Array(_) => Some(format!("{}::{label}", pg_quote_literal(s))),
         _ => None,
     }

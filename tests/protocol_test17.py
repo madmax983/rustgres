@@ -564,9 +564,13 @@ def group_e_datetime(c):
         msgs = c.query(f"SELECT {fn}")
         v = simple_single_value(msgs)
         check(f"{fn} returns a timestamp", v is not None and len(v) >= 10, str(v))
-    # age / justify stay unimplemented -> 42883
+    # age / justify implemented in v1.86 (were unimplemented -> 42883)
     msgs = c.query("SELECT age(TIMESTAMP '2026-09-12', TIMESTAMP '2026-09-11')")
-    check("age() is 42883", simple_err(msgs, "42883"))
+    v = simple_single_value(msgs)
+    check("age() works", v == "1 day", str(v))
+    msgs = c.query("SELECT justify_days(INTERVAL '40 days')")
+    v = simple_single_value(msgs)
+    check("justify_days works", v == "1 mon 10 days", str(v))
 
 
 def main():

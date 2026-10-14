@@ -55,7 +55,12 @@ pub enum ColType {
     Date,        // OID 1082 (v0.7)
     Timestamp,   // OID 1114 (v0.7)
     Timestamptz, // OID 1184 (v0.7)
-    Bytea,       // OID 17 (v0.7)
+    // v1.86: PG's time (OID 1083), timetz (OID 1266), and interval
+    // (OID 1186) types — the datetime family the engine lacked.
+    Time,     // OID 1083
+    TimeTz,   // OID 1266
+    Interval, // OID 1186
+    Bytea,    // OID 17 (v0.7)
     // v1.39: PG's `bit` fixed-length bit-string type (OID 1560) — the
     // result type of `x'...'`/`b'...'` literals (PG19 `bit_in`). The
     // value's bit length is carried on the value itself (PG stores the
@@ -100,6 +105,27 @@ pub enum ColType {
     // `row_to_json`. Values are carried as `Value::Text` holding the
     // JSON document text.
     Json, // OID 114
+    // v1.83: PG's `jsonb` type (OID 3802). Values are carried as
+    // `Value::Jsonb` holding the canonical jsonb text (exactly what
+    // PG's `jsonb_out` renders: keys sorted by (length, bytewise) and
+    // deduplicated last-wins, numbers as PG numerics).
+    Jsonb, // OID 3802
+    // v1.85: PG's `jsonpath` type (OID 4072). Values are carried as
+    // `Value::Jsonpath` holding the PG-rendered (jsonpath_out) text;
+    // the engine re-parses that text on evaluation (it is valid
+    // jsonpath input by construction).
+    Jsonpath, // OID 4072
+    // v1.88: PG's range types (pg_type.dat): int4range 3904, numrange
+    // 3906, tsrange 3908, tstzrange 3910, daterange 3912, int8range 3926.
+    // The subtype is a `RangeElem` so `ColType` stays `Copy`; user range
+    // types over the non-builtin elems (int2/text/float8) never appear
+    // as a bare `ColType` — they ride the named-type channel like
+    // composites (OID 2249 fallback via `Composite` in DDL).
+    Range(RangeElem),
+    // v1.88: PG's multirange types: int4multirange 4451, nummultirange
+    // 4532, tsmultirange 4533, tstzmultirange 4534, datemultirange 4535,
+    // int8multirange 4536.
+    Multirange(RangeElem),
     // v0.78: PG's array type — carries the element type. Arrays only
     // flow through expression evaluation (like Record/Json); table
     // columns cannot be arrays (no DDL support). Values are carried as
@@ -111,6 +137,141 @@ pub enum ColType {
     // multidimensional arrays, so an array's element is never itself
     // an array.
     Array(ArrayElem),
+}
+
+/// v1.88: the subtype family of a range / multirange type. Bounds are
+/// carried as plain `Value`s of the matching scalar kind, so all range
+/// machinery is written once over `Value` comparisons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RangeElem {
+    Int4,
+    Int8,
+    Int2,
+    Num,
+    Date,
+    Ts,
+    Tstz,
+    Text,
+    Float8,
+}
+
+impl RangeElem {
+    /// Discrete subtypes have a canonical form `[lo, hi)` (PG's
+    /// canonical functions step exclusive/inclusive bounds by one).
+    pub fn discrete(self) -> bool {
+        matches!(
+            self,
+            RangeElem::Int4 | RangeElem::Int8 | RangeElem::Int2 | RangeElem::Date
+        )
+    }
+    /// The builtin range type name for this elem, when one exists
+    /// (int2/text/float8 ranges exist only as user-defined types).
+    pub fn range_name(self) -> Option<&'static str> {
+        Some(match self {
+            RangeElem::Int4 => "int4range",
+            RangeElem::Int8 => "int8range",
+            RangeElem::Num => "numrange",
+            RangeElem::Date => "daterange",
+            RangeElem::Ts => "tsrange",
+            RangeElem::Tstz => "tstzrange",
+            _ => return None,
+        })
+    }
+    pub fn multirange_name(self) -> Option<&'static str> {
+        Some(match self {
+            RangeElem::Int4 => "int4multirange",
+            RangeElem::Int8 => "int8multirange",
+            RangeElem::Num => "nummultirange",
+            RangeElem::Date => "datemultirange",
+            RangeElem::Ts => "tsmultirange",
+            RangeElem::Tstz => "tstzmultirange",
+            _ => return None,
+        })
+    }
+    /// PG `pg_type.typname` of the subtype, for error messages.
+    pub fn elem_typname(self) -> &'static str {
+        match self {
+            RangeElem::Int4 => "integer",
+            RangeElem::Int8 => "bigint",
+            RangeElem::Int2 => "smallint",
+            RangeElem::Num => "numeric",
+            RangeElem::Date => "date",
+            RangeElem::Ts => "timestamp without time zone",
+            RangeElem::Tstz => "timestamp with time zone",
+            RangeElem::Text => "text",
+            RangeElem::Float8 => "double precision",
+        }
+    }
+    /// WAL/stable code for the elem (append-only).
+    pub fn code(self) -> u8 {
+        match self {
+            RangeElem::Int4 => 0,
+            RangeElem::Int8 => 1,
+            RangeElem::Num => 2,
+            RangeElem::Date => 3,
+            RangeElem::Ts => 4,
+            RangeElem::Tstz => 5,
+            RangeElem::Int2 => 6,
+            RangeElem::Text => 7,
+            RangeElem::Float8 => 8,
+        }
+    }
+    pub fn from_code(c: u8) -> Option<RangeElem> {
+        Some(match c {
+            0 => RangeElem::Int4,
+            1 => RangeElem::Int8,
+            2 => RangeElem::Num,
+            3 => RangeElem::Date,
+            4 => RangeElem::Ts,
+            5 => RangeElem::Tstz,
+            6 => RangeElem::Int2,
+            7 => RangeElem::Text,
+            8 => RangeElem::Float8,
+            _ => return None,
+        })
+    }
+    /// Map a scalar `ColType` to its range elem (for CREATE TYPE AS
+    /// RANGE subtype resolution and constructor result typing).
+    pub fn of_coltype(ct: &ColType) -> Option<RangeElem> {
+        Some(match ct {
+            ColType::Int => RangeElem::Int4,
+            ColType::BigInt => RangeElem::Int8,
+            ColType::SmallInt => RangeElem::Int2,
+            ColType::Numeric(..) => RangeElem::Num,
+            ColType::Date => RangeElem::Date,
+            ColType::Timestamp => RangeElem::Ts,
+            ColType::Timestamptz => RangeElem::Tstz,
+            ColType::Text | ColType::Char(_) | ColType::Varchar(_) => RangeElem::Text,
+            ColType::Float => RangeElem::Float8,
+            _ => return None,
+        })
+    }
+}
+
+/// v1.88: one range value (PG's RangeType, deserialized). Bounds are
+/// scalar `Value`s of the elem kind; `None` is an infinite bound.
+/// Discrete ranges are stored canonicalized to `[lo, hi)`; continuous
+/// ranges keep their inclusivity. `empty` ranges have no bounds.
+/// `name` is the user-defined type name for non-builtin range types
+/// (builtins leave it `None` and report `elem`'s canonical name).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RangeVal {
+    pub elem: RangeElem,
+    pub name: Option<String>,
+    pub empty: bool,
+    pub lo: Option<Value>,
+    pub lo_inc: bool,
+    pub hi: Option<Value>,
+    pub hi_inc: bool,
+}
+
+/// v1.88: one multirange value (PG's MultirangeType): a normalized list
+/// of non-empty, sorted, non-overlapping, non-adjacent ranges.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultiVal {
+    pub elem: RangeElem,
+    pub name: Option<String>,
+    pub ranges: Vec<RangeVal>,
 }
 
 /// v0.78: the scalar element type of a `ColType::Array`.
@@ -131,6 +292,9 @@ pub enum ArrayElem {
     Date,
     Timestamp,
     Timestamptz,
+    Time,
+    TimeTz,
+    Interval,
     Numeric,
     Uuid,
     Regclass,
@@ -166,11 +330,23 @@ impl ArrayElem {
             ColType::Date => ArrayElem::Date,
             ColType::Timestamp => ArrayElem::Timestamp,
             ColType::Timestamptz => ArrayElem::Timestamptz,
+            ColType::Time => ArrayElem::Time,
+            ColType::TimeTz => ArrayElem::TimeTz,
+            ColType::Interval => ArrayElem::Interval,
             ColType::Numeric(..) => ArrayElem::Numeric,
             ColType::Uuid => ArrayElem::Uuid,
             ColType::Regclass => ArrayElem::Regclass,
             ColType::Json => ArrayElem::Json,
+            // v1.83: jsonb[] (PG _jsonb, OID 3807) is not supported;
+            // array-of-jsonb degrades to the json element kind.
+            ColType::Jsonb => ArrayElem::Json,
+            // v1.85: jsonpath[] (PG _jsonpath, OID 4073) is not
+            // supported either; same degradation as jsonb.
+            ColType::Jsonpath => ArrayElem::Json,
             ColType::Record => ArrayElem::Record,
+            // v1.88: range/multirange arrays are not supported; degrade
+            // like jsonb (element kind is not representable in ArrayElem).
+            ColType::Range(_) | ColType::Multirange(_) => ArrayElem::Record,
             // v0.81: named composites are not arrayable yet.
             ColType::Composite => ArrayElem::Record,
             ColType::PgLsn => ArrayElem::PgLsn,
@@ -197,6 +373,9 @@ impl ArrayElem {
             ArrayElem::Date => 1182,
             ArrayElem::Timestamp => 1115,
             ArrayElem::Timestamptz => 1185,
+            ArrayElem::Time => 1183,
+            ArrayElem::TimeTz => 1270,
+            ArrayElem::Interval => 1187,
             ArrayElem::Numeric => 1231,
             ArrayElem::Uuid => 2951,
             ArrayElem::Regclass => 2206,
@@ -228,6 +407,9 @@ impl ArrayElem {
             ArrayElem::Date => "date",
             ArrayElem::Timestamp => "timestamp without time zone",
             ArrayElem::Timestamptz => "timestamp with time zone",
+            ArrayElem::Time => "time without time zone",
+            ArrayElem::TimeTz => "time with time zone",
+            ArrayElem::Interval => "interval",
             ArrayElem::Numeric => "numeric",
             ArrayElem::Uuid => "uuid",
             ArrayElem::Regclass => "regclass",
@@ -258,6 +440,9 @@ impl ArrayElem {
             ArrayElem::Date => "date",
             ArrayElem::Timestamp => "timestamp",
             ArrayElem::Timestamptz => "timestamptz",
+            ArrayElem::Time => "time",
+            ArrayElem::TimeTz => "timetz",
+            ArrayElem::Interval => "interval",
             ArrayElem::Numeric => "numeric",
             ArrayElem::Uuid => "uuid",
             ArrayElem::Regclass => "regclass",
@@ -378,6 +563,9 @@ impl ColType {
             ColType::Date => 1082,        // DATE
             ColType::Timestamp => 1114,   // TIMESTAMP
             ColType::Timestamptz => 1184, // TIMESTAMPTZ
+            ColType::Time => 1083,        // TIME (v1.86)
+            ColType::TimeTz => 1266,      // TIMETZ (v1.86)
+            ColType::Interval => 1186,    // INTERVAL (v1.86)
             ColType::Bytea => 17,         // BYTEA
             ColType::Bit => 1560,         // BIT (v1.39)
             ColType::Uuid => 2950,        // UUID
@@ -386,7 +574,31 @@ impl ColType {
             ColType::Record => 2249,      // RECORD (v0.73)
             // v0.81: named composite; PG uses the rowtype OID, we use record's.
             ColType::Composite => 2249,
-            ColType::Json => 114, // JSON (v0.73)
+            ColType::Json => 114,      // JSON (v0.73)
+            ColType::Jsonb => 3802,    // JSONB (v1.83)
+            ColType::Jsonpath => 4072, // JSONPATH (v1.85)
+            // v1.88: range / multirange OIDs (pg_type.dat). Non-builtin
+            // elems have no builtin type; 2249 (record) is the fallback,
+            // matching how user types surface (they normally ride the
+            // named-type channel and never reach this as a bare type).
+            ColType::Range(e) => match e {
+                RangeElem::Int4 => 3904,
+                RangeElem::Num => 3906,
+                RangeElem::Ts => 3908,
+                RangeElem::Tstz => 3910,
+                RangeElem::Date => 3912,
+                RangeElem::Int8 => 3926,
+                _ => 2249,
+            },
+            ColType::Multirange(e) => match e {
+                RangeElem::Int4 => 4451,
+                RangeElem::Num => 4532,
+                RangeElem::Ts => 4533,
+                RangeElem::Tstz => 4534,
+                RangeElem::Date => 4535,
+                RangeElem::Int8 => 4536,
+                _ => 2249,
+            },
             // v0.78: PG's _<elem> array OIDs (pg_type.dat).
             ColType::Array(e) => e.array_oid() as i32,
         }
@@ -416,6 +628,9 @@ impl ColType {
             ColType::Date => "date",
             ColType::Timestamp => "timestamp without time zone",
             ColType::Timestamptz => "timestamp with time zone",
+            ColType::Time => "time without time zone", // v1.86
+            ColType::TimeTz => "time with time zone",  // v1.86
+            ColType::Interval => "interval",           // v1.86
             ColType::Bytea => "bytea",
             ColType::Bit => "bit", // v1.39
             ColType::Uuid => "uuid",
@@ -427,7 +642,24 @@ impl ColType {
             ColType::Record => "record", // v0.73
             // v0.81: resolved to the actual name at execution time.
             ColType::Composite => "record",
-            ColType::Json => "json", // v0.73
+            ColType::Json => "json",         // v0.73
+            ColType::Jsonb => "jsonb",       // v1.83
+            ColType::Jsonpath => "jsonpath", // v1.85
+            // v1.88: range names double as SQL name and typname for the
+            // builtin elems; user elems fall back to the elem-derived
+            // spelling (values carry the real name when it matters).
+            ColType::Range(e) => {
+                return e
+                    .range_name()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("{}range", e.elem_typname()));
+            }
+            ColType::Multirange(e) => {
+                return e
+                    .multirange_name()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("{}multirange", e.elem_typname()));
+            }
             ColType::Array(_) => unreachable!("arrays return early above"),
         }
         .to_string()
@@ -459,6 +691,9 @@ impl ColType {
             ColType::Date => "date",
             ColType::Timestamp => "timestamp",
             ColType::Timestamptz => "timestamptz",
+            ColType::Time => "time",         // v1.86
+            ColType::TimeTz => "timetz",     // v1.86
+            ColType::Interval => "interval", // v1.86
             ColType::Bytea => "bytea",
             ColType::Bit => "bit", // v1.39
             ColType::Uuid => "uuid",
@@ -470,7 +705,21 @@ impl ColType {
             ColType::Record => "record", // v0.73
             // v0.81: resolved to the actual name at execution time.
             ColType::Composite => "record",
-            ColType::Json => "json", // v0.73
+            ColType::Json => "json",         // v0.73
+            ColType::Jsonb => "jsonb",       // v1.83
+            ColType::Jsonpath => "jsonpath", // v1.85
+            ColType::Range(e) => {
+                return e
+                    .range_name()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("{}range", e.elem_typname()));
+            }
+            ColType::Multirange(e) => {
+                return e
+                    .multirange_name()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("{}multirange", e.elem_typname()));
+            }
             ColType::Array(_) => unreachable!("arrays return early above"),
         }
         .to_string()
@@ -4237,8 +4486,15 @@ pub enum Value {
     Date(i32),        // v0.7: days since 1970-01-01
     Timestamp(i64),   // v0.7: micros since 1970-01-01 00:00:00 UTC
     Timestamptz(i64), // v0.7: micros since epoch, UTC
-    Bytea(Vec<u8>),   // v0.7
-    Uuid([u8; 16]),   // v0.7
+    // v1.86: time of day (micros since midnight, 0..=86_400_000_000).
+    Time(i64),
+    // v1.86: time of day with a fixed zone offset (micros, seconds
+    // east of UTC), PG's TimeTzADT.
+    TimeTz(i64, i32),
+    // v1.86: PG's interval triple (months, days, micros).
+    Interval(crate::datetime::Interval),
+    Bytea(Vec<u8>), // v0.7
+    Uuid([u8; 16]), // v0.7
     // v1.39: PG's `bit` fixed-length bit string (OID 1560) — the value
     // of `x'...'`/`b'...'` literals. The bit length rides on the value
     // (PG's VarBit datum carries its typmod); display is the bit
@@ -4247,6 +4503,22 @@ pub enum Value {
     // v0.64: PG's pg_lsn (OID 3220), stored as the raw u64 value.
     // Displays as HIGH/LOW uppercase hex (LOW zero-padded to 8).
     PgLsn(u64),
+    // v1.83: a jsonb value — the canonical jsonb text (what PG's
+    // `jsonb_out` renders), in its own variant so casts, operators,
+    // comparisons, and type inference can distinguish jsonb from both
+    // `json` and plain `text` (both of which ride in `Value::Text`).
+    // Operations parse the canonical text on demand, like v1.82's
+    // json operators parse their document text.
+    Jsonb(Arc<str>),
+    // v1.85: a jsonpath value — the PG-rendered text (jsonpath_out),
+    // in its own variant like Jsonb so casts, operators, and type
+    // inference can distinguish it from plain text.
+    Jsonpath(Arc<str>),
+    // v1.88: a range value (PG's RangeType, deserialized). Boxed like
+    // Array: ranges are rare next to scalars.
+    Range(Box<RangeVal>),
+    // v1.88: a multirange value (PG's MultirangeType, normalized).
+    Multirange(Box<MultiVal>),
     // v0.73: a whole-row (composite) value — PG19's whole-row Var
     // (varattno = 0). Field names travel with the value so `row_to_json`
     // can label its object keys; the text format `(f1,f2,...)` ignores
@@ -4404,6 +4676,28 @@ impl Value {
         Value::BpChar(s.into())
     }
 
+    /// Make a jsonb value from canonical jsonb text (v1.83). The caller
+    /// must have canonicalized (see `exec::json::jsonb_canonical`).
+    pub fn jsonb(s: impl Into<Arc<str>>) -> Value {
+        Value::Jsonb(s.into())
+    }
+
+    /// Make a jsonpath value from rendered jsonpath text (v1.85). The
+    /// caller must have rendered it via the jsonpath engine.
+    pub fn jsonpath(s: impl Into<Arc<str>>) -> Value {
+        Value::Jsonpath(s.into())
+    }
+
+    /// v1.88: make a range value from its (already canonical) parts.
+    pub fn range(r: RangeVal) -> Value {
+        Value::Range(Box::new(r))
+    }
+
+    /// v1.88: make a multirange value from normalized parts.
+    pub fn multirange(m: MultiVal) -> Value {
+        Value::Multirange(Box::new(m))
+    }
+
     /// Text-format encoding for the wire protocol (`None` = NULL).
     /// Matches what psql prints: ints/floats via Display, bools as t/f,
     /// bytea as `\x` hex, timestamps as ISO.
@@ -4416,6 +4710,13 @@ impl Value {
             Value::Float(f) => Some(float_text(*f)),
             Value::Numeric(n) => Some(n.to_text()),
             Value::Text(s) => Some(s.to_string()),
+            // v1.83: jsonb_out — the stored text is already canonical.
+            Value::Jsonb(s) => Some(s.to_string()),
+            // v1.85: jsonpath_out — the stored text is already rendered.
+            Value::Jsonpath(s) => Some(s.to_string()),
+            // v1.88: range_out / multirange_out (canonical text).
+            Value::Range(r) => Some(crate::exec::ranges::range_to_text(r)),
+            Value::Multirange(m) => Some(crate::exec::ranges::multirange_to_text(m)),
             // v0.35: bpchar is stored blank-padded; the wire shows the
             // padded bytes, like Postgres.
             Value::BpChar(s) => Some(s.to_string()),
@@ -4426,6 +4727,10 @@ impl Value {
             Value::Date(d) => Some(crate::datetime::format_date(*d)),
             Value::Timestamp(m) => Some(crate::datetime::format_timestamp(*m)),
             Value::Timestamptz(m) => Some(crate::datetime::format_timestamptz(*m)),
+            // v1.86: time_out / timetz_out / interval_out.
+            Value::Time(t) => Some(crate::datetime::format_time(*t)),
+            Value::TimeTz(t, off) => Some(crate::datetime::format_timetz(*t, *off)),
+            Value::Interval(iv) => Some(crate::datetime::format_interval(iv)),
             Value::Bytea(b) => Some(bytea_text(b)),
             // v1.39: PG19 `bit_out` — the bit characters.
             Value::BitString(b) => Some(b.to_bit_chars()),
@@ -4518,6 +4823,19 @@ impl Value {
             Value::Float(_) => Cow::Borrowed("double precision"),
             Value::Numeric(_) => Cow::Borrowed("numeric"),
             Value::Text(_) => Cow::Borrowed("text"),
+            Value::Jsonb(_) => Cow::Borrowed("jsonb"), // v1.83
+            Value::Jsonpath(_) => Cow::Borrowed("jsonpath"), // v1.85
+            // v1.88: pg_typeof names (user type name wins).
+            Value::Range(r) => Cow::Owned(
+                r.name
+                    .clone()
+                    .unwrap_or_else(|| r.elem.range_name().unwrap_or("range").to_string()),
+            ),
+            Value::Multirange(m) => {
+                Cow::Owned(m.name.clone().unwrap_or_else(|| {
+                    m.elem.multirange_name().unwrap_or("multirange").to_string()
+                }))
+            }
             Value::BpChar(_) => Cow::Borrowed("character"), // v0.35
             // v0.36: PG's format_type(18) renders `"char"` (quoted).
             Value::SingleChar(_) => Cow::Borrowed("\"char\""),
@@ -4525,6 +4843,9 @@ impl Value {
             Value::Date(_) => Cow::Borrowed("date"),
             Value::Timestamp(_) => Cow::Borrowed("timestamp without time zone"),
             Value::Timestamptz(_) => Cow::Borrowed("timestamp with time zone"),
+            Value::Time(_) => Cow::Borrowed("time without time zone"), // v1.86
+            Value::TimeTz(_, _) => Cow::Borrowed("time with time zone"), // v1.86
+            Value::Interval(_) => Cow::Borrowed("interval"),           // v1.86
             Value::Bytea(_) => Cow::Borrowed("bytea"),
             Value::BitString(_) => Cow::Borrowed("bit"), // v1.39
             Value::Tid(_, _) => Cow::Borrowed("tid"),    // v1.40
@@ -4547,6 +4868,11 @@ impl Value {
             Value::Float(_) => ColType::Float,
             Value::Numeric(_) => ColType::Numeric(None),
             Value::Text(_) => ColType::Text,
+            Value::Jsonb(_) => ColType::Jsonb,       // v1.83
+            Value::Jsonpath(_) => ColType::Jsonpath, // v1.85
+            // v1.88: range / multirange values know their elem.
+            Value::Range(r) => ColType::Range(r.elem),
+            Value::Multirange(m) => ColType::Multirange(m.elem),
             // v0.35: the value alone doesn't record the typmod; Char(None)
             // is the honest fallback (bare `character`).
             Value::BpChar(_) => ColType::Char(None),
@@ -4555,6 +4881,9 @@ impl Value {
             Value::Date(_) => ColType::Date,
             Value::Timestamp(_) => ColType::Timestamp,
             Value::Timestamptz(_) => ColType::Timestamptz,
+            Value::Time(_) => ColType::Time,         // v1.86
+            Value::TimeTz(_, _) => ColType::TimeTz,  // v1.86
+            Value::Interval(_) => ColType::Interval, // v1.86
             Value::Bytea(_) => ColType::Bytea,
             Value::BitString(_) => ColType::Bit, // v1.39
             Value::Tid(_, _) => ColType::Tid,    // v1.40
@@ -5252,6 +5581,10 @@ pub struct ShellType {
     /// v0.85: `CREATE DOMAIN` definition. None for shell/LIKE/composite
     /// types; a type is never both composite and domain.
     pub domain: Option<DomainDef>,
+    /// v1.88: `CREATE TYPE ... AS RANGE` definition: `(elem, is_multi)`
+    /// — a range type over `RangeElem`, or its auto-created multirange
+    /// companion when `is_multi` is true.
+    pub range: Option<(RangeElem, bool)>,
 }
 
 /// v0.86: a user-defined function definition. `arg_types` / `ret_type`

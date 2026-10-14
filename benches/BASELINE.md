@@ -2,6 +2,165 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `jsonb_val_arg`/`parse_jsonb` re-parses a jsonb/text argument's entire text into a fresh `JsonbVal` tree on every call — fix — 2026-10-14
+
+Fixes the target identified in the baseline entry immediately below this
+one.
+
+### Change
+
+`src/exec/json.rs`: `parse_jsonb` now checks a thread-local cache,
+keyed by the input text, before tokenizing/validating/sorting
+anything. A hit returns a `Clone` of the cached tree (a direct
+value-copy: allocate-and-memcpy `String`s and exact-capacity `Vec`s,
+no tokenizer, no UTF-8 re-validation, no numeric-literal re-parse, no
+object-key re-sort) instead of re-running `parse_json` +
+`jsonb_from_node`; a miss parses exactly as before and inserts a clone
+of the result into the cache. The cache is bounded at 64 entries,
+matching this repo's existing regex cache
+(`src/regex.rs`'s `REGEX_CACHE_CAP`, added 2026-10-01) and clears
+itself outright rather than evicting LRU-style when that cap is hit —
+the same shape, for the same reason: distinct rows essentially never
+share byte-identical jsonb text (each row's document differs), so this
+cache's entire hit rate lives in the "one row, several function calls
+on the same column value" pattern (e.g. `jsonb_path_exists(doc, ...),
+jsonb_path_match(doc, ...), jsonb_path_query_array(doc, ...)` in one
+SELECT, as in `benches/profile_jsonpath.py`); unbounded growth would
+just be dead weight sitting on an always-miss path for the
+across-row traffic. Only successful parses are cached; invalid input
+still reports the same 22P02 error on every call.
+
+The function's signature is unchanged (`Result<Option<JsonbVal>, ExecError>`
+still returns an owned, independent tree), so none of the 15
+`jsonb_val_arg`/`parse_jsonb`/`jsonb_canonical` call sites across
+`src/exec/funcs.rs` and `src/exec/json.rs` needed to change — the cache
+is entirely internal to `parse_jsonb`.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_jsonpath.py --rows 1000 --count 10`),
+same workload, same machine, same session.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes`):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total `Ir` | 9,410,840,695 | 6,459,050,801 | **-31.37%** |
+| `Parser::parse_string` self-cost | 357,796,668 (3.80%) | 126,960,108 (1.97%) | -64.52% |
+
+DHAT (same workload, one run each before/after):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total allocation blocks | 5,109,505 | 4,401,852 | **-13.85%** |
+| Total allocation bytes | 325,865,100 | 279,555,596 | **-14.21%** |
+
+The `Ir` delta (-31.37%) clears the ≥5%-of-profile floor by over 6x;
+the DHAT deltas (-13.85% blocks, -14.21% bytes) clear the
+≥10%-of-allocations floor independently. Both move in the same
+direction the hypothesis predicted: 2 of every 3 `jsonb_val_arg` calls
+per row (the query evaluates `doc` against 3 different `jsonb_path_*`
+functions) now hit the cache and clone instead of re-parsing, so
+`parse_string`'s absolute self-cost alone drops by nearly two thirds —
+consistent with "1 full parse + 3 cheap clones per row" replacing "3
+full parses per row".
+
+`cargo test --all-features`: 953/953 passed, unchanged. `cargo fmt
+--all -- --check`: clean. `cargo clippy --all-targets --all-features
+-- -D warnings`: 684 errors on both the pre-change and post-change
+tree (sorted-diff identical, confirmed via `git stash`/`git stash
+pop`) — the same pre-existing toolchain/lint-version mismatch noted
+throughout this file; zero new errors/warnings from this diff.
+`tests/conformance/schedule_runner.py --tests
+jsonb,jsonb_jsonpath,jsonpath,jsonpath_encoding,json_encoding,json,sqljson,sqljson_jsontable,sqljson_queryfuncs`:
+identical PASS=2292/REAL-FAIL=1389 (of 3682 scored) on both trees —
+zero behavior change.
+
+Before/after profiles committed:
+`benches/profiles/{callgrind,dhat}.out.jsonpathcache-{base,after}-2026-10-14`.
+
+**Reproduce**: check out the parent (baseline) commit, `cargo build`,
+repeat the Callgrind/DHAT commands in the baseline entry's "Reproduce"
+section for the before numbers; check out this commit, `cargo build`,
+repeat for the after numbers.
+
+## Bolt: `jsonb_val_arg`/`parse_jsonb` re-parses a jsonb/text argument's entire text into a fresh `JsonbVal` tree on every call — baseline — 2026-10-14
+
+**Why this workload**: v1.82-v1.85 (the four commits immediately
+before this round, 2026-10-13/14) added the entire JSON extraction
+operator family, the `jsonb` type, the json/jsonb function clusters,
+and the jsonpath engine (`jsonb_path_*`, SQL/JSON query functions) —
+none of it profiled by any prior Bolt round. `benches/
+profile_jsonpath.py` (new) loads 1000 rows of nested JSON order-event
+documents (a top-level `status`/`total`, a nested `customer` object,
+and a nested `items` array of 3 objects — shaped like a real
+order/event-log payload, not a toy `{"a":1}`), then runs 10 exact
+iterations of `SELECT jsonb_path_exists(doc, '$.items[*] ? (@.qty >
+5)'), jsonb_path_match(doc, '$.status == "shipped"'),
+jsonb_path_query_array(doc, '$.items[*].price') FROM bench_jsonpath`
+— three `jsonb_path_*` functions (predicate/match/extract), each with
+a literal jsonpath argument, over the real wire protocol, debug
+build, fresh data dir. One PR open at the time of this round
+(`#49`, decode `json::parse_string` via `&str` instead of a whole-doc
+UTF-8 revalidation) targets a different function in the same file;
+this round deliberately profiles a different angle to avoid
+duplicating it.
+
+Reproduce:
+```bash
+cargo build
+RUSTGRES_DATA_DIR=$(mktemp -d) valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out --collect-jumps=yes --cache-sim=yes ./target/debug/rustgres &
+python3 benches/profile_jsonpath.py --rows 1000 --count 10 --timeout 600
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | head -40
+# swap --tool=dhat --dhat-out-file=/tmp/dhat.out for the allocation profile
+```
+
+📈 **Profile** (Callgrind, valgrind 3.22.0, current HEAD v1.85): **9,410,840,695**
+total `Ir`. `src/exec/json.rs`'s own parse-path functions
+(`Parser::parse_string`, `parse_value_inner`, `skip_ws`,
+`jsonb_from_node`, `Parser::peek`, `expect`, `parse_number`, …) sum to
+roughly 10% of total `Ir` by self-cost alone, and the generic
+library callees they drive almost exclusively (`core::str::from_utf8`
+3.92% self-cost here — the same O(n²) revalidation PR #49 targets —
+plus `str::validations::next_code_point`, `Vec<char>` iteration,
+`memchr`, UTF-8 encode/decode helpers) push the fully-attributable
+total well past that.
+
+DHAT (same workload): **5,109,505** total allocation blocks,
+**325,865,100** total bytes. Attributing every allocation site whose
+call stack passes through `parse_json`, `json::Parser::*`,
+`jsonb_from_node`, or `parse_jsonb` (i.e. the full text-to-tree
+conversion, as opposed to jsonpath tokenizing/parsing or jsonpath
+*evaluation*, attributed separately) accounts for **53.07%** of total
+allocation blocks and **49.07%** of total bytes — comfortably clearing
+the ≥10%-of-allocations floor on its own. (For comparison, attributing
+by the same method to jsonpath *parsing* alone — `JpLexer`/`JpParser`/
+`tokenize_jsonpath` — comes to 9.61% of blocks, just under the floor;
+evaluation of the already-parsed tree is 20.75% but isn't a cacheable
+cost, since every row's evaluation result genuinely depends on that
+row's document.)
+
+💡 **Hypothesis**: `jsonb_val_arg`'s `parse_jsonb(s)` call depends only
+on its one argument (the text `s`) — nothing about the row, the
+statement, or the connection otherwise affects the tree it produces.
+Every one of this workload's 1000 rows asks 3 separate `jsonb_path_*`
+functions to each independently call `jsonb_val_arg` on the *same*
+`doc` column value (`Value::Jsonb(Arc<str>)`, backed by one shared
+buffer for that row), so 2 of every 3 full parse-and-build cycles per
+row are pure waste: a thread-local cache keyed on the text, exactly
+the same "pure function of its own arguments, so memoize it" shape as
+this repo's existing `compile_opts` regex cache (2026-10-01) and
+`to_char`/`to_number` format-picture cache (2026-10-05), turns 3000
+full parses (1000 rows x 3 calls) into 1000 full parses + 2000 cheap
+clones.
+
+`cargo test --all-features`: 953/953 passed (pre-change tree,
+unmodified).
+
+Before profiles committed:
+`benches/profiles/{callgrind,dhat}.out.jsonpathcache-base-2026-10-14`.
+
 ## Bolt: `json.rs`'s `parse_string` re-validates the entire remaining document as UTF-8 on every character copied — fix — 2026-10-13
 
 Fixes the target identified in the baseline entry immediately below

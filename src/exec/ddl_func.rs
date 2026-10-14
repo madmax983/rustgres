@@ -200,11 +200,30 @@ pub(crate) fn dummy_value_of(ty: &ColType) -> Value {
         ColType::Numeric(_) => Value::Numeric(crate::storage::Numeric::new(1, 0)),
         ColType::Char(_) => Value::BpChar("x".into()),
         ColType::Text | ColType::Varchar(_) | ColType::Name | ColType::Json => Value::text("x"),
+        // v1.83: a valid canonical jsonb dummy.
+        ColType::Jsonb => Value::jsonb("{}"),
+        // v1.85: the root path is the honest jsonpath dummy.
+        ColType::Jsonpath => Value::jsonpath("$"),
+        // v1.88: empty range / multirange dummies.
+        ColType::Range(e) => Value::range(super::ranges::empty_range(*e, None)),
+        ColType::Multirange(e) => Value::multirange(crate::storage::MultiVal {
+            elem: *e,
+            name: None,
+            ranges: Vec::new(),
+        }),
         ColType::SingleChar => Value::SingleChar(b'x'),
         ColType::Bool => Value::Bool(true),
         ColType::Date => Value::Date(1),
         ColType::Timestamp => Value::Timestamp(1),
         ColType::Timestamptz => Value::Timestamptz(1),
+        // v1.86: one second past midnight / a one-second interval.
+        ColType::Time => Value::Time(1_000_000),
+        ColType::TimeTz => Value::TimeTz(1_000_000, 0),
+        ColType::Interval => Value::Interval(crate::datetime::Interval {
+            months: 0,
+            days: 0,
+            micros: 1_000_000,
+        }),
         ColType::Bytea => Value::Bytea(vec![0]),
         // v1.39: one set bit.
         ColType::Bit => Value::BitString(crate::storage::BitString {

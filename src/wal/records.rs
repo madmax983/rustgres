@@ -248,6 +248,9 @@ pub enum WalRecord {
         composite: Option<Vec<(String, ColType, Option<String>)>>,
         /// v0.85: domain definition (None for shell/LIKE/composite types).
         domain: Option<WalDomain>,
+        /// v1.88: range definition as (RangeElem code, is_multirange);
+        /// trailing field, present only in RGSWAL22+ images.
+        range: Option<(u8, bool)>,
         xmin: u64,
     },
     DropType {

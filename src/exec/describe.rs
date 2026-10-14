@@ -347,6 +347,8 @@ pub(crate) fn from_schema_item(
             args,
             alias,
             col_aliases,
+            col_defs,
+            json_table,
             ..
         } => {
             let left: Vec<QCol> = out.iter().flatten().cloned().collect();
@@ -359,6 +361,8 @@ pub(crate) fn from_schema_item(
                 args,
                 alias,
                 col_aliases,
+                col_defs,
+                json_table.as_deref(),
                 &left,
             )?;
             out.push(cols);
@@ -447,13 +451,17 @@ pub(crate) fn from_schema_item(
                     args,
                     alias: falias,
                     col_aliases: fca,
+                    col_defs,
                     lateral,
+                    json_table,
                 } if *lateral || (is_comma && function_args_lateral(args, &lflat)) => {
                     Some(LateralRight::Func {
                         name: name.as_str(),
                         args: args.as_slice(),
                         alias: falias,
                         col_aliases: fca.as_slice(),
+                        col_defs: col_defs.as_slice(),
+                        json_table: json_table.as_deref(),
                     })
                 }
                 FromItem::Derived {
@@ -888,6 +896,16 @@ pub(crate) fn expr_col_name_strength(e: &Expr) -> (String, u8) {
             }
         }
         // v0.18: function calls are named after the function (SELECT sqrt(2) -> "sqrt").
+        // v1.85: SQL/JSON desugars present under their public names.
+        Expr::Func { name, .. } if name.starts_with("__sqljson_") => (
+            match name.as_str() {
+                "__sqljson_value" => "json_value",
+                "__sqljson_query" => "json_query",
+                _ => "json_exists",
+            }
+            .to_string(),
+            2,
+        ),
         Expr::Func { name, .. } => (name.clone(), 2),
         // v0.55: PG names an unaliased CASE output column "case".
         Expr::Case { .. } => ("case".to_string(), 2),
@@ -911,6 +929,27 @@ pub(crate) fn expr_col_name_strength(e: &Expr) -> (String, u8) {
         Expr::ArraySubquery(_) => ("array".to_string(), 2),
         // v0.75: PG names an unaliased EXISTS output column "exists".
         Expr::Exists { .. } => ("exists".to_string(), 2),
+        // v1.86: PG names an EXTRACT output column "extract"
+        // (FigureColnameInternal T_ValueFunction? no — extract is a
+        // SQLValueFunction-like special: parse_target.c names it
+        // "extract"), and an AT TIME ZONE expression takes its
+        // operand's name (it is a timezone-shifted column value).
+        Expr::Extract { .. } => ("extract".to_string(), 2),
+        // PG: AT TIME ZONE is the timezone() function call internally
+        // — the output column is named "timezone".
+        Expr::AtTimeZone { .. } => ("timezone".to_string(), 2),
+        // v1.86: typed datetime literals name their column after the
+        // type (PG TypeCast FigureColname), strength 1 so an outer
+        // cast/qualifier wins.
+        Expr::Literal(lit) => match lit {
+            crate::sql::Literal::Date(_) => ("date".to_string(), 1),
+            crate::sql::Literal::Timestamp(_) => ("timestamp".to_string(), 1),
+            crate::sql::Literal::Timestamptz(_) => ("timestamptz".to_string(), 1),
+            crate::sql::Literal::Time(_) => ("time".to_string(), 1),
+            crate::sql::Literal::TimeTz(..) => ("timetz".to_string(), 1),
+            crate::sql::Literal::Interval(_) => ("interval".to_string(), 1),
+            _ => ("?column?".to_string(), 0),
+        },
         _ => ("?column?".to_string(), 0),
     }
 }
@@ -1024,6 +1063,20 @@ pub(crate) fn expr_type(
             combine_arith_types(*op, ta, tb)
         }
         Expr::Cast { to, .. } => Ok(*to),
+        // v1.86: AT TIME ZONE flips the zone-ness of the operand
+        // type (PG19: timestamptz->timestamp, timestamp->timestamptz,
+        // timetz->time, time->timetz, date->timestamptz).
+        Expr::AtTimeZone { expr, .. } => {
+            let inner = expr_type(eng, snap, own, session, schemas, outer, ctes, expr)?;
+            Ok(match inner {
+                ColType::Timestamptz => ColType::Timestamp,
+                ColType::Timestamp => ColType::Timestamptz,
+                ColType::TimeTz => ColType::Time,
+                ColType::Time => ColType::TimeTz,
+                ColType::Date => ColType::Timestamptz,
+                other => other,
+            })
+        }
         // v0.81: `ROW(a, b, ...)` evaluates to a composite record value.
         Expr::Row(elems) => {
             for e in elems {
@@ -1040,6 +1093,15 @@ pub(crate) fn expr_type(
             expr_type(eng, snap, own, session, schemas, outer, ctes, expr)?;
             match eng.db.types.get(name) {
                 Some(st) if st.composite.is_some() => Ok(ColType::Composite),
+                // v1.88: casts to user-defined range types.
+                Some(st) if st.range.is_some() => {
+                    let (elem, multi) = st.range.expect("range branch");
+                    Ok(if multi {
+                        ColType::Multirange(elem)
+                    } else {
+                        ColType::Range(elem)
+                    })
+                }
                 Some(st) => match st.domain.as_ref() {
                     Some(dom) => Ok(dom.base.clone()),
                     // v1.38: LIKE types carry their base's physical
@@ -1115,6 +1177,7 @@ pub(crate) fn expr_type(
                 | ColType::BigInt
                 | ColType::Float4
                 | ColType::Float
+                | ColType::Interval
                 | ColType::Numeric(..)) => Ok(t),
                 ColType::Text => Ok(ColType::Int),
                 t => Err(exec_err(
@@ -1158,8 +1221,15 @@ pub(crate) fn expr_type(
         Expr::Concat(..) => Ok(ColType::Text),
         // v1.82: PG19 operator return types — `->`/`#>` are json,
         // `->>`/`#>>` are text.
-        Expr::JsonOp { op, .. } => Ok(if op.returns_json() {
-            ColType::Json
+        // v1.83: on a jsonb operand `->`/`#>` return jsonb, and the
+        // containment/existence family returns boolean.
+        Expr::JsonOp { op, left, .. } => Ok(if op.returns_bool() {
+            ColType::Bool
+        } else if op.returns_json() {
+            match expr_type(eng, snap, own, session, schemas, outer, ctes, left) {
+                Ok(ColType::Jsonb) => ColType::Jsonb,
+                _ => ColType::Json,
+            }
         } else {
             ColType::Text
         }),
@@ -1187,6 +1257,16 @@ pub(crate) fn expr_type(
             resolve_func_type_name(eng, snap, own, session, &fdef.ret_type)
         }
         Expr::Func { name, args } => {
+            // v1.85: SQL/JSON DEFAULT restrictions are analysis-time
+            // in PG — enforce them here too so they fire even when
+            // the query returns zero rows (see eval_func).
+            if name == "__sqljson_value" || name == "__sqljson_query" {
+                for slot in [4usize, 6usize] {
+                    if let Some(e) = args.get(slot) {
+                        check_sqljson_default(eng, e)?;
+                    }
+                }
+            }
             func_result_type(name, args, eng, snap, own, session, schemas, outer, ctes)
         }
         Expr::Extract { .. } => Ok(ColType::Numeric(None)),
@@ -1465,8 +1545,14 @@ pub(crate) fn arith_operand_type(
         )?)),
         Expr::Concat(..) => Ok(Some(ColType::Text)),
         // v1.82: same return-type rule as expr_type.
-        Expr::JsonOp { op, .. } => Ok(Some(if op.returns_json() {
-            ColType::Json
+        // v1.83: bool family + jsonb operand propagation, as expr_type.
+        Expr::JsonOp { op, left, .. } => Ok(Some(if op.returns_bool() {
+            ColType::Bool
+        } else if op.returns_json() {
+            match expr_type(eng, snap, own, session, schemas, outer, ctes, left) {
+                Ok(ColType::Jsonb) => ColType::Jsonb,
+                _ => ColType::Json,
+            }
         } else {
             ColType::Text
         })),
@@ -1570,6 +1656,25 @@ pub(crate) fn combine_arith_types(
             let is_int_kind =
                 |t: &ColType| matches!(t, ColType::SmallInt | ColType::Int | ColType::BigInt);
             match (&x, &y) {
+                // v1.88: range/multirange `+` (union), `*`
+                // (intersection), `-` (difference). Any multirange
+                // operand makes a multirange result; range - range and
+                // range * range stay ranges.
+                (ColType::Range(e), ColType::Range(_))
+                | (ColType::Range(e), ColType::Multirange(_))
+                | (ColType::Multirange(e), ColType::Range(_))
+                    if matches!(op, ArithOp::Add | ArithOp::Mul | ArithOp::Sub) =>
+                {
+                    match (&x, &y) {
+                        (ColType::Range(_), ColType::Range(_)) => Ok(ColType::Range(*e)),
+                        _ => Ok(ColType::Multirange(*e)),
+                    }
+                }
+                (ColType::Multirange(e), ColType::Multirange(_))
+                    if matches!(op, ArithOp::Add | ArithOp::Mul | ArithOp::Sub) =>
+                {
+                    Ok(ColType::Multirange(*e))
+                }
                 (ColType::Date, y) if is_int_kind(y) => match op {
                     ArithOp::Add | ArithOp::Sub => Ok(ColType::Date),
                     _ => Err(op_err(&x, &y)),
@@ -1581,6 +1686,83 @@ pub(crate) fn combine_arith_types(
                 },
                 (ColType::Date, ColType::Date) => match op {
                     ArithOp::Sub => Ok(ColType::Int),
+                    _ => Err(op_err(&x, &y)),
+                },
+                // v1.86: the datetime arithmetic matrix, mirroring
+                // eval_datetime_arith's result types (PG19
+                // pg_operator): interval+-interval, interval */-
+                // numeric, datetime +- interval (date -> timestamp!),
+                // date + time/timetz, datetime - datetime -> interval,
+                // time - time -> interval.
+                (ColType::Interval, ColType::Interval) => match op {
+                    ArithOp::Add | ArithOp::Sub => Ok(ColType::Interval),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Interval, y) if numeric_rank(y).is_some() => match op {
+                    ArithOp::Mul | ArithOp::Div => Ok(ColType::Interval),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (x, ColType::Interval) if numeric_rank(x).is_some() => match op {
+                    ArithOp::Mul => Ok(ColType::Interval),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Date, ColType::Interval) => match op {
+                    ArithOp::Add | ArithOp::Sub => Ok(ColType::Timestamp),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Interval, ColType::Date) => match op {
+                    ArithOp::Add => Ok(ColType::Timestamp),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Timestamp, ColType::Interval) => match op {
+                    ArithOp::Add | ArithOp::Sub => Ok(ColType::Timestamp),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Interval, ColType::Timestamp) => match op {
+                    ArithOp::Add => Ok(ColType::Timestamp),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Timestamptz, ColType::Interval) => match op {
+                    ArithOp::Add | ArithOp::Sub => Ok(ColType::Timestamptz),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Interval, ColType::Timestamptz) => match op {
+                    ArithOp::Add => Ok(ColType::Timestamptz),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Time, ColType::Interval) => match op {
+                    ArithOp::Add | ArithOp::Sub => Ok(ColType::Time),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Interval, ColType::Time) => match op {
+                    ArithOp::Add => Ok(ColType::Time),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::TimeTz, ColType::Interval) => match op {
+                    ArithOp::Add | ArithOp::Sub => Ok(ColType::TimeTz),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Interval, ColType::TimeTz) => match op {
+                    ArithOp::Add => Ok(ColType::TimeTz),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Date, ColType::Time) | (ColType::Time, ColType::Date) => match op {
+                    ArithOp::Add => Ok(ColType::Timestamp),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Date, ColType::TimeTz) | (ColType::TimeTz, ColType::Date) => match op {
+                    ArithOp::Add => Ok(ColType::Timestamptz),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Timestamp, ColType::Timestamp)
+                | (ColType::Timestamptz, ColType::Timestamptz)
+                | (ColType::Timestamp, ColType::Timestamptz)
+                | (ColType::Timestamptz, ColType::Timestamp) => match op {
+                    ArithOp::Sub => Ok(ColType::Interval),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Time, ColType::Time) | (ColType::TimeTz, ColType::TimeTz) => match op {
+                    ArithOp::Sub => Ok(ColType::Interval),
                     _ => Err(op_err(&x, &y)),
                 },
                 // v0.21: an unknown-type (text) literal against a numeric
@@ -1738,6 +1920,34 @@ pub(crate) fn agg_result_type(
                 _ => Err(exec_err(
                     "42883",
                     format!("function {}({}) does not exist", func.name(), t.sql_name()),
+                )),
+            }
+        }
+        // v1.84: JSON aggregates return json/jsonb (pg_proc).
+        AggFunc::JsonAgg | AggFunc::JsonObjectAgg => Ok(ColType::Json),
+        AggFunc::JsonbAgg | AggFunc::JsonbObjectAgg => Ok(ColType::Jsonb),
+        // v1.88: range aggregates — range_agg(anyrange) -> the
+        // multirange; range_intersect_agg mirrors its input kind.
+        AggFunc::RangeAgg => {
+            let a = arg.expect("range_agg always takes an argument");
+            match expr_type(eng, snap, own, session, schemas, outer, ctes, a)? {
+                ColType::Range(e) | ColType::Multirange(e) => Ok(ColType::Multirange(e)),
+                t => Err(exec_err(
+                    "42883",
+                    format!("function range_agg({}) does not exist", t.sql_name()),
+                )),
+            }
+        }
+        AggFunc::RangeIntersectAgg => {
+            let a = arg.expect("range_intersect_agg always takes an argument");
+            match expr_type(eng, snap, own, session, schemas, outer, ctes, a)? {
+                t @ (ColType::Range(_) | ColType::Multirange(_)) => Ok(t),
+                t => Err(exec_err(
+                    "42883",
+                    format!(
+                        "function range_intersect_agg({}) does not exist",
+                        t.sql_name()
+                    ),
                 )),
             }
         }

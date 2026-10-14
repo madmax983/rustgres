@@ -19,7 +19,7 @@ Sections:
   C. UPDATE's old chunks are reaped by vacuum
   D. ROLLBACK of a DELETE restores chunks (regression guard)
   E. chunk deletions survive a restart (WAL-logged)
-  F. WAL magic is RGSWAL21 (v1.05: SetToastRelid record tag 28;
+  F. WAL magic is RGSWAL22 (v1.05: SetToastRelid record tag 28;
      v0.41: method codes in toast_info;
      v0.72: is_partitioned in checkpoint/WAL records;
      v0.82: CreateType/DropType records;
@@ -298,7 +298,7 @@ def main():
         stop_server(proc)
     with open(os.path.join(data_dir, "wal.log"), "rb") as f:
         magic = f.read(8)
-    check("F1 WAL magic is RGSWAL21", magic == b"RGSWAL21")
+    check("F1 WAL magic is RGSWAL22", magic == b"RGSWAL22")
     shutil.rmtree(data_dir, ignore_errors=True)
 
     print(f"protocol_test39: {passed} passed, {failed} failed")

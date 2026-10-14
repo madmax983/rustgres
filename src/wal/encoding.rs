@@ -379,6 +379,35 @@ impl<'a> DbgParser<'a> {
                 self.expect(b')')?;
                 Some(Literal::Timestamptz(n))
             }
+            // v1.86: datetime family literals in checkpoints.
+            "Time" => {
+                self.expect(b'(')?;
+                let n: i64 = self.number()?.parse().ok()?;
+                self.expect(b')')?;
+                Some(Literal::Time(n))
+            }
+            "TimeTz" => {
+                self.expect(b'(')?;
+                let t: i64 = self.number()?.parse().ok()?;
+                self.expect(b',')?;
+                let o: i32 = self.number()?.parse().ok()?;
+                self.expect(b')')?;
+                Some(Literal::TimeTz(t, o))
+            }
+            "Interval" => {
+                self.expect(b'(')?;
+                let mo: i32 = self.number()?.parse().ok()?;
+                self.expect(b',')?;
+                let d: i32 = self.number()?.parse().ok()?;
+                self.expect(b',')?;
+                let us: i64 = self.number()?.parse().ok()?;
+                self.expect(b')')?;
+                Some(Literal::Interval(crate::datetime::Interval {
+                    months: mo,
+                    days: d,
+                    micros: us,
+                }))
+            }
             _ => None,
         }
     }
@@ -543,6 +572,41 @@ impl Enc {
                 self.u8(21);
                 return;
             }
+            // v1.83: jsonb; tag appends after v1.40's.
+            ColType::Jsonb => {
+                self.u8(27);
+                return;
+            }
+            // v1.85: jsonpath; tag appends after v1.83's.
+            ColType::Jsonpath => {
+                self.u8(28);
+                return;
+            }
+            // v1.86: time/timetz/interval; tags append after v1.85's.
+            ColType::Time => {
+                self.u8(29);
+                return;
+            }
+            ColType::TimeTz => {
+                self.u8(30);
+                return;
+            }
+            ColType::Interval => {
+                self.u8(31);
+                return;
+            }
+            // v1.88: range / multirange; tags append after v1.86's,
+            // then the RangeElem code.
+            ColType::Range(e) => {
+                self.u8(32);
+                self.u8(e.code());
+                return;
+            }
+            ColType::Multirange(e) => {
+                self.u8(33);
+                self.u8(e.code());
+                return;
+            }
             // v1.17: xid; tag appends after v0.81's.
             ColType::Xid => {
                 self.u8(24);
@@ -687,6 +751,51 @@ impl Enc {
                 self.u8(20);
                 self.u32(*b);
                 self.u32(*o);
+            }
+            // v1.83: jsonb values; tag appends after v1.40's. The
+            // canonical text is the whole payload.
+            Value::Jsonb(s) => {
+                self.u8(21);
+                self.str(s);
+            }
+            // v1.85: jsonpath values; tag appends after v1.83's.
+            Value::Jsonpath(s) => {
+                self.u8(22);
+                self.str(s);
+            }
+            // v1.86: time values; tag appends after v1.85's.
+            Value::Time(t) => {
+                self.u8(23);
+                self.i64(*t);
+            }
+            // v1.86: timetz values (micros, offset seconds).
+            Value::TimeTz(t, off) => {
+                self.u8(24);
+                self.i64(*t);
+                self.i32(*off);
+            }
+            // v1.86: interval values (months, days, micros).
+            Value::Interval(iv) => {
+                self.u8(25);
+                self.i32(iv.months);
+                self.i32(iv.days);
+                self.i64(iv.micros);
+            }
+            // v1.88: range values (tag 26) — elem code, user type name
+            // (empty = builtin), then the canonical text; the decoder
+            // re-parses it (canonical text always parses).
+            Value::Range(r) => {
+                self.u8(26);
+                self.u8(r.elem.code());
+                self.str(r.name.as_deref().unwrap_or(""));
+                self.str(&crate::exec::ranges::range_to_text(r));
+            }
+            // v1.88: multirange values (tag 27), same layout.
+            Value::Multirange(m) => {
+                self.u8(27);
+                self.u8(m.elem.code());
+                self.str(m.name.as_deref().unwrap_or(""));
+                self.str(&crate::exec::ranges::multirange_to_text(m));
             }
         }
     }
@@ -1033,6 +1142,7 @@ impl Enc {
                 like_base,
                 composite,
                 domain,
+                range,
                 xmin,
             } => {
                 self.u8(22);
@@ -1088,6 +1198,15 @@ impl Enc {
                     None => self.u8(0),
                 }
                 self.u64(*xmin);
+                // v1.88 (RGSWAL22): trailing range definition.
+                match range {
+                    Some((code, multi)) => {
+                        self.u8(1);
+                        self.u8(*code);
+                        self.u8(*multi as u8);
+                    }
+                    None => self.u8(0),
+                }
             }
             WalRecord::DropType { name, xmax } => {
                 self.u8(23);
@@ -1546,6 +1665,27 @@ impl<'a> Dec<'a> {
             // v1.40: tid.
             26 => Ok(ColType::Tid),
             21 => Ok(ColType::Json),
+            // v1.83: jsonb.
+            27 => Ok(ColType::Jsonb),
+            // v1.85: jsonpath.
+            28 => Ok(ColType::Jsonpath),
+            // v1.86: time/timetz/interval.
+            29 => Ok(ColType::Time),
+            30 => Ok(ColType::TimeTz),
+            31 => Ok(ColType::Interval),
+            // v1.88: range / multirange, then the RangeElem code.
+            32 => {
+                let c = self.u8()?;
+                crate::storage::RangeElem::from_code(c)
+                    .map(ColType::Range)
+                    .ok_or_else(|| self.err(&format!("unknown range elem {}", c)))
+            }
+            33 => {
+                let c = self.u8()?;
+                crate::storage::RangeElem::from_code(c)
+                    .map(ColType::Multirange)
+                    .ok_or_else(|| self.err(&format!("unknown range elem {}", c)))
+            }
             // v0.78: array, then the PG array OID identifying the
             // element type.
             22 => {
@@ -1565,6 +1705,10 @@ impl<'a> Dec<'a> {
                     1182 => ArrayElem::Date,
                     1115 => ArrayElem::Timestamp,
                     1185 => ArrayElem::Timestamptz,
+                    // v1.86: _time / _timetz / _interval.
+                    1183 => ArrayElem::Time,
+                    1270 => ArrayElem::TimeTz,
+                    1187 => ArrayElem::Interval,
                     1231 => ArrayElem::Numeric,
                     2951 => ArrayElem::Uuid,
                     2206 => ArrayElem::Regclass,
@@ -1625,6 +1769,41 @@ impl<'a> Dec<'a> {
             16 => Ok(Value::PgLsn(self.u64()?)),
             // v1.40: tid.
             20 => Ok(Value::Tid(self.u32()?, self.u32()?)),
+            // v1.83: jsonb (canonical text payload).
+            21 => Ok(Value::Jsonb(self.str_arc()?)),
+            // v1.85: jsonpath (rendered text payload).
+            22 => Ok(Value::Jsonpath(self.str_arc()?)),
+            // v1.86: time/timetz/interval.
+            23 => Ok(Value::Time(self.i64()?)),
+            24 => Ok(Value::TimeTz(self.i64()?, self.i32()?)),
+            25 => Ok(Value::Interval(crate::datetime::Interval {
+                months: self.i32()?,
+                days: self.i32()?,
+                micros: self.i64()?,
+            })),
+            // v1.88: range / multirange (tags 26/27; mirrors encoder).
+            26 => {
+                let c = self.u8()?;
+                let elem = crate::storage::RangeElem::from_code(c)
+                    .ok_or_else(|| self.err(&format!("unknown range elem {}", c)))?;
+                let name = self.str()?;
+                let name = if name.is_empty() { None } else { Some(name) };
+                let text = self.str()?;
+                let r = crate::exec::ranges::parse_range(elem, name, &text)
+                    .map_err(|e| self.err(&format!("bad range in WAL: {}", e.message)))?;
+                Ok(Value::Range(Box::new(r)))
+            }
+            27 => {
+                let c = self.u8()?;
+                let elem = crate::storage::RangeElem::from_code(c)
+                    .ok_or_else(|| self.err(&format!("unknown range elem {}", c)))?;
+                let name = self.str()?;
+                let name = if name.is_empty() { None } else { Some(name) };
+                let text = self.str()?;
+                let m = crate::exec::ranges::parse_multirange(elem, name, &text)
+                    .map_err(|e| self.err(&format!("bad multirange in WAL: {}", e.message)))?;
+                Ok(Value::Multirange(Box::new(m)))
+            }
             // v0.79: real array values (tag 17; mirrors the encoder).
             17 => {
                 let elem = self.array_elem()?;
@@ -1693,6 +1872,10 @@ impl<'a> Dec<'a> {
             1182 => Ok(ArrayElem::Date),
             1115 => Ok(ArrayElem::Timestamp),
             1185 => Ok(ArrayElem::Timestamptz),
+            // v1.86: _time / _timetz / _interval.
+            1183 => Ok(ArrayElem::Time),
+            1270 => Ok(ArrayElem::TimeTz),
+            1187 => Ok(ArrayElem::Interval),
             1231 => Ok(ArrayElem::Numeric),
             2951 => Ok(ArrayElem::Uuid),
             2206 => Ok(ArrayElem::Regclass),
@@ -2150,11 +2333,18 @@ impl<'a> Dec<'a> {
                     None
                 };
                 let xmin = self.u64()?;
+                // v1.88 (RGSWAL22): trailing range definition.
+                let range = if self.wal_version >= 22 && self.u8()? != 0 {
+                    Some((self.u8()?, self.u8()? != 0))
+                } else {
+                    None
+                };
                 Ok(WalRecord::CreateType {
                     name,
                     like_base,
                     composite,
                     domain,
+                    range,
                     xmin,
                 })
             }

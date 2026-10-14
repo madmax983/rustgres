@@ -898,12 +898,16 @@ fn v17_datetime_functions() {
         err_code(&mut eng, "SELECT to_date('2026-02-30', 'YYYY-MM-DD')"),
         "22008"
     );
+    // PG formatting.c (std=false): a template separator matches any
+    // single input separator, so '2026/01/15' parses under 'YYYY-MM-DD'.
     assert_eq!(
-        err_code(&mut eng, "SELECT to_date('2026/01/15', 'YYYY-MM-DD')"),
-        "22008"
+        one(&mut eng, "SELECT to_date('2026/01/15', 'YYYY-MM-DD')"),
+        "2026-01-15"
     );
+    // v1.86: Q is the quarter pattern element now (PG formatting.c);
+    // the unsupported-pattern pin moves to EE.
     assert_eq!(
-        err_code(&mut eng, "SELECT to_date('2026-01-15', 'YYYY-MM-QQ')"),
+        err_code(&mut eng, "SELECT to_date('2026-01-15', 'YYYY-MM-EE')"),
         "0A000"
     );
     // to_timestamp with format strings.
@@ -981,7 +985,8 @@ fn v17_datetime_functions() {
         "NULL"
     );
     assert_eq!(
-        err_code(&mut eng, "SELECT to_char(DATE '2026-09-11', 'QQ')"),
+        // v1.86: 'QQ' is two quarter elements now; EE stays unsupported.
+        err_code(&mut eng, "SELECT to_char(DATE '2026-09-11', 'EE')"),
         "0A000"
     );
     // v0.42: PG19 supports to_char() on int4/int8/numeric (formatting.c
@@ -1017,8 +1022,11 @@ fn v17_datetime_functions() {
         err_code(&mut eng, "SELECT make_timestamp(2026, 1, 1, 0, 0, 60)"),
         "22008"
     );
-    assert_eq!(err_code(&mut eng, "SELECT make_time(1, 2, 3)"), "42883");
-    // timezone(): UTC-only.
+    // v1.86: make_time exists now (the TIME type landed); the v0.17
+    // pin expected 42883 because the engine had no time type.
+    assert_eq!(one(&mut eng, "SELECT make_time(1, 2, 3)"), "01:02:03");
+    assert_eq!(err_code(&mut eng, "SELECT make_time(25, 0, 0)"), "22008");
+    // timezone(): UTC-only before v1.86 (now the full zone table).
     assert_eq!(
         one(
             &mut eng,
@@ -1033,16 +1041,20 @@ fn v17_datetime_functions() {
         ),
         "2026-09-11 13:25:01+00"
     );
+    // v1.86: the zone table landed — Chicago (CDT, UTC-5 in
+    // September) converts for real; the v0.17 pin expected 0A000.
     assert_eq!(
-        err_code(
+        one(
             &mut eng,
             "SELECT timezone('America/Chicago', TIMESTAMPTZ '2026-09-11 13:25:01+00')"
         ),
-        "0A000"
+        "2026-09-11 08:25:01"
     );
+    // v1.86: timezone(zone, date) -> timestamptz exists in PG; the
+    // v0.17 pin expected 42883.
     assert_eq!(
-        err_code(&mut eng, "SELECT timezone('UTC', DATE '2026-09-11')"),
-        "42883"
+        one(&mut eng, "SELECT timezone('UTC', DATE '2026-09-11')"),
+        "2026-09-11 00:00:00+00"
     );
     // clock/statement/transaction timestamps return timestamptz now.
     let ts = one(&mut eng, "SELECT clock_timestamp()");
@@ -1067,14 +1079,39 @@ fn v17_datetime_functions() {
         let perr = parse_statement(q).unwrap_err();
         assert_eq!(perr.code, "42883", "{}", q);
     }
-    // Deliberately unimplemented: 42883.
-    assert_eq!(err_code(&mut eng, "SELECT age(now())"), "42883");
-    assert_eq!(err_code(&mut eng, "SELECT make_interval(1)"), "42883");
+    // v1.86: age / make_interval / date_bin / justify_* landed
+    // (the v0.17 pins expected 42883 for all four).
     assert_eq!(
-        err_code(&mut eng, "SELECT date_bin('1 day', now(), now())"),
-        "42883"
+        one(
+            &mut eng,
+            "SELECT age(TIMESTAMP '2020-01-01', TIMESTAMP '2019-01-01')"
+        ),
+        "1 year"
     );
+    assert_eq!(one(&mut eng, "SELECT make_interval(1)"), "1 year");
+    assert_eq!(
+        one(
+            &mut eng,
+            "SELECT date_bin('1 day', TIMESTAMP '2021-11-05 12:34:56', TIMESTAMP '2000-01-01')"
+        ),
+        "2021-11-05 00:00:00"
+    );
+    assert_eq!(
+        one(&mut eng, "SELECT justify_days(INTERVAL '35 days')"),
+        "1 mon 5 days"
+    );
+    // Wrong argument types still do not exist, like PG.
     assert_eq!(err_code(&mut eng, "SELECT justify_days(now())"), "42883");
+    // v1.86 probe: datetime literal arithmetic.
+    assert_eq!(
+        one(&mut eng, "SELECT date '1981-02-03' + time '04:05:06'"),
+        "1981-02-03 04:05:06"
+    );
+    // PG: date + interval is a timestamp, even for day-only intervals.
+    assert_eq!(
+        one(&mut eng, "SELECT date '1991-02-03' + interval '2 years'"),
+        "1993-02-03 00:00:00"
+    );
 }
 
 // v0.58: PG19 binary float I/O — float4send / float4recv / float8recv.
@@ -2497,6 +2534,315 @@ fn v43_pg_input_error_info() {
     // Hard errors propagate: unknown type -> 42883.
     let err = run(&mut eng, "SELECT * FROM pg_input_error_info('x', 'bogus')").unwrap_err();
     assert_eq!(err.code, "42883");
+}
+
+/// v1.87: pg_input_is_valid / pg_input_error_info for all remaining
+/// type families (PG19 misc.c runs each type's input function under an
+/// ErrorSaveContext; expected rows mirror the PG regression .out files
+/// in tests/conformance/pg19/expected).
+#[test]
+fn v87_pg_input_all_types() {
+    let mut eng = engine();
+    let valid = |eng: &mut Engine, inp: &str, typ: &str| -> String {
+        let q = format!("SELECT pg_input_is_valid({inp}, {typ})");
+        rows_of(run(eng, &q).unwrap())[0][0].clone()
+    };
+    let info = |eng: &mut Engine, inp: &str, typ: &str| -> Vec<Vec<String>> {
+        let q = format!("SELECT * FROM pg_input_error_info({inp}, {typ})");
+        rows_of(run(eng, &q).unwrap())
+    };
+    // Datetime classifier (v1.86 arms re-mapped to PG's exact rows).
+    assert_eq!(
+        info(&mut eng, "'garbage'", "'date'"),
+        vec![vec![
+            "invalid input syntax for type date: \"garbage\"",
+            "NULL",
+            "NULL",
+            "22007"
+        ]]
+    );
+    assert_eq!(
+        info(&mut eng, "'6874898-01-01'", "'date'"),
+        vec![vec![
+            "date out of range: \"6874898-01-01\"",
+            "NULL",
+            "NULL",
+            "22008"
+        ]]
+    );
+    assert_eq!(
+        info(&mut eng, "'2026-01-01 Nehwon/Lankhmar'", "'timestamptz'"),
+        vec![vec![
+            "time zone \"nehwon/lankhmar\" not recognized",
+            "NULL",
+            "NULL",
+            "22023"
+        ]]
+    );
+    // Unsigned family (numutils.c strtoul semantics).
+    assert_eq!(valid(&mut eng, "'-1'", "'oid'"), "t");
+    assert_eq!(valid(&mut eng, "'0x10'", "'oid'"), "t");
+    assert_eq!(
+        info(&mut eng, "'4294967296'", "'oid'"),
+        vec![vec![
+            "value \"4294967296\" is out of range for type oid",
+            "NULL",
+            "NULL",
+            "22003"
+        ]]
+    );
+    assert_eq!(
+        info(&mut eng, "'01 01XYZ'", "'oidvector'"),
+        vec![vec![
+            "invalid input syntax for type oid: \"XYZ\"",
+            "NULL",
+            "NULL",
+            "22P02"
+        ]]
+    );
+    // bit/varbit.
+    assert_eq!(
+        info(&mut eng, "'01010Z01'", "'bit(8)'"),
+        vec![vec![
+            "\"Z\" is not a valid binary digit",
+            "NULL",
+            "NULL",
+            "22P02"
+        ]]
+    );
+    assert_eq!(
+        info(&mut eng, "'01010001'", "'bit(10)'"),
+        vec![vec![
+            "bit string length 8 does not match type bit(10)",
+            "NULL",
+            "NULL",
+            "22026"
+        ]]
+    );
+    // Geometry / ranges.
+    assert_eq!(
+        info(&mut eng, "'{0, 0, 0}'", "'line'"),
+        vec![vec![
+            "invalid line specification: A and B cannot both be zero",
+            "NULL",
+            "NULL",
+            "22P02"
+        ]]
+    );
+    assert_eq!(
+        info(&mut eng, "'(4,zed)'", "'int4range'"),
+        vec![vec![
+            "invalid input syntax for type integer: \"zed\"",
+            "NULL",
+            "NULL",
+            "22P02"
+        ]]
+    );
+    assert_eq!(
+        info(&mut eng, "'[1,2147483647]'", "'int4range'"),
+        vec![vec!["integer out of range", "NULL", "NULL", "22003"]]
+    );
+    assert_eq!(
+        info(&mut eng, "'[5,4]'", "'int4range'"),
+        vec![vec![
+            "range lower bound must be less than or equal to range upper bound",
+            "NULL",
+            "NULL",
+            "22000"
+        ]]
+    );
+    assert_eq!(valid(&mut eng, "'(5,6)'", "'int4range'"), "t");
+    // Statistics types.
+    assert_eq!(
+        info(&mut eng, "'null'", "'pg_ndistinct'"),
+        vec![vec![
+            "malformed pg_ndistinct: \"null\"",
+            "Unexpected scalar has been found.",
+            "NULL",
+            "22P02"
+        ]]
+    );
+    assert_eq!(
+        valid(
+            &mut eng,
+            "'[{\"attributes\": [1,2], \"ndistinct\": 10}]'",
+            "'pg_ndistinct'"
+        ),
+        "t"
+    );
+    assert_eq!(
+        info(
+            &mut eng,
+            "'[{\"attributes\": [1,3], \"dependency\": 3, \"degree\": 1.0}]'",
+            "'pg_dependencies'"
+        ),
+        vec![vec![
+            "malformed pg_dependencies: \"[{\"attributes\": [1,3], \"dependency\": 3, \"degree\": 1.0}]\"",
+            "Item \"dependency\" with value 3 has been found in the \"attributes\" list.",
+            "NULL",
+            "22P02"
+        ]]
+    );
+    // json/jsonb, jsonpath, money, network, snapshot, arrays.
+    assert_eq!(
+        info(&mut eng, "'{\"a\":1e1000000}'", "'jsonb'"),
+        vec![vec![
+            "value overflows numeric format",
+            "NULL",
+            "NULL",
+            "22003"
+        ]]
+    );
+    assert_eq!(valid(&mut eng, "'1e1000000'", "'json'"), "t");
+    assert_eq!(
+        info(&mut eng, "'@ + 1'", "'jsonpath'"),
+        vec![vec![
+            "@ is not allowed in root expressions",
+            "NULL",
+            "NULL",
+            "42601"
+        ]]
+    );
+    assert_eq!(
+        info(&mut eng, "'00'", "'jsonpath'"),
+        vec![vec![
+            "trailing junk after numeric literal at or near \"00\" of jsonpath input",
+            "NULL",
+            "NULL",
+            "42601"
+        ]]
+    );
+    assert_eq!(
+        info(&mut eng, "'192233720368547758.07'", "'money'"),
+        vec![vec![
+            "value \"192233720368547758.07\" is out of range for type money",
+            "NULL",
+            "NULL",
+            "22003"
+        ]]
+    );
+    assert_eq!(
+        info(&mut eng, "'10.0.0.1/8'", "'cidr'"),
+        vec![vec![
+            "invalid cidr value: \"10.0.0.1/8\"",
+            "Value has bits set to right of mask.",
+            "NULL",
+            "22P02"
+        ]]
+    );
+    assert_eq!(
+        info(&mut eng, "'31:12:'", "'pg_snapshot'"),
+        vec![vec![
+            "invalid input syntax for type pg_snapshot: \"31:12:\"",
+            "NULL",
+            "NULL",
+            "22P02"
+        ]]
+    );
+    assert_eq!(
+        info(&mut eng, "'{1,zed}'", "'integer[]'"),
+        vec![vec![
+            "invalid input syntax for type integer: \"zed\"",
+            "NULL",
+            "NULL",
+            "22P02"
+        ]]
+    );
+    // Catalog types: domain, composite, aclitem, reg*.
+    run(&mut eng, "CREATE DOMAIN v87pos AS int4 CHECK (VALUE > 0)").unwrap();
+    run(
+        &mut eng,
+        "CREATE DOMAIN v87wf AS float8 CHECK ((1 / VALUE) < 10)",
+    )
+    .unwrap();
+    run(&mut eng, "CREATE TYPE v87cx AS (r float8, i float8)").unwrap();
+    run(&mut eng, "CREATE ROLE v87user LOGIN").unwrap();
+    assert_eq!(
+        info(&mut eng, "'-1'", "'v87pos'"),
+        vec![vec![
+            "value for domain v87pos violates check constraint \"v87pos_check\"",
+            "NULL",
+            "NULL",
+            "23514"
+        ]]
+    );
+    assert_eq!(
+        info(&mut eng, "'junk'", "'v87pos'"),
+        vec![vec![
+            "invalid input syntax for type integer: \"junk\"",
+            "NULL",
+            "NULL",
+            "22P02"
+        ]]
+    );
+    // An error inside the CHECK expression itself is a HARD error.
+    let err = run(&mut eng, "SELECT * FROM pg_input_error_info('0', 'v87wf')").unwrap_err();
+    assert_eq!(err.code, "22012");
+    assert_eq!(
+        info(&mut eng, "'(1,zed)'", "'v87cx'"),
+        vec![vec![
+            "invalid input syntax for type double precision: \"zed\"",
+            "NULL",
+            "NULL",
+            "22P02"
+        ]]
+    );
+    assert_eq!(valid(&mut eng, "'(1,2)'", "'v87cx'"), "t");
+    assert_eq!(
+        info(&mut eng, "'v87user=Z/v87user'", "'aclitem'"),
+        vec![vec![
+            "invalid mode character: must be one of \"arwdDxtXUCTcsAm\"",
+            "NULL",
+            "NULL",
+            "22P02"
+        ]]
+    );
+    assert_eq!(
+        info(&mut eng, "'nosuch=r/v87user'", "'aclitem'"),
+        vec![vec![
+            "role \"nosuch\" does not exist",
+            "NULL",
+            "NULL",
+            "42704"
+        ]]
+    );
+    assert_eq!(
+        info(&mut eng, "'ng_catalog.pg_class'", "'regclass'"),
+        vec![vec![
+            "relation \"ng_catalog.pg_class\" does not exist",
+            "NULL",
+            "NULL",
+            "42P01"
+        ]]
+    );
+    assert_eq!(
+        info(&mut eng, "'-'", "'regoper'"),
+        vec![vec![
+            "more than one operator named -",
+            "NULL",
+            "NULL",
+            "42725"
+        ]]
+    );
+    assert_eq!(
+        info(&mut eng, "'no_such_type'", "'regtype'"),
+        vec![vec![
+            "type \"no_such_type\" does not exist",
+            "NULL",
+            "NULL",
+            "42704"
+        ]]
+    );
+    // regtype's malformed names are hard parseTypeString errors.
+    let err = run(
+        &mut eng,
+        "SELECT * FROM pg_input_error_info('way.too.many.names', 'regtype')",
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.message,
+        "improper qualified name (too many dotted names): way.too.many.names"
+    );
 }
 
 /// v0.41: SET COMPRESSION error taxonomy matches PG.

@@ -176,6 +176,10 @@ struct Txn {
     deferrable: Option<bool>,
     /// Pinned at the first data statement for RR/SERIALIZABLE.
     snapshot: Option<Snapshot>,
+    /// v1.86: transaction start time (micros since epoch) pinning
+    /// now()/transaction_timestamp() and 'now' input (PG semantics);
+    /// 0 = not yet pinned (set on the first statement).
+    start_micros: i64,
     /// v1.07: PG19's `FirstSnapshotSet` — set when the first statement
     /// snapshot is taken inside this transaction. `SET TRANSACTION`'s
     /// check hooks forbid characteristic changes afterwards (and in a
@@ -2270,6 +2274,18 @@ fn read_only_violation(
 /// `default_transaction_read_only` is honored; anything else is 42704.
 /// v0.29: `bytea_output` added.
 fn guc_value(session: &Session, name: &str) -> Option<String> {
+    // v1.86: the DateStyle boot value comes from PGDATESTYLE (like
+    // real PG), so SHOW/RESET report it instead of the compiled
+    // "ISO, MDY" default.
+    if name == "datestyle" && !session.gucs.contains_key("datestyle") {
+        if let Ok(v) = std::env::var("PGDATESTYLE") {
+            if !v.trim().is_empty() {
+                if let Ok(canon) = validate_generic_guc("datestyle", &v) {
+                    return Some(canon);
+                }
+            }
+        }
+    }
     match name {
         "default_transaction_read_only" => Some(
             if session.default_txn_read_only == Some(true) {
@@ -3730,6 +3746,31 @@ fn run_statement(
     // (PG19 ExplainExecuteQuery evaluates the EXECUTE arguments and
     // plans the prepared statement with them bound: custom-plan
     // semantics), so the planner sees a plain SELECT.
+    // v1.86: install the datetime session context (DateStyle,
+    // TimeZone, transaction-pinned now) for this statement. SET
+    // statements run under the *previous* context and take effect
+    // from the next statement, like PG. The transaction start is
+    // pinned on first use inside the transaction.
+    {
+        if let Some(t) = session.txn.as_mut() {
+            if t.start_micros == 0 {
+                t.start_micros = crate::datetime::now_micros();
+            }
+        }
+        // The DateStyle boot default comes from PGDATESTYLE (like real
+        // PG), not the compiled "ISO, MDY" -- suites RESET datestyle
+        // and expect the environment value back.
+        let ds = match session.gucs.get("datestyle") {
+            Some(v) => v.clone(),
+            None => match std::env::var("PGDATESTYLE") {
+                Ok(v) if !v.trim().is_empty() => v,
+                _ => "ISO, MDY".to_string(),
+            },
+        };
+        let tz = guc_value(session, "timezone").unwrap_or_else(|| "GMT".to_string());
+        let now = session.txn.as_ref().map(|t| t.start_micros).unwrap_or(0);
+        crate::datetime::set_session_context(&ds, &tz, now);
+    }
     let owned;
     let stmt = match stmt {
         Stmt::Execute { name, args } => {
@@ -4286,6 +4327,7 @@ fn begin_implicit_txn(engine: &Arc<Mutex<Engine>>, session: &mut Session) {
     // the session defaults, like the explicit BEGIN path (PG19).
     session.txn = Some(Txn {
         xid,
+        start_micros: 0,
         level: session
             .next_txn_level
             .take()
@@ -4445,6 +4487,7 @@ fn txn_begin(
     let xid = lock_engine(engine).begin_txn();
     session.txn = Some(Txn {
         xid,
+        start_micros: 0,
         level,
         read_only,
         deferrable,
@@ -5584,6 +5627,7 @@ mod tests {
             parse_cache_misses: 0,
             txn: Some(Txn {
                 xid,
+                start_micros: 0,
                 level,
                 read_only: None,
                 deferrable: None,
