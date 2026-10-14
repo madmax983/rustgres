@@ -291,7 +291,9 @@ def t_casts():
         check("NULL cast", c.q("SELECT NULL::int")[1] == [[None]])
         # Failures.
         check("bad int text -> 22P02", errcode(c, "SELECT 'abc'::int") == "22P02")
-        check("bad date text -> 22P02", errcode(c, "SELECT '2026-13-45'::date") == "22P02")
+        # PG: month/day field overflow is 22008 (DTERR_FIELD_OVERFLOW),
+        # not 22P02 (v1.86 aligned the cast error classification).
+        check("bad date text -> 22008", errcode(c, "SELECT '2026-13-45'::date") == "22008")
         check("bad uuid text -> 22P02", errcode(c, "SELECT 'nope'::uuid") == "22P02")
         # v0.29 bytea I/O fidelity: bad hex digits are PG's 22023
         # ("invalid hexadecimal digit"), not generic 22P02.
@@ -312,8 +314,10 @@ def t_casts():
         check("insert bad int text -> 22P02",
               errcode(c, "INSERT INTO ci2 VALUES ('xx')") == "22P02")
         c.q("CREATE TABLE cd(a DATE)")
-        check("insert bad date text -> 22P02",
-              errcode(c, "INSERT INTO cd VALUES ('yesterday')") == "22P02")
+        # v1.86: 'yesterday' is a valid PG date input (special value).
+        check("insert 'yesterday' date text works",
+              errcode(c, "INSERT INTO cd VALUES ('yesterday')") is None
+              and len(one(c, "SELECT a FROM cd")) == 10)
         c.close()
     finally:
         srv.cleanup()
@@ -494,10 +498,10 @@ def t_datetime_arith():
         check("date - date negative",
               one(c, "SELECT '2000-01-01'::date - '2000-01-31'::date") == "-30")
         check("date + 0", one(c, "SELECT '2026-09-10'::date + 0") == "2026-09-10")
-        # No INTERVAL in v0.7: timestamp arithmetic is undefined (42883).
-        check("timestamp - timestamp -> 42883 (no interval in v0.7)",
-              errcode(c, "SELECT '2026-01-02'::timestamp - '2026-01-01'::timestamp")
-              == "42883")
+        # INTERVAL exists since v1.86: timestamp - timestamp -> interval.
+        check("timestamp - timestamp -> interval",
+              one(c, "SELECT '2026-01-02'::timestamp - '2026-01-01'::timestamp")
+              == "1 day")
         check("timestamp + int -> 42883",
               errcode(c, "SELECT '2026-01-01'::timestamp + 1") == "42883")
         check("date vs timestamp compare",

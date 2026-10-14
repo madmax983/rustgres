@@ -166,6 +166,10 @@ fn type_tag(v: &Value) -> u8 {
         Value::Jsonb(_) => 20,
         // v1.85: jsonpath (append-only).
         Value::Jsonpath(_) => 21,
+        // v1.86: time/timetz/interval (append-only).
+        Value::Time(_) => 22,
+        Value::TimeTz(_, _) => 23,
+        Value::Interval(_) => 24,
     }
 }
 

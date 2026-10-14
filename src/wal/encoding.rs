@@ -379,6 +379,35 @@ impl<'a> DbgParser<'a> {
                 self.expect(b')')?;
                 Some(Literal::Timestamptz(n))
             }
+            // v1.86: datetime family literals in checkpoints.
+            "Time" => {
+                self.expect(b'(')?;
+                let n: i64 = self.number()?.parse().ok()?;
+                self.expect(b')')?;
+                Some(Literal::Time(n))
+            }
+            "TimeTz" => {
+                self.expect(b'(')?;
+                let t: i64 = self.number()?.parse().ok()?;
+                self.expect(b',')?;
+                let o: i32 = self.number()?.parse().ok()?;
+                self.expect(b')')?;
+                Some(Literal::TimeTz(t, o))
+            }
+            "Interval" => {
+                self.expect(b'(')?;
+                let mo: i32 = self.number()?.parse().ok()?;
+                self.expect(b',')?;
+                let d: i32 = self.number()?.parse().ok()?;
+                self.expect(b',')?;
+                let us: i64 = self.number()?.parse().ok()?;
+                self.expect(b')')?;
+                Some(Literal::Interval(crate::datetime::Interval {
+                    months: mo,
+                    days: d,
+                    micros: us,
+                }))
+            }
             _ => None,
         }
     }
@@ -553,6 +582,19 @@ impl Enc {
                 self.u8(28);
                 return;
             }
+            // v1.86: time/timetz/interval; tags append after v1.85's.
+            ColType::Time => {
+                self.u8(29);
+                return;
+            }
+            ColType::TimeTz => {
+                self.u8(30);
+                return;
+            }
+            ColType::Interval => {
+                self.u8(31);
+                return;
+            }
             // v1.17: xid; tag appends after v0.81's.
             ColType::Xid => {
                 self.u8(24);
@@ -708,6 +750,24 @@ impl Enc {
             Value::Jsonpath(s) => {
                 self.u8(22);
                 self.str(s);
+            }
+            // v1.86: time values; tag appends after v1.85's.
+            Value::Time(t) => {
+                self.u8(23);
+                self.i64(*t);
+            }
+            // v1.86: timetz values (micros, offset seconds).
+            Value::TimeTz(t, off) => {
+                self.u8(24);
+                self.i64(*t);
+                self.i32(*off);
+            }
+            // v1.86: interval values (months, days, micros).
+            Value::Interval(iv) => {
+                self.u8(25);
+                self.i32(iv.months);
+                self.i32(iv.days);
+                self.i64(iv.micros);
             }
         }
     }
@@ -1571,6 +1631,10 @@ impl<'a> Dec<'a> {
             27 => Ok(ColType::Jsonb),
             // v1.85: jsonpath.
             28 => Ok(ColType::Jsonpath),
+            // v1.86: time/timetz/interval.
+            29 => Ok(ColType::Time),
+            30 => Ok(ColType::TimeTz),
+            31 => Ok(ColType::Interval),
             // v0.78: array, then the PG array OID identifying the
             // element type.
             22 => {
@@ -1590,6 +1654,10 @@ impl<'a> Dec<'a> {
                     1182 => ArrayElem::Date,
                     1115 => ArrayElem::Timestamp,
                     1185 => ArrayElem::Timestamptz,
+                    // v1.86: _time / _timetz / _interval.
+                    1183 => ArrayElem::Time,
+                    1270 => ArrayElem::TimeTz,
+                    1187 => ArrayElem::Interval,
                     1231 => ArrayElem::Numeric,
                     2951 => ArrayElem::Uuid,
                     2206 => ArrayElem::Regclass,
@@ -1654,6 +1722,14 @@ impl<'a> Dec<'a> {
             21 => Ok(Value::Jsonb(self.str_arc()?)),
             // v1.85: jsonpath (rendered text payload).
             22 => Ok(Value::Jsonpath(self.str_arc()?)),
+            // v1.86: time/timetz/interval.
+            23 => Ok(Value::Time(self.i64()?)),
+            24 => Ok(Value::TimeTz(self.i64()?, self.i32()?)),
+            25 => Ok(Value::Interval(crate::datetime::Interval {
+                months: self.i32()?,
+                days: self.i32()?,
+                micros: self.i64()?,
+            })),
             // v0.79: real array values (tag 17; mirrors the encoder).
             17 => {
                 let elem = self.array_elem()?;
@@ -1722,6 +1798,10 @@ impl<'a> Dec<'a> {
             1182 => Ok(ArrayElem::Date),
             1115 => Ok(ArrayElem::Timestamp),
             1185 => Ok(ArrayElem::Timestamptz),
+            // v1.86: _time / _timetz / _interval.
+            1183 => Ok(ArrayElem::Time),
+            1270 => Ok(ArrayElem::TimeTz),
+            1187 => Ok(ArrayElem::Interval),
             1231 => Ok(ArrayElem::Numeric),
             2951 => Ok(ArrayElem::Uuid),
             2206 => Ok(ArrayElem::Regclass),

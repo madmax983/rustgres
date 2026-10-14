@@ -158,6 +158,25 @@ pub(crate) fn value_key(v: &Value, out: &mut Vec<u8>) {
             out.push(21);
             out.extend_from_slice(s.as_bytes());
         }
+        // v1.86: time groups by its micros; timetz by (micros,
+        // offset) (PG timetz equality includes the zone); interval
+        // groups by its comparison key (PG interval hash semantics:
+        // equal intervals hash equal, and interval_eq is cmp-based).
+        Value::Time(t) => {
+            out.push(22);
+            out.extend_from_slice(&t.to_be_bytes());
+        }
+        Value::TimeTz(t, off) => {
+            out.push(23);
+            out.extend_from_slice(&t.to_be_bytes());
+            out.extend_from_slice(&off.to_be_bytes());
+        }
+        Value::Interval(iv) => {
+            out.push(24);
+            let (span, micros) = crate::datetime::interval_cmp_key_pub(iv);
+            out.extend_from_slice(&span.to_be_bytes());
+            out.extend_from_slice(&micros.to_be_bytes());
+        }
         Value::Jsonb(s) => {
             out.push(20);
             match parse_jsonb(s) {
@@ -967,6 +986,13 @@ pub(crate) fn collect_target_srfs(
         | Expr::IsNull { expr, .. }
         | Expr::IsBool { expr, .. }
         | Expr::Extract { from: expr, .. } => collect_target_srfs(eng, expr, group_keys, out),
+        // v1.86: AT TIME ZONE.
+        Expr::AtTimeZone { expr, zone } => {
+            collect_target_srfs(eng, expr, group_keys, out);
+            if let Some(z) = zone {
+                collect_target_srfs(eng, z, group_keys, out);
+            }
+        }
         Expr::Row(elems) => {
             for el in elems {
                 collect_target_srfs(eng, el, group_keys, out);
@@ -1406,6 +1432,36 @@ pub(crate) fn eval_grouped(
                 q, outer, gscope, schema, rows, idxs, key_vals, group_by, expr,
             )?;
             eval_cast(&v, *to)
+        }
+        // v1.86: AT TIME ZONE in grouped evaluation.
+        Expr::AtTimeZone { expr, zone } => {
+            let v = eval_grouped(
+                q, outer, gscope, schema, rows, idxs, key_vals, group_by, expr,
+            )?;
+            if v == Value::Null {
+                return Ok(Value::Null);
+            }
+            let zone_name = match zone {
+                Some(z) => {
+                    match eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, z)?
+                    {
+                        Value::Text(s) | Value::BpChar(s) => s.to_string(),
+                        Value::Null => return Ok(Value::Null),
+                        other => {
+                            return Err(exec_err(
+                                "42883",
+                                format!(
+                                    "operator does not exist: {} AT TIME ZONE {}",
+                                    v.type_name().to_lowercase(),
+                                    other.type_name().to_lowercase()
+                                ),
+                            ));
+                        }
+                    }
+                }
+                None => crate::datetime::session_tz_name(),
+            };
+            crate::exec::eval::eval_at_time_zone(&v, &zone_name)
         }
         // v0.81: `ROW(a, b, ...)` — evaluates to a composite record with
         // PG's `f1`, `f2`, ... field names.

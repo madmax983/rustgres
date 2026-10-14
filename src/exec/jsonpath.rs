@@ -3370,7 +3370,15 @@ fn eval_datetime_method(m: &JpMethod, input: &str) -> Result<String, ExecError> 
                 let d = dt_catch(|| crate::datetime::parse_date(input))
                     .map_err(|_| dt_not_recognized("timestamp", input))?;
                 Ok(crate::datetime::format_timestamp(dt_apply_precision(
-                    d as i64 * 86_400_000_000,
+                    // v1.86: checked (extreme dates overflow i64
+                    // micros; saturate — format clamps like PG's
+                    // range error path in strict mode is unreachable
+                    // in lax mode anyway).
+                    (d as i64).checked_mul(86_400_000_000).unwrap_or(if d < 0 {
+                        i64::MIN
+                    } else {
+                        i64::MAX
+                    }),
                     *prec,
                 )))
             }
@@ -3394,9 +3402,11 @@ fn eval_datetime_method(m: &JpMethod, input: &str) -> Result<String, ExecError> 
         },
         JpMethod::Datetime(fmt) => match fmt {
             Some(f) => {
-                // Template form: PG's to_datetime template engine.
+                // Template form: PG's parse_datetime runs the
+                // template engine in std (strict) mode.
                 let parsed = dt_catch(|| {
-                    crate::datetime::parse_with_format(input, f).map_err(|e| format!("{:?}", e))
+                    crate::datetime::parse_with_format_strict(input, f)
+                        .map_err(|e| format!("{:?}", e))
                 })
                 .map_err(|_| {
                     jperr(

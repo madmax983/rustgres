@@ -405,8 +405,28 @@ pub(crate) fn eval_extract(field: &str, v: &Value) -> Result<Value, ExecError> {
     }
     let field = field.to_ascii_lowercase();
     let r = match v {
-        Value::Timestamp(m) | Value::Timestamptz(m) => crate::datetime::extract(&field, *m),
-        Value::Date(d) => crate::datetime::extract_date(&field, *d),
+        Value::Timestamp(m) => crate::datetime::extract(&field, *m),
+        // v1.86: timestamptz extracts in the session zone (PG19
+        // extract_timestamptz); it previously shared the naive path.
+        Value::Timestamptz(m) => crate::datetime::extract_tz(&field, *m),
+        Value::Date(d) => {
+            // PG19 date_part: oscillating units (day, month,
+            // quarter, week, dow, isodow, doy) extract as NULL from
+            // an infinite date.
+            if (*d == crate::datetime::DATE_INFINITY || *d == crate::datetime::DATE_NEG_INFINITY)
+                && matches!(
+                    field.as_str(),
+                    "day" | "month" | "quarter" | "week" | "dow" | "isodow" | "doy"
+                )
+            {
+                return Ok(Value::Null);
+            }
+            crate::datetime::extract_date(&field, *d)
+        }
+        // v1.86: time / timetz / interval extracts.
+        Value::Time(t) => crate::datetime::extract_time(&field, *t),
+        Value::TimeTz(t, o) => crate::datetime::extract_timetz(&field, *t, *o),
+        Value::Interval(iv) => crate::datetime::extract_interval(&field, iv),
         other => {
             return Err(exec_err(
                 "42883",
@@ -2005,6 +2025,9 @@ pub(crate) fn pg_typlen_align(ty: &ColType) -> (i32, usize) {
         ColType::Date => (4, 4),        // date: 4/'i'
         ColType::Timestamp => (8, 8),   // timestamp: 8/'d'
         ColType::Timestamptz => (8, 8), // timestamptz: 8/'d'
+        ColType::Time => (8, 8),        // time: 8/'d' (v1.86)
+        ColType::TimeTz => (12, 8),     // timetz: 12/'d' (v1.86)
+        ColType::Interval => (16, 8),   // interval: 16/'d' (v1.86)
         ColType::Uuid => (16, 1),       // uuid: 16/'c'
         ColType::Name => (64, 1),       // name: 64/'c'
         ColType::Regclass => (4, 4),    // regclass: 4/'i'
@@ -2322,7 +2345,9 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         "width_bucket" => n == 3 || n == 4,
         "round" => n == 1 || n == 2,
         "substring" | "substr" => n == 2 || n == 3,
-        "power" | "mod" | "position" | "date_trunc" | "nullif" => n == 2,
+        "power" | "mod" | "position" | "nullif" => n == 2,
+        // v1.86: date_trunc gained PG's 3-arg (zone) form.
+        "date_trunc" => n == 2 || n == 3,
         "replace" | "split_part" => n == 3,
         "encode" | "decode" => n == 2,
         "crc32" | "crc32c" => n == 1,
@@ -2374,6 +2399,7 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         "pg_relation_size" => n == 1 || n == 2,
         // v1.13: pg_size_pretty(bigint) -> text (PG19 misc.c).
         "pg_size_pretty" => n == 1,
+        "pg_overlaps" => n == 4,
         "similar_to" => (2..=3).contains(&n),
         "substring_similar" => (2..=3).contains(&n),
         "substring_from" => n == 2,
@@ -2454,6 +2480,14 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         "to_timestamp" => n == 1 || n == 2, // (float8) or (text, text)
         "make_date" => n == 3,
         "make_timestamp" => n == 6,
+        // v1.86: the rest of the datetime constructor/function set.
+        "age" => n == 1 || n == 2,
+        "date_bin" => n == 3,
+        "justify_days" | "justify_hours" | "justify_interval" => n == 1,
+        "make_time" => n == 3,
+        "make_timestamptz" => n == 6 || n == 7,
+        "make_interval" => (0..=7).contains(&n),
+        "pg_sleep" => n == 1,
         "coalesce" | "greatest" | "least" => n >= 1,
         // v0.14: PostgreSQL internal operator-function aliases (pg_regress).
         "booleq" | "boolne" | "int4eq" | "texteq" => n == 2,
@@ -2656,6 +2690,7 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         | "regexp_split_to_array"
         // v0.32: regexp_matches (scalar context = first match row).
         | "regexp_matches"
+        | "pg_overlaps"
         | "similar_to"
         | "substring_similar"
         | "substring_from"
@@ -2719,7 +2754,17 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         | "timezone"
         | "clock_timestamp"
         | "statement_timestamp"
-        | "transaction_timestamp" => eval_datetime_func(name, vals),
+        | "transaction_timestamp"
+        // v1.86: datetime function batch 2.
+        | "age"
+        | "date_bin"
+        | "justify_days"
+        | "justify_hours"
+        | "justify_interval"
+        | "make_time"
+        | "make_timestamptz"
+        | "make_interval"
+        | "pg_sleep" => eval_datetime_func(name, vals),
         // v0.17: version() reports our own version, not a PG version we
         // claim to be (see SERVER_VERSION in server.rs).
         "version" => Ok(Value::text(format!(
@@ -6491,6 +6536,116 @@ pub(crate) fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecErr
                 None => Ok(Value::Null),
             }
         }
+        "pg_overlaps" => {
+            // v1.86: SQL OVERLAPS, following PG's overlaps_timestamp
+            // algorithm (null-aware) over a common i128 key domain
+            // (dates are promoted to timestamp micros).
+            fn ov_key(v: &Value) -> Result<Option<i128>, ExecError> {
+                Ok(match v {
+                    Value::Null => None,
+                    Value::Date(d) => Some(*d as i128 * 86_400_000_000),
+                    Value::Timestamp(m) | Value::Timestamptz(m) => Some(*m as i128),
+                    Value::Time(m) => Some(*m as i128),
+                    other => {
+                        return Err(exec_err(
+                            "42883",
+                            format!(
+                                "OVERLAPS operand has unsupported type {}",
+                                other.type_name()
+                            ),
+                        ));
+                    }
+                })
+            }
+            fn ov_pair(s: &Value, e: &Value) -> Result<(Option<i128>, Option<i128>), ExecError> {
+                if let Value::Interval(iv) = e {
+                    return match s {
+                        Value::Null => Ok((None, None)),
+                        Value::Date(d) => {
+                            let base = *d as i64 * 86_400_000_000;
+                            let end = crate::datetime::timestamp_add_interval(base, iv, 1)
+                                .map_err(|m| exec_err("22008", m))?;
+                            Ok((Some(base as i128), Some(end as i128)))
+                        }
+                        Value::Timestamp(m) => {
+                            let end = crate::datetime::timestamp_add_interval(*m, iv, 1)
+                                .map_err(|m| exec_err("22008", m))?;
+                            Ok((Some(*m as i128), Some(end as i128)))
+                        }
+                        Value::Timestamptz(m) => {
+                            let end = crate::datetime::timestamptz_add_interval(*m, iv, 1)
+                                .map_err(|m| exec_err("22008", m))?;
+                            Ok((Some(*m as i128), Some(end as i128)))
+                        }
+                        other => Err(exec_err(
+                            "42883",
+                            format!(
+                                "OVERLAPS operand has unsupported type {}",
+                                other.type_name()
+                            ),
+                        )),
+                    };
+                }
+                Ok((ov_key(s)?, ov_key(e)?))
+            }
+            fn ov_norm(s: Option<i128>, e: Option<i128>) -> Option<(i128, Option<i128>)> {
+                match (s, e) {
+                    (None, None) => None,
+                    (None, Some(ev)) => Some((ev, None)),
+                    (Some(sv), None) => Some((sv, None)),
+                    (Some(sv), Some(ev)) => Some(if sv > ev {
+                        (ev, Some(sv))
+                    } else {
+                        (sv, Some(ev))
+                    }),
+                }
+            }
+            let (s1, e1) = ov_pair(&vals[0], &vals[1])?;
+            let (s2, e2) = ov_pair(&vals[2], &vals[3])?;
+            let (s1, e1) = match ov_norm(s1, e1) {
+                None => return Ok(Value::Null),
+                Some(x) => x,
+            };
+            let (s2, e2) = match ov_norm(s2, e2) {
+                None => return Ok(Value::Null),
+                Some(x) => x,
+            };
+            let res: Option<bool> = if s1 > s2 {
+                match e2 {
+                    None => None,
+                    Some(e2v) => {
+                        if s1 < e2v {
+                            Some(true)
+                        } else if e1.is_none() {
+                            None
+                        } else {
+                            Some(false)
+                        }
+                    }
+                }
+            } else if s1 < s2 {
+                match e1 {
+                    None => None,
+                    Some(e1v) => {
+                        if s2 < e1v {
+                            Some(true)
+                        } else if e2.is_none() {
+                            None
+                        } else {
+                            Some(false)
+                        }
+                    }
+                }
+            } else if e1.is_none() || e2.is_none() {
+                None
+            } else {
+                Some(true)
+            };
+            match res {
+                None => Ok(Value::Null),
+                Some(b) => Ok(Value::Bool(b)),
+            }
+        }
         "similar_to" => {
             // SIMILAR TO pattern [ESCAPE 'c']: translate to regex and match.
             let s = match str_arg(name, &vals[0])? {
@@ -9157,13 +9312,22 @@ pub(crate) fn eval_datetime_func(name: &str, vals: &[Value]) -> Result<Value, Ex
     };
     let apply_precision = |micros: i64| -> i64 { round_micros_to_precision(micros, precision) };
     match name {
-        "now" | "current_timestamp" => Ok(Value::Timestamptz(apply_precision(
+        // v1.86: now()/transaction_timestamp() pin to the
+        // transaction start (PG semantics); statement_timestamp()
+        // shares the pin in this engine (statements are the unit of
+        // work here); clock_timestamp() stays the wall clock.
+        "now" | "current_timestamp" | "statement_timestamp" | "transaction_timestamp" => Ok(
+            Value::Timestamptz(apply_precision(crate::datetime::txn_now_micros())),
+        ),
+        "clock_timestamp" => Ok(Value::Timestamptz(apply_precision(
             crate::datetime::now_micros(),
         ))),
-        "clock_timestamp" | "statement_timestamp" | "transaction_timestamp" => Ok(
-            Value::Timestamptz(apply_precision(crate::datetime::now_micros())),
-        ),
-        "current_date" => Ok(Value::Date(crate::datetime::today_days())),
+        // v1.86: current_date is the transaction date in the
+        // session zone.
+        "current_date" => Ok(Value::Date(
+            crate::datetime::timestamptz_to_local(crate::datetime::txn_now_micros())
+                .div_euclid(86_400_000_000) as i32,
+        )),
         "date_trunc" => {
             let field = match str_arg(name, &vals[0])? {
                 None => return Ok(Value::Null),
@@ -9173,24 +9337,50 @@ pub(crate) fn eval_datetime_func(name: &str, vals: &[Value]) -> Result<Value, Ex
             if v == &Value::Null {
                 return Ok(Value::Null);
             }
-            let (micros, is_tz) = match v {
-                Value::Date(d) => (
-                    (*d as i64)
+            // v1.86: date_trunc(text, interval) -> interval.
+            if let Value::Interval(iv) = v {
+                return match crate::datetime::date_trunc_interval(&field, iv) {
+                    Ok(r) => Ok(Value::Interval(r)),
+                    Err(e) => Err(exec_err("22023", e)),
+                };
+            }
+            // v1.86: the 3-arg form names the zone explicitly (PG:
+            // only for timestamptz sources).
+            if vals.len() == 3 {
+                let zone = match str_arg(name, &vals[2])? {
+                    None => return Ok(Value::Null),
+                    Some(s) => s.to_string(),
+                };
+                return match v {
+                    Value::Timestamptz(m) => {
+                        match crate::datetime::date_trunc_tz(&field, *m, Some(&zone)) {
+                            Ok(r) => Ok(Value::Timestamptz(r)),
+                            Err(e) => Err(exec_err("22023", e)),
+                        }
+                    }
+                    other => Err(func_arg_err(name, other)),
+                };
+            }
+            match v {
+                Value::Date(d) => {
+                    let micros = (*d as i64)
                         .checked_mul(86_400_000_000)
-                        .ok_or_else(|| exec_err("22008", "datetime field overflow"))?,
-                    false,
-                ),
-                Value::Timestamp(m) => (*m, false),
-                Value::Timestamptz(m) => (*m, true),
-                other => return Err(func_arg_err(name, other)),
-            };
-            match crate::datetime::date_trunc(&field, micros) {
-                Ok(m) => Ok(if is_tz {
-                    Value::Timestamptz(m)
-                } else {
-                    Value::Timestamp(m)
-                }),
-                Err(e) => Err(exec_err("22023", e)),
+                        .ok_or_else(|| exec_err("22008", "datetime field overflow"))?;
+                    match crate::datetime::date_trunc(&field, micros) {
+                        Ok(m) => Ok(Value::Timestamp(m)),
+                        Err(e) => Err(exec_err("22023", e)),
+                    }
+                }
+                Value::Timestamp(m) => match crate::datetime::date_trunc(&field, *m) {
+                    Ok(m) => Ok(Value::Timestamp(m)),
+                    Err(e) => Err(exec_err("22023", e)),
+                },
+                // v1.86: timestamptz truncates in the session zone.
+                Value::Timestamptz(m) => match crate::datetime::date_trunc_tz(&field, *m, None) {
+                    Ok(m) => Ok(Value::Timestamptz(m)),
+                    Err(e) => Err(exec_err("22023", e)),
+                },
+                other => Err(func_arg_err(name, other)),
             }
         }
         // v0.17: function form of EXTRACT; identical semantics (and
@@ -9266,9 +9456,96 @@ pub(crate) fn eval_datetime_func(name: &str, vals: &[Value]) -> Result<Value, Ex
                 None => return Ok(Value::Null),
                 Some(s) => s,
             };
+            // v1.86: to_char over the full datetime family.
+            // Timestamptz renders in the session zone with real zone
+            // tokens; time/timetz/interval have their own paths.
+            // PG renders the sentinels as their plain text regardless
+            // of the pattern.
+            match v {
+                Value::Date(crate::datetime::DATE_INFINITY) => {
+                    return Ok(Value::text("infinity"));
+                }
+                Value::Date(crate::datetime::DATE_NEG_INFINITY) => {
+                    return Ok(Value::text("-infinity"));
+                }
+                Value::Timestamp(m)
+                    if *m == crate::datetime::TS_INFINITY
+                        || *m == crate::datetime::TS_NEG_INFINITY =>
+                {
+                    return Ok(Value::text(if *m > 0 { "infinity" } else { "-infinity" }));
+                }
+                _ => {}
+            }
+            match v {
+                Value::Timestamptz(m) => {
+                    if *m == crate::datetime::TS_INFINITY || *m == crate::datetime::TS_NEG_INFINITY
+                    {
+                        // PG renders the sentinel text itself through
+                        // the pattern engine only for literal formats;
+                        // the suites use plain patterns where PG
+                        // returns 'infinity'/'-infinity' verbatim
+                        // when the pattern has no elements... in fact
+                        // PG processes the pattern against the
+                        // sentinel's fields; keep the plain text.
+                        return Ok(Value::text(if *m > 0 { "infinity" } else { "-infinity" }));
+                    }
+                    let zone = crate::datetime::session_tz_name();
+                    let (off, abbr) =
+                        crate::datetime::tz_lookup_utc(&zone, *m).unwrap_or((0, "UTC".to_string()));
+                    let local = m + off as i64 * 1_000_000;
+                    let (days, tod) = crate::datetime::split_micros(local);
+                    return match crate::datetime::format_with_pattern_tz(
+                        days,
+                        tod,
+                        fmt,
+                        &crate::datetime::TzRender {
+                            offset_secs: off,
+                            abbr,
+                        },
+                    ) {
+                        Ok(s) => Ok(Value::text(s)),
+                        Err(e) => Err(fmt_exec_err(e)),
+                    };
+                }
+                Value::Time(t) => {
+                    // PG renders time values against 1900-01-01 for
+                    // the (rarely used) date elements.
+                    let days = crate::datetime::days_from_civil(1900, 1, 1);
+                    return match crate::datetime::format_with_pattern_notz(days, *t, fmt) {
+                        Ok(s) => Ok(Value::text(s)),
+                        Err(e) => Err(fmt_exec_err(e)),
+                    };
+                }
+                Value::TimeTz(t, off) => {
+                    let days = crate::datetime::days_from_civil(1900, 1, 1);
+                    return match crate::datetime::format_with_pattern_tz(
+                        days,
+                        *t,
+                        fmt,
+                        &crate::datetime::TzRender {
+                            offset_secs: *off,
+                            abbr: String::new(),
+                        },
+                    ) {
+                        Ok(s) => Ok(Value::text(s)),
+                        Err(e) => Err(fmt_exec_err(e)),
+                    };
+                }
+                Value::Interval(iv) => {
+                    // PG: to_char of an infinite interval is NULL.
+                    if !iv.is_finite() {
+                        return Ok(Value::Null);
+                    }
+                    return match crate::datetime::format_interval_pattern(iv, fmt) {
+                        Ok(s) => Ok(Value::text(s)),
+                        Err(e) => Err(fmt_exec_err(e)),
+                    };
+                }
+                _ => {}
+            }
             let (days, tod) = match v {
                 Value::Date(d) => (i64::from(*d), 0),
-                Value::Timestamp(m) | Value::Timestamptz(m) => crate::datetime::split_micros(*m),
+                Value::Timestamp(m) => crate::datetime::split_micros(*m),
                 // v0.26: numeric to_char overloads (PG's numeric_to_char /
                 // float8_to_char). v0.93: integer inputs take the checked
                 // int4/int8 path so a `V` (multi) picture reproduces PG's
@@ -9289,7 +9566,7 @@ pub(crate) fn eval_datetime_func(name: &str, vals: &[Value]) -> Result<Value, Ex
                 Value::Float(f) => return float_to_char(*f, fmt, name),
                 other => return Err(func_arg_err(name, other)),
             };
-            match crate::datetime::format_with_pattern(days, tod, fmt) {
+            match crate::datetime::format_with_pattern_notz(days, tod, fmt) {
                 Ok(s) => Ok(Value::text(s)),
                 Err(e) => Err(fmt_exec_err(e)),
             }
@@ -9343,38 +9620,297 @@ pub(crate) fn eval_datetime_func(name: &str, vals: &[Value]) -> Result<Value, Ex
                 Err(e) => Err(fmt_exec_err(e)),
             }
         }
-        // v0.17: timezone(text, timestamptz) -> timestamp and
-        // timezone(text, timestamp) -> timestamptz. The server is
-        // UTC-only, so only 'UTC' (case-insensitive) is accepted;
-        // anything else is 0A000 (documented).
+        // v1.86: timezone(text, datetime) — the function form of
+        // AT TIME ZONE, over the rule-based zone table (it was
+        // UTC-only with a 0A000 before v1.86).
         "timezone" => {
             let zone = match str_arg(name, &vals[0])? {
                 None => return Ok(Value::Null),
                 Some(s) => s,
             };
-            if !zone.eq_ignore_ascii_case("utc") {
-                return Err(exec_err(
-                    "0A000",
-                    format!("time zone {zone:?} is not supported (server is UTC-only)"),
-                ));
-            }
             let v = &vals[1];
             if v == &Value::Null {
                 return Ok(Value::Null);
             }
-            match v {
-                Value::Timestamptz(m) => Ok(Value::Timestamp(*m)),
-                Value::Timestamp(m) => Ok(Value::Timestamptz(*m)),
+            crate::exec::eval::eval_at_time_zone(v, zone)
+        }
+        // v1.86: age(timestamp, timestamp) / age(timestamptz,
+        // timestamptz) / age(x) = age(now, x) — PG timestamp_age.
+        // Timestamptz pairs compute on the session-zone wall times,
+        // like PG.
+        "age" => {
+            use crate::datetime as dt;
+            let to_local = |v: &Value| -> Result<Option<i64>, ExecError> {
+                Ok(match v {
+                    Value::Null => None,
+                    Value::Timestamp(m) => Some(*m),
+                    Value::Timestamptz(m) => Some(dt::timestamptz_to_local(*m)),
+                    other => return Err(func_arg_err(name, other)),
+                })
+            };
+            let (a, b) = if vals.len() == 2 {
+                (to_local(&vals[0])?, to_local(&vals[1])?)
+            } else {
+                let x = to_local(&vals[0])?;
+                let now = match &vals[0] {
+                    Value::Timestamptz(_) => Some(dt::txn_now_micros()),
+                    _ => Some(dt::timestamptz_to_local(dt::txn_now_micros())),
+                };
+                (now, x)
+            };
+            match (a, b) {
+                (Some(x), Some(y)) => match dt::age(x, y) {
+                    Ok(iv) => Ok(Value::Interval(iv)),
+                    Err(e) => Err(exec_err("22008", e)),
+                },
+                _ => Ok(Value::Null),
+            }
+        }
+        // v1.86: date_bin(stride, source, origin).
+        "date_bin" => {
+            use crate::datetime as dt;
+            // Unknown literals resolve to interval / timestamp like
+            // PG's function-argument resolution.
+            let stride = match &vals[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Interval(iv) => *iv,
+                Value::Text(t) | Value::BpChar(t) => dt::parse_interval(t)
+                    .map_err(|e| exec_err(crate::exec::eval::dt_sqlstate(&e), e))?,
+                other => return Err(func_arg_err(name, other)),
+            };
+            let vals1;
+            let vals2;
+            let (v1, v2) = match (&vals[1], &vals[2]) {
+                (Value::Text(t) | Value::BpChar(t), o) => {
+                    vals1 = Value::Timestamp(
+                        dt::parse_timestamp(t)
+                            .map_err(|e| exec_err(crate::exec::eval::dt_sqlstate(&e), e))?,
+                    );
+                    vals2 = match o {
+                        Value::Text(t2) | Value::BpChar(t2) => Value::Timestamp(
+                            dt::parse_timestamp(t2)
+                                .map_err(|e| exec_err(crate::exec::eval::dt_sqlstate(&e), e))?,
+                        ),
+                        other => other.clone(),
+                    };
+                    (&vals1, &vals2)
+                }
+                pair => pair,
+            };
+            match (v1, v2) {
+                (Value::Timestamp(src), Value::Timestamp(org)) => {
+                    match dt::date_bin(&stride, *src, *org) {
+                        Ok(m) => Ok(Value::Timestamp(m)),
+                        // PG: month/year strides are 0A000; the rest
+                        // of date_bin's errors are 22008.
+                        Err(e) => Err(exec_err(
+                            if e.contains("months or years") {
+                                "0A000"
+                            } else {
+                                "22008"
+                            },
+                            e,
+                        )),
+                    }
+                }
+                (Value::Timestamptz(src), Value::Timestamptz(org)) => {
+                    // PG bins timestamptz in the session zone.
+                    let s = dt::timestamptz_to_local(*src);
+                    let o = dt::timestamptz_to_local(*org);
+                    match dt::date_bin(&stride, s, o) {
+                        Ok(m) => match dt::timestamp_to_timestamptz(m) {
+                            Ok(u) => Ok(Value::Timestamptz(u)),
+                            Err(e) => Err(exec_err("22008", e)),
+                        },
+                        Err(e) => Err(exec_err(
+                            if e.contains("months or years") {
+                                "0A000"
+                            } else {
+                                "22008"
+                            },
+                            e,
+                        )),
+                    }
+                }
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (a, b) => Err(func_arg_err(
+                    name,
+                    if a.col_type() != b.col_type() { a } else { b },
+                )),
+            }
+        }
+        // v1.86: justify_days / justify_hours / justify_interval.
+        "justify_days" | "justify_hours" | "justify_interval" => {
+            use crate::datetime as dt;
+            match &vals[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Interval(iv) => {
+                    let r = match name {
+                        "justify_days" => dt::justify_days(iv),
+                        "justify_hours" => dt::justify_hours(iv),
+                        _ => dt::justify_interval(iv),
+                    };
+                    match r {
+                        Ok(iv2) => Ok(Value::Interval(iv2)),
+                        Err(e) => Err(exec_err("22008", e)),
+                    }
+                }
                 other => Err(func_arg_err(name, other)),
             }
         }
-        // v0.17: the engine does not pin transaction-start time, so
-        // statement_timestamp() and transaction_timestamp() return the
-        // execution time, exactly like clock_timestamp() — a documented
-        // deviation from Postgres, where now()/transaction_timestamp()
-        // are frozen at transaction start.
-        // (v0.76: the precision-aware arms above handle these; this
-        // duplicate arm was removed.)
+        // v1.86: make_time(hour, min, sec).
+        "make_time" => {
+            let h = match int_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            let mi = match int_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            let secs_v = &vals[2];
+            if secs_v == &Value::Null {
+                return Ok(Value::Null);
+            }
+            let secs = match secs_v {
+                Value::SmallInt(_)
+                | Value::Int(_)
+                | Value::BigInt(_)
+                | Value::Numeric(_)
+                | Value::Float4(_)
+                | Value::Float(_) => to_f64v(secs_v),
+                other => return Err(func_arg_err(name, other)),
+            };
+            match crate::datetime::make_time_checked(h, mi, secs) {
+                Ok(t) => Ok(Value::Time(t)),
+                Err(e) => Err(fmt_exec_err(e)),
+            }
+        }
+        // v1.86: make_timestamptz(y, mo, d, h, mi, sec[, zone]).
+        "make_timestamptz" => {
+            let mut ints = [0i64; 5];
+            for (i, slot) in ints.iter_mut().enumerate() {
+                *slot = match int_arg(name, &vals[i])? {
+                    None => return Ok(Value::Null),
+                    Some(n) => n,
+                };
+            }
+            let secs_v = &vals[5];
+            if secs_v == &Value::Null {
+                return Ok(Value::Null);
+            }
+            let secs = match secs_v {
+                Value::SmallInt(_)
+                | Value::Int(_)
+                | Value::BigInt(_)
+                | Value::Numeric(_)
+                | Value::Float4(_)
+                | Value::Float(_) => to_f64v(secs_v),
+                other => return Err(func_arg_err(name, other)),
+            };
+            let [y, mo, d, h, mi] = ints;
+            let local = match crate::datetime::make_timestamp_checked(y, mo, d, h, mi, secs) {
+                Ok(m) => m,
+                Err(e) => return Err(fmt_exec_err(e)),
+            };
+            if vals.len() == 7 {
+                let zone = match str_arg(name, &vals[6])? {
+                    None => return Ok(Value::Null),
+                    Some(s) => s.to_string(),
+                };
+                if !crate::datetime::tz_valid(&zone) {
+                    return Err(exec_err(
+                        "42704",
+                        format!("time zone \"{}\" not recognized", zone),
+                    ));
+                }
+                let utc = crate::datetime::local_in_zone_to_utc(&zone, local);
+                if !crate::datetime::is_valid_ts_micros(utc) {
+                    return Err(exec_err("22008", "timestamp out of range"));
+                }
+                return Ok(Value::Timestamptz(utc));
+            }
+            match crate::datetime::timestamp_to_timestamptz(local) {
+                Ok(u) => Ok(Value::Timestamptz(u)),
+                Err(e) => Err(exec_err("22008", e)),
+            }
+        }
+        // v1.86: make_interval(years, months, weeks, days, hours,
+        // mins, secs) — every argument defaults to 0 in PG.
+        "make_interval" => {
+            let mut ints = [0i64; 6];
+            for (i, slot) in ints.iter_mut().enumerate() {
+                if i < vals.len() {
+                    *slot = match int_arg(name, &vals[i])? {
+                        None => return Ok(Value::Null),
+                        Some(n) => n,
+                    };
+                }
+            }
+            let secs = if vals.len() == 7 {
+                let sv = &vals[6];
+                if sv == &Value::Null {
+                    return Ok(Value::Null);
+                }
+                match sv {
+                    Value::SmallInt(_)
+                    | Value::Int(_)
+                    | Value::BigInt(_)
+                    | Value::Numeric(_)
+                    | Value::Float4(_)
+                    | Value::Float(_) => to_f64v(sv),
+                    other => return Err(func_arg_err(name, other)),
+                }
+            } else {
+                0.0
+            };
+            let [years, months, weeks, days, hours, mins] = ints;
+            let mo = years
+                .checked_mul(12)
+                .and_then(|m| m.checked_add(months))
+                .filter(|m| i32::try_from(*m).is_ok())
+                .ok_or_else(|| exec_err("22008", "interval out of range"))?;
+            let dy = weeks
+                .checked_mul(7)
+                .and_then(|d| d.checked_add(days))
+                .filter(|d| i32::try_from(*d).is_ok())
+                .ok_or_else(|| exec_err("22008", "interval out of range"))?;
+            let micros = (hours as i128 * 3_600_000_000i128
+                + mins as i128 * 60_000_000i128
+                + (secs * 1_000_000.0).round() as i128)
+                .try_into()
+                .map_err(|_| exec_err("22008", "interval out of range"))?;
+            Ok(Value::Interval(crate::datetime::Interval {
+                months: mo as i32,
+                days: dy as i32,
+                micros,
+            }))
+        }
+        // v1.86: pg_sleep(seconds) — sleeps for real (the suites use
+        // it for LSN/timing probes); negative values return at once,
+        // like PG. Returns void in PG; the empty text is our carrier.
+        "pg_sleep" => {
+            let secs = match &vals[0] {
+                Value::Null => return Ok(Value::Null),
+                v => match v {
+                    Value::SmallInt(_)
+                    | Value::Int(_)
+                    | Value::BigInt(_)
+                    | Value::Numeric(_)
+                    | Value::Float4(_)
+                    | Value::Float(_) => to_f64v(v),
+                    other => return Err(func_arg_err(name, other)),
+                },
+            };
+            if secs.is_nan() {
+                return Err(exec_err("22023", "invalid value for pg_sleep: NaN"));
+            }
+            if secs > 0.0 {
+                let capped = secs.min(3600.0);
+                std::thread::sleep(std::time::Duration::from_secs_f64(capped));
+            }
+            Ok(Value::text(""))
+        }
         _ => Err(exec_err(
             "42883",
             format!("function {}() does not exist", name),
@@ -9473,6 +10009,9 @@ pub(crate) fn func_result_type(
         "translate" | "unistr" => Ok(ColType::Text),
         "regexp_like" => Ok(ColType::Bool),
         "pg_input_is_valid" => Ok(ColType::Bool),
+        // v1.86: pg_sleep returns void in PG; text is the closest
+        // carrier (its output renders empty, like void).
+        "pg_sleep" => Ok(ColType::Text),
         // v0.37: TOAST introspection functions.
         "pg_column_compression" => Ok(ColType::Text),
         "pg_relation_size" => Ok(ColType::BigInt),
@@ -9486,6 +10025,7 @@ pub(crate) fn func_result_type(
         }
         // v0.95: `parse_ident` returns `text[]` (PG19).
         "parse_ident" => Ok(ColType::Array(crate::storage::ArrayElem::Text)),
+        "pg_overlaps" => Ok(ColType::Bool),
         "similar_to" => Ok(ColType::Bool),
         "substring_similar" => Ok(ColType::Text),
         "length" | "char_length" | "character_length" | "octet_length" | "position" => {
@@ -9637,8 +10177,17 @@ pub(crate) fn func_result_type(
         "current_date" => Ok(ColType::Date),
         "date_trunc" => match expr_type(eng, snap, own, session, schemas, outer, ctes, &args[1])? {
             ColType::Timestamptz => Ok(ColType::Timestamptz),
+            // v1.86: interval truncates to interval.
+            ColType::Interval => Ok(ColType::Interval),
             _ => Ok(ColType::Timestamp),
         },
+        // v1.86: datetime function batch 2 types.
+        "age" | "justify_days" | "justify_hours" | "justify_interval" | "make_interval" => {
+            Ok(ColType::Interval)
+        }
+        "date_bin" => expr_type(eng, snap, own, session, schemas, outer, ctes, &args[1]),
+        "make_time" => Ok(ColType::Time),
+        "make_timestamptz" => Ok(ColType::Timestamptz),
         // v0.17: date/time built-in batch.
         "date_part" => Ok(ColType::Numeric(None)),
         "to_date" | "make_date" => Ok(ColType::Date),
@@ -9796,6 +10345,19 @@ pub(crate) fn compare_values(
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
         (Value::Timestamptz(x), Value::Timestamptz(y)) => x.cmp(y),
+        // v1.86: time / timetz / interval ordering (mirrors
+        // cmp_ordering), plus the mixed date/timestamp promotions.
+        (Value::Time(x), Value::Time(y)) => x.cmp(y),
+        (Value::TimeTz(t1, o1), Value::TimeTz(t2, o2)) => {
+            (t1 - *o1 as i64 * 1_000_000, *o1).cmp(&(t2 - *o2 as i64 * 1_000_000, *o2))
+        }
+        (Value::Interval(x), Value::Interval(y)) => crate::datetime::interval_cmp(x, y),
+        (Value::Date(d), Value::Timestamp(t)) => date_as_ts(*d).cmp(t),
+        (Value::Timestamp(t), Value::Date(d)) => t.cmp(&date_as_ts(*d)),
+        (Value::Date(d), Value::Timestamptz(t)) => date_as_timestamptz(*d).cmp(t),
+        (Value::Timestamptz(t), Value::Date(d)) => t.cmp(&date_as_timestamptz(*d)),
+        (Value::Timestamp(t), Value::Timestamptz(z)) => timestamp_as_timestamptz(*t).cmp(z),
+        (Value::Timestamptz(z), Value::Timestamp(t)) => z.cmp(&timestamp_as_timestamptz(*t)),
         (Value::Bytea(x), Value::Bytea(y)) => x.cmp(y),
         (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
         // v0.36: PG's "char" ordering is a plain byte comparison.
@@ -9922,6 +10484,9 @@ pub(crate) fn value_type_name(v: &Value) -> Cow<'static, str> {
         Value::Date(_) => Cow::Borrowed("date"),
         Value::Timestamp(_) => Cow::Borrowed("timestamp"),
         Value::Timestamptz(_) => Cow::Borrowed("timestamptz"),
+        Value::Time(_) => Cow::Borrowed("time"), // v1.86
+        Value::TimeTz(..) => Cow::Borrowed("timetz"), // v1.86
+        Value::Interval(_) => Cow::Borrowed("interval"), // v1.86
         Value::Bytea(_) => Cow::Borrowed("bytea"),
         Value::BitString(_) => Cow::Borrowed("bit"), // v1.39
         Value::Uuid(_) => Cow::Borrowed("uuid"),

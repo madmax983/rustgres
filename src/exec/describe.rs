@@ -925,6 +925,27 @@ pub(crate) fn expr_col_name_strength(e: &Expr) -> (String, u8) {
         Expr::ArraySubquery(_) => ("array".to_string(), 2),
         // v0.75: PG names an unaliased EXISTS output column "exists".
         Expr::Exists { .. } => ("exists".to_string(), 2),
+        // v1.86: PG names an EXTRACT output column "extract"
+        // (FigureColnameInternal T_ValueFunction? no — extract is a
+        // SQLValueFunction-like special: parse_target.c names it
+        // "extract"), and an AT TIME ZONE expression takes its
+        // operand's name (it is a timezone-shifted column value).
+        Expr::Extract { .. } => ("extract".to_string(), 2),
+        // PG: AT TIME ZONE is the timezone() function call internally
+        // — the output column is named "timezone".
+        Expr::AtTimeZone { .. } => ("timezone".to_string(), 2),
+        // v1.86: typed datetime literals name their column after the
+        // type (PG TypeCast FigureColname), strength 1 so an outer
+        // cast/qualifier wins.
+        Expr::Literal(lit) => match lit {
+            crate::sql::Literal::Date(_) => ("date".to_string(), 1),
+            crate::sql::Literal::Timestamp(_) => ("timestamp".to_string(), 1),
+            crate::sql::Literal::Timestamptz(_) => ("timestamptz".to_string(), 1),
+            crate::sql::Literal::Time(_) => ("time".to_string(), 1),
+            crate::sql::Literal::TimeTz(..) => ("timetz".to_string(), 1),
+            crate::sql::Literal::Interval(_) => ("interval".to_string(), 1),
+            _ => ("?column?".to_string(), 0),
+        },
         _ => ("?column?".to_string(), 0),
     }
 }
@@ -1038,6 +1059,20 @@ pub(crate) fn expr_type(
             combine_arith_types(*op, ta, tb)
         }
         Expr::Cast { to, .. } => Ok(*to),
+        // v1.86: AT TIME ZONE flips the zone-ness of the operand
+        // type (PG19: timestamptz->timestamp, timestamp->timestamptz,
+        // timetz->time, time->timetz, date->timestamptz).
+        Expr::AtTimeZone { expr, .. } => {
+            let inner = expr_type(eng, snap, own, session, schemas, outer, ctes, expr)?;
+            Ok(match inner {
+                ColType::Timestamptz => ColType::Timestamp,
+                ColType::Timestamp => ColType::Timestamptz,
+                ColType::TimeTz => ColType::Time,
+                ColType::Time => ColType::TimeTz,
+                ColType::Date => ColType::Timestamptz,
+                other => other,
+            })
+        }
         // v0.81: `ROW(a, b, ...)` evaluates to a composite record value.
         Expr::Row(elems) => {
             for e in elems {
@@ -1129,6 +1164,7 @@ pub(crate) fn expr_type(
                 | ColType::BigInt
                 | ColType::Float4
                 | ColType::Float
+                | ColType::Interval
                 | ColType::Numeric(..)) => Ok(t),
                 ColType::Text => Ok(ColType::Int),
                 t => Err(exec_err(
@@ -1618,6 +1654,83 @@ pub(crate) fn combine_arith_types(
                 },
                 (ColType::Date, ColType::Date) => match op {
                     ArithOp::Sub => Ok(ColType::Int),
+                    _ => Err(op_err(&x, &y)),
+                },
+                // v1.86: the datetime arithmetic matrix, mirroring
+                // eval_datetime_arith's result types (PG19
+                // pg_operator): interval+-interval, interval */-
+                // numeric, datetime +- interval (date -> timestamp!),
+                // date + time/timetz, datetime - datetime -> interval,
+                // time - time -> interval.
+                (ColType::Interval, ColType::Interval) => match op {
+                    ArithOp::Add | ArithOp::Sub => Ok(ColType::Interval),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Interval, y) if numeric_rank(y).is_some() => match op {
+                    ArithOp::Mul | ArithOp::Div => Ok(ColType::Interval),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (x, ColType::Interval) if numeric_rank(x).is_some() => match op {
+                    ArithOp::Mul => Ok(ColType::Interval),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Date, ColType::Interval) => match op {
+                    ArithOp::Add | ArithOp::Sub => Ok(ColType::Timestamp),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Interval, ColType::Date) => match op {
+                    ArithOp::Add => Ok(ColType::Timestamp),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Timestamp, ColType::Interval) => match op {
+                    ArithOp::Add | ArithOp::Sub => Ok(ColType::Timestamp),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Interval, ColType::Timestamp) => match op {
+                    ArithOp::Add => Ok(ColType::Timestamp),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Timestamptz, ColType::Interval) => match op {
+                    ArithOp::Add | ArithOp::Sub => Ok(ColType::Timestamptz),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Interval, ColType::Timestamptz) => match op {
+                    ArithOp::Add => Ok(ColType::Timestamptz),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Time, ColType::Interval) => match op {
+                    ArithOp::Add | ArithOp::Sub => Ok(ColType::Time),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Interval, ColType::Time) => match op {
+                    ArithOp::Add => Ok(ColType::Time),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::TimeTz, ColType::Interval) => match op {
+                    ArithOp::Add | ArithOp::Sub => Ok(ColType::TimeTz),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Interval, ColType::TimeTz) => match op {
+                    ArithOp::Add => Ok(ColType::TimeTz),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Date, ColType::Time) | (ColType::Time, ColType::Date) => match op {
+                    ArithOp::Add => Ok(ColType::Timestamp),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Date, ColType::TimeTz) | (ColType::TimeTz, ColType::Date) => match op {
+                    ArithOp::Add => Ok(ColType::Timestamptz),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Timestamp, ColType::Timestamp)
+                | (ColType::Timestamptz, ColType::Timestamptz)
+                | (ColType::Timestamp, ColType::Timestamptz)
+                | (ColType::Timestamptz, ColType::Timestamp) => match op {
+                    ArithOp::Sub => Ok(ColType::Interval),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Time, ColType::Time) | (ColType::TimeTz, ColType::TimeTz) => match op {
+                    ArithOp::Sub => Ok(ColType::Interval),
                     _ => Err(op_err(&x, &y)),
                 },
                 // v0.21: an unknown-type (text) literal against a numeric

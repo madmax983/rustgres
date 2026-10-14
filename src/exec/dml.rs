@@ -1500,6 +1500,9 @@ pub(crate) fn array_elem_coltype(e: ArrayElem) -> ColType {
         ArrayElem::Date => ColType::Date,
         ArrayElem::Timestamp => ColType::Timestamp,
         ArrayElem::Timestamptz => ColType::Timestamptz,
+        ArrayElem::Time => ColType::Time,         // v1.86
+        ArrayElem::TimeTz => ColType::TimeTz,     // v1.86
+        ArrayElem::Interval => ColType::Interval, // v1.86
         ArrayElem::Numeric => ColType::Numeric(None),
         ArrayElem::Uuid => ColType::Uuid,
         ArrayElem::Regclass => ColType::Regclass,

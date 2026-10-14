@@ -1699,7 +1699,15 @@ pub(crate) fn datum_to_json_text(v: &Value, out: &mut String) {
 /// 'T' and a bare `+HH`/`-HH` zone offset widened to `+HH:00`
 /// (PG's EncodeDateTime with USE_XSD_DATES).
 pub(crate) fn json_xsd_datetime_text(v: &Value) -> String {
-    let t = v.to_text().unwrap_or_default();
+    // PG's JsonEncodeDateTime forces ISO format inside JSON,
+    // ignoring the session DateStyle (the type output functions
+    // honor it; the JSON encoder does not).
+    let t = match v {
+        Value::Date(d) => crate::datetime::format_date_iso(*d),
+        Value::Timestamp(m) => crate::datetime::format_timestamp_iso(*m),
+        Value::Timestamptz(m) => crate::datetime::format_timestamptz_iso(*m),
+        _ => v.to_text().unwrap_or_default(),
+    };
     if matches!(v, Value::Date(_)) {
         return t;
     }
@@ -2885,7 +2893,9 @@ pub(crate) fn sqljson_convert_return(item: &JsonbVal, type_name: &str) -> Result
             }
         }
         "timestamp with time zone" => {
-            match dt_safe(|| crate::datetime::parse_timestamp(text.trim())) {
+            // v1.86: was parse_timestamp (zone silently dropped);
+            // PG populates timestamptz via timestamptz_in.
+            match dt_safe(|| crate::datetime::parse_timestamptz(text.trim())) {
                 Ok(t) => Ok(Value::Timestamptz(t)),
                 Err(_) => Err(exec_err(
                     "22007",
@@ -2896,6 +2906,34 @@ pub(crate) fn sqljson_convert_return(item: &JsonbVal, type_name: &str) -> Result
                 )),
             }
         }
+        // v1.86: time / timetz / interval from JSON strings.
+        "time without time zone" => match dt_safe(|| crate::datetime::parse_time(text.trim())) {
+            Ok(t) => Ok(Value::Time(t)),
+            Err(_) => Err(exec_err(
+                "22007",
+                format!(
+                    "invalid input syntax for type time without time zone: {:?}",
+                    text
+                ),
+            )),
+        },
+        "time with time zone" => match dt_safe(|| crate::datetime::parse_timetz(text.trim())) {
+            Ok((t, o)) => Ok(Value::TimeTz(t, o)),
+            Err(_) => Err(exec_err(
+                "22007",
+                format!(
+                    "invalid input syntax for type time with time zone: {:?}",
+                    text
+                ),
+            )),
+        },
+        "interval" => match dt_safe(|| crate::datetime::parse_interval(text.trim())) {
+            Ok(iv) => Ok(Value::Interval(iv)),
+            Err(_) => Err(exec_err(
+                "22007",
+                format!("invalid input syntax for type interval: {:?}", text),
+            )),
+        },
         "text" => Ok(Value::text(text)),
         "json" => Ok(Value::text(item.render())),
         "jsonb" => Ok(Value::jsonb(item.render())),

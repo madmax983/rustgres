@@ -841,6 +841,10 @@ pub(crate) fn stmt_uses_pg_column_compression(stmt: &SelectStmt) -> bool {
             // v0.81: row constructors, named casts and field accesses
             // recurse into their operand(s).
             Expr::CastNamed { expr, .. } => expr_uses(expr),
+            // v1.86: AT TIME ZONE.
+            Expr::AtTimeZone { expr, zone } => {
+                expr_uses(expr) || zone.as_deref().map(expr_uses).unwrap_or(false)
+            }
             Expr::Row(elems) => elems.iter().any(expr_uses),
             Expr::FieldAccess { expr, .. } => expr_uses(expr),
             Expr::Concat(a, b) => expr_uses(a) || expr_uses(b),
@@ -958,6 +962,10 @@ pub(crate) fn stmt_uses_tableoid(stmt: &SelectStmt) -> bool {
             Expr::Arith { left, right, .. } => expr_uses(left) || expr_uses(right),
             Expr::Cast { expr, .. } => expr_uses(expr),
             Expr::CastNamed { expr, .. } => expr_uses(expr),
+            // v1.86: AT TIME ZONE.
+            Expr::AtTimeZone { expr, zone } => {
+                expr_uses(expr) || zone.as_deref().map(expr_uses).unwrap_or(false)
+            }
             Expr::Row(elems) => elems.iter().any(expr_uses),
             Expr::FieldAccess { expr, .. } => expr_uses(expr),
             Expr::Concat(a, b) => expr_uses(a) || expr_uses(b),
@@ -1073,6 +1081,10 @@ pub(crate) fn stmt_uses_xmin_xmax(stmt: &SelectStmt) -> bool {
             Expr::Arith { left, right, .. } => expr_uses(left) || expr_uses(right),
             Expr::Cast { expr, .. } => expr_uses(expr),
             Expr::CastNamed { expr, .. } => expr_uses(expr),
+            // v1.86: AT TIME ZONE.
+            Expr::AtTimeZone { expr, zone } => {
+                expr_uses(expr) || zone.as_deref().map(expr_uses).unwrap_or(false)
+            }
             Expr::Row(elems) => elems.iter().any(expr_uses),
             Expr::FieldAccess { expr, .. } => expr_uses(expr),
             Expr::Concat(a, b) => expr_uses(a) || expr_uses(b),
@@ -1412,6 +1424,11 @@ pub(crate) fn resolve_predicate_columns_in(
                     ))
                 })
                 .collect::<Result<Vec<_>, _>>()?,
+        }),
+        // v1.86: AT TIME ZONE rebuilds with resolved operands.
+        Expr::AtTimeZone { expr, zone } => Ok(Expr::AtTimeZone {
+            expr: Box::new(r(expr)?),
+            zone: zone.as_deref().map(r).transpose()?.map(Box::new),
         }),
         Expr::Cast { expr, to, written } => Ok(Expr::Cast {
             expr: Box::new(r(expr)?),
@@ -1754,6 +1771,14 @@ pub(crate) enum FnKeyVal {
     Date(i32),
     Timestamp(i64),
     Timestamptz(i64),
+    // v1.86: datetime family cache keys.
+    Time(i64),
+    TimeTz(i64, i32),
+    Interval {
+        months: i32,
+        days: i32,
+        micros: i64,
+    },
     Bytea(Vec<u8>),
     // v1.39: bit length matters (trailing bits are padding).
     BitString {
@@ -1802,6 +1827,13 @@ pub(crate) fn fn_key_val(v: &Value) -> FnKeyVal {
         Value::Date(d) => FnKeyVal::Date(*d),
         Value::Timestamp(t) => FnKeyVal::Timestamp(*t),
         Value::Timestamptz(t) => FnKeyVal::Timestamptz(*t),
+        Value::Time(t) => FnKeyVal::Time(*t), // v1.86
+        Value::TimeTz(t, o) => FnKeyVal::TimeTz(*t, *o), // v1.86
+        Value::Interval(iv) => FnKeyVal::Interval {
+            months: iv.months,
+            days: iv.days,
+            micros: iv.micros,
+        },
         Value::Bytea(b) => FnKeyVal::Bytea(b.clone()),
         // v1.39
         Value::BitString(b) => FnKeyVal::BitString {

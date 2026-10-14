@@ -870,6 +870,26 @@ pub(crate) fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<V
                 .map(Value::Timestamptz)
                 .map_err(|_| bad(format!("\"{}\"", s)))
         }
+        // v1.86: time / timetz / interval parameters parse through
+        // the same input functions as casts.
+        ColType::Time => {
+            let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
+            crate::datetime::parse_time(s.trim())
+                .map(Value::Time)
+                .map_err(|_| bad(format!("\"{}\"", s)))
+        }
+        ColType::TimeTz => {
+            let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
+            crate::datetime::parse_timetz(s.trim())
+                .map(|(t, o)| Value::TimeTz(t, o))
+                .map_err(|_| bad(format!("\"{}\"", s)))
+        }
+        ColType::Interval => {
+            let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
+            crate::datetime::parse_interval(s.trim())
+                .map(Value::Interval)
+                .map_err(|_| bad(format!("\"{}\"", s)))
+        }
         ColType::Bytea => {
             let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
             crate::storage::parse_bytea(s.trim())
@@ -1179,6 +1199,11 @@ pub(crate) fn value_to_literal(v: &Option<Value>) -> Literal {
         Some(Value::Date(d)) => Literal::Date(*d),
         Some(Value::Timestamp(m)) => Literal::Timestamp(*m),
         Some(Value::Timestamptz(m)) => Literal::Timestamptz(*m),
+        // v1.86: time/timetz/interval parameters substitute as their
+        // output text; downstream coercion re-parses for the target.
+        Some(Value::Time(t)) => Literal::Text(crate::datetime::format_time(*t).into()),
+        Some(Value::TimeTz(t, o)) => Literal::Text(crate::datetime::format_timetz(*t, *o).into()),
+        Some(Value::Interval(iv)) => Literal::Text(crate::datetime::format_interval(iv).into()),
         Some(Value::Bytea(b)) => Literal::Bytea(b.clone()),
         // v1.39: bit strings substitute losslessly as bit literals.
         Some(Value::BitString(b)) => Literal::BitString(b.clone()),
@@ -1243,6 +1268,13 @@ pub(crate) fn subst_expr(e: &mut Expr, params: &[Option<Value>]) -> Result<(), E
             subst_expr(right, params)?;
         }
         Expr::Cast { expr, .. } => subst_expr(expr, params)?,
+        // v1.86: AT TIME ZONE — substitute in both operands.
+        Expr::AtTimeZone { expr, zone } => {
+            subst_expr(expr, params)?;
+            if let Some(z) = zone {
+                subst_expr(z, params)?;
+            }
+        }
         // v0.86: named casts (e.g. `row($1,$2)::int8_tbl` in function bodies).
         Expr::CastNamed { expr, .. } => subst_expr(expr, params)?,
         // v0.86: parameters inside ROW(...) constructors (function
@@ -1377,6 +1409,9 @@ pub(crate) fn dummy_value(t: &ColType) -> Value {
         ColType::Date => Value::Date(0),
         ColType::Timestamp => Value::Timestamp(0),
         ColType::Timestamptz => Value::Timestamptz(0),
+        ColType::Time => Value::Time(0),        // v1.86
+        ColType::TimeTz => Value::TimeTz(0, 0), // v1.86
+        ColType::Interval => Value::Interval(crate::datetime::Interval::zero()), // v1.86
         ColType::Bytea => Value::Bytea(Vec::new()),
         // v1.39: the empty bit string.
         ColType::Bit => Value::BitString(crate::storage::BitString {

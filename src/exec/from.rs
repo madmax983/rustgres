@@ -201,6 +201,14 @@ pub(crate) fn expr_is_volatile(db: &Database, e: &Expr) -> bool {
         | Expr::IsBool { expr, .. }
         | Expr::Extract { from: expr, .. }
         | Expr::NamedArg { expr, .. } => expr_is_volatile(db, expr),
+        // v1.86: AT TIME ZONE is stable (PG19 timezone() is stable).
+        Expr::AtTimeZone { expr, zone } => {
+            expr_is_volatile(db, expr)
+                || zone
+                    .as_deref()
+                    .map(|z| expr_is_volatile(db, z))
+                    .unwrap_or(false)
+        }
         Expr::Like { expr, pattern, .. } | Expr::Regex { expr, pattern, .. } => {
             expr_is_volatile(db, expr) || expr_is_volatile(db, pattern)
         }
@@ -423,6 +431,13 @@ pub(crate) fn collect_column_refs(e: &Expr, out: &mut Vec<(Option<String>, Strin
         }
         Expr::CastNamed { expr, .. } | Expr::FieldAccess { expr, .. } => {
             collect_column_refs(expr, out);
+        }
+        // v1.86: AT TIME ZONE.
+        Expr::AtTimeZone { expr, zone } => {
+            collect_column_refs(expr, out);
+            if let Some(z) = zone {
+                collect_column_refs(z, out);
+            }
         }
         Expr::Subscript { array, indices } => {
             collect_column_refs(array, out);

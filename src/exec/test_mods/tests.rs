@@ -898,12 +898,16 @@ fn v17_datetime_functions() {
         err_code(&mut eng, "SELECT to_date('2026-02-30', 'YYYY-MM-DD')"),
         "22008"
     );
+    // PG formatting.c (std=false): a template separator matches any
+    // single input separator, so '2026/01/15' parses under 'YYYY-MM-DD'.
     assert_eq!(
-        err_code(&mut eng, "SELECT to_date('2026/01/15', 'YYYY-MM-DD')"),
-        "22008"
+        one(&mut eng, "SELECT to_date('2026/01/15', 'YYYY-MM-DD')"),
+        "2026-01-15"
     );
+    // v1.86: Q is the quarter pattern element now (PG formatting.c);
+    // the unsupported-pattern pin moves to EE.
     assert_eq!(
-        err_code(&mut eng, "SELECT to_date('2026-01-15', 'YYYY-MM-QQ')"),
+        err_code(&mut eng, "SELECT to_date('2026-01-15', 'YYYY-MM-EE')"),
         "0A000"
     );
     // to_timestamp with format strings.
@@ -981,7 +985,8 @@ fn v17_datetime_functions() {
         "NULL"
     );
     assert_eq!(
-        err_code(&mut eng, "SELECT to_char(DATE '2026-09-11', 'QQ')"),
+        // v1.86: 'QQ' is two quarter elements now; EE stays unsupported.
+        err_code(&mut eng, "SELECT to_char(DATE '2026-09-11', 'EE')"),
         "0A000"
     );
     // v0.42: PG19 supports to_char() on int4/int8/numeric (formatting.c
@@ -1017,8 +1022,11 @@ fn v17_datetime_functions() {
         err_code(&mut eng, "SELECT make_timestamp(2026, 1, 1, 0, 0, 60)"),
         "22008"
     );
-    assert_eq!(err_code(&mut eng, "SELECT make_time(1, 2, 3)"), "42883");
-    // timezone(): UTC-only.
+    // v1.86: make_time exists now (the TIME type landed); the v0.17
+    // pin expected 42883 because the engine had no time type.
+    assert_eq!(one(&mut eng, "SELECT make_time(1, 2, 3)"), "01:02:03");
+    assert_eq!(err_code(&mut eng, "SELECT make_time(25, 0, 0)"), "22008");
+    // timezone(): UTC-only before v1.86 (now the full zone table).
     assert_eq!(
         one(
             &mut eng,
@@ -1033,16 +1041,20 @@ fn v17_datetime_functions() {
         ),
         "2026-09-11 13:25:01+00"
     );
+    // v1.86: the zone table landed — Chicago (CDT, UTC-5 in
+    // September) converts for real; the v0.17 pin expected 0A000.
     assert_eq!(
-        err_code(
+        one(
             &mut eng,
             "SELECT timezone('America/Chicago', TIMESTAMPTZ '2026-09-11 13:25:01+00')"
         ),
-        "0A000"
+        "2026-09-11 08:25:01"
     );
+    // v1.86: timezone(zone, date) -> timestamptz exists in PG; the
+    // v0.17 pin expected 42883.
     assert_eq!(
-        err_code(&mut eng, "SELECT timezone('UTC', DATE '2026-09-11')"),
-        "42883"
+        one(&mut eng, "SELECT timezone('UTC', DATE '2026-09-11')"),
+        "2026-09-11 00:00:00+00"
     );
     // clock/statement/transaction timestamps return timestamptz now.
     let ts = one(&mut eng, "SELECT clock_timestamp()");
@@ -1067,14 +1079,39 @@ fn v17_datetime_functions() {
         let perr = parse_statement(q).unwrap_err();
         assert_eq!(perr.code, "42883", "{}", q);
     }
-    // Deliberately unimplemented: 42883.
-    assert_eq!(err_code(&mut eng, "SELECT age(now())"), "42883");
-    assert_eq!(err_code(&mut eng, "SELECT make_interval(1)"), "42883");
+    // v1.86: age / make_interval / date_bin / justify_* landed
+    // (the v0.17 pins expected 42883 for all four).
     assert_eq!(
-        err_code(&mut eng, "SELECT date_bin('1 day', now(), now())"),
-        "42883"
+        one(
+            &mut eng,
+            "SELECT age(TIMESTAMP '2020-01-01', TIMESTAMP '2019-01-01')"
+        ),
+        "1 year"
     );
+    assert_eq!(one(&mut eng, "SELECT make_interval(1)"), "1 year");
+    assert_eq!(
+        one(
+            &mut eng,
+            "SELECT date_bin('1 day', TIMESTAMP '2021-11-05 12:34:56', TIMESTAMP '2000-01-01')"
+        ),
+        "2021-11-05 00:00:00"
+    );
+    assert_eq!(
+        one(&mut eng, "SELECT justify_days(INTERVAL '35 days')"),
+        "1 mon 5 days"
+    );
+    // Wrong argument types still do not exist, like PG.
     assert_eq!(err_code(&mut eng, "SELECT justify_days(now())"), "42883");
+    // v1.86 probe: datetime literal arithmetic.
+    assert_eq!(
+        one(&mut eng, "SELECT date '1981-02-03' + time '04:05:06'"),
+        "1981-02-03 04:05:06"
+    );
+    // PG: date + interval is a timestamp, even for day-only intervals.
+    assert_eq!(
+        one(&mut eng, "SELECT date '1991-02-03' + interval '2 years'"),
+        "1993-02-03 00:00:00"
+    );
 }
 
 // v0.58: PG19 binary float I/O — float4send / float4recv / float8recv.

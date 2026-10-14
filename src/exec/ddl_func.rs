@@ -209,6 +209,14 @@ pub(crate) fn dummy_value_of(ty: &ColType) -> Value {
         ColType::Date => Value::Date(1),
         ColType::Timestamp => Value::Timestamp(1),
         ColType::Timestamptz => Value::Timestamptz(1),
+        // v1.86: one second past midnight / a one-second interval.
+        ColType::Time => Value::Time(1_000_000),
+        ColType::TimeTz => Value::TimeTz(1_000_000, 0),
+        ColType::Interval => Value::Interval(crate::datetime::Interval {
+            months: 0,
+            days: 0,
+            micros: 1_000_000,
+        }),
         ColType::Bytea => Value::Bytea(vec![0]),
         // v1.39: one set bit.
         ColType::Bit => Value::BitString(crate::storage::BitString {

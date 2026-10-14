@@ -936,8 +936,12 @@ pub enum Literal {
     Date(i32),        // v0.7: days since 1970-01-01
     Timestamp(i64),   // v0.7: micros since 1970-01-01 00:00:00 UTC
     Timestamptz(i64), // v0.7: micros since epoch, UTC
-    Bytea(Vec<u8>),   // v0.7
-    Uuid([u8; 16]),   // v0.7
+    // v1.86: the rest of the datetime family as parsed constants.
+    Time(i64),        // micros since midnight
+    TimeTz(i64, i32), // micros, offset seconds
+    Interval(crate::datetime::Interval),
+    Bytea(Vec<u8>), // v0.7
+    Uuid([u8; 16]), // v0.7
     // v1.39: a validated `x'...'`/`b'...'` bit-string literal (PG19
     // `bit_in`); the marker's case was normalized by the lexer.
     BitString(crate::storage::BitString),
@@ -960,6 +964,9 @@ impl Literal {
             Literal::Date(_) => "date",
             Literal::Timestamp(_) => "timestamp without time zone",
             Literal::Timestamptz(_) => "timestamp with time zone",
+            Literal::Time(_) => "time without time zone", // v1.86
+            Literal::TimeTz(..) => "time with time zone", // v1.86
+            Literal::Interval(_) => "interval",           // v1.86
             Literal::Bytea(_) => "bytea",
             Literal::Uuid(_) => "uuid",
             Literal::BitString(_) => "bit", // v1.39
@@ -983,6 +990,9 @@ impl Literal {
             Literal::Date(_) => ColType::Date,
             Literal::Timestamp(_) => ColType::Timestamp,
             Literal::Timestamptz(_) => ColType::Timestamptz,
+            Literal::Time(_) => ColType::Time,         // v1.86
+            Literal::TimeTz(..) => ColType::TimeTz,    // v1.86
+            Literal::Interval(_) => ColType::Interval, // v1.86
             Literal::Bytea(_) => ColType::Bytea,
             Literal::Uuid(_) => ColType::Uuid,
             Literal::BitString(_) => ColType::Bit, // v1.39
@@ -1015,6 +1025,9 @@ impl Literal {
             Literal::Date(d) => Value::Date(d),
             Literal::Timestamp(m) => Value::Timestamp(m),
             Literal::Timestamptz(m) => Value::Timestamptz(m),
+            Literal::Time(t) => Value::Time(t),           // v1.86
+            Literal::TimeTz(t, o) => Value::TimeTz(t, o), // v1.86
+            Literal::Interval(iv) => Value::Interval(iv), // v1.86
             Literal::Bytea(b) => Value::Bytea(b),
             Literal::Uuid(u) => Value::Uuid(u),
             Literal::BitString(b) => Value::BitString(b), // v1.39
@@ -1352,6 +1365,12 @@ pub enum Expr {
     CastNamed {
         expr: Box<Expr>,
         name: String,
+    },
+    // v1.86: `expr AT TIME ZONE zone` / `expr AT LOCAL` (zone None =
+    // the session TimeZone). PG converts timestamp<->timestamptz.
+    AtTimeZone {
+        expr: Box<Expr>,
+        zone: Option<Box<Expr>>,
     },
     /// v0.81: `ROW(a, b, ...)` row constructor. Evaluates to
     /// `Value::Record` with PG's `f1`, `f2`, ... field names.
@@ -2809,6 +2828,13 @@ pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>
         Expr::Cast { expr, .. } => collect_col_refs(expr, out),
         // v0.81: composite expressions — recurse into sub-expressions.
         Expr::CastNamed { expr, .. } => collect_col_refs(expr, out),
+        // v1.86: AT TIME ZONE depends on both operands.
+        Expr::AtTimeZone { expr, zone } => {
+            collect_col_refs(expr, out);
+            if let Some(z) = zone {
+                collect_col_refs(z, out);
+            }
+        }
         Expr::Row(elems) => {
             for e in elems {
                 collect_col_refs(e, out);
@@ -5568,6 +5594,11 @@ pub(crate) fn max_param_expr(e: &Expr) -> usize {
         Expr::Cmp { left, right, .. } => max_param_expr(left).max(max_param_expr(right)),
         // v0.81: composite expressions recurse into their operands.
         Expr::CastNamed { expr, .. } | Expr::FieldAccess { expr, .. } => max_param_expr(expr),
+        // v1.86: AT TIME ZONE.
+        Expr::AtTimeZone { expr, zone } => {
+            let z = zone.as_deref().map(max_param_expr).unwrap_or(0);
+            max_param_expr(expr).max(z)
+        }
         Expr::Row(elems) => elems.iter().map(max_param_expr).max().unwrap_or(0),
         // v0.79: array expressions recurse into their operands.
         Expr::ArrayCtor { elems, .. } => elems.iter().map(max_param_expr).max().unwrap_or(0),

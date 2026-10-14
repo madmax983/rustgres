@@ -608,6 +608,17 @@ impl Parser {
             }),
             "reset" => {
                 // RESET name | RESET ALL
+                // v1.86: RESET TIME ZONE is the two-word spelling.
+                if self.peek_ident() == Some("time") {
+                    let save = self.pos;
+                    self.next();
+                    if self.eat_keyword("zone") {
+                        return Ok(Stmt::Reset {
+                            name: "timezone".to_string(),
+                        });
+                    }
+                    self.pos = save;
+                }
                 let name = self.expect_ident()?;
                 Ok(Stmt::Reset { name })
             }
@@ -668,6 +679,41 @@ impl Parser {
             return Ok((ColType::SingleChar, None));
         }
         self.parse_type_name_rest(name)
+    }
+
+    /// v1.86: PG's interval fields qualifier — `YEAR`, `MONTH`, `DAY`,
+    /// `HOUR`, `MINUTE`, `SECOND`, or an `X TO Y` range. Consumes and
+    /// returns it when the next token names a field; `Ok(None)` when
+    /// the next token is not a field word (so `interval` column types
+    /// in DDL are not disturbed). Plural spellings normalize to the
+    /// singular, as PG's lexer effectively does here.
+    pub(crate) fn parse_interval_fields(
+        &mut self,
+    ) -> Result<Option<(String, Option<String>)>, SqlError> {
+        let field = |p: &Parser| -> Option<String> {
+            let name = p.peek_ident()?;
+            let n = name.strip_suffix('s').unwrap_or(name);
+            matches!(n, "year" | "month" | "day" | "hour" | "minute" | "second")
+                .then(|| n.to_string())
+        };
+        let Some(f1) = field(self) else {
+            return Ok(None);
+        };
+        self.next(); // the field word
+        if self.eat_keyword("to") {
+            let Some(f2) = field(self) else {
+                return Err(err(
+                    "syntax error: expected interval field after TO".to_string()
+                ));
+            };
+            self.next();
+            // v1.86: trailing precision, `... TO SECOND(2)`.
+            let _ = self.parse_opt_typmod()?;
+            return Ok(Some((f1, Some(f2))));
+        }
+        // v1.86: trailing precision, `SECOND(2)`.
+        let _ = self.parse_opt_typmod()?;
+        Ok(Some((f1, None)))
     }
 
     pub(crate) fn parse_type_name_rest(
@@ -806,8 +852,15 @@ impl Parser {
             "bool" | "boolean" => Ok(ColType::Bool),
             "text" => Ok(ColType::Text),
             "date" => Ok(ColType::Date),
-            "timestamptz" => Ok(ColType::Timestamptz),
+            "timestamptz" => {
+                // v1.86: optional precision typmod is accepted (the
+                // value model keeps full microsecond precision;
+                // PG rounds on storage — see scope hold-backs).
+                let _ = self.parse_opt_typmod()?;
+                Ok(ColType::Timestamptz)
+            }
             "timestamp" => {
+                let _ = self.parse_opt_typmod()?;
                 if self.eat_keyword("with") {
                     self.expect_keyword("time")?;
                     self.expect_keyword("zone")?;
@@ -819,6 +872,35 @@ impl Parser {
                     }
                     Ok(ColType::Timestamp)
                 }
+            }
+            // v1.86: PG's time / timetz / interval types.
+            "timetz" => {
+                let _ = self.parse_opt_typmod()?;
+                Ok(ColType::TimeTz)
+            }
+            "time" => {
+                let _ = self.parse_opt_typmod()?;
+                if self.eat_keyword("with") {
+                    self.expect_keyword("time")?;
+                    self.expect_keyword("zone")?;
+                    Ok(ColType::TimeTz)
+                } else {
+                    if self.eat_keyword("without") {
+                        self.expect_keyword("time")?;
+                        self.expect_keyword("zone")?;
+                    }
+                    Ok(ColType::Time)
+                }
+            }
+            "interval" => {
+                // v1.86: optional fields qualifier (YEAR, MONTH, DAY,
+                // HOUR, MINUTE, SECOND, and `X TO Y` ranges) and an
+                // optional precision typmod are accepted; the value
+                // model keeps the full triple (typmod restriction of
+                // stored values is a documented hold-back).
+                self.parse_interval_fields()?;
+                let _ = self.parse_opt_typmod()?;
+                Ok(ColType::Interval)
             }
             "bytea" => Ok(ColType::Bytea),
             // v1.39: PG's `bit` type (OID 1560). `bit(n)` typmod is not
@@ -919,6 +1001,9 @@ impl Parser {
                 | "date"
                 | "timestamp"
                 | "timestamptz"
+                | "time"     // v1.86
+                | "timetz"   // v1.86
+                | "interval" // v1.86
                 | "bytea"
                 | "uuid"
                 | "regclass"
@@ -4114,6 +4199,20 @@ impl Parser {
                 let is_composite = matches!(&ty, Ok((ColType::Composite, _)));
                 if ty.is_ok() && !is_composite {
                     if let Token::Str(s) = self.next() {
+                        // v1.86: INTERVAL 'x' QUALIFIER in VALUES —
+                        // fold the qualifier into canonical text.
+                        if matches!(&ty, Ok((ColType::Interval, _))) {
+                            if let Some((f1, f2)) = self.parse_interval_fields()? {
+                                let iv = crate::datetime::parse_interval_q(
+                                    &s,
+                                    Some((&f1, f2.as_deref())),
+                                )
+                                .map_err(err_invalid_text)?;
+                                return Ok(InsertValue::Lit(Literal::Text(
+                                    crate::datetime::format_interval(&iv).into(),
+                                )));
+                            }
+                        }
                         return Ok(InsertValue::Lit(Literal::Text(s.into())));
                     }
                 }
@@ -4196,6 +4295,30 @@ impl Parser {
 
     pub(crate) fn parse_cmp(&mut self) -> Result<Expr, SqlError> {
         let left = self.parse_bitor()?;
+        // v1.86: SQL OVERLAPS: `(a, b) OVERLAPS (c, d)` (the second
+        // element of a pair may be an interval). Desugars to the
+        // internal pg_overlaps(a, b, c, d) call.
+        if self.eat_keyword("overlaps") {
+            let right = self.parse_bitor()?;
+            let pair = |e: Expr| -> Result<(Expr, Expr), SqlError> {
+                match e {
+                    Expr::Row(mut elems) if elems.len() == 2 => {
+                        let b = elems.remove(1);
+                        let a = elems.remove(0);
+                        Ok((a, b))
+                    }
+                    _ => Err(err(
+                        "syntax error: OVERLAPS requires two-element row operands".to_string(),
+                    )),
+                }
+            };
+            let (a, b) = pair(left)?;
+            let (c, d) = pair(right)?;
+            return Ok(Expr::Func {
+                name: "pg_overlaps".to_string(),
+                args: vec![a, b, c, d],
+            });
+        }
         // `[NOT] BETWEEN low AND high`, `[NOT] LIKE pat`,
         // `[NOT] ILIKE pat`, `[NOT] IN (subquery)`.
         let neg = self.eat_keyword("not");
@@ -4857,6 +4980,54 @@ impl Parser {
             // the next `::`.
             expr = self.parse_postfix_subscripts(expr)?;
         }
+        // v1.86: `expr AT TIME ZONE zone` / `expr AT LOCAL` — PG19
+        // treats AT TIME ZONE as a postfix operator binding at this
+        // level (just looser than `::` chains, so it applies after
+        // any casts above and can itself be cast afterwards).
+        loop {
+            let save = self.pos;
+            if !self.eat_keyword("at") {
+                break;
+            }
+            if self.eat_keyword("local") {
+                expr = Expr::AtTimeZone {
+                    expr: Box::new(expr),
+                    zone: None,
+                };
+                continue;
+            }
+            if self.eat_keyword("time") && self.eat_keyword("zone") {
+                let mut z = self.parse_unary()?;
+                z = self.parse_postfix_subscripts(z)?;
+                // A following `::type` binds to the zone operand in
+                // PG (`AT TIME ZONE 'x'::text`); parse_cast on the
+                // operand would recurse wrongly, so fold one cast
+                // level here when present.
+                while *self.peek() == Token::ColonColon {
+                    self.next();
+                    let (to, composite_name) = self.parse_type_name()?;
+                    if composite_name.is_some() {
+                        return Err(err(
+                            "syntax error: AT TIME ZONE operand cannot cast to a composite"
+                                .to_string(),
+                        ));
+                    }
+                    z = Expr::Cast {
+                        expr: Box::new(z),
+                        to,
+                        written: None,
+                    };
+                    z = self.parse_postfix_subscripts(z)?;
+                }
+                expr = Expr::AtTimeZone {
+                    expr: Box::new(expr),
+                    zone: Some(Box::new(z)),
+                };
+                continue;
+            }
+            self.pos = save;
+            break;
+        }
         Ok(expr)
     }
 
@@ -5120,10 +5291,26 @@ impl Parser {
                 if Self::is_type_start(&name) {
                     let save = self.pos;
                     // v0.81: named composites are not typed literals.
-                    if let Ok((to, None)) = self.parse_type_name_rest(name.clone()) {
+                    if let Ok((to, _)) = self.parse_type_name_rest(name.clone()) {
                         if let Token::Str(s) = self.peek() {
                             let s = s.clone();
                             self.next();
+                            // v1.86: `INTERVAL 'x' YEAR [TO MONTH]`
+                            // — the fields qualifier follows the
+                            // string and binds to the literal (PG19
+                            // gram.y IntervalConst). Fold it now via
+                            // the interval parser, like PG does at
+                            // parse analysis.
+                            if to == ColType::Interval {
+                                if let Some((f1, f2)) = self.parse_interval_fields()? {
+                                    let iv = crate::datetime::parse_interval_q(
+                                        &s,
+                                        Some((&f1, f2.as_deref())),
+                                    )
+                                    .map_err(err_invalid_text)?;
+                                    return Ok(Expr::Literal(Literal::Interval(iv)));
+                                }
+                            }
                             return Ok(Expr::Cast {
                                 expr: Box::new(Expr::Literal(Literal::Text(s.into()))),
                                 to,
@@ -6736,6 +6923,70 @@ impl Parser {
         let local = self.eat_keyword("local");
         if !local {
             self.eat_keyword("session");
+        }
+        // v1.86: `SET TIME ZONE value` — the SQL-standard spelling of
+        // SET timezone (PG19 gram.y SetTimeZoneStmt). Values: a zone
+        // name string/identifier, LOCAL, DEFAULT, or an INTERVAL
+        // literal (a fixed offset).
+        if matches!(self.peek(), Token::Ident(s) if s == "time")
+            && matches!(self.peek2(), Token::Ident(s) if s == "zone")
+        {
+            self.next(); // time
+            self.next(); // zone
+            if self.eat_keyword("to") {
+                // consumed TO
+            } else if *self.peek() == Token::Eq {
+                self.next();
+            }
+            let value = match self.next() {
+                Token::Str(s) => SetValue::Str(s),
+                Token::Ident(kw) if kw == "default" => SetValue::Default,
+                Token::Ident(kw) if kw == "local" => {
+                    // PG: LOCAL means the machine default (UTC here).
+                    SetValue::Str("UTC".to_string())
+                }
+                // PG: SET TIME ZONE INTERVAL '...' [fields] — a
+                // fixed offset from the interval's time part.
+                Token::Ident(kw) if kw == "interval" => {
+                    let lit = match self.next() {
+                        Token::Str(s) => s,
+                        other => {
+                            return Err(err(format!(
+                                "syntax error: expected interval string, found {:?}",
+                                other
+                            )));
+                        }
+                    };
+                    let _ = self.parse_interval_fields()?;
+                    let iv = crate::datetime::parse_interval(&lit).map_err(err_invalid_text)?;
+                    let secs = (iv.micros / 1_000_000) as i32;
+                    let sign = if secs < 0 { '-' } else { '+' };
+                    let a = secs.abs();
+                    SetValue::Str(if a % 60 == 0 {
+                        format!("{}{:02}:{:02}", sign, a / 3600, (a % 3600) / 60)
+                    } else {
+                        format!(
+                            "{}{:02}:{:02}:{:02}",
+                            sign,
+                            a / 3600,
+                            (a % 3600) / 60,
+                            a % 60
+                        )
+                    })
+                }
+                Token::Ident(kw) => SetValue::Str(kw),
+                other => {
+                    return Err(err(format!(
+                        "syntax error: unexpected SET TIME ZONE value {:?}",
+                        other
+                    )));
+                }
+            };
+            return Ok(Stmt::Set {
+                name: "timezone".to_string(),
+                value,
+                local,
+            });
         }
         let name = self.expect_ident()?;
         // v1.07: SET [LOCAL|SESSION] ROLE name|NONE — PG19 treats this as
@@ -9623,6 +9874,14 @@ pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
         Expr::CastNamed { expr, .. } | Expr::FieldAccess { expr, .. } => {
             validate_constraint_expr(expr, what)
         }
+        // v1.86: AT TIME ZONE — validate both operands.
+        Expr::AtTimeZone { expr, zone } => {
+            validate_constraint_expr(expr, what)?;
+            if let Some(z) = zone {
+                validate_constraint_expr(z, what)?;
+            }
+            Ok(())
+        }
         Expr::Row(elems) => {
             for e in elems {
                 validate_constraint_expr(e, what)?;
@@ -9783,6 +10042,12 @@ pub(crate) fn encode_literal(lit: &Literal, out: &mut String) {
         Literal::Date(d) => out.push_str(&format!("date {}", d)),
         Literal::Timestamp(t) => out.push_str(&format!("ts {}", t)),
         Literal::Timestamptz(t) => out.push_str(&format!("tstz {}", t)),
+        // v1.86: datetime family literals.
+        Literal::Time(t) => out.push_str(&format!("time {}", t)),
+        Literal::TimeTz(t, o) => out.push_str(&format!("timetz {} {}", t, o)),
+        Literal::Interval(iv) => {
+            out.push_str(&format!("ival {} {} {}", iv.months, iv.days, iv.micros))
+        }
         Literal::Bytea(b) => {
             out.push_str("bytea ");
             for byte in b {
@@ -9858,6 +10123,17 @@ pub(crate) fn encode_expr_inner(e: &Expr, out: &mut String) {
             sexpr_escape(&to.typmod_display(), out);
             out.push(' ');
             encode_expr_inner(expr, out);
+            out.push(')');
+        }
+        // v1.86: AT TIME ZONE (zone `none` = AT LOCAL).
+        Expr::AtTimeZone { expr, zone } => {
+            out.push_str("(atz ");
+            encode_expr_inner(expr, out);
+            out.push(' ');
+            match zone {
+                Some(z) => encode_expr_inner(z, out),
+                None => out.push_str("none"),
+            }
             out.push(')');
         }
         // v0.81: composite expressions.
@@ -10296,6 +10572,25 @@ impl<'a> SexprParser<'a> {
                     written: None,
                 }
             }
+            // v1.86: AT TIME ZONE; the zone operand is an expr or
+            // the atom `none` (AT LOCAL).
+            "atz" => {
+                let x = self.expr()?;
+                self.ws();
+                let zone = if self.chars.peek() == Some(&'(') {
+                    Some(Box::new(self.expr()?))
+                } else {
+                    let a = self.atom()?;
+                    if a != "none" {
+                        return Err(format!("bad atz zone {}", a));
+                    }
+                    None
+                };
+                Expr::AtTimeZone {
+                    expr: Box::new(x),
+                    zone,
+                }
+            }
             "concat" => {
                 let a = self.expr()?;
                 let b = self.expr()?;
@@ -10606,6 +10901,23 @@ impl<'a> SexprParser<'a> {
             "date" => Literal::Date(self.atom()?.parse().map_err(|_| "bad date")?),
             "ts" => Literal::Timestamp(self.atom()?.parse().map_err(|_| "bad ts")?),
             "tstz" => Literal::Timestamptz(self.atom()?.parse().map_err(|_| "bad tstz")?),
+            // v1.86: datetime family literals.
+            "time" => Literal::Time(self.atom()?.parse().map_err(|_| "bad time")?),
+            "timetz" => {
+                let t: i64 = self.atom()?.parse().map_err(|_| "bad timetz")?;
+                let o: i32 = self.atom()?.parse().map_err(|_| "bad timetz")?;
+                Literal::TimeTz(t, o)
+            }
+            "ival" => {
+                let months: i32 = self.atom()?.parse().map_err(|_| "bad ival")?;
+                let days: i32 = self.atom()?.parse().map_err(|_| "bad ival")?;
+                let micros: i64 = self.atom()?.parse().map_err(|_| "bad ival")?;
+                Literal::Interval(crate::datetime::Interval {
+                    months,
+                    days,
+                    micros,
+                })
+            }
             "bytea" => {
                 let hex = self.atom()?;
                 Literal::Bytea(hex_decode(&hex)?)

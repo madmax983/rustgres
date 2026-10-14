@@ -285,6 +285,14 @@ pub(crate) fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecErr
             validate_window_expr(right, in_agg)
         }
         Expr::Cast { expr, .. } => validate_window_expr(expr, in_agg),
+        // v1.86: AT TIME ZONE.
+        Expr::AtTimeZone { expr, zone } => {
+            validate_window_expr(expr, in_agg)?;
+            if let Some(z) = zone {
+                validate_window_expr(z, in_agg)?;
+            }
+            Ok(())
+        }
         Expr::Func { args, .. } => {
             for a in args {
                 validate_window_expr(a, in_agg)?;

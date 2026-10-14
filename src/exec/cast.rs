@@ -756,6 +756,79 @@ pub(crate) fn pg_input_validate(
         t if t.starts_with("numeric(") || t.starts_with("decimal(") => {
             pg_input_validate_numeric_typmod(input, t)
         }
+        // v1.86: the datetime family validates through the same
+        // parsers as the casts. PG reports 22008 for range failures
+        // and 22P02 for syntax; the message text rides along.
+        "date" => crate::datetime::parse_date(input).map(|_| ()).map_err(|e| {
+            PgInputFailure::Soft(PgInputError::soft(
+                if e.contains("out of range") {
+                    "22008"
+                } else {
+                    "22P02"
+                },
+                e,
+            ))
+        }),
+        "timestamp" | "timestamp without time zone" => crate::datetime::parse_timestamp(input)
+            .map(|_| ())
+            .map_err(|e| {
+                PgInputFailure::Soft(PgInputError::soft(
+                    if e.contains("out of range") {
+                        "22008"
+                    } else {
+                        "22P02"
+                    },
+                    e,
+                ))
+            }),
+        "timestamptz" | "timestamp with time zone" => crate::datetime::parse_timestamptz(input)
+            .map(|_| ())
+            .map_err(|e| {
+                PgInputFailure::Soft(PgInputError::soft(
+                    if e.contains("out of range") {
+                        "22008"
+                    } else {
+                        "22P02"
+                    },
+                    e,
+                ))
+            }),
+        "time" | "time without time zone" => {
+            crate::datetime::parse_time(input).map(|_| ()).map_err(|e| {
+                PgInputFailure::Soft(PgInputError::soft(
+                    if e.contains("out of range") || e.contains("overflow") {
+                        "22008"
+                    } else {
+                        "22P02"
+                    },
+                    e,
+                ))
+            })
+        }
+        "timetz" | "time with time zone" => crate::datetime::parse_timetz(input)
+            .map(|_| ())
+            .map_err(|e| {
+                PgInputFailure::Soft(PgInputError::soft(
+                    if e.contains("out of range") || e.contains("overflow") {
+                        "22008"
+                    } else {
+                        "22P02"
+                    },
+                    e,
+                ))
+            }),
+        "interval" => crate::datetime::parse_interval(input)
+            .map(|_| ())
+            .map_err(|e| {
+                PgInputFailure::Soft(PgInputError::soft(
+                    if e.contains("overflow") {
+                        "22008"
+                    } else {
+                        "22P02"
+                    },
+                    e,
+                ))
+            }),
         // v0.35: character types with typmod, via the same blank-tolerant
         // input coercion as INSERT. A malformed typmod is 22023, like PG's
         // type parser (hard error, via `?`).
@@ -1389,40 +1462,124 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
             .and_then(|n| apply_numeric_typmod(n, tm))
             .map(Value::Numeric),
         ColType::Date => match v {
-            Value::Text(s) => crate::datetime::parse_date(s)
+            Value::Text(s) | Value::BpChar(s) => crate::datetime::parse_date(s)
                 .map(Value::Date)
-                .map_err(|e| exec_err("22P02", e)),
-            // Timestamps truncate to their UTC date (v0.7 is always UTC).
-            Value::Timestamp(m) | Value::Timestamptz(m) => {
-                Ok(Value::Date((m.div_euclid(86_400_000_000)) as i32))
+                .map_err(|e| exec_err(crate::exec::eval::dt_sqlstate(&e), e)),
+            // v1.86: timestamp -> date takes its (naive) date part;
+            // timestamptz -> date takes the date in the session zone
+            // (PG timestamp.c). Sentinels map to sentinels.
+            Value::Timestamp(m) => Ok(Value::Date(if *m == crate::datetime::TS_INFINITY {
+                crate::datetime::DATE_INFINITY
+            } else if *m == crate::datetime::TS_NEG_INFINITY {
+                crate::datetime::DATE_NEG_INFINITY
+            } else {
+                (m.div_euclid(86_400_000_000)) as i32
+            })),
+            Value::Timestamptz(m) => {
+                if *m == crate::datetime::TS_INFINITY {
+                    Ok(Value::Date(crate::datetime::DATE_INFINITY))
+                } else if *m == crate::datetime::TS_NEG_INFINITY {
+                    Ok(Value::Date(crate::datetime::DATE_NEG_INFINITY))
+                } else {
+                    Ok(Value::Date(
+                        crate::datetime::timestamptz_to_date(*m)
+                            .map_err(|e| exec_err("22008", e))?,
+                    ))
+                }
             }
             other => Err(cast_err(other, "date")),
         },
         ColType::Timestamp => match v {
-            Value::Text(s) => crate::datetime::parse_timestamp(s)
+            Value::Text(s) | Value::BpChar(s) => crate::datetime::parse_timestamp(s)
                 .map(Value::Timestamp)
-                .map_err(|e| exec_err("22P02", e)),
-            Value::Date(d) => (*d as i64)
-                .checked_mul(86_400_000_000)
-                .map(Value::Timestamp)
-                .ok_or_else(|| exec_err("22008", "datetime field overflow")),
-            // Timestamptz -> timestamp keeps the instant; v0.7 has no
-            // session timezone so this is the UTC wall-clock time.
-            Value::Timestamptz(m) => Ok(Value::Timestamp(*m)),
+                .map_err(|e| exec_err(crate::exec::eval::dt_sqlstate(&e), e)),
+            // v1.86: date -> timestamp is midnight; a finite date too
+            // large for a timestamp is 22008 (PG timestamp.c).
+            Value::Date(d) => {
+                if *d == crate::datetime::DATE_INFINITY {
+                    Ok(Value::Timestamp(crate::datetime::TS_INFINITY))
+                } else if *d == crate::datetime::DATE_NEG_INFINITY {
+                    Ok(Value::Timestamp(crate::datetime::TS_NEG_INFINITY))
+                } else {
+                    // v1.86: checked multiply — the plain product
+                    // overflowed i64 (debug panic) for extreme dates
+                    // like 2202020-10-05 before the range check ran.
+                    match (*d as i64).checked_mul(86_400_000_000) {
+                        Some(m) if crate::datetime::is_valid_ts_micros(m) => {
+                            Ok(Value::Timestamp(m))
+                        }
+                        _ => Err(exec_err("22008", "date out of range for timestamp")),
+                    }
+                }
+            }
+            // v1.86: timestamptz -> timestamp renders the instant in
+            // the session zone (PG timestamptz_timestamp).
+            Value::Timestamptz(m) => {
+                Ok(Value::Timestamp(crate::datetime::timestamptz_to_local(*m)))
+            }
+            // v1.86: date + time fields combine (PG date2timestamp via
+            // the + operator in the suites uses this cast path too).
+            Value::TimeTz(..) => Err(cast_err(v, "timestamp without time zone")),
             other => Err(cast_err(other, "timestamp without time zone")),
         },
         ColType::Timestamptz => match v {
-            Value::Text(s) => crate::datetime::parse_timestamptz(s)
+            Value::Text(s) | Value::BpChar(s) => crate::datetime::parse_timestamptz(s)
                 .map(Value::Timestamptz)
-                .map_err(|e| exec_err("22P02", e)),
-            Value::Date(d) => (*d as i64)
-                .checked_mul(86_400_000_000)
-                .map(Value::Timestamptz)
-                .ok_or_else(|| exec_err("22008", "datetime field overflow")),
-            // Timestamp -> timestamptz assumes UTC (documented: v0.7
-            // has no session timezone setting).
-            Value::Timestamp(m) => Ok(Value::Timestamptz(*m)),
+                .map_err(|e| exec_err(crate::exec::eval::dt_sqlstate(&e), e)),
+            // v1.86: date -> timestamptz is midnight in the session
+            // zone, range-checked like PG (the horology probe:
+            // '4714-11-24 BC'::date at UTC-2 is below the minimum).
+            Value::Date(d) => {
+                if *d == crate::datetime::DATE_INFINITY {
+                    Ok(Value::Timestamptz(crate::datetime::TS_INFINITY))
+                } else if *d == crate::datetime::DATE_NEG_INFINITY {
+                    Ok(Value::Timestamptz(crate::datetime::TS_NEG_INFINITY))
+                } else {
+                    Ok(Value::Timestamptz(
+                        crate::datetime::date_to_timestamptz(*d)
+                            .map_err(|e| exec_err("22008", e))?,
+                    ))
+                }
+            }
+            // v1.86: timestamp -> timestamptz interprets the naive
+            // wall time in the session zone (PG timestamp_timestamptz).
+            Value::Timestamp(m) => Ok(Value::Timestamptz(
+                crate::datetime::timestamp_to_timestamptz(*m).map_err(|e| exec_err("22008", e))?,
+            )),
             other => Err(cast_err(other, "timestamp with time zone")),
+        },
+        // v1.86: time without time zone (PG time.c).
+        ColType::Time => match v {
+            Value::Text(s) | Value::BpChar(s) => crate::datetime::parse_time(s)
+                .map(Value::Time)
+                .map_err(|e| exec_err(crate::exec::eval::dt_sqlstate(&e), e)),
+            Value::Timestamp(m) => Ok(Value::Time(crate::datetime::timestamp_time(*m))),
+            Value::Timestamptz(m) => Ok(Value::Time(crate::datetime::timestamptz_time(*m))),
+            Value::TimeTz(t, _) => Ok(Value::Time(*t)),
+            other => Err(cast_err(other, "time without time zone")),
+        },
+        // v1.86: time with time zone (PG timetzin / timetz casts).
+        ColType::TimeTz => match v {
+            Value::Text(s) | Value::BpChar(s) => crate::datetime::parse_timetz(s)
+                .map(|(t, o)| Value::TimeTz(t, o))
+                .map_err(|e| exec_err(crate::exec::eval::dt_sqlstate(&e), e)),
+            Value::Time(t) => {
+                let (off, _) =
+                    crate::datetime::tz_lookup_local(&crate::datetime::session_tz_name(), *t)
+                        .unwrap_or((0, String::new()));
+                Ok(Value::TimeTz(*t, off))
+            }
+            Value::Timestamptz(m) => crate::datetime::timestamptz_timetz(*m)
+                .map(|(t, o)| Value::TimeTz(t, o))
+                .map_err(|e| exec_err("22008", e)),
+            other => Err(cast_err(other, "time with time zone")),
+        },
+        // v1.86: interval (PG intervalin).
+        ColType::Interval => match v {
+            Value::Text(s) | Value::BpChar(s) => crate::datetime::parse_interval(s)
+                .map(Value::Interval)
+                .map_err(|e| exec_err(crate::exec::eval::dt_sqlstate(&e), e)),
+            other => Err(cast_err(other, "interval")),
         },
         ColType::Bytea => match v {
             Value::Text(s) => crate::storage::parse_bytea(s)

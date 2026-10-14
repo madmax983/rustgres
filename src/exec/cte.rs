@@ -1003,6 +1003,10 @@ pub(crate) fn contains_agg(e: &Expr) -> bool {
         // v0.81: composite operands can hide aggregates — recurse.
         Expr::Row(elems) => elems.iter().any(contains_agg),
         Expr::CastNamed { expr, .. } | Expr::FieldAccess { expr, .. } => contains_agg(expr),
+        // v1.86: AT TIME ZONE.
+        Expr::AtTimeZone { expr, zone } => {
+            contains_agg(expr) || zone.as_deref().map(contains_agg).unwrap_or(false)
+        }
         Expr::Subscript { array, indices } => {
             contains_agg(array) || indices.iter().any(contains_agg)
         }
@@ -1092,6 +1096,13 @@ pub(crate) fn expr_walk<'a>(e: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
             // v0.81: composite expressions — visit sub-expressions.
             Expr::CastNamed { expr, .. } | Expr::FieldAccess { expr, .. } => {
                 stack.push(expr);
+            }
+            // v1.86: AT TIME ZONE — visit both operands.
+            Expr::AtTimeZone { expr, zone } => {
+                stack.push(expr);
+                if let Some(z) = zone {
+                    stack.push(z);
+                }
             }
             Expr::Row(elems) => {
                 stack.extend(elems.iter());
@@ -1398,6 +1409,10 @@ pub(crate) fn contains_window(e: &Expr) -> bool {
         // v0.81: composite operands can hide window functions — recurse.
         Expr::Row(elems) => elems.iter().any(contains_window),
         Expr::CastNamed { expr, .. } | Expr::FieldAccess { expr, .. } => contains_window(expr),
+        // v1.86: AT TIME ZONE.
+        Expr::AtTimeZone { expr, zone } => {
+            contains_window(expr) || zone.as_deref().map(contains_window).unwrap_or(false)
+        }
         Expr::Subscript { array, indices } => {
             contains_window(array) || indices.iter().any(contains_window)
         }

@@ -396,6 +396,9 @@ pub(crate) fn value_coltype(v: &Value) -> ColType {
         Value::Date(_) => ColType::Date,
         Value::Timestamp(_) => ColType::Timestamp,
         Value::Timestamptz(_) => ColType::Timestamptz,
+        Value::Time(_) => ColType::Time,         // v1.86
+        Value::TimeTz(_, _) => ColType::TimeTz,  // v1.86
+        Value::Interval(_) => ColType::Interval, // v1.86
         Value::Bytea(_) => ColType::Bytea,
         Value::BitString(_) => ColType::Bit, // v1.39
         Value::Uuid(_) => ColType::Uuid,

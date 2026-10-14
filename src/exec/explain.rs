@@ -97,6 +97,9 @@ pub(crate) fn pg_array_elem_label(e: ArrayElem) -> Option<&'static str> {
         ArrayElem::Date => "date",
         ArrayElem::Timestamp => "timestamp without time zone",
         ArrayElem::Timestamptz => "timestamp with time zone",
+        ArrayElem::Time => "time without time zone", // v1.86
+        ArrayElem::TimeTz => "time with time zone",  // v1.86
+        ArrayElem::Interval => "interval",           // v1.86
         ArrayElem::Numeric => "numeric",
         ArrayElem::Uuid => "uuid",
         ArrayElem::Regclass => "regclass",

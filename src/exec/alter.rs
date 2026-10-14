@@ -474,6 +474,13 @@ pub(crate) fn rename_col_in_expr(e: &mut Expr, old: &str, new: &str) {
         Expr::CastNamed { expr, .. } | Expr::FieldAccess { expr, .. } => {
             rename_col_in_expr(expr, old, new)
         }
+        // v1.86: AT TIME ZONE.
+        Expr::AtTimeZone { expr, zone } => {
+            rename_col_in_expr(expr, old, new);
+            if let Some(z) = zone {
+                rename_col_in_expr(z, old, new);
+            }
+        }
         Expr::Row(elems) => {
             for e in elems {
                 rename_col_in_expr(e, old, new);

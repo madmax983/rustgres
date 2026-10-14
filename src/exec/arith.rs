@@ -861,6 +861,10 @@ pub(crate) fn eval_neg_val(v: &Value) -> Result<Value, ExecError> {
         Value::Float4(f) => Ok(Value::Float4(-f)),
         Value::Float(f) => Ok(Value::Float(-f)),
         Value::Numeric(n) => Ok(Value::Numeric(n.neg())),
+        // v1.86: unary minus on an interval (PG interval_um).
+        Value::Interval(iv) => crate::datetime::interval_neg(iv)
+            .map(Value::Interval)
+            .map_err(|e| exec_err("22008", e)),
         _ => Err(exec_err(
             "42883",
             format!("operator does not exist: - {}", v.type_name()),
@@ -886,13 +890,21 @@ pub(crate) fn fit_int_result(icat: NumCat, r: i128) -> Result<Value, ExecError> 
     }
 }
 
-/// Date arithmetic. Ok(None) = not date/time operands (caller falls
-/// through to numeric handling).
+/// Date/time arithmetic (PG19 timestamp.c / date.c / interval.c).
+/// Ok(None) = not datetime operands (caller falls through to numeric
+/// handling). v1.86: the full operator matrix over the datetime
+/// family — interval arithmetic, timestamp/timestamptz/date/time
+/// plus/minus interval, timestamp differences as intervals,
+/// date + time, and interval scaling by numerics. Unknown text
+/// operands resolve the way PG resolves unknown literals: as an
+/// interval for +/- against a datetime value (falling back to the
+/// other operand's own type for timestamp - timestamp).
 pub(crate) fn eval_datetime_arith(
     op: ArithOp,
     a: &Value,
     b: &Value,
 ) -> Result<Option<Value>, ExecError> {
+    use crate::datetime as dt;
     fn int_days(v: &Value) -> Option<i64> {
         match v {
             Value::SmallInt(i) => Some(*i as i64),
@@ -901,16 +913,134 @@ pub(crate) fn eval_datetime_arith(
             _ => None,
         }
     }
+    fn num_factor(v: &Value) -> Option<f64> {
+        match v {
+            Value::SmallInt(i) => Some(*i as f64),
+            Value::Int(i) => Some(*i as f64),
+            Value::BigInt(i) => Some(*i as f64),
+            Value::Float4(f) => Some(*f as f64),
+            Value::Float(f) => Some(*f),
+            Value::Numeric(n) => Some(n.to_f64()),
+            _ => None,
+        }
+    }
     let is_dt = |v: &Value| {
         matches!(
             v,
-            Value::Date(_) | Value::Timestamp(_) | Value::Timestamptz(_)
+            Value::Date(_)
+                | Value::Timestamp(_)
+                | Value::Timestamptz(_)
+                | Value::Time(_)
+                | Value::TimeTz(..)
+                | Value::Interval(_)
         )
     };
     if !is_dt(a) && !is_dt(b) {
         return Ok(None);
     }
-    // date +/- integer-kind -> date
+    let err22008 = |e: String| exec_err("22008", e);
+    // Unknown-literal resolution (text operand against a datetime
+    // operand): interval first for +/-, then the peer type.
+    let owned_a;
+    let owned_b;
+    let (a, b) = {
+        let mut pa = a;
+        let mut pb = b;
+        if let (Value::Text(t) | Value::BpChar(t), other) = (a, b) {
+            if is_dt(other) && !matches!(other, Value::Interval(_)) {
+                if let Ok(iv) = dt::parse_interval(t) {
+                    owned_a = Value::Interval(iv);
+                    pa = &owned_a;
+                }
+            }
+        }
+        if let (other, Value::Text(t) | Value::BpChar(t)) = (a, b) {
+            if is_dt(other) && !matches!(other, Value::Interval(_)) {
+                if op == ArithOp::Add || op == ArithOp::Sub {
+                    if let Ok(iv) = dt::parse_interval(t) {
+                        owned_b = Value::Interval(iv);
+                        pb = &owned_b;
+                    }
+                }
+            }
+        }
+        (pa, pb)
+    };
+    // interval OP interval / scalar.
+    if let (Value::Interval(x), Value::Interval(y)) = (a, b) {
+        return match op {
+            ArithOp::Add => dt::interval_add(x, y)
+                .map(|v| Some(Value::Interval(v)))
+                .map_err(err22008),
+            ArithOp::Sub => dt::interval_sub(x, y)
+                .map(|v| Some(Value::Interval(v)))
+                .map_err(err22008),
+            _ => Err(op_err(op, a, b)),
+        };
+    }
+    if let (Value::Interval(iv), other) | (other, Value::Interval(iv)) = (a, b) {
+        let interval_first = matches!(a, Value::Interval(_));
+        if let Some(f) = num_factor(other) {
+            return match (op, interval_first) {
+                (ArithOp::Mul, _) => dt::interval_mul(iv, f)
+                    .map(|v| Some(Value::Interval(v)))
+                    .map_err(err22008),
+                (ArithOp::Div, true) => dt::interval_div(iv, f)
+                    .map(|v| Some(Value::Interval(v)))
+                    .map_err(err22008),
+                _ => Err(op_err(op, a, b)),
+            };
+        }
+        // datetime +/- interval (and the commutative additions).
+        let sign: i32 = match (op, interval_first) {
+            (ArithOp::Add, _) => 1,
+            (ArithOp::Sub, false) => -1,
+            _ => return Err(op_err(op, a, b)),
+        };
+        return match other {
+            Value::Timestamp(m) => dt::timestamp_add_interval(*m, iv, sign)
+                .map(|v| Some(Value::Timestamp(v)))
+                .map_err(err22008),
+            Value::Timestamptz(m) => dt::timestamptz_add_interval(*m, iv, sign)
+                .map(|v| Some(Value::Timestamptz(v)))
+                .map_err(err22008),
+            Value::Date(d) => match dt::date_add_interval(*d, iv, sign).map_err(err22008)? {
+                dt::DateAddResult::Timestamp(m) => Ok(Some(Value::Timestamp(m))),
+            },
+            Value::Time(t) => {
+                // PG time_pl_interval wraps within the day; an
+                // infinite interval is out of range here.
+                if !iv.is_finite() {
+                    return Err(exec_err("22008", "interval out of range"));
+                }
+                let delta = iv
+                    .micros
+                    .checked_mul(sign as i64)
+                    .ok_or_else(|| exec_err("22008", "interval out of range"))?;
+                let r = t
+                    .checked_add(delta)
+                    .ok_or_else(|| exec_err("22008", "time out of range"))?
+                    .rem_euclid(86_400_000_000);
+                Ok(Some(Value::Time(r)))
+            }
+            Value::TimeTz(t, off) => {
+                if !iv.is_finite() {
+                    return Err(exec_err("22008", "interval out of range"));
+                }
+                let delta = iv
+                    .micros
+                    .checked_mul(sign as i64)
+                    .ok_or_else(|| exec_err("22008", "interval out of range"))?;
+                let r = t
+                    .checked_add(delta)
+                    .ok_or_else(|| exec_err("22008", "time out of range"))?
+                    .rem_euclid(86_400_000_000);
+                Ok(Some(Value::TimeTz(r, *off)))
+            }
+            _ => Err(op_err(op, a, b)),
+        };
+    }
+    // date +/- integer-kind -> date (PG date_pli / date_mii).
     if let Value::Date(d) = a {
         if let Some(days) = int_days(b) {
             match op {
@@ -918,44 +1048,102 @@ pub(crate) fn eval_datetime_arith(
                     let delta = if op == ArithOp::Add { days } else { -days };
                     let r = (*d as i64)
                         .checked_add(delta)
-                        .and_then(|r| i32::try_from(r).ok())
-                        .ok_or_else(|| exec_err("22008", "datetime field overflow"))?;
-                    return Ok(Some(Value::Date(r)));
+                        .filter(|r| dt::is_valid_date_days(*r))
+                        .ok_or_else(|| exec_err("22008", "date out of range"))?;
+                    return Ok(Some(Value::Date(r as i32)));
                 }
                 _ => return Err(op_err(op, a, b)),
             }
         }
     }
-    // integer + date -> date (commutative with date + integer; only
-    // addition commutes — `int - date` is undefined, like Postgres).
     if let Value::Date(d) = b {
         if let Some(days) = int_days(a) {
             if op == ArithOp::Add {
                 let r = (*d as i64)
                     .checked_add(days)
-                    .and_then(|r| i32::try_from(r).ok())
-                    .ok_or_else(|| exec_err("22008", "datetime field overflow"))?;
-                return Ok(Some(Value::Date(r)));
+                    .filter(|r| dt::is_valid_date_days(*r))
+                    .ok_or_else(|| exec_err("22008", "date out of range"))?;
+                return Ok(Some(Value::Date(r as i32)));
             }
             return Err(op_err(op, a, b));
         }
     }
-    // date - date -> integer days
+    // date - date -> integer days; date + time -> timestamp;
+    // date + timetz -> timestamptz (PG date_plustimetz).
     if let (Value::Date(d1), Value::Date(d2)) = (a, b) {
         return match op {
             ArithOp::Sub => Ok(Some(Value::Int(*d1 as i64 - *d2 as i64))),
             _ => Err(op_err(op, a, b)),
         };
     }
-    // timestamp - timestamp would be an interval; v0.7 has none.
-    if matches!(
-        (a, b),
-        (Value::Timestamp(_), Value::Timestamp(_)) | (Value::Timestamptz(_), Value::Timestamptz(_))
-    ) {
-        return Err(exec_err(
-            "42883",
-            "operator does not exist: timestamp - timestamp (intervals are not supported in v0.7)",
-        ));
+    if op == ArithOp::Add {
+        let date_time = match (a, b) {
+            (Value::Date(d), Value::Time(t)) | (Value::Time(t), Value::Date(d)) => {
+                // v1.86: checked — extreme dates overflow i64 micros.
+                Some(
+                    (*d as i64)
+                        .checked_mul(86_400_000_000)
+                        .and_then(|base| base.checked_add(*t)),
+                )
+            }
+            _ => None,
+        };
+        if let Some(m) = date_time {
+            return match m {
+                Some(m) if dt::is_valid_ts_micros(m) => Ok(Some(Value::Timestamp(m))),
+                _ => Err(exec_err("22008", "timestamp out of range")),
+            };
+        }
+        if let (Value::Date(d), Value::TimeTz(t, off)) | (Value::TimeTz(t, off), Value::Date(d)) =
+            (a, b)
+        {
+            let utc = (*d as i64)
+                .checked_mul(86_400_000_000)
+                .and_then(|base| base.checked_add(*t))
+                .and_then(|base| base.checked_sub(*off as i64 * 1_000_000));
+            return match utc {
+                Some(u) if dt::is_valid_ts_micros(u) => Ok(Some(Value::Timestamptz(u))),
+                _ => Err(exec_err("22008", "timestamp out of range")),
+            };
+        }
+    }
+    // timestamp - timestamp -> interval (also timestamptz pairs and
+    // the mixed pair, which PG resolves through the session zone).
+    if op == ArithOp::Sub {
+        let pair = match (a, b) {
+            (Value::Timestamp(x), Value::Timestamp(y)) => Some((*x, *y)),
+            (Value::Timestamptz(x), Value::Timestamptz(y)) => Some((*x, *y)),
+            (Value::Timestamptz(x), Value::Timestamp(y)) => {
+                Some((dt::timestamptz_to_local(*x), *y))
+            }
+            (Value::Timestamp(x), Value::Timestamptz(y)) => {
+                Some((*x, dt::timestamptz_to_local(*y)))
+            }
+            _ => None,
+        };
+        if let Some((x, y)) = pair {
+            return dt::timestamp_diff(x, y)
+                .map(|iv| Some(Value::Interval(iv)))
+                .map_err(err22008);
+        }
+        // time - time -> interval; timetz pairs compare in UTC
+        // (PG timetz_mi: both shift to UTC first).
+        if let (Value::Time(x), Value::Time(y)) = (a, b) {
+            return Ok(Some(Value::Interval(dt::Interval {
+                months: 0,
+                days: 0,
+                micros: x - y,
+            })));
+        }
+        if let (Value::TimeTz(t1, o1), Value::TimeTz(t2, o2)) = (a, b) {
+            let u1 = t1 - *o1 as i64 * 1_000_000;
+            let u2 = t2 - *o2 as i64 * 1_000_000;
+            return Ok(Some(Value::Interval(dt::Interval {
+                months: 0,
+                days: 0,
+                micros: u1 - u2,
+            })));
+        }
     }
     Err(op_err(op, a, b))
 }

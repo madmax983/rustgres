@@ -55,7 +55,12 @@ pub enum ColType {
     Date,        // OID 1082 (v0.7)
     Timestamp,   // OID 1114 (v0.7)
     Timestamptz, // OID 1184 (v0.7)
-    Bytea,       // OID 17 (v0.7)
+    // v1.86: PG's time (OID 1083), timetz (OID 1266), and interval
+    // (OID 1186) types — the datetime family the engine lacked.
+    Time,     // OID 1083
+    TimeTz,   // OID 1266
+    Interval, // OID 1186
+    Bytea,    // OID 17 (v0.7)
     // v1.39: PG's `bit` fixed-length bit-string type (OID 1560) — the
     // result type of `x'...'`/`b'...'` literals (PG19 `bit_in`). The
     // value's bit length is carried on the value itself (PG stores the
@@ -141,6 +146,9 @@ pub enum ArrayElem {
     Date,
     Timestamp,
     Timestamptz,
+    Time,
+    TimeTz,
+    Interval,
     Numeric,
     Uuid,
     Regclass,
@@ -176,6 +184,9 @@ impl ArrayElem {
             ColType::Date => ArrayElem::Date,
             ColType::Timestamp => ArrayElem::Timestamp,
             ColType::Timestamptz => ArrayElem::Timestamptz,
+            ColType::Time => ArrayElem::Time,
+            ColType::TimeTz => ArrayElem::TimeTz,
+            ColType::Interval => ArrayElem::Interval,
             ColType::Numeric(..) => ArrayElem::Numeric,
             ColType::Uuid => ArrayElem::Uuid,
             ColType::Regclass => ArrayElem::Regclass,
@@ -213,6 +224,9 @@ impl ArrayElem {
             ArrayElem::Date => 1182,
             ArrayElem::Timestamp => 1115,
             ArrayElem::Timestamptz => 1185,
+            ArrayElem::Time => 1183,
+            ArrayElem::TimeTz => 1270,
+            ArrayElem::Interval => 1187,
             ArrayElem::Numeric => 1231,
             ArrayElem::Uuid => 2951,
             ArrayElem::Regclass => 2206,
@@ -244,6 +258,9 @@ impl ArrayElem {
             ArrayElem::Date => "date",
             ArrayElem::Timestamp => "timestamp without time zone",
             ArrayElem::Timestamptz => "timestamp with time zone",
+            ArrayElem::Time => "time without time zone",
+            ArrayElem::TimeTz => "time with time zone",
+            ArrayElem::Interval => "interval",
             ArrayElem::Numeric => "numeric",
             ArrayElem::Uuid => "uuid",
             ArrayElem::Regclass => "regclass",
@@ -274,6 +291,9 @@ impl ArrayElem {
             ArrayElem::Date => "date",
             ArrayElem::Timestamp => "timestamp",
             ArrayElem::Timestamptz => "timestamptz",
+            ArrayElem::Time => "time",
+            ArrayElem::TimeTz => "timetz",
+            ArrayElem::Interval => "interval",
             ArrayElem::Numeric => "numeric",
             ArrayElem::Uuid => "uuid",
             ArrayElem::Regclass => "regclass",
@@ -394,6 +414,9 @@ impl ColType {
             ColType::Date => 1082,        // DATE
             ColType::Timestamp => 1114,   // TIMESTAMP
             ColType::Timestamptz => 1184, // TIMESTAMPTZ
+            ColType::Time => 1083,        // TIME (v1.86)
+            ColType::TimeTz => 1266,      // TIMETZ (v1.86)
+            ColType::Interval => 1186,    // INTERVAL (v1.86)
             ColType::Bytea => 17,         // BYTEA
             ColType::Bit => 1560,         // BIT (v1.39)
             ColType::Uuid => 2950,        // UUID
@@ -434,6 +457,9 @@ impl ColType {
             ColType::Date => "date",
             ColType::Timestamp => "timestamp without time zone",
             ColType::Timestamptz => "timestamp with time zone",
+            ColType::Time => "time without time zone", // v1.86
+            ColType::TimeTz => "time with time zone",  // v1.86
+            ColType::Interval => "interval",           // v1.86
             ColType::Bytea => "bytea",
             ColType::Bit => "bit", // v1.39
             ColType::Uuid => "uuid",
@@ -479,6 +505,9 @@ impl ColType {
             ColType::Date => "date",
             ColType::Timestamp => "timestamp",
             ColType::Timestamptz => "timestamptz",
+            ColType::Time => "time",         // v1.86
+            ColType::TimeTz => "timetz",     // v1.86
+            ColType::Interval => "interval", // v1.86
             ColType::Bytea => "bytea",
             ColType::Bit => "bit", // v1.39
             ColType::Uuid => "uuid",
@@ -4259,8 +4288,15 @@ pub enum Value {
     Date(i32),        // v0.7: days since 1970-01-01
     Timestamp(i64),   // v0.7: micros since 1970-01-01 00:00:00 UTC
     Timestamptz(i64), // v0.7: micros since epoch, UTC
-    Bytea(Vec<u8>),   // v0.7
-    Uuid([u8; 16]),   // v0.7
+    // v1.86: time of day (micros since midnight, 0..=86_400_000_000).
+    Time(i64),
+    // v1.86: time of day with a fixed zone offset (micros, seconds
+    // east of UTC), PG's TimeTzADT.
+    TimeTz(i64, i32),
+    // v1.86: PG's interval triple (months, days, micros).
+    Interval(crate::datetime::Interval),
+    Bytea(Vec<u8>), // v0.7
+    Uuid([u8; 16]), // v0.7
     // v1.39: PG's `bit` fixed-length bit string (OID 1560) — the value
     // of `x'...'`/`b'...'` literals. The bit length rides on the value
     // (PG's VarBit datum carries its typmod); display is the bit
@@ -4475,6 +4511,10 @@ impl Value {
             Value::Date(d) => Some(crate::datetime::format_date(*d)),
             Value::Timestamp(m) => Some(crate::datetime::format_timestamp(*m)),
             Value::Timestamptz(m) => Some(crate::datetime::format_timestamptz(*m)),
+            // v1.86: time_out / timetz_out / interval_out.
+            Value::Time(t) => Some(crate::datetime::format_time(*t)),
+            Value::TimeTz(t, off) => Some(crate::datetime::format_timetz(*t, *off)),
+            Value::Interval(iv) => Some(crate::datetime::format_interval(iv)),
             Value::Bytea(b) => Some(bytea_text(b)),
             // v1.39: PG19 `bit_out` — the bit characters.
             Value::BitString(b) => Some(b.to_bit_chars()),
@@ -4576,6 +4616,9 @@ impl Value {
             Value::Date(_) => Cow::Borrowed("date"),
             Value::Timestamp(_) => Cow::Borrowed("timestamp without time zone"),
             Value::Timestamptz(_) => Cow::Borrowed("timestamp with time zone"),
+            Value::Time(_) => Cow::Borrowed("time without time zone"), // v1.86
+            Value::TimeTz(_, _) => Cow::Borrowed("time with time zone"), // v1.86
+            Value::Interval(_) => Cow::Borrowed("interval"),           // v1.86
             Value::Bytea(_) => Cow::Borrowed("bytea"),
             Value::BitString(_) => Cow::Borrowed("bit"), // v1.39
             Value::Tid(_, _) => Cow::Borrowed("tid"),    // v1.40
@@ -4608,6 +4651,9 @@ impl Value {
             Value::Date(_) => ColType::Date,
             Value::Timestamp(_) => ColType::Timestamp,
             Value::Timestamptz(_) => ColType::Timestamptz,
+            Value::Time(_) => ColType::Time,         // v1.86
+            Value::TimeTz(_, _) => ColType::TimeTz,  // v1.86
+            Value::Interval(_) => ColType::Interval, // v1.86
             Value::Bytea(_) => ColType::Bytea,
             Value::BitString(_) => ColType::Bit, // v1.39
             Value::Tid(_, _) => ColType::Tid,    // v1.40
