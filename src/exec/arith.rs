@@ -605,10 +605,30 @@ pub(crate) fn eval_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, Exe
         None => (a, b),
     };
     // v0.25: bitwise operators only accept the integer kinds.
+    // v1.93: PG19 varbit.c — `& | #` on two bit strings (equal lengths
+    // required, 22026) and `<< >>` on a bit string by an integer count.
     if matches!(
         op,
         ArithOp::BitAnd | ArithOp::BitOr | ArithOp::BitXor | ArithOp::Shl | ArithOp::Shr
     ) {
+        if let (Value::BitString(x), Value::BitString(y)) = (a, b) {
+            return Ok(Value::BitString(match op {
+                ArithOp::BitAnd => bit_and(x, y)?,
+                ArithOp::BitOr => bit_or(x, y)?,
+                ArithOp::BitXor => bit_xor(x, y)?,
+                _ => return Err(op_err(op, a, b)),
+            }));
+        }
+        if let (Value::BitString(x), n) = (a, b) {
+            if matches!(op, ArithOp::Shl | ArithOp::Shr) {
+                let shft = match n {
+                    Value::SmallInt(i) => *i as i64,
+                    Value::Int(i) | Value::BigInt(i) => *i,
+                    _ => return Err(op_err(op, a, b)),
+                };
+                return Ok(Value::BitString(bit_shift(x, shft, op == ArithOp::Shl)));
+            }
+        }
         return eval_bitwise(op, a, b);
     }
     if let Some(v) = eval_datetime_arith(op, a, b)? {
@@ -818,6 +838,10 @@ pub(crate) fn eval_bitwise(op: ArithOp, a: &Value, b: &Value) -> Result<Value, E
 pub(crate) fn eval_bitnot_val(v: &Value) -> Result<Value, ExecError> {
     if v == &Value::Null {
         return Ok(Value::Null);
+    }
+    // v1.93: PG19 varbit.c `bitnot` on bit strings.
+    if let Value::BitString(bs) = v {
+        return Ok(Value::BitString(bit_not(bs)));
     }
     match num_cat(v) {
         Some(NumCat::Small) | Some(NumCat::Int) => {

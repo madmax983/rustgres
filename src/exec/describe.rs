@@ -906,6 +906,16 @@ pub(crate) fn expr_col_name_strength(e: &Expr) -> (String, u8) {
                 (inner, s)
             }
         }
+        // v1.93: the bit-typmod cast wrap is a TypeCast for naming:
+        // the inner name wins at strength 2, else "bit" at strength 1.
+        Expr::Func { name, args } if name == "__bit_typmod_cast" => {
+            let (inner, s) = expr_col_name_strength(&args[0]);
+            if s <= 1 {
+                ("bit".to_string(), 1)
+            } else {
+                (inner, s)
+            }
+        }
         // v0.18: function calls are named after the function (SELECT sqrt(2) -> "sqrt").
         // v1.85: SQL/JSON desugars present under their public names.
         Expr::Func { name, .. } if name.starts_with("__sqljson_") => (
@@ -1208,6 +1218,8 @@ pub(crate) fn expr_type(
             match expr_type(eng, snap, own, session, schemas, outer, ctes, x)? {
                 ColType::BigInt => Ok(ColType::BigInt),
                 ColType::SmallInt | ColType::Int => Ok(ColType::Int),
+                // v1.93: PG19 varbit.c `bitnot` — ~bit is bit.
+                ColType::Bit => Ok(ColType::Bit),
                 t => Err(exec_err(
                     "42883",
                     format!("operator does not exist: ~ {}", t.sql_name()),
@@ -1266,7 +1278,16 @@ pub(crate) fn expr_type(
             }
             case_result_type(eng, snap, own, session, schemas, ctes, whens, else_)
         }
-        Expr::Concat(..) => Ok(ColType::Text),
+        // v1.93: bit || bit is bit concatenation (varbit.c bitcat);
+        // every other || keeps the text rule.
+        Expr::Concat(a, b) => {
+            let ta = expr_type(eng, snap, own, session, schemas, outer, ctes, a);
+            let tb = expr_type(eng, snap, own, session, schemas, outer, ctes, b);
+            match (ta, tb) {
+                (Ok(ColType::Bit), Ok(ColType::Bit)) => Ok(ColType::Bit),
+                _ => Ok(ColType::Text),
+            }
+        }
         // v1.82: PG19 operator return types — `->`/`#>` are json,
         // `->>`/`#>>` are text.
         // v1.83: on a jsonb operand `->`/`#>` return jsonb, and the
@@ -1720,6 +1741,18 @@ pub(crate) fn combine_arith_types(
             let is_int_kind =
                 |t: &ColType| matches!(t, ColType::SmallInt | ColType::Int | ColType::BigInt);
             match (&x, &y) {
+                // v1.93: PG19 varbit.c — bit & | # bit -> bit, and
+                // bit << / >> int -> bit.
+                (ColType::Bit, ColType::Bit)
+                    if matches!(op, ArithOp::BitAnd | ArithOp::BitOr | ArithOp::BitXor) =>
+                {
+                    Ok(ColType::Bit)
+                }
+                (ColType::Bit, y)
+                    if is_int_kind(y) && matches!(op, ArithOp::Shl | ArithOp::Shr) =>
+                {
+                    Ok(ColType::Bit)
+                }
                 // v1.88: range/multirange `+` (union), `*`
                 // (intersection), `-` (difference). Any multirange
                 // operand makes a multirange result; range - range and
@@ -1974,6 +2007,23 @@ pub(crate) fn agg_result_type(
                 ));
             }
             Ok(ColType::Bool)
+        }
+        // v1.93: bit_and/bit_or/bit_xor — PG19 defines them for
+        // int2/int4/int8 and bit/varbit; the result type is the
+        // argument type.
+        AggFunc::BitAnd | AggFunc::BitOr | AggFunc::BitXor => {
+            let a = arg.expect("bit_and/bit_or/bit_xor always take an argument");
+            let t = expr_type(eng, snap, own, session, schemas, outer, ctes, a)?;
+            if !matches!(
+                t,
+                ColType::SmallInt | ColType::Int | ColType::BigInt | ColType::Bit
+            ) {
+                return Err(exec_err(
+                    "42883",
+                    format!("function {}({}) does not exist", func.name(), t.sql_name()),
+                ));
+            }
+            Ok(t)
         }
         // v0.91: array_agg(anyelement) -> anyarray; the element type is
         // the argument's scalar element (arrays flatten, like PG).

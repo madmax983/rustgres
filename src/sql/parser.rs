@@ -1447,6 +1447,7 @@ impl Parser {
             columns: Vec::new(), // inherited from parent at exec
             composite_types: Vec::new(),
             domain_types: Vec::new(),
+            bit_typmods: Vec::new(),
             domain_elem: Vec::new(),
             not_null: Vec::new(),
             defaults: Vec::new(),
@@ -1655,6 +1656,19 @@ impl Parser {
             _ => None,
         };
         let (col_type, composite_name) = self.parse_col_type()?;
+        // v1.93: capture the bit typmod side channel before anything
+        // else parses a type. Bare `bit` is bit(1); an unbounded
+        // `bit varying` / `varbit` (recorded as (-1, true)) carries no
+        // typmod.
+        let bit_typmod = if col_type == ColType::Bit {
+            match self.last_bit_typmod {
+                Some((n, varying)) if n > 0 => Some((n, varying)),
+                Some((_, true)) => None,
+                _ => Some((1, false)),
+            }
+        } else {
+            None
+        };
         // v0.41: PG19 `opt_column_compression` sits between the type
         // name and the column constraints.
         let compression = if self.eat_keyword("compression") {
@@ -1704,6 +1718,7 @@ impl Parser {
         Ok(ParsedColDef {
             name,
             col_type,
+            bit_typmod,
             composite_name,
             serial,
             compression,
@@ -2132,6 +2147,7 @@ impl Parser {
             return Ok(AlterAction::AddColumn {
                 name: col.name,
                 col_type: col.col_type,
+                bit_typmod: col.bit_typmod,
                 not_null,
                 default,
                 serial: col.serial,
@@ -5120,7 +5136,11 @@ impl Parser {
         expr = self.parse_postfix_subscripts(expr)?;
         while *self.peek() == Token::ColonColon {
             self.next();
+            // v1.93: capture the bit typmod of THIS type name (clear
+            // first so a stale value from an earlier type cannot leak).
+            self.last_bit_typmod = None;
             let (to, composite_name) = self.parse_type_name()?;
+            let bit_tm = self.last_bit_typmod;
             // v0.81: `::named_composite` becomes CastNamed (resolved at
             // execution time); builtins keep the existing Cast path.
             if let Some(name) = composite_name {
@@ -5151,6 +5171,9 @@ impl Parser {
                 to,
                 written: None,
             };
+            // v1.93: ::bit(n) / ::varbit(n) (and bare ::bit = bit(1))
+            // apply PG's explicit-cast typmod adjustment.
+            expr = Self::wrap_bit_typmod_cast(expr, to, bit_tm);
             // v0.79: subscripts/slices bind to the cast result too —
             // `('...'::int[])[1]` and `('...'::int[])[1]::text`, like
             // PG19 where indirection sits below the cast and above
@@ -5214,6 +5237,46 @@ impl Parser {
     /// `^` (so `-2^2` is `(-2)^2`) but looser than `::` (so `-5::int`
     /// is `-(5::int)`). v0.53: `-x` is a first-class `Expr::Neg`
     /// (PG's doNegate) — type-preserving, NULL stays NULL, and
+    /// v1.93: wrap a just-built `::bit...` / `CAST AS bit...` cast in
+    /// the `__bit_typmod_cast` adjustment when the type name carried
+    /// an explicit `(n)` typmod: `bit_tm` is the parser's captured
+    /// last_bit_typmod for this type name — None (bare `bit`) and
+    /// Some((-1, true)) (unbounded bit varying) need no adjustment.
+    /// Non-bit targets pass through unchanged.
+    pub(crate) fn wrap_bit_typmod_cast(
+        expr: Expr,
+        to: ColType,
+        bit_tm: Option<(i32, bool)>,
+    ) -> Expr {
+        if to != ColType::Bit {
+            return expr;
+        }
+        let (n, varying) = match bit_tm {
+            Some((n, v)) if n > 0 => (n, v),
+            // Bare `bit` / unbounded varying: no wrap — the engine's
+            // pinned plain-cast behavior stands (v1.92: int -> bit
+            // yields the integer's own width; PG's bit(1) default for
+            // a bare cast target is a documented deviation).
+            _ => return expr,
+        };
+        // The wrap replaces the Cast node and applies to its INNER
+        // expression: PG dispatches on the source type (bit -> bit()
+        // first-bits semantics, int -> bitfromint low-bits semantics),
+        // which the already-cast value can no longer distinguish.
+        let inner = match expr {
+            Expr::Cast { expr, .. } => *expr,
+            other => other,
+        };
+        Expr::Func {
+            name: "__bit_typmod_cast".to_string(),
+            args: vec![
+                inner,
+                Expr::Literal(Literal::Int(n as i64)),
+                Expr::Literal(Literal::Int(if varying { 1 } else { 0 })),
+            ],
+        }
+    }
+
     /// `-'2026-01-01'` fails at evaluation, like Postgres.
     /// The generic prefix operators are PG19's `qual_Op a_expr %prec Op`
     /// — the loosest precedence in the grammar — so their operand is a
@@ -5447,7 +5510,10 @@ impl Parser {
                     self.next();
                     let expr = self.parse_or()?;
                     self.expect_keyword("as")?;
+                    // v1.93: capture this type name's bit typmod.
+                    self.last_bit_typmod = None;
                     let (to, composite_name) = self.parse_type_name()?;
+                    let bit_tm = self.last_bit_typmod;
                     self.expect(Token::RParen, "')'")?;
                     // v0.81: CAST(x AS named_composite).
                     if let Some(name) = composite_name {
@@ -5456,11 +5522,15 @@ impl Parser {
                             name,
                         });
                     }
-                    return Ok(Expr::Cast {
-                        expr: Box::new(expr),
+                    return Ok(Self::wrap_bit_typmod_cast(
+                        Expr::Cast {
+                            expr: Box::new(expr),
+                            to,
+                            written: None,
+                        },
                         to,
-                        written: None,
-                    });
+                        bit_tm,
+                    ));
                 }
                 // Typed literal: DATE '2026-01-01', TIMESTAMP '...', etc.
                 // Backtracks when no string literal follows, so columns
@@ -5926,6 +5996,10 @@ impl Parser {
             "max" => Some(AggFunc::Max),
             "string_agg" => Some(AggFunc::StringAgg),
             "bool_and" => Some(AggFunc::BoolAnd),
+            // v1.93: bit_and/bit_or/bit_xor aggregates.
+            "bit_and" => Some(AggFunc::BitAnd),
+            "bit_or" => Some(AggFunc::BitOr),
+            "bit_xor" => Some(AggFunc::BitXor),
             "variance" | "var_samp" => Some(AggFunc::VarianceSamp),
             "var_pop" => Some(AggFunc::VariancePop),
             "stddev" | "stddev_samp" => Some(AggFunc::StddevSamp),

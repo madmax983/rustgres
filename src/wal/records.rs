@@ -66,6 +66,9 @@ pub enum WalRecord {
         /// checkpoints carried it, so a crash between checkpoints turned
         /// partitioned tables into plain ones. `None` on `RGSWAL20` logs.
         partition: Option<crate::storage::PartitionInfo>,
+        /// v1.93 (`RGSWAL23`): declared bit typmod per column
+        /// (`bit_typmods`); empty on older logs.
+        bit_typmods: Vec<Option<(i32, bool)>>,
         xmin: u64,
     },
     InsertRows {
@@ -169,6 +172,9 @@ pub enum WalRecord {
         /// and DROP COLUMN key shifts all version the table through this
         /// record). `None` on `RGSWAL20` logs.
         partition: Option<crate::storage::PartitionInfo>,
+        /// v1.93 (`RGSWAL23`): declared bit typmod per column
+        /// (`bit_typmods`); empty on older logs.
+        bit_typmods: Vec<Option<(i32, bool)>>,
         xmin: u64,
     },
     CreateView {

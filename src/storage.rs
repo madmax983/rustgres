@@ -5349,6 +5349,10 @@ pub struct Table {
     /// (`Some(d)` iff the column was declared with domain type `d`,
     /// possibly as `d[]`).
     pub domain_types: Vec<Option<String>>,
+    /// v1.93: declared bit typmod per column, parallel to `columns`
+    /// (`Some((n, varying))` for `bit(n)` / `bit varying(n)`; bare
+    /// `bit` is `(1, false)`). Enforced on row writes (varbit.c).
+    pub bit_typmods: Vec<Option<(i32, bool)>>,
     /// v0.85: iff `domain_types[i]` is `Some` and the column was
     /// declared as `d[]`: the domain applies per array element.
     pub domain_elem: Vec<bool>,
@@ -5436,6 +5440,8 @@ impl Table {
             composite_types: vec![None; n],
             // v0.85: no domain-typed columns by default.
             domain_types: vec![None; n],
+            // v1.93: no declared bit typmods by default.
+            bit_typmods: vec![None; n],
             domain_elem: vec![false; n],
             rows: Vec::new(),
             row_index: HashMap::default(),
@@ -5494,6 +5500,8 @@ impl Table {
         // v0.85: domain type use per column.
         t.domain_types = def.domain_types.clone();
         t.domain_elem = def.domain_elem.clone();
+        // v1.93: declared bit typmods per column.
+        t.bit_typmods = def.bit_typmods.clone();
         // v0.72: per-column STORAGE overrides (LIKE ... INCLUDING
         // STORAGE); `None` keeps the type default from `Table::new`.
         for (i, s) in def.storage.iter().enumerate() {

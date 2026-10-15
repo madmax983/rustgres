@@ -83,6 +83,8 @@ pub(crate) fn eval_concat(a: &Value, b: &Value) -> Result<Value, ExecError> {
             r.extend_from_slice(y);
             Ok(Value::Bytea(r))
         }
+        // v1.93: PG19 varbit.c `bitcat` — bit || bit appends the bits.
+        (Value::BitString(x), Value::BitString(y)) => Ok(Value::BitString(bit_concat(x, y)?)),
         _ => {
             // v0.90: PG19 only resolves `||` to text concatenation when
             // the implicit cast to text is allowed, i.e. when at least
@@ -2657,7 +2659,7 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
     let n = vals.len();
     let ok = match name {
         "upper" | "lower" | "length" | "char_length" | "character_length" | "octet_length"
-        | "abs" | "floor" | "ceil" | "ceiling" | "sqrt" => n == 1,
+        | "bit_length" | "abs" | "floor" | "ceil" | "ceiling" | "sqrt" => n == 1,
         "exp" | "ln" => n == 1,
         "log" => n == 1 || n == 2,
         "cbrt" | "factorial" | "numeric_inc" => n == 1,
@@ -2716,6 +2718,7 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         // v1.85: SQL/JSON desugar internals (fixed shapes).
         "__sqljson_value" => n == 8,
         "__sqljson_query" => n == 12,
+        "__bit_typmod_cast" => n == 3,
         "__sqljson_exists" => n == 4,
         // v0.32: regexp set-returning functions (PG 19).
         "regexp_matches" => (2..=3).contains(&n),
@@ -2992,6 +2995,7 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         | "char_length"
         | "character_length"
         | "octet_length"
+        | "bit_length"
         | "substring"
         | "position"
         | "replace"
@@ -3152,6 +3156,41 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         }
         "__sqljson_value" | "__sqljson_query" | "__sqljson_exists" => {
             eval_sqljson_func(name, vals)
+        }
+        // v1.93: explicit bit(n)/varbit(n) cast adjustment (parser wrap
+        // of ::bit(n) / CAST AS bit(n)); args are (value, n, varying).
+        "__bit_typmod_cast" => {
+            let n = match int_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(n) => n as i32,
+            };
+            let varying = matches!(&vals[2], Value::Int(1) | Value::BigInt(1) | Value::SmallInt(1));
+            match &vals[0] {
+                Value::Null => Ok(Value::Null),
+                Value::BitString(bs) => Ok(Value::BitString(
+                    super::bit::bit_cast_typmod(bs, n, varying),
+                )),
+                Value::Text(s) | Value::BpChar(s) => {
+                    let bs = crate::storage::BitString::parse_input(s.trim())
+                        .map_err(|m| exec_err("22P02", m))?;
+                    Ok(Value::BitString(super::bit::bit_cast_typmod(
+                        &bs, n, varying,
+                    )))
+                }
+                // PG bitfromint4/bitfromint8: the low `n` bits of the
+                // two's-complement integer (sign-filled above its own
+                // width when n exceeds it).
+                Value::SmallInt(i) => Ok(Value::BitString(
+                    super::bit::bit_from_int(*i as i64, 16, n, varying),
+                )),
+                Value::Int(i) => Ok(Value::BitString(super::bit::bit_from_int(
+                    *i, 32, n, varying,
+                ))),
+                Value::BigInt(i) => Ok(Value::BitString(super::bit::bit_from_int(
+                    *i, 64, n, varying,
+                ))),
+                other => eval_cast(other, crate::storage::ColType::Bit),
+            }
         }
         // v1.90: the aggregate-option marker is the identity on its
         // value in pure contexts (grouped paths intercept earlier).
@@ -5785,6 +5824,11 @@ pub(crate) fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecErr
             Some(s) => Value::text(pg_quote_literal_cstr(s)),
         }),
         "length" | "char_length" | "character_length" => {
+            // v1.93: PG19 varbit.c `bitlength` — length(bit) is the
+            // bit count.
+            if let Value::BitString(b) = &vals[0] {
+                return Ok(Value::Int(b.bitlen as i64));
+            }
             // v0.29: length(bytea) returns the byte count (PG).
             if let Value::Bytea(b) = &vals[0] {
                 return Ok(Value::Int(b.len() as i64));
@@ -5794,10 +5838,21 @@ pub(crate) fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecErr
                 Some(s) => Value::Int(s.chars().count() as i64),
             })
         }
+        // v1.93: PG19 `bit_length` — bitlen for bit, 8x the octet
+        // length for bytea/text.
+        "bit_length" => Ok(match &vals[0] {
+            Value::Null => Value::Null,
+            Value::BitString(b) => Value::Int(b.bitlen as i64),
+            Value::Bytea(b) => Value::Int(b.len() as i64 * 8),
+            Value::Text(s) | Value::BpChar(s) => Value::Int(s.len() as i64 * 8),
+            other => return Err(func_arg_err(name, other)),
+        }),
         // v0.29: octet_length returns the byte count. For bytea it's the
         // byte length; for text it's the UTF-8 byte length (PG).
         "octet_length" => Ok(match &vals[0] {
             Value::Null => Value::Null,
+            // v1.93: PG19 varbit.c `bitoctetlength` — ceil(bitlen / 8).
+            Value::BitString(b) => Value::Int(b.bitlen.div_ceil(8) as i64),
             Value::Bytea(b) => Value::Int(b.len() as i64),
             Value::Text(s) => Value::Int(s.len() as i64),
             // v0.35: PG's octet_length(bpchar) counts the padded bytes.
@@ -5805,6 +5860,22 @@ pub(crate) fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecErr
             other => return Err(func_arg_err(name, other)),
         }),
         "substring" => {
+            // v1.93: bit form (PG19 varbit.c bitsubstring).
+            if let Value::BitString(b) = &vals[0] {
+                let start = match int_arg(name, &vals[1])? {
+                    None => return Ok(Value::Null),
+                    Some(n) => n,
+                };
+                let len = if vals.len() > 2 {
+                    match int_arg(name, &vals[2])? {
+                        None => return Ok(Value::Null),
+                        Some(n) => Some(n),
+                    }
+                } else {
+                    None
+                };
+                return Ok(Value::BitString(bit_substring(b, start, len)?));
+            }
             // v0.33: bytea form (PG bytea_substr) dispatches before str_arg.
             if let Value::Bytea(b) = &vals[0] {
                 let start = match int_arg(name, &vals[1])? {
@@ -5859,6 +5930,23 @@ pub(crate) fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecErr
             // v0.24: `SUBSTRING(s FROM x FOR y)` — runtime dispatch.
             // Integer (start, len) vs SIMILAR (pattern, escape); PG
             // decides by type, so `-1`, `1+1`, etc. work as integers.
+            // v1.93: bit subject (PG bitsubstring) dispatches first.
+            if let Value::BitString(b) = &vals[0] {
+                return Ok(match (&vals[1], &vals[2]) {
+                    (Value::Null, _) | (_, Value::Null) => Value::Null,
+                    _ => {
+                        let start = match int_arg(name, &vals[1])? {
+                            None => return Ok(Value::Null),
+                            Some(n) => n,
+                        };
+                        let len = match int_arg(name, &vals[2])? {
+                            None => return Ok(Value::Null),
+                            Some(n) => n,
+                        };
+                        Value::BitString(bit_substring(b, start, Some(len))?)
+                    }
+                });
+            }
             // v0.33: bytea subject (PG bytea_substr) dispatches first.
             if let Value::Bytea(b) = &vals[0] {
                 match (&vals[1], &vals[2]) {
@@ -5898,6 +5986,22 @@ pub(crate) fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecErr
             }
         }
         "position" => {
+            // v1.93: bit position (PG19 varbit.c bitposition): the
+            // substring is argument 0, the string argument 1.
+            if matches!(&vals[0], Value::BitString(_)) || matches!(&vals[1], Value::BitString(_)) {
+                if matches!(&vals[0], Value::Null) || matches!(&vals[1], Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let (Value::BitString(sub), Value::BitString(s)) = (&vals[0], &vals[1]) else {
+                    let other = if matches!(&vals[0], Value::BitString(_)) {
+                        &vals[1]
+                    } else {
+                        &vals[0]
+                    };
+                    return Err(func_arg_err(name, other));
+                };
+                return Ok(Value::Int(bit_position(sub, s)));
+            }
             // bytea position: 1-based byte index, 0 if not found.
             if let (Value::Bytea(sub), Value::Bytea(s)) = (&vals[0], &vals[1]) {
                 if sub.is_empty() {
@@ -6382,6 +6486,15 @@ pub(crate) fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecErr
         // ("bit 0 is the least significant bit of the first byte, and
         // bit 15 is the most significant bit of the second byte").
         "get_bit" => {
+            // v1.93: bit form (PG19 varbit.c bitgetbit) — 0-based
+            // left-to-right (MSB first), unlike the bytea form below.
+            if let Value::BitString(b) = &vals[0] {
+                let n = match int_arg(name, &vals[1])? {
+                    None => return Ok(Value::Null),
+                    Some(n) => n,
+                };
+                return Ok(Value::Int(bit_get_bit(b, n)?));
+            }
             let b = match &vals[0] {
                 Value::Null => return Ok(Value::Null),
                 Value::Bytea(b) => b,
@@ -6407,6 +6520,19 @@ pub(crate) fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecErr
             Ok(Value::Int(((b[byte_idx] >> bit_idx) & 1) as i64))
         }
         "set_bit" => {
+            // v1.93: bit form (PG19 varbit.c bitsetbit) — MSB-first
+            // numbering, 2202E range / 22023 value errors.
+            if let Value::BitString(b) = &vals[0] {
+                let n = match int_arg(name, &vals[1])? {
+                    None => return Ok(Value::Null),
+                    Some(n) => n,
+                };
+                let v = match int_arg(name, &vals[2])? {
+                    None => return Ok(Value::Null),
+                    Some(n) => n,
+                };
+                return Ok(Value::BitString(bit_set_bit(b, n, v)?));
+            }
             let b = match &vals[0] {
                 Value::Null => return Ok(Value::Null),
                 Value::Bytea(b) => b.clone(),
@@ -6498,6 +6624,10 @@ pub(crate) fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecErr
             Ok(Value::Bytea(out))
         }
         "bit_count" => {
+            // v1.93: bit form (PG19 varbit.c bit_bit_count).
+            if let Value::BitString(b) = &vals[0] {
+                return Ok(Value::BigInt(bit_count(b)));
+            }
             let b = match &vals[0] {
                 Value::Null => return Ok(Value::Null),
                 Value::Bytea(b) => b,
@@ -6887,6 +7017,16 @@ pub(crate) fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecErr
         "substring_from" => {
             // SUBSTRING(s FROM pat): POSIX regex substring. If the pattern
             // contains a group, return the first group; else the whole match.
+            // v1.93: bit subject with integer start (PG bitsubstr_no_len).
+            if let Value::BitString(b) = &vals[0] {
+                return Ok(match &vals[1] {
+                    Value::Null => Value::Null,
+                    _ => match int_arg(name, &vals[1])? {
+                        None => Value::Null,
+                        Some(n) => Value::BitString(bit_substring(b, n, None)?),
+                    },
+                });
+            }
             // v0.33: bytea subject with integer start (PG bytea_substr_no_len).
             if let Value::Bytea(b) = &vals[0] {
                 match &vals[1] {
@@ -7187,6 +7327,29 @@ pub(crate) fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecErr
         "overlay" => {
             // overlay(s, replacement, start [, len]); omitted len defaults
             // to length(replacement). 1-based start; start < 1 is clamped.
+            // v1.93: bit form (PG19 varbit.c bit_overlay). The placing
+            // argument is an unknown literal ('001') in SQL — PG
+            // resolves it to bit, so a text value parses as bit digits.
+            // Unlike text/bytea, bit errors on start <= 0 (22011).
+            if let Value::BitString(b) = &vals[0] {
+                if matches!(&vals[1], Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let placing = bit_placing_arg(&vals[1])?;
+                let start = match int_arg(name, &vals[2])? {
+                    None => return Ok(Value::Null),
+                    Some(n) => n,
+                };
+                let len = if vals.len() > 3 {
+                    match int_arg(name, &vals[3])? {
+                        None => return Ok(Value::Null),
+                        Some(n) => n,
+                    }
+                } else {
+                    placing.bitlen as i64
+                };
+                return Ok(Value::BitString(bit_overlay(b, &placing, start, len)?));
+            }
             // v0.33: bytea form (PG byteaoverlay/byteaoverlay_no_len).
             // Unlike text, bytea errors on start <= 0 (22011).
             if let Value::Bytea(b) = &vals[0] {
@@ -10564,6 +10727,13 @@ pub(crate) fn func_result_type(
         Ok(_) => Ok(ColType::Text),
         Err(e) => Err(e),
     };
+    // v1.93: substring/overlay on a bit input return bit (varbit.c).
+    let bit_bytea_if_arg0 = || match arg0() {
+        Ok(ColType::Bit) => Ok(ColType::Bit),
+        Ok(ColType::Bytea) => Ok(ColType::Bytea),
+        Ok(_) => Ok(ColType::Text),
+        Err(e) => Err(e),
+    };
     match name {
         "upper" | "lower" | "replace" | "split_part" | "concat" | "concat_ws" | "to_hex"
         | "to_oct" | "to_bin" | "left" | "right" | "reverse" | "encode" | "repeat" | "lpad"
@@ -10571,13 +10741,21 @@ pub(crate) fn func_result_type(
         // v1.15: quote_ident/quote_literal/quote_nullable return text.
         | "quote_ident" | "quote_literal" | "quote_nullable" => Ok(ColType::Text),
         // v0.33: substring/overlay/ltrim/rtrim/btrim return bytea for bytea input.
-        "substring" | "substr" | "substring_from" | "substring_from_for" | "overlay" | "ltrim"
-        | "rtrim" | "btrim" => bytea_if_arg0_bytea(),
+        // v1.93: substring/overlay return bit for bit input.
+        "substring" | "substr" | "substring_from" | "substring_from_for" | "overlay" => {
+            bit_bytea_if_arg0()
+        }
+        "ltrim" | "rtrim" | "btrim" => bytea_if_arg0_bytea(),
         "decode" => Ok(ColType::Bytea),
         "crc32" | "crc32c" => Ok(ColType::BigInt),
         // v0.28: bytea bit/byte functions.
         "get_bit" | "get_byte" => Ok(ColType::Int),
-        "set_bit" | "set_byte" => Ok(ColType::Bytea),
+        // v1.93: set_bit on a bit input returns bit, not bytea.
+        "set_bit" => match arg0() {
+            Ok(ColType::Bit) => Ok(ColType::Bit),
+            _ => Ok(ColType::Bytea),
+        },
+        "set_byte" => Ok(ColType::Bytea),
         "bit_count" => Ok(ColType::BigInt),
         "sha224" | "sha256" | "sha384" | "sha512" => Ok(ColType::Bytea),
         "strpos" => Ok(ColType::Int),
@@ -10604,9 +10782,8 @@ pub(crate) fn func_result_type(
         "pg_overlaps" => Ok(ColType::Bool),
         "similar_to" => Ok(ColType::Bool),
         "substring_similar" => Ok(ColType::Text),
-        "length" | "char_length" | "character_length" | "octet_length" | "position" => {
-            Ok(ColType::Int)
-        }
+        "length" | "char_length" | "character_length" | "octet_length" | "bit_length"
+        | "position" => Ok(ColType::Int),
         // v0.79: array functions (PG19 arrayfuncs.c) — the runtime
         // dispatches these in eval_func_vals, but inference fell
         // through to 42883. scalar unnest(array) yields the element
@@ -10737,6 +10914,7 @@ pub(crate) fn func_result_type(
         }),
         "jsonb_path_query" | "jsonb_path_query_tz" => Ok(ColType::Jsonb),
         "__sqljson_value" => Ok(ColType::Text),
+        "__bit_typmod_cast" => Ok(ColType::Bit),
         // v1.90: SQL/JSON constructor desugars — the RETURNING spec
         // rides as a literal argument (last for object/array, index
         // 3 for serialize); defaults are json (text for serialize).
@@ -10977,6 +11155,14 @@ pub(crate) fn compare_values(
         (Value::Timestamp(t), Value::Timestamptz(z)) => timestamp_as_timestamptz(*t).cmp(z),
         (Value::Timestamptz(z), Value::Timestamp(t)) => z.cmp(&timestamp_as_timestamptz(*t)),
         (Value::Bytea(x), Value::Bytea(y)) => x.cmp(y),
+        // v1.93: PG19 varbit.c bit_cmp — memcmp over the common byte
+        // prefix, then the shorter bit length sorts first.
+        (Value::BitString(x), Value::BitString(y)) => {
+            let n = x.bytes.len().min(y.bytes.len());
+            x.bytes[..n]
+                .cmp(&y.bytes[..n])
+                .then_with(|| x.bitlen.cmp(&y.bitlen))
+        }
         (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
         // v0.36: PG's "char" ordering is a plain byte comparison.
         (Value::SingleChar(x), Value::SingleChar(y)) => x.cmp(y),

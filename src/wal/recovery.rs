@@ -406,11 +406,14 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             next_attnum,
             fillfactor,
             partition,
+            bit_typmods,
             xmin,
         } => {
             let mut t = Table::new(columns.clone(), *xmin);
             // v1.80: partition metadata (None on RGSWAL20 logs).
             t.partition = partition.clone();
+            // v1.93: declared bit typmods (empty on pre-RGSWAL23 logs).
+            t.bit_typmods = bit_typmods.clone();
             // v1.41: restore attnums, the next-attnum counter, and
             // fillfactor.
             t.attnums = attnums.clone();
@@ -726,6 +729,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             next_value_id,
             toast_info,
             partition,
+            bit_typmods,
             xmin,
         } => {
             let versions = eng.db.tables.entry(name.clone()).or_default();
@@ -788,6 +792,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             t.composite_types = composite_types.clone();
             t.domain_types = domain_types.clone();
             t.domain_elem = domain_elem.clone();
+            // v1.93: declared bit typmods (empty on pre-RGSWAL23 logs).
+            t.bit_typmods = bit_typmods.clone();
             // v0.96: restore inheritance parent links.
             t.inherits = inherits.clone();
             // v0.41: per-column compression methods (0 = default).
@@ -1198,6 +1204,8 @@ pub fn records_for_commit(
                     fillfactor: ours.fillfactor,
                     // v1.80: partition metadata (RGSWAL21).
                     partition: ours.partition.clone(),
+                    // v1.93: declared bit typmods (RGSWAL23).
+                    bit_typmods: ours.bit_typmods.clone(),
                     xmin: own,
                 });
             }
@@ -1285,6 +1293,8 @@ pub fn records_for_commit(
                         .collect(),
                     // v1.80: partition metadata (RGSWAL21).
                     partition: ours.partition.clone(),
+                    // v1.93: declared bit typmods (RGSWAL23).
+                    bit_typmods: ours.bit_typmods.clone(),
                     xmin: own,
                 });
             }

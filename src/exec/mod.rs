@@ -63,6 +63,7 @@ mod agg;
 mod alter;
 mod analyze;
 mod arith;
+mod bit;
 mod cast;
 mod catalog;
 mod constraint;
@@ -254,6 +255,9 @@ mod v191_range_remainder_tests;
 #[path = "test_mods/v192_sqljson_queryfuncs_tests.rs"]
 mod v192_sqljson_queryfuncs_tests;
 #[cfg(test)]
+#[path = "test_mods/v193_bit_tests.rs"]
+mod v193_bit_tests;
+#[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;
 
@@ -261,6 +265,7 @@ pub(crate) use agg::*;
 pub(crate) use alter::*;
 pub(crate) use analyze::*;
 pub(crate) use arith::*;
+pub(crate) use bit::*;
 pub(crate) use cast::*;
 pub(crate) use catalog::*;
 pub(crate) use constraint::*;

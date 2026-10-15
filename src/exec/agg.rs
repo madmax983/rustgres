@@ -445,6 +445,96 @@ pub(crate) fn check_lateral_agg_args(
     Ok(())
 }
 
+/// v1.93: PG19 planner.c GROUP BY capability check. bit/varbit have
+/// only a btree opclass (sort-only); xid has only a hash opclass
+/// (hash-only). `create_grouping_sets_data` errors 0A000 when one
+/// grouping set mixes both kinds, and the add_paths fallback errors
+/// the same when grouping sets need a hash-only key re-sorted for an
+/// ordered aggregate (the chained-hashagg path cannot re-aggregate).
+/// The engine keeps its own hash capability for bit elsewhere — this
+/// check emulates only PG's planner restriction, at exactly the two
+/// corpus shapes:
+/// (a) any single resolved set contains both a sort-only (bit) and a
+///     hash-only (xid) key;
+/// (b) grouping-sets mode with a hash-only key in any set while an
+///     aggregate with ORDER BY is present.
+pub(crate) fn check_groupby_capability_mix(
+    q: &mut Q,
+    outer: &[Scope],
+    stmt: &SelectStmt,
+    sets: &[Vec<Expr>],
+    schema: &[QCol],
+) -> Result<(), ExecError> {
+    // Some(true) = sort-only (bit), Some(false) = hash-only (xid).
+    let mut schemas: Vec<&[QCol]> = outer.iter().map(|s| s.schema).collect();
+    schemas.push(schema);
+    // A parenthesized grouping element `(a, b)` parses as one Row
+    // expression; classify each of its elements as its own key.
+    fn key_kinds(q: &mut Q, schemas: &[&[QCol]], e: &Expr, out: &mut Vec<Option<bool>>) {
+        if let Expr::Row(elems) = e {
+            for el in elems {
+                key_kinds(q, schemas, el, out);
+            }
+            return;
+        }
+        out.push(
+            match expr_type(q.eng, q.snap, q.own, q.session, schemas, &[], &[], e) {
+                Ok(ColType::Bit) => Some(true),
+                Ok(ColType::Xid) => Some(false),
+                _ => None,
+            },
+        );
+    }
+    // Flattened per-set key kinds (Row elements classified singly).
+    let mut set_kinds: Vec<Vec<Option<bool>>> = Vec::with_capacity(sets.len());
+    for set in sets {
+        let mut kinds = Vec::new();
+        for k in set {
+            key_kinds(q, &schemas, k, &mut kinds);
+        }
+        set_kinds.push(kinds);
+    }
+    let err = || {
+        exec_err_detail(
+            "0A000",
+            "could not implement GROUP BY",
+            "Some of the datatypes only support hashing, while others only support sorting.",
+        )
+    };
+    for kinds in &set_kinds {
+        if kinds.contains(&Some(true)) && kinds.contains(&Some(false)) {
+            return Err(err());
+        }
+    }
+    if stmt.group_by_sets && set_kinds.iter().flatten().any(|k| *k == Some(false)) {
+        let mut ordered_agg = false;
+        let mut scan = |e: &Expr| {
+            expr_walk(e, &mut |x| {
+                if let Expr::Agg { agg_order_by, .. } = x {
+                    if !agg_order_by.is_empty() {
+                        ordered_agg = true;
+                    }
+                }
+            });
+        };
+        for item in &stmt.items {
+            if let SelectItem::Expr { expr, .. } = item {
+                scan(expr);
+            }
+        }
+        if let Some(h) = &stmt.having {
+            scan(h);
+        }
+        for o in &stmt.order_by {
+            scan(&o.expr);
+        }
+        if ordered_agg {
+            return Err(err());
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn exec_agg(
     q: &mut Q,
     outer: &[Scope],
@@ -465,6 +555,9 @@ pub(crate) fn exec_agg(
     // parse_agg.c). Validated once per statement, before any per-set
     // aggregation.
     validate_grouping_calls(stmt, schema, &sets)?;
+    // v1.93: PG19 planner GROUP BY capability mix (bit sort-only vs
+    // xid hash-only) — 0A000 before any per-set aggregation.
+    check_groupby_capability_mix(q, outer, stmt, &sets, schema)?;
     if !stmt.group_by_sets {
         debug_assert!(sets.len() <= 1);
         let set = sets.into_iter().next().unwrap_or_default();
@@ -2160,6 +2253,54 @@ pub(crate) fn variance_float_vals(
     Ok(Value::Float(if want_variance { var } else { var.sqrt() }))
 }
 
+/// v1.93: `bit_and` / `bit_or` / `bit_xor` aggregates — PG19's
+/// transition function is the scalar bitwise operator, so integer
+/// inputs fold through `eval_bitwise` (per-type semantics preserved)
+/// and bit inputs through the varbit.c ops (equal bit lengths
+/// required, 22026). NULL inputs were already skipped by the caller;
+/// zero inputs yield NULL.
+pub(crate) fn bit_agg_vals(func: AggFunc, vals: &[Value]) -> Result<Value, ExecError> {
+    let (aop, bop): (
+        ArithOp,
+        fn(&BitString, &BitString) -> Result<BitString, ExecError>,
+    ) = match func {
+        AggFunc::BitAnd => (ArithOp::BitAnd, bit_and),
+        AggFunc::BitOr => (ArithOp::BitOr, bit_or),
+        AggFunc::BitXor => (ArithOp::BitXor, bit_xor),
+        _ => unreachable!("bit_agg_vals called for a non-bit aggregate"),
+    };
+    let mut acc: Option<Value> = None;
+    for v in vals {
+        match (&acc, v) {
+            (None, _) => {
+                if !matches!(
+                    v,
+                    Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) | Value::BitString(_)
+                ) {
+                    return Err(exec_err(
+                        "42883",
+                        format!("function {}({}) does not exist", func.name(), v.type_name()),
+                    ));
+                }
+                acc = Some(v.clone());
+            }
+            (Some(Value::BitString(x)), Value::BitString(y)) => {
+                acc = Some(Value::BitString(bop(x, y)?));
+            }
+            (Some(_), Value::BitString(_)) | (Some(Value::BitString(_)), _) => {
+                return Err(exec_err(
+                    "42883",
+                    format!("function {}({}) does not exist", func.name(), v.type_name()),
+                ));
+            }
+            (Some(a), _) => {
+                acc = Some(eval_bitwise(aop, a, v)?);
+            }
+        }
+    }
+    Ok(acc.unwrap_or(Value::Null))
+}
+
 /// v0.64: `bool_and` — true iff every non-null input is true, NULL when
 /// there are no non-null inputs (Postgres semantics).
 pub(crate) fn bool_and_vals(vals: &[Value]) -> Result<Value, ExecError> {
@@ -2948,6 +3089,7 @@ pub(crate) fn eval_agg_func(
         AggFunc::Sum => sum_vals(&vals),
         AggFunc::Avg => avg_vals(&vals),
         AggFunc::BoolAnd => bool_and_vals(&vals),
+        AggFunc::BitAnd | AggFunc::BitOr | AggFunc::BitXor => bit_agg_vals(func, &vals),
         AggFunc::VarianceSamp => variance_vals(&vals, "variance", true, true),
         AggFunc::VariancePop => variance_vals(&vals, "var_pop", false, true),
         AggFunc::StddevSamp => variance_vals(&vals, "stddev", true, false),

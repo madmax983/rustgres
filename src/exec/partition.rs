@@ -1783,6 +1783,9 @@ pub(crate) fn expand_like_clauses(
                 .push(src.composite_types.get(i).cloned().unwrap_or(None));
             def.domain_types
                 .push(src.domain_types.get(i).cloned().unwrap_or(None));
+            // v1.93: the declared bit typmod rides along too.
+            def.bit_typmods
+                .push(src.bit_typmods.get(i).copied().unwrap_or(None));
             def.domain_elem
                 .push(src.domain_elem.get(i).copied().unwrap_or(false));
         }
@@ -2020,6 +2023,8 @@ pub(crate) fn create_table_from_def(
                             == parent.composite_types.get(i).cloned().unwrap_or(None)
                         && merged.domain_types[pos]
                             == parent.domain_types.get(i).cloned().unwrap_or(None)
+                        && merged.bit_typmods[pos]
+                            == parent.bit_typmods.get(i).copied().unwrap_or(None)
                         && merged.domain_elem[pos]
                             == parent.domain_elem.get(i).copied().unwrap_or(false);
                     if !same {
@@ -2057,6 +2062,10 @@ pub(crate) fn create_table_from_def(
                 merged
                     .domain_types
                     .push(parent.domain_types.get(i).cloned().unwrap_or(None));
+                // v1.93: inherit the declared bit typmod too.
+                merged
+                    .bit_typmods
+                    .push(parent.bit_typmods.get(i).copied().unwrap_or(None));
                 merged
                     .domain_elem
                     .push(parent.domain_elem.get(i).copied().unwrap_or(false));
@@ -2087,6 +2096,7 @@ pub(crate) fn create_table_from_def(
                     == like_def.composite_types.get(i).cloned().unwrap_or(None)
                 && merged.domain_types[pos]
                     == like_def.domain_types.get(i).cloned().unwrap_or(None)
+                && merged.bit_typmods[pos] == like_def.bit_typmods.get(i).copied().unwrap_or(None)
                 && merged.domain_elem[pos] == like_def.domain_elem.get(i).copied().unwrap_or(false);
             if !same {
                 return Err(exec_err(
@@ -2126,6 +2136,10 @@ pub(crate) fn create_table_from_def(
             merged
                 .domain_types
                 .push(like_def.domain_types.get(i).cloned().unwrap_or(None));
+            // v1.93: declared bit typmod for the new column.
+            merged
+                .bit_typmods
+                .push(like_def.bit_typmods.get(i).copied().unwrap_or(None));
             merged
                 .domain_elem
                 .push(like_def.domain_elem.get(i).copied().unwrap_or(false));
@@ -2240,6 +2254,7 @@ pub(crate) fn create_table_from_def(
                 def.columns = parent.columns.clone();
                 def.composite_types = parent.composite_types.clone();
                 def.domain_types = parent.domain_types.clone();
+                def.bit_typmods = parent.bit_typmods.clone();
                 def.domain_elem = parent.domain_elem.clone();
                 def.not_null = parent.not_null.clone();
                 def.defaults = parent.defaults.clone();
@@ -2375,6 +2390,7 @@ pub(crate) fn create_table_from_def(
             def.columns = parent.columns.clone();
             def.composite_types = parent.composite_types.clone();
             def.domain_types = parent.domain_types.clone();
+            def.bit_typmods = parent.bit_typmods.clone();
             def.domain_elem = parent.domain_elem.clone();
             def.not_null = parent.not_null.clone();
             def.defaults = parent.defaults.clone();

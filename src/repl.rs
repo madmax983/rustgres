@@ -1013,6 +1013,7 @@ mod tests {
                 next_attnum: 1,
                 fillfactor: 100,
                 partition: None,
+                bit_typmods: Vec::new(),
             },
             WalRecord::InsertRows {
                 table: "t".into(),

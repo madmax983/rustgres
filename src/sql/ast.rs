@@ -1111,6 +1111,12 @@ pub enum AggFunc {
     Max,
     StringAgg, // v0.7: string_agg(x, delim)
     BoolAnd,   // v0.64: bool_and(x)
+    // v1.93: bit_and/bit_or/bit_xor (PG19 pg_aggregate.dat: int2/int4/
+    // int8 and bit/varbit forms; the transition function is the scalar
+    // bitwise operator, the result type is the argument type).
+    BitAnd,
+    BitOr,
+    BitXor,
     // v0.64: variance/stddev. PG's `variance`/`stddev` are the sample
     // forms; `var_samp`/`stddev_samp` are coherent aliases and the
     // `_pop` forms are the population variants.
@@ -1151,6 +1157,9 @@ impl AggFunc {
             AggFunc::Max => "max",
             AggFunc::StringAgg => "string_agg",
             AggFunc::BoolAnd => "bool_and",
+            AggFunc::BitAnd => "bit_and",
+            AggFunc::BitOr => "bit_or",
+            AggFunc::BitXor => "bit_xor",
             AggFunc::VarianceSamp => "variance",
             AggFunc::VariancePop => "var_pop",
             AggFunc::StddevSamp => "stddev",
@@ -2276,6 +2285,12 @@ pub struct TableDef {
     /// possibly as `d[]`); resolved against the type catalog at
     /// execution time.
     pub domain_types: Vec<Option<String>>,
+    /// v1.93: bit typmod per column, parallel to `columns`
+    /// (`Some((n, varying))` for `bit(n)` / `bit varying(n)` columns;
+    /// bare `bit` records `(1, false)`, unbounded varying records
+    /// `None`). ColType::Bit is typmod-free, so the declared length
+    /// travels here for INSERT-time enforcement (varbit.c).
+    pub bit_typmods: Vec<Option<(i32, bool)>>,
     /// v0.85: iff `domain_types[i]` is `Some` and the column was
     /// declared as `d[]` (array of domain): the domain applies per
     /// array element, not to the whole column value.
@@ -2373,6 +2388,9 @@ pub enum AlterAction {
     AddColumn {
         name: String,
         col_type: ColType,
+        /// v1.93: declared bit typmod for a `bit(n)` / `bit varying(n)`
+        /// column (see TableDef::bit_typmods).
+        bit_typmod: Option<(i32, bool)>,
         not_null: bool,
         default: Option<DefaultExpr>,
         /// v0.65: serial pseudo-type marker; exec creates the backing
@@ -2583,6 +2601,11 @@ pub enum LikeKind {
 pub(crate) struct ParsedColDef {
     pub(crate) name: String,
     pub(crate) col_type: ColType,
+    /// v1.93: declared bit typmod when `col_type == ColType::Bit`
+    /// (`Some((n, varying))`; unbounded varying is `None`, bare `bit`
+    /// is `(1, false)`), captured from the parser's bit-typmod side
+    /// channel at column-parse time.
+    pub(crate) bit_typmod: Option<(i32, bool)>,
     /// v0.81: named composite type for `col_type == ColType::Composite`
     /// (`a t_rec`); resolved against the type catalog at execution time.
     pub(crate) composite_name: Option<String>,
@@ -2655,6 +2678,7 @@ impl TableDef {
             columns: Vec::new(),
             composite_types: Vec::new(),
             domain_types: Vec::new(),
+            bit_typmods: Vec::new(),
             domain_elem: Vec::new(),
             not_null: Vec::new(),
             defaults: Vec::new(),
@@ -2844,6 +2868,8 @@ pub(crate) fn build_table_def(
             // v0.81: named composite type travels to exec for catalog
             // resolution.
             def.composite_types.push(c.composite_name.clone());
+            // v1.93: the declared bit typmod travels alongside.
+            def.bit_typmods.push(c.bit_typmod);
             // v0.85: domain slots travel alongside; exec resolves the
             // named type to a domain (or not) and fills them in.
             def.domain_types.push(None);

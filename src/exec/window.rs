@@ -347,6 +347,9 @@ pub(crate) fn check_agg_window_arity(f: &AggFunc, n: usize) -> bool {
         | AggFunc::Min
         | AggFunc::Max
         | AggFunc::BoolAnd
+        | AggFunc::BitAnd
+        | AggFunc::BitOr
+        | AggFunc::BitXor
         | AggFunc::VarianceSamp
         | AggFunc::VariancePop
         | AggFunc::StddevSamp
@@ -1771,6 +1774,7 @@ pub(crate) fn eval_window_agg(
         AggFunc::Sum => sum_vals(vals),
         AggFunc::Avg => avg_vals(vals),
         AggFunc::BoolAnd => bool_and_vals(vals),
+        AggFunc::BitAnd | AggFunc::BitOr | AggFunc::BitXor => bit_agg_vals(f, vals),
         AggFunc::VarianceSamp => variance_vals(vals, "variance", true, true),
         AggFunc::VariancePop => variance_vals(vals, "var_pop", false, true),
         AggFunc::StddevSamp => variance_vals(vals, "stddev", true, false),

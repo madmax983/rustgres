@@ -1403,6 +1403,7 @@ pub(crate) fn exec_create_table_as(
         columns,
         composite_types: vec![None; ncols],
         domain_types: vec![None; ncols],
+        bit_typmods: vec![None; ncols],
         domain_elem: vec![false; ncols],
         not_null: vec![false; ncols],
         defaults: vec![None; ncols],

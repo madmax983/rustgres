@@ -17,6 +17,8 @@ pub(crate) struct TableMeta {
     /// v0.85: domain name per column, parallel to `columns`
     /// (`Some(d)` iff the column was declared with domain type `d`).
     pub(crate) domain_types: Vec<Option<String>>,
+    /// v1.93: declared bit typmod per column, parallel to `columns`.
+    pub(crate) bit_typmods: Vec<Option<(i32, bool)>>,
     /// v0.85: iff `domain_types[i]` is `Some` and the column was
     /// declared as `d[]`: the domain applies per array element.
     pub(crate) domain_elem: Vec<bool>,
@@ -33,6 +35,7 @@ impl TableMeta {
             columns: t.columns.clone(),
             composite_types: t.composite_types.clone(),
             domain_types: t.domain_types.clone(),
+            bit_typmods: t.bit_typmods.clone(),
             domain_elem: t.domain_elem.clone(),
             not_null: t.not_null.clone(),
             defaults: t.defaults.clone(),
@@ -307,6 +310,18 @@ pub(crate) fn check_row_constraints(
                     name, table
                 ),
             ));
+        }
+    }
+    // v1.93: declared bit typmods (PG19 varbit.c assignment rules):
+    // fixed bit requires the exact length, varying only bounds it
+    // (22026). This is the shared row-write choke point — INSERT
+    // VALUES / INSERT..SELECT / COPY (which reuses exec_insert) and
+    // UPDATE all materialize their final rows through here. The check
+    // runs on the finished BitString value, so text-literal input
+    // (COPY hex, casts) is judged post-coercion, like PG.
+    for (i, tm) in meta.bit_typmods.iter().enumerate() {
+        if let (Some((n, varying)), Some(Value::BitString(bs))) = (tm, values.get(i)) {
+            super::json::sj_check_bit_len(bs.bitlen, *n, *varying)?;
         }
     }
     // v0.85: domain CHECK constraints (PG19 coerce_to_domain) — on the

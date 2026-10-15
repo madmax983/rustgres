@@ -828,6 +828,7 @@ impl Enc {
                 next_attnum,
                 fillfactor,
                 partition,
+                bit_typmods,
                 xmin,
             } => {
                 self.u8(1);
@@ -861,6 +862,8 @@ impl Enc {
                 // v1.80 (RGSWAL21): partition metadata, last so an
                 // RGSWAL20 record is an exact prefix of this layout.
                 self.partition(partition);
+                // v1.93 (RGSWAL23): declared bit typmods, last.
+                self.bit_typmod_list(bit_typmods);
             }
             WalRecord::InsertRows { table, rows } => {
                 self.u8(2);
@@ -987,6 +990,7 @@ impl Enc {
                 next_value_id,
                 toast_info,
                 partition,
+                bit_typmods,
                 xmin,
             } => {
                 self.u8(7);
@@ -1032,6 +1036,8 @@ impl Enc {
                 self.u64(*xmin);
                 // v1.80 (RGSWAL21): partition metadata, last (see CreateTable).
                 self.partition(partition);
+                // v1.93 (RGSWAL23): declared bit typmods, last.
+                self.bit_typmod_list(bit_typmods);
             }
             WalRecord::CreateView {
                 name,
@@ -1337,6 +1343,22 @@ impl Enc {
                 Some(s) => {
                     self.u8(1);
                     self.str(s);
+                }
+                None => self.u8(0),
+            }
+        }
+    }
+
+    /// v1.93: encode a `Vec<Option<(i32, bool)>>` (per-column bit
+    /// typmods: length + varying flag).
+    pub(crate) fn bit_typmod_list(&mut self, v: &[Option<(i32, bool)>]) {
+        self.u32(v.len() as u32);
+        for o in v {
+            match o {
+                Some((n, varying)) => {
+                    self.u8(1);
+                    self.i32(*n);
+                    self.u8(if *varying { 1 } else { 0 });
                 }
                 None => self.u8(0),
             }
@@ -1971,6 +1993,12 @@ impl<'a> Dec<'a> {
                 } else {
                     None
                 };
+                // v1.93 (RGSWAL23): trailing bit typmods.
+                let bit_typmods = if self.wal_version >= 23 {
+                    self.bit_typmod_list_d()?
+                } else {
+                    Vec::new()
+                };
                 Ok(WalRecord::CreateTable {
                     name,
                     columns,
@@ -1989,6 +2017,7 @@ impl<'a> Dec<'a> {
                     next_attnum,
                     fillfactor,
                     partition,
+                    bit_typmods,
                     xmin,
                 })
             }
@@ -2137,6 +2166,12 @@ impl<'a> Dec<'a> {
                 } else {
                     None
                 };
+                // v1.93 (RGSWAL23): trailing bit typmods.
+                let bit_typmods = if self.wal_version >= 23 {
+                    self.bit_typmod_list_d()?
+                } else {
+                    Vec::new()
+                };
                 Ok(WalRecord::AlterTable {
                     name,
                     columns,
@@ -2160,6 +2195,7 @@ impl<'a> Dec<'a> {
                     next_value_id,
                     toast_info,
                     partition,
+                    bit_typmods,
                     xmin,
                 })
             }
@@ -2532,6 +2568,20 @@ impl<'a> Dec<'a> {
         for _ in 0..n {
             out.push(if self.u8()? != 0 {
                 Some(self.str()?)
+            } else {
+                None
+            });
+        }
+        Ok(out)
+    }
+
+    /// v1.93: decode a `Vec<Option<(i32, bool)>>` (bit typmods).
+    pub(crate) fn bit_typmod_list_d(&mut self) -> Result<Vec<Option<(i32, bool)>>, String> {
+        let n = self.u32()? as usize;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(if self.u8()? != 0 {
+                Some((self.i32()?, self.u8()? != 0))
             } else {
                 None
             });

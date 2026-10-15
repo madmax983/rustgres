@@ -628,6 +628,7 @@ pub(crate) fn exec_alter_one(
         AlterAction::AddColumn {
             name: col,
             col_type,
+            bit_typmod,
             not_null,
             default,
             serial,
@@ -643,6 +644,7 @@ pub(crate) fn exec_alter_one(
                 name,
                 col,
                 col_type,
+                *bit_typmod,
                 *not_null,
                 default,
                 *serial,
@@ -673,6 +675,7 @@ pub(crate) fn exec_alter_one(
                     let child_action = AlterAction::AddColumn {
                         name: col.clone(),
                         col_type: *col_type,
+                        bit_typmod: *bit_typmod,
                         not_null: *not_null,
                         default: default.clone(),
                         serial: *serial,
@@ -826,6 +829,8 @@ pub(crate) fn alter_add_column(
     name: &str,
     col: &str,
     col_type: &ColType,
+    // v1.93: declared bit typmod for the new column, if any.
+    bit_typmod: Option<(i32, bool)>,
     not_null: bool,
     default: &Option<DefaultExpr>,
     serial: Option<SerialKind>,
@@ -871,6 +876,12 @@ pub(crate) fn alter_add_column(
     }
     let mut next = t.clone();
     next.columns.push((col.to_string(), col_type.clone()));
+    // v1.93: keep the declared bit typmods parallel to `columns`
+    // (padding a short vec like col_compression below).
+    if next.bit_typmods.len() < next.columns.len() - 1 {
+        next.bit_typmods.resize(next.columns.len() - 1, None);
+    }
+    next.bit_typmods.push(bit_typmod);
     // v1.41: the new column gets the next never-reused attnum (PG19
     // ATExecAddColumn: max(all attnums, incl. dropped)+1).
     next.attnums.push(next.next_attnum);
@@ -1285,6 +1296,10 @@ pub(crate) fn alter_drop_column(
     next.attnums.remove(ci);
     next.not_null.remove(ci);
     next.defaults.remove(ci);
+    // v1.93: keep the declared bit typmods parallel too.
+    if next.bit_typmods.len() > ci {
+        next.bit_typmods.remove(ci);
+    }
     // v0.37: keep the per-column TOAST storage parallel to `columns`.
     next.col_storage.remove(ci);
     // v0.41: keep the per-column COMPRESSION metadata parallel too.

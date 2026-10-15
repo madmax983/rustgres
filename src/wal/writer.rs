@@ -27,7 +27,10 @@ pub(crate) const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK16";
 /// v0.98: version 17 adds the sequence CACHE size to sequence
 /// images. v16 checkpoints are refused; remove the data directory
 /// to start fresh.
-pub(crate) const CHKPT_VERSION: u32 = 18;
+/// v1.93: version 19 adds the per-column declared bit typmods
+/// (`bit_typmods`) to table images. v18 checkpoints are refused;
+/// remove the data directory to start fresh.
+pub(crate) const CHKPT_VERSION: u32 = 19;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -69,9 +72,13 @@ pub(crate) const CHKPT_VERSION: u32 = 18;
 /// lost partitioning). `RGSWAL20` logs are still READ (the field decodes
 /// as absent); opening one replays it and immediately checkpoints, so the
 /// live generation is always current-format before anything is appended.
-pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL22";
+/// v1.93: `RGSWAL23` — `CreateTable`/`AlterTable` carry the per-column
+/// declared bit typmods (`bit_typmods`), trailing like the partition
+/// metadata. Older logs (down to MIN_READABLE) still read, with the
+/// field decoded as empty.
+pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL23";
 /// v1.80: the format version number in [`WAL_MAGIC`].
-pub(crate) const WAL_VERSION: u32 = 22;
+pub(crate) const WAL_VERSION: u32 = 23;
 /// v1.80: oldest WAL format this build can replay.
 pub(crate) const MIN_READABLE_WAL_VERSION: u32 = 20;
 pub(crate) const WAL_HEADER_LEN: u64 = 16;
@@ -448,6 +455,8 @@ impl Wal {
                 body.opt_str_list(&t.composite_types);
                 body.opt_str_list(&t.domain_types);
                 body.bool_list(&t.domain_elem);
+                // v1.93: declared bit typmods per column.
+                body.bit_typmod_list(&t.bit_typmods);
                 let mut toast_keys: Vec<u32> = t.toast_info.keys().copied().collect();
                 toast_keys.sort_unstable();
                 body.u32(toast_keys.len() as u32);
@@ -999,6 +1008,8 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         for _ in 0..n_de {
             domain_elem.push(d.u8().map_err(|e| bad(&e))? != 0);
         }
+        // v1.93: declared bit typmods per column.
+        let bit_typmods = d.bit_typmod_list_d().map_err(|e| bad(&e))?;
         let n_toast_info = d.u32().map_err(|e| bad(&e))? as usize;
         let mut toast_info = std::collections::HashMap::new();
         for _ in 0..n_toast_info {
@@ -1073,6 +1084,8 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         __t.composite_types = composite_types;
         __t.domain_types = domain_types;
         __t.domain_elem = domain_elem;
+        // v1.93: declared bit typmods.
+        __t.bit_typmods = bit_typmods;
         match crate::sql::decode_constraints(&constraints) {
             Ok(dc) => {
                 __t.not_null = dc.not_null;

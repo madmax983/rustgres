@@ -124,6 +124,7 @@ fn record_roundtrip_all_kinds() {
             next_attnum: 2,
             fillfactor: 100,
             partition: Some(v180_sample_partition()),
+            bit_typmods: Vec::new(),
             xmin: 3,
         },
         WalRecord::InsertRows {
@@ -246,6 +247,7 @@ fn v96_create_table_inherits_roundtrip() {
         next_attnum: 2,
         fillfactor: 100,
         partition: None,
+        bit_typmods: Vec::new(),
         xmin: 3,
     };
     assert_eq!(&roundtrip(&create), &create);
@@ -271,6 +273,7 @@ fn v96_create_table_inherits_roundtrip() {
         next_attnum: 2,
         fillfactor: 100,
         partition: None,
+        bit_typmods: Vec::new(),
         next_value_id: 1,
         toast_info: vec![],
         xmin: 4,
@@ -408,6 +411,7 @@ fn apply_record_rebuilds_versions_and_counters() {
             next_attnum: 2,
             fillfactor: 100,
             partition: None,
+            bit_typmods: Vec::new(),
             xmin: 4,
         },
     )
@@ -819,13 +823,16 @@ fn v180_rgswal20_records_decode_without_partition() {
         next_attnum: 2,
         fillfactor: 100,
         partition: Some(v180_sample_partition()),
+        bit_typmods: Vec::new(),
         xmin: 3,
     };
     let mut e = Enc::new();
     e.record(&rec);
-    // Strip the trailing v21 partition bytes to get the v20 layout.
+    // Strip the trailing v21 partition bytes (and the v1.93 v23
+    // bit-typmod bytes after them) to get the v20 layout.
     let mut tail = Enc::new();
     tail.partition(&Some(v180_sample_partition()));
+    tail.bit_typmod_list(&[]);
     let v20 = &e.buf[..e.buf.len() - tail.buf.len()];
     let mut d = Dec::with_wal_version(v20, 20);
     match d.record().unwrap() {
@@ -872,6 +879,7 @@ fn v180_legacy_fill_partition_keeps_live_metadata() {
             next_attnum: 2,
             fillfactor: 100,
             partition: Some(v180_sample_partition()),
+            bit_typmods: Vec::new(),
             xmin: 3,
         },
     )
@@ -897,6 +905,7 @@ fn v180_legacy_fill_partition_keeps_live_metadata() {
         next_attnum: 2,
         fillfactor: 100,
         partition: None,
+        bit_typmods: Vec::new(),
         next_value_id: 1,
         toast_info: vec![],
         xmin: 4,
@@ -942,6 +951,7 @@ fn v180_alter(cols: &[&str], xmin: u64) -> WalRecord {
         next_attnum: n as i16 + 1,
         fillfactor: 100,
         partition: None,
+        bit_typmods: Vec::new(),
         next_value_id: 1,
         toast_info: vec![],
         xmin,
