@@ -295,6 +295,7 @@ pub(crate) fn expr_is_volatile(db: &Database, e: &Expr) -> bool {
         // (Subquery conjuncts were never pushable: `pushable_columns`
         // returns false for them, so this changes nothing there.)
         Expr::ScalarSub(_)
+        | Expr::JsonArraySubq { .. }
         | Expr::ArraySubquery(_)
         | Expr::InSub { .. }
         | Expr::Quantified { .. }
@@ -546,6 +547,7 @@ pub(crate) fn collect_column_refs(e: &Expr, out: &mut Vec<(Option<String>, Strin
             }
         }
         Expr::ScalarSub(s) => collect_stmt_refs(s, out),
+        Expr::JsonArraySubq { query, .. } => collect_stmt_refs(query, out),
         Expr::ArraySubquery(s) => collect_stmt_refs(s, out),
         Expr::InSub { expr, sub, .. } => {
             collect_column_refs(expr, out);

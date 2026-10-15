@@ -1913,6 +1913,14 @@ pub(crate) fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, 
                 .map(|r| r[0].clone())
                 .unwrap_or(Value::Null))
         }
+        // v1.90: JSON_ARRAY(subquery) — JSON_ARRAYAGG over the
+        // subquery with a '[]' coalesce (see json.rs).
+        Expr::JsonArraySubq {
+            query,
+            format_json,
+            ret,
+            ..
+        } => super::json::eval_json_array_subq_ctor(q, scopes, query, *format_json, ret),
         // v0.77: `array(SELECT ...)` — evaluate the subquery and format
         // the first column of each row as a PG array literal.
         Expr::ArraySubquery(sub) => {
@@ -2330,6 +2338,9 @@ pub(crate) fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
         }
         Expr::ScalarSub(sub) | Expr::ArraySubquery(sub) => {
             walk_select(sub, f);
+        }
+        Expr::JsonArraySubq { query, .. } => {
+            walk_select(query, f);
         }
         Expr::InSub { expr, sub, .. } => {
             walk_expr(expr, f);

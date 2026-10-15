@@ -906,6 +906,24 @@ pub(crate) fn expr_col_name_strength(e: &Expr) -> (String, u8) {
             .to_string(),
             2,
         ),
+        // v1.90: SQL/JSON constructor desugars present under their
+        // public names (IS JSON is a predicate: PG names it ?column?,
+        // which the generic fallback below already yields for
+        // non-Func nodes; __is_json keeps strength 0 here so a
+        // surrounding cast does not inherit a bogus name).
+        Expr::Func { name, .. } if name.starts_with("__json_") => (
+            match name.as_str() {
+                "__json_parse" => "json",
+                "__json_scalar" => "json_scalar",
+                "__json_serialize" => "json_serialize",
+                "__json_object" => "json_object",
+                "__json_array" => "json_array",
+                _ => "?column?",
+            }
+            .to_string(),
+            2,
+        ),
+        Expr::Func { name, .. } if name == "__is_json" => ("?column?".to_string(), 0),
         Expr::Func { name, .. } => (name.clone(), 2),
         // v0.55: PG names an unaliased CASE output column "case".
         Expr::Case { .. } => ("case".to_string(), 2),
@@ -927,6 +945,25 @@ pub(crate) fn expr_col_name_strength(e: &Expr) -> (String, u8) {
         // v1.23: PG19 names `ARRAY(subselect)` `array`
         // (`FigureColnameInternal`, `T_SubLink`/`ARRAY_SUBLINK` case).
         Expr::ArraySubquery(_) => ("array".to_string(), 2),
+        // v1.90: PG names a JSON_ARRAY(subquery) column `json_array`.
+        Expr::JsonArraySubq { .. } => ("json_array".to_string(), 2),
+        // PG names an unaliased window-function column after the
+        // function (FigureColnameInternal T_WindowFunc / T_Aggref).
+        Expr::Window { func, .. } => (
+            match func {
+                crate::sql::WindowFunc::Agg(f) => f.name().to_string(),
+                crate::sql::WindowFunc::RowNumber => "row_number".to_string(),
+                crate::sql::WindowFunc::Rank => "rank".to_string(),
+                crate::sql::WindowFunc::DenseRank => "dense_rank".to_string(),
+                crate::sql::WindowFunc::Ntile => "ntile".to_string(),
+                crate::sql::WindowFunc::Lag => "lag".to_string(),
+                crate::sql::WindowFunc::Lead => "lead".to_string(),
+                crate::sql::WindowFunc::FirstValue => "first_value".to_string(),
+                crate::sql::WindowFunc::LastValue => "last_value".to_string(),
+                crate::sql::WindowFunc::NthValue => "nth_value".to_string(),
+            },
+            2,
+        ),
         // v0.75: PG names an unaliased EXISTS output column "exists".
         Expr::Exists { .. } => ("exists".to_string(), 2),
         // v1.86: PG names an EXTRACT output column "extract"
@@ -1318,6 +1355,22 @@ pub(crate) fn expr_type(
             }
             Ok(cols[0].clone().1)
         }
+        // v1.90: JSON_ARRAY(subquery) — its RETURNING type (default
+        // json), independent of the subquery's column type.
+        Expr::JsonArraySubq { ret_ty, ret, .. } => Ok(match ret_ty {
+            Some(t) => *t,
+            None => match ret.as_deref() {
+                Some(name) => super::jsontable::jt_static_leaf_type(
+                    eng,
+                    snap,
+                    own,
+                    session,
+                    ColType::Composite,
+                    &Some(name.to_string()),
+                )?,
+                None => ColType::Json,
+            },
+        }),
         // v0.78: `array(SELECT ...)` — a proper array type over the
         // subquery's (single) column type, with PG's array OID. Values
         // are still carried as the `{...}` literal text (exactly what
@@ -1926,6 +1979,39 @@ pub(crate) fn agg_result_type(
         // v1.84: JSON aggregates return json/jsonb (pg_proc).
         AggFunc::JsonAgg | AggFunc::JsonObjectAgg => Ok(ColType::Json),
         AggFunc::JsonbAgg | AggFunc::JsonbObjectAgg => Ok(ColType::Jsonb),
+        // v1.90: SQL/JSON constructor aggregates — the RETURNING spec
+        // rides on the value argument's __jsonagg_opt marker.
+        AggFunc::JsonArrayAgg | AggFunc::JsonObjectAggSql => {
+            let val_expr = if matches!(func, AggFunc::JsonObjectAggSql) {
+                arg2
+            } else {
+                arg
+            };
+            match super::json::jsonagg_opt_spec(val_expr) {
+                Some(spec) if !spec.is_empty() => {
+                    if let Some(t) = super::json::ctor_spec_coltype(&spec) {
+                        Ok(t)
+                    } else if spec == "bytea" {
+                        Ok(ColType::Bytea)
+                    } else if spec == "jsonb" {
+                        Ok(ColType::Jsonb)
+                    } else if spec == "json" {
+                        Ok(ColType::Json)
+                    } else {
+                        // Domain RETURNING type: resolve to its base.
+                        super::jsontable::jt_static_leaf_type(
+                            eng,
+                            snap,
+                            own,
+                            session,
+                            ColType::Composite,
+                            &Some(spec),
+                        )
+                    }
+                }
+                _ => Ok(ColType::Json),
+            }
+        }
         // v1.88: range aggregates — range_agg(anyrange) -> the
         // multirange; range_intersect_agg mirrors its input kind.
         AggFunc::RangeAgg => {

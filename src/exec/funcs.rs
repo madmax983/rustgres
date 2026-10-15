@@ -1650,6 +1650,211 @@ pub(crate) fn analyze_sqljson_defaults(eng: &Engine, e: &Expr) -> Result<(), Exe
     }
 }
 
+/// v1.90: static category of a SQL/JSON constructor argument,
+/// resolved from its expression (json values ride as Value::Text, so
+/// the category cannot come from the evaluated value). Returns the
+/// category plus the display type name for error messages when the
+/// expression is a cast to a named (domain/composite) type.
+pub(crate) fn ctor_cat_of_expr(
+    q: &Q,
+    scopes: &[Scope],
+    e: &Expr,
+) -> (super::json::CtorCat, Option<String>) {
+    use super::json::CtorCat;
+    let mut e = e;
+    while let Expr::NamedArg { expr, .. } = e {
+        e = expr;
+    }
+    match e {
+        Expr::CastNamed { name, .. } => {
+            if let Some(st) = q.eng.db.types.get(name) {
+                if let Some(d) = &st.domain {
+                    return (super::json::ctor_cat_of_coltype(d.base), Some(name.clone()));
+                }
+                return (CtorCat::Other, Some(name.clone()));
+            }
+            (CtorCat::Other, Some(name.clone()))
+        }
+        Expr::Cast { to, .. } => (super::json::ctor_cat_of_coltype(*to), None),
+        Expr::Func { .. }
+        | Expr::Agg { .. }
+        | Expr::Window { .. }
+        | Expr::JsonArraySubq { .. }
+        | Expr::Literal(_) => (super::json::ctor_cat_shallow(&q.eng.db, e), None),
+        _ => {
+            let schemas: Vec<&[QCol]> = scopes.iter().map(|s| s.schema).collect();
+            match super::describe::expr_type(q.eng, q.snap, q.own, q.session, &schemas, &[], &[], e)
+            {
+                Ok(t) => (super::json::ctor_cat_of_coltype(t), None),
+                Err(_) => (super::json::ctor_cat_shallow(&q.eng.db, e), None),
+            }
+        }
+    }
+}
+
+/// v1.90: display name of an expression's static type for the
+/// constructor family's "cannot use/cast type %s" errors.
+fn ctor_type_display(q: &Q, scopes: &[Scope], e: &Expr, named: &Option<String>) -> String {
+    if let Some(n) = named {
+        return n.clone();
+    }
+    let schemas: Vec<&[QCol]> = scopes.iter().map(|s| s.schema).collect();
+    if let Ok(t) =
+        super::describe::expr_type(q.eng, q.snap, q.own, q.session, &schemas, &[], &[], e)
+    {
+        return t.sql_name().to_string();
+    }
+    "unknown".to_string()
+}
+
+/// v1.90: evaluate one constructor argument into a CtorArg (value +
+/// static category). `fmt`/`enc` come from the parser's FORMAT JSON
+/// clause encoding.
+/// The argument evaluator for try_eval_ctor_func: row contexts use
+/// eval_expr; grouped contexts use eval_grouped (whose arguments may
+/// contain aggregates, e.g. JSON_OBJECT over JSON_OBJECTAGG).
+pub(crate) type CtorEval<'a> = dyn FnMut(&mut Q, &Expr) -> Result<Value, ExecError> + 'a;
+
+fn ctor_eval_arg(
+    q: &mut Q,
+    scopes: &[Scope],
+    eval: &mut CtorEval<'_>,
+    e: &Expr,
+    fmt: bool,
+    enc: i64,
+) -> Result<super::json::CtorArg, ExecError> {
+    let (cat, _) = ctor_cat_of_expr(q, scopes, e);
+    let v = eval(q, e)?;
+    Ok(super::json::CtorArg { v, cat, fmt, enc })
+}
+
+fn ctor_lit_int(e: &Expr) -> i64 {
+    match e {
+        Expr::Literal(Literal::Int(i)) => *i,
+        Expr::Literal(Literal::Bool(b)) => *b as i64,
+        _ => 0,
+    }
+}
+
+fn ctor_lit_text(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Literal(Literal::Text(s)) => Some(s.to_string()),
+        _ => None,
+    }
+}
+
+/// v1.90: the SQL/JSON constructor desugars. Returns Some(result)
+/// when `name` is one of the internal constructor builtins, None to
+/// fall through to the generic function path. Argument layouts are
+/// defined by the parser productions (parse_json_parse_ctor &c):
+///   __json_parse(doc, fmt, enc, unique)
+///   __json_scalar(v)
+///   __json_serialize(doc, fmt, enc, spec)
+///   __json_object(k, v, vfmt, venc, ..., absent, unique, spec)
+///   __json_array(v, vfmt, venc, ..., absent, spec)
+///   __is_json(expr, kind, unique)
+///   __jsonagg_opt(inner, fmt, null_on_null, unique, enc, spec)
+pub(crate) fn try_eval_ctor_func(
+    q: &mut Q,
+    scopes: &[Scope],
+    name: &str,
+    args: &[Expr],
+    eval: &mut CtorEval<'_>,
+) -> Option<Result<Value, ExecError>> {
+    use super::json::CtorCat;
+    Some(match name {
+        "__jsonagg_opt" => eval(q, &args[0]),
+        "__json_parse" => (|| {
+            let a = ctor_eval_arg(q, scopes, eval, &args[0], ctor_lit_int(&args[1]) != 0, 0)?;
+            let enc = ctor_lit_text(&args[2]);
+            if a.cat == CtorCat::Other {
+                let (_, named) = ctor_cat_of_expr(q, scopes, &args[0]);
+                let disp = ctor_type_display(q, scopes, &args[0], &named);
+                return Err(exec_err(
+                    "42846",
+                    format!("cannot cast type {} to json", disp),
+                ));
+            }
+            let enc_ref = if ctor_lit_int(&args[1]) != 0 && enc.is_some() {
+                enc.as_deref()
+            } else {
+                enc.as_deref()
+            };
+            super::json::eval_json_parse_ctor(q, &a, enc_ref, ctor_lit_int(&args[3]) != 0)
+        })(),
+        "__json_scalar" => (|| {
+            let a = ctor_eval_arg(q, scopes, eval, &args[0], false, 0)?;
+            super::json::eval_json_scalar_ctor(&a)
+        })(),
+        "__json_serialize" => (|| {
+            let a = ctor_eval_arg(
+                q,
+                scopes,
+                eval,
+                &args[0],
+                ctor_lit_int(&args[1]) != 0,
+                ctor_lit_int(&args[2]),
+            )?;
+            let spec = ctor_lit_text(&args[3]).unwrap_or_default();
+            super::json::eval_json_serialize_ctor(q, &a, &spec)
+        })(),
+        "__json_object" => (|| {
+            let n = args.len();
+            let absent = ctor_lit_int(&args[n - 3]) != 0;
+            let unique = ctor_lit_int(&args[n - 2]) != 0;
+            let spec = ctor_lit_text(&args[n - 1]).unwrap_or_default();
+            let mut pairs = Vec::with_capacity(n / 4);
+            let mut i = 0;
+            while i + 4 <= n - 3 {
+                let k = ctor_eval_arg(q, scopes, eval, &args[i], false, 0)?;
+                let v = ctor_eval_arg(
+                    q,
+                    scopes,
+                    eval,
+                    &args[i + 1],
+                    ctor_lit_int(&args[i + 2]) != 0,
+                    ctor_lit_int(&args[i + 3]),
+                )?;
+                pairs.push((k, v));
+                i += 4;
+            }
+            super::json::ctor_build_object(q, pairs, absent, unique, &spec, false)
+        })(),
+        "__json_array" => (|| {
+            let n = args.len();
+            let absent = ctor_lit_int(&args[n - 2]) != 0;
+            let spec = ctor_lit_text(&args[n - 1]).unwrap_or_default();
+            let mut rows = Vec::with_capacity(n / 3);
+            let mut i = 0;
+            while i + 3 <= n - 2 {
+                rows.push(ctor_eval_arg(
+                    q,
+                    scopes,
+                    eval,
+                    &args[i],
+                    ctor_lit_int(&args[i + 1]) != 0,
+                    ctor_lit_int(&args[i + 2]),
+                )?);
+                i += 3;
+            }
+            super::json::ctor_build_array(q, rows, absent, &spec, false)
+        })(),
+        "__is_json" => (|| {
+            let (cat, named) = ctor_cat_of_expr(q, scopes, &args[0]);
+            if cat == CtorCat::Other {
+                let disp = ctor_type_display(q, scopes, &args[0], &named);
+                return Err(exec_err(
+                    "42804",
+                    format!("cannot use type {} in IS JSON predicate", disp),
+                ));
+            }
+            let a = ctor_eval_arg(q, scopes, eval, &args[0], false, 0)?;
+            super::json::eval_is_json_ctor(&a, ctor_lit_int(&args[1]), ctor_lit_int(&args[2]) != 0)
+        })(),
+        _ => return None,
+    })
+}
+
 /// v1.37: `node` is the call-site `Expr::Func` node's address, keying
 /// the plan-fold memo (`Q::plan_fold_memo`). It always identifies the
 /// original call site, even when named-argument reordering below
@@ -1682,6 +1887,31 @@ pub(crate) fn eval_func(
             eval_expr(q, scopes, &args[0])?;
             return Ok(Value::text(dname));
         }
+        // v1.90: json rides as Value::Text at runtime, so pg_typeof
+        // of a constructor desugar must come from the static type.
+        if let Expr::Func {
+            name: inner,
+            args: iargs,
+        } = &args[0]
+        {
+            if inner.starts_with("__json") || inner == "__is_json" {
+                let schemas: Vec<&[QCol]> = scopes.iter().map(|s| s.schema).collect();
+                if let Ok(t) = func_result_type(
+                    inner,
+                    iargs,
+                    q.eng,
+                    q.snap,
+                    q.own,
+                    q.session,
+                    &schemas,
+                    &[],
+                    &[],
+                ) {
+                    eval_expr(q, scopes, &args[0])?;
+                    return Ok(Value::text(t.sql_name().to_string()));
+                }
+            }
+        }
         let v = eval_expr(q, scopes, &args[0])?;
         return Ok(Value::text(v.type_name()));
     }
@@ -1705,6 +1935,14 @@ pub(crate) fn eval_func(
             Err(PgInputFailure::Soft(_)) => Ok(Value::Bool(false)),
             Err(PgInputFailure::Hard(e)) => Err(e),
         };
+    }
+    // v1.90: SQL/JSON constructors (parser desugars) need the
+    // catalog + argument expressions (static categories), like
+    // pg_input_is_valid above.
+    if let Some(r) = try_eval_ctor_func(q, scopes, name, args, &mut |qq: &mut Q, e: &Expr| {
+        eval_expr(qq, scopes, e)
+    }) {
+        return r;
     }
     // v1.88: constructors of user-defined range types
     // (CREATE TYPE ... AS RANGE) resolve through the type catalog.
@@ -2910,6 +3148,9 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         "__sqljson_value" | "__sqljson_query" | "__sqljson_exists" => {
             eval_sqljson_func(name, vals)
         }
+        // v1.90: the aggregate-option marker is the identity on its
+        // value in pure contexts (grouped paths intercept earlier).
+        "__jsonagg_opt" => Ok(vals[0].clone()),
         _ => Err(exec_err(
             "42883",
             format!("function {}() does not exist", name),
@@ -10072,6 +10313,38 @@ pub(crate) fn eval_cond_func(name: &str, vals: &[Value]) -> Result<Value, ExecEr
 }
 
 /// Result-column type of a built-in function call (Describe path).
+/// v1.90: the result ColType of a constructor RETURNING spec
+/// literal ("" / "json" -> json, "jsonb" -> jsonb, "bytea" ->
+/// bytea, a builtin string type, or a domain name resolved to its
+/// base). `default_text` distinguishes JSON_SERIALIZE (default
+/// text) — handled by the caller passing its own default.
+pub(crate) fn ctor_spec_result_type(eng: &Engine, spec_arg: Option<&Expr>) -> ColType {
+    let spec = match spec_arg {
+        Some(Expr::Literal(Literal::Text(s))) => s.to_string(),
+        _ => return ColType::Json,
+    };
+    ctor_spec_result_type_named(eng, &spec)
+}
+
+pub(crate) fn ctor_spec_result_type_named(eng: &Engine, spec: &str) -> ColType {
+    match spec {
+        "" | "json" => ColType::Json,
+        "jsonb" => ColType::Jsonb,
+        "bytea" => ColType::Bytea,
+        _ => {
+            if let Some(t) = super::json::ctor_spec_coltype(spec) {
+                return t;
+            }
+            if let Some(st) = eng.db.types.get(spec) {
+                if let Some(d) = &st.domain {
+                    return d.base;
+                }
+            }
+            ColType::Text
+        }
+    }
+}
+
 pub(crate) fn func_result_type(
     name: &str,
     args: &[Expr],
@@ -10293,6 +10566,21 @@ pub(crate) fn func_result_type(
         | "jsonb_path_query_first_tz" | "__sqljson_query" => Ok(ColType::Jsonb),
         "jsonb_path_query" | "jsonb_path_query_tz" => Ok(ColType::Jsonb),
         "__sqljson_value" => Ok(ColType::Text),
+        // v1.90: SQL/JSON constructor desugars — the RETURNING spec
+        // rides as a literal argument (last for object/array, index
+        // 3 for serialize); defaults are json (text for serialize).
+        "__json_parse" | "__json_scalar" => Ok(ColType::Json),
+        "__is_json" => Ok(ColType::Bool),
+        "__json_serialize" => Ok(match args.get(3) {
+            Some(Expr::Literal(Literal::Text(s))) if s.is_empty() => ColType::Text,
+            other => ctor_spec_result_type(eng, other),
+        }),
+        "__json_object" | "__json_array" => {
+            Ok(ctor_spec_result_type(eng, args.last()))
+        }
+        "__jsonagg_opt" => {
+            expr_type(eng, snap, own, session, schemas, outer, ctes, &args[0])
+        }
         // v0.91: hidden quantified-array-comparison desugar; boolean.
         "__any_all_array" => Ok(ColType::Bool),
         "random" => Ok(ColType::Float),

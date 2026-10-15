@@ -4665,11 +4665,34 @@ impl Parser {
         // `IS [NOT] DISTINCT FROM`.
         if self.eat_keyword("is") {
             let neg = self.eat_keyword("not");
-            // v0.48: `IS [NOT] DISTINCT FROM` (PG19 gram.y) — the
-            // NULL-safe comparison. Same precedence level as the other
-            // IS forms; the right operand parses at the next-tighter
-            // level, like `=` does.
-            if self.eat_keyword("distinct") {
+            // v1.90: `IS [NOT] JSON [VALUE|OBJECT|ARRAY|SCALAR]
+            // [{WITH|WITHOUT} UNIQUE [KEYS]]` (PG19 gram.y
+            // JsonIsPredicate) -> __is_json(expr, kind, unique),
+            // wrapped in Not for the NOT form (PG: NOT (x IS JSON)).
+            if matches!(self.peek(), Token::Ident(s) if s == "json") {
+                self.next();
+                let kind: i64 = if self.eat_keyword("value") {
+                    0
+                } else if self.eat_keyword("object") {
+                    1
+                } else if self.eat_keyword("array") {
+                    2
+                } else if self.eat_keyword("scalar") {
+                    3
+                } else {
+                    0
+                };
+                let unique = self.parse_opt_unique_keys()?.unwrap_or(false);
+                let pred = Expr::Func {
+                    name: "__is_json".to_string(),
+                    args: vec![
+                        expr,
+                        Expr::Literal(Literal::Int(kind)),
+                        Expr::Literal(Literal::Int(unique as i64)),
+                    ],
+                };
+                expr = if neg { Expr::Not(Box::new(pred)) } else { pred };
+            } else if self.eat_keyword("distinct") {
                 self.expect_keyword("from")?;
                 let right = self.parse_bitor()?;
                 expr = Expr::IsDistinctFrom {
@@ -5776,6 +5799,29 @@ impl Parser {
     }
 
     pub(crate) fn parse_call(&mut self, name: String) -> Result<Expr, SqlError> {
+        // v1.90: SQL/JSON constructors are grammar productions, not
+        // regular function calls (PG19 gram.y): they intercept before
+        // the func-style cast attempt (`json` is a type name, so the
+        // cast path would otherwise swallow JSON(...)).
+        if *self.peek() == Token::LParen {
+            match name.as_str() {
+                "json" => return self.parse_json_parse_ctor(),
+                "json_scalar" => return self.parse_json_scalar_ctor(),
+                "json_serialize" => return self.parse_json_serialize_ctor(),
+                "json_object" => {
+                    if self.json_object_is_ctor() {
+                        return self.parse_json_object_ctor();
+                    }
+                    // Otherwise the legacy json_object(text[, ...])
+                    // builtin (PG's grammar falls back to a plain
+                    // function call when no pair syntax follows).
+                }
+                "json_array" => return self.parse_json_array_ctor(),
+                "json_arrayagg" => return self.parse_json_arrayagg_ctor(),
+                "json_objectagg" => return self.parse_json_objectagg_ctor(),
+                _ => {}
+            }
+        }
         // v0.77: `array(SELECT ...)` — ARRAY constructor with a subquery.
         // This is valid PG syntax; without it the 42601 would (correctly)
         // abort an explicit transaction in the conformance suite.
@@ -6811,6 +6857,551 @@ impl Parser {
                 t
             ))),
         }
+    }
+
+    // =============================================================
+    // v1.90: SQL/JSON constructor productions (PG19 gram.y:
+    // JsonParseExpr / JsonScalarExpr / JsonSerializeExpr /
+    // JsonObjectConstructor / JsonArrayConstructor /
+    // JsonArrayQueryConstructor / JsonObjectAgg / JsonArrayAgg).
+    // Desugared onto internal builtins evaluated in exec/funcs.rs +
+    // exec/json.rs. FORMAT JSON ENCODING is encoded as an integer:
+    // 0 = no clause, 1 = UTF8, 2 = UTF16/UTF32 (recognized names,
+    // unsupported at runtime like PG).
+    // =============================================================
+
+    /// `[FORMAT JSON [ENCODING name]]` — returns (present, encoding
+    /// code). An unrecognized encoding name is a 0A000 here (PG
+    /// raises it from transformJsonReturning / the encoding lookup).
+    fn parse_opt_format_json(&mut self) -> Result<(bool, i64), SqlError> {
+        if !self.eat_keyword("format") {
+            return Ok((false, 0));
+        }
+        self.expect_keyword("json")?;
+        if !self.eat_keyword("encoding") {
+            return Ok((true, 0));
+        }
+        let name = match self.next() {
+            Token::Ident(s) => s,
+            t => {
+                return Err(err(&format!(
+                    "syntax error: expected encoding name, found {:?}",
+                    t
+                )));
+            }
+        };
+        match name.as_str() {
+            "utf8" => Ok((true, 1)),
+            "utf16" | "utf32" => Ok((true, 2)),
+            _ => Err(SqlError {
+                message: format!("unrecognized JSON encoding: {}", name),
+                code: "0A000",
+            }),
+        }
+    }
+
+    /// `[{WITH|WITHOUT} UNIQUE [KEYS]]` — returns Some(true/false)
+    /// when a clause was present.
+    fn parse_opt_unique_keys(&mut self) -> Result<Option<bool>, SqlError> {
+        if self.eat_keyword("with") {
+            self.expect_keyword("unique")?;
+            let _ = self.eat_keyword("keys");
+            return Ok(Some(true));
+        }
+        if self.eat_keyword("without") {
+            self.expect_keyword("unique")?;
+            let _ = self.eat_keyword("keys");
+            return Ok(Some(false));
+        }
+        Ok(None)
+    }
+
+    /// `[NULL|ABSENT ON NULL]` — returns Some(true) for NULL ON NULL,
+    /// Some(false) for ABSENT ON NULL.
+    fn parse_opt_null_on_null(&mut self) -> Option<bool> {
+        let save = self.pos;
+        if self.eat_keyword("null") {
+            if self.eat_keyword("on") && self.eat_keyword("null") {
+                return Some(true);
+            }
+            self.pos = save;
+            return None;
+        }
+        if self.eat_keyword("absent") {
+            if self.eat_keyword("on") && self.eat_keyword("null") {
+                return Some(false);
+            }
+            self.pos = save;
+            return None;
+        }
+        None
+    }
+
+    /// The RETURNING spec string for a parsed (type, named) pair —
+    /// the same encoding __sqljson_value uses (domains keep their
+    /// name; builtin string typmods are spelled out).
+    fn json_ret_spec(ty: ColType, named: &Option<String>) -> String {
+        if let Some(n) = named {
+            return n.clone();
+        }
+        match ty {
+            ColType::Char(n) => match n {
+                Some(n) => format!("character({})", n),
+                None => "character".to_string(),
+            },
+            ColType::Varchar(n) => match n {
+                Some(n) => format!("character varying({})", n),
+                None => "character varying".to_string(),
+            },
+            ColType::Numeric(Some((p, s))) => format!("numeric({},{})", p, s),
+            t => t.sql_name().to_string(),
+        }
+    }
+
+    /// `[RETURNING type [FORMAT JSON [ENCODING name]]]` — returns
+    /// (spec, type, named) or None when absent. The FORMAT/ENCODING
+    /// checks PG performs in transformJsonReturning live here: an
+    /// encoding is only allowed for bytea output (0A000), and only
+    /// UTF8 is supported (0A000).
+    fn parse_opt_json_returning(
+        &mut self,
+    ) -> Result<Option<(String, ColType, Option<String>)>, SqlError> {
+        if !self.eat_keyword("returning") {
+            return Ok(None);
+        }
+        let tname = match self.next() {
+            Token::Ident(s) => s,
+            t => {
+                return Err(err(&format!(
+                    "syntax error: expected type name, found {:?}",
+                    t
+                )));
+            }
+        };
+        let (ty, named) = self.parse_type_name_rest(tname)?;
+        let spec = Self::json_ret_spec(ty, &named);
+        // Optional FORMAT JSON [ENCODING x] on the RETURNING type.
+        if matches!(self.peek(), Token::Ident(s) if s == "format") {
+            let (_, enc) = self.parse_opt_format_json()?;
+            if enc != 0 {
+                if ty != ColType::Bytea {
+                    return Err(SqlError {
+                        message: "cannot set JSON encoding for non-bytea output types".to_string(),
+                        code: "0A000",
+                    });
+                }
+                if enc == 2 {
+                    return Err(SqlError {
+                        message: "unsupported JSON encoding".to_string(),
+                        code: "0A000",
+                    });
+                }
+            }
+        }
+        Ok(Some((spec, ty, named)))
+    }
+
+    /// True when the upcoming tokens start a trailing clause rather
+    /// than another constructor argument: `NULL ON NULL` begins with
+    /// NULL, but a bare NULL can also be an argument/key itself.
+    fn peek_is_ctor_clause(&self) -> bool {
+        match self.peek() {
+            Token::RParen => true,
+            Token::Ident(s) => match s.as_str() {
+                "absent" | "with" | "without" | "returning" => true,
+                "null" => matches!(self.peek2(), Token::Ident(s2) if s2 == "on"),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Speculative lookahead for JSON_OBJECT: the SQL-standard
+    /// constructor only applies when the argument list is empty,
+    /// starts with a trailing clause, or its first expression is
+    /// followed by ':' or VALUE (PG gram.y resolves the same
+    /// ambiguity against the legacy json_object(text[, ...])
+    /// function). Restores the token position either way.
+    fn json_object_is_ctor(&mut self) -> bool {
+        let save = self.pos;
+        self.next(); // '('
+        let verdict = if matches!(self.peek(), Token::RParen) || self.peek_is_ctor_clause() {
+            true
+        } else if matches!(self.peek(), Token::Ident(s) if s == "key") {
+            true
+        } else {
+            match self.parse_or() {
+                Ok(_) => {
+                    *self.peek() == Token::Colon
+                        || matches!(self.peek(), Token::Ident(s) if s == "value")
+                }
+                Err(_) => false,
+            }
+        };
+        self.pos = save;
+        verdict
+    }
+
+    /// JSON(expr [FORMAT JSON [ENCODING x]] [{WITH|WITHOUT} UNIQUE
+    /// [KEYS]]) -> __json_parse(doc, fmt, enc_name, unique).
+    fn parse_json_parse_ctor(&mut self) -> Result<Expr, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let doc = self.parse_or()?;
+        let (fmt, enc) = self.parse_opt_format_json()?;
+        let enc_name = match enc {
+            1 => Expr::Literal(Literal::Text("utf8".into())),
+            2 => Expr::Literal(Literal::Text("utf16".into())),
+            _ => Expr::Literal(Literal::Null),
+        };
+        let unique = self.parse_opt_unique_keys()?.unwrap_or(false);
+        self.expect(Token::RParen, "')'")?;
+        Ok(Expr::Func {
+            name: "__json_parse".to_string(),
+            args: vec![
+                doc,
+                Expr::Literal(Literal::Int(fmt as i64)),
+                enc_name,
+                Expr::Literal(Literal::Int(unique as i64)),
+            ],
+        })
+    }
+
+    /// JSON_SCALAR(expr) -> __json_scalar(v).
+    fn parse_json_scalar_ctor(&mut self) -> Result<Expr, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let v = self.parse_or()?;
+        self.expect(Token::RParen, "')'")?;
+        Ok(Expr::Func {
+            name: "__json_scalar".to_string(),
+            args: vec![v],
+        })
+    }
+
+    /// JSON_SERIALIZE(expr [FORMAT JSON [ENCODING x]]
+    /// [RETURNING type ...]) -> __json_serialize(doc, fmt, enc, spec).
+    fn parse_json_serialize_ctor(&mut self) -> Result<Expr, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let doc = self.parse_or()?;
+        let (fmt, enc) = self.parse_opt_format_json()?;
+        let spec = match self.parse_opt_json_returning()? {
+            Some((spec, _, _)) => spec,
+            None => String::new(),
+        };
+        self.expect(Token::RParen, "')'")?;
+        Ok(Expr::Func {
+            name: "__json_serialize".to_string(),
+            args: vec![
+                doc,
+                Expr::Literal(Literal::Int(fmt as i64)),
+                Expr::Literal(Literal::Int(enc)),
+                Expr::Literal(Literal::Text(spec.into())),
+            ],
+        })
+    }
+
+    /// One JSON_OBJECT pair: `[KEY] key {VALUE|:} value
+    /// [FORMAT JSON [ENCODING x]]` -> (key, value, fmt, enc).
+    fn parse_json_object_pair(&mut self) -> Result<(Expr, Expr, bool, i64), SqlError> {
+        let _ = self.eat_keyword("key");
+        let k = self.parse_or()?;
+        if *self.peek() == Token::Colon {
+            self.next();
+        } else {
+            self.expect_keyword("value")?;
+        }
+        let v = self.parse_or()?;
+        let (fmt, enc) = self.parse_opt_format_json()?;
+        Ok((k, v, fmt, enc))
+    }
+
+    /// JSON_OBJECT([pair, ...] [NULL|ABSENT ON NULL]
+    /// [{WITH|WITHOUT} UNIQUE [KEYS]] [RETURNING ...])
+    /// -> __json_object(k, v, vfmt, venc, ..., absent, unique, spec).
+    fn parse_json_object_ctor(&mut self) -> Result<Expr, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let mut args: Vec<Expr> = Vec::new();
+        // Pairs are present unless the next token closes the call or
+        // starts a trailing clause.
+        if !self.peek_is_ctor_clause() {
+            loop {
+                let (k, v, fmt, enc) = self.parse_json_object_pair()?;
+                args.push(k);
+                args.push(v);
+                args.push(Expr::Literal(Literal::Int(fmt as i64)));
+                args.push(Expr::Literal(Literal::Int(enc)));
+                if *self.peek() == Token::Comma {
+                    self.next();
+                    continue;
+                }
+                break;
+            }
+        }
+        let absent = match self.parse_opt_null_on_null() {
+            Some(null_on_null) => !null_on_null,
+            None => false, // JSON_OBJECT defaults to NULL ON NULL.
+        };
+        let unique = self.parse_opt_unique_keys()?.unwrap_or(false);
+        let spec = match self.parse_opt_json_returning()? {
+            Some((spec, _, _)) => spec,
+            None => String::new(),
+        };
+        self.expect(Token::RParen, "')'")?;
+        args.push(Expr::Literal(Literal::Int(absent as i64)));
+        args.push(Expr::Literal(Literal::Int(unique as i64)));
+        args.push(Expr::Literal(Literal::Text(spec.into())));
+        Ok(Expr::Func {
+            name: "__json_object".to_string(),
+            args,
+        })
+    }
+
+    /// JSON_ARRAY(...) — two productions: the value-list form
+    /// (-> __json_array(v, vfmt, venc, ..., absent, spec)) and the
+    /// subquery form (-> Expr::JsonArraySubq).
+    fn parse_json_array_ctor(&mut self) -> Result<Expr, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        // Subquery form: JSON_ARRAY(SELECT ... | WITH ... | VALUES ...)
+        if matches!(self.peek(), Token::Ident(s) if matches!(s.as_str(), "select" | "with" | "values"))
+        {
+            let sub = if matches!(self.peek(), Token::Ident(s) if s == "values") {
+                self.parse_values_query()?
+            } else if matches!(self.peek(), Token::Ident(s) if s == "with") {
+                self.next(); // WITH
+                let (ctes, _recursive) = self.parse_cte_defs()?;
+                let kw = match self.next() {
+                    Token::Ident(kw) => kw,
+                    other => {
+                        return Err(err(&format!(
+                            "syntax error: expected SELECT or VALUES after WITH                              in JSON_ARRAY subquery, found {:?}",
+                            other
+                        )));
+                    }
+                };
+                let mut sel = match kw.as_str() {
+                    "select" => self.parse_select_query()?,
+                    "values" => self.parse_values_query()?,
+                    _ => {
+                        return Err(err(
+                            "syntax error: expected SELECT or VALUES after WITH                              in JSON_ARRAY subquery",
+                        ));
+                    }
+                };
+                sel.with = ctes;
+                sel
+            } else {
+                self.parse_subquery()?
+            };
+            let (fmt, _enc) = self.parse_opt_format_json()?;
+            let (ret, ret_ty) = match self.parse_opt_json_returning()? {
+                Some((spec, ty, named)) => {
+                    if named.is_some() {
+                        (Some(spec), None)
+                    } else {
+                        (Some(spec), Some(ty))
+                    }
+                }
+                None => (None, None),
+            };
+            self.expect(Token::RParen, "')'")?;
+            return Ok(Expr::JsonArraySubq {
+                query: Box::new(sub),
+                format_json: fmt,
+                ret,
+                ret_ty,
+            });
+        }
+        let mut args: Vec<Expr> = Vec::new();
+        if !self.peek_is_ctor_clause() {
+            loop {
+                let v = self.parse_or()?;
+                let (fmt, enc) = self.parse_opt_format_json()?;
+                args.push(v);
+                args.push(Expr::Literal(Literal::Int(fmt as i64)));
+                args.push(Expr::Literal(Literal::Int(enc)));
+                if *self.peek() == Token::Comma {
+                    self.next();
+                    continue;
+                }
+                break;
+            }
+        }
+        let absent = match self.parse_opt_null_on_null() {
+            Some(null_on_null) => !null_on_null,
+            None => true, // JSON_ARRAY defaults to ABSENT ON NULL.
+        };
+        let spec = match self.parse_opt_json_returning()? {
+            Some((spec, _, _)) => spec,
+            None => String::new(),
+        };
+        self.expect(Token::RParen, "')'")?;
+        args.push(Expr::Literal(Literal::Int(absent as i64)));
+        args.push(Expr::Literal(Literal::Text(spec.into())));
+        Ok(Expr::Func {
+            name: "__json_array".to_string(),
+            args,
+        })
+    }
+
+    /// The `__jsonagg_opt` marker wrapping a constructor aggregate's
+    /// value argument: (inner, fmt, null_on_null, unique, enc, spec).
+    fn jsonagg_marker(
+        v: Expr,
+        fmt: bool,
+        enc: i64,
+        null_on_null: bool,
+        unique: bool,
+        spec: String,
+    ) -> Expr {
+        Expr::Func {
+            name: "__jsonagg_opt".to_string(),
+            args: vec![
+                v,
+                Expr::Literal(Literal::Int(fmt as i64)),
+                Expr::Literal(Literal::Int(null_on_null as i64)),
+                Expr::Literal(Literal::Int(unique as i64)),
+                Expr::Literal(Literal::Int(enc)),
+                Expr::Literal(Literal::Text(spec.into())),
+            ],
+        }
+    }
+
+    /// The trailing clauses of a constructor aggregate, in any order
+    /// (PG's grammar fixes an order, but the corpus exercises
+    /// ORDER BY / null-behavior / RETURNING in several sequences):
+    /// [ORDER BY ...] [NULL|ABSENT ON NULL] [RETURNING ...].
+    /// Returns (order_by, null_on_null, spec).
+    fn parse_jsonagg_clauses(
+        &mut self,
+        default_null_on_null: bool,
+    ) -> Result<(Vec<OrderTerm>, bool, String), SqlError> {
+        let mut order_by: Vec<OrderTerm> = Vec::new();
+        let mut null_on_null = default_null_on_null;
+        let mut spec = String::new();
+        loop {
+            if self.eat_keyword("order") {
+                self.expect_keyword("by")?;
+                loop {
+                    order_by.push(self.parse_order_term()?);
+                    if *self.peek() == Token::Comma {
+                        self.next();
+                        continue;
+                    }
+                    break;
+                }
+            } else if let Some(n) = self.parse_opt_null_on_null() {
+                null_on_null = n;
+            } else if matches!(self.peek(), Token::Ident(s) if s == "returning") {
+                if let Some((s, _, _)) = self.parse_opt_json_returning()? {
+                    spec = s;
+                }
+            } else {
+                break;
+            }
+        }
+        Ok((order_by, null_on_null, spec))
+    }
+
+    /// Attach FILTER / OVER to a built aggregate expression, like
+    /// the generic aggregate path does.
+    fn finish_jsonagg(
+        &mut self,
+        func: AggFunc,
+        arg: Option<Box<Expr>>,
+        arg2: Option<Box<Expr>>,
+        order_by: Vec<OrderTerm>,
+    ) -> Result<Expr, SqlError> {
+        let filter = self.parse_filter_clause()?;
+        let mut args: Vec<Expr> = Vec::new();
+        if let Some(a) = &arg {
+            args.push((**a).clone());
+        }
+        if let Some(a) = &arg2 {
+            args.push((**a).clone());
+        }
+        let mut expr = Expr::Agg {
+            func,
+            arg,
+            distinct: false,
+            arg2,
+            agg_order_by: order_by.clone(),
+            filter: filter.clone(),
+        };
+        if self.eat_keyword("over") {
+            if !order_by.is_empty() {
+                return Err(SqlError {
+                    message: "aggregate ORDER BY is not implemented for window functions"
+                        .to_string(),
+                    code: "0A000",
+                });
+            }
+            let spec = self.parse_window_spec()?;
+            expr = Expr::Window {
+                func: WindowFunc::Agg(func),
+                args,
+                distinct: false,
+                partition_by: spec.partition_by,
+                order_by: spec.order_by,
+                frame: spec.frame,
+                wid: 0,
+                filter,
+                exclusion: spec.exclusion,
+            };
+        }
+        Ok(expr)
+    }
+
+    /// JSON_ARRAYAGG(value [FORMAT JSON [ENCODING x]] [ORDER BY ...]
+    /// [NULL|ABSENT ON NULL] [RETURNING ...]) [FILTER ...] [OVER ...].
+    fn parse_json_arrayagg_ctor(&mut self) -> Result<Expr, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let v = self.parse_or()?;
+        let (fmt, enc) = self.parse_opt_format_json()?;
+        // JSON_ARRAYAGG defaults to ABSENT ON NULL.
+        let (order_by, null_on_null, spec) = self.parse_jsonagg_clauses(false)?;
+        self.expect(Token::RParen, "')'")?;
+        let marked = Self::jsonagg_marker(v, fmt, enc, null_on_null, false, spec);
+        self.finish_jsonagg(
+            AggFunc::JsonArrayAgg,
+            Some(Box::new(marked)),
+            None,
+            order_by,
+        )
+    }
+
+    /// JSON_OBJECTAGG([KEY] key {VALUE|:} value [FORMAT JSON ...]
+    /// [NULL|ABSENT ON NULL] [{WITH|WITHOUT} UNIQUE [KEYS]]
+    /// [RETURNING ...]) [FILTER ...] [OVER ...].
+    fn parse_json_objectagg_ctor(&mut self) -> Result<Expr, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let _ = self.eat_keyword("key");
+        let k = self.parse_or()?;
+        if *self.peek() == Token::Colon {
+            self.next();
+        } else {
+            self.expect_keyword("value")?;
+        }
+        let v = self.parse_or()?;
+        let (fmt, enc) = self.parse_opt_format_json()?;
+        // JSON_OBJECTAGG defaults to NULL ON NULL.
+        let (order_by, null_on_null, spec) = self.parse_jsonagg_clauses(true)?;
+        let unique = self.parse_opt_unique_keys()?.unwrap_or(false);
+        // RETURNING may also follow the UNIQUE clause in PG's order.
+        let spec = if matches!(self.peek(), Token::Ident(s) if s == "returning") {
+            match self.parse_opt_json_returning()? {
+                Some((s, _, _)) => s,
+                None => spec,
+            }
+        } else {
+            spec
+        };
+        self.expect(Token::RParen, "')'")?;
+        let marked = Self::jsonagg_marker(v, fmt, enc, null_on_null, unique, spec);
+        self.finish_jsonagg(
+            AggFunc::JsonObjectAggSql,
+            Some(Box::new(k)),
+            Some(Box::new(marked)),
+            order_by,
+        )
     }
 
     /// `trim([ [leading|trailing|both] [chars] from ] str)`.
@@ -10478,6 +11069,7 @@ pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
             Err(err(format!("cannot use aggregate in {} constraint", what)))
         }
         Expr::ScalarSub(_)
+        | Expr::JsonArraySubq { .. }
         | Expr::ArraySubquery(_)
         | Expr::InSub { .. }
         | Expr::Quantified { .. }
@@ -11000,6 +11592,7 @@ pub(crate) fn encode_expr_inner(e: &Expr, out: &mut String) {
         Expr::Agg { .. }
         | Expr::WithinGroup { .. }
         | Expr::ScalarSub(_)
+        | Expr::JsonArraySubq { .. }
         | Expr::ArraySubquery(_)
         | Expr::InSub { .. }
         | Expr::Quantified { .. }

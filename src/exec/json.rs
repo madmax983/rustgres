@@ -3225,3 +3225,815 @@ fn dt_safe<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
         Err(_) => Err("datetime value out of range".to_string()),
     }
 }
+
+// =====================================================================
+// v1.90: SQL/JSON constructors (PG19 gram.y JsonParseExpr /
+// JsonScalarExpr / JsonSerializeExpr / JsonObjectConstructor /
+// JsonArrayConstructor / JsonArrayQueryConstructor / JsonObjectAgg /
+// JsonArrayAgg / JsonIsPredicate; parse_expr.c transformJson*;
+// json.c / jsonb.c ExecEvalJson*). The parser desugars each form to
+// an internal builtin (__json_parse / __json_scalar / __json_serialize
+// / __json_object / __json_array / __is_json, plus AggFunc variants
+// for the aggregates); evaluation lives here because RETURNING
+// conversion and the static FORMAT/type checks need the catalog.
+// =====================================================================
+
+/// Static category of a constructor argument, resolved from the
+/// argument EXPRESSION (json-typed values ride as plain Value::Text,
+/// so the runtime value alone cannot distinguish json from text).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CtorCat {
+    /// Unknown-typed literal / unresolvable: treated as text, and
+    /// permitted everywhere PG permits an unknown literal.
+    Unknown,
+    /// String category: text, varchar, char, name.
+    Str,
+    Bytea,
+    Json,
+    Jsonb,
+    /// Anything else; `Other` carries no payload — error messages
+    /// that need the type name are produced by the caller, which has
+    /// the expression.
+    Other,
+}
+
+/// One evaluated constructor argument: its value, its static
+/// category, and whether a FORMAT JSON clause was attached.
+#[derive(Clone)]
+pub(crate) struct CtorArg {
+    pub v: Value,
+    pub cat: CtorCat,
+    pub fmt: bool,
+    /// FORMAT JSON ENCODING: 0 = no encoding clause, 1 = UTF8,
+    /// 2 = a recognized but unsupported encoding (UTF16/UTF32).
+    pub enc: i64,
+}
+
+impl CtorArg {
+    fn is_jsonb_origin(&self) -> bool {
+        self.cat == CtorCat::Jsonb || matches!(self.v, Value::Jsonb(_))
+    }
+}
+
+/// Decode a bytea value to its UTF-8 text (PG's bytea -> text
+/// conversion for JSON input: invalid UTF-8 is 22021).
+fn ctor_bytea_text(b: &[u8]) -> Result<String, ExecError> {
+    // PG's encoding verifier rejects the NUL byte outright (bytea
+    // '\x00' IS JSON errors 22021 in the corpus rather than
+    // returning false), even though 0x00 is well-formed UTF-8.
+    if b.contains(&0) {
+        return Err(exec_err(
+            "22021",
+            "invalid byte sequence for encoding \"UTF8\": 0x00",
+        ));
+    }
+    match std::str::from_utf8(b) {
+        Ok(s) => Ok(s.to_string()),
+        Err(e) => {
+            let pos = e.valid_up_to();
+            let byte = b.get(pos).copied().unwrap_or(0);
+            Err(exec_err(
+                "22021",
+                format!(
+                    "invalid byte sequence for encoding \"UTF8\": 0x{:02x}",
+                    byte
+                ),
+            ))
+        }
+    }
+}
+
+/// The JSON text of a document-ish argument (no FORMAT semantics):
+/// json verbatim, jsonb canonical, bytea decoded, anything else its
+/// output text. Used by JSON() / JSON_SERIALIZE / IS JSON.
+fn ctor_doc_text(a: &CtorArg) -> Result<String, ExecError> {
+    match &a.v {
+        Value::Jsonb(s) => Ok(s.to_string()),
+        Value::Text(s) | Value::BpChar(s) => Ok(s.to_string()),
+        Value::Bytea(b) => ctor_bytea_text(b),
+        other => Ok(other.to_text().unwrap_or_default()),
+    }
+}
+
+/// Validate JSON text and return its parsed document (22P02 like
+/// PG's json input function).
+fn ctor_parse_doc(text: &str) -> Result<JsonDoc, ExecError> {
+    parse_json(text).map_err(|_| {
+        exec_err(
+            "22P02",
+            format!("invalid input syntax for type json: {:?}", text),
+        )
+    })
+}
+
+/// Does this parsed document contain a duplicate object key at any
+/// depth? (PG's WITH UNIQUE KEYS / unique-check semantics.)
+fn ctor_doc_has_dup_keys(node: &JsonNode) -> bool {
+    match &node.kind {
+        JsonKind::Object(fields) => {
+            let mut seen: Vec<&str> = Vec::with_capacity(fields.len());
+            for (k, _) in fields {
+                if seen.contains(&k.as_str()) {
+                    return true;
+                }
+                seen.push(k.as_str());
+            }
+            fields.iter().any(|(_, v)| ctor_doc_has_dup_keys(v))
+        }
+        JsonKind::Array(elems) => elems.iter().any(ctor_doc_has_dup_keys),
+        _ => false,
+    }
+}
+
+/// Convert one constructor VALUE argument to its (json-mode text
+/// piece, jsonb value) pair. FORMAT JSON parsing, json embedding, and
+/// the plain datum conversion (datum_to_json / datum_to_jsonb) all
+/// live here. SQL NULL never reaches this function (callers apply
+/// the NULL ON NULL / ABSENT ON NULL rule first).
+
+/// The static FORMAT JSON checks (PG transformJsonValueExpr):
+/// the ENCODING clause is only allowed for bytea input and only
+/// UTF8 is supported; a non-string non-json input type is a 42804.
+/// These fire at parse analysis in PG, so they must run even when
+/// the value itself is SQL NULL.
+pub(crate) fn ctor_check_fmt(a: &CtorArg) -> Result<(), ExecError> {
+    if !a.fmt {
+        return Ok(());
+    }
+    if a.enc != 0 && a.cat != CtorCat::Bytea {
+        return Err(exec_err(
+            "42804",
+            "JSON ENCODING clause is only allowed for bytea input type",
+        ));
+    }
+    if a.enc == 2 {
+        return Err(exec_err("0A000", "unsupported JSON encoding"));
+    }
+    match a.cat {
+        CtorCat::Json | CtorCat::Jsonb => {}
+        CtorCat::Str | CtorCat::Bytea | CtorCat::Unknown => {}
+        CtorCat::Other => {
+            return Err(exec_err(
+                "42804",
+                "cannot use non-string types with explicit FORMAT JSON clause",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ctor_value_piece(a: &CtorArg) -> Result<(String, JsonbVal), ExecError> {
+    if a.fmt {
+        ctor_check_fmt(a)?;
+        if let Value::Jsonb(s) = &a.v {
+            let jb = parse_jsonb(s)?;
+            return Ok((s.to_string(), jb));
+        }
+        let text = ctor_doc_text(a)?;
+        let doc = ctor_parse_doc(&text)?;
+        let jb = jsonb_from_node(&doc, &doc.root)?;
+        return Ok((text, jb));
+    }
+    if let Value::Jsonb(s) = &a.v {
+        let jb = parse_jsonb(s)?;
+        return Ok((s.to_string(), jb));
+    }
+    if a.cat == CtorCat::Json {
+        // A json-typed value embeds raw (its stored text IS JSON).
+        let text = ctor_doc_text(a)?;
+        let doc = ctor_parse_doc(&text)?;
+        let jb = jsonb_from_node(&doc, &doc.root)?;
+        return Ok((text, jb));
+    }
+    let mut piece = String::new();
+    datum_to_json_text(&a.v, &mut piece);
+    let jb = datum_to_jsonb(&a.v)?;
+    Ok((piece, jb))
+}
+
+/// The RETURNING conversion shared by all constructors. `text` is
+/// the effective result text (canonical when the constructor ran in
+/// jsonb mode, built json text otherwise); `jb` is the result as a
+/// JsonbVal tree. `spec` is the parser's RETURNING spec: "" (default
+/// json), "json", "jsonb", "bytea", a builtin text-family name with
+/// optional typmod ("character varying(2)"), or a domain name.
+pub(crate) fn ctor_apply_returning(
+    q: &mut Q,
+    text: String,
+    jb: &JsonbVal,
+    spec: &str,
+) -> Result<Value, ExecError> {
+    match spec {
+        "" | "json" => Ok(Value::text(text)),
+        "jsonb" => Ok(Value::jsonb(jb.render())),
+        "bytea" => Ok(Value::Bytea(text.into_bytes())),
+        _ => {
+            // Domain RETURNING type: convert through the JSON_TABLE
+            // coercion machinery (base conversion + domain checks).
+            if q.eng.db.types.contains_key(spec) {
+                let base = super::jsontable::jt_static_leaf_type(
+                    q.eng,
+                    q.snap,
+                    q.own,
+                    q.session,
+                    crate::storage::ColType::Composite,
+                    &Some(spec.to_string()),
+                )?;
+                return super::jsontable::jt_coerce_sql_value(
+                    q,
+                    Value::text(text),
+                    base,
+                    &Some(spec.to_string()),
+                    None,
+                );
+            }
+            // Builtin string type with an optional typmod:
+            // ASSIGNMENT coercion (22001 on overflow, char padding).
+            let ty = ctor_spec_coltype(spec).ok_or_else(|| {
+                exec_err(
+                    "42804",
+                    format!("cannot use type {} in RETURNING clause", spec),
+                )
+            })?;
+            super::cast::eval_assign_cast(&Value::text(text), &ty)
+        }
+    }
+}
+
+/// Parse a builtin RETURNING spec ("text", "character(2)",
+/// "character varying(2)") back to a ColType; None when the spec is
+/// not a string-family builtin (json/jsonb/bytea are handled by the
+/// caller; anything else is a domain name or an error).
+pub(crate) fn ctor_spec_coltype(spec: &str) -> Option<crate::storage::ColType> {
+    use crate::storage::ColType;
+    let (name, typmod) = match spec.find('(') {
+        Some(open) => {
+            let n: i32 = spec[open + 1..].trim_end_matches(')').trim().parse().ok()?;
+            (&spec[..open], Some(n))
+        }
+        None => (spec, None),
+    };
+    match name.trim() {
+        "text" => Some(ColType::Text),
+        "character varying" => Some(ColType::Varchar(typmod)),
+        "character" | "bpchar" => Some(ColType::Char(typmod.or(Some(1)))),
+        "name" => Some(ColType::Name),
+        _ => None,
+    }
+}
+
+/// Whether a RETURNING spec names jsonb mode for a constructor
+/// (explicit RETURNING jsonb; the any-jsonb-arg rule is separate).
+pub(crate) fn ctor_spec_is_jsonb(spec: &str) -> bool {
+    spec == "jsonb"
+}
+
+/// JSON(<doc> [FORMAT JSON [ENCODING x]] [{WITH|WITHOUT} UNIQUE
+/// [KEYS]]) -> json.
+pub(crate) fn eval_json_parse_ctor(
+    q: &mut Q,
+    a: &CtorArg,
+    enc: Option<&str>,
+    unique: bool,
+) -> Result<Value, ExecError> {
+    let _ = q;
+    if enc.is_some() && a.cat != CtorCat::Bytea {
+        return Err(exec_err(
+            "42804",
+            "JSON ENCODING clause is only allowed for bytea input type",
+        ));
+    }
+    if matches!(enc, Some(e) if e != "utf8") {
+        return Err(exec_err("0A000", "unsupported JSON encoding"));
+    }
+    if unique && !matches!(a.cat, CtorCat::Str | CtorCat::Unknown) {
+        return Err(exec_err(
+            "42804",
+            "cannot use non-string types with WITH UNIQUE KEYS clause",
+        ));
+    }
+    if a.cat == CtorCat::Other {
+        return Err(exec_err("42846", "cannot cast type to json"));
+    }
+    if a.v == Value::Null {
+        return Ok(Value::Null);
+    }
+    let text = ctor_doc_text(a)?;
+    let doc = ctor_parse_doc(&text)?;
+    if unique && ctor_doc_has_dup_keys(&doc.root) {
+        return Err(exec_err("22030", "duplicate JSON object key value"));
+    }
+    // json input is preserved verbatim; jsonb renders canonically —
+    // ctor_doc_text already produced exactly that text.
+    Ok(Value::text(text))
+}
+
+/// JSON_SCALAR(<expr>) -> json.
+pub(crate) fn eval_json_scalar_ctor(a: &CtorArg) -> Result<Value, ExecError> {
+    if a.v == Value::Null {
+        return Ok(Value::Null);
+    }
+    if let Value::Jsonb(s) = &a.v {
+        return Ok(Value::text(s.to_string()));
+    }
+    if a.cat == CtorCat::Json {
+        return Ok(Value::text(ctor_doc_text(a)?));
+    }
+    let mut out = String::new();
+    datum_to_json_text(&a.v, &mut out);
+    Ok(Value::text(out))
+}
+
+/// JSON_SERIALIZE(<doc> [FORMAT JSON] [RETURNING spec]) -> text by
+/// default.
+pub(crate) fn eval_json_serialize_ctor(
+    q: &mut Q,
+    a: &CtorArg,
+    spec: &str,
+) -> Result<Value, ExecError> {
+    if spec == "jsonb" || spec == "json" {
+        return Err(exec_err(
+            "42804",
+            format!(
+                "cannot use type {} in RETURNING clause of JSON_SERIALIZE()",
+                spec
+            ),
+        ));
+    }
+    if a.cat == CtorCat::Other {
+        return Err(exec_err(
+            "42804",
+            "cannot use non-string types with implicit FORMAT JSON clause",
+        ));
+    }
+    if a.v == Value::Null {
+        // The RETURNING coercion of a NULL still runs (a NOT NULL
+        // domain would fail); ctor_apply_returning handles the
+        // plain cases, so only domains need the explicit pass.
+        if !spec.is_empty() && q.eng.db.types.contains_key(spec) {
+            return ctor_apply_returning(q, String::new(), &JsonbVal::Null, spec)
+                .map(|_| Value::Null)
+                .or(Ok(Value::Null));
+        }
+        return Ok(Value::Null);
+    }
+    let (text, jb) = if a.cat == CtorCat::Jsonb || matches!(a.v, Value::Jsonb(_)) {
+        let t = ctor_doc_text(a)?;
+        let jb = parse_jsonb(&t)?;
+        (t, jb)
+    } else {
+        let t = ctor_doc_text(a)?;
+        let doc = ctor_parse_doc(&t)?;
+        let jb = jsonb_from_node(&doc, &doc.root)?;
+        (t, jb)
+    };
+    if spec.is_empty() {
+        return Ok(Value::text(text));
+    }
+    ctor_apply_returning(q, text, &jb, spec)
+}
+
+/// Build a JSON object from (key, value) pairs — the shared core of
+/// JSON_OBJECT and JSON_OBJECTAGG. `pairs` are in constructor order;
+/// the unique check runs over ALL keys before ABSENT filtering
+/// (PG checks key uniqueness during construction, and the corpus
+/// pins an ABSENT-dropped duplicate still erroring).
+pub(crate) fn ctor_build_object(
+    q: &mut Q,
+    pairs: Vec<(CtorArg, CtorArg)>,
+    absent_on_null: bool,
+    unique: bool,
+    spec: &str,
+    agg_style: bool,
+) -> Result<Value, ExecError> {
+    let (effective, jb) = ctor_build_object_parts(pairs, absent_on_null, unique, spec, agg_style)?;
+    ctor_apply_returning(q, effective, &jb, spec)
+}
+
+/// The (effective text, jsonb tree) pair behind ctor_build_object,
+/// split out so the window machinery (which has no Q) can apply the
+/// pure RETURNING conversion itself.
+pub(crate) fn ctor_build_object_parts(
+    pairs: Vec<(CtorArg, CtorArg)>,
+    absent_on_null: bool,
+    unique: bool,
+    spec: &str,
+    agg_style: bool,
+) -> Result<(String, JsonbVal), ExecError> {
+    let jsonb_mode = ctor_spec_is_jsonb(spec)
+        || pairs
+            .iter()
+            .any(|(k, v)| k.is_jsonb_origin() || v.is_jsonb_origin());
+    // Keys first (NULL key and key-shape errors precede value work).
+    let mut keys: Vec<String> = Vec::with_capacity(pairs.len());
+    for (k, _) in &pairs {
+        if k.cat == CtorCat::Json || k.cat == CtorCat::Jsonb {
+            return Err(exec_err(
+                "22023",
+                "key value must be scalar, not array, composite, or json",
+            ));
+        }
+        if k.v == Value::Null {
+            return Err(if jsonb_mode {
+                exec_err("22004", "field name must not be null")
+            } else {
+                exec_err("22004", "null value not allowed for object key")
+            });
+        }
+        keys.push(json_key_text(&k.v)?);
+    }
+    if unique {
+        let mut seen: Vec<&str> = Vec::with_capacity(keys.len());
+        for k in &keys {
+            if seen.contains(&k.as_str()) {
+                return Err(if jsonb_mode {
+                    exec_err("22030", "duplicate JSON object key value")
+                } else {
+                    exec_err("22030", format!("duplicate JSON object key value: {:?}", k))
+                });
+            }
+            seen.push(k.as_str());
+        }
+    }
+    // Scalar JSON_OBJECT renders {"k" : v}; the JSON_OBJECTAGG
+    // transition functions build "{ " ... " }" (json.c).
+    let mut text = String::from(if agg_style { "{ " } else { "{" });
+    let mut jb_pairs: Vec<(String, JsonbVal)> = Vec::new();
+    let mut first = true;
+    for ((_, v), k) in pairs.iter().zip(keys.iter()) {
+        ctor_check_fmt(v)?;
+        if v.v == Value::Null {
+            if absent_on_null {
+                continue;
+            }
+            if !first {
+                text.push_str(", ");
+            }
+            first = false;
+            text.push('"');
+            escape_json_into(k, &mut text);
+            text.push_str("\" : null");
+            jb_pairs.push((k.clone(), JsonbVal::Null));
+            continue;
+        }
+        let (piece, jb) = ctor_value_piece(v)?;
+        if !first {
+            text.push_str(", ");
+        }
+        first = false;
+        text.push('"');
+        escape_json_into(k, &mut text);
+        text.push_str("\" : ");
+        text.push_str(&piece);
+        jb_pairs.push((k.clone(), jb));
+    }
+    text.push_str(if agg_style { " }" } else { "}" });
+    if pairs.is_empty() {
+        text = if agg_style {
+            "{ }".to_string()
+        } else {
+            "{}".to_string()
+        };
+    }
+    let jb = jsonb_canon(JsonbVal::Object(jb_pairs));
+    let effective = if jsonb_mode { jb.render() } else { text };
+    Ok((effective, jb))
+}
+
+/// Build a JSON array from value arguments — the shared core of
+/// JSON_ARRAY, JSON_ARRAYAGG, JSON_ARRAY(subquery), and the windowed
+/// JSON_ARRAYAGG. `rows` are in result order; when `absent_on_null`
+/// is false, SQL NULLs become JSON nulls. An empty `rows` produces
+/// "[]" (callers that need zero-rows -> NULL check before calling).
+pub(crate) fn ctor_build_array(
+    q: &mut Q,
+    rows: Vec<CtorArg>,
+    absent_on_null: bool,
+    spec: &str,
+    agg_style: bool,
+) -> Result<Value, ExecError> {
+    let (effective, jb) = ctor_build_array_parts(rows, absent_on_null, spec, agg_style)?;
+    ctor_apply_returning(q, effective, &jb, spec)
+}
+
+/// The (effective text, jsonb tree) pair behind ctor_build_array.
+pub(crate) fn ctor_build_array_parts(
+    rows: Vec<CtorArg>,
+    absent_on_null: bool,
+    spec: &str,
+    agg_style: bool,
+) -> Result<(String, JsonbVal), ExecError> {
+    let jsonb_mode = ctor_spec_is_jsonb(spec) || rows.iter().any(|a| a.is_jsonb_origin());
+    let mut text = String::from("[");
+    let mut jb_elems: Vec<JsonbVal> = Vec::new();
+    let mut first = true;
+    for a in &rows {
+        ctor_check_fmt(a)?;
+        if a.v == Value::Null {
+            if absent_on_null {
+                continue;
+            }
+            if !first {
+                text.push_str(", ");
+            }
+            first = false;
+            text.push_str("null");
+            jb_elems.push(JsonbVal::Null);
+            continue;
+        }
+        let (piece, jb) = ctor_value_piece(a)?;
+        if !first {
+            text.push_str(", ");
+            // json_array_agg's transition (json.c) inserts a
+            // newline + space before a non-first array/composite
+            // element.
+            if agg_style && matches!(a.v, Value::Array(_) | Value::Record(_)) {
+                text.push_str("\n ");
+            }
+        }
+        first = false;
+        text.push_str(&piece);
+        jb_elems.push(jb);
+    }
+    text.push(']');
+    let jb = JsonbVal::Array(jb_elems);
+    let effective = if jsonb_mode { jb.render() } else { text };
+    Ok((effective, jb))
+}
+
+/// `<expr> IS [NOT] JSON [VALUE|OBJECT|ARRAY|SCALAR]
+/// [{WITH|WITHOUT} UNIQUE [KEYS]]`. `kind`: 0 any/VALUE, 1 OBJECT,
+/// 2 ARRAY, 3 SCALAR. The static type check lives with the caller
+/// (it must fire even for NULL operands of a bad type).
+pub(crate) fn eval_is_json_ctor(a: &CtorArg, kind: i64, unique: bool) -> Result<Value, ExecError> {
+    if a.v == Value::Null {
+        return Ok(Value::Null);
+    }
+    if matches!(a.v, Value::Jsonb(_)) {
+        // jsonb is always valid JSON; uniqueness is structural.
+        let jb = match &a.v {
+            Value::Jsonb(s) => parse_jsonb(s)?,
+            _ => unreachable!(),
+        };
+        let ok = match kind {
+            1 => matches!(jb, JsonbVal::Object(_)),
+            2 => matches!(jb, JsonbVal::Array(_)),
+            3 => !matches!(jb, JsonbVal::Object(_) | JsonbVal::Array(_)),
+            _ => true,
+        };
+        return Ok(Value::Bool(ok));
+    }
+    let text = ctor_doc_text(a)?;
+    let doc = match parse_json(&text) {
+        Ok(d) => d,
+        Err(_) => return Ok(Value::Bool(false)),
+    };
+    let ok = match kind {
+        1 => matches!(doc.root.kind, JsonKind::Object(_)),
+        2 => matches!(doc.root.kind, JsonKind::Array(_)),
+        3 => !matches!(doc.root.kind, JsonKind::Object(_) | JsonKind::Array(_)),
+        _ => true,
+    };
+    if ok && unique && ctor_doc_has_dup_keys(&doc.root) {
+        return Ok(Value::Bool(false));
+    }
+    Ok(Value::Bool(ok))
+}
+
+/// RETURNING conversion without catalog access (window path):
+/// json / jsonb / bytea / builtin string typmods. A domain spec
+/// falls back to the plain text (windowed domain RETURNING is not
+/// exercised by the corpus).
+pub(crate) fn ctor_apply_returning_pure(
+    text: String,
+    jb: &JsonbVal,
+    spec: &str,
+) -> Result<Value, ExecError> {
+    match spec {
+        "" | "json" => Ok(Value::text(text)),
+        "jsonb" => Ok(Value::jsonb(jb.render())),
+        "bytea" => Ok(Value::Bytea(text.into_bytes())),
+        _ => match ctor_spec_coltype(spec) {
+            Some(ty) => super::cast::eval_assign_cast(&Value::text(text), &ty),
+            None => Ok(Value::text(text)),
+        },
+    }
+}
+
+/// Shallow static category of an expression (aggregate/window
+/// contexts, where no full expr_type pass is available): casts,
+/// constructor calls, literals, and named casts resolved against
+/// the type catalog; everything else is Unknown (permissive).
+pub(crate) fn ctor_cat_shallow(db: &Database, e: &Expr) -> CtorCat {
+    match e {
+        Expr::NamedArg { expr, .. } => ctor_cat_shallow(db, expr),
+        Expr::Cast { to, .. } => ctor_cat_of_coltype(*to),
+        Expr::CastNamed { name, .. } => match db.types.get(name) {
+            Some(st) => match &st.domain {
+                Some(d) => ctor_cat_of_coltype(d.base),
+                None => CtorCat::Other,
+            },
+            None => CtorCat::Other,
+        },
+        Expr::Literal(Literal::Text(_)) => CtorCat::Unknown,
+        Expr::Literal(Literal::Null) => CtorCat::Unknown,
+        Expr::Literal(_) => CtorCat::Other,
+        Expr::Func { name, args } => match name.as_str() {
+            "__json_parse" | "__json_scalar" => CtorCat::Json,
+            "__json_serialize" => match args.get(2) {
+                Some(Expr::Literal(Literal::Text(s))) => match s.as_ref() {
+                    "jsonb" => CtorCat::Jsonb,
+                    "bytea" => CtorCat::Bytea,
+                    "" => CtorCat::Str,
+                    _ => CtorCat::Str,
+                },
+                _ => CtorCat::Str,
+            },
+            "__json_object" | "__json_array" => match args.last() {
+                Some(Expr::Literal(Literal::Text(s))) => match s.as_ref() {
+                    "jsonb" => CtorCat::Jsonb,
+                    "bytea" => CtorCat::Bytea,
+                    "" | "json" => CtorCat::Json,
+                    _ => CtorCat::Str,
+                },
+                _ => CtorCat::Json,
+            },
+            "json_build_object" | "json_object" => CtorCat::Json,
+            "jsonb_build_object" | "jsonb_object" => CtorCat::Jsonb,
+            _ => CtorCat::Unknown,
+        },
+        Expr::Agg {
+            func, arg2, arg, ..
+        } => {
+            let _ = (arg, arg2);
+            match func {
+                AggFunc::JsonArrayAgg | AggFunc::JsonObjectAggSql => CtorCat::Json,
+                AggFunc::JsonbAgg | AggFunc::JsonbObjectAgg => CtorCat::Jsonb,
+                AggFunc::JsonAgg | AggFunc::JsonObjectAgg => CtorCat::Json,
+                _ => CtorCat::Unknown,
+            }
+        }
+        Expr::JsonArraySubq { ret, .. } => match ret.as_deref() {
+            Some("jsonb") => CtorCat::Jsonb,
+            Some("bytea") => CtorCat::Bytea,
+            Some(_) => CtorCat::Str,
+            None => CtorCat::Json,
+        },
+        _ => CtorCat::Unknown,
+    }
+}
+
+/// ctor_cat_shallow without catalog access (window path): named
+/// casts and columns are Unknown (permissive); dynamic jsonb values
+/// still register through Value::Jsonb at build time.
+pub(crate) fn ctor_cat_shallow_nodb(e: &Expr) -> CtorCat {
+    match e {
+        Expr::NamedArg { expr, .. } => ctor_cat_shallow_nodb(expr),
+        Expr::Cast { to, .. } => ctor_cat_of_coltype(*to),
+        Expr::Literal(Literal::Text(_)) | Expr::Literal(Literal::Null) => CtorCat::Unknown,
+        Expr::Literal(_) => CtorCat::Other,
+        Expr::Func { name, .. } => match name.as_str() {
+            "__json_parse" | "__json_scalar" | "__json_object" | "__json_array" => CtorCat::Json,
+            "jsonb_build_object" | "jsonb_object" => CtorCat::Jsonb,
+            _ => CtorCat::Unknown,
+        },
+        _ => CtorCat::Unknown,
+    }
+}
+
+/// Map a ColType onto a constructor-argument category.
+pub(crate) fn ctor_cat_of_coltype(t: ColType) -> CtorCat {
+    match t {
+        ColType::Text | ColType::Varchar(_) | ColType::Char(_) | ColType::Name => CtorCat::Str,
+        ColType::Bytea => CtorCat::Bytea,
+        ColType::Json => CtorCat::Json,
+        ColType::Jsonb => CtorCat::Jsonb,
+        _ => CtorCat::Other,
+    }
+}
+
+/// v1.90: options carried by the `__jsonagg_opt` marker the parser
+/// wraps around a SQL/JSON constructor aggregate's value argument:
+/// (inner, format_json, null_on_null, unique, returning-spec).
+#[derive(Clone, Debug)]
+pub(crate) struct JsonAggOpts {
+    pub fmt: bool,
+    pub null_on_null: bool,
+    pub unique: bool,
+    /// FORMAT JSON ENCODING on the value: 0 none, 1 UTF8, 2 other.
+    pub enc: i64,
+    pub spec: String,
+}
+
+impl Default for JsonAggOpts {
+    fn default() -> Self {
+        JsonAggOpts {
+            fmt: false,
+            null_on_null: false,
+            unique: false,
+            enc: 0,
+            spec: String::new(),
+        }
+    }
+}
+
+/// If `e` is a `__jsonagg_opt` marker, return (inner expr, options).
+pub(crate) fn jsonagg_opt_unwrap(e: &Expr) -> (&Expr, Option<JsonAggOpts>) {
+    if let Expr::Func { name, args } = e {
+        if name == "__jsonagg_opt" && args.len() == 6 {
+            let flag = |i: usize| matches!(args[i], Expr::Literal(Literal::Int(1)));
+            let enc = match &args[4] {
+                Expr::Literal(Literal::Int(i)) => *i,
+                _ => 0,
+            };
+            let spec = match &args[5] {
+                Expr::Literal(Literal::Text(s)) => s.to_string(),
+                _ => String::new(),
+            };
+            return (
+                &args[0],
+                Some(JsonAggOpts {
+                    fmt: flag(1),
+                    null_on_null: flag(2),
+                    unique: flag(3),
+                    enc,
+                    spec,
+                }),
+            );
+        }
+    }
+    (e, None)
+}
+
+/// The RETURNING spec of a possibly marker-wrapped aggregate value
+/// expression (None when there is no marker).
+pub(crate) fn jsonagg_opt_spec(e: Option<&Expr>) -> Option<String> {
+    let (_, opts) = jsonagg_opt_unwrap(e?);
+    opts.map(|o| o.spec)
+}
+
+/// Run a JSON_ARRAY(subquery) body: execute the SelectStmt with the
+/// caller's scopes visible (SubPlan correlation), require exactly
+/// one result column, and build the array from its first column.
+/// PG's desugar COALESCEs JSON_ARRAYAGG's NULL (zero rows) to '[]',
+/// and the RETURNING coercion applies to that '[]' too.
+pub(crate) fn eval_json_array_subq_ctor(
+    q: &mut Q,
+    scopes: &[Scope],
+    query: &SelectStmt,
+    format_json: bool,
+    ret: &Option<String>,
+) -> Result<Value, ExecError> {
+    let out = {
+        let mut sub_q = Q {
+            eng: &mut *q.eng,
+            snap: q.snap,
+            own: q.own,
+            all_xids: q.all_xids.clone(),
+            session: q.session,
+            role: q.role,
+            read_only: q.read_only,
+            depth: q.depth + 1,
+            lock_ids: &mut *q.lock_ids,
+            ctes: q.ctes.clone(),
+            wctx: None,
+            srf_vals: Vec::new(),
+            priv_scopes: q.priv_scopes.clone(),
+            hashed_exists: q.hashed_exists.clone(),
+            immutable_fn_cache: q.immutable_fn_cache.clone(),
+            plan_fold_memo: q.plan_fold_memo.clone(),
+            hashed_in: q.hashed_in.clone(),
+            pending_updates: None,
+            write: q.write.as_mut().map(QWrite::reborrow),
+        };
+        run_select(&mut sub_q, query, scopes)?
+    };
+    if out.columns.len() != 1 {
+        return Err(exec_err("42601", "subquery must return only one column"));
+    }
+    // The subquery column's static type drives the value category
+    // (and array-typed columns: row values may arrive as array
+    // literal text, which datum_to_json must see as an array).
+    let col_ty = out.columns[0].1;
+    let col_cat = ctor_cat_of_coltype(col_ty);
+    let rows: Vec<CtorArg> = out
+        .rows
+        .iter()
+        .map(|r| {
+            let mut v = r[0].clone();
+            if let (ColType::Array(elem), Value::Text(s)) = (&col_ty, &v) {
+                if let Ok(av) = super::eval::parse_array_literal(s, *elem) {
+                    v = Value::Array(Box::new(av));
+                }
+            }
+            CtorArg {
+                v,
+                cat: col_cat,
+                fmt: format_json,
+                enc: 0,
+            }
+        })
+        .collect();
+    let spec = ret.as_deref().unwrap_or("");
+    ctor_build_array(q, rows, true, spec, false)
+}

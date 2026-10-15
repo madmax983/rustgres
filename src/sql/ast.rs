@@ -1112,6 +1112,13 @@ pub enum AggFunc {
     JsonbAgg,
     JsonObjectAgg,
     JsonbObjectAgg,
+    // v1.90: SQL/JSON constructor aggregates (json.c). The value
+    // argument rides wrapped in a `__jsonagg_opt` marker Func carrying
+    // (format_json, null_on_null, unique, returning-spec) literals;
+    // the agg/window collectors strip it before evaluation.
+    // JsonObjectAggSql's key is `arg`, its (wrapped) value is `arg2`.
+    JsonArrayAgg,
+    JsonObjectAggSql,
     // v1.88: range aggregates (rangetypes.c): range_agg(anyrange) ->
     // anymultirange (also the multirange-input form), and
     // range_intersect_agg(anyrange) -> anyrange.
@@ -1138,6 +1145,8 @@ impl AggFunc {
             AggFunc::JsonbAgg => "jsonb_agg",
             AggFunc::JsonObjectAgg => "json_object_agg",
             AggFunc::JsonbObjectAgg => "jsonb_object_agg",
+            AggFunc::JsonArrayAgg => "json_arrayagg",
+            AggFunc::JsonObjectAggSql => "json_objectagg",
             AggFunc::RangeAgg => "range_agg",
             AggFunc::RangeIntersectAgg => "range_intersect_agg",
         }
@@ -1530,6 +1539,20 @@ pub enum Expr {
     },
     /// `(SELECT ...)` used as a value: 0 rows -> NULL, >1 row -> 21000.
     ScalarSub(Box<SelectStmt>),
+    /// v1.90: `JSON_ARRAY(<subquery> [FORMAT JSON] [RETURNING ...])`
+    /// (PG19 JsonArrayQueryConstructor): PG desugars it to
+    /// JSON_ARRAYAGG over the subquery with a COALESCE '[]', so zero
+    /// rows yield the empty array (after RETURNING coercion, which is
+    /// applied eagerly — an empty result still overflows varchar(1)).
+    /// `ret` is the RETURNING spec text (builtin name with typmod, or
+    /// a domain name); None = json. `ret_ty` is its resolved ColType
+    /// when it is a plain builtin (used for static typing).
+    JsonArraySubq {
+        query: Box<SelectStmt>,
+        format_json: bool,
+        ret: Option<String>,
+        ret_ty: Option<ColType>,
+    },
     /// v0.77: `array(SELECT ...)` — ARRAY constructor with a subquery.
     /// Evaluates the subquery and returns the first column of each row
     /// as a PG array literal (e.g. `{1,2,3}`). Currently returned as
@@ -3030,6 +3053,7 @@ pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>
         | Expr::Agg { .. }
         | Expr::WithinGroup { .. }
         | Expr::ScalarSub(_)
+        | Expr::JsonArraySubq { .. }
         | Expr::ArraySubquery(_)
         | Expr::InSub { .. }
         | Expr::Exists { .. }
@@ -5816,6 +5840,7 @@ pub(crate) fn max_param_expr(e: &Expr) -> usize {
             .max()
             .unwrap_or(0),
         Expr::ScalarSub(s) => max_param_select(s),
+        Expr::JsonArraySubq { query, .. } => max_param_select(query),
         Expr::ArraySubquery(s) => max_param_select(s),
         Expr::InSub { expr, sub, .. } => max_param_expr(expr).max(max_param_select(sub)),
         // v0.87: quantified comparison and user operator.

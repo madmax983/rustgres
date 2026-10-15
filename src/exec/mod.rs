@@ -245,6 +245,9 @@ mod v188_range_tests;
 #[path = "test_mods/v189_jsontable_tests.rs"]
 mod v189_jsontable_tests;
 #[cfg(test)]
+#[path = "test_mods/v190_ctor_tests.rs"]
+mod v190_ctor_tests;
+#[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;
 

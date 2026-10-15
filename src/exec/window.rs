@@ -313,6 +313,7 @@ pub(crate) fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecErr
         | Expr::Literal(_)
         | Expr::Param(_)
         | Expr::ScalarSub(_)
+        | Expr::JsonArraySubq { .. }
         | Expr::ArraySubquery(_)
         | Expr::Exists { .. } => Ok(()),
     }
@@ -357,6 +358,10 @@ pub(crate) fn check_agg_window_arity(f: &AggFunc, n: usize) -> bool {
         // window machinery does not carry (StringAgg precedent).
         AggFunc::JsonAgg | AggFunc::JsonbAgg => n == 1,
         AggFunc::JsonObjectAgg | AggFunc::JsonbObjectAgg => false,
+        // v1.90: PG19 supports both SQL/JSON constructor aggregates
+        // as window functions.
+        AggFunc::JsonArrayAgg => n == 1,
+        AggFunc::JsonObjectAggSql => n == 2,
         // v1.88: PG19 allows range_agg / range_intersect_agg as window
         // aggregates.
         AggFunc::RangeAgg | AggFunc::RangeIntersectAgg => n == 1,
@@ -1641,6 +1646,78 @@ pub(crate) fn compute_partition(
                         .is_some_and(|a| expr_is_statically_array(a, None));
                 for j in 0..n {
                     let (s, e) = resolve_frame(spec, input, idxs, j, &peer_id)?;
+                    // v1.90: windowed SQL/JSON constructor aggregates
+                    // need their marker options and (for
+                    // JSON_OBJECTAGG) both argument streams, which
+                    // the single-stream path below cannot carry.
+                    if matches!(f, AggFunc::JsonArrayAgg | AggFunc::JsonObjectAggSql) {
+                        let is_obj = *f == AggFunc::JsonObjectAggSql;
+                        let marker_expr = if is_obj { &spec.args[1] } else { &spec.args[0] };
+                        let (_, o) = super::json::jsonagg_opt_unwrap(marker_expr);
+                        let o = o.unwrap_or_default();
+                        let kcat = super::json::ctor_cat_shallow_nodb(&spec.args[0]);
+                        let vcat = if is_obj {
+                            super::json::ctor_cat_shallow_nodb(&spec.args[1])
+                        } else {
+                            kcat
+                        };
+                        let mut nrows = 0usize;
+                        let mut cargs: Vec<super::json::CtorArg> = Vec::new();
+                        let mut cpairs: Vec<(super::json::CtorArg, super::json::CtorArg)> =
+                            Vec::new();
+                        if s <= e {
+                            for p in s..=e {
+                                if filt(p) || excl(j, p) {
+                                    continue;
+                                }
+                                nrows += 1;
+                                if is_obj {
+                                    cpairs.push((
+                                        super::json::CtorArg {
+                                            v: arg(p, 0),
+                                            cat: kcat,
+                                            fmt: false,
+                                            enc: 0,
+                                        },
+                                        super::json::CtorArg {
+                                            v: arg(p, 1),
+                                            cat: vcat,
+                                            fmt: o.fmt,
+                                            enc: o.enc,
+                                        },
+                                    ));
+                                } else {
+                                    cargs.push(super::json::CtorArg {
+                                        v: arg(p, 0),
+                                        cat: vcat,
+                                        fmt: o.fmt,
+                                        enc: o.enc,
+                                    });
+                                }
+                            }
+                        }
+                        out[j] = if nrows == 0 {
+                            Value::Null
+                        } else if is_obj {
+                            let (text, jb) = super::json::ctor_build_object_parts(
+                                cpairs,
+                                !o.null_on_null,
+                                o.unique,
+                                &o.spec,
+                                true,
+                            )?;
+                            super::json::ctor_apply_returning_pure(text, &jb, &o.spec)?
+                        } else {
+                            let (text, jb) = super::json::ctor_build_array_parts(
+                                cargs,
+                                !o.null_on_null,
+                                &o.spec,
+                                true,
+                            )?;
+                            super::json::ctor_apply_returning_pure(text, &jb, &o.spec)?
+                        };
+                        continue;
+                    }
                     let mut vals: Vec<Value> = Vec::new();
                     if s <= e {
                         for p in s..=e {
@@ -1758,6 +1835,15 @@ pub(crate) fn eval_window_agg(
             }
             Ok(Value::jsonb(JsonbVal::Array(elems).render()))
         }
+        // v1.90: windowed SQL/JSON constructor aggregates are
+        // intercepted in compute_partition (they need their marker
+        // options and both argument streams); reaching here means a
+        // caller without that interception — fail like the other
+        // two-stream aggregates.
+        AggFunc::JsonArrayAgg | AggFunc::JsonObjectAggSql => Err(exec_err(
+            "0A000",
+            "SQL/JSON constructor aggregate is not supported as a window function here",
+        )),
         AggFunc::JsonObjectAgg | AggFunc::JsonbObjectAgg => Err(exec_err(
             "0A000",
             "json_object_agg is not supported as a window function",

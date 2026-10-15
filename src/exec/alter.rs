@@ -573,6 +573,7 @@ pub(crate) fn rename_col_in_expr(e: &mut Expr, old: &str, new: &str) {
         // v1.30: ordered-set aggregates resolve like plain aggregates.
         Expr::WithinGroup { .. } => {}
         Expr::ScalarSub(_)
+        | Expr::JsonArraySubq { .. }
         | Expr::ArraySubquery(_)
         | Expr::InSub { .. }
         | Expr::Quantified { .. }

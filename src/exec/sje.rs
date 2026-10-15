@@ -1209,6 +1209,7 @@ pub(crate) fn sje_rewrite_qual(e: &Expr, from_q: &str, to_q: &str) -> Option<Exp
         Expr::InSub { .. }
         | Expr::Quantified { .. }
         | Expr::ScalarSub(_)
+        | Expr::JsonArraySubq { .. }
         | Expr::ArraySubquery(_)
         | Expr::Exists { .. } => return None,
         Expr::UserOp { op, left, right } => Expr::UserOp {

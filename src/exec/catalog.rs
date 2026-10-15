@@ -894,6 +894,7 @@ pub(crate) fn stmt_uses_pg_column_compression(stmt: &SelectStmt) -> bool {
             }
             Expr::ScalarSub(s) => stmt_uses_pg_column_compression(s),
             Expr::ArraySubquery(s) => stmt_uses_pg_column_compression(s),
+            Expr::JsonArraySubq { query, .. } => stmt_uses_pg_column_compression(query),
             Expr::InSub { expr, sub, .. } => {
                 expr_uses(expr) || stmt_uses_pg_column_compression(sub)
             }
@@ -1013,6 +1014,7 @@ pub(crate) fn stmt_uses_tableoid(stmt: &SelectStmt) -> bool {
             }
             Expr::ScalarSub(s) => stmt_uses_tableoid(s),
             Expr::ArraySubquery(s) => stmt_uses_tableoid(s),
+            Expr::JsonArraySubq { query, .. } => stmt_uses_tableoid(query),
             Expr::InSub { expr, sub, .. } => expr_uses(expr) || stmt_uses_tableoid(sub),
             Expr::Quantified { left, sub, .. } => expr_uses(left) || stmt_uses_tableoid(sub),
             Expr::UserOp { left, right, .. } => expr_uses(left) || expr_uses(right),
@@ -1132,6 +1134,7 @@ pub(crate) fn stmt_uses_xmin_xmax(stmt: &SelectStmt) -> bool {
             }
             Expr::ScalarSub(s) => stmt_uses_xmin_xmax(s),
             Expr::ArraySubquery(s) => stmt_uses_xmin_xmax(s),
+            Expr::JsonArraySubq { query, .. } => stmt_uses_xmin_xmax(query),
             Expr::InSub { expr, sub, .. } => expr_uses(expr) || stmt_uses_xmin_xmax(sub),
             Expr::Quantified { left, sub, .. } => expr_uses(left) || stmt_uses_xmin_xmax(sub),
             Expr::UserOp { left, right, .. } => expr_uses(left) || expr_uses(right),
@@ -1371,9 +1374,11 @@ pub(crate) fn resolve_predicate_columns_in(
         // Leaves and already-resolved nodes pass through (idempotent).
         Expr::ResolvedCol { .. } | Expr::Literal(_) | Expr::Param(_) => Ok(pred.clone()),
         // Separate query levels: runtime resolution (correlation intact).
-        Expr::ScalarSub(_) | Expr::ArraySubquery(_) | Expr::InSub { .. } | Expr::Exists { .. } => {
-            Ok(pred.clone())
-        }
+        Expr::ScalarSub(_)
+        | Expr::JsonArraySubq { .. }
+        | Expr::ArraySubquery(_)
+        | Expr::InSub { .. }
+        | Expr::Exists { .. } => Ok(pred.clone()),
         // v0.87: quantified comparison — resolve the outer `left`, leave
         // the subquery for runtime resolution (like InSub).
         Expr::Quantified {
@@ -2216,6 +2221,7 @@ pub(crate) fn expr_mentions_row_input(e: &Expr) -> bool {
             | Expr::WholeRow { .. }
             | Expr::Param(_)
             | Expr::ScalarSub(_)
+            | Expr::JsonArraySubq { .. }
             | Expr::ArraySubquery(_)
             | Expr::InSub { .. }
             | Expr::Exists { .. }
@@ -2555,6 +2561,11 @@ pub(crate) fn select_foldable(
             }
             Expr::ScalarSub(sub) | Expr::ArraySubquery(sub) | Expr::Exists { sub, .. } => {
                 if !select_foldable(db, scopes, sub, visiting, depth, ctes) {
+                    ok = false;
+                }
+            }
+            Expr::JsonArraySubq { query, .. } => {
+                if !select_foldable(db, scopes, query, visiting, depth, ctes) {
                     ok = false;
                 }
             }

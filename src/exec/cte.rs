@@ -876,6 +876,7 @@ pub(crate) fn validate_from(f: &FromItem) -> Result<(), ExecError> {
 pub(crate) fn validate_expr(e: &Expr) -> Result<(), ExecError> {
     match e {
         Expr::ScalarSub(s) => validate_select(s),
+        Expr::JsonArraySubq { query, .. } => validate_select(query),
         Expr::InSub { expr, sub, .. } => {
             validate_expr(expr)?;
             validate_select(sub)
@@ -1054,7 +1055,10 @@ pub(crate) fn contains_agg(e: &Expr) -> bool {
         Expr::Quantified { left, .. } => contains_agg(left),
         Expr::UserOp { left, right, .. } => contains_agg(left) || contains_agg(right),
         // ScalarSub / ArraySubquery / Exists are separate query levels.
-        Expr::ScalarSub(_) | Expr::ArraySubquery(_) | Expr::Exists { .. } => false,
+        Expr::ScalarSub(_)
+        | Expr::JsonArraySubq { .. }
+        | Expr::ArraySubquery(_)
+        | Expr::Exists { .. } => false,
         // v0.10: a window counts as an aggregate when any of its input
         // expressions does (e.g. `sum(x) OVER (...)`).
         Expr::Window {
@@ -1236,6 +1240,7 @@ pub(crate) fn expr_walk<'a>(e: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
             | Expr::Literal(_)
             | Expr::Param(_)
             | Expr::ScalarSub(_)
+            | Expr::JsonArraySubq { .. }
             | Expr::ArraySubquery(_)
             | Expr::Exists { .. } => {}
         }
@@ -1473,6 +1478,9 @@ pub(crate) fn contains_window(e: &Expr) -> bool {
         Expr::Quantified { left, .. } => contains_window(left),
         Expr::UserOp { left, right, .. } => contains_window(left) || contains_window(right),
         // Subqueries are separate query levels.
-        Expr::ScalarSub(_) | Expr::ArraySubquery(_) | Expr::Exists { .. } => false,
+        Expr::ScalarSub(_)
+        | Expr::JsonArraySubq { .. }
+        | Expr::ArraySubquery(_)
+        | Expr::Exists { .. } => false,
     }
 }

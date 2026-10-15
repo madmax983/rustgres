@@ -973,6 +973,7 @@ pub(crate) fn collect_target_srfs(
         // v1.30: ordered-set aggregates prune like plain aggregates.
         Expr::Agg { .. } | Expr::WithinGroup { .. } | Expr::Window { .. } => {}
         Expr::ScalarSub(_)
+        | Expr::JsonArraySubq { .. }
         | Expr::ArraySubquery(_)
         | Expr::InSub { .. }
         | Expr::Quantified { .. }
@@ -1429,6 +1430,7 @@ pub(crate) fn eval_grouped(
             eval_quantified_value(q, &scopes, lv, op, *quant, sub)
         }
         Expr::ScalarSub(_)
+        | Expr::JsonArraySubq { .. }
         | Expr::ArraySubquery(_)
         | Expr::InSub { .. }
         | Expr::Quantified { .. }
@@ -1745,6 +1747,24 @@ pub(crate) fn eval_grouped(
                 }
                 check_builtin_arity(name, &vals)?;
                 return eval_pg_relation_size(q, &vals);
+            }
+            // v1.90: SQL/JSON constructors in grouped context — their
+            // arguments may contain aggregates (JSON_OBJECT over
+            // JSON_OBJECTAGG), so they evaluate through eval_grouped.
+            {
+                let gsc = Scope {
+                    schema: gscope.schema,
+                    row: gscope.row,
+                    prov: gscope.prov,
+                };
+                let mut chained: Vec<Scope> = outer.to_vec();
+                chained.push(gsc);
+                let mut ev = |qq: &mut Q, e: &Expr| {
+                    eval_grouped(qq, outer, gscope, schema, rows, idxs, key_vals, group_by, e)
+                };
+                if let Some(r) = try_eval_ctor_func(q, &chained, name, args, &mut ev) {
+                    return r;
+                }
             }
             let mut vals = Vec::with_capacity(args.len());
             for a in args {
@@ -2733,6 +2753,30 @@ pub(crate) fn eval_agg_func(
         return Ok(Value::BigInt(idxs.len() as i64));
     }
     let a = arg.expect("non-COUNT aggregates take an argument");
+    // v1.90: SQL/JSON constructor aggregates carry their options on
+    // a __jsonagg_opt marker around the value argument; strip it so
+    // the collector evaluates the bare value expression.
+    let mut jopts = super::json::JsonAggOpts::default();
+    let (a, arg2) = match func {
+        AggFunc::JsonArrayAgg => {
+            let (inner, o) = super::json::jsonagg_opt_unwrap(a);
+            if let Some(o) = o {
+                jopts = o;
+            }
+            (inner, arg2)
+        }
+        AggFunc::JsonObjectAggSql => {
+            let (inner, o) = super::json::jsonagg_opt_unwrap(
+                arg2.expect("json_objectagg takes a value argument"),
+            );
+            if let Some(o) = o {
+                jopts = o;
+            }
+            (a, Some(inner))
+        }
+        _ => (a, arg2),
+    };
+    let _ = &jopts;
     // v1.29: FILTER applies at the aggregate's input — before the
     // in-aggregate ORDER BY sort (PG19 builds the sort from
     // filter-passing rows) and before DISTINCT dedup.
@@ -2785,6 +2829,10 @@ pub(crate) fn eval_agg_func(
         }
         visit = keyed.into_iter().map(|(_, i)| i).collect();
     }
+    // v1.90: post-FILTER/ORDER input-row count: JSON_ARRAYAGG and
+    // JSON_OBJECTAGG distinguish zero input rows (-> NULL) from
+    // rows that are all ABSENT ON NULL (-> [] / {}).
+    let jagg_saw_input = !visit.is_empty();
     // `visit.len() == idxs.len()` is an exact upper bound: the loop
     // below pushes at most one value per visited row (NULLs are
     // skipped, never adding to the count), so this avoids the 0->4->8->16
@@ -2825,7 +2873,11 @@ pub(crate) fn eval_agg_func(
         // argument per row into `delims` (StringAgg's channel) and
         // keep every row: a NULL key errors at finalize, a NULL value
         // becomes a JSON null (PG19 json_objectagg_transfn).
-        } else if matches!(func, AggFunc::JsonObjectAgg | AggFunc::JsonbObjectAgg) {
+        // v1.90: JSON_OBJECTAGG rides the same channel.
+        } else if matches!(
+            func,
+            AggFunc::JsonObjectAgg | AggFunc::JsonbObjectAgg | AggFunc::JsonObjectAggSql
+        ) {
             let d = eval_expr(
                 q,
                 scopes,
@@ -2833,6 +2885,13 @@ pub(crate) fn eval_agg_func(
             )?;
             vals.push(v);
             delims.push(d);
+        // v1.90: JSON_ARRAYAGG — SQL NULL inputs are kept in `vals`
+        // only under NULL ON NULL; the ABSENT rule tests the exact
+        // NULL datum (a whole-row record is a value, not a null).
+        } else if func == AggFunc::JsonArrayAgg {
+            if v != Value::Null || jopts.null_on_null {
+                vals.push(v);
+            }
         // v0.73: a whole-row value counts as null iff every field is
         // null (PG19: `count(t.*)` skips null-extended outer-join rows).
         // v0.92: array_agg keeps NULL inputs — PG19 "Collects all the
@@ -2861,7 +2920,10 @@ pub(crate) fn eval_agg_func(
             value_key(v, &mut k);
             if matches!(
                 func,
-                AggFunc::StringAgg | AggFunc::JsonObjectAgg | AggFunc::JsonbObjectAgg
+                AggFunc::StringAgg
+                    | AggFunc::JsonObjectAgg
+                    | AggFunc::JsonbObjectAgg
+                    | AggFunc::JsonObjectAggSql
             ) {
                 if let Some(d) = delims.get(i) {
                     value_key(d, &mut k);
@@ -3010,6 +3072,65 @@ pub(crate) fn eval_agg_func(
             }
             out.push('}');
             Ok(Value::text(out))
+        }
+        // v1.90: JSON_ARRAYAGG — zero input rows -> NULL (PG has no
+        // initcond); otherwise the constructor array over the kept
+        // values (NULLs already filtered unless NULL ON NULL).
+        AggFunc::JsonArrayAgg => {
+            if !jagg_saw_input {
+                return Ok(Value::Null);
+            }
+            let cat = super::json::ctor_cat_shallow(&q.eng.db, a);
+            let rows: Vec<super::json::CtorArg> = vals
+                .iter()
+                .map(|v| super::json::CtorArg {
+                    v: v.clone(),
+                    cat,
+                    fmt: jopts.fmt,
+                    enc: jopts.enc,
+                })
+                .collect();
+            super::json::ctor_build_array(q, rows, !jopts.null_on_null, &jopts.spec, true)
+        }
+        // v1.90: JSON_OBJECTAGG — zero input rows -> NULL; pairs
+        // ride the (vals, delims) channels like json_object_agg.
+        AggFunc::JsonObjectAggSql => {
+            if !jagg_saw_input {
+                return Ok(Value::Null);
+            }
+            let kcat = super::json::ctor_cat_shallow(&q.eng.db, a);
+            let vcat = super::json::ctor_cat_shallow(
+                &q.eng.db,
+                arg2.expect("json_objectagg value argument"),
+            );
+            let pairs: Vec<(super::json::CtorArg, super::json::CtorArg)> = vals
+                .iter()
+                .zip(delims.iter())
+                .map(|(k, v)| {
+                    (
+                        super::json::CtorArg {
+                            v: k.clone(),
+                            cat: kcat,
+                            fmt: false,
+                            enc: 0,
+                        },
+                        super::json::CtorArg {
+                            v: v.clone(),
+                            cat: vcat,
+                            fmt: jopts.fmt,
+                            enc: jopts.enc,
+                        },
+                    )
+                })
+                .collect();
+            super::json::ctor_build_object(
+                q,
+                pairs,
+                !jopts.null_on_null,
+                jopts.unique,
+                &jopts.spec,
+                true,
+            )
         }
         // v1.88: range_agg — the union of all input ranges as a
         // multirange. vals holds only non-NULL inputs (the collector
