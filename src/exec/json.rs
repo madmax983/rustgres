@@ -1861,6 +1861,34 @@ pub(crate) fn escape_json_into(s: &str, out: &mut String) {
 /// their output text (Infinity overflows like PG's float->numeric
 /// conversion); arrays nest by dimension; records become objects
 /// (canonicalized: sorted keys, last duplicate wins).
+/// Cheap stand-in for `datum_to_jsonb`, used only when the caller has
+/// already determined the jsonb tree it would build is going to be
+/// discarded (jsonb-mode is off and RETURNING isn't jsonb -- the
+/// default-RETURNING JSON_OBJECT/JSON_ARRAY path, by far the common
+/// case for a plain `SELECT JSON_OBJECT(...) FROM t` query). These
+/// kinds can never fail (SmallInt/Int/BigInt/Numeric -- see the
+/// `.unwrap()`s below) or fail on exactly one cheap-to-check
+/// condition (a NUL byte in a string), so checking that condition
+/// directly skips the `Numeric`/`String`/`JsonbVal` allocations
+/// `datum_to_jsonb` would otherwise build only to throw away. Kinds
+/// whose error path costs as much as the real conversion (floats,
+/// whose overflow check needs the same `Numeric::parse` the real
+/// builder does) or that recurse (arrays, records, embedded jsonb)
+/// return `None`, and the caller falls through to `datum_to_jsonb`.
+fn datum_jsonb_skip_tree(v: &Value) -> Option<Result<(), ExecError>> {
+    match v {
+        Value::Null
+        | Value::Bool(_)
+        | Value::SmallInt(_)
+        | Value::Int(_)
+        | Value::BigInt(_)
+        | Value::Numeric(_) => Some(Ok(())),
+        Value::Text(s) => Some(jsonb_nul_check(s)),
+        Value::BpChar(s) => Some(jsonb_nul_check(crate::storage::rtrim_spaces(s))),
+        _ => None,
+    }
+}
+
 pub(crate) fn datum_to_jsonb(v: &Value) -> Result<JsonbVal, ExecError> {
     match v {
         Value::Null => Ok(JsonbVal::Null),
@@ -1905,10 +1933,18 @@ pub(crate) fn datum_to_jsonb(v: &Value) -> Result<JsonbVal, ExecError> {
 }
 
 fn jsonb_string_value(s: &str) -> Result<JsonbVal, ExecError> {
+    jsonb_nul_check(s)?;
+    Ok(JsonbVal::Str(s.to_string()))
+}
+
+/// The one error `jsonb_string_value` can raise, split out so a
+/// caller that only needs to know *whether* a string converts (not
+/// the resulting `JsonbVal`) can check it without allocating.
+fn jsonb_nul_check(s: &str) -> Result<(), ExecError> {
     if s.contains('\0') {
         return Err(exec_err("22P02", "\\u0000 cannot be converted to text."));
     }
-    Ok(JsonbVal::Str(s.to_string()))
+    Ok(())
 }
 
 fn datum_float_to_jsonb(f: f64) -> Result<JsonbVal, ExecError> {
@@ -4311,7 +4347,11 @@ pub(crate) fn ctor_check_fmt(a: &CtorArg) -> Result<(), ExecError> {
     Ok(())
 }
 
-fn ctor_value_piece(a: &CtorArg) -> Result<(String, JsonbVal), ExecError> {
+/// `need_jb` is false when the caller has already established the
+/// returned `JsonbVal` will never be read (see `ctor_build_object_parts`
+/// / `ctor_build_array_parts`): the plain-datum arm below then uses
+/// `datum_jsonb_skip_tree` to skip building it when that's cheap.
+fn ctor_value_piece(a: &CtorArg, need_jb: bool) -> Result<(String, JsonbVal), ExecError> {
     if a.fmt {
         ctor_check_fmt(a)?;
         if let Value::Jsonb(s) = &a.v {
@@ -4336,6 +4376,10 @@ fn ctor_value_piece(a: &CtorArg) -> Result<(String, JsonbVal), ExecError> {
     }
     let mut piece = String::new();
     datum_to_json_text(&a.v, &mut piece);
+    if !need_jb && let Some(check) = datum_jsonb_skip_tree(&a.v) {
+        check?;
+        return Ok((piece, JsonbVal::Null));
+    }
     let jb = datum_to_jsonb(&a.v)?;
     Ok((piece, jb))
 }
@@ -4602,10 +4646,12 @@ pub(crate) fn ctor_build_object_parts(
             text.push('"');
             escape_json_into(k, &mut text);
             text.push_str("\" : null");
-            jb_pairs.push((k.clone(), JsonbVal::Null));
+            if jsonb_mode {
+                jb_pairs.push((k.clone(), JsonbVal::Null));
+            }
             continue;
         }
-        let (piece, jb) = ctor_value_piece(v)?;
+        let (piece, jb) = ctor_value_piece(v, jsonb_mode)?;
         if !first {
             text.push_str(", ");
         }
@@ -4614,7 +4660,14 @@ pub(crate) fn ctor_build_object_parts(
         escape_json_into(k, &mut text);
         text.push_str("\" : ");
         text.push_str(&piece);
-        jb_pairs.push((k.clone(), jb));
+        // `jb_pairs` only feeds the jsonb tree below, which is itself
+        // only read (via `jb.render()` or by a "jsonb"-RETURNING
+        // caller) when `jsonb_mode` is set -- so building it at all
+        // when it isn't is pure waste (a `String` clone of every key
+        // plus whatever `ctor_value_piece` built for every value).
+        if jsonb_mode {
+            jb_pairs.push((k.clone(), jb));
+        }
     }
     text.push_str(if agg_style { " }" } else { "}" });
     if pairs.is_empty() {
@@ -4624,7 +4677,11 @@ pub(crate) fn ctor_build_object_parts(
             "{}".to_string()
         };
     }
-    let jb = jsonb_canon(JsonbVal::Object(jb_pairs));
+    let jb = if jsonb_mode {
+        jsonb_canon(JsonbVal::Object(jb_pairs))
+    } else {
+        JsonbVal::Null
+    };
     let effective = if jsonb_mode { jb.render() } else { text };
     Ok((effective, jb))
 }
@@ -4667,10 +4724,12 @@ pub(crate) fn ctor_build_array_parts(
             }
             first = false;
             text.push_str("null");
-            jb_elems.push(JsonbVal::Null);
+            if jsonb_mode {
+                jb_elems.push(JsonbVal::Null);
+            }
             continue;
         }
-        let (piece, jb) = ctor_value_piece(a)?;
+        let (piece, jb) = ctor_value_piece(a, jsonb_mode)?;
         if !first {
             text.push_str(", ");
             // json_array_agg's transition (json.c) inserts a
@@ -4682,10 +4741,19 @@ pub(crate) fn ctor_build_array_parts(
         }
         first = false;
         text.push_str(&piece);
-        jb_elems.push(jb);
+        // See ctor_build_object_parts: `jb_elems` only feeds the
+        // jsonb tree below, itself only read when `jsonb_mode` is
+        // set.
+        if jsonb_mode {
+            jb_elems.push(jb);
+        }
     }
     text.push(']');
-    let jb = JsonbVal::Array(jb_elems);
+    let jb = if jsonb_mode {
+        JsonbVal::Array(jb_elems)
+    } else {
+        JsonbVal::Null
+    };
     let effective = if jsonb_mode { jb.render() } else { text };
     Ok((effective, jb))
 }
