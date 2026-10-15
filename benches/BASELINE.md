@@ -2,6 +2,74 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: default-RETURNING `JSON_OBJECT`/`JSON_ARRAY` builds a full jsonb tree it never reads — baseline — 2026-10-15
+
+**Why this workload**: v1.90 (2026-10-15, the commit immediately
+before this round) added the entire SQL/JSON constructor family —
+`JSON_OBJECT`, `JSON_ARRAY`, `JSON()`, `JSON_SCALAR`,
+`JSON_SERIALIZE`, `JSON_ARRAYAGG`, `JSON_OBJECTAGG`, `IS JSON` — none
+of it profiled by any prior Bolt round. `benches/profile_jsonctor.py`
+(new) loads 2000 rows of ordinary relational columns (`id INT, name
+TEXT, status TEXT, total NUMERIC(10,2), qty INT`), then runs 10 exact
+iterations of `SELECT JSON_OBJECT('id': id, 'name': name, 'status':
+status, 'total': total, 'qty': qty) FROM bench_jsonctor` — the
+textbook SQL/JSON use case the PG19 docs lead with (building a JSON
+API response straight from relational columns, instead of
+serializing rows in application code), using the default (no
+RETURNING clause) output mode, over the real wire protocol, debug
+build, fresh data dir. One PR open at the time of this round (`#49`,
+decode `json::parse_string` via `&str`) targets an unrelated function
+in the same file.
+
+Reproduce:
+```bash
+cargo build
+RUSTGRES_DATA_DIR=$(mktemp -d) valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out --collect-jumps=yes --cache-sim=yes ./target/debug/rustgres &
+python3 benches/profile_jsonctor.py --rows 2000 --count 10 --timeout 1800
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | head -40
+# swap --tool=dhat --dhat-out-file=/tmp/dhat.out for the allocation profile
+```
+
+📈 **Profile** (Callgrind, valgrind 3.22.0, current HEAD v1.90):
+**2,456,716,530** total `Ir`.
+
+DHAT (same workload): **1,178,247** total allocation blocks,
+**81,980,853** total bytes. Attributing every allocation whose call
+stack passes through `datum_to_jsonb` (and the `Numeric::parse`/
+`jsonb_string_value` helpers it calls), the `jb_pairs.push`
+accumulation in `ctor_build_object_parts`, or `jsonb_canon`'s own
+sort/dedup — i.e. everything that exists only to build the `JsonbVal`
+tree a default-RETURNING `JSON_OBJECT` call never reads, as opposed
+to the `text`/`piece` building that every call needs regardless —
+accounts for **27.67%** of total allocation blocks and **35.23%** of
+total bytes, clearing the ≥10%-of-allocations floor by nearly 3x on
+blocks.
+
+💡 **Hypothesis**: `ctor_build_object_parts`/`ctor_build_array_parts`
+(the shared core of `JSON_OBJECT`/`JSON_ARRAY` and their aggregate
+variants `JSON_OBJECTAGG`/`JSON_ARRAYAGG`) unconditionally build a
+complete `JsonbVal` tree for every value — cloning every key, calling
+`datum_to_jsonb` on every value (itself calling
+`Numeric::parse(&i.to_string())` for every integer, `.to_string()`
+for every piece of text, …), then running the whole object/array
+through `jsonb_canon`'s sort/dedup or an `Array` wrap — even though
+that tree is read back in exactly one case: `jsonb_mode` is set,
+meaning some argument is itself jsonb-typed or `RETURNING jsonb` was
+given (`ctor_apply_returning`'s `"" | "json"` arm returns the
+already-built `text` directly, never touching `jb`). The by-far-common
+case — plain relational columns, no `RETURNING` clause, the textbook
+usage this feature was built for — throws the entire tree away
+unread, paying a full parallel allocation-heavy conversion (a
+`Numeric` parse and a `String`/`Vec` allocation per value, a further
+`Vec` per object/array, a sort/dedup pass) for nothing.
+
+`cargo test --all-features`: 986/986 passed (pre-change tree,
+unmodified).
+
+Before profiles committed:
+`benches/profiles/{callgrind,dhat}.out.jsonctor-base-2026-10-15`.
+
 ## Bolt: `jsonb_val_arg`/`parse_jsonb` re-parses a jsonb/text argument's entire text into a fresh `JsonbVal` tree on every call — fix — 2026-10-14
 
 Fixes the target identified in the baseline entry immediately below this
