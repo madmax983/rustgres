@@ -2,6 +2,94 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: default-RETURNING `JSON_OBJECT`/`JSON_ARRAY` builds a full jsonb tree it never reads — fix — 2026-10-15
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec/json.rs`:
+
+* `ctor_build_object_parts`/`ctor_build_array_parts` now only
+  accumulate into `jb_pairs`/`jb_elems` and only call
+  `jsonb_canon`/wrap the `JsonbVal::Array` when `jsonb_mode` is set
+  (some argument is itself jsonb-typed, or `RETURNING jsonb` was
+  given); otherwise the returned `jb` is a cheap `JsonbVal::Null`
+  placeholder. This is safe because `jb` is read in exactly two
+  places — `effective = jb.render()` a few lines down (gated on the
+  same `jsonb_mode`) and `ctor_apply_returning`/
+  `ctor_apply_returning_pure`'s `"jsonb"` arm — and `jsonb_mode`
+  already includes `ctor_spec_is_jsonb(spec)` in its own OR-clause,
+  so `jsonb_mode` is false only when neither reader would ever touch
+  the placeholder.
+* `ctor_value_piece` takes the caller's `need_jb` flag and, when
+  false, calls the new `datum_jsonb_skip_tree` instead of the real
+  `datum_to_jsonb` for the scalar kinds that either can never fail
+  (`SmallInt`/`Int`/`BigInt`/`Numeric` — see the `.unwrap()`s in
+  `datum_to_jsonb` itself) or fail on exactly one cheap check
+  (`Text`/`BpChar`'s embedded-NUL check, factored out of
+  `jsonb_string_value` into the shared `jsonb_nul_check` so both
+  paths raise the identical `22P02` error). Floats, arrays, records,
+  and embedded json/jsonb values fall through to the real
+  `datum_to_jsonb` unconditionally — their error paths cost as much
+  as the real conversion (a float's overflow check needs the same
+  `Numeric::parse` of its formatted text; arrays/records recurse) —
+  so those keep their exact existing behavior and existing cost,
+  unoptimized.
+
+Behavior is preserved exactly, including the two error conditions
+`datum_to_jsonb` can raise, in *both* RETURNING modes: manually
+verified `JSON_OBJECT('a': E'x\000y')` and
+`JSON_OBJECT('a': E'x\000y' RETURNING jsonb)` still both raise
+`22P02 \u0000 cannot be converted to text.` (no prior test exercised
+a NUL byte through a constructor), and `JSON_ARRAY('inf'::float8)`
+still raises `22003 value overflows numeric format` unconditionally.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_jsonctor.py --rows 2000 --count 10`),
+same workload, same machine, same session.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes`):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total `Ir` | 2,456,716,530 | 1,866,522,270 | **-24.02%** |
+
+DHAT (same workload, one run each before/after):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total allocation blocks | 1,178,247 | 858,247 | **-27.16%** |
+| Total allocation bytes | 81,980,853 | 53,120,833 | **-35.20%** |
+
+The `Ir` delta (-24.02%) clears the ≥5%-of-profile floor by nearly
+5x; the DHAT deltas (-27.16% blocks, -35.20% bytes) clear the
+≥10%-of-allocations floor independently and land within half a point
+of the baseline entry's own call-stack-attributed estimate
+(27.67%/35.23%) — the allocations that disappear are exactly the
+ones the hypothesis named.
+
+`cargo test --all-features`: 986/986 passed, unchanged. `cargo fmt
+--all -- --check`: clean. `cargo clippy --all-targets --all-features
+-- -D warnings`: 781 errors on both the pre-change and post-change
+tree (sorted-diff identical after fixing one `collapsible_if` the
+change itself introduced) — the same pre-existing
+toolchain/lint-version mismatch noted throughout this file; zero net
+new errors/warnings from this diff.
+`tests/conformance/schedule_runner.py --tests
+json,jsonb,sqljson,sqljson_queryfuncs`: identical PASS=1607/
+REAL-FAIL=689 (of 2297 scored) on both trees — zero behavior change.
+
+Before/after profiles committed:
+`benches/profiles/{callgrind,dhat}.out.jsonctor-{base,after}-2026-10-15`.
+
+**Reproduce**: check out the parent (baseline) commit, `cargo build`,
+repeat the Callgrind/DHAT commands in the baseline entry's
+"Reproduce" section for the before numbers; check out this commit,
+`cargo build`, repeat for the after numbers.
+
 ## Bolt: default-RETURNING `JSON_OBJECT`/`JSON_ARRAY` builds a full jsonb tree it never reads — baseline — 2026-10-15
 
 **Why this workload**: v1.90 (2026-10-15, the commit immediately
