@@ -992,8 +992,17 @@ pub(crate) fn parse_record_literal(
                     out.push(chars[*pos] as char);
                     *pos += 1;
                 } else if c == b'"' {
-                    *pos += 1;
-                    break;
+                    // v1.92: PG record_in treats a doubled quote
+                    // inside a quoted field as a literal quote
+                    // (record_out emits that form); a single quote
+                    // closes the field.
+                    if chars.get(*pos + 1) == Some(&b'"') {
+                        out.push('"');
+                        *pos += 2;
+                    } else {
+                        *pos += 1;
+                        break;
+                    }
                 } else {
                     out.push(c as char);
                     *pos += 1;
@@ -4049,6 +4058,24 @@ pub(crate) fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ord
         }
         _ => {}
     }
+    // v1.92: unknown-literal coercion for bit strings — a text
+    // operand against a bit string parses through bit_in (PG
+    // resolves the unknown literal to the peer type; this is what
+    // domain CHECKs like `VALUE <> '01'` over a varbit domain ride
+    // on).
+    match (a, b) {
+        (Value::Text(t) | Value::BpChar(t), Value::BitString(_)) => {
+            let parsed = crate::storage::BitString::parse_input(t.trim())
+                .map_err(|m| exec_err("22P02", m))?;
+            return cmp_ordering(&Value::BitString(parsed), b, op);
+        }
+        (Value::BitString(_), Value::Text(t) | Value::BpChar(t)) => {
+            let parsed = crate::storage::BitString::parse_input(t.trim())
+                .map_err(|m| exec_err("22P02", m))?;
+            return cmp_ordering(a, &Value::BitString(parsed), op);
+        }
+        _ => {}
+    }
     // v1.88: unknown-literal coercion for ranges — a text operand
     // against a range/multirange parses as that type (PG resolves the
     // unknown literal to the peer type).
@@ -4148,6 +4175,15 @@ pub(crate) fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ord
         }
         (Value::Bytea(x), Value::Bytea(y)) => Ok(Some(x.cmp(y))),
         (Value::Uuid(x), Value::Uuid(y)) => Ok(Some(x.cmp(y))),
+        // v1.92: bit string comparison (PG bit_cmp: byte order,
+        // then the shorter bit length sorts first).
+        (Value::BitString(x), Value::BitString(y)) => Ok(Some({
+            let n = x.bytes.len().min(y.bytes.len());
+            match x.bytes[..n].cmp(&y.bytes[..n]) {
+                Ordering::Equal => x.bitlen.cmp(&y.bitlen),
+                o => o,
+            }
+        })),
         // v0.36: PG's "char" comparison is a plain byte comparison
         // (chareq/charlt compare the single byte).
         (Value::SingleChar(x), Value::SingleChar(y)) => Ok(Some(x.cmp(y))),

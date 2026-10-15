@@ -213,6 +213,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     not_null: d.not_null,
                     default: crate::sql::decode_domain_default(&d.default)
                         .map_err(|e| format!("corrupt domain default in WAL: {}", e))?,
+                    // v1.92: not carried by the WAL domain record.
+                    bit_typmod: None,
                 }),
                 None => None,
             };

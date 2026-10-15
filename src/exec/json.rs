@@ -2667,21 +2667,14 @@ fn sqljson_run(
     };
     let path = match super::jsonpath::parse_jsonpath(path_text) {
         Ok(p) => p,
-        Err(e) => {
-            return match or_kind {
-                SJ_NULL => Ok(None),
-                SJ_EXPR => Ok(Some(vec![jsonbval_of_sql_value(or_expr)])),
-                SJ_TRUE => Ok(Some(vec![JsonbVal::Bool(true)])),
-                SJ_FALSE => Ok(Some(vec![JsonbVal::Bool(false)])),
-                SJ_EMPTY => Ok(Some(Vec::new())),
-                SJ_EMPTY_ARRAY => Ok(Some(vec![JsonbVal::Array(Vec::new())])),
-                SJ_EMPTY_OBJECT => Ok(Some(vec![JsonbVal::Object(Vec::new())])),
-                _ => Err(e),
-            };
-        }
+        // v1.92: a jsonpath that does not parse is a hard error in
+        // PG (the path operand itself is malformed); the ON ERROR
+        // behavior only covers path *execution*.
+        Err(e) => return Err(e),
     };
     match super::jsonpath::jp_query_seq(&doc, &path, vars.as_ref()) {
         Ok(seq) => Ok(Some(seq)),
+        Err(e) if sj_is_hard_path_error(&e) => Err(e),
         Err(e) => match or_kind {
             SJ_NULL => Ok(None),
             SJ_EXPR => Ok(Some(vec![jsonbval_of_sql_value(or_expr)])),
@@ -2725,6 +2718,145 @@ fn jsonbval_of_sql_value(v: &Value) -> JsonbVal {
 /// populate_typed's assignment semantics (22001 / typmod overflow
 /// are conversion errors, subject to ON ERROR). Everything else
 /// keeps the v1.85 sqljson_convert_return path.
+/// v1.92: whether a named type is a domain whose chain forbids
+/// NULL (its own NOT NULL or an inner domain's).
+fn sj_domain_not_null(eng: &Engine, name: &str) -> bool {
+    let mut cur = Some(name);
+    while let Some(n) = cur {
+        match eng.db.types.get(n).and_then(|st| st.domain.as_ref()) {
+            Some(d) => {
+                if d.not_null {
+                    return true;
+                }
+                cur = d.base_domain.as_deref();
+            }
+            None => return false,
+        }
+    }
+    false
+}
+
+/// v1.92: jsonpath errors PG raises as hard errors regardless of
+/// the ON ERROR behavior: an unbound PASSING variable is reported
+/// while setting up the path evaluation, not as an item error
+/// (jsonpath parse errors are likewise hard — the callers return
+/// them directly).
+fn sj_is_hard_path_error(e: &ExecError) -> bool {
+    e.message.starts_with("could not find jsonpath variable")
+}
+
+/// v1.92: the bit-typmod RETURNING spec of a SQL/JSON function
+/// call ("bit(n)" -> (n, false); "bit varying(n)" -> (n, true)).
+fn sj_bit_typmod(spec: Option<&str>) -> Option<(i32, bool)> {
+    let spec = spec?;
+    let open = spec.find('(')?;
+    let n: i32 = spec[open + 1..].trim_end_matches(')').trim().parse().ok()?;
+    match spec[..open].trim() {
+        "bit" => Some((n, false)),
+        "bit varying" | "varbit" => Some((n, true)),
+        _ => None,
+    }
+}
+
+/// v1.92: classify a RETURNING spec as a bit target: the outer
+/// Option marks a bit spec at all; the inner is its typmod (None
+/// for a length-less `bit varying`). Bare `bit` is bit(1).
+fn sj_bit_spec(spec: Option<&str>) -> Option<Option<(i32, bool)>> {
+    let spec = spec?;
+    match spec {
+        "bit" => Some(Some((1, false))),
+        "bit varying" | "varbit" => Some(None),
+        _ => sj_bit_typmod(Some(spec)).map(Some),
+    }
+}
+
+/// v1.92: enforce a bit(n) / bit varying(n) typmod on a bit value
+/// (PG19 varbit.c input rules): fixed bit requires the exact
+/// length (22026); varying only bounds it.
+pub(crate) fn sj_check_bit_len(bitlen: u32, n: i32, varying: bool) -> Result<(), ExecError> {
+    if varying {
+        if bitlen as i32 > n {
+            return Err(exec_err(
+                "22026",
+                format!("bit string too long for type bit varying({})", n),
+            ));
+        }
+    } else if bitlen as i32 != n {
+        return Err(exec_err(
+            "22026",
+            format!(
+                "bit string length {} does not match type bit({})",
+                bitlen, n
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// v1.92: apply a bit(n) / bit varying(n) typmod to a bit-string
+/// VALUE (PG19 varbit.c typmod adjustment, as a coercion of an
+/// already-typed datum): fixed bit drops leading bits when they
+/// are all zero and pads on the right when short; an excess of
+/// nonzero bits (fixed) or any excess (varying) is 22026.
+pub(crate) fn sj_coerce_bit_typmod(
+    bs: &crate::storage::BitString,
+    n: i32,
+    varying: bool,
+) -> Result<crate::storage::BitString, ExecError> {
+    let len = bs.bitlen as i32;
+    if varying {
+        if len > n {
+            return Err(exec_err(
+                "22026",
+                format!("bit string too long for type bit varying({})", n),
+            ));
+        }
+        return Ok(bs.clone());
+    }
+    if len == n {
+        return Ok(bs.clone());
+    }
+    let get = |i: i32| -> bool {
+        let i = i as usize;
+        bs.bytes[i / 8] >> (7 - (i % 8)) & 1 == 1
+    };
+    if len > n {
+        let excess = len - n;
+        if (0..excess).any(&get) {
+            return Err(exec_err(
+                "22026",
+                format!(
+                    "bit string length {} does not match type bit({})",
+                    bs.bitlen, n
+                ),
+            ));
+        }
+        let mut out = crate::storage::BitString {
+            bitlen: n as u32,
+            bytes: vec![0u8; (n as usize).div_ceil(8)],
+        };
+        for j in 0..n {
+            if get(excess + j) {
+                let j = j as usize;
+                out.bytes[j / 8] |= 1 << (7 - (j % 8));
+            }
+        }
+        Ok(out)
+    } else {
+        let mut out = crate::storage::BitString {
+            bitlen: n as u32,
+            bytes: vec![0u8; (n as usize).div_ceil(8)],
+        };
+        for j in 0..len {
+            if get(j) {
+                let j = j as usize;
+                out.bytes[j / 8] |= 1 << (7 - (j % 8));
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// The builtin string-typmod RETURNING spec of a `__sqljson_value`
 /// call ("character(n)" / "character varying(n)"), if it has one.
 fn sj_string_typmod(spec: Option<&Value>) -> Option<crate::storage::ColType> {
@@ -2763,6 +2895,57 @@ pub(crate) fn eval_sqljson_value_q(q: &mut Q, vals_in: &[Value]) -> Result<Value
             &owned
         }
         None => vals_in,
+    };
+    // v1.92: PG coerces a JSON_VALUE DEFAULT expression to a bit
+    // RETURNING type at analysis time with an ASSIGNMENT-context
+    // coercion, so a bad DEFAULT is a hard error even when the
+    // behavior never fires: bit values are typmod-adjusted, string
+    // literals go through bit_in, and anything else (e.g. an
+    // integer — the int->bit cast is explicit-only) is a hard
+    // 42846 "cannot cast behavior expression ... to bit".
+    let spec_text = match vals.get(7) {
+        Some(Value::Text(t)) => Some(t.to_string()),
+        _ => None,
+    };
+    let mut owned2: Vec<Value>;
+    let vals: &[Value] = match sj_bit_spec(spec_text.as_deref()) {
+        Some(typmod) => {
+            owned2 = vals.to_vec();
+            for (kind_slot, expr_slot) in [(3usize, 4usize), (5usize, 6usize)] {
+                if sj_kind(&owned2[kind_slot]) != SJ_EXPR {
+                    continue;
+                }
+                match &owned2[expr_slot] {
+                    Value::Null => {}
+                    Value::BitString(bs) => {
+                        if let Some((n, varying)) = typmod {
+                            let coerced = sj_coerce_bit_typmod(bs, n, varying)?;
+                            owned2[expr_slot] = Value::BitString(coerced);
+                        }
+                    }
+                    Value::Text(t) | Value::BpChar(t) => {
+                        let bs = crate::storage::BitString::parse_input(t.trim())
+                            .map_err(|m| exec_err("22P02", m))?;
+                        let bs = match typmod {
+                            Some((n, varying)) => sj_coerce_bit_typmod(&bs, n, varying)?,
+                            None => bs,
+                        };
+                        owned2[expr_slot] = Value::BitString(bs);
+                    }
+                    other => {
+                        return Err(exec_err(
+                            "42846",
+                            format!(
+                                "cannot cast behavior expression of type {} to bit",
+                                other.type_name().to_lowercase()
+                            ),
+                        ));
+                    }
+                }
+            }
+            &owned2
+        }
+        None => vals,
     };
     let name = "__sqljson_value";
     let oe_kind = sj_kind(&vals[3]);
@@ -2827,6 +3010,11 @@ pub(crate) fn eval_sqljson_value_q(q: &mut Q, vals_in: &[Value]) -> Result<Value
                         None,
                     ) {
                         Ok(v) => Ok(v),
+                        // v1.92: PG performs the NULL-to-domain
+                        // coercion regardless of the ON ERROR
+                        // behavior — a NOT NULL domain rejects the
+                        // JSON null item unconditionally.
+                        Err(e) if sj_domain_not_null(q.eng, spec) => Err(e),
                         Err(e) => on_err(e),
                     };
                 }
@@ -2859,6 +3047,13 @@ fn sqljson_value_convert(
             _ => unreachable!(),
         });
     };
+    // v1.92: array-of-named RETURNING (`rec[]`): the populate-item
+    // converter handles it (a scalar item goes through the array
+    // input-function path or errors, like PG's populate).
+    if spec.ends_with("[]") {
+        let target = sqljson_spec_target(q.eng, q.snap, q.own, q.session, spec)?;
+        return sqljson_query_convert(q, item, &target, false);
+    }
     // Domain / composite RETURNING type: full conversion with domain
     // checks via the JSON_TABLE item converter.
     if q.eng.db.types.contains_key(spec) {
@@ -2889,6 +3084,24 @@ fn sqljson_value_convert(
             .split(',')
             .filter_map(|p| p.trim().parse::<i64>().ok())
             .collect();
+        // v1.92: bit(n) / bit varying(n): bit_in over the item's
+        // text form, then the typmod length rules.
+        if let Some((n, varying)) = match base_name.trim() {
+            "bit" => nums.first().map(|n| (*n as i32, false)),
+            "bit varying" | "varbit" => nums.first().map(|n| (*n as i32, true)),
+            _ => None,
+        } {
+            let text = match item {
+                JsonbVal::Str(s) => s.clone(),
+                JsonbVal::Number(n) => n.to_text(),
+                JsonbVal::Bool(b) => b.to_string(),
+                _ => item.render(),
+            };
+            let bs = crate::storage::BitString::parse_input(text.trim())
+                .map_err(|m| exec_err("22P02", m))?;
+            sj_check_bit_len(bs.bitlen, n, varying)?;
+            return Ok(Value::BitString(bs));
+        }
         let ty = match (base_name.trim(), nums.as_slice()) {
             ("character", [n]) => Some(crate::storage::ColType::Char(Some(*n as i32))),
             ("character varying", [n]) => Some(crate::storage::ColType::Varchar(Some(*n as i32))),
@@ -2914,6 +3127,698 @@ fn sqljson_value_convert(
         }
     }
     sqljson_convert_return(item, spec)
+}
+
+/// v1.92: a resolved JSON_QUERY RETURNING target (the spec string
+/// the parser threads through, resolved against the catalog).
+#[derive(Clone, Debug)]
+pub(crate) struct SjTarget {
+    /// Leaf type: domain base, composite, range, or the builtin.
+    pub(crate) ty: crate::storage::ColType,
+    /// The domain / composite / range type name, when named.
+    pub(crate) named: Option<String>,
+    /// Element type name for an array-of-named spec (`rec[]`).
+    pub(crate) elem_named: Option<String>,
+    /// bit(n) typmod for bit / bit varying targets.
+    pub(crate) bit_len: Option<i32>,
+    /// Whether a bit target is the varying flavor.
+    pub(crate) bit_varying: bool,
+}
+
+/// v1.92: geometric type names with no ColType in this engine;
+/// values ride as their canonical text form (see eval_cast_named).
+pub(crate) fn sqljson_geometric_name(name: &str) -> bool {
+    matches!(
+        name,
+        "point" | "box" | "circle" | "line" | "lseg" | "path" | "polygon"
+    )
+}
+
+/// v1.92: resolve a SQL/JSON RETURNING spec string to its target.
+/// Mirrors sqljson_value_convert's spec handling, extended with
+/// bit(n), arrays, and the full builtin name table.
+pub(crate) fn sqljson_spec_target(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    spec: &str,
+) -> Result<SjTarget, ExecError> {
+    use crate::storage::ColType;
+    // Array of a named type (`sqljsonb_rec[]`).
+    if let Some(base) = spec.strip_suffix("[]") {
+        if eng.db.types.contains_key(base) || sqljson_geometric_name(base) {
+            let leaf = super::jsontable::jt_static_leaf_type(
+                eng,
+                snap,
+                own,
+                session,
+                ColType::Composite,
+                &Some(base.to_string()),
+            )?;
+            return Ok(SjTarget {
+                ty: ColType::Array(crate::storage::ArrayElem::of(&leaf)),
+                named: None,
+                elem_named: Some(base.to_string()),
+                bit_len: None,
+                bit_varying: false,
+            });
+        }
+    }
+    // Named type: domain / composite / range / table rowtype.
+    if eng.db.types.contains_key(spec) {
+        let leaf = super::jsontable::jt_static_leaf_type(
+            eng,
+            snap,
+            own,
+            session,
+            ColType::Composite,
+            &Some(spec.to_string()),
+        )?;
+        return Ok(SjTarget {
+            ty: leaf,
+            named: Some(spec.to_string()),
+            elem_named: None,
+            bit_len: None,
+            bit_varying: false,
+        });
+    }
+    if sqljson_geometric_name(spec) {
+        return Ok(SjTarget {
+            ty: ColType::Text,
+            named: Some(spec.to_string()),
+            elem_named: None,
+            bit_len: None,
+            bit_varying: false,
+        });
+    }
+    // Builtin typmod specs: character(n), character varying(n),
+    // numeric(p,s), bit(n), bit varying(n).
+    if let Some(open) = spec.find('(') {
+        let (base_name, rest) = spec.split_at(open);
+        let nums: Vec<i64> = rest
+            .trim_matches(|c| c == '(' || c == ')')
+            .split(',')
+            .filter_map(|p| p.trim().parse::<i64>().ok())
+            .collect();
+        let resolved = match (base_name.trim(), nums.as_slice()) {
+            ("character", [n]) => Some((ColType::Char(Some(*n as i32)), None, false)),
+            ("character varying", [n]) => Some((ColType::Varchar(Some(*n as i32)), None, false)),
+            ("numeric", [p, s]) => {
+                Some((ColType::Numeric(Some((*p as u32, *s as i32))), None, false))
+            }
+            ("bit", [n]) => Some((ColType::Bit, Some(*n as i32), false)),
+            ("bit varying", [n]) => Some((ColType::Bit, Some(*n as i32), true)),
+            _ => None,
+        };
+        if let Some((ty, bit_len, bit_varying)) = resolved {
+            return Ok(SjTarget {
+                ty,
+                named: None,
+                elem_named: None,
+                bit_len,
+                bit_varying,
+            });
+        }
+    }
+    // Array of a builtin (`integer[]`, `bigint[]`, ...).
+    if let Some(inner) = spec.strip_suffix("[]") {
+        let inner = sqljson_spec_target(eng, snap, own, session, inner)?;
+        return Ok(SjTarget {
+            ty: ColType::Array(crate::storage::ArrayElem::of(&inner.ty)),
+            named: None,
+            elem_named: inner.named,
+            bit_len: None,
+            bit_varying: false,
+        });
+    }
+    let ty = match spec {
+        "smallint" => Some(ColType::SmallInt),
+        "integer" => Some(ColType::Int),
+        "bigint" => Some(ColType::BigInt),
+        "boolean" => Some(ColType::Bool),
+        "real" => Some(ColType::Float4),
+        "double precision" => Some(ColType::Float),
+        "numeric" | "decimal" => Some(ColType::Numeric(None)),
+        "text" => Some(ColType::Text),
+        "character" => Some(ColType::Char(Some(1))),
+        "character varying" => Some(ColType::Varchar(None)),
+        "\"char\"" => Some(ColType::SingleChar),
+        "name" => Some(ColType::Name),
+        "date" => Some(ColType::Date),
+        "timestamp without time zone" => Some(ColType::Timestamp),
+        "timestamp with time zone" => Some(ColType::Timestamptz),
+        "time without time zone" => Some(ColType::Time),
+        "time with time zone" => Some(ColType::TimeTz),
+        "interval" => Some(ColType::Interval),
+        "bytea" => Some(ColType::Bytea),
+        "bit" | "bit varying" => Some(ColType::Bit),
+        "uuid" => Some(ColType::Uuid),
+        "json" => Some(ColType::Json),
+        "jsonb" => Some(ColType::Jsonb),
+        "jsonpath" => Some(ColType::Jsonpath),
+        "pg_lsn" => Some(ColType::PgLsn),
+        "xid" => Some(ColType::Xid),
+        "tid" => Some(ColType::Tid),
+        "regclass" => Some(ColType::Regclass),
+        _ => None,
+    };
+    if let Some(ty) = ty {
+        return Ok(SjTarget {
+            ty,
+            named: None,
+            elem_named: None,
+            bit_len: None,
+            bit_varying: false,
+        });
+    }
+    if let Some(e) = super::ranges::builtin_range_elem(spec) {
+        return Ok(SjTarget {
+            ty: ColType::Range(e),
+            named: None,
+            elem_named: None,
+            bit_len: None,
+            bit_varying: false,
+        });
+    }
+    if let Some(e) = super::ranges::builtin_multirange_elem(spec) {
+        return Ok(SjTarget {
+            ty: ColType::Multirange(e),
+            named: None,
+            elem_named: None,
+            bit_len: None,
+            bit_varying: false,
+        });
+    }
+    Err(exec_err(
+        "42704",
+        format!("type \"{}\" does not exist", spec),
+    ))
+}
+
+/// v1.92: the Describe-path result type of a JSON_QUERY RETURNING
+/// spec (func_result_type): the leaf type, Text on any resolution
+/// failure (evaluation reports the real error).
+pub(crate) fn sqljson_spec_result_type(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    spec: &str,
+) -> ColType {
+    match sqljson_spec_target(eng, snap, own, session, spec) {
+        Ok(t) => t.ty,
+        Err(_) => ColType::Text,
+    }
+}
+
+/// v1.92: coerce one final JSON_QUERY item to the RETURNING target
+/// (PG19 json_populate_type over the JsonPathQuery result):
+/// string items feed scalar targets their content (OMIT QUOTES) or
+/// their quoted JSON text (KEEP QUOTES: the input function sees
+/// `"..."`), structured targets populate from array/object items,
+/// and a string item for a structured target goes through the
+/// type's input function when quotes are omitted and is an error
+/// ("expected JSON array" / populate_composite on a scalar) when
+/// kept.
+fn sqljson_query_convert(
+    q: &mut Q,
+    item: &JsonbVal,
+    target: &SjTarget,
+    keep_quotes: bool,
+) -> Result<Value, ExecError> {
+    use crate::storage::ColType;
+    // A JSON null item converts to SQL NULL — unless the RETURNING
+    // type is a NOT NULL domain, whose check PG runs regardless.
+    if matches!(item, JsonbVal::Null) {
+        if let Some(name) = &target.named {
+            if q.eng
+                .db
+                .types
+                .get(name)
+                .is_some_and(|st| st.domain.is_some())
+            {
+                return super::jsontable::jt_coerce_sql_value(
+                    q,
+                    Value::Null,
+                    target.ty,
+                    &target.named,
+                    target.bit_len,
+                );
+            }
+        }
+        return Ok(Value::Null);
+    }
+    // Geometric RETURNING types ride as canonical text (validated
+    // by the same input path as a CastNamed).
+    if let Some(name) = &target.named {
+        if sqljson_geometric_name(name) {
+            let text = match item {
+                JsonbVal::Str(s) => s.clone(),
+                other => other.render(),
+            };
+            return super::cast::eval_cast_named(q, &Value::text(text), name);
+        }
+    }
+    // Domains convert through the JSON_TABLE converter (base
+    // conversion + domain checks, including its bool materialization
+    // and bit-length enforcement).
+    if let Some(name) = &target.named {
+        if q.eng
+            .db
+            .types
+            .get(name)
+            .is_some_and(|st| st.domain.is_some())
+        {
+            return super::jsontable::jt_convert_item(
+                q,
+                item,
+                target.ty,
+                &target.named,
+                target.bit_len,
+                false,
+                Some(keep_quotes),
+            );
+        }
+    }
+    match target.ty {
+        ColType::Json | ColType::Jsonb => super::jsontable::jt_convert_item(
+            q,
+            item,
+            target.ty,
+            &None,
+            None,
+            false,
+            Some(keep_quotes),
+        ),
+        // PG19 populate to bytea runs bytea's input function over
+        // the item's JSON representation (its content for a string
+        // item with OMIT QUOTES): bytea input of plain text is the
+        // text's own bytes.
+        ColType::Bytea => {
+            let text = match (item, keep_quotes) {
+                (JsonbVal::Str(s), false) => s.clone(),
+                _ => item.render(),
+            };
+            Ok(Value::Bytea(text.into_bytes()))
+        }
+        ColType::Array(_) => {
+            // Array of a named composite: populate element-wise
+            // (populate_typed cannot thread the element type name).
+            if let Some(elem_name) = &target.elem_named {
+                // Only a real array item populates element-wise
+                // here (a string item would need the array input
+                // function with per-element record parsing, which
+                // populate_typed cannot thread the element name
+                // through — PG accepts it via array_in).
+                let JsonbVal::Array(elems) = item else {
+                    return Err(exec_err("22P02", "expected JSON array".to_string()));
+                };
+                let leaf = super::jsontable::jt_static_leaf_type(
+                    q.eng,
+                    q.snap,
+                    q.own,
+                    q.session,
+                    ColType::Composite,
+                    &Some(elem_name.clone()),
+                )?;
+                let mut vals = Vec::with_capacity(elems.len());
+                for e in elems {
+                    vals.push(match e {
+                        JsonbVal::Null => Value::Null,
+                        _ => super::jsontable::jt_convert_item(
+                            q,
+                            e,
+                            leaf,
+                            &Some(elem_name.clone()),
+                            None,
+                            false,
+                            Some(keep_quotes),
+                        )?,
+                    });
+                }
+                let n = vals.len() as i32;
+                return Ok(Value::Array(Box::new(crate::storage::ArrayVal {
+                    elem: crate::storage::ArrayElem::of(&leaf),
+                    lower: vec![1],
+                    dims: vec![n],
+                    elems: vals,
+                })));
+            }
+            match item {
+                JsonbVal::Array(_) => super::jsontable::jt_convert_item(
+                    q,
+                    item,
+                    target.ty,
+                    &None,
+                    None,
+                    false,
+                    Some(keep_quotes),
+                ),
+                JsonbVal::Str(_) if !keep_quotes => super::jsontable::jt_convert_item(
+                    q,
+                    item,
+                    target.ty,
+                    &None,
+                    None,
+                    false,
+                    Some(keep_quotes),
+                ),
+                _ => Err(exec_err("22P02", "expected JSON array".to_string())),
+            }
+        }
+        ColType::Composite => match item {
+            JsonbVal::Object(_) => super::jsontable::jt_convert_item(
+                q,
+                item,
+                target.ty,
+                &target.named,
+                None,
+                false,
+                Some(keep_quotes),
+            ),
+            JsonbVal::Str(_) if !keep_quotes => super::jsontable::jt_convert_item(
+                q,
+                item,
+                target.ty,
+                &target.named,
+                None,
+                false,
+                Some(keep_quotes),
+            ),
+            JsonbVal::Array(_) => Err(exec_err(
+                "22023",
+                "cannot call populate_composite on an array".to_string(),
+            )),
+            _ => Err(exec_err(
+                "22023",
+                "cannot call populate_composite on a scalar".to_string(),
+            )),
+        },
+        ty => {
+            // Scalar / range / multirange targets: the item's text
+            // form (string content or quoted render per QUOTES;
+            // containers render) through the type's input semantics.
+            let text = match item {
+                JsonbVal::Str(s) => {
+                    if keep_quotes {
+                        item.render()
+                    } else {
+                        s.clone()
+                    }
+                }
+                JsonbVal::Number(n) => n.to_text(),
+                JsonbVal::Bool(b) => {
+                    if *b {
+                        "true".to_string()
+                    } else {
+                        "false".to_string()
+                    }
+                }
+                other => other.render(),
+            };
+            let f = super::funcs::PopField {
+                name: String::new(),
+                ty,
+                named: None,
+                sub: None,
+            };
+            let v = super::funcs::populate_typed(q, &f, None, &JsonbVal::Str(text))?;
+            if let (Some(n), Value::BitString(bs)) = (target.bit_len, &v) {
+                sj_check_bit_len(bs.bitlen, n, target.bit_varying)?;
+            }
+            Ok(v)
+        }
+    }
+}
+
+/// v1.92: wrap a failed behavior-value coercion the way PG19's
+/// ExecEvalJsonCoercionFinish does: 42804 with the original error
+/// as the DETAIL.
+fn sqljson_coerce_wrap(clause: &str, label: &str, e: ExecError) -> ExecError {
+    exec_err_detail(
+        "42804",
+        format!(
+            "could not coerce {} expression ({}) to the RETURNING type",
+            clause, label
+        ),
+        e.message,
+    )
+}
+
+/// v1.92: apply a JSON_QUERY ON EMPTY / ON ERROR behavior whose
+/// kind is not ERROR. Behavior results are final: coerced to the
+/// RETURNING type like regular items, never wrapped.
+#[allow(clippy::too_many_arguments)]
+fn sqljson_query_behavior(
+    q: &mut Q,
+    clause: &str,
+    kind: i64,
+    expr_val: &Value,
+    target: Option<&SjTarget>,
+    keep_quotes: bool,
+) -> Result<Value, ExecError> {
+    match kind {
+        SJ_NULL => match target {
+            None => Ok(Value::Null),
+            Some(t) => {
+                super::jsontable::jt_coerce_sql_value(q, Value::Null, t.ty, &t.named, t.bit_len)
+                    .map_err(|e| sqljson_coerce_wrap(clause, "NULL", e))
+            }
+        },
+        SJ_EXPR => match target {
+            None => {
+                // No RETURNING: the DEFAULT value is coerced to
+                // jsonb (PG coerces the behavior expression to the
+                // RETURNING type at analysis time).
+                match expr_val {
+                    Value::Null => Ok(Value::Null),
+                    Value::Jsonb(_) => Ok(expr_val.clone()),
+                    Value::Text(t) | Value::BpChar(t) => {
+                        let parsed = parse_jsonb(t).map_err(|_| {
+                            exec_err("22P02", "invalid input syntax for type json".to_string())
+                        })?;
+                        Ok(Value::jsonb(parsed.render()))
+                    }
+                    other => Ok(Value::jsonb(jsonbval_of_sql_value(other).render())),
+                }
+            }
+            Some(t) => {
+                // v1.92: a domain target coerces the behavior value
+                // directly as an SQL value (PG's CoerceToDomain of
+                // the behavior datum) — the JSON-item round trip
+                // would apply KEEP QUOTES text semantics the domain
+                // coercion does not have.
+                let is_domain = t
+                    .named
+                    .as_deref()
+                    .is_some_and(|n| q.eng.db.types.get(n).is_some_and(|st| st.domain.is_some()));
+                let representable = !is_domain
+                    && matches!(
+                        expr_val,
+                        Value::Null
+                            | Value::Bool(_)
+                            | Value::SmallInt(_)
+                            | Value::Int(_)
+                            | Value::BigInt(_)
+                            | Value::Numeric(_)
+                            | Value::Float(_)
+                            | Value::Float4(_)
+                            | Value::Text(_)
+                            | Value::BpChar(_)
+                            | Value::Jsonb(_)
+                    );
+                let r = if representable {
+                    let item = jsonbval_of_sql_value(expr_val);
+                    sqljson_query_convert(q, &item, t, keep_quotes)
+                } else {
+                    super::jsontable::jt_coerce_sql_value(
+                        q,
+                        expr_val.clone(),
+                        t.ty,
+                        &t.named,
+                        t.bit_len,
+                    )
+                };
+                r.map_err(|e| sqljson_coerce_wrap(clause, "DEFAULT", e))
+            }
+        },
+        SJ_EMPTY | SJ_EMPTY_ARRAY => {
+            let item = JsonbVal::Array(Vec::new());
+            match target {
+                None => Ok(Value::jsonb("[]")),
+                Some(t) => sqljson_query_convert(q, &item, t, keep_quotes).map_err(|e| {
+                    sqljson_coerce_wrap(
+                        clause,
+                        if kind == SJ_EMPTY {
+                            "EMPTY"
+                        } else {
+                            "EMPTY ARRAY"
+                        },
+                        e,
+                    )
+                }),
+            }
+        }
+        SJ_EMPTY_OBJECT => {
+            let item = JsonbVal::Object(Vec::new());
+            match target {
+                None => Ok(Value::jsonb("{}")),
+                Some(t) => sqljson_query_convert(q, &item, t, keep_quotes)
+                    .map_err(|e| sqljson_coerce_wrap(clause, "EMPTY OBJECT", e)),
+            }
+        }
+        _ => Err(exec_err(
+            "XX000",
+            format!("JSON_QUERY behavior kind {} not applicable here", kind),
+        )),
+    }
+}
+
+/// v1.92: q-aware JSON_QUERY evaluation (intercepted in eval_func
+/// like eval_sqljson_value_q). Args: [doc, path, vars, oe_k, oe_x,
+/// or_k, or_x, wrapper, quotes_mode, ret_spec, ret_format,
+/// doc_format]. PG19 ExecEvalJsonExprPath + JsonPathQuery +
+/// json_populate_type, with behavior handling kept out of the path
+/// run so behavior results are never wrapped.
+pub(crate) fn eval_sqljson_query_q(q: &mut Q, vals: &[Value]) -> Result<Value, ExecError> {
+    if vals[0] == Value::Null {
+        return Ok(Value::Null);
+    }
+    let name = "__sqljson_query";
+    let oe_kind = sj_kind(&vals[3]);
+    let or_kind = sj_kind(&vals[5]);
+    let wrapper = sj_kind(&vals[7]);
+    // Quotes mode: 0 unspecified, 1 KEEP, 2 OMIT. Coercion keeps
+    // quotes unless OMIT was spelled out.
+    let omit_quotes = sj_kind(&vals[8]) == 2;
+    let keep_quotes = !omit_quotes;
+    let spec = match vals.get(9) {
+        Some(Value::Text(t)) => Some(t.to_string()),
+        _ => None,
+    };
+    let target = match &spec {
+        Some(s) => Some(sqljson_spec_target(q.eng, q.snap, q.own, q.session, s)?),
+        None => None,
+    };
+    let on_error = |q: &mut Q, e: ExecError| -> Result<Value, ExecError> {
+        match or_kind {
+            0 => Err(e),
+            _ => sqljson_query_behavior(
+                q,
+                "ON ERROR",
+                or_kind,
+                &vals[6],
+                target.as_ref(),
+                keep_quotes,
+            ),
+        }
+    };
+    let doc = jsonb_val_arg(name, &vals[0])?.unwrap();
+    let path_text = match &vals[1] {
+        Value::Text(t) | Value::BpChar(t) => t.as_ref().to_string(),
+        Value::Jsonpath(p) => p.as_ref().to_string(),
+        other => return Err(func_arg_err(name, other)),
+    };
+    let vars = if vals[2] == Value::Null {
+        None
+    } else {
+        jsonb_val_arg(name, &vals[2])?
+    };
+    // v1.92: jsonpath parse errors and unbound PASSING variables
+    // are hard errors in PG (the ON ERROR behavior covers path
+    // execution errors only).
+    let path = match super::jsonpath::parse_jsonpath(&path_text) {
+        Ok(p) => p,
+        Err(e) => return Err(e),
+    };
+    let seq = match super::jsonpath::jp_query_seq(&doc, &path, vars.as_ref()) {
+        Ok(s) => s,
+        Err(e) if sj_is_hard_path_error(&e) => return Err(e),
+        Err(e) => return on_error(q, e),
+    };
+    if seq.is_empty() {
+        return match oe_kind {
+            0 => Err(exec_err(
+                "22035",
+                "no SQL/JSON item found for specified path".to_string(),
+            )),
+            _ => sqljson_query_behavior(
+                q,
+                "ON EMPTY",
+                oe_kind,
+                &vals[4],
+                target.as_ref(),
+                keep_quotes,
+            ),
+        };
+    }
+    let item = match wrapper {
+        // WITHOUT WRAPPER: exactly one item.
+        0 => {
+            if seq.len() > 1 {
+                return on_error(
+                    q,
+                    exec_err(
+                        "22038",
+                        "JSON path expression in JSON_QUERY must return single item when no wrapper is requested"
+                            .to_string(),
+                    ),
+                );
+            }
+            seq.into_iter().next().unwrap()
+        }
+        // UNCONDITIONAL WRAPPER: always wrap in an array.
+        1 => JsonbVal::Array(seq),
+        // CONDITIONAL WRAPPER: the sequence is wrapped only when
+        // it does not consist of exactly one item — a single item
+        // (array or scalar) is used as-is (PG19 JsonExpr conditional
+        // wrap; e.g. '["1"]' '$[*]' yields the string "1", not ["1"]).
+        _ => {
+            if seq.len() == 1 {
+                seq.into_iter().next().unwrap()
+            } else {
+                JsonbVal::Array(seq)
+            }
+        }
+    };
+    match &target {
+        Some(t) => match sqljson_query_convert(q, &item, t, keep_quotes) {
+            Ok(v) => Ok(v),
+            // v1.92: a JSON null item coerced to a NOT NULL domain
+            // fails unconditionally (PG performs the coercion
+            // outside the ON ERROR behavior).
+            Err(e)
+                if matches!(item, JsonbVal::Null)
+                    && t.named
+                        .as_deref()
+                        .is_some_and(|n| sj_domain_not_null(q.eng, n)) =>
+            {
+                Err(e)
+            }
+            Err(e) => on_error(q, e),
+        },
+        None => {
+            // Default jsonb RETURNING. A scalar item is returned
+            // as-is (PG19 JsonPathQuery), except that OMIT QUOTES
+            // forces JSON coercion: the item's unquoted text must
+            // itself parse as JSON.
+            if omit_quotes {
+                match &item {
+                    JsonbVal::Str(s) => match parse_jsonb(s) {
+                        Ok(v) => Ok(Value::jsonb(v.render())),
+                        Err(_) => on_error(
+                            q,
+                            exec_err("22P02", "invalid input syntax for type json".to_string()),
+                        ),
+                    },
+                    _ => Ok(Value::jsonb(item.render())),
+                }
+            } else {
+                Ok(Value::jsonb(item.render()))
+            }
+        }
+    }
 }
 
 /// The __sqljson_* internal builtins the parser desugars
@@ -3210,6 +4115,23 @@ pub(crate) fn sqljson_convert_return(item: &JsonbVal, type_name: &str) -> Result
             )),
         },
         "text" => Ok(Value::text(text)),
+        // v1.92: bit RETURNING (bare `bit` is bit(1) in PG).
+        "bit" => {
+            let bs = crate::storage::BitString::parse_input(text.trim())
+                .map_err(|m| exec_err("22P02", m))?;
+            sj_check_bit_len(bs.bitlen, 1, false)?;
+            Ok(Value::BitString(bs))
+        }
+        "bit varying" | "varbit" => {
+            let bs = crate::storage::BitString::parse_input(text.trim())
+                .map_err(|m| exec_err("22P02", m))?;
+            Ok(Value::BitString(bs))
+        }
+        // v1.92: bytea RETURNING — PG populates through bytea's
+        // input function over the item's text form (for a string
+        // item JSON_VALUE always omits quotes, so the content);
+        // plain text input to bytea is the text's own bytes.
+        "bytea" => Ok(Value::Bytea(text.into_bytes())),
         "json" => Ok(Value::text(item.render())),
         "jsonb" => Ok(Value::jsonb(item.render())),
         _ => {

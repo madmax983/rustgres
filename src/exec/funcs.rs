@@ -2169,6 +2169,11 @@ pub(crate) fn eval_func(
         if name == "__sqljson_value" {
             return super::json::eval_sqljson_value_q(q, &vals);
         }
+        // v1.92: JSON_QUERY likewise (populate-item coercion of the
+        // final item to the RETURNING type).
+        if name == "__sqljson_query" {
+            return super::json::eval_sqljson_query_q(q, &vals);
+        }
         // v1.89: json_build_object / jsonb_build_object keys whose
         // static type is json/jsonb/array/composite are 22023 in PG
         // (json.c add_json key_scalar) — json values ride as plain
@@ -2710,7 +2715,7 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         | "jsonb_path_match_tz" => (2..=4).contains(&n),
         // v1.85: SQL/JSON desugar internals (fixed shapes).
         "__sqljson_value" => n == 8,
-        "__sqljson_query" => n == 9,
+        "__sqljson_query" => n == 12,
         "__sqljson_exists" => n == 4,
         // v0.32: regexp set-returning functions (PG 19).
         "regexp_matches" => (2..=3).contains(&n),
@@ -3985,7 +3990,10 @@ pub(crate) fn populate_typed(
             let JsonbVal::Array(elems) = jsv else {
                 return Err(exec_err("22P02", "malformed JSON array"));
             };
-            let (dims, flat) = populate_array_rec(q, *elem, elems)?;
+            // v1.92: an array-of-composite field's element type
+            // name rides on f.named (the composite definition's
+            // nested name); thread it to the element populates.
+            let (dims, flat) = populate_array_rec(q, *elem, elems, f.named.as_deref())?;
             Ok(Value::Array(Box::new(ArrayVal {
                 elem: *elem,
                 lower: vec![1; dims.len()],
@@ -4066,12 +4074,19 @@ fn populate_array_rec(
     q: &mut Q,
     elem: ArrayElem,
     elems: &[JsonbVal],
+    elem_named: Option<&str>,
 ) -> Result<(Vec<i32>, Vec<Value>), ExecError> {
     let elem_ty = array_elem_coltype(elem);
     let elem_field = PopField {
         name: String::new(),
-        ty: elem_ty,
-        named: None,
+        ty: elem_ty.clone(),
+        // v1.92: composite elements populate against their named
+        // row type (without it they have no field list at all).
+        named: if elem_ty == ColType::Composite {
+            elem_named.map(str::to_string)
+        } else {
+            None
+        },
         sub: None,
     };
     let mut child_shape: Option<Vec<i32>> = None;
@@ -4079,7 +4094,7 @@ fn populate_array_rec(
     for e in elems {
         let (shape, mut vals) = match e {
             JsonbVal::Array(sub) => {
-                let (s, v) = populate_array_rec(q, elem, sub)?;
+                let (s, v) = populate_array_rec(q, elem, sub, elem_named)?;
                 (s, v)
             }
             JsonbVal::Null => (Vec::new(), vec![Value::Null]),
@@ -4854,10 +4869,23 @@ pub(crate) fn eval_table_function(
         // arrayfuncs.c `unnest`). NULL yields zero rows; a text value
         // parses as a text[] literal (unknown-literal coercion).
         "unnest" => {
-            let rows = unnest_rows(&vals[0])?
-                .into_iter()
-                .map(|v| vec![v])
-                .collect();
+            let elems = unnest_rows(&vals[0])?;
+            // v1.92: record elements expand to their fields (PG
+            // unnest of a record array yields one column per
+            // composite field).
+            if let Some(Value::Record(fs)) = elems.iter().find(|v| !matches!(v, Value::Null)) {
+                let names: Vec<String> = fs.iter().map(|(n, _)| n.clone()).collect();
+                let width = names.len();
+                let rows = elems
+                    .into_iter()
+                    .map(|v| match v {
+                        Value::Record(fs) => fs.into_iter().map(|(_, x)| x).collect(),
+                        _ => vec![Value::Null; width],
+                    })
+                    .collect();
+                return Ok((names, rows));
+            }
+            let rows = elems.into_iter().map(|v| vec![v]).collect();
             Ok((vec![name.to_string()], rows))
         }
         // v0.99: parse_ident as a scalar function in FROM — one row
@@ -10698,7 +10726,15 @@ pub(crate) fn func_result_type(
         "jsonb_path_exists" | "jsonb_path_match" | "jsonb_path_exists_tz"
         | "jsonb_path_match_tz" | "__sqljson_exists" => Ok(ColType::Bool),
         "jsonb_path_query_array" | "jsonb_path_query_first" | "jsonb_path_query_array_tz"
-        | "jsonb_path_query_first_tz" | "__sqljson_query" => Ok(ColType::Jsonb),
+        | "jsonb_path_query_first_tz" => Ok(ColType::Jsonb),
+        // v1.92: JSON_QUERY reports its RETURNING type when the
+        // spec argument is present; jsonb by default.
+        "__sqljson_query" => Ok(match args.get(9) {
+            Some(Expr::Literal(Literal::Text(s))) => {
+                super::json::sqljson_spec_result_type(eng, snap, own, session, &s.to_string())
+            }
+            _ => ColType::Jsonb,
+        }),
         "jsonb_path_query" | "jsonb_path_query_tz" => Ok(ColType::Jsonb),
         "__sqljson_value" => Ok(ColType::Text),
         // v1.90: SQL/JSON constructor desugars — the RETURNING spec

@@ -464,6 +464,7 @@ pub(crate) fn exec_create_domain(
     checks: &[CheckDef],
     not_null: bool,
     default: Option<&DefaultExpr>,
+    base_bit_typmod: Option<(i32, bool)>,
 ) -> Result<ExecResult, ExecError> {
     if eng.db.types.contains_key(name) {
         return Err(exec_err(
@@ -547,6 +548,7 @@ pub(crate) fn exec_create_domain(
                 checks: checks.to_vec(),
                 not_null,
                 default: default.cloned(),
+                bit_typmod: base_bit_typmod,
             }),
         },
     );

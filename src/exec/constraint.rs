@@ -146,6 +146,13 @@ pub(crate) fn check_domain_value(
     if let Some(inner) = &dom.base_domain {
         check_domain_value(q, inner, value, false)?;
     }
+    // v1.92: a bit(n) / bit varying(n) domain typmod — ColType::Bit
+    // is typmod-free in this engine, so the domain carries the
+    // typmod and it is enforced here, before the CHECKs (PG coerces
+    // to the domain type ahead of running its checks).
+    if let (Some((n, varying)), Value::BitString(bs)) = (dom.bit_typmod, value) {
+        super::json::sj_check_bit_len(bs.bitlen, n, varying)?;
+    }
     // This domain's CHECKs see a one-column scope named `value` (PG19's
     // VALUE pseudo-column).
     for c in &dom.checks {

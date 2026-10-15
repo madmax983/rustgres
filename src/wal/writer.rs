@@ -1339,6 +1339,9 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 checks: crate::sql::decode_domain_checks(&checks).map_err(|e| bad(&e))?,
                 not_null,
                 default: crate::sql::decode_domain_default(&default).map_err(|e| bad(&e))?,
+                // v1.92: the WAL domain record does not carry the
+                // bit typmod yet (bounded durability gap).
+                bit_typmod: None,
             })
         } else {
             None

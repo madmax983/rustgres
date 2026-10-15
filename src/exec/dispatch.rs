@@ -193,6 +193,7 @@ pub(crate) fn execute_inner(
             checks,
             not_null,
             default,
+            base_bit_typmod,
         } => exec_create_domain(
             eng,
             ctx,
@@ -202,6 +203,7 @@ pub(crate) fn execute_inner(
             checks,
             *not_null,
             default.as_ref(),
+            *base_bit_typmod,
         ),
         Stmt::DropDomain { names, if_exists } => exec_drop_domain(eng, ctx, names, *if_exists),
         // --- v0.97: ALTER DOMAIN ---

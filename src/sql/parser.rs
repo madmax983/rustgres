@@ -13,6 +13,11 @@ pub(crate) struct Parser {
     /// `SUBSTRING(s SIMILAR pat ...)`, where a bare SIMILAR introduces the
     /// SQL substring form instead of a boolean SIMILAR TO test.
     pub(crate) allow_similar_to: bool,
+    /// v1.92: the (length, varying) typmod of the most recent
+    /// bit/varbit type name parsed by parse_type_name_rest — ColType::Bit
+    /// carries no typmod, so RETURNING specs and JSON_TABLE columns
+    /// read it from here.
+    pub(crate) last_bit_typmod: Option<(i32, bool)>,
 }
 
 impl Parser {
@@ -720,6 +725,9 @@ impl Parser {
         &mut self,
         name: String,
     ) -> Result<(ColType, Option<String>), SqlError> {
+        // v1.92: reset the bit-typmod side channel; the bit/varbit
+        // arms below set it when they consume a `(n)`.
+        self.last_bit_typmod = None;
         let base: ColType = match name.as_str() {
             "int" | "integer" => Ok(ColType::Int),
             // v0.14: PostgreSQL internal alias names (pg_regress conformance).
@@ -917,10 +925,28 @@ impl Parser {
                 Ok(ColType::Interval)
             }
             "bytea" => Ok(ColType::Bytea),
-            // v1.39: PG's `bit` type (OID 1560). `bit(n)` typmod is not
-            // accepted yet (fail-closed: the value carries its own bit
-            // length, so enforcement would need per-value checks).
-            "bit" => Ok(ColType::Bit),
+            // v1.39: PG's `bit` type (OID 1560); the value carries its
+            // own bit length. v1.92: the `(n)` typmod is now consumed
+            // (and `bit varying` / `varbit` recognized) with the length
+            // recorded in `last_bit_typmod` for consumers that enforce
+            // it (SQL/JSON RETURNING specs, JSON_TABLE columns).
+            "bit" => {
+                let varying = self.eat_keyword("varying");
+                if let Some(n) = self.parse_opt_typmod()? {
+                    self.last_bit_typmod = Some((n, varying));
+                } else if varying {
+                    self.last_bit_typmod = Some((-1, true));
+                }
+                Ok(ColType::Bit)
+            }
+            "varbit" => {
+                if let Some(n) = self.parse_opt_typmod()? {
+                    self.last_bit_typmod = Some((n, true));
+                } else {
+                    self.last_bit_typmod = Some((-1, true));
+                }
+                Ok(ColType::Bit)
+            }
             "uuid" => Ok(ColType::Uuid),
             "regclass" => Ok(ColType::Regclass),
             "pg_lsn" => Ok(ColType::PgLsn), // v0.64
@@ -1182,22 +1208,13 @@ impl Parser {
             } else {
                 None
             };
-            let name = if name.is_empty() {
-                let key_part: Vec<String> = columns
-                    .iter()
-                    .map(|c| {
-                        c.name.clone().unwrap_or_else(|| {
-                            // PG mangles expression auto-names; "expr" is
-                            // unambiguous and cannot collide with a real
-                            // column list's mangling.
-                            "expr".to_string()
-                        })
-                    })
-                    .collect();
-                format!("{}_{}_idx", table, key_part.join("_"))
-            } else {
-                name
-            };
+            // v1.92: an omitted index name stays empty here;
+            // exec_create_index generates PG's <table>_<cols>_idx
+            // name and uniquifies it against existing relations
+            // (PG19 ChooseRelationName appends 1, 2, ... on
+            // collision). Generating it in the parser made every
+            // unnamed expression index on a table share one name, so
+            // the second CREATE INDEX always failed 42P07.
             return Ok(Stmt::CreateIndex {
                 name,
                 table,
@@ -3198,6 +3215,13 @@ impl Parser {
         let name = self.expect_ident()?;
         self.expect_keyword("as")?;
         let (base, base_named) = self.parse_type_name()?;
+        // v1.92: capture a bit base's typmod before anything else
+        // parses a type (parse_type_name_rest recorded it).
+        let base_bit_typmod = if base == ColType::Bit {
+            self.last_bit_typmod
+        } else {
+            None
+        };
         let mut checks = Vec::new();
         let mut not_null = false;
         let mut default = None;
@@ -3269,6 +3293,7 @@ impl Parser {
             checks,
             not_null,
             default,
+            base_bit_typmod,
         })
     }
 
@@ -6533,17 +6558,28 @@ impl Parser {
     /// JsonQueryExpr / JsonExistsExpr). Desugared onto internal
     /// builtins over the jsonpath engine:
     ///   JSON_VALUE  -> __sqljson_value(doc, path, vars, oe_k, oe_x,
-    ///                  or_k, or_x) [wrapped in a Cast when RETURNING]
+    ///                  or_k, or_x, ret_spec)
     ///   JSON_QUERY  -> __sqljson_query(doc, path, vars, oe_k, oe_x,
-    ///                  or_k, or_x, wrapper, keep_quotes) [+ Cast]
+    ///                  or_k, or_x, wrapper, keep_quotes, ret_spec,
+    ///                  ret_format_json, doc_format_json)
     ///   JSON_EXISTS -> __sqljson_exists(doc, path, vars, or_k)
     /// Behavior kinds (exec/json.rs): 0 ERROR, 1 NULL, 2 DEFAULT-expr,
     /// 3 EMPTY, 4 EMPTY ARRAY, 5 EMPTY OBJECT, 6 TRUE, 7 FALSE.
     /// PASSING pairs fold into a jsonb_build_object() vars argument.
     /// `kind`: 0 = VALUE, 1 = QUERY, 2 = EXISTS.
+    /// v1.92: unspecified ON EMPTY / ON ERROR default to NULL for
+    /// VALUE and QUERY and to FALSE (ON ERROR) for EXISTS (PG19
+    /// transformJsonBehavior); the RETURNING spec rides as an
+    /// argument for QUERY too (no outer Cast wrap — the evaluator
+    /// applies populate semantics itself).
     pub(crate) fn parse_sqljson_fn(&mut self, kind: u8) -> Result<Expr, SqlError> {
         self.expect(Token::LParen, "'('")?;
         let doc = self.parse_or()?;
+        // PG19 gram.y: the context item is a JsonValueExpr, so a
+        // FORMAT JSON clause may follow it (the pathspec may not
+        // carry one). The flag rides to the evaluator; ENCODING is
+        // validated by parse_opt_format_json itself.
+        let (doc_format_json, _doc_enc) = self.parse_opt_format_json()?;
         self.expect(Token::Comma, "','")?;
         let path = self.parse_or()?;
         // PASSING expr AS name [, ...]
@@ -6551,10 +6587,32 @@ impl Parser {
         if self.eat_keyword("passing") {
             let mut kv: Vec<Expr> = Vec::new();
             loop {
-                let v = self.parse_or()?;
+                // v1.92: a geometric typed literal (`point ' (1, 2)'`)
+                // as a PASSING value: the geometric types have no
+                // ColType, so the literal rides as a CastNamed that
+                // eval_cast_named validates and canonicalizes.
+                let v = match (self.peek().clone(), self.peek2().clone()) {
+                    (Token::Ident(tn), Token::Str(s))
+                        if matches!(
+                            tn.as_str(),
+                            "point" | "box" | "circle" | "line" | "lseg" | "path" | "polygon"
+                        ) =>
+                    {
+                        self.next();
+                        self.next();
+                        Expr::CastNamed {
+                            expr: Box::new(Expr::Literal(Literal::Text(s.into()))),
+                            name: tn,
+                        }
+                    }
+                    _ => self.parse_or()?,
+                };
                 self.expect_keyword("as")?;
                 let nm = match self.next() {
                     Token::Ident(s) => s,
+                    // v1.92: quoted variable names keep their case
+                    // (PG19 jsonpath variables are case-sensitive).
+                    Token::QIdent(s) => s,
                     t => {
                         return Err(err(&format!(
                             "syntax error: expected PASSING variable name, found {:?}",
@@ -6578,6 +6636,11 @@ impl Parser {
         // RETURNING type (VALUE and QUERY).
         let mut returning: Option<ColType> = None;
         let mut returning_named: Option<String> = None;
+        // v1.92: the RETURNING spec string (json_ret_spec encoding,
+        // extended with bit(n) / bit varying(n)) and the FORMAT JSON
+        // flag, threaded to the evaluator as arguments.
+        let mut ret_spec: Option<String> = None;
+        let mut ret_format_json = false;
         if kind != 2 && self.eat_keyword("returning") {
             let tname = match self.next() {
                 Token::Ident(s) => s,
@@ -6595,16 +6658,74 @@ impl Parser {
                 ));
             }
             let (ty, named) = self.parse_type_name_rest(tname)?;
+            ret_spec = Some(if ty == ColType::Bit && named.is_none() {
+                match self.last_bit_typmod {
+                    Some((n, varying)) if n > 0 => {
+                        format!("{}({})", if varying { "bit varying" } else { "bit" }, n)
+                    }
+                    Some((_, true)) => "bit varying".to_string(),
+                    _ => "bit".to_string(),
+                }
+            } else {
+                Self::json_ret_spec(ty, &named)
+            });
             returning = Some(ty);
             returning_named = named;
+            // v1.92: `RETURNING <type> FORMAT JSON [ENCODING name]`
+            // (PG19 gram.y json_returning_clause_opt). PG19
+            // transformJsonExpr rejects the clause for JSON_VALUE
+            // outright (42601); for JSON_QUERY the encoding checks
+            // mirror checkJsonOutputFormat.
+            if matches!(self.peek(), Token::Ident(s) if s == "format") {
+                let (_, enc) = self.parse_opt_format_json()?;
+                if kind == 0 {
+                    return Err(err(
+                        "cannot specify FORMAT JSON in RETURNING clause of JSON_VALUE()",
+                    ));
+                }
+                if enc != 0 {
+                    if ty != ColType::Bytea && returning_named.is_none() {
+                        return Err(SqlError {
+                            message: "cannot set JSON encoding for non-bytea output types"
+                                .to_string(),
+                            code: "0A000",
+                        });
+                    }
+                    if enc == 2 {
+                        return Err(SqlError {
+                            message: "unsupported JSON encoding".to_string(),
+                            code: "0A000",
+                        });
+                    }
+                }
+                if returning_named.is_none()
+                    && !matches!(
+                        ty,
+                        ColType::Text
+                            | ColType::Char(_)
+                            | ColType::Varchar(_)
+                            | ColType::Name
+                            | ColType::Json
+                            | ColType::Jsonb
+                            | ColType::Bytea
+                    )
+                {
+                    return Err(SqlError {
+                        message: "cannot use JSON format with non-string output types".to_string(),
+                        code: "0A000",
+                    });
+                }
+                ret_format_json = true;
+            }
         }
         // JSON_QUERY wrapper / quotes clauses.
         let mut wrapper: i64 = 0; // 0 without, 1 unconditional, 2 conditional
-        let mut keep_quotes = false;
-        let mut quotes_seen = false;
+        let mut quotes_spec: Option<bool> = None; // Some(true) = KEEP, Some(false) = OMIT
         if kind == 1 {
             loop {
                 if self.eat_keyword("without") {
+                    // PG19 gram.y: WITHOUT [ARRAY] WRAPPER.
+                    let _ = self.eat_keyword("array");
                     self.expect_keyword("wrapper")?;
                     wrapper = 0;
                 } else if self.eat_keyword("with") {
@@ -6615,32 +6736,48 @@ impl Parser {
                     } else {
                         wrapper = 1;
                     }
+                    // PG19 gram.y: WITH [CONDITIONAL|UNCONDITIONAL]
+                    // [ARRAY] WRAPPER; bare WITH ARRAY WRAPPER is the
+                    // unconditional form.
+                    let _ = self.eat_keyword("array");
                     self.expect_keyword("wrapper")?;
                 } else if self.eat_keyword("keep") {
                     self.expect_keyword("quotes")?;
-                    keep_quotes = true;
-                    quotes_seen = true;
+                    // PG19 gram.y: [KEEP|OMIT] QUOTES [ON SCALAR STRING].
+                    if self.eat_keyword("on") {
+                        self.expect_keyword("scalar")?;
+                        self.expect_keyword("string")?;
+                    }
+                    quotes_spec = Some(true);
                 } else if self.eat_keyword("omit") {
                     self.expect_keyword("quotes")?;
-                    keep_quotes = false;
-                    quotes_seen = true;
+                    if self.eat_keyword("on") {
+                        self.expect_keyword("scalar")?;
+                        self.expect_keyword("string")?;
+                    }
+                    quotes_spec = Some(false);
                 } else {
                     break;
                 }
             }
-            // PG19: QUOTES must not be specified when WITH WRAPPER is
-            // used (either flavor).
-            if wrapper != 0 && quotes_seen {
+            // PG19 transformJsonExpr: only OMIT QUOTES conflicts with
+            // a wrapper (KEEP QUOTES is the JsonExpr default and is
+            // allowed alongside WITH [CONDITIONAL] WRAPPER).
+            if wrapper != 0 && quotes_spec == Some(false) {
                 return Err(err(
                     "SQL/JSON QUOTES behavior must not be specified when WITH WRAPPER is used",
                 ));
             }
         }
         // Behavior clauses: `<behavior> ON EMPTY|ON ERROR` in either
-        // order, each at most once (defaults: ERROR / ERROR; for
-        // JSON_EXISTS ON ERROR defaults to ERROR too).
+        // order, each at most once. v1.92: PG19's unspecified-clause
+        // defaults (transformJsonBehavior) are NULL for both clauses
+        // of JSON_VALUE / JSON_QUERY and FALSE for JSON_EXISTS'
+        // ON ERROR — track which clauses were actually spelled out.
         let (mut oe_kind, mut oe_expr) = (0i64, Expr::Literal(Literal::Null));
         let (mut or_kind, mut or_expr) = (0i64, Expr::Literal(Literal::Null));
+        let mut oe_specified = false;
+        let mut or_specified = false;
         for _ in 0..2 {
             let save = self.pos;
             let (bk, bx) = match self.parse_sqljson_behavior() {
@@ -6654,15 +6791,29 @@ impl Parser {
                 if self.eat_keyword("empty") {
                     oe_kind = bk;
                     oe_expr = bx;
+                    oe_specified = true;
                 } else if self.eat_keyword("error") {
                     or_kind = bk;
                     or_expr = bx;
+                    or_specified = true;
                 } else {
                     return Err(err("syntax error: expected EMPTY or ERROR after ON"));
                 }
             } else {
                 self.pos = save;
                 break;
+            }
+        }
+        if kind == 2 {
+            if !or_specified {
+                or_kind = 7; // FALSE
+            }
+        } else {
+            if !oe_specified {
+                oe_kind = 1; // NULL
+            }
+            if !or_specified {
+                or_kind = 1; // NULL
             }
         }
         // PG19 behavior validity (parse_expr.c transformJsonBehavior
@@ -6704,11 +6855,10 @@ impl Parser {
         // a user-written cast would build (CastNamed for domains and
         // composites, Cast for builtins) — except string-typmod
         // targets, below. JSON_QUERY (kind 1) defaults are NOT
-        // wrapped: they ride the item path of the query arm and the
-        // outer RETURNING Cast converts the result (the v1.88
-        // semantics); wrapping a jsonb DEFAULT in a plain Cast would
-        // truncate its rendered text ('"bb"' -> '"b' for char(2))
-        // instead of populating the item.
+        // wrapped: they ride the item path of the query evaluator
+        // (the v1.88 semantics); wrapping a jsonb DEFAULT in a plain
+        // Cast would truncate its rendered text ('"bb"' -> '"b' for
+        // char(2)) instead of populating the item.
         let wrap_default = |e: Expr, bk: i64| -> Expr {
             if bk != 2 || kind != 0 {
                 return e;
@@ -6729,7 +6879,15 @@ impl Parser {
                     // builtin char/varchar target WITH a typmod the
                     // default rides unwrapped and eval_sqljson_value_q
                     // applies eval_assign_cast (22001) eagerly.
-                    if matches!(to, ColType::Char(Some(_)) | ColType::Varchar(Some(_))) {
+                    if matches!(to, ColType::Char(Some(_)) | ColType::Varchar(Some(_)))
+                        || *to == ColType::Bit
+                    {
+                        // v1.92: bit targets likewise ride unwrapped —
+                        // PG's behavior coercion is assignment-context,
+                        // under which the explicit-only int->bit cast
+                        // FAILS (42846) while bit literals and string
+                        // literals coerce; eval_sqljson_value_q's
+                        // eager bit block applies those rules.
                         e
                     } else {
                         Expr::Cast {
@@ -6744,33 +6902,15 @@ impl Parser {
         };
         let oe_expr = wrap_default(oe_expr, oe_kind);
         let or_expr = wrap_default(or_expr, or_kind);
-        // JSON_VALUE's RETURNING conversion is NOT a plain cast in
-        // PG (it uses the target type's input semantics — "1.234"
-        // to int errors), so the type name rides as an argument and
-        // __sqljson_value converts strictly. JSON_QUERY keeps the
-        // plain Cast wrap. v1.89: the spec keeps the domain/composite
-        // name and any typmod (char(n), numeric(p,s), bit(n)) so the
+        // Neither JSON_VALUE's nor JSON_QUERY's RETURNING conversion
+        // is a plain cast in PG (both use json_populate_type's input
+        // semantics — "1.234" to int errors), so the type spec rides
+        // as an argument and the evaluators convert strictly.
+        // v1.89/v1.92: the spec keeps the domain/composite name and
+        // any typmod (char(n), numeric(p,s), bit(n)) so the
         // evaluator can apply domain checks and assignment semantics.
-        let ret_name = match (kind, &returning) {
-            (0, Some(ty)) => {
-                let spec = if let Some(n) = &returning_named {
-                    n.clone()
-                } else {
-                    match ty {
-                        ColType::Char(n) => match n {
-                            Some(n) => format!("character({})", n),
-                            None => "character".to_string(),
-                        },
-                        ColType::Varchar(n) => match n {
-                            Some(n) => format!("character varying({})", n),
-                            None => "character varying".to_string(),
-                        },
-                        ColType::Numeric(Some((p, s))) => format!("numeric({},{})", p, s),
-                        t => t.sql_name(),
-                    }
-                };
-                Expr::Literal(Literal::Text(spec.into()))
-            }
+        let ret_name = match (kind, &ret_spec) {
+            (0, Some(spec)) | (1, Some(spec)) => Expr::Literal(Literal::Text(spec.clone().into())),
             _ => Expr::Literal(Literal::Null),
         };
         let call = match kind {
@@ -6789,7 +6929,20 @@ impl Parser {
                     int_lit(or_kind),
                     or_expr,
                     int_lit(wrapper),
-                    Expr::Literal(Literal::Bool(keep_quotes)),
+                    // v1.92: quotes mode as a tri-state (PG19's
+                    // JsonQuotesClause): 0 = unspecified (the
+                    // coercion default), 1 = KEEP QUOTES, 2 = OMIT
+                    // QUOTES. OMIT differs from unspecified for a
+                    // jsonb RETURNING (it forces JSON coercion of
+                    // scalar items), so a plain bool is not enough.
+                    int_lit(match quotes_spec {
+                        None => 0,
+                        Some(true) => 1,
+                        Some(false) => 2,
+                    }),
+                    ret_name,
+                    int_lit(i64::from(ret_format_json)),
+                    int_lit(i64::from(doc_format_json)),
                 ],
             },
             _ => Expr::Func {
@@ -6806,14 +6959,7 @@ impl Parser {
                 ],
             },
         };
-        Ok(match returning {
-            Some(to) if kind == 1 => Expr::Cast {
-                expr: Box::new(call),
-                to,
-                written: None,
-            },
-            _ => call,
-        })
+        Ok(call)
     }
 
     /// One SQL/JSON behavior: ERROR | NULL | TRUE | FALSE | EMPTY
@@ -6945,6 +7091,12 @@ impl Parser {
     /// name; builtin string typmods are spelled out).
     fn json_ret_spec(ty: ColType, named: &Option<String>) -> String {
         if let Some(n) = named {
+            // v1.92: an array of a named type keeps its `[]` in the
+            // spec (the name alone would read as the scalar type);
+            // the parser flattens multi-dim arrays to one level.
+            if matches!(ty, ColType::Array(_)) {
+                return format!("{}[]", n);
+            }
             return n.clone();
         }
         match ty {
@@ -9796,13 +9948,14 @@ impl Parser {
                     cols.push(JtColumn::Ordinality { name: cname });
                 } else {
                     // Column type. bit(n)/varbit(n): ColType::Bit
-                    // drops the typmod, so consume it here when the
-                    // type parser left it behind.
+                    // drops the typmod; since v1.92 the type parser
+                    // consumes it and records it in last_bit_typmod.
                     let is_bit =
                         matches!(self.peek(), Token::Ident(s) if s == "bit" || s == "varbit");
                     let (ty, named) = self.parse_type_name()?;
-                    let bit_len = if is_bit && *self.peek() == Token::LParen {
-                        self.parse_opt_typmod()?
+                    let bit_len = if is_bit {
+                        self.last_bit_typmod
+                            .and_then(|(n, _)| if n > 0 { Some(n) } else { None })
                     } else {
                         None
                     };
@@ -11047,12 +11200,29 @@ pub(crate) fn parse_statement_inner(text: &str) -> Result<Stmt, SqlError> {
         pos: 0,
         unnamed_seq: 0,
         allow_similar_to: true,
+        last_bit_typmod: None,
     };
     let stmt = p.parse_top()?;
     match p.next() {
         Token::EOF => Ok(stmt),
         other => Err(err(format!("syntax error: unexpected {:?}", other))),
     }
+}
+
+/// v1.92: parse a standalone expression from source text. Used to
+/// re-analyze stored index-expression / predicate sources (which
+/// were captured with tokens_to_sql at CREATE INDEX time) for the
+/// immutability check.
+pub(crate) fn parse_expr_str(text: &str) -> Result<Expr, SqlError> {
+    let tokens = tokenize(text)?;
+    let mut p = Parser {
+        tokens,
+        pos: 0,
+        unnamed_seq: 0,
+        allow_similar_to: true,
+        last_bit_typmod: None,
+    };
+    p.parse_or()
 }
 
 /// Walk an expression, rejecting anything a CHECK / DEFAULT expression
@@ -12191,6 +12361,7 @@ pub(crate) fn coltype_from_sql_spelling(name: &str) -> Result<ColType, String> {
         pos: 0,
         unnamed_seq: 0,
         allow_similar_to: true,
+        last_bit_typmod: None,
     };
     let (ty, named) = p
         .parse_type_name()

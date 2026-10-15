@@ -4911,7 +4911,8 @@ pub enum ByteaOutput {
 /// v0.73: PG19 `record_out` composite literal: `(f1,f2,...)`. NULL
 /// fields render as empty and unquoted; a field is double-quoted when it
 /// is empty or contains `(`, `)`, `,`, `"`, `\`, or whitespace, with `"`
-/// and `\` backslash-escaped inside the quotes. Nested records render
+/// and `\` doubled inside the quotes (v1.92: PG19 rowtypes.c style).
+/// Nested records render
 /// recursively, so their parens trigger quoting (`("(1)")`).
 pub fn record_text(fields: &[(String, Value)]) -> String {
     let mut out = String::from("(");
@@ -4922,9 +4923,12 @@ pub fn record_text(fields: &[(String, Value)]) -> String {
         if let Some(t) = v.to_text() {
             if record_field_needs_quote(&t) {
                 out.push('"');
+                // v1.92: PG19 record_out *doubles* `"` and `\`
+                // inside a quoted field (it does not backslash-
+                // escape; that is array_out's style).
                 for ch in t.chars() {
                     if ch == '"' || ch == '\\' {
-                        out.push('\\');
+                        out.push(ch);
                     }
                     out.push(ch);
                 }
@@ -5566,6 +5570,12 @@ pub struct DomainDef {
     pub checks: Vec<CheckDef>,
     pub not_null: bool,
     pub default: Option<DefaultExpr>,
+    /// v1.92: bit typmod of the base when the domain is over
+    /// bit(n)/bit varying(n) — (length, varying). ColType::Bit
+    /// itself is typmod-free in this engine, so the domain carries
+    /// it and check_domain_value enforces it. (Not yet carried by
+    /// the WAL type record.)
+    pub bit_typmod: Option<(i32, bool)>,
 }
 
 #[derive(Clone, Debug)]

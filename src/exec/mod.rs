@@ -251,6 +251,9 @@ mod v190_ctor_tests;
 #[path = "test_mods/v191_range_remainder_tests.rs"]
 mod v191_range_remainder_tests;
 #[cfg(test)]
+#[path = "test_mods/v192_sqljson_queryfuncs_tests.rs"]
+mod v192_sqljson_queryfuncs_tests;
+#[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;
 

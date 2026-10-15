@@ -1002,31 +1002,38 @@ pub(crate) fn eval_function_item(
                 "function unnest() does not exist".to_string(),
             ));
         }
-        let elem_ty = match &arg_vals[0] {
-            Value::Array(a) => elem_scalar_type(a.elem),
-            Value::Text(_) | Value::BpChar(_) => ColType::Text,
-            Value::Null => {
-                let schemas: Vec<&[QCol]> = scopes.iter().map(|s| s.schema).collect();
-                match expr_type(
-                    &mut *q.eng,
-                    q.snap,
-                    q.own,
-                    q.session,
-                    &schemas,
-                    &[],
-                    &[],
-                    &args[0],
-                ) {
-                    Ok(ColType::Array(e)) => elem_scalar_type(e),
-                    // Typing failed (e.g. a CTE reference, which the
-                    // Describe path types properly): zero rows either
-                    // way; fall back to text for the column type.
-                    _ => ColType::Text,
+        // v1.92: an array of a named composite expands to the
+        // composite's columns (the rows already carry the fields,
+        // expanded by eval_table_function).
+        if let Some(fields) = unnest_record_elem_fields(q.eng, q.snap, q.own, q.session, &args[0]) {
+            fields.into_iter().map(|(_, t)| t).collect::<Vec<ColType>>()
+        } else {
+            let elem_ty = match &arg_vals[0] {
+                Value::Array(a) => elem_scalar_type(a.elem),
+                Value::Text(_) | Value::BpChar(_) => ColType::Text,
+                Value::Null => {
+                    let schemas: Vec<&[QCol]> = scopes.iter().map(|s| s.schema).collect();
+                    match expr_type(
+                        &mut *q.eng,
+                        q.snap,
+                        q.own,
+                        q.session,
+                        &schemas,
+                        &[],
+                        &[],
+                        &args[0],
+                    ) {
+                        Ok(ColType::Array(e)) => elem_scalar_type(e),
+                        // Typing failed (e.g. a CTE reference, which the
+                        // Describe path types properly): zero rows either
+                        // way; fall back to text for the column type.
+                        _ => ColType::Text,
+                    }
                 }
-            }
-            other => return Err(func_arg_err(name, other)),
-        };
-        vec![elem_ty]
+                other => return Err(func_arg_err(name, other)),
+            };
+            vec![elem_ty]
+        }
     } else {
         table_function_col_types(name, &arg_vals)?
     };
@@ -1922,6 +1929,115 @@ pub(crate) fn eval_lateral_right(
     }
 }
 
+/// v1.92: the named composite fields of a type name (CREATE TYPE
+/// composite or table rowtype): (field, type, nested type name).
+fn named_composite_fields(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    type_name: &str,
+) -> Option<Vec<(String, ColType, Option<String>)>> {
+    if let Some(st) = eng.db.types.get(type_name) {
+        if let Some(fields) = &st.composite {
+            return Some(fields.clone());
+        }
+    }
+    let t = eng.db.find_table(type_name, snap, &[own], session)?;
+    Some(
+        t.columns
+            .iter()
+            .enumerate()
+            .map(|(i, (n, c))| {
+                (
+                    n.clone(),
+                    c.clone(),
+                    t.domain_types.get(i).cloned().flatten(),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// v1.92: the named type an expression statically carries, as
+/// (type name, is-array-of-that-name). Covers the shapes whose
+/// element type matters for unnest: casts to named types, SQL/JSON
+/// query/value RETURNING specs, and field access into a named
+/// composite (where the field's stored nested name is the
+/// element type for array fields).
+fn expr_named_type(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    e: &Expr,
+) -> Option<(String, bool)> {
+    match e {
+        Expr::CastNamed { name, .. } => Some(match name.strip_suffix("[]") {
+            Some(base) => (base.to_string(), true),
+            None => (name.clone(), false),
+        }),
+        Expr::Func { name, args, .. } if name == "__sqljson_query" || name == "__sqljson_value" => {
+            let slot = if name == "__sqljson_query" { 9 } else { 7 };
+            let spec = match args.get(slot) {
+                Some(Expr::Literal(Literal::Text(t))) => t.clone(),
+                _ => return None,
+            };
+            Some(match spec.strip_suffix("[]") {
+                Some(base) => (base.to_string(), true),
+                None => (spec.to_string(), false),
+            })
+        }
+        Expr::FieldAccess { expr: base, field } => {
+            let (bn, _) = expr_named_type(eng, snap, own, session, base)?;
+            let fields = named_composite_fields(eng, snap, own, session, &bn)?;
+            let (_, ty, nested) = fields.iter().find(|(n, _, _)| n == field)?;
+            let nested = nested.clone()?;
+            Some((nested, matches!(ty, ColType::Array(_))))
+        }
+        _ => None,
+    }
+}
+
+/// v1.92: for an unnest argument, the (name, type) field list of
+/// its composite element type when the argument is an array of a
+/// named composite (PG expands unnest of a record array to the
+/// composite's columns).
+fn unnest_record_elem_fields(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    arg: &Expr,
+) -> Option<Vec<(String, ColType)>> {
+    let (elem_name, is_array) = expr_named_type(eng, snap, own, session, arg)?;
+    if !is_array {
+        return None;
+    }
+    let fields = named_composite_fields(eng, snap, own, session, &elem_name)?;
+    Some(fields.into_iter().map(|(n, t, _)| (n, t)).collect())
+}
+
+/// v1.92: for a field-access unnest argument, the field's declared
+/// type (expr_type loses it, returning the record pseudo-type).
+fn unnest_arg_field_type(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    arg: &Expr,
+) -> Option<ColType> {
+    let Expr::FieldAccess { expr: base, field } = arg else {
+        return None;
+    };
+    let (bn, _) = expr_named_type(eng, snap, own, session, base)?;
+    let fields = named_composite_fields(eng, snap, own, session, &bn)?;
+    fields
+        .into_iter()
+        .find(|(n, _, _)| n == field)
+        .map(|(_, t, _)| t)
+}
+
 /// v0.46: output schema of a table function in an implicit-LATERAL
 /// position, inferred statically from the argument *types* against the
 /// left input's schema. Row values aren't available (and must not
@@ -2041,16 +2157,28 @@ pub(crate) fn lateral_function_schema(
                 "function unnest() does not exist".to_string(),
             ));
         }
+        // v1.92: an array of a named composite expands to the
+        // composite's columns.
+        if let Some(fields) = unnest_record_elem_fields(eng, snap, own, session, &args[0]) {
+            let (names, types): (Vec<String>, Vec<ColType>) = fields.into_iter().unzip();
+            return function_item_schema(name, &names, &types, alias, col_aliases);
+        }
         let schemas = [left];
-        let ty = match expr_type(eng, snap, own, session, &schemas, &[], &[], &args[0])? {
-            ColType::Array(e) => elem_scalar_type(e),
-            ColType::Text if matches!(args[0], Expr::Literal(_)) => ColType::Text,
-            other => {
-                return Err(exec_err(
-                    "42883",
-                    format!("function unnest({}) does not exist", other.sql_name()),
-                ));
-            }
+        // v1.92: a field-access argument's type comes from the
+        // field definition (expr_type returns the record
+        // pseudo-type for field access).
+        let ty = match unnest_arg_field_type(eng, snap, own, session, &args[0]) {
+            Some(ColType::Array(e)) => elem_scalar_type(e),
+            _ => match expr_type(eng, snap, own, session, &schemas, &[], &[], &args[0])? {
+                ColType::Array(e) => elem_scalar_type(e),
+                ColType::Text if matches!(args[0], Expr::Literal(_)) => ColType::Text,
+                other => {
+                    return Err(exec_err(
+                        "42883",
+                        format!("function unnest({}) does not exist", other.sql_name()),
+                    ));
+                }
+            },
         };
         vec![ty]
     } else if is_json_expansion_srf(name) {

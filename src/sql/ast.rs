@@ -4844,6 +4844,7 @@ pub fn parse_trigger_body(body: &str) -> Result<Vec<TriggerBodyStmt>, SqlError> 
         pos: 0,
         unnamed_seq: 0,
         allow_similar_to: true,
+        last_bit_typmod: None,
     };
     p.parse_trigger_body_stmts()
 }
@@ -5119,6 +5120,8 @@ pub enum Stmt {
         checks: Vec<CheckDef>,
         not_null: bool,
         default: Option<DefaultExpr>,
+        /// v1.92: bit(n)/bit varying(n) typmod of the base type.
+        base_bit_typmod: Option<(i32, bool)>,
     },
     DropDomain {
         names: Vec<String>,

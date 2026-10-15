@@ -207,6 +207,118 @@ pub(crate) fn check_update_unique_pairs(
     Ok(())
 }
 
+/// v1.92: is this candidate index name already taken in the
+/// (temp-aware) relation namespace? Mirrors PG19's
+/// ChooseRelationName check, which considers indexes and tables.
+fn index_name_taken(eng: &Engine, ctx: &StmtCtx, cand: &str, is_temp: bool) -> bool {
+    let ix = if is_temp {
+        eng.db
+            .temp_indexes
+            .get(&ctx.session)
+            .and_then(|m| m.get(cand))
+            .filter(|ix| index_visible(&ix.def, ctx.snap, &ctx.all_xids))
+            .is_some()
+    } else {
+        eng.db.find_index(cand, ctx.snap, &ctx.all_xids).is_some()
+    };
+    ix || eng
+        .db
+        .find_table(cand, ctx.snap, &ctx.all_xids, ctx.session)
+        .is_some()
+}
+
+/// v1.92: the datetime status of a PASSING variable's static type,
+/// for the jsonpath mutability check (PG19 jspIsMutable's variable
+/// case: date/time/timestamp are non-zoned, timetz/timestamptz
+/// zoned, everything else non-datetime).
+fn sqljson_var_dt_status(e: &Expr) -> super::jsonpath::JpDtStatus {
+    use super::jsonpath::JpDtStatus;
+    let named_status = |n: &str| match n {
+        "date" | "time" | "timestamp" => JpDtStatus::NonZoned,
+        "timetz" | "timestamptz" => JpDtStatus::Zoned,
+        _ => JpDtStatus::Non,
+    };
+    match e {
+        Expr::Cast { to, .. } => match to {
+            ColType::Date | ColType::Time | ColType::Timestamp => JpDtStatus::NonZoned,
+            ColType::TimeTz | ColType::Timestamptz => JpDtStatus::Zoned,
+            _ => JpDtStatus::Non,
+        },
+        Expr::CastNamed { name, .. } => named_status(name),
+        _ => JpDtStatus::Non,
+    }
+}
+
+/// v1.92: does this __sqljson_* call's jsonpath make it mutable in
+/// PG19's jspIsMutable sense? `args` are the desugared call's
+/// arguments (doc, path, vars, ...).
+fn sqljson_path_mutable(args: &[Expr]) -> bool {
+    let Some(Expr::Literal(Literal::Text(p))) = args.get(1) else {
+        return false;
+    };
+    let mut vars: Vec<(String, super::jsonpath::JpDtStatus)> = Vec::new();
+    if let Some(Expr::Func { name, args: kv }) = args.get(2) {
+        if name == "jsonb_build_object" {
+            for pair in kv.chunks(2) {
+                if let [Expr::Literal(Literal::Text(n)), v] = pair {
+                    vars.push((n.to_string(), sqljson_var_dt_status(v)));
+                }
+            }
+        }
+    }
+    match super::jsonpath::parse_jsonpath(p) {
+        Ok(jp) => super::jsonpath::jp_path_is_mutable(&jp, &vars),
+        Err(_) => false,
+    }
+}
+
+/// v1.92: PG19 DefineIndex rejects index expressions / predicates
+/// that are not IMMUTABLE (42P17). Bounded port: generic volatility
+/// (volatile builtins and user functions, via expr_is_volatile) plus
+/// the SQL/JSON path check (jspIsMutable). Expressions containing
+/// subqueries, window functions, or aggregates keep the historical
+/// accept-anything behavior (PG rejects those with different
+/// errors; out of scope here).
+fn index_expr_is_mutable(eng: &Engine, e: &Expr) -> bool {
+    let mut blocked = false;
+    walk_expr(e, &mut |x| {
+        if matches!(
+            x,
+            Expr::ScalarSub(_)
+                | Expr::ArraySubquery(_)
+                | Expr::InSub { .. }
+                | Expr::Exists { .. }
+                | Expr::Window { .. }
+                | Expr::Agg { .. }
+                | Expr::JsonArraySubq { .. }
+        ) {
+            blocked = true;
+        }
+    });
+    if blocked {
+        return false;
+    }
+    if expr_is_volatile(&eng.db, e) {
+        return true;
+    }
+    let mut mutable = false;
+    walk_expr(e, &mut |x| {
+        if mutable {
+            return;
+        }
+        if let Expr::Func { name, args } = x {
+            if matches!(
+                name.as_str(),
+                "__sqljson_query" | "__sqljson_value" | "__sqljson_exists"
+            ) && sqljson_path_mutable(args)
+            {
+                mutable = true;
+            }
+        }
+    });
+    mutable
+}
+
 pub(crate) fn exec_create_index(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -221,6 +333,52 @@ pub(crate) fn exec_create_index(
     require_table_owner(eng, ctx, table)?;
     // v0.87: temp tables use the session-local temp index map.
     let is_temp = eng.db.is_temp_table(ctx.session, table);
+    // v1.92: PG19 checks expression/predicate immutability while
+    // defining the index (before the catalog insertion that reports
+    // duplicate names).
+    for c in columns.iter() {
+        if let Some(src) = &c.expr {
+            if let Ok(e) = crate::sql::parse_expr_str(src) {
+                if index_expr_is_mutable(eng, &e) {
+                    return Err(exec_err(
+                        "42P17",
+                        "functions in index expression must be marked IMMUTABLE",
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(pred) = predicate {
+        if let Ok(e) = crate::sql::parse_expr_str(pred) {
+            if index_expr_is_mutable(eng, &e) {
+                return Err(exec_err(
+                    "42P17",
+                    "functions in index predicate must be marked IMMUTABLE",
+                ));
+            }
+        }
+    }
+    // v1.92: an omitted name is generated like PG19's
+    // ChooseIndexName + ChooseRelationName: <table>_<keyparts>_idx,
+    // with 1, 2, ... appended until the name is free.
+    let generated_name: String;
+    let name: &str = if name.is_empty() {
+        let key_part: Vec<String> = columns
+            .iter()
+            .map(|c| c.name.clone().unwrap_or_else(|| "expr".to_string()))
+            .collect();
+        let base = format!("{}_{}_idx", table, key_part.join("_"));
+        let mut cand = base.clone();
+        let mut i = 1;
+        while index_name_taken(eng, ctx, &cand, is_temp) {
+            cand = format!("{base}{i}");
+            i += 1;
+        }
+        generated_name = cand;
+        &generated_name
+    } else {
+        name
+    };
     let exists = if is_temp {
         eng.db
             .temp_indexes

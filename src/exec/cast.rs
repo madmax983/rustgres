@@ -1380,7 +1380,59 @@ pub(crate) fn eval_cast_named(q: &mut Q, v: &Value, name: &str) -> Result<Value,
     if let Some(casted) = apply_binary_cast(q, v, name)? {
         return Ok(casted);
     }
+    // v1.92: the geometric types have no ColType in this engine; a
+    // cast to one validates the input text through the type's input
+    // function (the pg_input port) and yields the canonical text
+    // form — points are re-rendered from their parsed coordinates
+    // (point_out); the other geometric types keep the input text
+    // (their full canonicalization is not modeled).
+    if super::json::sqljson_geometric_name(name) {
+        let text = match v {
+            Value::Text(t) | Value::BpChar(t) => t.to_string(),
+            other => {
+                return Err(exec_err(
+                    "42846",
+                    format!(
+                        "cannot cast type {} to {}",
+                        other.type_name().to_lowercase(),
+                        name
+                    ),
+                ));
+            }
+        };
+        if let Err(f) = super::pg_input::pg_input_validate_geometry(&text, name) {
+            return Err(match f {
+                PgInputFailure::Soft(e) => exec_err(e.code, e.message),
+                PgInputFailure::Hard(e) => e,
+            });
+        }
+        if name == "point" {
+            if let Some(canon) = canonical_point_text(&text) {
+                return Ok(Value::text(canon));
+            }
+        }
+        return Ok(Value::text(text.trim().to_string()));
+    }
     eval_cast_composite_inner(q, v, name)
+}
+
+/// v1.92: canonical point_out text for a validated point literal:
+/// `(x, y)` renders as `(x,y)` with shortest round-trip float
+/// formatting (Rust's f64 Display, like PG's Ryu-based float8out
+/// for ordinary magnitudes).
+fn canonical_point_text(input: &str) -> Option<String> {
+    let t = input.trim();
+    let inner = t
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(t);
+    let (a, b) = inner.split_once(',')?;
+    let x: f64 = a.trim().parse().ok()?;
+    let y: f64 = b.trim().parse().ok()?;
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    Some(format!("({},{})", x, y))
 }
 
 /// v0.81: cast to a named composite type (`expr::t_rec`). Resolves
@@ -1860,11 +1912,31 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
         },
         // v1.39: `bit` target — identity for bit values (PG's bit(bit)
         // typmod cast is a no-op here since the value carries its own
-        // bit length). No other source casts to bit (PG19 pg_cast.dat
-        // has only int4/int8 -> bit as explicit casts, which need the
-        // int-to-bits conversion — not yet implemented).
+        // bit length). v1.92: text input goes through bit_in
+        // (BitString::parse_input), like PG's IO conversion — this is
+        // what SQL/JSON behavior coercions and domain bases ride on.
+        // (PG19 pg_cast.dat's int4/int8 -> bit explicit casts still
+        // need the int-to-bits conversion — not yet implemented.)
         ColType::Bit => match v {
             Value::BitString(bs) => Ok(Value::BitString(bs.clone())),
+            // v1.92: PG's explicit int -> bit casts: the integer's
+            // two's-complement bits at its own width (the typmod
+            // adjustment happens in the caller's coercion).
+            Value::SmallInt(i) => Ok(Value::BitString(crate::storage::BitString {
+                bitlen: 16,
+                bytes: i.to_be_bytes().to_vec(),
+            })),
+            Value::Int(i) => Ok(Value::BitString(crate::storage::BitString {
+                bitlen: 32,
+                bytes: (*i as i32).to_be_bytes().to_vec(),
+            })),
+            Value::BigInt(i) => Ok(Value::BitString(crate::storage::BitString {
+                bitlen: 64,
+                bytes: i.to_be_bytes().to_vec(),
+            })),
+            Value::Text(s) | Value::BpChar(s) => crate::storage::BitString::parse_input(s.trim())
+                .map(Value::BitString)
+                .map_err(|m| exec_err("22P02", m)),
             other => Err(cast_err(other, "bit")),
         },
         ColType::Uuid => match v {

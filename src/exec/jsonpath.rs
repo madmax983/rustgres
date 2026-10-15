@@ -3043,10 +3043,188 @@ pub(crate) fn jp_exists(
 ) -> Result<bool, ExecError> {
     let ctx = jp_context(root, path, vars)?;
     if path.expr.is_predicate() {
-        Ok(eval_pred(&path.expr, &ctx, std::slice::from_ref(root), None, false)? == Tri::True)
+        // PG19 jsonpath_exec.c: a top-level predicate item goes
+        // through appendBoolResult, which in exists mode (no result
+        // list) reports jperOk — "found" — WHATEVER the tri-state
+        // outcome (true, false, or unknown), because the predicate
+        // itself produced a boolean verdict. Soft evaluation errors
+        // likewise collapse to unknown there. Only hard errors (an
+        // undefined variable) propagate.
+        match eval_pred(&path.expr, &ctx, std::slice::from_ref(root), None, false) {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                if e.message.starts_with("could not find jsonpath variable") {
+                    Err(e)
+                } else {
+                    Ok(true)
+                }
+            }
+        }
     } else {
         Ok(!eval(&path.expr, &ctx, std::slice::from_ref(root), None)?.is_empty())
     }
+}
+
+/// v1.92: the datetime status of a jsonpath (sub)expression's
+/// result, for PG19's jspIsMutable (jsonpath.c): whether values
+/// flowing through a comparison may depend on the TimeZone setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JpDtStatus {
+    /// null / bool / numeric / string / array / object.
+    Non,
+    /// Unknown datetime type (a `.datetime()` without a format).
+    Unknown,
+    /// timetz / timestamptz (zoned).
+    Zoned,
+    /// time / timestamp / date (non-zoned).
+    NonZoned,
+}
+
+struct JpMutCtx<'a> {
+    vars: &'a [(String, JpDtStatus)],
+    /// Status of the `@` item inside the innermost filter.
+    current: JpDtStatus,
+    lax: bool,
+    mutable: bool,
+}
+
+/// PG19's datetime_format_has_tz: does the .datetime() format
+/// template contain a TZ/TZH/TZM element (outside quoted text)?
+fn datetime_format_has_tz(fmt: &str) -> bool {
+    let b = fmt.as_bytes();
+    let mut quoted = false;
+    let mut i = 0;
+    while i + 1 < b.len() {
+        if b[i] == b'"' {
+            quoted = !quoted;
+            i += 1;
+            continue;
+        }
+        if !quoted && (b[i] == b't' || b[i] == b'T') && (b[i + 1] == b'z' || b[i + 1] == b'Z') {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// v1.92: port of PG19's jspIsMutableWalker over this engine's
+/// tree-shaped AST (PG walks a flat item chain; here each accessor
+/// wraps its base, so the walk returns the status of the value the
+/// subexpression produces). `.date()` / `.time()` / `.time_tz()` /
+/// `.timestamp()` / `.timestamp_tz()` are unconditionally mutable;
+/// a comparison is mutable when both sides carry datetime status
+/// and they differ or either is unknown.
+fn jp_mut_walk(e: &JpExpr, ctx: &mut JpMutCtx) -> JpDtStatus {
+    use JpDtStatus::*;
+    match e {
+        JpExpr::Root => Non,
+        JpExpr::Current => ctx.current,
+        JpExpr::Last => Non,
+        JpExpr::Var(name) => ctx
+            .vars
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, s)| *s)
+            .unwrap_or(Non),
+        JpExpr::Str(_) | JpExpr::Num(_) | JpExpr::Bool(_) | JpExpr::Null => Non,
+        JpExpr::Key(base, _) | JpExpr::AnyKey(base) => {
+            jp_mut_walk(base, ctx);
+            Non
+        }
+        JpExpr::AnyArray(base) => {
+            let s = jp_mut_walk(base, ctx);
+            if ctx.lax { s } else { Non }
+        }
+        JpExpr::Any(base, first, _) => {
+            let s = jp_mut_walk(base, ctx);
+            if *first > 0 { Non } else { s }
+        }
+        JpExpr::Subscript(base, elems) => {
+            for (f, t) in elems {
+                jp_mut_walk(f, ctx);
+                if let Some(t) = t {
+                    jp_mut_walk(t, ctx);
+                }
+            }
+            jp_mut_walk(base, ctx);
+            Non
+        }
+        JpExpr::Filter(base, pred) => {
+            let s = jp_mut_walk(base, ctx);
+            let prev = ctx.current;
+            ctx.current = s;
+            jp_mut_walk(pred, ctx);
+            ctx.current = prev;
+            s
+        }
+        JpExpr::Method(base, m) => {
+            jp_mut_walk(base, ctx);
+            match m {
+                JpMethod::Date
+                | JpMethod::Time(_)
+                | JpMethod::Timestamp(_)
+                | JpMethod::TimeTz(_)
+                | JpMethod::TimestampTz(_) => {
+                    ctx.mutable = true;
+                    NonZoned
+                }
+                JpMethod::Datetime(fmt) => match fmt {
+                    None => Unknown,
+                    Some(f) => {
+                        if datetime_format_has_tz(f) {
+                            Zoned
+                        } else {
+                            NonZoned
+                        }
+                    }
+                },
+                _ => Non,
+            }
+        }
+        JpExpr::Cmp(_, l, r) => {
+            let ls = jp_mut_walk(l, ctx);
+            let rs = jp_mut_walk(r, ctx);
+            if ls != Non && rs != Non && (ls == Unknown || rs == Unknown || ls != rs) {
+                ctx.mutable = true;
+            }
+            Non
+        }
+        JpExpr::And(l, r)
+        | JpExpr::Or(l, r)
+        | JpExpr::Arith(_, l, r)
+        | JpExpr::StartsWith(l, r) => {
+            jp_mut_walk(l, ctx);
+            jp_mut_walk(r, ctx);
+            Non
+        }
+        JpExpr::Not(x)
+        | JpExpr::IsUnknown(x)
+        | JpExpr::Exists(x)
+        | JpExpr::UnaryPlus(x)
+        | JpExpr::UnaryMinus(x) => {
+            jp_mut_walk(x, ctx);
+            Non
+        }
+        JpExpr::LikeRegex(x, ..) => {
+            jp_mut_walk(x, ctx);
+            Non
+        }
+    }
+}
+
+/// v1.92: PG19 jspIsMutable — is this path mutable (and so barred
+/// from index expressions)? `vars` maps PASSING variable names to
+/// the datetime status of their declared types.
+pub(crate) fn jp_path_is_mutable(path: &JpPath, vars: &[(String, JpDtStatus)]) -> bool {
+    let mut ctx = JpMutCtx {
+        vars,
+        current: JpDtStatus::Non,
+        lax: path.lax,
+        mutable: false,
+    };
+    jp_mut_walk(&path.expr, &mut ctx);
+    ctx.mutable
 }
 
 /// jsonb_path_match: the path must produce a single boolean item
