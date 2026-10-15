@@ -162,14 +162,26 @@ pub(crate) fn make_range(
         hi_inc = false;
     }
     if elem.discrete() {
+        // v1.91: PG's canonical functions skip DATE_NOT_FINITE bounds
+        // entirely (daterange_canonical), so '-infinity'/'infinity'
+        // date bounds keep their written inclusivity instead of being
+        // stepped and flipped.
+        let not_finite = |v: &Value| {
+            elem == RangeElem::Date
+                && matches!(
+                    v,
+                    Value::Date(d) if *d == crate::datetime::DATE_INFINITY
+                        || *d == crate::datetime::DATE_NEG_INFINITY
+                )
+        };
         if let Some(l) = &lo {
-            if !lo_inc {
+            if !lo_inc && !not_finite(l) {
                 lo = Some(step_up(elem, l)?);
                 lo_inc = true;
             }
         }
         if let Some(u) = &hi {
-            if hi_inc {
+            if hi_inc && !not_finite(u) {
                 hi = Some(step_up(elem, u)?);
                 hi_inc = false;
             }
@@ -857,6 +869,161 @@ pub(crate) fn range_overlaps(a: &RangeVal, b: &RangeVal) -> bool {
     !range_intersect(a, b).empty
 }
 
+/// v1.91: a PG `RangeBound` for comparison purposes: `val: None` is an
+/// infinite (unbounded) bound; `lower` marks which side it belongs to.
+#[derive(Clone)]
+pub(crate) struct Bnd {
+    val: Option<Value>,
+    inc: bool,
+    lower: bool,
+}
+
+fn lo_bnd(r: &RangeVal) -> Bnd {
+    Bnd {
+        val: r.lo.clone(),
+        inc: r.lo_inc,
+        lower: true,
+    }
+}
+
+fn hi_bnd(r: &RangeVal) -> Bnd {
+    Bnd {
+        val: r.hi.clone(),
+        inc: r.hi_inc,
+        lower: false,
+    }
+}
+
+/// PG `range_cmp_bounds` (rangetypes.c): infinite bounds compare by
+/// side (a lower infinity is below everything, an upper infinity above
+/// everything; two infinities are equal only when on the same side).
+/// Finite bounds compare by value; at equal values an exclusive lower
+/// bound sorts after and an exclusive upper bound before (both
+/// exclusive on opposite sides: the lower one is greater; both
+/// inclusive: equal).
+pub(crate) fn cmp_bounds(a: &Bnd, b: &Bnd) -> Ordering {
+    match (&a.val, &b.val) {
+        (None, None) => {
+            if a.lower == b.lower {
+                Ordering::Equal
+            } else if a.lower {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (None, Some(_)) => {
+            if a.lower {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (Some(_), None) => {
+            if b.lower {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (Some(x), Some(y)) => match bound_cmp(x, y) {
+            Ordering::Equal => {
+                if !a.inc && !b.inc {
+                    if a.lower == b.lower {
+                        Ordering::Equal
+                    } else if a.lower {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    }
+                } else if !a.inc {
+                    if a.lower {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    }
+                } else if !b.inc {
+                    if b.lower {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
+                } else {
+                    Ordering::Equal
+                }
+            }
+            o => o,
+        },
+    }
+}
+
+/// The non-empty component ranges of an operand (a range contributes
+/// itself unless empty; a multirange contributes its stored ranges,
+/// which are already non-empty by construction).
+fn components(v: &Operand) -> Vec<&RangeVal> {
+    match v {
+        Operand::R(r) => {
+            if r.empty {
+                Vec::new()
+            } else {
+                vec![r]
+            }
+        }
+        Operand::M(m) => m.ranges.iter().collect(),
+        Operand::E(_) => Vec::new(),
+    }
+}
+
+/// v1.91: the position predicates (PG rangetypes.c range_before /
+/// range_after / range_overleft / range_overright / range_adjacent and
+/// the multirangetypes.c cross forms). `kind` is one of "before",
+/// "after", "overleft", "overright", "adjacent". An empty operand
+/// makes every predicate false (PG: "An empty range is neither before
+/// nor after any other range", and likewise for the multirange forms).
+/// Multirange spans use the first range's lower / last range's upper
+/// bound; adjacency is pairwise over components.
+pub(crate) fn position_pred(kind: &str, a: &Operand, b: &Operand) -> bool {
+    let ca = components(a);
+    let cb = components(b);
+    if ca.is_empty() || cb.is_empty() {
+        return false;
+    }
+    match kind {
+        "before" => cmp_bounds(&hi_bnd(ca[ca.len() - 1]), &lo_bnd(cb[0])) == Ordering::Less,
+        "after" => cmp_bounds(&lo_bnd(ca[0]), &hi_bnd(cb[cb.len() - 1])) == Ordering::Greater,
+        "overleft" => {
+            cmp_bounds(&hi_bnd(ca[ca.len() - 1]), &hi_bnd(cb[cb.len() - 1])) != Ordering::Greater
+        }
+        "overright" => cmp_bounds(&lo_bnd(ca[0]), &lo_bnd(cb[0])) != Ordering::Less,
+        // PG multirangetypes.c: adjacency between multiranges (or a
+        // range and a multirange) is a SPAN-ENDPOINT property only —
+        // the last upper bound of one side meeting the first lower
+        // bound of the other. A range sitting in a multirange's inner
+        // gap, adjacent to an inner component, is NOT adjacent to the
+        // multirange (range_adjacent_multirange_internal checks only
+        // the first lower and last upper bounds).
+        "adjacent" => {
+            if ca.len() == 1 && cb.len() == 1 {
+                // The plain range/range form is range_adjacent itself.
+                return range_adjacent(ca[0], cb[0]);
+            }
+            bounds_meet(ca[ca.len() - 1], cb[0]) || bounds_meet(cb[cb.len() - 1], ca[0])
+        }
+        _ => false,
+    }
+}
+
+/// Do the bounds `u.hi` and `l.lo` meet (PG bounds_adjacent for
+/// canonical inputs: equal values with exactly one inclusive side —
+/// see range_adjacent's comment for why the discrete cmp<0 case
+/// reduces to this).
+fn bounds_meet(u: &RangeVal, l: &RangeVal) -> bool {
+    match (&u.hi, &l.lo) {
+        (Some(x), Some(y)) => bound_eq(x, y) && (u.hi_inc != l.lo_inc),
+        _ => false,
+    }
+}
+
 pub(crate) fn range_adjacent(a: &RangeVal, b: &RangeVal) -> bool {
     if a.empty || b.empty {
         return false;
@@ -871,13 +1038,7 @@ pub(crate) fn range_adjacent(a: &RangeVal, b: &RangeVal) -> bool {
     // lower inclusive -> adjacent. Continuous [1,5] meets (5,7]:
     // upper inclusive, lower exclusive -> adjacent. [1,5) and (5,7]
     // leave 5 uncovered -> not adjacent; [1,5] and [5,7] overlap.
-    let meets = |u: &RangeVal, l: &RangeVal| -> bool {
-        match (&u.hi, &l.lo) {
-            (Some(x), Some(y)) => bound_eq(x, y) && (u.hi_inc != l.lo_inc),
-            _ => false,
-        }
-    };
-    meets(a, b) || meets(b, a)
+    bounds_meet(a, b) || bounds_meet(b, a)
 }
 
 // ---------------------------------------------------------------------------
@@ -1105,7 +1266,7 @@ pub(crate) fn coerce_elem_value(v: &Value, elem: RangeElem) -> Value {
     }
 }
 
-enum Operand {
+pub(crate) enum Operand {
     R(RangeVal),
     M(MultiVal),
     E(Value),
@@ -1159,7 +1320,10 @@ fn operand_of(
 /// The `@>` / `<@` / `&&` family over range/multirange/element operands
 /// (PG rangetypes operators). Mismatched combinations are 42883, like
 /// PG's "operator does not exist".
-pub(crate) fn eval_range_op(op: JsonOp, left: &Value, right: &Value) -> Result<Value, ExecError> {
+/// Resolve both operator/function operands against each other's
+/// type (text parses as the peer's range/multirange kind, anything
+/// else scalar is an element value).
+fn operands_of(left: &Value, right: &Value) -> Result<(Operand, Operand), ExecError> {
     let (le, ln, lm) = match left {
         Value::Range(r) => (Some(r.elem), r.name.clone(), false),
         Value::Multirange(m) => (Some(m.elem), m.name.clone(), true),
@@ -1170,11 +1334,13 @@ pub(crate) fn eval_range_op(op: JsonOp, left: &Value, right: &Value) -> Result<V
         Value::Multirange(m) => (Some(m.elem), m.name.clone(), true),
         _ => (None, None, false),
     };
-    let elem = le.or(re).unwrap_or(RangeElem::Int4);
-    let name = ln.clone().or(rn.clone());
     let lo = operand_of(left, re.or(le), &rn.clone().or(ln.clone()), rm)?;
     let ro = operand_of(right, le.or(re), &ln.clone().or(rn.clone()), lm)?;
-    let _ = (elem, name);
+    Ok((lo, ro))
+}
+
+pub(crate) fn eval_range_op(op: JsonOp, left: &Value, right: &Value) -> Result<Value, ExecError> {
+    let (lo, ro) = operands_of(left, right)?;
     let no_op = || {
         exec_err(
             "42883",
@@ -1190,6 +1356,7 @@ pub(crate) fn eval_range_op(op: JsonOp, left: &Value, right: &Value) -> Result<V
         JsonOp::Contains => match (&lo, &ro) {
             (Operand::R(a), Operand::R(b)) => range_contains_range(a, b),
             (Operand::R(a), Operand::E(v)) => range_contains_elem(a, &coerce_elem_value(v, a.elem)),
+            (Operand::R(a), Operand::M(b)) => multi_contains_multi(&multi_from_range(a.clone()), b),
             (Operand::M(a), Operand::R(b)) => multi_contains_range(a, b),
             (Operand::M(a), Operand::M(b)) => multi_contains_multi(a, b),
             (Operand::M(a), Operand::E(v)) => multi_contains_elem(a, &coerce_elem_value(v, a.elem)),
@@ -1199,10 +1366,33 @@ pub(crate) fn eval_range_op(op: JsonOp, left: &Value, right: &Value) -> Result<V
             (Operand::R(a), Operand::R(b)) => range_contains_range(b, a),
             (Operand::E(v), Operand::R(b)) => range_contains_elem(b, &coerce_elem_value(v, b.elem)),
             (Operand::R(a), Operand::M(b)) => multi_contains_range(b, a),
+            // A multirange is contained by a range iff every one of
+            // its components is (components are disjoint with real
+            // gaps, so componentwise containment is exact).
+            (Operand::M(a), Operand::R(b)) => a.ranges.iter().all(|x| range_contains_range(b, x)),
             (Operand::M(a), Operand::M(b)) => multi_contains_multi(b, a),
             (Operand::E(v), Operand::M(b)) => multi_contains_elem(b, &coerce_elem_value(v, b.elem)),
             _ => return Err(no_op()),
         },
+        // v1.91: &< / &> / -|- over range and multirange operands
+        // (PG range_overleft / range_overright / range_adjacent and
+        // the multirange cross forms). Element operands have no such
+        // operator in PG (42883).
+        JsonOp::OverLeft | JsonOp::OverRight | JsonOp::Adjacent => {
+            match (&lo, &ro) {
+                (Operand::R(_), Operand::R(_))
+                | (Operand::R(_), Operand::M(_))
+                | (Operand::M(_), Operand::R(_))
+                | (Operand::M(_), Operand::M(_)) => {}
+                _ => return Err(no_op()),
+            }
+            let kind = match op {
+                JsonOp::OverLeft => "overleft",
+                JsonOp::OverRight => "overright",
+                _ => "adjacent",
+            };
+            position_pred(kind, &lo, &ro)
+        }
         JsonOp::Overlaps => match (&lo, &ro) {
             (Operand::R(a), Operand::R(b)) => range_overlaps(a, b),
             (Operand::R(a), Operand::M(b)) => multi_overlaps(&multi_from_range(a.clone()), b),
@@ -1230,7 +1420,7 @@ pub(crate) fn eval_range_arith(
     Some(eval_range_arith_inner(op, a, b))
 }
 
-fn as_multi(v: &Value, peer: &Value) -> Result<MultiVal, ExecError> {
+pub(crate) fn as_multi(v: &Value, peer: &Value) -> Result<MultiVal, ExecError> {
     match v {
         Value::Multirange(m) => Ok((**m).clone()),
         Value::Range(r) => Ok(multi_from_range((**r).clone())),
@@ -1253,7 +1443,7 @@ fn as_multi(v: &Value, peer: &Value) -> Result<MultiVal, ExecError> {
     }
 }
 
-fn as_range(v: &Value, peer: &Value) -> Result<RangeVal, ExecError> {
+pub(crate) fn as_range(v: &Value, peer: &Value) -> Result<RangeVal, ExecError> {
     match v {
         Value::Range(r) => Ok((**r).clone()),
         Value::Text(t) | Value::BpChar(t) => {
@@ -1277,6 +1467,36 @@ fn as_range(v: &Value, peer: &Value) -> Result<RangeVal, ExecError> {
 
 fn eval_range_arith_inner(op: ArithOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
     let any_multi = matches!(a, Value::Multirange(_)) || matches!(b, Value::Multirange(_));
+    // v1.91: `<<` / `>>` on rangeish operands are the position
+    // operators (PG range_before / range_after and the multirange
+    // cross forms), NOT bit shifts. Text operands resolve against
+    // the peer like the @> family.
+    if matches!(op, ArithOp::Shl | ArithOp::Shr) {
+        let (lo, ro) = operands_of(a, b)?;
+        return match (&lo, &ro) {
+            (Operand::R(_), Operand::R(_))
+            | (Operand::R(_), Operand::M(_))
+            | (Operand::M(_), Operand::R(_))
+            | (Operand::M(_), Operand::M(_)) => Ok(Value::Bool(position_pred(
+                if op == ArithOp::Shl {
+                    "before"
+                } else {
+                    "after"
+                },
+                &lo,
+                &ro,
+            ))),
+            _ => Err(exec_err(
+                "42883",
+                format!(
+                    "operator does not exist: {} {} {}",
+                    a.type_name().to_lowercase(),
+                    op.sql(),
+                    b.type_name().to_lowercase()
+                ),
+            )),
+        };
+    }
     match op {
         ArithOp::Add => {
             if any_multi {
@@ -1522,13 +1742,7 @@ pub(crate) fn try_eval_range_func(name: &str, vals: &[Value]) -> Option<Result<V
             }
             _ => None,
         },
-        "range_union"
-        | "range_intersect"
-        | "range_minus"
-        | "range_adjacent"
-        | "range_overlaps"
-        | "range_contains_range"
-        | "range_contained_by_range" => {
+        "range_union" | "range_intersect" | "range_minus" => {
             if vals.len() != 2 {
                 return None;
             }
@@ -1542,16 +1756,131 @@ pub(crate) fn try_eval_range_func(name: &str, vals: &[Value]) -> Option<Result<V
                 Ok(match name {
                     "range_union" => Value::range(range_union(&x, &y)?),
                     "range_intersect" => Value::range(range_intersect(&x, &y)),
-                    "range_minus" => Value::range(range_minus(&x, &y)?),
-                    "range_adjacent" => Value::Bool(range_adjacent(&x, &y)),
-                    "range_overlaps" => Value::Bool(range_overlaps(&x, &y)),
-                    "range_contains_range" => Value::Bool(range_contains_range(&x, &y)),
-                    _ => Value::Bool(range_contains_range(&y, &x)),
+                    _ => Value::range(range_minus(&x, &y)?),
                 })
             })())
         }
-        "range_minus_multi"
-        | "multirange_minus_multi"
+        // v1.91: the full boolean operator-function family (PG19
+        // pg_proc: range_contains / range_contained_by are the @> / <@
+        // functions under their SQL names; every *_multirange and
+        // multirange_* cross form is the same predicate over the
+        // operand kinds). Dispatch goes through the operator
+        // machinery so text literals resolve identically.
+        "range_contains"
+        | "range_contains_range"
+        | "range_contains_multirange"
+        | "multirange_contains_range"
+        | "multirange_contains_multirange"
+        | "range_contained_by"
+        | "range_contained_by_range"
+        | "range_contained_by_multirange"
+        | "multirange_contained_by_range"
+        | "multirange_contained_by_multirange"
+        | "range_overlaps"
+        | "range_overlaps_multirange"
+        | "multirange_overlaps_range"
+        | "multirange_overlaps_multirange"
+        | "range_adjacent"
+        | "range_adjacent_multirange"
+        | "multirange_adjacent_range"
+        | "multirange_adjacent_multirange"
+        | "range_overleft"
+        | "range_overleft_multirange"
+        | "multirange_overleft_range"
+        | "multirange_overleft_multirange"
+        | "range_overright"
+        | "range_overright_multirange"
+        | "multirange_overright_range"
+        | "multirange_overright_multirange"
+        | "range_before"
+        | "range_before_multirange"
+        | "multirange_before_range"
+        | "multirange_before_multirange"
+        | "range_after"
+        | "range_after_multirange"
+        | "multirange_after_range"
+        | "multirange_after_multirange"
+        | "range_contains_elem"
+        | "multirange_contains_elem"
+        | "elem_contained_by_range"
+        | "elem_contained_by_multirange" => {
+            if vals.len() != 2 {
+                return None;
+            }
+            let (a, b) = (&vals[0], &vals[1]);
+            if !is_rangeish(a) && !is_rangeish(b) {
+                return None;
+            }
+            Some((|| {
+                Ok(match name {
+                    "range_contains_elem" | "multirange_contains_elem" => {
+                        let m = as_multi(a, b)?;
+                        Value::Bool(multi_contains_elem(&m, &coerce_elem_value(b, m.elem)))
+                    }
+                    "elem_contained_by_range" | "elem_contained_by_multirange" => {
+                        let m = as_multi(b, a)?;
+                        Value::Bool(multi_contains_elem(&m, &coerce_elem_value(a, m.elem)))
+                    }
+                    "range_contains"
+                    | "range_contains_range"
+                    | "range_contains_multirange"
+                    | "multirange_contains_range"
+                    | "multirange_contains_multirange" => eval_range_op(JsonOp::Contains, a, b)?,
+                    "range_contained_by"
+                    | "range_contained_by_range"
+                    | "range_contained_by_multirange"
+                    | "multirange_contained_by_range"
+                    | "multirange_contained_by_multirange" => {
+                        eval_range_op(JsonOp::ContainedBy, a, b)?
+                    }
+                    "range_overlaps"
+                    | "range_overlaps_multirange"
+                    | "multirange_overlaps_range"
+                    | "multirange_overlaps_multirange" => eval_range_op(JsonOp::Overlaps, a, b)?,
+                    "range_overleft"
+                    | "range_overleft_multirange"
+                    | "multirange_overleft_range"
+                    | "multirange_overleft_multirange" => eval_range_op(JsonOp::OverLeft, a, b)?,
+                    "range_overright"
+                    | "range_overright_multirange"
+                    | "multirange_overright_range"
+                    | "multirange_overright_multirange" => eval_range_op(JsonOp::OverRight, a, b)?,
+                    "range_adjacent"
+                    | "range_adjacent_multirange"
+                    | "multirange_adjacent_range"
+                    | "multirange_adjacent_multirange" => eval_range_op(JsonOp::Adjacent, a, b)?,
+                    "range_before"
+                    | "range_before_multirange"
+                    | "multirange_before_range"
+                    | "multirange_before_multirange" => {
+                        let (lo, ro) = operands_of(a, b)?;
+                        Value::Bool(position_pred("before", &lo, &ro))
+                    }
+                    _ => {
+                        let (lo, ro) = operands_of(a, b)?;
+                        Value::Bool(position_pred("after", &lo, &ro))
+                    }
+                })
+            })())
+        }
+        // v1.91: the generic multirange(anyrange) constructor
+        // function (PG pg_proc 'multirange').
+        "multirange" => match vals {
+            [v] if matches!(v, Value::Range(_)) => {
+                let r = match v {
+                    Value::Range(r) => (**r).clone(),
+                    _ => unreachable!(),
+                };
+                Some(Ok(Value::multirange(multi_from_range(r))))
+            }
+            _ => None,
+        },
+        // NOTE: range_minus_multi / multirange_minus_multi are NOT
+        // here — in PG they are SETOF functions (proretset), handled
+        // by the SRF path (funcs::eval_srf_vals).
+        "multirange_minus"
+        | "multirange_union"
+        | "multirange_intersect"
         | "range_plus_multi"
         | "multirange_plus_multirange"
         | "range_intersect_multi"
@@ -1567,8 +1896,10 @@ pub(crate) fn try_eval_range_func(name: &str, vals: &[Value]) -> Option<Result<V
                 let x = as_multi(a, b)?;
                 let y = as_multi(b, a)?;
                 Ok(Value::multirange(match name {
-                    "range_minus_multi" | "multirange_minus_multi" => multi_minus(&x, &y),
-                    "range_plus_multi" | "multirange_plus_multirange" => multi_union(&x, &y),
+                    "multirange_minus" => multi_minus(&x, &y),
+                    "range_plus_multi" | "multirange_plus_multirange" | "multirange_union" => {
+                        multi_union(&x, &y)
+                    }
                     _ => multi_intersect(&x, &y),
                 }))
             })())

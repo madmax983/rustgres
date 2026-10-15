@@ -263,9 +263,13 @@ fn range_aggregates() {
         Some("empty")
     );
     run(&mut eng, "create table rb (r int4range)").unwrap();
+    // v1.91 correction: PG19 range_agg_finalfn returns NULL on zero
+    // inputs ("like other aggregates") — the v1.88 '{}' expectation
+    // was a wrong test pin, disproven by PG19's multirangetypes.out
+    // (range_agg over an empty / all-NULL input is blank).
     assert_eq!(
         cell(&mut eng, "select range_agg(r) from rb").as_deref(),
-        Some("{}")
+        None
     );
     assert_eq!(
         cell(&mut eng, "select range_intersect_agg(r) from rb").as_deref(),

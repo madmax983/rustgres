@@ -2624,12 +2624,32 @@ fn stmt_set_role(
 }
 
 /// v0.17: boolean-ish GUC spellings, mirroring PG's accepted variants.
+/// v1.91: PG's parse_bool (guc.c) accepts any non-empty prefix of
+/// true/false/yes/no/on/off (checked in that order, so a bare `o`
+/// resolves as `on`), the full words, and the single characters 1/0.
 fn parse_bool_guc(s: &str) -> Option<bool> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "on" | "true" | "yes" | "1" => Some(true),
-        "off" | "false" | "no" | "0" => Some(false),
-        _ => None,
+    let t = s.trim().to_ascii_lowercase();
+    match t.as_str() {
+        "1" => return Some(true),
+        "0" => return Some(false),
+        _ => {}
     }
+    if t.is_empty() {
+        return None;
+    }
+    for (word, val) in [
+        ("true", true),
+        ("false", false),
+        ("yes", true),
+        ("no", false),
+        ("on", true),
+        ("off", false),
+    ] {
+        if t.len() <= word.len() && word.starts_with(t.as_str()) {
+            return Some(val);
+        }
+    }
+    None
 }
 
 /// v1.07: isolation-level GUC spellings (`default_transaction_isolation`,

@@ -881,6 +881,17 @@ pub(crate) fn expr_col_name_strength(e: &Expr) -> (String, u8) {
         // v1.30: PG19 names the column after the ordered-set
         // aggregate (`FigureColName`: the FuncCall name).
         Expr::WithinGroup { func, .. } => (func.name().to_string(), 2),
+        // v1.91: PG FigureColname for a TypeCast is the type name
+        // (strength 1, so a strength-2 inner name wins, exactly like
+        // the builtin Cast arm below): `'...'::textrange` -> `textrange`.
+        Expr::CastNamed { expr, name } => {
+            let (inner, s) = expr_col_name_strength(expr);
+            if s <= 1 {
+                (name.clone(), 1)
+            } else {
+                (inner, s)
+            }
+        }
         Expr::Cast { expr, to, written } => {
             // v0.93: a func-style cast (`float8(q1)`) is named after the
             // type name as written (PG19 treats the type-named call like
@@ -1727,6 +1738,17 @@ pub(crate) fn combine_arith_types(
                     if matches!(op, ArithOp::Add | ArithOp::Mul | ArithOp::Sub) =>
                 {
                     Ok(ColType::Multirange(*e))
+                }
+                // v1.91: `<<` / `>>` over rangeish operands are the
+                // position operators (range_before / range_after and
+                // the multirange cross forms), returning boolean.
+                (ColType::Range(_), ColType::Range(_))
+                | (ColType::Range(_), ColType::Multirange(_))
+                | (ColType::Multirange(_), ColType::Range(_))
+                | (ColType::Multirange(_), ColType::Multirange(_))
+                    if matches!(op, ArithOp::Shl | ArithOp::Shr) =>
+                {
+                    Ok(ColType::Bool)
                 }
                 (ColType::Date, y) if is_int_kind(y) => match op {
                     ArithOp::Add | ArithOp::Sub => Ok(ColType::Date),

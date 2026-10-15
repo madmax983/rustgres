@@ -4924,6 +4924,11 @@ pub(crate) fn is_builtin_srf(name: &str) -> bool {
             // v1.85: the jsonpath row source.
             | "jsonb_path_query"
             | "jsonb_path_query_tz"
+            // v1.91: PG's two SETOF range-difference functions
+            // (proretset: range_minus_multi -> SETOF anyrange,
+            // multirange_minus_multi -> SETOF anymultirange).
+            | "range_minus_multi"
+            | "multirange_minus_multi"
     )
 }
 
@@ -4993,6 +4998,33 @@ pub(crate) fn eval_srf_vals(
         | "jsonb_to_recordset" => eval_json_recordset_srf(q, name, vals, arg_exprs),
         // v1.85: jsonb_path_query in target-list position.
         "jsonb_path_query" | "jsonb_path_query_tz" => jsonpath_query_rows(name, vals),
+        // v1.91: range_minus_multi(a, b) yields one row per piece of
+        // a - b (0, 1, or 2 ranges); multirange_minus_multi yields
+        // the difference as a single multirange row, or zero rows
+        // when the difference is empty. STRICT: NULL -> no rows.
+        "range_minus_multi" | "multirange_minus_multi" => {
+            if vals.len() != 2 || vals.iter().any(|v| *v == Value::Null) {
+                return Ok(Vec::new());
+            }
+            let (a, b) = (&vals[0], &vals[1]);
+            if name == "range_minus_multi" {
+                let x = super::ranges::as_range(a, b)?;
+                let y = super::ranges::as_range(b, a)?;
+                Ok(super::ranges::range_minus_multi_inner(&x, &y)
+                    .into_iter()
+                    .map(Value::range)
+                    .collect())
+            } else {
+                let x = super::ranges::as_multi(a, b)?;
+                let y = super::ranges::as_multi(b, a)?;
+                let d = super::ranges::multi_minus(&x, &y);
+                if d.ranges.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    Ok(vec![Value::multirange(d)])
+                }
+            }
+        }
         _ => Err(exec_err(
             "42883",
             format!("function {name} is not a set-returning function"),
@@ -10394,6 +10426,107 @@ pub(crate) fn func_result_type(
                     return Ok(t);
                 }
             }
+            // v1.91: the boolean operator-function family (static
+            // types mirror ranges::try_eval_range_func; an operand of
+            // range/multirange type on either side qualifies — elem
+            // forms carry the rangeish type second).
+            "range_contains"
+            | "range_contains_range"
+            | "range_contains_multirange"
+            | "multirange_contains_range"
+            | "multirange_contains_multirange"
+            | "range_contained_by"
+            | "range_contained_by_range"
+            | "range_contained_by_multirange"
+            | "multirange_contained_by_range"
+            | "multirange_contained_by_multirange"
+            | "range_overlaps"
+            | "range_overlaps_multirange"
+            | "multirange_overlaps_range"
+            | "multirange_overlaps_multirange"
+            | "range_adjacent"
+            | "range_adjacent_multirange"
+            | "multirange_adjacent_range"
+            | "multirange_adjacent_multirange"
+            | "range_overleft"
+            | "range_overleft_multirange"
+            | "multirange_overleft_range"
+            | "multirange_overleft_multirange"
+            | "range_overright"
+            | "range_overright_multirange"
+            | "multirange_overright_range"
+            | "multirange_overright_multirange"
+            | "range_before"
+            | "range_before_multirange"
+            | "multirange_before_range"
+            | "multirange_before_multirange"
+            | "range_after"
+            | "range_after_multirange"
+            | "multirange_after_range"
+            | "multirange_after_multirange"
+            | "range_contains_elem"
+            | "multirange_contains_elem"
+            | "elem_contained_by_range"
+            | "elem_contained_by_multirange" => {
+                let rangeish = |i: usize| {
+                    args.get(i).is_some_and(|a| {
+                        matches!(
+                            expr_type(eng, snap, own, session, schemas, outer, ctes, a),
+                            Ok(ColType::Range(_)) | Ok(ColType::Multirange(_))
+                        )
+                    })
+                };
+                if rangeish(0) || rangeish(1) {
+                    return Ok(ColType::Bool);
+                }
+            }
+            // v1.91: multirange-returning set functions and the
+            // generic multirange(anyrange) constructor.
+            "multirange_minus"
+            | "multirange_union"
+            | "multirange_intersect"
+            | "range_plus_multi"
+            | "multirange_plus_multirange"
+            | "range_intersect_multi"
+            | "multirange_intersect_multirange" => {
+                if let Ok(t) = arg0() {
+                    match t {
+                        ColType::Range(e) | ColType::Multirange(e) => {
+                            return Ok(ColType::Multirange(e));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "multirange" => {
+                if let Ok(ColType::Range(e)) = arg0() {
+                    return Ok(ColType::Multirange(e));
+                }
+            }
+            // v1.91: the SETOF difference functions — the target-list
+            // column type is the element kind (range for
+            // range_minus_multi, multirange for
+            // multirange_minus_multi).
+            "range_minus_multi" => {
+                if let Ok(t) = arg0() {
+                    match t {
+                        ColType::Range(e) | ColType::Multirange(e) => {
+                            return Ok(ColType::Range(e));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "multirange_minus_multi" => {
+                if let Ok(t) = arg0() {
+                    match t {
+                        ColType::Range(e) | ColType::Multirange(e) => {
+                            return Ok(ColType::Multirange(e));
+                        }
+                        _ => {}
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -10456,6 +10589,8 @@ pub(crate) fn func_result_type(
         "array_dims" => Ok(ColType::Text),
         "unnest" => match arg0() {
             Ok(ColType::Array(e)) => Ok(elem_scalar_type(e)),
+            // v1.91: unnest(anymultirange) yields the component ranges.
+            Ok(ColType::Multirange(e)) => Ok(ColType::Range(e)),
             Ok(other) => Err(exec_err(
                 "42883",
                 format!("function unnest({}) does not exist", other.sql_name()),

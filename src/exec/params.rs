@@ -62,6 +62,22 @@ pub(crate) fn hint_type(
         )
         .ok(),
         Expr::Cast { to, .. } => Some(*to),
+        // v1.91: casts to named types hint the catalog type (a VALUES
+        // column of `'...'::textrange` rows is a textrange column, not
+        // text — PG resolves the common type from the cast targets).
+        Expr::CastNamed { name, .. } => match eng.db.types.get(name) {
+            Some(st) if st.composite.is_some() => Some(ColType::Composite),
+            Some(st) if st.range.is_some() => {
+                let (elem, multi) = st.range.expect("range branch");
+                Some(if multi {
+                    ColType::Multirange(elem)
+                } else {
+                    ColType::Range(elem)
+                })
+            }
+            Some(st) => st.domain.as_ref().map(|dom| dom.base.clone()),
+            None => None,
+        },
         // v0.53: `-x` hints like the old `0 - x` desugar.
         Expr::Neg(x) => combine_arith_types(
             ArithOp::Sub,

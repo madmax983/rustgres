@@ -112,24 +112,27 @@ pub(crate) enum Token {
     Slash,   // v0.7: `/`
     Percent, // v0.7: `%`
     Eq,
-    FatArrow,   // v0.95: `=>` named-argument operator (PG19)
-    Dot,        // v0.6: qualified refs (t.col)
-    Lt,         // v0.6: <
-    Gt,         // v0.6: >
-    LtEq,       // v0.6: <=
-    GtEq,       // v0.6: >=
-    Neq,        // v0.6: <> and !=
-    ColonColon, // v0.7: `::` cast
-    PipePipe,   // v0.7: `||` concat
-    Pipe,       // v0.25: `|` bitwise OR
-    Amp,        // v0.25: `&` bitwise AND
-    AmpAmp,     // v1.88: `&&` overlap operator (PG19 gram.y Op)
-    Hash,       // v0.25: `#` bitwise XOR
+    FatArrow,     // v0.95: `=>` named-argument operator (PG19)
+    Dot,          // v0.6: qualified refs (t.col)
+    Lt,           // v0.6: <
+    Gt,           // v0.6: >
+    LtEq,         // v0.6: <=
+    GtEq,         // v0.6: >=
+    Neq,          // v0.6: <> and !=
+    ColonColon,   // v0.7: `::` cast
+    PipePipe,     // v0.7: `||` concat
+    Pipe,         // v0.25: `|` bitwise OR
+    Amp,          // v0.25: `&` bitwise AND
+    AmpAmp,       // v1.88: `&&` overlap operator (PG19 gram.y Op)
+    AmpLt,        // v1.91: `&<` does-not-extend-right-of (PG19 gram.y Op)
+    AmpGt,        // v1.91: `&>` does-not-extend-left-of (PG19 gram.y Op)
+    DashPipeDash, // v1.91: `-|-` adjacent-to (PG19 gram.y Op)
+    Hash,         // v0.25: `#` bitwise XOR
     /// v1.82: JSON operators (PG19 scan.l `right_arrow`, gram.y `Op`):
     /// `->`, `->>`, `#>`, `#>>`. Lexed longest-match-first, like PG.
     Arrow, // `->`
-    ArrowText,  // `->>`
-    HashArrow,  // `#>`
+    ArrowText,    // `->>`
+    HashArrow,    // `#>`
     HashArrowText, // `#>>`
     /// v1.83: jsonb operators (PG19 gram.y `Op`): `@>`, `<@`, `?`,
     /// `?|`, `?&`. The `?` family lexes out of the v0.86 `?`-led branch
@@ -138,22 +141,22 @@ pub(crate) enum Token {
     /// v1.85: `@?` (jsonpath exists) and `@@` (jsonpath match) —
     /// PG19 gram.y `Op` for (jsonb, jsonpath).
     AtQuestion, // `@?`
-    AtAt,       // `@@`
-    LtAt,       // `<@`
-    Question,   // `?`
+    AtAt,         // `@@`
+    LtAt,         // `<@`
+    Question,     // `?`
     QuestionPipe, // `?|`
-    QuestionAmp, // `?&`
-    Tilde,      // v0.25: `~` bitwise NOT (unary)
-    TildeStar,  // v0.68: `~*` POSIX regex match, case-insensitive
-    BangTilde,  // v0.68: `!~` POSIX regex non-match
+    QuestionAmp,  // `?&`
+    Tilde,        // v0.25: `~` bitwise NOT (unary)
+    TildeStar,    // v0.68: `~*` POSIX regex match, case-insensitive
+    BangTilde,    // v0.68: `!~` POSIX regex non-match
     BangTildeStar, // v0.68: `!~*` POSIX regex non-match, case-insensitive
-    Shl,        // v0.25: `<<` shift left
-    Shr,        // v0.25: `>>` shift right
-    At,         // v0.21: `@` prefix abs operator
-    PipeSlash,  // v0.21: `|/` prefix sqrt operator
+    Shl,          // v0.25: `<<` shift left
+    Shr,          // v0.25: `>>` shift right
+    At,           // v0.21: `@` prefix abs operator
+    PipeSlash,    // v0.21: `|/` prefix sqrt operator
     PipePipeSlash, // v0.21: `||/` prefix cbrt operator
-    Caret,      // v0.7: `^` exponentiation
-    StarEq,     // v0.81: `*=` PG19 record-image equality (record_image_eq)
+    Caret,        // v0.7: `^` exponentiation
+    StarEq,       // v0.81: `*=` PG19 record-image equality (record_image_eq)
     /// v0.86: user-defined operator name starting with `?` (e.g. `?=`).
     /// Only `?`-led sequences lex here; every other operator character
     /// already has its own token. Used in `CREATE OPERATOR`'s name
@@ -379,7 +382,12 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
         // `right_arrow`); longest match first. A `-` followed by `>`
         // with no space between is always the arrow, never minus.
         if c == '-' {
-            if i + 1 < chars.len() && chars[i + 1] == '>' {
+            // v1.91: `-|-` (range adjacency) lexes as one token (PG19
+            // gram.y `Op`); checked before the arrow forms.
+            if i + 2 < chars.len() && chars[i + 1] == '|' && chars[i + 2] == '-' {
+                toks.push(Token::DashPipeDash);
+                i += 3;
+            } else if i + 1 < chars.len() && chars[i + 1] == '>' {
                 if i + 2 < chars.len() && chars[i + 2] == '>' {
                     toks.push(Token::ArrowText);
                     i += 3;
@@ -437,9 +445,16 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
         }
         // v0.25: `&` bitwise AND, `#` bitwise XOR, `~` bitwise NOT.
         // v1.88: `&&` (overlap) lexes as one token, like PG.
+        // v1.91: `&<` / `&>` (range overleft/overright) likewise.
         if c == '&' {
             if i + 1 < chars.len() && chars[i + 1] == '&' {
                 toks.push(Token::AmpAmp);
+                i += 2;
+            } else if i + 1 < chars.len() && chars[i + 1] == '<' {
+                toks.push(Token::AmpLt);
+                i += 2;
+            } else if i + 1 < chars.len() && chars[i + 1] == '>' {
+                toks.push(Token::AmpGt);
                 i += 2;
             } else {
                 toks.push(Token::Amp);
@@ -1276,6 +1291,12 @@ pub enum JsonOp {
     /// and has the same binary shape; evaluation dispatches on the
     /// operand values (ranges here, jsonb for the ops above).
     Overlaps,
+    /// v1.91: `&<`: does not extend to the right of (range_overleft).
+    OverLeft,
+    /// v1.91: `&>`: does not extend to the left of (range_overright).
+    OverRight,
+    /// v1.91: `-|-`: adjacent to (range_adjacent).
+    Adjacent,
 }
 
 impl JsonOp {
@@ -1293,6 +1314,9 @@ impl JsonOp {
             JsonOp::PathExists => "@?",
             JsonOp::PathMatch => "@@",
             JsonOp::Overlaps => "&&",
+            JsonOp::OverLeft => "&<",
+            JsonOp::OverRight => "&>",
+            JsonOp::Adjacent => "-|-",
         }
     }
 
@@ -1314,6 +1338,9 @@ impl JsonOp {
                 | JsonOp::PathExists
                 | JsonOp::PathMatch
                 | JsonOp::Overlaps
+                | JsonOp::OverLeft
+                | JsonOp::OverRight
+                | JsonOp::Adjacent
         )
     }
 
@@ -1335,6 +1362,9 @@ impl JsonOp {
             JsonOp::PathExists => "pathexists",
             JsonOp::PathMatch => "pathmatch",
             JsonOp::Overlaps => "overlaps",
+            JsonOp::OverLeft => "overleft",
+            JsonOp::OverRight => "overright",
+            JsonOp::Adjacent => "adjacent",
         }
     }
 
@@ -1352,6 +1382,9 @@ impl JsonOp {
             "pathexists" => Some(JsonOp::PathExists),
             "pathmatch" => Some(JsonOp::PathMatch),
             "overlaps" => Some(JsonOp::Overlaps),
+            "overleft" => Some(JsonOp::OverLeft),
+            "overright" => Some(JsonOp::OverRight),
+            "adjacent" => Some(JsonOp::Adjacent),
             _ => None,
         }
     }
@@ -6043,6 +6076,9 @@ pub(crate) fn tokens_to_sql(toks: &[Token]) -> String {
             Token::Pipe => "|".to_string(),
             Token::Amp => "&".to_string(),
             Token::AmpAmp => "&&".to_string(),
+            Token::AmpLt => "&<".to_string(),
+            Token::AmpGt => "&>".to_string(),
+            Token::DashPipeDash => "-|-".to_string(),
             Token::Hash => "#".to_string(),
             Token::Tilde => "~".to_string(),
             Token::TildeStar => "~*".to_string(),

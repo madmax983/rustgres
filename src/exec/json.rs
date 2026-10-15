@@ -623,7 +623,10 @@ pub(crate) fn eval_json_op(op: JsonOp, left: &Value, right: &Value) -> Result<Va
         | JsonOp::Exists
         | JsonOp::ExistsAny
         | JsonOp::ExistsAll
-        | JsonOp::Overlaps => {
+        | JsonOp::Overlaps
+        | JsonOp::OverLeft
+        | JsonOp::OverRight
+        | JsonOp::Adjacent => {
             return Err(exec_err(
                 "42883",
                 format!(
@@ -1367,13 +1370,17 @@ fn eval_jsonb_op(op: JsonOp, doc_text: &str, right: &Value) -> Result<Value, Exe
             }
         }
         // v1.88: && is ranges-only; jsonb has no overlap operator.
-        JsonOp::Overlaps => Err(exec_err(
-            "42883",
-            format!(
-                "operator does not exist: jsonb && {}",
-                value_type_name(right)
-            ),
-        )),
+        // v1.91: &< / &> / -|- are ranges-only too.
+        JsonOp::Overlaps | JsonOp::OverLeft | JsonOp::OverRight | JsonOp::Adjacent => {
+            Err(exec_err(
+                "42883",
+                format!(
+                    "operator does not exist: jsonb {} {}",
+                    op.sql(),
+                    value_type_name(right)
+                ),
+            ))
+        }
         // v1.85: @? / @@ — the jsonpath predicate operators. The
         // right operand is a jsonpath value or jsonpath text; a
         // malformed literal raises the jsonpath input error (22P02).

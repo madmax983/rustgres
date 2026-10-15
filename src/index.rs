@@ -76,6 +76,12 @@ pub fn index_key_cmp(a: &Value, b: &Value) -> Ordering {
                 _ => x.cmp(y),
             }
         }
+        // v1.91: range / multirange btree opclasses (PG range_cmp /
+        // multirange_cmp). Without these arms every pair fell to the
+        // type-tag fallback and compared Equal, so an index scan on a
+        // range column returned heap order and ORDER BY trusted it.
+        (Value::Range(x), Value::Range(y)) => crate::exec::ranges::range_cmp(x, y),
+        (Value::Multirange(x), Value::Multirange(y)) => crate::exec::ranges::multirange_cmp(x, y),
         // Total fallback: values of different types can never share one
         // indexed column, but the B-tree still needs a total order.
         _ => type_tag(a).cmp(&type_tag(b)),

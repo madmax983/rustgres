@@ -1218,7 +1218,7 @@ pub fn records_for_commit(
                         xmin: own,
                     });
                 }
-                i += 1;
+                // v1.91: no local increment (see CreateType arm note).
             }
             // v0.9: ALTER TABLE swaps the table version; log the latest
             // version this transaction created.
@@ -1527,14 +1527,19 @@ pub fn records_for_commit(
                         xmin: own,
                     });
                 }
-                i += 1;
+                // v1.91: no local `i += 1` here (or in DropType below):
+                // the loop's blanket increment at the bottom already
+                // advances. The old double increment silently skipped
+                // the write op following any type-DDL op — for a
+                // CREATE TYPE AS RANGE that next op is the multirange
+                // companion's CreateType, so companions vanished on
+                // WAL replay after a crash/restart.
             }
             WriteOp::DropType { name, .. } => {
                 out.push(WalRecord::DropType {
                     name: name.clone(),
                     xmax: own,
                 });
-                i += 1;
             }
             // v0.86: function/operator DDL is WAL-logged (definitions
             // survive checkpoint/restart). The new definition is read
@@ -1575,7 +1580,7 @@ pub fn records_for_commit(
                         xmin: own,
                     });
                 }
-                i += 1;
+                // v1.91: no local increment (see CreateType arm note).
             }
             // v0.87: WAL-log the specific overload's signature.
             WriteOp::DropFunction { name, prev, .. } => {
@@ -1588,7 +1593,7 @@ pub fn records_for_commit(
                     arg_types,
                     xmax: own,
                 });
-                i += 1;
+                // v1.91: no local increment (see CreateType arm note).
             }
             WriteOp::CreateOperator { name, .. } => {
                 if let Some(defs) = eng.db.operators.get(name) {
@@ -1609,20 +1614,20 @@ pub fn records_for_commit(
                         xmin: own,
                     });
                 }
-                i += 1;
+                // v1.91: no local increment (see CreateType arm note).
             }
             WriteOp::DropOperator { name, .. } => {
                 out.push(WalRecord::DropOperator {
                     name: name.clone(),
                     xmax: own,
                 });
-                i += 1;
+                // v1.91: no local increment (see CreateType arm note).
             }
             // v1.38: cast DDL is deliberately NOT WAL-logged (documented
             // known gap on `Database::casts`): user-defined casts are
             // in-memory and do not survive restart.
             WriteOp::CreateCast { .. } => {
-                i += 1;
+                // v1.91: no local increment (see CreateType arm note).
             }
             WriteOp::CreateIndex { name } => {
                 let Some(ix) = eng.db.indexes.get(name) else {

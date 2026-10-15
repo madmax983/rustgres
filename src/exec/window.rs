@@ -1874,6 +1874,11 @@ pub(crate) fn eval_window_agg(
                     }
                 }
             }
+            // v1.91: PG range_agg_finalfn returns NULL on zero
+            // non-NULL inputs (see agg.rs).
+            if elem_name.is_none() {
+                return Ok(Value::Null);
+            }
             let (elem, mname) = elem_name.unwrap_or((RangeElem::Int4, None));
             Ok(Value::multirange(super::ranges::normalize_multi(
                 elem, mname, ranges,

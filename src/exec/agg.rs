@@ -3134,11 +3134,16 @@ pub(crate) fn eval_agg_func(
         }
         // v1.88: range_agg — the union of all input ranges as a
         // multirange. vals holds only non-NULL inputs (the collector
-        // filters them, matching PG's strict transition); zero rows
-        // yield the empty multirange of the statically-known elem
-        // (PG's agginitval '{}'), falling back to int4 when the type
-        // cannot be determined.
+        // filters them, matching PG's strict transition).
+        // v1.91 correction (PG19 range_agg_finalfn): "return NULL if
+        // we had zero inputs, like other aggregates" — zero NON-NULL
+        // inputs yield NULL, not '{}'. (An empty range / empty
+        // multirange input still counts as an input and yields '{}';
+        // v1.88's initcond reading was wrong.)
         AggFunc::RangeAgg => {
+            if vals.is_empty() {
+                return Ok(Value::Null);
+            }
             let mut ranges: Vec<RangeVal> = Vec::new();
             let mut elem_name: Option<(RangeElem, Option<String>)> = None;
             for v in &vals {

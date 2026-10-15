@@ -633,6 +633,9 @@ pub(crate) fn unnest_rows(v: &Value) -> Result<Vec<Value>, ExecError> {
     match v {
         Value::Null => Ok(Vec::new()),
         Value::Array(a) => Ok(a.elems.clone()),
+        // v1.91: unnest(anymultirange) yields one row per component
+        // range (PG multirange_unnest).
+        Value::Multirange(m) => Ok(m.ranges.iter().cloned().map(Value::range).collect()),
         Value::Text(s) | Value::BpChar(s) => {
             let a = parse_array_literal(s, crate::storage::ArrayElem::Text)?;
             Ok(a.elems)
