@@ -2,6 +2,78 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `JSON_QUERY`/`JSON_EXISTS`/`JSON_VALUE` re-parse their jsonpath literal from scratch on every row — fix — 2026-10-16
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec/jsonpath.rs`: `parse_jsonpath` now checks a thread-local
+cache, keyed by the input path text, before tokenizing/parsing
+anything. A hit clones the cached `JpPath` (an `Rc` deref + one
+`Clone`, no tokenizer, no recursive-descent parse, no per-node `Box`
+allocation) instead of re-running `tokenize_jsonpath` +
+`JpParser::parse_path`; a miss parses exactly as before and caches a
+clone of the result. Bounded at 64 entries (`JSONPATH_PARSE_CACHE_CAP`),
+matching this repo's existing `REGEX_CACHE_CAP`/`JSONB_PARSE_CACHE_CAP`
+caches, and clears itself outright on overflow rather than evicting
+LRU-style. Only successful parses are cached; a parse error re-reports
+the identical error on every call, exactly as before. The function's
+signature and all 5 call sites are unchanged.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_sqljson_queryfuncs.py --rows 1500
+--count 20`), same workload, same machine, same session.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total `Ir` | 18,556,724,153 | 16,406,519,485 | **-11.59%** |
+
+DHAT (same workload, one run each before/after):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total allocation bytes | 862,466,772 | 779,460,864 | -9.62% |
+| Total allocation blocks | 13,164,200 | 12,114,261 | -7.98% |
+| Target-attributable bytes (tokenize/parse call stacks) | 106,770,000 | 18,244,084 | **-82.91%** |
+| Target-attributable blocks (tokenize/parse call stacks) | 1,560,000 | 450,060 | **-71.15%** |
+
+The `Ir` delta (-11.59%) clears the ≥5%-of-profile floor by more than
+2x on its own. The target-attributable DHAT deltas (-82.91% bytes,
+-71.15% blocks — the allocations whose call stack passes through
+`tokenize_jsonpath`/`JpLexer`/`JpParser`/`JpTok::clone`) clear the
+≥10%-of-allocations floor independently and confirm the fix hits
+exactly the call stacks the baseline named; the residual (the cache
+still misses on a path's first appearance, and occasionally reallocates
+the cache `HashMap` itself) is inherent. Program-wide DHAT totals also
+drop (-9.62% bytes, -7.98% blocks), smaller than the target-specific
+numbers because most of this workload's remaining allocation churn is
+unrelated document/numeric parsing, not jsonpath parsing.
+
+`cargo test --all-features`: 1017/1017 passed, unchanged. `cargo fmt
+--all -- --check`: clean. `cargo clippy --all-targets --all-features
+-- -D warnings`: 808 errors on both the pre-change and post-change
+tree (compared by count via `git stash`) — the same pre-existing
+toolchain/lint-version mismatch noted throughout this file, zero new.
+`tests/conformance/schedule_runner.py --tests
+json,jsonb,json_encoding,jsonpath,jsonpath_encoding,jsonb_jsonpath,
+sqljson,sqljson_queryfuncs,sqljson_jsontable`: identical PASS=2844
+EF=1 REAL-FAIL=836 of 3681 scored on both trees — zero behavior
+change.
+
+Before/after profiles committed:
+`benches/profiles/{callgrind,dhat}.out.sqljsonpathcache-{base,after}-2026-10-16`.
+
+**Reproduce**: check out the parent (baseline) commit, `cargo build`,
+repeat the Callgrind/DHAT commands in the baseline entry's
+"Reproduce" section for the before numbers; check out this commit,
+`cargo build`, repeat for the after numbers.
+
 ## Bolt: `JSON_QUERY`/`JSON_EXISTS`/`JSON_VALUE` re-parse their jsonpath literal from scratch on every row — baseline — 2026-10-16
 
 **Why this workload**: v1.92 added the SQL-standard query functions
