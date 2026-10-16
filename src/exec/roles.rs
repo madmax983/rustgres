@@ -15,6 +15,7 @@ pub(crate) fn exec_create_role(
     name: &str,
     login: bool,
     superuser: bool,
+    bypassrls: bool,
     password: &Option<String>,
     connlimit: Option<i32>,
     valid_until: &Option<String>,
@@ -36,6 +37,7 @@ pub(crate) fn exec_create_role(
             .map(|pw| crate::crypto::verifier_for_password(pw)),
         can_login: login,
         superuser,
+        bypassrls,
         connlimit: connlimit.unwrap_or(-1),
         memberships: Vec::new(),
         valid_until: valid_until.clone(),
@@ -57,6 +59,7 @@ pub(crate) fn exec_alter_role(
     name: &str,
     login: Option<bool>,
     superuser: Option<bool>,
+    bypassrls: Option<bool>,
     password: &Option<Option<String>>,
     connlimit: Option<i32>,
     valid_until: &Option<String>,
@@ -89,6 +92,9 @@ pub(crate) fn exec_alter_role(
     }
     if let Some(s) = superuser {
         next.superuser = s;
+    }
+    if let Some(b) = bypassrls {
+        next.bypassrls = b;
     }
     if let Some(pw) = password {
         next.password = pw.as_ref().map(|p| crate::crypto::verifier_for_password(p));
@@ -384,9 +390,10 @@ pub(crate) fn exec_grant_revoke(
     revoke: bool,
 ) -> Result<ExecResult, ExecError> {
     use crate::sql::{GrantObject, PrivSpec, Privilege};
-    // All grantees must be existing roles.
+    // All grantees must be existing roles — except PUBLIC, PG's
+    // pseudo-role (acl.h ACL_ID_PUBLIC), which needs no catalog row.
     for g in grantees {
-        if eng.db.find_role(g, ctx.snap, ctx.own).is_none() {
+        if g != "public" && eng.db.find_role(g, ctx.snap, ctx.own).is_none() {
             return Err(exec_err("42704", format!("role \"{}\" does not exist", g)));
         }
     }
@@ -433,64 +440,69 @@ pub(crate) fn exec_grant_revoke(
     }
     let verb = if revoke { "REVOKE" } else { "GRANT" };
     match object {
-        GrantObject::Table(name) => {
-            let t = eng
-                .db
-                .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
-                .ok_or_else(|| {
-                    exec_err("42P01", format!("relation \"{}\" does not exist", name))
-                })?;
-            if t.owner != ctx.role
-                && !crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own)
-            {
-                return Err(exec_err(
-                    "42501",
-                    format!(
-                        "permission denied: must be owner of table \"{}\" to {}",
-                        name,
-                        verb.to_lowercase()
-                    ),
-                ));
-            }
-            let mut next = t.clone();
-            apply_acl_delta(&mut next.acl, grantees, bits, revoke, false);
-            // v0.11: column-level grants.
-            if !col_specs.is_empty() {
-                let cols: Vec<String> = next.columns.iter().map(|(n, _)| n.clone()).collect();
-                for s in &col_specs {
-                    match (s.priv_, object) {
-                        (
-                            Privilege::Select
-                            | Privilege::Insert
-                            | Privilege::Update
-                            | Privilege::References,
-                            GrantObject::Table(_),
-                        ) => {}
-                        _ => {
-                            return Err(exec_err(
-                                "0A000",
-                                format!("invalid privilege {:?} for {:?}", s.priv_, object),
-                            ));
-                        }
-                    }
-                    for c in &s.columns {
-                        if !cols.iter().any(|n| n == c) {
-                            return Err(exec_err(
-                                "42703",
-                                format!("column \"{}\" of relation \"{}\" does not exist", c, name),
-                            ));
-                        }
-                    }
-                    apply_col_acl_delta(
-                        &mut next.col_acl,
-                        grantees,
-                        s.priv_.bits(),
-                        &s.columns,
-                        revoke,
-                    );
+        GrantObject::Table(names) => {
+            for name in names {
+                let t = eng
+                    .db
+                    .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                    .ok_or_else(|| {
+                        exec_err("42P01", format!("relation \"{}\" does not exist", name))
+                    })?;
+                if t.owner != ctx.role
+                    && !crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own)
+                {
+                    return Err(exec_err(
+                        "42501",
+                        format!(
+                            "permission denied: must be owner of table \"{}\" to {}",
+                            name,
+                            verb.to_lowercase()
+                        ),
+                    ));
                 }
+                let mut next = t.clone();
+                apply_acl_delta(&mut next.acl, grantees, bits, revoke, false);
+                // v0.11: column-level grants.
+                if !col_specs.is_empty() {
+                    let cols: Vec<String> = next.columns.iter().map(|(n, _)| n.clone()).collect();
+                    for s in &col_specs {
+                        match (s.priv_, object) {
+                            (
+                                Privilege::Select
+                                | Privilege::Insert
+                                | Privilege::Update
+                                | Privilege::References,
+                                GrantObject::Table(_),
+                            ) => {}
+                            _ => {
+                                return Err(exec_err(
+                                    "0A000",
+                                    format!("invalid privilege {:?} for {:?}", s.priv_, object),
+                                ));
+                            }
+                        }
+                        for c in &s.columns {
+                            if !cols.iter().any(|n| n == c) {
+                                return Err(exec_err(
+                                    "42703",
+                                    format!(
+                                        "column \"{}\" of relation \"{}\" does not exist",
+                                        c, name
+                                    ),
+                                ));
+                            }
+                        }
+                        apply_col_acl_delta(
+                            &mut next.col_acl,
+                            grantees,
+                            s.priv_.bits(),
+                            &s.columns,
+                            revoke,
+                        );
+                    }
+                }
+                alter_swap(eng, ctx, name, None, next, None)?;
             }
-            alter_swap(eng, ctx, name, None, next, None)?;
         }
         GrantObject::Sequence(name) => {
             let s = eng

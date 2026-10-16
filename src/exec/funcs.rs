@@ -1917,6 +1917,23 @@ pub(crate) fn eval_func(
     } else {
         args
     };
+    // v1.95: SQL value functions for role context. current_user and
+    // current_role are the CURRENT role (Q.role, post SET ROLE);
+    // session_user is the login role installed per statement.
+    if args.is_empty() {
+        match name {
+            "current_user" | "current_role" | "user" => {
+                return Ok(Value::text(q.role.to_string()));
+            }
+            "session_user" => {
+                return Ok(Value::text(crate::exec::session_user_name(q.role)));
+            }
+            "current_catalog" => {
+                return Ok(Value::text("postgres".to_string()));
+            }
+            _ => {}
+        }
+    }
     // v0.97: pg_typeof is statically typed (PG19 resolves it at parse
     // analysis): a cast to a domain, or a reference to a domain-typed
     // column, reports the domain name — not the base type the runtime
@@ -11131,6 +11148,9 @@ pub(crate) fn func_result_type(
             Ok(ColType::Timestamptz)
         }
         "current_date" => Ok(ColType::Date),
+        "current_user" | "current_role" | "session_user" | "current_catalog" | "user" => {
+            Ok(ColType::Text)
+        }
         "date_trunc" => match expr_type(eng, snap, own, session, schemas, outer, ctes, &args[1])? {
             ColType::Timestamptz => Ok(ColType::Timestamptz),
             // v1.86: interval truncates to interval.

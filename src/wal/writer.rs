@@ -33,7 +33,7 @@ pub(crate) const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK16";
 /// v1.94: version 20 adds the tsvector / tsquery column types and
 /// value tags to table and row images. v19 checkpoints are refused;
 /// remove the data directory to start fresh.
-pub(crate) const CHKPT_VERSION: u32 = 20;
+pub(crate) const CHKPT_VERSION: u32 = 21;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -82,9 +82,12 @@ pub(crate) const CHKPT_VERSION: u32 = 20;
 /// v1.94: `RGSWAL24` — new ColType tags 34/35 (tsvector/tsquery) and
 /// Value tags 28/29 for the text-search types. Older logs (down to
 /// MIN_READABLE) still read.
-pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL24";
+/// v1.95: `RGSWAL25` — role records carry `bypassrls` (trailing byte);
+/// table RLS flags + policies ride the s-expr constraints string
+/// (decoded optionally, so older logs still read).
+pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL25";
 /// v1.80: the format version number in [`WAL_MAGIC`].
-pub(crate) const WAL_VERSION: u32 = 24;
+pub(crate) const WAL_VERSION: u32 = 25;
 /// v1.80: oldest WAL format this build can replay.
 pub(crate) const MIN_READABLE_WAL_VERSION: u32 = 20;
 pub(crate) const WAL_HEADER_LEN: u64 = 16;
@@ -577,6 +580,9 @@ impl Wal {
                 }
                 // v0.11: owner.
                 v_body.str(&v.owner);
+                // v1.95 (checkpoint v21): view options.
+                v_body.u8(v.security_invoker as u8);
+                v_body.u8(v.check_option as u8);
                 n_views += 1;
             }
         }
@@ -1100,6 +1106,9 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 __t.uniques = dc.uniques;
                 __t.pkey = dc.pkey;
                 __t.fks = dc.fks;
+                __t.rls_enabled = dc.rls_enabled;
+                __t.rls_forced = dc.rls_forced;
+                __t.policies = dc.policies;
             }
             Err(e) => {
                 return Err(bad(&format!(
@@ -1224,6 +1233,9 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         }
         // v0.11: owner.
         let owner = d.str().map_err(|e| bad(&e))?;
+        // v1.95 (checkpoint v21): view options.
+        let security_invoker = d.u8().map_err(|e| bad(&e))? != 0;
+        let check_option = d.u8().map_err(|e| bad(&e))? != 0;
         eng.db
             .views
             .entry(name.clone())
@@ -1235,6 +1247,8 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 created_xmin,
                 dropped_xmax,
                 owner,
+                security_invoker,
+                check_option,
             });
     }
     // v0.9: sequences, with their current values.
@@ -1266,6 +1280,7 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 password: wr.password.map(WalVerifier::into_verifier),
                 can_login: wr.can_login,
                 superuser: wr.superuser,
+                bypassrls: wr.bypassrls,
                 connlimit: wr.connlimit,
                 memberships: wr
                     .memberships

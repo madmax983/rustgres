@@ -2338,6 +2338,44 @@ pub(crate) fn exec_insert(
         }
         fired
     };
+    // v1.95: row-level security WITH CHECK on every new row (PG19
+    // ExecWithCheckOptions, WCO_RLS_INSERT_CHECK; the SELECT policies
+    // join as checks when RETURNING requires SELECT perms). Runs on
+    // the post-trigger rows, before conflict arbitration — PG checks
+    // the proposed row as part of speculative insertion too.
+    {
+        let t = eng
+            .db
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+            .expect("target still visible");
+        if t.rls_enabled {
+            let t = t.clone();
+            let schema: Vec<QCol> = t
+                .columns
+                .iter()
+                .map(|(n, ty)| QCol {
+                    qual: table.to_string(),
+                    name: n.clone(),
+                    ty: *ty,
+                    hidden: false,
+                    src_ord: 0,
+                })
+                .collect();
+            for row in &new_rows {
+                rls_check_new_row_ctx(
+                    eng,
+                    ctx,
+                    &t,
+                    table,
+                    PolicyCmd::Insert,
+                    !returning.is_empty(),
+                    false,
+                    &schema,
+                    &row[..],
+                )?;
+            }
+        }
+    }
     // v0.10: plan the per-row ON CONFLICT resolution. No mutation happens
     // here, so a failed row still leaves the statement atomic. Tracks:
     // - inserts: (new row id, values) to insert,
@@ -2656,6 +2694,52 @@ pub(crate) fn exec_insert(
                         &[],
                         Some(tid),
                     )?;
+                    // v1.95: row-level security for the DO UPDATE path
+                    // (PG19 rowsecurity.c ON CONFLICT block): the
+                    // existing row must pass the UPDATE policies' USING
+                    // group as a check (WCO_RLS_CONFLICT_CHECK — an
+                    // error, not a skip), and the new row must pass
+                    // the UPDATE WITH CHECK group.
+                    {
+                        let tdef = eng
+                            .db
+                            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+                            .expect("target still visible")
+                            .clone();
+                        if tdef.rls_enabled {
+                            let schema: Vec<QCol> = meta_for_upsert
+                                .columns
+                                .iter()
+                                .map(|(n, ty)| QCol {
+                                    qual: table.to_string(),
+                                    name: n.clone(),
+                                    ty: *ty,
+                                    hidden: false,
+                                    src_ord: 0,
+                                })
+                                .collect();
+                            rls_check_using_as_check_ctx(
+                                eng,
+                                ctx,
+                                &tdef,
+                                table,
+                                PolicyCmd::Update,
+                                &schema,
+                                &target_parent[..],
+                            )?;
+                            rls_check_new_row_ctx(
+                                eng,
+                                ctx,
+                                &tdef,
+                                table,
+                                PolicyCmd::Update,
+                                !returning.is_empty(),
+                                false,
+                                &schema,
+                                &new_values[..],
+                            )?;
+                        }
+                    }
                     // prev xmax for the WAL undo record.
                     let prev_xmax: u64 = if is_planned {
                         0
@@ -3136,6 +3220,57 @@ pub(crate) fn exec_update(
                 vis.push((leaf.clone(), leaf_cols.clone(), r.id, r.xmax, pv));
             }
         }
+        // v1.95: row-level security — the target's UPDATE USING group
+        // (plus the SELECT group when the statement requires SELECT
+        // perms: a WHERE clause or RETURNING, rowsecurity.c) filters
+        // the candidate rows; invisible rows are simply not updated.
+        {
+            let tdef = eng
+                .db
+                .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+                .expect("target still visible")
+                .clone();
+            if tdef.rls_enabled {
+                let mut cmds = vec![PolicyCmd::Update];
+                if where_.is_some() || !returning.is_empty() {
+                    cmds.push(PolicyCmd::Select);
+                }
+                let mut lock_ids = Vec::new();
+                let mut q = Q {
+                    eng: &mut *eng,
+                    snap: ctx.snap,
+                    own: ctx.own,
+                    all_xids: ctx.all_xids.clone(),
+                    session: ctx.session,
+                    role: ctx.role,
+                    read_only: ctx.read_only,
+                    depth: 0,
+                    lock_ids: &mut lock_ids,
+                    ctes: ctes.clone(),
+                    wctx: None,
+                    srf_vals: Vec::new(),
+                    priv_scopes: Vec::new(),
+                    hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+                    immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+                    plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
+                    hashed_in: Rc::new(RefCell::new(Vec::new())),
+                    pending_updates: None,
+                    write: Some(qwrite_from_ctx(
+                        &mut *ctx.writes,
+                        ctx.write_xid,
+                        ctx.level,
+                        ctx.default_toast_compression,
+                    )),
+                };
+                let mut kept = Vec::with_capacity(vis.len());
+                for entry in vis {
+                    if rls_visible_q(&mut q, &tdef, table, &cmds, &schema, &entry.4)? {
+                        kept.push(entry);
+                    }
+                }
+                vis = kept;
+            }
+        }
         let mut plan: Vec<(String, u64, u64, Row)> = Vec::new();
         let mut moves: Vec<(String, u64, u64, String, Row)> = Vec::new();
         let mut ret_new: Vec<Row> = Vec::new();
@@ -3521,6 +3656,43 @@ pub(crate) fn exec_update(
         let from_schema = from_data.map(|(s, _)| s);
         (plan, moves, ret_new, ret_from, ret_prov_ids, from_schema)
     };
+    // v1.95: row-level security WITH CHECK on every updated row's new
+    // version (WCO_RLS_UPDATE_CHECK; SELECT policies join as checks
+    // when RETURNING is present). ret_new is in target (parent)
+    // column order, matching the target schema built here.
+    {
+        let tdef = eng
+            .db
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+            .expect("target still visible")
+            .clone();
+        if tdef.rls_enabled {
+            let schema: Vec<QCol> = tdef
+                .columns
+                .iter()
+                .map(|(n, ty)| QCol {
+                    qual: table.to_string(),
+                    name: n.clone(),
+                    ty: *ty,
+                    hidden: false,
+                    src_ord: 0,
+                })
+                .collect();
+            for row in &ret_new {
+                rls_check_new_row_ctx(
+                    eng,
+                    ctx,
+                    &tdef,
+                    table,
+                    PolicyCmd::Update,
+                    !returning.is_empty(),
+                    false,
+                    &schema,
+                    &row[..],
+                )?;
+            }
+        }
+    }
     // Apply: UPDATE = delete old version + insert new version, per leaf.
     // v0.70: moved rows are deleted from their source leaf and inserted
     // into the routed destination leaf.
@@ -3864,6 +4036,59 @@ pub(crate) fn exec_delete(
                 }
             }
             v
+        };
+        // v1.95: row-level security — the target's DELETE USING group
+        // (plus the SELECT group when a WHERE clause or RETURNING
+        // requires SELECT perms) filters candidate rows; invisible
+        // rows are simply not deleted.
+        let vis: Vec<(String, u64, u64, Row, Row, Vec<u32>)> = {
+            let tdef = eng
+                .db
+                .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+                .expect("target still visible")
+                .clone();
+            if !tdef.rls_enabled {
+                vis
+            } else {
+                let mut cmds = vec![PolicyCmd::Delete];
+                if where_.is_some() || !returning.is_empty() {
+                    cmds.push(PolicyCmd::Select);
+                }
+                let mut lock_ids = Vec::new();
+                let mut q = Q {
+                    eng: &mut *eng,
+                    snap: ctx.snap,
+                    own: ctx.own,
+                    all_xids: ctx.all_xids.clone(),
+                    session: ctx.session,
+                    role: ctx.role,
+                    read_only: ctx.read_only,
+                    depth: 0,
+                    lock_ids: &mut lock_ids,
+                    ctes: ctes.clone(),
+                    wctx: None,
+                    srf_vals: Vec::new(),
+                    priv_scopes: Vec::new(),
+                    hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+                    immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+                    plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
+                    hashed_in: Rc::new(RefCell::new(Vec::new())),
+                    pending_updates: None,
+                    write: Some(qwrite_from_ctx(
+                        &mut *ctx.writes,
+                        ctx.write_xid,
+                        ctx.level,
+                        ctx.default_toast_compression,
+                    )),
+                };
+                let mut kept = Vec::with_capacity(vis.len());
+                for entry in vis {
+                    if rls_visible_q(&mut q, &tdef, table, &cmds, &schema, &entry.3)? {
+                        kept.push(entry);
+                    }
+                }
+                kept
+            }
         };
         let mut plan = Vec::new();
         // v0.76: the USING row matched for each deleted target row,

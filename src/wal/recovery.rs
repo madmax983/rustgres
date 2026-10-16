@@ -122,6 +122,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 password: role.password.clone().map(WalVerifier::into_verifier),
                 can_login: role.can_login,
                 superuser: role.superuser,
+                bypassrls: role.bypassrls,
                 connlimit: role.connlimit,
                 memberships: role
                     .memberships
@@ -167,6 +168,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 password: role.password.clone().map(WalVerifier::into_verifier),
                 can_login: role.can_login,
                 superuser: role.superuser,
+                bypassrls: role.bypassrls,
                 connlimit: role.connlimit,
                 memberships: role
                     .memberships
@@ -463,6 +465,9 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     t.uniques = dc.uniques;
                     t.pkey = dc.pkey;
                     t.fks = dc.fks;
+                    t.rls_enabled = dc.rls_enabled;
+                    t.rls_forced = dc.rls_forced;
+                    t.policies = dc.policies;
                 }
                 Err(e) => {
                     return Err(format!(
@@ -756,6 +761,9 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     t.uniques = dc.uniques;
                     t.pkey = dc.pkey;
                     t.fks = dc.fks;
+                    t.rls_enabled = dc.rls_enabled;
+                    t.rls_forced = dc.rls_forced;
+                    t.policies = dc.policies;
                 }
                 Err(e) => {
                     return Err(format!(
@@ -827,6 +835,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             col_aliases,
             deps,
             owner,
+            security_invoker,
+            check_option,
             xmin,
         } => {
             eng.db
@@ -841,6 +851,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     dropped_xmax: 0,
                     // v0.11: owner comes from the record.
                     owner: owner.clone(),
+                    security_invoker: *security_invoker,
+                    check_option: *check_option,
                 });
         }
         WalRecord::DropView { name, xmax } => {
@@ -1327,6 +1339,8 @@ pub fn records_for_commit(
                     col_aliases: ours.col_aliases.clone(),
                     deps: ours.deps.clone(),
                     owner: ours.owner.clone(),
+                    security_invoker: ours.security_invoker,
+                    check_option: ours.check_option,
                     xmin: own,
                 });
             }

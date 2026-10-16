@@ -2507,6 +2507,27 @@ pub(crate) fn build_source(
                 let (_, rows) = pg_sequences_scan(&q.eng.db, q.snap, q.own);
                 return Ok((apply_aliases(schema)?, rows));
             }
+            // v1.95: pg_policies / pg_policy are virtual too.
+            if matches!(name.as_str(), "pg_policies" | "pg_policy")
+                && q.eng
+                    .db
+                    .find_table(name, q.snap, &q.all_xids, q.session)
+                    .is_none()
+            {
+                let (schema, rows) = if name == "pg_policies" {
+                    pg_policies_scan(&q.eng.db, q.snap, q.own, q.session)
+                } else {
+                    pg_policy_scan(&q.eng.db, q.snap, q.own, q.session)
+                };
+                let schema: Vec<QCol> = schema
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                return Ok((apply_aliases(schema)?, rows));
+            }
             // v0.11: the role catalogs are virtual too.
             if matches!(
                 name.as_str(),
@@ -2605,6 +2626,13 @@ pub(crate) fn build_source(
                     .as_ref()
                     .map(|p| !p.children.is_empty())
                     .unwrap_or(false);
+                // v1.95: when RLS will filter this scan, an index-order
+                // scan's early LIMIT budget would truncate rows before
+                // the policy qual runs (PG applies quals before
+                // LIMIT). Drop the hint; the plain paths return the
+                // full row set and the filter below applies.
+                let order_hint = if t.rls_enabled { None } else { order_hint };
+                let early_limit = if t.rls_enabled { None } else { early_limit };
                 // v0.96: table inheritance — a plain `FROM t` scans t plus
                 // all recursive inheritance descendants (PG's Append
                 // plan); `FROM ONLY t` scans just t. Inheritance and
@@ -2811,6 +2839,39 @@ pub(crate) fn build_source(
                     }
                 };
                 (schema, rows)
+            };
+            // v1.95: row-level security — filter the base table's rows
+            // through the SELECT USING group (plus the UPDATE group for
+            // FOR UPDATE scans, rowsecurity.c). Applies to every access
+            // path above (seq/index/partition/inheritance) because they
+            // all funnel into `rows` here. Skipped entirely for CTE /
+            // virtual-catalog names (handled by earlier returns).
+            let rows = {
+                let t = q
+                    .eng
+                    .db
+                    .find_table(name, q.snap, &q.all_xids, q.session)
+                    .cloned();
+                match t {
+                    Some(t) if t.rls_enabled => {
+                        let mut cmds = vec![PolicyCmd::Select];
+                        if need_prov {
+                            cmds.push(PolicyCmd::Update);
+                        }
+                        // Order-hint early termination may have cut the
+                        // scan short; RLS filtering after a LIMIT budget
+                        // is still correct PG-wise only if the full
+                        // ordered stream is filtered first — the hint
+                        // path is taken only for plain SELECTs, where
+                        // an under-filled LIMIT is observable. PG
+                        // applies quals before LIMIT, so re-run
+                        // unfiltered is not possible here; the planner
+                        // hint is disabled for RLS tables upstream
+                        // (plan-time), making this a plain filter.
+                        rls_filter_qrows(q, &t, name, &cmds, &schema, rows)?
+                    }
+                    _ => rows,
+                }
             };
             // v0.89: volatile function bodies see the in-flight UPDATE's
             // already-planned rows instead of the statement snapshot.

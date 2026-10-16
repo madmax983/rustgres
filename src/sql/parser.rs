@@ -598,6 +598,7 @@ impl Parser {
                 Token::Ident(s) if s == "sequence" => self.parse_alter_sequence(),
                 Token::Ident(s) if s == "domain" => self.parse_alter_domain(),
                 Token::Ident(s) if s == "function" => self.parse_alter_function(),
+                Token::Ident(s) if s == "policy" => self.parse_alter_policy(),
                 Token::Ident(s) if s == "role" || s == "user" || s == "group" => {
                     self.parse_alter_role()
                 }
@@ -625,6 +626,15 @@ impl Parser {
                     self.pos = save;
                 }
                 let name = self.expect_ident()?;
+                // v1.95: RESET SESSION AUTHORIZATION (two-word name).
+                if name == "session"
+                    && matches!(self.peek(), Token::Ident(s) if s == "authorization")
+                {
+                    self.next();
+                    return Ok(Stmt::Reset {
+                        name: "session_authorization".to_string(),
+                    });
+                }
                 Ok(Stmt::Reset { name })
             }
             // --- v0.10: WITH [RECURSIVE] ... / COPY
@@ -1105,6 +1115,10 @@ impl Parser {
         // v1.00: CREATE [CONSTRAINT] TRIGGER (bounded).
         if matches!(self.peek(), Token::Ident(s) if s == "trigger") {
             return self.parse_create_trigger();
+        }
+        // v1.95: CREATE POLICY name ON table ... (PG19).
+        if matches!(self.peek(), Token::Ident(s) if s == "policy") {
+            return self.parse_create_policy();
         }
         // CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (col [, ...])
         let unique = self.eat_keyword("unique");
@@ -2073,6 +2087,25 @@ impl Parser {
     }
 
     pub(crate) fn parse_alter_action(&mut self) -> Result<AlterAction, SqlError> {
+        // v1.95: ALTER TABLE t {ENABLE|DISABLE|FORCE} ROW LEVEL SECURITY.
+        if self.eat_keyword("enable") {
+            self.expect_keyword("row")?;
+            self.expect_keyword("level")?;
+            self.expect_keyword("security")?;
+            return Ok(AlterAction::EnableRowSecurity);
+        }
+        if self.eat_keyword("disable") {
+            self.expect_keyword("row")?;
+            self.expect_keyword("level")?;
+            self.expect_keyword("security")?;
+            return Ok(AlterAction::DisableRowSecurity);
+        }
+        if self.eat_keyword("force") {
+            self.expect_keyword("row")?;
+            self.expect_keyword("level")?;
+            self.expect_keyword("security")?;
+            return Ok(AlterAction::ForceRowSecurity);
+        }
         // v0.69: ALTER TABLE parent ATTACH PARTITION child FOR VALUES ...
         if self.eat_keyword("attach") {
             self.expect_keyword("partition")?;
@@ -2236,6 +2269,13 @@ impl Parser {
             return Ok(AlterAction::Inherit { parent });
         }
         if self.eat_keyword("no") {
+            // v1.95: NO FORCE ROW LEVEL SECURITY.
+            if self.eat_keyword("force") {
+                self.expect_keyword("row")?;
+                self.expect_keyword("level")?;
+                self.expect_keyword("security")?;
+                return Ok(AlterAction::NoForceRowSecurity);
+            }
             self.expect_keyword("inherit")?;
             let parent = self.expect_ident()?;
             return Ok(AlterAction::NoInherit { parent });
@@ -2952,6 +2992,186 @@ impl Parser {
             false
         };
         Ok(Stmt::DropTrigger {
+            name,
+            table,
+            if_exists,
+            cascade,
+        })
+    }
+
+    /// v1.95: `( <expr> )` for policy USING / WITH CHECK clauses.
+    /// Returns the AST plus the expr's source SQL (rendered back from
+    /// the consumed tokens): policy exprs are persisted via the SQL
+    /// text because the s-expr codec cannot represent subqueries.
+    pub(crate) fn parse_paren_policy_expr(&mut self) -> Result<(Expr, String), SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let start = self.pos;
+        let e = self.parse_or()?;
+        let sql = self.tokens[start..self.pos]
+            .iter()
+            .map(token_sql)
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.expect(Token::RParen, "')'")?;
+        Ok((e, sql))
+    }
+
+    /// v1.95: policy TO list: `role [, ...]` or PUBLIC. Empty = PUBLIC.
+    pub(crate) fn parse_policy_roles(&mut self) -> Result<Vec<String>, SqlError> {
+        let mut roles = Vec::new();
+        loop {
+            if self.eat_keyword("public") {
+                // PUBLIC is recorded as the empty list (PG19 ACL_ID_PUBLIC).
+                roles.clear();
+            } else {
+                roles.push(self.expect_ident()?);
+            }
+            if !matches!(self.peek(), Token::Comma) {
+                break;
+            }
+            self.next();
+        }
+        Ok(roles)
+    }
+
+    /// v1.95: `CREATE POLICY name ON table [AS PERMISSIVE|RESTRICTIVE]
+    /// [FOR ALL|SELECT|INSERT|UPDATE|DELETE] [TO roles] [USING (e)]
+    /// [WITH CHECK (e)]` (PG19 gram.y CreatePolicyStmt).
+    pub(crate) fn parse_create_policy(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("policy")?;
+        let name = self.expect_ident()?;
+        self.expect_keyword("on")?;
+        let table = self.expect_ident()?;
+        let mut permissive = true;
+        let mut cmd = PolicyCmd::All;
+        let mut roles: Vec<String> = Vec::new();
+        let mut using_expr: Option<Expr> = None;
+        let mut check_expr: Option<Expr> = None;
+        let mut using_sql: Option<String> = None;
+        let mut check_sql: Option<String> = None;
+        loop {
+            if self.eat_keyword("as") {
+                if self.eat_keyword("permissive") {
+                    permissive = true;
+                } else if self.eat_keyword("restrictive") {
+                    permissive = false;
+                } else {
+                    return Err(err(
+                        "syntax error: expected PERMISSIVE or RESTRICTIVE".to_string()
+                    ));
+                }
+            } else if self.eat_keyword("for") {
+                let c = self.expect_ident()?;
+                cmd = PolicyCmd::from_name(&c).ok_or_else(|| {
+                    err(format!(
+                        "syntax error: expected ALL, SELECT, INSERT, UPDATE or DELETE, found \"{}\"",
+                        c
+                    ))
+                })?;
+            } else if self.eat_keyword("to") {
+                roles = self.parse_policy_roles()?;
+            } else if self.eat_keyword("using") {
+                let (e, s) = self.parse_paren_policy_expr()?;
+                using_expr = Some(e);
+                using_sql = Some(s);
+            } else if self.eat_keyword("with") {
+                self.expect_keyword("check")?;
+                let (e, s) = self.parse_paren_policy_expr()?;
+                check_expr = Some(e);
+                check_sql = Some(s);
+            } else {
+                break;
+            }
+        }
+        Ok(Stmt::CreatePolicy {
+            name,
+            table,
+            permissive,
+            cmd,
+            roles,
+            using_expr,
+            check_expr,
+            using_sql,
+            check_sql,
+        })
+    }
+
+    /// v1.95: `ALTER POLICY name ON table [RENAME TO n] [TO roles]
+    /// [USING (e)] [WITH CHECK (e)]` (PG19 AlterPolicyStmt).
+    pub(crate) fn parse_alter_policy(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("policy")?;
+        let name = self.expect_ident()?;
+        self.expect_keyword("on")?;
+        let table = self.expect_ident()?;
+        if self.eat_keyword("rename") {
+            self.expect_keyword("to")?;
+            let new_name = self.expect_ident()?;
+            return Ok(Stmt::AlterPolicy {
+                name,
+                table,
+                rename_to: Some(new_name),
+                roles: None,
+                using_expr: None,
+                check_expr: None,
+                using_sql: None,
+                check_sql: None,
+                has_using: false,
+                has_check: false,
+            });
+        }
+        let mut roles: Option<Vec<String>> = None;
+        let mut using_expr: Option<Expr> = None;
+        let mut check_expr: Option<Expr> = None;
+        let mut using_sql: Option<String> = None;
+        let mut check_sql: Option<String> = None;
+        let mut has_using = false;
+        let mut has_check = false;
+        loop {
+            if self.eat_keyword("to") {
+                roles = Some(self.parse_policy_roles()?);
+            } else if self.eat_keyword("using") {
+                let (e, s) = self.parse_paren_policy_expr()?;
+                using_expr = Some(e);
+                using_sql = Some(s);
+                has_using = true;
+            } else if self.eat_keyword("with") {
+                self.expect_keyword("check")?;
+                let (e, s) = self.parse_paren_policy_expr()?;
+                check_expr = Some(e);
+                check_sql = Some(s);
+                has_check = true;
+            } else {
+                break;
+            }
+        }
+        Ok(Stmt::AlterPolicy {
+            name,
+            table,
+            rename_to: None,
+            roles,
+            using_expr,
+            check_expr,
+            using_sql,
+            check_sql,
+            has_using,
+            has_check,
+        })
+    }
+
+    /// v1.95: `DROP POLICY [IF EXISTS] name ON table [CASCADE|RESTRICT]`.
+    pub(crate) fn parse_drop_policy(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("policy")?;
+        let if_exists = if self.eat_keyword("if") {
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.expect_ident()?;
+        self.expect_keyword("on")?;
+        let table = self.expect_ident()?;
+        let cascade = self.parse_cascade_opt()?;
+        Ok(Stmt::DropPolicy {
             name,
             table,
             if_exists,
@@ -5652,7 +5872,18 @@ impl Parser {
                     return self.parse_call(name);
                 }
                 // `current_date` / `current_timestamp` without parens.
-                if name == "current_date" || name == "current_timestamp" {
+                // v1.95: the SQL value functions for role context are
+                // likewise paren-less keywords (PG gram.y
+                // SQLValueFunction): current_user, current_role,
+                // session_user, current_catalog, and USER.
+                if name == "current_date"
+                    || name == "current_timestamp"
+                    || name == "current_user"
+                    || name == "current_role"
+                    || name == "session_user"
+                    || name == "current_catalog"
+                    || name == "user"
+                {
                     return Ok(Expr::Func {
                         name,
                         args: Vec::new(),
@@ -8019,6 +8250,29 @@ impl Parser {
 
     /// v0.17: `SET TRANSACTION ...`, `SET SESSION CHARACTERISTICS ...`,
     /// or `SET name = value` / `SET name TO value`.
+    /// v1.95: the value part of SET [SESSION|LOCAL] SESSION
+    /// AUTHORIZATION: a role name (identifier or string literal),
+    /// DEFAULT, or NONE — the latter two reset to the authenticated
+    /// user (server-side).
+    fn parse_session_authorization(&mut self, local: bool) -> Result<Stmt, SqlError> {
+        let value = match self.next() {
+            Token::Str(s) => SetValue::Str(s),
+            Token::Ident(s) if s == "default" || s == "none" => SetValue::Default,
+            Token::Ident(s) => SetValue::Str(s.to_ascii_lowercase()),
+            other => {
+                return Err(err(format!(
+                    "syntax error: expected role name after SESSION AUTHORIZATION, found {:?}",
+                    other
+                )));
+            }
+        };
+        Ok(Stmt::Set {
+            name: "session_authorization".to_string(),
+            value,
+            local,
+        })
+    }
+
     pub(crate) fn parse_set(&mut self) -> Result<Stmt, SqlError> {
         if self.eat_keyword("transaction") {
             // v1.07: SET TRANSACTION SNAPSHOT 'snapshot-id' (PG19 special
@@ -8050,6 +8304,11 @@ impl Parser {
             });
         }
         if self.eat_keyword("session") {
+            // v1.95: SET SESSION AUTHORIZATION {name | 'name' | DEFAULT
+            // | NONE} (PG19 gram.y set_rest SESSION_AUTHORIZATION).
+            if self.eat_keyword("authorization") {
+                return self.parse_session_authorization(false);
+            }
             // SET SESSION CHARACTERISTICS AS TRANSACTION mode [, ...]
             self.expect_keyword("characteristics")?;
             self.expect_keyword("as")?;
@@ -8070,6 +8329,15 @@ impl Parser {
         let local = self.eat_keyword("local");
         if !local {
             self.eat_keyword("session");
+        }
+        // v1.95: SET [LOCAL] SESSION AUTHORIZATION ... — the two-word
+        // variable name after the scope word.
+        if self.peek_ident() == Some("session")
+            && matches!(self.peek2(), Token::Ident(s) if s == "authorization")
+        {
+            self.next();
+            self.next();
+            return self.parse_session_authorization(local);
         }
         // v1.86: `SET TIME ZONE value` — the SQL-standard spelling of
         // SET timezone (PG19 gram.y SetTimeZoneStmt). Values: a zone
@@ -8904,15 +9172,37 @@ impl Parser {
                 break;
             }
         }
-        let for_update = if self.eat_keyword("for") {
-            self.expect_keyword("update")?;
-            true
+        // v1.95: all four PG19 locking strengths. UPDATE and
+        // NO KEY UPDATE set `for_update` (they are the strengths that
+        // pull the UPDATE policy group into RLS); SHARE and KEY SHARE
+        // parse but add no policy group (rowsecurity.c). Optional
+        // NOWAIT / SKIP LOCKED suffix accepted (lock waits are
+        // no-ops in this engine's snapshot model).
+        let (for_update, had_lock) = if self.eat_keyword("for") {
+            if self.eat_keyword("update") {
+                (true, true)
+            } else if self.eat_keyword("no") {
+                self.expect_keyword("key")?;
+                self.expect_keyword("update")?;
+                (true, true)
+            } else if self.eat_keyword("share") {
+                (false, true)
+            } else if self.eat_keyword("key") {
+                self.expect_keyword("share")?;
+                (false, true)
+            } else {
+                return Err(err(
+                    "syntax error: expected UPDATE, NO KEY UPDATE, SHARE or KEY SHARE after FOR"
+                        .to_string(),
+                ));
+            }
         } else {
-            false
+            (false, false)
         };
         // v1.14: `FOR UPDATE OF tbl [, ...]` (PG19). The table names are
-        // validated against the FROM items by the executor.
-        let for_update_of = if for_update && self.eat_keyword("of") {
+        // validated against the FROM items by the executor. v1.95: OF
+        // attaches to any locking strength.
+        let for_update_of = if had_lock && self.eat_keyword("of") {
             let mut names = Vec::new();
             loop {
                 names.push(self.expect_ident()?);
@@ -8926,6 +9216,11 @@ impl Parser {
         } else {
             Vec::new()
         };
+        // v1.95: NOWAIT / SKIP LOCKED follow the OF list.
+        if had_lock {
+            let _ = self.eat_keyword("nowait")
+                || (self.eat_keyword("skip") && self.eat_keyword("locked"));
+        }
         sel.order_by = order_by;
         sel.limit = limit;
         sel.offset = offset;
@@ -10480,6 +10775,10 @@ impl Parser {
         if matches!(self.peek(), Token::Ident(s) if s == "trigger") {
             return self.parse_drop_trigger();
         }
+        // v1.95: DROP POLICY [IF EXISTS] name ON table (PG19).
+        if matches!(self.peek(), Token::Ident(s) if s == "policy") {
+            return self.parse_drop_policy();
+        }
         self.expect_keyword("table")?;
         let if_exists = if self.eat_keyword("if") {
             self.expect_keyword("exists")?;
@@ -10529,6 +10828,7 @@ impl Parser {
         let name = self.expect_ident()?;
         let mut login = kind == "user";
         let mut superuser = false;
+        let mut bypassrls = false;
         let mut password: Option<String> = None;
         let mut connlimit: Option<i32> = None;
         let mut valid_until: Option<String> = None;
@@ -10541,6 +10841,10 @@ impl Parser {
                 superuser = true;
             } else if self.eat_keyword("nosuperuser") {
                 superuser = false;
+            } else if self.eat_keyword("bypassrls") {
+                bypassrls = true;
+            } else if self.eat_keyword("nobypassrls") {
+                bypassrls = false;
             } else if self.eat_keyword("password") {
                 match self.next() {
                     Token::Str(s) => password = Some(s),
@@ -10589,6 +10893,7 @@ impl Parser {
             name,
             login,
             superuser,
+            bypassrls,
             password,
             connlimit,
             valid_until,
@@ -10602,6 +10907,7 @@ impl Parser {
         let name = self.expect_ident()?;
         let mut login: Option<bool> = None;
         let mut superuser: Option<bool> = None;
+        let mut bypassrls: Option<bool> = None;
         let mut password: Option<Option<String>> = None;
         let mut connlimit: Option<i32> = None;
         let mut valid_until: Option<String> = None;
@@ -10614,6 +10920,10 @@ impl Parser {
                 superuser = Some(true);
             } else if self.eat_keyword("nosuperuser") {
                 superuser = Some(false);
+            } else if self.eat_keyword("bypassrls") {
+                bypassrls = Some(true);
+            } else if self.eat_keyword("nobypassrls") {
+                bypassrls = Some(false);
             } else if self.eat_keyword("password") {
                 match self.next() {
                     Token::Str(s) => password = Some(Some(s)),
@@ -10660,6 +10970,7 @@ impl Parser {
         }
         if login.is_none()
             && superuser.is_none()
+            && bypassrls.is_none()
             && password.is_none()
             && connlimit.is_none()
             && valid_until.is_none()
@@ -10672,6 +10983,7 @@ impl Parser {
             name,
             login,
             superuser,
+            bypassrls,
             password,
             connlimit,
             valid_until,
@@ -10886,15 +11198,9 @@ impl Parser {
             self.next();
         }
         let _ = is_table_kw;
-        // Encode multi-name lists by chaining: keep the first as the
-        // object and stash the rest via repeated execution is complex;
-        // instead we only support one name per statement in v0.11.
-        if names.len() > 1 {
-            return Err(err(
-                "only one object name per GRANT/REVOKE is supported".to_string()
-            ));
-        }
-        Ok(GrantObject::Table(names.into_iter().next().unwrap()))
+        // v1.95: multi-name object lists apply the grant to each
+        // named table in turn (PG19 GrantStmt.objects).
+        Ok(GrantObject::Table(names))
     }
 
     pub(crate) fn parse_grantee_list(&mut self) -> Result<Vec<String>, SqlError> {
@@ -11061,6 +11367,7 @@ pub fn check_builtin_arity(name: &str, n: usize) -> Result<(), SqlError> {
         "upper" | "lower" | "length" | "char_length" | "character_length" | "abs" | "floor"
         | "ceil" | "ceiling" | "sqrt" => n == 1,
         "current_date" => n == 0,
+        "current_user" | "current_role" | "session_user" | "current_catalog" | "user" => n == 0,
         // v0.76: only CURRENT_TIMESTAMP takes the optional precision
         // (0-6) — PG19's grammar handles it as special syntax
         // (makeSQLValueFunction), while now()/clock_timestamp()/
@@ -11279,8 +11586,74 @@ pub(crate) fn try_split_create_view(text: &str) -> Option<Result<Stmt, SqlError>
         rest = skip_balanced_parens(rest)?;
         rest = skip_ws_comments(rest);
     }
+    // v1.95: WITH (option [= value] [, ...]) before AS: PG19 view
+    // options security_barrier / security_invoker / check_option.
+    let mut security_invoker = false;
+    let mut check_option = false;
+    if let Some(r) = match_kw(rest, "with") {
+        let r2 = skip_ws_comments(r);
+        if r2.starts_with('(') {
+            let inner_end = match r2.find(')') {
+                Some(i) => i,
+                None => {
+                    return Some(Err(err(
+                        "syntax error: unterminated view option list".to_string()
+                    )));
+                }
+            };
+            // (option list found via a Some(Err) channel: return early)
+            let inner = r2[1..inner_end].to_string();
+            for part in inner.split(',') {
+                let part = part.trim().to_ascii_lowercase();
+                if part.is_empty() {
+                    continue;
+                }
+                let (oname, oval) = match part.split_once('=') {
+                    Some((a, b)) => (a.trim().to_string(), Some(b.trim().to_string())),
+                    None => (part.clone(), None),
+                };
+                let truthy = match oval.as_deref() {
+                    None => true,
+                    Some("true") | Some("on") | Some("yes") | Some("1") => true,
+                    Some("false") | Some("off") | Some("no") | Some("0") => false,
+                    Some(v) => {
+                        return Some(Err(err(format!(
+                            "invalid value for view option \"{}\": \"{}\"",
+                            oname, v
+                        ))));
+                    }
+                };
+                match oname.as_str() {
+                    "security_invoker" => security_invoker = truthy,
+                    "security_barrier" => {}
+                    "check_option" => check_option = true,
+                    _ => {
+                        return Some(Err(err(format!("unrecognized parameter \"{}\"", oname))));
+                    }
+                }
+            }
+            rest = skip_ws_comments(&r2[inner_end + 1..]);
+        }
+    }
     rest = match_kw(rest, "as")?;
-    let query = skip_ws_comments(rest).trim().to_string();
+    let mut query = skip_ws_comments(rest).trim().to_string();
+    // v1.95: a trailing WITH [LOCAL|CASCADED] CHECK OPTION belongs to
+    // the view, not the query (PG19 ViewStmt.check_option).
+    {
+        let lower = query.to_ascii_lowercase();
+        for pat in [
+            "with local check option",
+            "with cascaded check option",
+            "with check option",
+        ] {
+            if lower.ends_with(pat) {
+                query.truncate(query.len() - pat.len());
+                query = query.trim_end().to_string();
+                check_option = true;
+                break;
+            }
+        }
+    }
     if query.is_empty() {
         return Some(Err(
             err("syntax error: expected query after AS".to_string()),
@@ -11321,6 +11694,8 @@ pub(crate) fn try_split_create_view(text: &str) -> Option<Result<Stmt, SqlError>
         query,
         col_aliases,
         or_replace,
+        security_invoker,
+        check_option,
     }))
 }
 
@@ -11367,6 +11742,95 @@ pub(crate) fn parse_statement_inner(text: &str) -> Result<Stmt, SqlError> {
 /// re-analyze stored index-expression / predicate sources (which
 /// were captured with tokens_to_sql at CREATE INDEX time) for the
 /// immutability check.
+/// v1.95: render one token back to SQL text. Used to capture the
+/// source of policy USING / WITH CHECK expressions for the
+/// constraints codec: joining the renderings with spaces always
+/// re-tokenizes to the same token stream for expression fragments.
+pub(crate) fn token_sql(t: &Token) -> String {
+    fn quote_ident(s: &str) -> String {
+        let bare = !s.is_empty()
+            && s.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '$');
+        if bare {
+            s.to_string()
+        } else {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        }
+    }
+    fn quote_str(s: &str) -> String {
+        format!("'{}'", s.replace('\'', "''"))
+    }
+    match t {
+        Token::Ident(s) => quote_ident(s),
+        Token::QIdent(s) | Token::UIdent(s) => quote_ident(s),
+        Token::Number(s) => s.clone(),
+        Token::Str(s) => quote_str(s),
+        Token::UStr(s) => format!("U&{}", quote_str(s)),
+        Token::BitStr(c, s) => format!("{c}'{s}'"),
+        Token::Param(n) => format!("${n}"),
+        Token::LParen => "(".into(),
+        Token::RParen => ")".into(),
+        Token::LBracket => "[".into(),
+        Token::RBracket => "]".into(),
+        Token::Colon => ":".into(),
+        Token::Comma => ",".into(),
+        Token::Semi => ";".into(),
+        Token::Star => "*".into(),
+        Token::Plus => "+".into(),
+        Token::Minus => "-".into(),
+        Token::Slash => "/".into(),
+        Token::Percent => "%".into(),
+        Token::Eq => "=".into(),
+        Token::FatArrow => "=>".into(),
+        Token::Dot => ".".into(),
+        Token::Lt => "<".into(),
+        Token::Gt => ">".into(),
+        Token::LtEq => "<=".into(),
+        Token::GtEq => ">=".into(),
+        Token::Neq => "<>".into(),
+        Token::ColonColon => "::".into(),
+        Token::PipePipe => "||".into(),
+        Token::Pipe => "|".into(),
+        Token::Amp => "&".into(),
+        Token::AmpAmp => "&&".into(),
+        Token::AmpLt => "&<".into(),
+        Token::AmpGt => "&>".into(),
+        Token::DashPipeDash => "-|-".into(),
+        Token::PhraseOp(1) => "<->".into(),
+        Token::PhraseOp(n) => format!("<{n}>"),
+        Token::Bang => "!".into(),
+        Token::BangBang => "!!".into(),
+        Token::Hash => "#".into(),
+        Token::Arrow => "->".into(),
+        Token::ArrowText => "->>".into(),
+        Token::HashArrow => "#>".into(),
+        Token::HashArrowText => "#>>".into(),
+        Token::AtGt => "@>".into(),
+        Token::AtQuestion => "@?".into(),
+        Token::AtAt => "@@".into(),
+        Token::LtAt => "<@".into(),
+        Token::Question => "?".into(),
+        Token::QuestionPipe => "?|".into(),
+        Token::QuestionAmp => "?&".into(),
+        Token::Tilde => "~".into(),
+        Token::TildeStar => "~*".into(),
+        Token::BangTilde => "!~".into(),
+        Token::BangTildeStar => "!~*".into(),
+        Token::Shl => "<<".into(),
+        Token::Shr => ">>".into(),
+        Token::At => "@".into(),
+        Token::PipeSlash => "|/".into(),
+        Token::PipePipeSlash => "||/".into(),
+        Token::Caret => "^".into(),
+        Token::StarEq => "*=".into(),
+        Token::Op(s) => s.clone(),
+        Token::EOF => String::new(),
+    }
+}
+
 pub(crate) fn parse_expr_str(text: &str) -> Result<Expr, SqlError> {
     let tokens = tokenize(text)?;
     let mut p = Parser {
@@ -12568,6 +13032,22 @@ pub(crate) fn parse_fk_action(s: &str) -> Result<FkAction, String> {
 /// v0.9: encode a table's full constraint/default metadata for WAL and
 /// checkpoints. All variable-length lists align with the table's columns
 /// by position (defaults/notnull) or carry their own names.
+/// v1.95: one policy expr slot in the constraints codec: `-` when
+/// absent, `sql <text>` when the source SQL was captured (the only
+/// form that round-trips subqueries), else the s-expr form.
+fn encode_policy_expr(e: &Option<Expr>, sql: &Option<String>, out: &mut String) {
+    match e {
+        None => out.push('-'),
+        Some(e) => match sql {
+            Some(s) => {
+                out.push_str("sql ");
+                sexpr_escape(s, out);
+            }
+            None => encode_expr_inner(e, out),
+        },
+    }
+}
+
 pub fn encode_constraints(t: &crate::storage::Table) -> String {
     let mut out = String::from("(constraints ");
     out.push_str("(notnull");
@@ -12644,6 +13124,31 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
         out.push_str(fk_action_name(f.on_update));
         out.push_str("))");
     }
+    out.push_str(")");
+    // v1.95: RLS flags + policies, trailing sections. Older decoders
+    // are not in play (RGSWAL25 bump); this decoder reads them
+    // optionally so pre-v1.95 encodings still decode.
+    out.push_str(" (rls ");
+    out.push_str(if t.rls_enabled { "1" } else { "0" });
+    out.push(' ');
+    out.push_str(if t.rls_forced { "1" } else { "0" });
+    out.push_str(") (policies");
+    for p in &t.policies {
+        out.push_str(" (");
+        sexpr_escape(&p.name, &mut out);
+        out.push_str(if p.permissive { " p " } else { " r " });
+        out.push(p.cmd.chr());
+        out.push_str(" (roles");
+        for r in &p.roles {
+            out.push(' ');
+            sexpr_escape(r, &mut out);
+        }
+        out.push_str(") (using ");
+        encode_policy_expr(&p.using_expr, &p.using_sql, &mut out);
+        out.push_str(") (check ");
+        encode_policy_expr(&p.check_expr, &p.check_sql, &mut out);
+        out.push_str("))");
+    }
     out.push_str("))");
     out
 }
@@ -12656,6 +13161,10 @@ pub struct DecodedConstraints {
     pub uniques: Vec<UniqueDef>,
     pub pkey: Option<UniqueDef>,
     pub fks: Vec<FkDef>,
+    /// v1.95: RLS flags + policies (absent in pre-v1.95 encodings).
+    pub rls_enabled: bool,
+    pub rls_forced: bool,
+    pub policies: Vec<PolicyDef>,
 }
 
 pub(crate) fn sexpr_is_close(p: &mut SexprParser) -> bool {
@@ -12855,6 +13364,91 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
         });
     }
     p.close()?;
+    // v1.95: optional trailing (rls e f) and (policies ...) sections;
+    // pre-v1.95 encodings end right here.
+    let (mut rls_enabled, mut rls_forced) = (false, false);
+    let mut policies: Vec<PolicyDef> = Vec::new();
+    if !sexpr_is_close(&mut p) {
+        p.open()?;
+        if p.atom()? != "rls" {
+            return Err("bad rls head".into());
+        }
+        rls_enabled = p.atom()? == "1";
+        rls_forced = p.atom()? == "1";
+        p.close()?;
+        p.open()?;
+        if p.atom()? != "policies" {
+            return Err("bad policies head".into());
+        }
+        while !sexpr_is_close(&mut p) {
+            p.open()?;
+            let name = p.atom()?;
+            let permissive = match p.atom()?.as_str() {
+                "p" => true,
+                "r" => false,
+                o => return Err(format!("bad policy kind {}", o)),
+            };
+            let cmd = match p.atom()?.as_str() {
+                "*" => PolicyCmd::All,
+                "r" => PolicyCmd::Select,
+                "a" => PolicyCmd::Insert,
+                "w" => PolicyCmd::Update,
+                "d" => PolicyCmd::Delete,
+                o => return Err(format!("bad policy cmd {}", o)),
+            };
+            p.open()?;
+            if p.atom()? != "roles" {
+                return Err("bad policy roles head".into());
+            }
+            let mut roles = Vec::new();
+            while !sexpr_is_close(&mut p) {
+                roles.push(p.atom()?);
+            }
+            p.close()?;
+            // Returns (expr, source-sql): the sql form re-derives
+            // the AST via parse_expr_str and is kept for re-encoding.
+            let parse_opt_expr = |p: &mut SexprParser,
+                                  head: &str|
+             -> Result<(Option<Expr>, Option<String>), String> {
+                p.open()?;
+                if p.atom()? != head {
+                    return Err(format!("bad policy {} head", head));
+                }
+                p.ws();
+                let v = if p.chars.peek() == Some(&'-') {
+                    p.chars.next();
+                    (None, None)
+                } else if p.chars.peek() == Some(&'(') {
+                    (Some(p.expr()?), None)
+                } else {
+                    // `sql <text>` form.
+                    if p.atom()? != "sql" {
+                        return Err(format!("bad policy {} form", head));
+                    }
+                    let text = p.atom()?;
+                    let e = parse_expr_str(&text)
+                        .map_err(|e| format!("bad policy {} sql: {}", head, e.message))?;
+                    (Some(e), Some(text))
+                };
+                p.close()?;
+                Ok(v)
+            };
+            let (using_expr, using_sql) = parse_opt_expr(&mut p, "using")?;
+            let (check_expr, check_sql) = parse_opt_expr(&mut p, "check")?;
+            p.close()?;
+            policies.push(PolicyDef {
+                name,
+                permissive,
+                cmd,
+                roles,
+                using_expr,
+                check_expr,
+                using_sql,
+                check_sql,
+            });
+        }
+        p.close()?;
+    }
     p.close()?;
     p.ws();
     if p.chars.peek().is_some() {
@@ -12867,6 +13461,9 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
         uniques,
         pkey,
         fks,
+        rls_enabled,
+        rls_forced,
+        policies,
     })
 }
 

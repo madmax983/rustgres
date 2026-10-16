@@ -1492,6 +1492,26 @@ pub(crate) fn plan_from_item(
                     output: scan_output(name, None, &[], where_, &[]),
                 });
             }
+            // v1.95: pg_policies / pg_policy are virtual too; the
+            // estimate is the live policy count.
+            if matches!(name.as_str(), "pg_policies" | "pg_policy")
+                && eng.db.find_table(name, snap, &[own], session).is_none()
+            {
+                let rows: u64 = eng
+                    .db
+                    .tables
+                    .values()
+                    .flat_map(|vs| vs.iter())
+                    .map(|t| t.policies.len() as u64)
+                    .sum();
+                return Ok(PlanNode::SeqScan {
+                    table: name.clone(),
+                    alias: None,
+                    filter: None,
+                    rows,
+                    output: scan_output(name, None, &[], where_, &[]),
+                });
+            }
             let t = eng
                 .db
                 .find_table(name, snap, &[own], session)

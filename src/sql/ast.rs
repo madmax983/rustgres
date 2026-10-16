@@ -2372,6 +2372,76 @@ pub struct TableDef {
     pub deferred_not_null: Vec<String>,
 }
 
+/// v1.95: the command a row-level-security policy applies to
+/// (PG19 `pg_policy.polcmd`: '*' ALL, 'r' SELECT, 'a' INSERT,
+/// 'w' UPDATE, 'd' DELETE).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyCmd {
+    All,
+    Select,
+    Insert,
+    Update,
+    Delete,
+}
+
+impl PolicyCmd {
+    pub fn chr(self) -> char {
+        match self {
+            PolicyCmd::All => '*',
+            PolicyCmd::Select => 'r',
+            PolicyCmd::Insert => 'a',
+            PolicyCmd::Update => 'w',
+            PolicyCmd::Delete => 'd',
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            PolicyCmd::All => "ALL",
+            PolicyCmd::Select => "SELECT",
+            PolicyCmd::Insert => "INSERT",
+            PolicyCmd::Update => "UPDATE",
+            PolicyCmd::Delete => "DELETE",
+        }
+    }
+    pub fn from_name(s: &str) -> Option<PolicyCmd> {
+        match s.to_ascii_lowercase().as_str() {
+            "all" => Some(PolicyCmd::All),
+            "select" => Some(PolicyCmd::Select),
+            "insert" => Some(PolicyCmd::Insert),
+            "update" => Some(PolicyCmd::Update),
+            "delete" => Some(PolicyCmd::Delete),
+            _ => None,
+        }
+    }
+}
+
+/// v1.95: one row-level-security policy (PG19 `pg_policy`), stored on
+/// the table's catalog entry (`storage::Table.policies`) so it
+/// versions, WAL-replays, and checkpoints with the table (via the
+/// s-expr constraints codec). `roles` empty = TO PUBLIC (every role).
+/// `using_expr` is the USING qual (visibility of existing rows);
+/// `check_expr` is the WITH CHECK qual (validity of new rows), falling
+/// back to `using_expr` at evaluation time when absent (PG19
+/// rowsecurity.c `add_with_check_options`).
+#[derive(Clone, Debug)]
+pub struct PolicyDef {
+    pub name: String,
+    /// true = PERMISSIVE (the default), false = RESTRICTIVE.
+    pub permissive: bool,
+    pub cmd: PolicyCmd,
+    pub roles: Vec<String>,
+    pub using_expr: Option<Expr>,
+    pub check_expr: Option<Expr>,
+    /// v1.95: the source SQL of each expr, captured at parse time.
+    /// The constraints codec persists policy exprs in this form
+    /// whenever present: the s-expr expr codec cannot represent
+    /// subqueries / aggregates (`(invalid)` catch-all), which ARE
+    /// legal in policies. Decoded policies re-derive the AST with
+    /// `parse_expr_str` and keep the text for re-encoding.
+    pub using_sql: Option<String>,
+    pub check_sql: Option<String>,
+}
+
 /// v0.69: `PARTITION BY` / `PARTITION OF` definition (PG19 partdef.c).
 #[derive(Clone, Debug, PartialEq)]
 pub struct PartitionDef {
@@ -2513,6 +2583,14 @@ pub enum AlterAction {
     NoInherit {
         parent: String,
     },
+    /// v1.95: `ALTER TABLE t ENABLE ROW LEVEL SECURITY` (PG19).
+    EnableRowSecurity,
+    /// v1.95: `ALTER TABLE t DISABLE ROW LEVEL SECURITY` (PG19).
+    DisableRowSecurity,
+    /// v1.95: `ALTER TABLE t FORCE ROW LEVEL SECURITY` (PG19).
+    ForceRowSecurity,
+    /// v1.95: `ALTER TABLE t NO FORCE ROW LEVEL SECURITY` (PG19).
+    NoForceRowSecurity,
 }
 
 /// v0.9: CREATE / ALTER SEQUENCE options. `None` = keep current value
@@ -3254,7 +3332,7 @@ impl Privilege {
 /// What a GRANT / REVOKE applies to.
 #[derive(Clone, Debug)]
 pub enum GrantObject {
-    Table(String),
+    Table(Vec<String>),
     Sequence(String),
     Database,
 }
@@ -5115,6 +5193,9 @@ pub enum Stmt {
         query: String,
         col_aliases: Vec<String>,
         or_replace: bool,
+        // v1.95: WITH (security_invoker = ...) / trailing CHECK OPTION.
+        security_invoker: bool,
+        check_option: bool,
     },
     DropView {
         names: Vec<String>,
@@ -5281,6 +5362,8 @@ pub enum Stmt {
         name: String,
         login: bool,
         superuser: bool,
+        /// v1.95: BYPASSRLS (PG19 `rolbypassrls`); default false.
+        bypassrls: bool,
         /// Cleartext password from PASSWORD '...'; hashed into a SCRAM
         /// verifier at execution. None = no password (trust-only).
         password: Option<String>,
@@ -5293,6 +5376,8 @@ pub enum Stmt {
         name: String,
         login: Option<bool>,
         superuser: Option<bool>,
+        /// v1.95: BYPASSRLS / NOBYPASSRLS; None = leave unchanged.
+        bypassrls: Option<bool>,
         /// Some(Some(pw)) = set password, Some(None) = PASSWORD NULL
         /// (remove), None = leave unchanged.
         password: Option<Option<String>>,
@@ -5304,6 +5389,44 @@ pub enum Stmt {
     DropRole {
         names: Vec<String>,
         if_exists: bool,
+    },
+    /// v1.95: `CREATE POLICY name ON table ...` (PG19 CreatePolicyStmt).
+    CreatePolicy {
+        name: String,
+        table: String,
+        permissive: bool,
+        cmd: PolicyCmd,
+        /// Empty = TO PUBLIC (PG19's default when TO is omitted).
+        roles: Vec<String>,
+        using_expr: Option<Expr>,
+        check_expr: Option<Expr>,
+        using_sql: Option<String>,
+        check_sql: Option<String>,
+    },
+    /// v1.95: `ALTER POLICY name ON table ...` (PG19 AlterPolicyStmt).
+    /// Every field is optional; at least one change is present.
+    AlterPolicy {
+        name: String,
+        table: String,
+        rename_to: Option<String>,
+        /// Some(roles) replaces the TO list (empty = PUBLIC).
+        roles: Option<Vec<String>>,
+        using_expr: Option<Expr>,
+        check_expr: Option<Expr>,
+        using_sql: Option<String>,
+        check_sql: Option<String>,
+        /// True when a USING clause was present (distinguishes
+        /// "replace with this expr" from "leave unchanged" — the
+        /// expr itself is in `using_expr`).
+        has_using: bool,
+        has_check: bool,
+    },
+    /// v1.95: `DROP POLICY [IF EXISTS] name ON table` (PG19 DropPolicyStmt).
+    DropPolicy {
+        name: String,
+        table: String,
+        if_exists: bool,
+        cascade: bool,
     },
     Grant {
         privs: Vec<PrivSpec>,

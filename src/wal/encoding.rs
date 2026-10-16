@@ -1065,6 +1065,8 @@ impl Enc {
                 col_aliases,
                 deps,
                 owner,
+                security_invoker,
+                check_option,
                 xmin,
             } => {
                 self.u8(8);
@@ -1080,6 +1082,9 @@ impl Enc {
                 }
                 self.str(owner);
                 self.u64(*xmin);
+                // v1.95 (RGSWAL25): view options, last.
+                self.u8(*security_invoker as u8);
+                self.u8(*check_option as u8);
             }
             WalRecord::DropView { name, xmax } => {
                 self.u8(9);
@@ -1521,6 +1526,8 @@ impl Enc {
             }
             None => self.u8(0),
         }
+        // v1.95 (RGSWAL25): bypassrls, trailing.
+        self.u8(r.bypassrls as u8);
     }
 
     pub(crate) fn sequence(&mut self, s: &WalSequence) {
@@ -2257,12 +2264,20 @@ impl<'a> Dec<'a> {
                 // v0.11
                 let owner = self.str()?;
                 let xmin = self.u64()?;
+                // v1.95 (RGSWAL25): trailing view options.
+                let (security_invoker, check_option) = if self.wal_version >= 25 {
+                    (self.u8()? != 0, self.u8()? != 0)
+                } else {
+                    (false, false)
+                };
                 Ok(WalRecord::CreateView {
                     name,
                     query,
                     col_aliases,
                     deps,
                     owner,
+                    security_invoker,
+                    check_option,
                     xmin,
                 })
             }
@@ -2803,10 +2818,17 @@ impl<'a> Dec<'a> {
         } else {
             None
         };
+        // v1.95: bypassrls rides RGSWAL25+ role records only.
+        let bypassrls = if self.wal_version >= 25 {
+            self.u8()? != 0
+        } else {
+            false
+        };
         Ok(WalRole {
             password,
             can_login,
             superuser,
+            bypassrls,
             connlimit,
             memberships,
             valid_until,

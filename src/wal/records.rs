@@ -184,6 +184,9 @@ pub enum WalRecord {
         deps: Vec<String>,
         /// v0.11: creating role.
         owner: String,
+        /// v1.95 (RGSWAL25): view options.
+        security_invoker: bool,
+        check_option: bool,
         xmin: u64,
     },
     DropView {
@@ -417,6 +420,8 @@ pub struct WalRole {
     pub connlimit: i32,
     pub memberships: Vec<WalMembership>,
     pub valid_until: Option<String>,
+    /// v1.95: BYPASSRLS (trailing; RGSWAL25).
+    pub bypassrls: bool,
 }
 
 /// WAL form of one `GRANT group TO member` edge.
@@ -432,6 +437,7 @@ impl WalRole {
             password: r.password.as_ref().map(WalVerifier::of),
             can_login: r.can_login,
             superuser: r.superuser,
+            bypassrls: r.bypassrls,
             connlimit: r.connlimit,
             memberships: r
                 .memberships

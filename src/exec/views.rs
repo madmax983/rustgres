@@ -13,6 +13,8 @@ pub(crate) fn exec_create_view(
     query: &str,
     col_aliases: &[String],
     or_replace: bool,
+    security_invoker: bool,
+    check_option: bool,
 ) -> Result<ExecResult, ExecError> {
     // A table by this name blocks the view (Postgres shares the namespace).
     if eng
@@ -76,6 +78,8 @@ pub(crate) fn exec_create_view(
         dropped_xmax: 0,
         // v0.11: the creating role owns the view.
         owner: ctx.role.to_string(),
+        security_invoker,
+        check_option,
     };
     eng.db.views.entry(name.to_string()).or_default().push(def);
     ctx.writes.push(WriteOp::CreateView {

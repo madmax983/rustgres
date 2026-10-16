@@ -259,6 +259,26 @@ pub(crate) fn from_schema_item(
                 out.push(apply_aliases(schema)?);
                 return Ok(());
             }
+            // v1.95: pg_policies / pg_policy are virtual too.
+            if matches!(name.as_str(), "pg_policies" | "pg_policy")
+                && eng.db.find_table(name, snap, &[own], session).is_none()
+            {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let raw = if name == "pg_policies" {
+                    pg_policies_schema()
+                } else {
+                    pg_policy_schema()
+                };
+                let schema: Vec<QCol> = raw
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                out.push(apply_aliases(schema)?);
+                return Ok(());
+            }
             // v0.11: the role catalogs are virtual too.
             if matches!(
                 name.as_str(),

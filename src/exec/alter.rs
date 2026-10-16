@@ -806,6 +806,12 @@ pub(crate) fn exec_alter_one(
         AlterAction::RenameTo { new_name } => alter_rename_to(eng, ctx, name, new_name),
         // v0.11
         AlterAction::OwnerTo { new_owner } => alter_owner_to(eng, ctx, name, new_owner),
+        // v1.95: ROW LEVEL SECURITY toggles (PG19 ATExecSetRowSecurity /
+        // ATExecForceNoForceRowSecurity via the shared alter_swap).
+        AlterAction::EnableRowSecurity => alter_set_rls(eng, ctx, name, Some(true), None),
+        AlterAction::DisableRowSecurity => alter_set_rls(eng, ctx, name, Some(false), None),
+        AlterAction::ForceRowSecurity => alter_set_rls(eng, ctx, name, None, Some(true)),
+        AlterAction::NoForceRowSecurity => alter_set_rls(eng, ctx, name, None, Some(false)),
         // v0.37
         AlterAction::SetStorage { column, mode } => alter_set_storage(eng, ctx, name, column, mode),
         AlterAction::SetCompression { column, mode } => {

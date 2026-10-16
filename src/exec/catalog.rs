@@ -18,6 +18,10 @@ pub(crate) fn pg_class_schema() -> Vec<QCol> {
         // RELKIND_PARTITIONED_TABLE), 'r' for ordinary tables and leaf
         // partitions (RELKIND_RELATION).
         ("relkind", ColType::SingleChar),
+        // v1.95: RLS flags (PG19 pg_class.relrowsecurity /
+        // relforcerowsecurity), appended to the bounded subset.
+        ("relrowsecurity", ColType::Bool),
+        ("relforcerowsecurity", ColType::Bool),
     ]
     .into_iter()
     .map(|(n, ty)| QCol {
@@ -66,6 +70,8 @@ pub(crate) fn pg_class_scan(
                 Value::text(name.as_str()),
                 Value::Int(t.toast_relid as i64),
                 relkind,
+                Value::Bool(t.rls_enabled),
+                Value::Bool(t.rls_forced),
             ]),
             prov: Vec::new(),
         });
@@ -84,6 +90,8 @@ pub(crate) fn pg_class_scan(
                 // v1.00: the virtual pg_class itself is an ordinary
                 // relation ('r').
                 Value::SingleChar(b'r'),
+                Value::Bool(false),
+                Value::Bool(false),
             ]),
             prov: Vec::new(),
         });
@@ -301,6 +309,306 @@ pub(crate) fn pg_sequences_scan(
     }
     (schema, rows)
 }
+
+// ---------------------------------------------------------------------------
+// v1.95: pg_policies / pg_policy (virtual). One row per policy on a
+// live table. `qual` / `with_check` are deparsed with a bounded
+// ruleutils-style renderer (policy_expr_text); complex shapes render
+// approximately. A real table by the same name takes precedence.
+// ---------------------------------------------------------------------------
+
+/// Split a stored relation name into (schema, table) for catalog
+/// display: the engine is single-schema, but names may be stored
+/// schema-qualified ("sch.tbl").
+pub(crate) fn catalog_name_parts(name: &str) -> (String, String) {
+    match name.rsplit_once('.') {
+        Some((sch, tbl)) => (sch.to_string(), tbl.to_string()),
+        None => ("public".to_string(), name.to_string()),
+    }
+}
+
+/// Bounded PG ruleutils-style rendering of a policy expression.
+pub(crate) fn policy_expr_text(e: &Expr) -> String {
+    fn lit(l: &Literal) -> String {
+        match l {
+            Literal::Int(i) => i.to_string(),
+            Literal::BigInt(i) => i.to_string(),
+            Literal::SmallInt(i) => i.to_string(),
+            Literal::Float(f) => format!("{}", f),
+            Literal::Real(f) => format!("{}", f),
+            Literal::Decimal(s) => s.clone(),
+            Literal::Numeric(n) => crate::storage::Value::Numeric(n.clone())
+                .to_text()
+                .unwrap_or_default(),
+            Literal::Text(s) => format!("'{}'", s.replace('\'', "''")),
+            Literal::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+            Literal::Null => "NULL".to_string(),
+            other => format!("{:?}", other),
+        }
+    }
+    fn inner(e: &Expr) -> String {
+        match e {
+            Expr::Column { name, .. } => name.clone(),
+            Expr::Literal(l) => lit(l),
+            Expr::Param(n) => format!("${}", n),
+            Expr::Cmp { op, left, right } => {
+                let o = match op {
+                    CmpOp::Eq => "=",
+                    CmpOp::Ne => "<>",
+                    CmpOp::Lt => "<",
+                    CmpOp::Le => "<=",
+                    CmpOp::Gt => ">",
+                    CmpOp::Ge => ">=",
+                    CmpOp::ImageEq => "*=",
+                };
+                format!("({} {} {})", inner(left), o, inner(right))
+            }
+            Expr::And(a, b) => format!("({} AND {})", inner(a), inner(b)),
+            Expr::Or(a, b) => format!("({} OR {})", inner(a), inner(b)),
+            Expr::Not(a) => format!("(NOT {})", inner(a)),
+            Expr::Arith { op, left, right } => {
+                let o = match op {
+                    ArithOp::Add => "+",
+                    ArithOp::Sub => "-",
+                    ArithOp::Mul => "*",
+                    ArithOp::Div => "/",
+                    ArithOp::Mod => "%",
+                    ArithOp::Pow => "^",
+                    ArithOp::BitAnd => "&",
+                    ArithOp::BitOr => "|",
+                    ArithOp::BitXor => "#",
+                    ArithOp::Shl => "<<",
+                    ArithOp::Shr => ">>",
+                };
+                format!("({} {} {})", inner(left), o, inner(right))
+            }
+            Expr::Concat(a, b) => format!("({} || {})", inner(a), inner(b)),
+            Expr::IsNull { expr, neg } => {
+                format!(
+                    "({} IS {}NULL)",
+                    inner(expr),
+                    if *neg { "NOT " } else { "" }
+                )
+            }
+            Expr::Func { name, args, .. } => {
+                // PG prints the SQL value functions without parens.
+                if args.is_empty()
+                    && matches!(
+                        name.as_str(),
+                        "current_user" | "current_role" | "session_user" | "current_catalog"
+                    )
+                {
+                    name.clone()
+                } else {
+                    let parts: Vec<String> = args.iter().map(inner).collect();
+                    format!("{}({})", name, parts.join(", "))
+                }
+            }
+            Expr::Cast { expr, to, .. } => format!("({})::{}", inner(expr), to.sql_name()),
+            Expr::CastNamed { expr, name } => format!("({})::{}", inner(expr), name),
+            Expr::Between {
+                expr,
+                low,
+                high,
+                neg,
+            } => format!(
+                "({} {}BETWEEN {} AND {})",
+                inner(expr),
+                if *neg { "NOT " } else { "" },
+                inner(low),
+                inner(high)
+            ),
+            Expr::Like {
+                expr,
+                pattern,
+                not,
+                ilike,
+                ..
+            } => format!(
+                "({} {} {} {})",
+                inner(expr),
+                if *not { "NOT" } else { "" },
+                if *ilike { "ILIKE" } else { "LIKE" },
+                inner(pattern)
+            ),
+            Expr::Case {
+                operand,
+                whens,
+                else_,
+            } => {
+                let mut s = String::from("(CASE");
+                if let Some(o) = operand {
+                    s.push(' ');
+                    s.push_str(&inner(o));
+                }
+                for (w, r) in whens {
+                    s.push_str(&format!(" WHEN {} THEN {}", inner(w), inner(r)));
+                }
+                if let Some(el) = else_ {
+                    s.push_str(&format!(" ELSE {}", inner(el)));
+                }
+                s.push_str(" END)");
+                s
+            }
+            other => format!("{:?}", other),
+        }
+    }
+    inner(e)
+}
+
+pub(crate) fn pg_policies_schema() -> Vec<QCol> {
+    [
+        ("schemaname", ColType::Text),
+        ("tablename", ColType::Text),
+        ("policyname", ColType::Text),
+        ("permissive", ColType::Text),
+        ("roles", ColType::Array(ArrayElem::Text)),
+        ("cmd", ColType::Text),
+        ("qual", ColType::Text),
+        ("with_check", ColType::Text),
+    ]
+    .into_iter()
+    .map(|(n, ty)| qcol("pg_policies", n, ty))
+    .collect()
+}
+
+pub(crate) fn pg_policy_schema() -> Vec<QCol> {
+    [
+        ("oid", ColType::Int),
+        ("polname", ColType::Text),
+        ("polrelid", ColType::Int),
+        ("polcmd", ColType::SingleChar),
+        ("polpermissive", ColType::Bool),
+        ("polroles", ColType::Array(ArrayElem::Int)),
+        ("polqual", ColType::Text),
+        ("polwithcheck", ColType::Text),
+    ]
+    .into_iter()
+    .map(|(n, ty)| qcol("pg_policy", n, ty))
+    .collect()
+}
+
+/// (table name, table, policy) triples over all live tables, sorted
+/// by (table, policy) for deterministic output.
+fn all_policies(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> Vec<(String, Table, crate::sql::PolicyDef)> {
+    let mut out = Vec::new();
+    let mut names: Vec<&String> = db.tables.keys().collect();
+    names.sort();
+    for name in names {
+        let Some(t) = db.find_table(name, snap, &[own], session) else {
+            continue;
+        };
+        for p in &t.policies {
+            out.push((name.clone(), t.clone(), p.clone()));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.name.cmp(&b.2.name)));
+    out
+}
+
+fn text_array(items: Vec<String>) -> Value {
+    let n = items.len() as i32;
+    Value::Array(Box::new(ArrayVal {
+        elem: ArrayElem::Text,
+        dims: vec![n],
+        lower: vec![1],
+        elems: items.into_iter().map(Value::text).collect(),
+    }))
+}
+
+fn int_array(items: Vec<i64>) -> Value {
+    let n = items.len() as i32;
+    Value::Array(Box::new(ArrayVal {
+        elem: ArrayElem::Int,
+        dims: vec![n],
+        lower: vec![1],
+        elems: items.into_iter().map(Value::Int).collect(),
+    }))
+}
+
+pub(crate) fn pg_policies_scan(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = pg_policies_schema();
+    let mut rows = Vec::new();
+    for (tname, _t, p) in all_policies(db, snap, own, session) {
+        let (sch, tbl) = catalog_name_parts(&tname);
+        let roles: Vec<String> = if p.roles.is_empty() {
+            vec!["public".to_string()]
+        } else {
+            p.roles.clone()
+        };
+        rows.push(QRow {
+            cells: Row::new(vec![
+                Value::text(sch.as_str()),
+                Value::text(tbl.as_str()),
+                Value::text(p.name.as_str()),
+                Value::text(if p.permissive {
+                    "PERMISSIVE"
+                } else {
+                    "RESTRICTIVE"
+                }),
+                text_array(roles),
+                Value::text(p.cmd.name()),
+                p.using_expr
+                    .as_ref()
+                    .map(|e| Value::text(policy_expr_text(e)))
+                    .unwrap_or(Value::Null),
+                p.check_expr
+                    .as_ref()
+                    .map(|e| Value::text(policy_expr_text(e)))
+                    .unwrap_or(Value::Null),
+            ]),
+            prov: Vec::new(),
+        });
+    }
+    (schema, rows)
+}
+
+pub(crate) fn pg_policy_scan(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = pg_policy_schema();
+    let mut rows = Vec::new();
+    for (tname, t, p) in all_policies(db, snap, own, session) {
+        let polroles: Vec<i64> = if p.roles.is_empty() {
+            vec![0]
+        } else {
+            p.roles.iter().map(|r| name_oid(r) as i64).collect()
+        };
+        rows.push(QRow {
+            cells: Row::new(vec![
+                Value::Int(name_oid(&format!("{}.{}", tname, p.name)) as i64),
+                Value::text(p.name.as_str()),
+                Value::Int(t.oid as i64),
+                Value::SingleChar(p.cmd.chr() as u8),
+                Value::Bool(p.permissive),
+                int_array(polroles),
+                p.using_expr
+                    .as_ref()
+                    .map(|e| Value::text(policy_expr_text(e)))
+                    .unwrap_or(Value::Null),
+                p.check_expr
+                    .as_ref()
+                    .map(|e| Value::text(policy_expr_text(e)))
+                    .unwrap_or(Value::Null),
+            ]),
+            prov: Vec::new(),
+        });
+    }
+    (schema, rows)
+}
 // ---------------------------------------------------------------------------
 // v0.11: role catalogs (virtual). A real table by the same name takes
 // precedence, like pg_stats. `pg_authid` masks password verifiers from
@@ -328,6 +636,8 @@ pub(crate) fn pg_authid_schema() -> Vec<QCol> {
         qcol("pg_authid", "rolconnlimit", ColType::Int),
         qcol("pg_authid", "rolpassword", ColType::Text),
         qcol("pg_authid", "rolvaliduntil", ColType::Timestamp),
+        // v1.95: rolbypassrls (appended to the bounded subset).
+        qcol("pg_authid", "rolbypassrls", ColType::Bool),
     ]
 }
 
@@ -341,6 +651,8 @@ pub(crate) fn pg_roles_schema() -> Vec<QCol> {
         qcol("pg_roles", "rolcanlogin", ColType::Bool),
         qcol("pg_roles", "rolconnlimit", ColType::Int),
         qcol("pg_roles", "rolvaliduntil", ColType::Timestamp),
+        // v1.95: rolbypassrls (appended to the bounded subset).
+        qcol("pg_roles", "rolbypassrls", ColType::Bool),
     ]
 }
 
@@ -448,6 +760,7 @@ pub(crate) fn pg_auth_scan(
                 Value::Bool(r.can_login),
                 Value::Int(r.connlimit as i64),
                 valid_until.clone(),
+                Value::Bool(r.bypassrls),
             ],
             "pg_user" => vec![
                 Value::text(r.name.as_str()),
@@ -471,6 +784,7 @@ pub(crate) fn pg_auth_scan(
                 Value::Int(r.connlimit as i64),
                 passwd,
                 valid_until,
+                Value::Bool(r.bypassrls),
             ],
         };
         rows.push(QRow {

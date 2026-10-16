@@ -5632,6 +5632,16 @@ pub struct Table {
     /// transactional. Only BEFORE INSERT FOR EACH ROW triggers fire
     /// in v1.00.
     pub triggers: Vec<crate::sql::TriggerDef>,
+    /// v1.95: `pg_class.relrowsecurity` — RLS enabled by
+    /// `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`.
+    pub rls_enabled: bool,
+    /// v1.95: `pg_class.relforcerowsecurity` — the table owner is also
+    /// subject to policies (`FORCE ROW LEVEL SECURITY`).
+    pub rls_forced: bool,
+    /// v1.95: row-level-security policies (PG19 `pg_policy`), in
+    /// creation order. Versions, WAL-replays, and checkpoints with the
+    /// table via the s-expr constraints codec.
+    pub policies: Vec<crate::sql::PolicyDef>,
 }
 
 impl Table {
@@ -5686,6 +5696,10 @@ impl Table {
             inherits: Vec::new(),
             // v1.00: no triggers by default.
             triggers: Vec::new(),
+            // v1.95: RLS off, no policies by default.
+            rls_enabled: false,
+            rls_forced: false,
+            policies: Vec::new(),
         }
     }
 
@@ -5982,6 +5996,13 @@ pub struct ViewDef {
     pub dropped_xmax: u64,
     /// v0.11: role that owns the view.
     pub owner: String,
+    /// v1.95: WITH (security_invoker): RLS on underlying tables is
+    /// evaluated as the querying role. (This engine evaluates view
+    /// RLS as the querying role regardless; the flag is carried for
+    /// catalog fidelity.)
+    pub security_invoker: bool,
+    /// v1.95: WITH [LOCAL|CASCADED] CHECK OPTION present.
+    pub check_option: bool,
 }
 
 /// A sequence (v0.9). Bounds and parameters are transactional DDL;
@@ -7277,6 +7298,10 @@ pub struct Role {
     pub password: Option<crate::crypto::ScramVerifier>,
     pub can_login: bool,
     pub superuser: bool,
+    /// v1.95: BYPASSRLS (PG19 `rolbypassrls`): the role bypasses every
+    /// row-level-security policy. Superusers bypass regardless (PG19
+    /// `has_bypassrls_privilege`).
+    pub bypassrls: bool,
     /// -1 = unlimited, like PostgreSQL.
     pub connlimit: i32,
     /// Group roles this role is a member of (`GRANT group TO member`).
@@ -7311,6 +7336,8 @@ impl Role {
             password: None,
             can_login: true,
             superuser: true,
+            // PG19: the bootstrap superuser's rolbypassrls is true.
+            bypassrls: true,
             connlimit: -1,
             memberships: Vec::new(),
             valid_until: None,
@@ -7397,7 +7424,8 @@ pub fn table_privs_in(
     }
     let mut privs = 0u32;
     for e in &t.acl {
-        if closure.iter().any(|n| n == &e.role) {
+        // v1.95: grants TO PUBLIC (ACL_ID_PUBLIC) apply to every role.
+        if e.role == "public" || closure.iter().any(|n| n == &e.role) {
             privs |= e.privs;
         }
     }
@@ -7427,7 +7455,9 @@ pub fn column_privs_in(
         return privs;
     }
     for e in &t.col_acl {
-        if closure.iter().any(|n| n == &e.role) && e.columns.iter().any(|c| c == column) {
+        if (e.role == "public" || closure.iter().any(|n| n == &e.role))
+            && e.columns.iter().any(|c| c == column)
+        {
             privs |= e.privs;
         }
     }
@@ -7495,6 +7525,15 @@ pub fn db_connect_allowed(db: &Database, role: &str, snap: &Snapshot, own: u64) 
         return false;
     }
     true
+}
+
+/// v1.95: whether `role` bypasses row-level security under
+/// (`snap`, `own`) — PG19 `has_bypassrls_privilege`: superusers always
+/// qualify, plus roles created/altered with BYPASSRLS.
+pub fn role_bypassrls_snap(db: &Database, role: &str, snap: &Snapshot, own: u64) -> bool {
+    db.find_role(role, snap, own)
+        .map(|r| r.superuser || r.bypassrls)
+        .unwrap_or(false)
 }
 
 /// Whether `role` is a superuser under (`snap`, `own`). Unknown roles
