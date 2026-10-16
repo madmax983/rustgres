@@ -607,6 +607,15 @@ impl Enc {
                 self.u8(e.code());
                 return;
             }
+            // v1.94: tsvector / tsquery; tags append after v1.88's.
+            ColType::TsVector => {
+                self.u8(34);
+                return;
+            }
+            ColType::TsQuery => {
+                self.u8(35);
+                return;
+            }
             // v1.17: xid; tag appends after v0.81's.
             ColType::Xid => {
                 self.u8(24);
@@ -796,6 +805,17 @@ impl Enc {
                 self.u8(m.elem.code());
                 self.str(m.name.as_deref().unwrap_or(""));
                 self.str(&crate::exec::ranges::multirange_to_text(m));
+            }
+            // v1.94: tsvector values (tag 28) — the canonical text;
+            // the decoder re-parses it (canonical text always parses).
+            Value::TsVector(v) => {
+                self.u8(28);
+                self.str(&crate::exec::tsearch::tsvector_to_text(v));
+            }
+            // v1.94: tsquery values (tag 29), same pattern.
+            Value::TsQuery(q) => {
+                self.u8(29);
+                self.str(&crate::exec::tsearch::tsquery_to_text(q));
             }
         }
     }
@@ -1708,6 +1728,9 @@ impl<'a> Dec<'a> {
                     .map(ColType::Multirange)
                     .ok_or_else(|| self.err(&format!("unknown range elem {}", c)))
             }
+            // v1.94: tsvector / tsquery (WAL v24+ only).
+            34 => Ok(ColType::TsVector),
+            35 => Ok(ColType::TsQuery),
             // v0.78: array, then the PG array OID identifying the
             // element type.
             22 => {
@@ -1740,6 +1763,9 @@ impl<'a> Dec<'a> {
                     1011 => ArrayElem::Xid,
                     // v1.39: _bit.
                     1561 => ArrayElem::Bit,
+                    // v1.94: _tsvector / _tsquery.
+                    3616 => ArrayElem::TsVector,
+                    3645 => ArrayElem::TsQuery,
                     t => return Err(self.err(&format!("unknown array element OID {}", t))),
                 };
                 Ok(ColType::Array(elem))
@@ -1826,6 +1852,19 @@ impl<'a> Dec<'a> {
                     .map_err(|e| self.err(&format!("bad multirange in WAL: {}", e.message)))?;
                 Ok(Value::Multirange(Box::new(m)))
             }
+            // v1.94: tsvector / tsquery (tags 28/29; mirrors encoder).
+            28 => {
+                let text = self.str()?;
+                let v = crate::exec::tsearch::parse_tsvector(&text)
+                    .map_err(|e| self.err(&format!("bad tsvector in WAL: {}", e.message)))?;
+                Ok(Value::TsVector(std::sync::Arc::new(v)))
+            }
+            29 => {
+                let text = self.str()?;
+                let q = crate::exec::tsearch::parse_tsquery(&text)
+                    .map_err(|e| self.err(&format!("bad tsquery in WAL: {}", e.message)))?;
+                Ok(Value::TsQuery(std::sync::Arc::new(q)))
+            }
             // v0.79: real array values (tag 17; mirrors the encoder).
             17 => {
                 let elem = self.array_elem()?;
@@ -1908,6 +1947,9 @@ impl<'a> Dec<'a> {
             1561 => Ok(ArrayElem::Bit),
             // v1.40: _tid.
             1010 => Ok(ArrayElem::Tid),
+            // v1.94: _tsvector / _tsquery.
+            3616 => Ok(ArrayElem::TsVector),
+            3645 => Ok(ArrayElem::TsQuery),
             t => Err(self.err(&format!("unknown array element OID {}", t))),
         }
     }

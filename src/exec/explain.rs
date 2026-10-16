@@ -107,6 +107,8 @@ pub(crate) fn pg_array_elem_label(e: ArrayElem) -> Option<&'static str> {
         ArrayElem::Record => "record",
         ArrayElem::PgLsn => "pg_lsn",
         ArrayElem::Xid => "xid",
+        ArrayElem::TsVector => "tsvector", // v1.94
+        ArrayElem::TsQuery => "tsquery",   // v1.94
     })
 }
 

@@ -127,12 +127,19 @@ pub(crate) enum Token {
     AmpLt,        // v1.91: `&<` does-not-extend-right-of (PG19 gram.y Op)
     AmpGt,        // v1.91: `&>` does-not-extend-left-of (PG19 gram.y Op)
     DashPipeDash, // v1.91: `-|-` adjacent-to (PG19 gram.y Op)
-    Hash,         // v0.25: `#` bitwise XOR
+    // v1.94: text-search phrase operator `<->` (distance 1) and
+    // `<N>` (explicit distance), plus the prefix NOT token `!`.
+    // Lexed only when adjacent (PG19 scan.l makes `<->` the phrase
+    // operator only as a contiguous token).
+    PhraseOp(i64), // `<->` is PhraseOp(1); `<N>` carries N
+    Bang,          // v1.94: lone `!` (an Op token in PG19 scan.l)
+    BangBang,      // v1.94: `!!` — PG's tsquery NOT prefix operator
+    Hash,          // v0.25: `#` bitwise XOR
     /// v1.82: JSON operators (PG19 scan.l `right_arrow`, gram.y `Op`):
     /// `->`, `->>`, `#>`, `#>>`. Lexed longest-match-first, like PG.
     Arrow, // `->`
-    ArrowText,    // `->>`
-    HashArrow,    // `#>`
+    ArrowText,     // `->>`
+    HashArrow,     // `#>`
     HashArrowText, // `#>>`
     /// v1.83: jsonb operators (PG19 gram.y `Op`): `@>`, `<@`, `?`,
     /// `?|`, `?&`. The `?` family lexes out of the v0.86 `?`-led branch
@@ -141,22 +148,22 @@ pub(crate) enum Token {
     /// v1.85: `@?` (jsonpath exists) and `@@` (jsonpath match) —
     /// PG19 gram.y `Op` for (jsonb, jsonpath).
     AtQuestion, // `@?`
-    AtAt,         // `@@`
-    LtAt,         // `<@`
-    Question,     // `?`
-    QuestionPipe, // `?|`
-    QuestionAmp,  // `?&`
-    Tilde,        // v0.25: `~` bitwise NOT (unary)
-    TildeStar,    // v0.68: `~*` POSIX regex match, case-insensitive
-    BangTilde,    // v0.68: `!~` POSIX regex non-match
+    AtAt,          // `@@`
+    LtAt,          // `<@`
+    Question,      // `?`
+    QuestionPipe,  // `?|`
+    QuestionAmp,   // `?&`
+    Tilde,         // v0.25: `~` bitwise NOT (unary)
+    TildeStar,     // v0.68: `~*` POSIX regex match, case-insensitive
+    BangTilde,     // v0.68: `!~` POSIX regex non-match
     BangTildeStar, // v0.68: `!~*` POSIX regex non-match, case-insensitive
-    Shl,          // v0.25: `<<` shift left
-    Shr,          // v0.25: `>>` shift right
-    At,           // v0.21: `@` prefix abs operator
-    PipeSlash,    // v0.21: `|/` prefix sqrt operator
+    Shl,           // v0.25: `<<` shift left
+    Shr,           // v0.25: `>>` shift right
+    At,            // v0.21: `@` prefix abs operator
+    PipeSlash,     // v0.21: `|/` prefix sqrt operator
     PipePipeSlash, // v0.21: `||/` prefix cbrt operator
-    Caret,        // v0.7: `^` exponentiation
-    StarEq,       // v0.81: `*=` PG19 record-image equality (record_image_eq)
+    Caret,         // v0.7: `^` exponentiation
+    StarEq,        // v0.81: `*=` PG19 record-image equality (record_image_eq)
     /// v0.86: user-defined operator name starting with `?` (e.g. `?=`).
     /// Only `?`-led sequences lex here; every other operator character
     /// already has its own token. Used in `CREATE OPERATOR`'s name
@@ -642,7 +649,27 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
                 }
             }
             '<' => {
-                if i + 1 < chars.len() && chars[i + 1] == '<' {
+                // v1.94: `<->` / `<N>` text-search phrase operators —
+                // only when the closing `>` lands before any non-digit
+                // (PG19 scan.l lexes the phrase operator contiguously).
+                if i + 3 < chars.len() && chars[i + 1] == '-' && chars[i + 2] == '>' {
+                    toks.push(Token::PhraseOp(1));
+                    i += 3;
+                } else if i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
+                    let mut j = i + 1;
+                    while j < chars.len() && chars[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    if j < chars.len() && chars[j] == '>' {
+                        let digits: String = chars[i + 1..j].iter().collect();
+                        let n: i64 = digits.parse().unwrap_or(i64::MAX);
+                        toks.push(Token::PhraseOp(n));
+                        i = j + 1;
+                    } else {
+                        toks.push(Token::Lt);
+                        i += 1;
+                    }
+                } else if i + 1 < chars.len() && chars[i + 1] == '<' {
                     toks.push(Token::Shl);
                     i += 2;
                 } else if i + 1 < chars.len() && chars[i + 1] == '@' {
@@ -686,8 +713,16 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
                         toks.push(Token::BangTilde);
                         i += 2;
                     }
+                } else if i + 1 < chars.len() && chars[i + 1] == '!' {
+                    // v1.94: `!!` glues into one Op token in PG19
+                    // scan.l — the tsquery NOT prefix operator.
+                    toks.push(Token::BangBang);
+                    i += 2;
                 } else {
-                    return Err(err(format!("unexpected character '{}'", c)));
+                    // v1.94: a lone `!` stays an Op token (PG19
+                    // resolves it — and fails — as a prefix operator).
+                    toks.push(Token::Bang);
+                    i += 1;
                 }
             }
             '\'' => {
@@ -6108,6 +6143,11 @@ pub(crate) fn tokens_to_sql(toks: &[Token]) -> String {
             Token::AmpLt => "&<".to_string(),
             Token::AmpGt => "&>".to_string(),
             Token::DashPipeDash => "-|-".to_string(),
+            // v1.94: text-search phrase operator / NOT prefix.
+            Token::PhraseOp(1) => "<->".to_string(),
+            Token::PhraseOp(n) => format!("<{}>", n),
+            Token::Bang => "!".to_string(),
+            Token::BangBang => "!!".to_string(),
             Token::Hash => "#".to_string(),
             Token::Tilde => "~".to_string(),
             Token::TildeStar => "~*".to_string(),

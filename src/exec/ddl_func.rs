@@ -211,6 +211,11 @@ pub(crate) fn dummy_value_of(ty: &ColType) -> Value {
             name: None,
             ranges: Vec::new(),
         }),
+        // v1.94: empty tsvector / tsquery dummies.
+        ColType::TsVector => Value::tsvector(crate::storage::TsVectorVal {
+            entries: Vec::new(),
+        }),
+        ColType::TsQuery => Value::tsquery(crate::storage::TsQueryVal { root: None }),
         ColType::SingleChar => Value::SingleChar(b'x'),
         ColType::Bool => Value::Bool(true),
         ColType::Date => Value::Date(1),

@@ -98,6 +98,7 @@ mod reorder;
 mod roles;
 mod seq;
 mod sje;
+pub(crate) mod tsearch;
 mod views;
 mod window;
 
@@ -257,6 +258,9 @@ mod v192_sqljson_queryfuncs_tests;
 #[cfg(test)]
 #[path = "test_mods/v193_bit_tests.rs"]
 mod v193_bit_tests;
+#[cfg(test)]
+#[path = "test_mods/v194_tsearch_tests.rs"]
+mod v194_tsearch_tests;
 #[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;

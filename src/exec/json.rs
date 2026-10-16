@@ -565,6 +565,14 @@ pub(crate) fn eval_json_op(op: JsonOp, left: &Value, right: &Value) -> Result<Va
     if super::ranges::is_rangeish(left) || super::ranges::is_rangeish(right) {
         return super::ranges::eval_range_op(op, left, right);
     }
+    // v1.94: text-search operands take @@ (tsvector @@ tsquery, both
+    // orders; text @@ tsquery via to_tsvector) and the tsquery
+    // boolean operators && (AND) / || (OR) before any jsonb reading.
+    if matches!(left, Value::TsVector(_) | Value::TsQuery(_))
+        || matches!(right, Value::TsVector(_) | Value::TsQuery(_))
+    {
+        return super::tsearch::eval_ts_op(op, left, right);
+    }
     if let Value::Jsonb(s) = left {
         return eval_jsonb_op(op, s, right);
     }

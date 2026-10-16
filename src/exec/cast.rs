@@ -1517,6 +1517,35 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
     }
     match to {
         ColType::Text => Ok(text_value_of(&[v])),
+        // v1.94: cast to tsvector (PG tsvectorin on text; a tsquery
+        // has no cast to tsvector — 42804 like PG).
+        ColType::TsVector => match v {
+            Value::Text(t) | Value::BpChar(t) => {
+                super::tsearch::parse_tsvector(t).map(Value::tsvector)
+            }
+            Value::TsVector(_) => Ok(v.clone()),
+            other => Err(exec_err(
+                "42804",
+                format!(
+                    "cannot cast type {} to tsvector",
+                    other.type_name().to_lowercase()
+                ),
+            )),
+        },
+        // v1.94: cast to tsquery (PG tsqueryin on text).
+        ColType::TsQuery => match v {
+            Value::Text(t) | Value::BpChar(t) => {
+                super::tsearch::parse_tsquery(t).map(Value::tsquery)
+            }
+            Value::TsQuery(_) => Ok(v.clone()),
+            other => Err(exec_err(
+                "42804",
+                format!(
+                    "cannot cast type {} to tsquery",
+                    other.type_name().to_lowercase()
+                ),
+            )),
+        },
         // v1.88: cast to a range type (PG range_in on text; a range of
         // the same elem passes through; anything else is 42804).
         ColType::Range(elem) => match v {

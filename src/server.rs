@@ -3790,6 +3790,13 @@ fn run_statement(
         let tz = guc_value(session, "timezone").unwrap_or_else(|| "GMT".to_string());
         let now = session.txn.as_ref().map(|t| t.start_micros).unwrap_or(0);
         crate::datetime::set_session_context(&ds, &tz, now);
+        // v1.94: float output honors extra_float_digits (PG19
+        // float.c) — suites like tstypes SET it to 0 and expect
+        // the legacy %.6g float4 rendering.
+        let efd: i32 = guc_value(session, "extra_float_digits")
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1);
+        crate::storage::set_extra_float_digits(efd);
     }
     let owned;
     let stmt = match stmt {

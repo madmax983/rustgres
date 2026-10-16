@@ -792,6 +792,10 @@ impl Parser {
             "jsonb" => Ok(ColType::Jsonb),
             // v1.85: PG's `jsonpath` type (pg_type.dat, oid 4072).
             "jsonpath" => Ok(ColType::Jsonpath),
+            // v1.94: PG's text-search types (pg_type.dat, oids
+            // 3614/3615).
+            "tsvector" => Ok(ColType::TsVector),
+            "tsquery" => Ok(ColType::TsQuery),
             // v1.88: PG's builtin range types (pg_type.dat).
             "int4range" => Ok(ColType::Range(crate::storage::RangeElem::Int4)),
             "int8range" => Ok(ColType::Range(crate::storage::RangeElem::Int8)),
@@ -1065,6 +1069,8 @@ impl Parser {
                 | "datemultirange"
                 | "tsmultirange"
                 | "tstzmultirange"
+                | "tsvector" // v1.94
+                | "tsquery" // v1.94
         )
     }
 
@@ -5051,6 +5057,40 @@ impl Parser {
                 _ => None,
             } {
                 self.next();
+                // v1.94: `@@ ANY|ALL|SOME (array)` — PG resolves the
+                // quantified form through the scalar @@ operator;
+                // desugar to the hidden __any_all_array builtin like
+                // quantified comparisons do.
+                if jop == JsonOp::PathMatch {
+                    let quant = match self.peek() {
+                        Token::Ident(s)
+                            if matches!(
+                                s.to_ascii_lowercase().as_str(),
+                                "any" | "all" | "some"
+                            ) && *self.peek2() == Token::LParen =>
+                        {
+                            Some(s.to_ascii_lowercase())
+                        }
+                        _ => None,
+                    };
+                    if let Some(quant) = quant {
+                        self.next(); // quantifier word
+                        self.next(); // '('
+                        let arr = self.parse_or()?;
+                        self.expect(Token::RParen, "')'")?;
+                        let quant_txt = if quant == "all" { "all" } else { "any" };
+                        left = Expr::Func {
+                            name: "__any_all_array".to_string(),
+                            args: vec![
+                                left,
+                                Expr::Literal(Literal::Text("@@".into())),
+                                Expr::Literal(Literal::Text(quant_txt.into())),
+                                arr,
+                            ],
+                        };
+                        continue;
+                    }
+                }
                 let right = self.parse_add()?;
                 left = Expr::JsonOp {
                     op: jop,
@@ -5063,6 +5103,22 @@ impl Parser {
                 self.next();
                 let right = self.parse_add()?;
                 left = Expr::Concat(Box::new(left), Box::new(right));
+                continue;
+            }
+            // v1.94: the tsquery phrase operator `<->` / `<N>` is a
+            // gram.y `Op` too; desugar to the `tsquery_phrase`
+            // function (PG exposes it as a real function, oid 3435).
+            if let Token::PhraseOp(dist) = *self.peek() {
+                self.next();
+                let right = self.parse_add()?;
+                let mut args = vec![left, right];
+                if dist != 1 {
+                    args.push(Expr::Literal(Literal::Int(dist)));
+                }
+                left = Expr::Func {
+                    name: "__tsquery_phrase".to_string(),
+                    args,
+                };
                 continue;
             }
             break;
@@ -5285,6 +5341,30 @@ impl Parser {
     /// desugar like Postgres' parser does: `~x` -> bitwise NOT,
     /// `@x` -> `abs(x)`, `|/x` -> `sqrt(x)`, `||/x` -> `cbrt(x)`.
     pub(crate) fn parse_unary(&mut self) -> Result<Expr, SqlError> {
+        // v1.94: PG19's tsquery NOT prefix operator is the glued
+        // `!!` token; desugar to the `tsquery_not` function over a
+        // unary operand (so `!!'x'::tsquery` is NOT('x'::tsquery)).
+        if *self.peek() == Token::BangBang {
+            self.next();
+            let inner = self.parse_cast()?;
+            return Ok(Expr::Func {
+                name: "__tsquery_not".to_string(),
+                args: vec![inner],
+            });
+        }
+        // v1.94: a lone `!` is an Op token in PG19 too, but no
+        // operator of that name exists — it parses, then fails
+        // resolution with 42883 "operator does not exist: ! <type>".
+        // Desugar to an internal call whose evaluation raises
+        // exactly that (see tsearch::try_eval_ts_func).
+        if *self.peek() == Token::Bang {
+            self.next();
+            let inner = self.parse_cast()?;
+            return Ok(Expr::Func {
+                name: "__prefix_bang".to_string(),
+                args: vec![inner],
+            });
+        }
         match self.peek() {
             Token::Minus => {
                 self.next();

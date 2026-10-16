@@ -404,8 +404,10 @@ pub(crate) fn value_coltype(v: &Value) -> ColType {
         Value::Bytea(_) => ColType::Bytea,
         Value::BitString(_) => ColType::Bit, // v1.39
         Value::Uuid(_) => ColType::Uuid,
-        Value::PgLsn(_) => ColType::PgLsn,   // v0.64
-        Value::Record(_) => ColType::Record, // v0.73
+        Value::PgLsn(_) => ColType::PgLsn,       // v0.64
+        Value::Record(_) => ColType::Record,     // v0.73
+        Value::TsVector(_) => ColType::TsVector, // v1.94
+        Value::TsQuery(_) => ColType::TsQuery,   // v1.94
         // v0.79: array values report their array type.
         Value::Array(a) => ColType::Array(a.elem),
         Value::Null => ColType::Text,

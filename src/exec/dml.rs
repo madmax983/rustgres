@@ -1511,6 +1511,8 @@ pub(crate) fn array_elem_coltype(e: ArrayElem) -> ColType {
         ArrayElem::Record => ColType::Composite,
         ArrayElem::PgLsn => ColType::PgLsn,
         ArrayElem::Xid => ColType::Xid,
+        ArrayElem::TsVector => ColType::TsVector, // v1.94
+        ArrayElem::TsQuery => ColType::TsQuery,   // v1.94
     }
 }
 

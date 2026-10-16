@@ -1002,10 +1002,19 @@ pub(crate) fn eval_function_item(
                 "function unnest() does not exist".to_string(),
             ));
         }
-        // v1.92: an array of a named composite expands to the
-        // composite's columns (the rows already carry the fields,
-        // expanded by eval_table_function).
-        if let Some(fields) = unnest_record_elem_fields(q.eng, q.snap, q.own, q.session, &args[0]) {
+        // v1.94: unnest(tsvector) expands to PG tsvector_unnest's
+        // three OUT columns (lexeme text, positions int2[], weights
+        // text[]); eval_table_function already expanded the row
+        // Records into cells under those names.
+        if matches!(arg_vals[0], Value::TsVector(_)) {
+            vec![
+                ColType::Text,
+                ColType::Array(crate::storage::ArrayElem::SmallInt),
+                ColType::Array(crate::storage::ArrayElem::Text),
+            ]
+        } else if let Some(fields) =
+            unnest_record_elem_fields(q.eng, q.snap, q.own, q.session, &args[0])
+        {
             fields.into_iter().map(|(_, t)| t).collect::<Vec<ColType>>()
         } else {
             let elem_ty = match &arg_vals[0] {
@@ -2162,6 +2171,32 @@ pub(crate) fn lateral_function_schema(
         if let Some(fields) = unnest_record_elem_fields(eng, snap, own, session, &args[0]) {
             let (names, types): (Vec<String>, Vec<ColType>) = fields.into_iter().unzip();
             return function_item_schema(name, &names, &types, alias, col_aliases);
+        }
+        // v1.94: unnest(tsvector) — PG tsvector_unnest's OUT columns
+        // (lexeme text, positions int2[], weights text[]).
+        let ts_arg = matches!(
+            unnest_arg_field_type(eng, snap, own, session, &args[0]),
+            Some(ColType::TsVector)
+        ) || matches!(
+            expr_type(eng, snap, own, session, &[left], &[], &[], &args[0]),
+            Ok(ColType::TsVector)
+        );
+        if ts_arg {
+            let names: Vec<String> = ["lexeme", "positions", "weights"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            return function_item_schema(
+                name,
+                &names,
+                &[
+                    ColType::Text,
+                    ColType::Array(crate::storage::ArrayElem::SmallInt),
+                    ColType::Array(crate::storage::ArrayElem::Text),
+                ],
+                alias,
+                col_aliases,
+            );
         }
         let schemas = [left];
         // v1.92: a field-access argument's type comes from the

@@ -230,6 +230,21 @@ pub(crate) fn value_key(v: &Value, out: &mut Vec<u8>) {
                 value_key(&Value::Range(Box::new(r.clone())), out);
             }
         }
+        // v1.94: tsvector/tsquery group by their canonical text
+        // (injective on the normalized forms, and equality for both
+        // types is structural).
+        Value::TsVector(v) => {
+            out.push(28);
+            let t = crate::exec::tsearch::tsvector_to_text(v);
+            out.extend_from_slice(&(t.len() as u64).to_be_bytes());
+            out.extend_from_slice(t.as_bytes());
+        }
+        Value::TsQuery(q) => {
+            out.push(29);
+            let t = crate::exec::tsearch::tsquery_to_text(q);
+            out.extend_from_slice(&(t.len() as u64).to_be_bytes());
+            out.extend_from_slice(t.as_bytes());
+        }
         Value::Array(a) => {
             out.push(17);
             out.push(a.elem as u8);

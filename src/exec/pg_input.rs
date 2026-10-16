@@ -3254,290 +3254,26 @@ pub(crate) fn pg_input_validate_xml(input: &str) -> Result<(), PgInputFailure> {
 }
 
 // ---------------------------------------------------------------------------
-// tsvector / tsquery (subset ports of the tsvector/tsquery parsers)
+// tsvector / tsquery (v1.94: delegated to the real parsers in
+// exec::tsearch, which also back the cast path)
 // ---------------------------------------------------------------------------
 
 pub(crate) fn pg_input_validate_tsvector(input: &str) -> Result<(), PgInputFailure> {
-    let syntax = || pgi_soft("42601", format!("syntax error in tsvector: \"{input}\""));
-    let b = input.as_bytes();
-    let mut i = 0usize;
-    let mut any = false;
-    loop {
-        while i < b.len() && (b[i] as char).is_whitespace() {
-            i += 1;
-        }
-        if i >= b.len() {
-            break;
-        }
-        any = true;
-        // One lexeme.
-        if b[i] == b'\'' {
-            i += 1;
-            let mut len = 0usize;
-            loop {
-                match b.get(i).copied() {
-                    None => return Err(syntax()),
-                    Some(b'\\') => {
-                        i += 2;
-                        len += 1;
-                    }
-                    Some(b'\'') => {
-                        if b.get(i + 1).copied() == Some(b'\'') {
-                            i += 2;
-                            len += 1;
-                        } else {
-                            i += 1;
-                            break;
-                        }
-                    }
-                    Some(_) => {
-                        i += 1;
-                        len += 1;
-                    }
-                }
-            }
-            if len == 0 {
-                return Err(syntax());
-            }
-        } else {
-            let start = i;
-            while i < b.len() && !(b[i] as char).is_whitespace() && b[i] != b':' {
-                i += 1;
-            }
-            if i == start {
-                return Err(syntax());
-            }
-        }
-        // Optional :positions.
-        if b.get(i).copied() == Some(b':') {
-            i += 1;
-            loop {
-                let start = i;
-                while i < b.len() && b[i].is_ascii_digit() {
-                    i += 1;
-                }
-                if i == start {
-                    return Err(syntax());
-                }
-                if matches!(
-                    b.get(i).copied(),
-                    Some(b'A')
-                        | Some(b'B')
-                        | Some(b'C')
-                        | Some(b'D')
-                        | Some(b'a')
-                        | Some(b'b')
-                        | Some(b'c')
-                        | Some(b'd')
-                        | Some(b'*')
-                ) {
-                    i += 1;
-                }
-                if b.get(i).copied() == Some(b',') {
-                    i += 1;
-                    continue;
-                }
-                break;
-            }
-        }
-        if i < b.len() && !(b[i] as char).is_whitespace() {
-            return Err(syntax());
-        }
-    }
-    let _ = any;
-    Ok(())
-}
-
-struct TsqParser<'a> {
-    b: &'a [u8],
-    i: usize,
-    input: &'a str,
-}
-
-impl<'a> TsqParser<'a> {
-    fn syntax(&self) -> PgInputFailure {
-        pgi_soft(
-            "42601",
-            format!("syntax error in tsquery: \"{}\"", self.input),
-        )
-    }
-
-    fn skip_ws(&mut self) {
-        while self.i < self.b.len() && (self.b[self.i] as char).is_whitespace() {
-            self.i += 1;
-        }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.b.get(self.i).copied()
-    }
-
-    fn parse_or(&mut self) -> Result<(), PgInputFailure> {
-        self.parse_and()?;
-        loop {
-            self.skip_ws();
-            if self.peek() == Some(b'|') {
-                self.i += 1;
-                self.parse_and()?;
-            } else {
-                return Ok(());
-            }
-        }
-    }
-
-    fn parse_and(&mut self) -> Result<(), PgInputFailure> {
-        self.parse_unary()?;
-        loop {
-            self.skip_ws();
-            match self.peek() {
-                Some(b'&') => {
-                    self.i += 1;
-                    self.parse_unary()?;
-                }
-                Some(b'<') => {
-                    // Phrase operator: <-> or <N>.
-                    let save = self.i;
-                    self.i += 1;
-                    if self.peek() == Some(b'-') && self.b.get(self.i + 1) == Some(&b'>') {
-                        self.i += 2;
-                    } else {
-                        let start = self.i;
-                        let mut val: i64 = 0;
-                        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
-                            val = val * 10 + (self.b[self.i] - b'0') as i64;
-                            if val > 1_000_000 {
-                                val = 1_000_001;
-                            }
-                            self.i += 1;
-                        }
-                        if self.i == start || self.peek() != Some(b'>') {
-                            return Err(self.syntax());
-                        }
-                        self.i += 1;
-                        if val > 16384 {
-                            return Err(pgi_soft(
-                                "22023",
-                                "distance in phrase operator must be an integer value between zero and 16384 inclusive".into(),
-                            ));
-                        }
-                    }
-                    let _ = save;
-                    self.parse_unary()?;
-                }
-                _ => return Ok(()),
-            }
-        }
-    }
-
-    fn parse_unary(&mut self) -> Result<(), PgInputFailure> {
-        self.skip_ws();
-        if self.peek() == Some(b'!') {
-            self.i += 1;
-            return self.parse_unary();
-        }
-        self.parse_primary()
-    }
-
-    fn parse_primary(&mut self) -> Result<(), PgInputFailure> {
-        self.skip_ws();
-        match self.peek() {
-            Some(b'(') => {
-                self.i += 1;
-                self.parse_or()?;
-                self.skip_ws();
-                if self.peek() != Some(b')') {
-                    return Err(self.syntax());
-                }
-                self.i += 1;
-                Ok(())
-            }
-            Some(b'\'') => {
-                self.i += 1;
-                let mut len = 0usize;
-                loop {
-                    match self.peek() {
-                        None => return Err(self.syntax()),
-                        Some(b'\\') => {
-                            self.i += 2;
-                            len += 1;
-                        }
-                        Some(b'\'') => {
-                            if self.b.get(self.i + 1).copied() == Some(b'\'') {
-                                self.i += 2;
-                                len += 1;
-                            } else {
-                                self.i += 1;
-                                break;
-                            }
-                        }
-                        Some(_) => {
-                            self.i += 1;
-                            len += 1;
-                        }
-                    }
-                }
-                if len == 0 {
-                    return Err(self.syntax());
-                }
-                self.operand_suffix()
-            }
-            Some(c) if !matches!(c, b')' | b'&' | b'|' | b'!' | b'<' | b':') => {
-                let start = self.i;
-                while let Some(c) = self.peek() {
-                    if (c as char).is_whitespace()
-                        || matches!(c, b'(' | b')' | b'&' | b'|' | b'!' | b'<' | b':')
-                    {
-                        break;
-                    }
-                    self.i += 1;
-                }
-                if self.i == start {
-                    return Err(self.syntax());
-                }
-                self.operand_suffix()
-            }
-            _ => Err(self.syntax()),
-        }
-    }
-
-    fn operand_suffix(&mut self) -> Result<(), PgInputFailure> {
-        if self.peek() == Some(b':') {
-            self.i += 1;
-            // Optional weights: '*' or letters a-d, comma-separated,
-            // possibly with a leading '*'.
-            loop {
-                match self.peek() {
-                    Some(b'*') => self.i += 1,
-                    Some(c)
-                        if matches!(c, b'A' | b'B' | b'C' | b'D' | b'a' | b'b' | b'c' | b'd') =>
-                    {
-                        self.i += 1;
-                    }
-                    _ => return Err(self.syntax()),
-                }
-                if self.peek() == Some(b',') {
-                    self.i += 1;
-                    continue;
-                }
-                break;
-            }
-        }
-        Ok(())
+    // v1.94: the real tsvectorin parser (exec::tsearch) is the
+    // validator now — pg_input_is_valid must agree with the cast
+    // path on every input, including its exact error messages.
+    match super::tsearch::parse_tsvector(input) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(pgi_soft(e.code, e.message)),
     }
 }
 
 pub(crate) fn pg_input_validate_tsquery(input: &str) -> Result<(), PgInputFailure> {
-    let mut p = TsqParser {
-        b: input.as_bytes(),
-        i: 0,
-        input,
-    };
-    p.parse_or()?;
-    p.skip_ws();
-    if p.i != p.b.len() {
-        return Err(p.syntax());
+    // v1.94: the real tsqueryin parser (exec::tsearch), as above.
+    match super::tsearch::parse_tsquery(input) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(pgi_soft(e.code, e.message)),
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -3870,6 +3606,9 @@ pub(crate) fn coltype_typ_string(ct: &ColType) -> String {
         ColType::Jsonpath => "jsonpath".into(),
         // v1.88: range / multirange type names.
         ColType::Range(_) | ColType::Multirange(_) => ct.sql_name(),
+        // v1.94: text-search type names.
+        ColType::TsVector => "tsvector".into(),
+        ColType::TsQuery => "tsquery".into(),
         ColType::Array(e) => format!("{}[]", coltype_typ_string(&elem_coltype(e))),
         ColType::Composite | ColType::Record => "record".into(),
     }

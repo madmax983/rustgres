@@ -968,6 +968,17 @@ pub(crate) fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<V
                 .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
             super::ranges::parse_multirange(*elem, None, s).map(Value::multirange)
         }
+        // v1.94: tsvector / tsquery parameters parse like the cast path.
+        ColType::TsVector => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
+            super::tsearch::parse_tsvector(s).map(Value::tsvector)
+        }
+        ColType::TsQuery => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
+            super::tsearch::parse_tsquery(s).map(Value::tsquery)
+        }
     }
     .map_err(|e| {
         // Keep the parameter number in the message for debuggability.
@@ -1219,6 +1230,10 @@ pub(crate) fn value_to_literal(v: &Option<Value>) -> Literal {
         // downstream coercion re-parses for a range target.
         Some(Value::Range(r)) => Literal::Text(super::ranges::range_to_text(r).into()),
         Some(Value::Multirange(m)) => Literal::Text(super::ranges::multirange_to_text(m).into()),
+        // v1.94: tsvector / tsquery parameters substitute as canonical
+        // text; downstream coercion re-parses for a tsvector target.
+        Some(Value::TsVector(v)) => Literal::Text(super::tsearch::tsvector_to_text(v).into()),
+        Some(Value::TsQuery(qv)) => Literal::Text(super::tsearch::tsquery_to_text(qv).into()),
         // v0.35: a bpchar parameter substitutes as its (padded) text;
         // downstream coercion re-applies any target typmod.
         Some(Value::BpChar(s)) => Literal::Text(s.clone()),
@@ -1473,6 +1488,11 @@ pub(crate) fn dummy_value(t: &ColType) -> Value {
             name: None,
             ranges: Vec::new(),
         }),
+        // v1.94: the empty tsvector / tsquery dummies.
+        ColType::TsVector => Value::tsvector(crate::storage::TsVectorVal {
+            entries: Vec::new(),
+        }),
+        ColType::TsQuery => Value::tsquery(crate::storage::TsQueryVal { root: None }),
         // v0.78: the empty array literal is the honest dummy; values
         // are carried as the `{...}` literal text.
         ColType::Array(_) => Value::text("{}"),

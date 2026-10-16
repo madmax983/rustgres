@@ -636,6 +636,44 @@ pub(crate) fn unnest_rows(v: &Value) -> Result<Vec<Value>, ExecError> {
         // v1.91: unnest(anymultirange) yields one row per component
         // range (PG multirange_unnest).
         Value::Multirange(m) => Ok(m.ranges.iter().cloned().map(Value::range).collect()),
+        // v1.94: unnest(tsvector) yields one (lexeme, positions,
+        // weights) record per entry (PG tsvector_unnest). A stripped
+        // entry (no positions) yields NULL positions and weights.
+        Value::TsVector(v) => Ok(v
+            .entries
+            .iter()
+            .map(|(lex, positions)| {
+                let (pos_arr, w_arr) = if positions.is_empty() {
+                    (Value::Null, Value::Null)
+                } else {
+                    (
+                        Value::Array(Box::new(crate::storage::ArrayVal {
+                            elem: crate::storage::ArrayElem::SmallInt,
+                            dims: vec![positions.len() as i32],
+                            lower: vec![1],
+                            elems: positions
+                                .iter()
+                                .map(|(p, _)| Value::SmallInt(*p as i16))
+                                .collect(),
+                        })),
+                        Value::Array(Box::new(crate::storage::ArrayVal {
+                            elem: crate::storage::ArrayElem::Text,
+                            dims: vec![positions.len() as i32],
+                            lower: vec![1],
+                            elems: positions
+                                .iter()
+                                .map(|(_, w)| Value::text(((b'D' - w) as char).to_string()))
+                                .collect(),
+                        })),
+                    )
+                };
+                Value::Record(vec![
+                    ("lexeme".to_string(), Value::text(lex.clone())),
+                    ("positions".to_string(), pos_arr),
+                    ("weights".to_string(), w_arr),
+                ])
+            })
+            .collect()),
         Value::Text(s) | Value::BpChar(s) => {
             let a = parse_array_literal(s, crate::storage::ArrayElem::Text)?;
             Ok(a.elems)
@@ -1179,6 +1217,8 @@ pub(crate) fn elem_scalar_type(elem: crate::storage::ArrayElem) -> ColType {
         E::Record => ColType::Record,
         E::PgLsn => ColType::PgLsn,
         E::Xid => ColType::Xid,
+        E::TsVector => ColType::TsVector, // v1.94
+        E::TsQuery => ColType::TsQuery,   // v1.94
     }
 }
 
@@ -3681,6 +3721,54 @@ pub(crate) fn eval_quantified_value(
 /// is true (else NULL if any is NULL, else false); ALL is false if
 /// any is false (else NULL if any is NULL, else true). A NULL array
 /// yields NULL; an empty array yields false (ANY) / true (ALL).
+/// v1.94: `expr @@ ANY|ALL (array)` (PG's ScalarArrayOp three-valued
+/// logic over the ts match operator). PG coerces an untyped array
+/// literal to tsquery[] but does NOT implicitly cast a typed text[] —
+/// that is 42883 `operator does not exist: tsvector @@ text`.
+fn eval_any_all_ts(left: &Value, arr_val: &Value, is_all: bool) -> Result<Value, ExecError> {
+    let elems: Vec<Value> = match arr_val {
+        Value::Null => return Ok(Value::Null),
+        Value::Text(s) => parse_array_literal(s, crate::storage::ArrayElem::Text)?.elems,
+        Value::Array(a) => {
+            if a.elems.iter().any(|e| matches!(e, Value::Text(_))) {
+                return Err(exec_err(
+                    "42883",
+                    format!("operator does not exist: {} @@ text", left.type_name()),
+                ));
+            }
+            a.elems.clone()
+        }
+        other => {
+            return Err(exec_err(
+                "42821",
+                format!(
+                    "op ANY/ALL (array) requires array on right side, not {}",
+                    other.type_name()
+                ),
+            ));
+        }
+    };
+    let mut saw_null = false;
+    for elem in &elems {
+        match crate::exec::json::eval_json_op(JsonOp::PathMatch, left, elem)? {
+            Value::Bool(true) if !is_all => return Ok(Value::Bool(true)),
+            Value::Bool(false) if is_all => return Ok(Value::Bool(false)),
+            Value::Null => saw_null = true,
+            Value::Bool(_) => {}
+            _ => {
+                return Err(exec_err(
+                    "XX000",
+                    "internal error: non-boolean @@ result".to_string(),
+                ));
+            }
+        }
+    }
+    if saw_null {
+        return Ok(Value::Null);
+    }
+    Ok(Value::Bool(is_all))
+}
+
 pub(crate) fn eval_any_all_array(
     q: &mut Q,
     scopes: &[Scope],
@@ -3712,6 +3800,10 @@ pub(crate) fn eval_any_all_array(
             ));
         }
     };
+    // v1.94: the ts @@ operator has its own array handling (above).
+    if op_txt == "@@" {
+        return eval_any_all_ts(left, &vals[3], is_all);
+    }
     let arr = match &vals[3] {
         Value::Null => return Ok(Value::Null),
         Value::Array(a) => a,
@@ -4098,8 +4190,35 @@ pub(crate) fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ord
         }
         _ => {}
     }
+    // v1.94: unknown-literal coercion for the text-search types — a
+    // text operand against a tsvector/tsquery parses as that type.
+    match (a, b) {
+        (Value::Text(t) | Value::BpChar(t), Value::TsVector(_)) => {
+            let parsed = crate::exec::tsearch::parse_tsvector(t)?;
+            return cmp_ordering(&Value::tsvector(parsed), b, op);
+        }
+        (Value::TsVector(_), Value::Text(t) | Value::BpChar(t)) => {
+            let parsed = crate::exec::tsearch::parse_tsvector(t)?;
+            return cmp_ordering(a, &Value::tsvector(parsed), op);
+        }
+        (Value::Text(t) | Value::BpChar(t), Value::TsQuery(_)) => {
+            let parsed = crate::exec::tsearch::parse_tsquery(t)?;
+            return cmp_ordering(&Value::tsquery(parsed), b, op);
+        }
+        (Value::TsQuery(_), Value::Text(t) | Value::BpChar(t)) => {
+            let parsed = crate::exec::tsearch::parse_tsquery(t)?;
+            return cmp_ordering(a, &Value::tsquery(parsed), op);
+        }
+        _ => {}
+    }
     match (a, b) {
         (Value::Null, _) | (_, Value::Null) => Ok(None),
+        // v1.94: tsvector / tsquery comparisons (PG tsvector_cmp /
+        // tsquery_cmp).
+        (Value::TsVector(x), Value::TsVector(y)) => {
+            Ok(Some(crate::exec::tsearch::tsvector_cmp(x, y)))
+        }
+        (Value::TsQuery(x), Value::TsQuery(y)) => Ok(Some(crate::exec::tsearch::tsquery_cmp(x, y))),
         // v1.88: range / multirange comparisons (PG range_cmp /
         // multirange_cmp; range vs multirange of the same elem compare
         // by wrapping the range — PG forbids mixing range types).

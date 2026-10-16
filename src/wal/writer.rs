@@ -30,7 +30,10 @@ pub(crate) const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK16";
 /// v1.93: version 19 adds the per-column declared bit typmods
 /// (`bit_typmods`) to table images. v18 checkpoints are refused;
 /// remove the data directory to start fresh.
-pub(crate) const CHKPT_VERSION: u32 = 19;
+/// v1.94: version 20 adds the tsvector / tsquery column types and
+/// value tags to table and row images. v19 checkpoints are refused;
+/// remove the data directory to start fresh.
+pub(crate) const CHKPT_VERSION: u32 = 20;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -76,9 +79,12 @@ pub(crate) const CHKPT_VERSION: u32 = 19;
 /// declared bit typmods (`bit_typmods`), trailing like the partition
 /// metadata. Older logs (down to MIN_READABLE) still read, with the
 /// field decoded as empty.
-pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL23";
+/// v1.94: `RGSWAL24` — new ColType tags 34/35 (tsvector/tsquery) and
+/// Value tags 28/29 for the text-search types. Older logs (down to
+/// MIN_READABLE) still read.
+pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL24";
 /// v1.80: the format version number in [`WAL_MAGIC`].
-pub(crate) const WAL_VERSION: u32 = 23;
+pub(crate) const WAL_VERSION: u32 = 24;
 /// v1.80: oldest WAL format this build can replay.
 pub(crate) const MIN_READABLE_WAL_VERSION: u32 = 20;
 pub(crate) const WAL_HEADER_LEN: u64 = 16;

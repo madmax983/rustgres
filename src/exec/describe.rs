@@ -945,6 +945,11 @@ pub(crate) fn expr_col_name_strength(e: &Expr) -> (String, u8) {
             2,
         ),
         Expr::Func { name, .. } if name == "__is_json" => ("?column?".to_string(), 0),
+        // v1.94: operator desugars (`<->` / `!!`) are not function
+        // calls in PG's FigureColname — the column is ?column?.
+        Expr::Func { name, .. } if name == "__tsquery_phrase" || name == "__tsquery_not" => {
+            ("?column?".to_string(), 0)
+        }
         Expr::Func { name, .. } => (name.clone(), 2),
         // v0.55: PG names an unaliased CASE output column "case".
         Expr::Case { .. } => ("case".to_string(), 2),

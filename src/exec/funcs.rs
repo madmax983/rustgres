@@ -58,6 +58,25 @@ pub(crate) fn variadic_null_expands_empty(func_name: &str) -> bool {
     func_name.eq_ignore_ascii_case("format")
 }
 
+/// v1.94: view a `||` operand as a tsvector when it already is one
+/// or is bare text (parsed through tsvectorin); None otherwise.
+fn as_tsvector_operand(v: &Value) -> Result<Option<crate::storage::TsVectorVal>, ExecError> {
+    match v {
+        Value::TsVector(x) => Ok(Some((**x).clone())),
+        Value::Text(t) | Value::BpChar(t) => super::tsearch::parse_tsvector(t).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// v1.94: view a `||` operand as a tsquery (see above).
+fn as_tsquery_operand(v: &Value) -> Result<Option<crate::storage::TsQueryVal>, ExecError> {
+    match v {
+        Value::TsQuery(x) => Ok(Some((**x).clone())),
+        Value::Text(t) | Value::BpChar(t) => super::tsearch::parse_tsquery(t).map(Some),
+        _ => Ok(None),
+    }
+}
+
 pub(crate) fn eval_concat(a: &Value, b: &Value) -> Result<Value, ExecError> {
     // v0.79: array concatenation takes precedence over the NULL
     // short-circuit below (so `ARRAY[1] || NULL` appends a NULL).
@@ -76,12 +95,33 @@ pub(crate) fn eval_concat(a: &Value, b: &Value) -> Result<Value, ExecError> {
         let vb = parse_jsonb(y)?;
         return Ok(Value::jsonb(jsonb_concat(&va, &vb).render()));
     }
+    // v1.94: a bare text operand beside a tsvector/tsquery coerces to
+    // that type (PG resolves the unknown literal to the peer type),
+    // so `'a:1'::tsvector || 'b:2'` concatenates as tsvectors.
+    if matches!(a, Value::TsVector(_)) || matches!(b, Value::TsVector(_)) {
+        if let (Some(x), Some(y)) = (as_tsvector_operand(a)?, as_tsvector_operand(b)?) {
+            return Ok(Value::tsvector(super::tsearch::tsvector_concat(&x, &y)));
+        }
+    }
+    if matches!(a, Value::TsQuery(_)) || matches!(b, Value::TsQuery(_)) {
+        if let (Some(x), Some(y)) = (as_tsquery_operand(a)?, as_tsquery_operand(b)?) {
+            return Ok(Value::tsquery(super::tsearch::tsquery_or(&x, &y)));
+        }
+    }
     match (a, b) {
         (Value::Bytea(x), Value::Bytea(y)) => {
             let mut r = Vec::with_capacity(x.len() + y.len());
             r.extend_from_slice(x);
             r.extend_from_slice(y);
             Ok(Value::Bytea(r))
+        }
+        // v1.94: tsvector || tsvector is tsvector_concat and
+        // tsquery || tsquery is tsquery_or (PG19 pg_proc).
+        (Value::TsVector(x), Value::TsVector(y)) => {
+            Ok(Value::tsvector(super::tsearch::tsvector_concat(x, y)))
+        }
+        (Value::TsQuery(x), Value::TsQuery(y)) => {
+            Ok(Value::tsquery(super::tsearch::tsquery_or(x, y)))
         }
         // v1.93: PG19 varbit.c `bitcat` — bit || bit appends the bits.
         (Value::BitString(x), Value::BitString(y)) => Ok(Value::BitString(bit_concat(x, y)?)),
@@ -1938,6 +1978,27 @@ pub(crate) fn eval_func(
             Err(PgInputFailure::Hard(e)) => Err(e),
         };
     }
+    // v1.94: pg_input_error_info in scalar (target-list) position —
+    // PG returns the same four OUT columns as a record value; the
+    // FROM-clause form lives in eval_table_function. A NULL argument
+    // yields a NULL record (oracle-verified against PG19).
+    if name == "pg_input_error_info" && args.len() == 2 {
+        let v0 = eval_expr(q, scopes, &args[0])?;
+        let v1 = eval_expr(q, scopes, &args[1])?;
+        let input = match str_arg(name, &v0)? {
+            None => return Ok(Value::Null),
+            Some(s) => s.to_string(),
+        };
+        let typ = match str_arg(name, &v1)? {
+            None => return Ok(Value::Null),
+            Some(s) => s.to_string(),
+        };
+        return match pg_input_validate_catalog(q, "pg_input_error_info", &input, &typ) {
+            Ok(()) => Ok(pg_input_error_record(None)),
+            Err(PgInputFailure::Soft(e)) => Ok(pg_input_error_record(Some(e))),
+            Err(PgInputFailure::Hard(e)) => Err(e),
+        };
+    }
     // v1.90: SQL/JSON constructors (parser desugars) need the
     // catalog + argument expressions (static categories), like
     // pg_input_is_valid above.
@@ -2081,6 +2142,43 @@ pub(crate) fn eval_func(
             return Ok(Value::text(out));
         }
         return Ok(Value::jsonb(datum_to_jsonb(&v)?.render()));
+    }
+    // v1.94: to_tsvector's json overload — PG indexes only the
+    // document's string values. The json type rides in Value::Text,
+    // so the overload is resolved from the document argument's
+    // static type, like to_json above. (A Jsonb value is resolved
+    // inside eval_ts_func, where the variant is unambiguous.)
+    if name == "to_tsvector" && (1..=2).contains(&args.len()) {
+        let doc_expr = &args[args.len() - 1];
+        let schemas: Vec<&[QCol]> = scopes.iter().map(|s| s.schema).collect();
+        if matches!(
+            expr_type(
+                &mut *q.eng,
+                q.snap,
+                q.own,
+                q.session,
+                &schemas,
+                &[],
+                &[],
+                doc_expr
+            )?,
+            ColType::Json
+        ) {
+            let cfg = if args.len() == 2 {
+                let cv = eval_expr(q, scopes, &args[0])?;
+                if cv == Value::Null {
+                    return Ok(Value::Null);
+                }
+                Some(cv)
+            } else {
+                None
+            };
+            let dv = eval_expr(q, scopes, doc_expr)?;
+            if dv == Value::Null {
+                return Ok(Value::Null);
+            }
+            return super::tsearch::to_tsvector_json(cfg.as_ref(), &dv);
+        }
     }
     // v1.84: json(b)_populate_record / jsonb_populate_record_valid —
     // the target row type comes from the base argument's static
@@ -2374,6 +2472,8 @@ pub(crate) fn pg_typlen_align(ty: &ColType) -> (i32, usize) {
             | crate::storage::RangeElem::Float8 => (-1, 8),
             _ => (-1, 4),
         },
+        ColType::TsVector => (-1, 4), // tsvector: -1/'i' (v1.94)
+        ColType::TsQuery => (-1, 4),  // tsquery: -1/'i' (v1.94)
         // Pseudo/composite types never persist in table columns; map
         // them to varlena so the layout code stays total.
         ColType::Record | ColType::Composite => (-1, 8), // record: -1/'d'
@@ -2953,6 +3053,10 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
     if let Some(r) = super::ranges::try_eval_range_func(name, vals) {
         return r;
     }
+    // v1.94: text-search functions dispatch (same pattern).
+    if let Some(r) = super::tsearch::try_eval_ts_func(name, vals) {
+        return r;
+    }
     check_builtin_arity(name, vals)?;
     // v0.16: `substr` is a true alias of `substring` (same semantics).
     let name = if name == "substr" { "substring" } else { name };
@@ -3049,6 +3153,7 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         | "set_byte"
         | "bit_count"
         | "pg_input_is_valid"
+        | "pg_input_error_info"
         // v0.95: parse_ident returns text[].
         // v1.15: quote_ident/quote_literal/quote_nullable (PG19 quote.c).
         | "parse_ident" | "quote_ident" | "quote_literal" | "quote_nullable" => {
@@ -5017,6 +5122,12 @@ pub(crate) fn eval_srf_vals(
         // flattened to one value per row — PG19's unnest returns a
         // single column.
         "unnest" => {
+            // v1.94: unnest(tsvector) is a three-column SRF — one
+            // Record per row (the projection expands it), not the
+            // single-column flattening below.
+            if matches!(vals[0], Value::TsVector(_)) {
+                return unnest_rows(&vals[0]);
+            }
             let (_, rows) = eval_table_function(name, vals)?;
             rows.into_iter()
                 .map(|mut r| {
@@ -5771,6 +5882,27 @@ pub(crate) fn pg_quote_literal_cstr(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+/// v1.94: build the `pg_input_error_info` record value (PG19 misc.c
+/// OUT columns message, detail, hint, sql_error_code); `None` is the
+/// valid-input row of four NULLs.
+pub(crate) fn pg_input_error_record(err: Option<PgInputError>) -> Value {
+    let (msg, det, hint, code) = match err {
+        None => (Value::Null, Value::Null, Value::Null, Value::Null),
+        Some(e) => (
+            Value::text(e.message),
+            e.detail.map(Value::text).unwrap_or(Value::Null),
+            e.hint.map(Value::text).unwrap_or(Value::Null),
+            Value::text(e.code),
+        ),
+    };
+    Value::Record(vec![
+        ("message".to_string(), msg),
+        ("detail".to_string(), det),
+        ("hint".to_string(), hint),
+        ("sql_error_code".to_string(), code),
+    ])
 }
 
 pub(crate) fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
@@ -6652,6 +6784,24 @@ pub(crate) fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecErr
             match pg_input_validate("pg_input_is_valid", input, typ) {
                 Ok(()) => Ok(Value::Bool(true)),
                 Err(PgInputFailure::Soft(_)) => Ok(Value::Bool(false)),
+                Err(PgInputFailure::Hard(e)) => Err(e),
+            }
+        }
+        // v1.94: pg_input_error_info(input text, type text) -> record,
+        // the scalar-context sibling of the table-function form in
+        // eval_table_function (same pg_input_validate core).
+        "pg_input_error_info" => {
+            let input = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            let typ = match str_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(s) => s,
+            };
+            match pg_input_validate("pg_input_error_info", input, typ) {
+                Ok(()) => Ok(pg_input_error_record(None)),
+                Err(PgInputFailure::Soft(e)) => Ok(pg_input_error_record(Some(e))),
                 Err(PgInputFailure::Hard(e)) => Err(e),
             }
         }
@@ -10763,6 +10913,13 @@ pub(crate) fn func_result_type(
         "translate" | "unistr" => Ok(ColType::Text),
         "regexp_like" => Ok(ColType::Bool),
         "pg_input_is_valid" => Ok(ColType::Bool),
+        "pg_input_error_info" => Ok(ColType::Record),
+        // v1.94: returns regconfig in PG; the engine has no regconfig
+        // type, and the name renders identically as text.
+        "get_current_ts_config" => Ok(ColType::Text),
+        // v1.94: the lone-`!` prefix desugar; evaluation always
+        // raises the PG operator error, so this type is never seen.
+        "__prefix_bang" => Ok(ColType::Bool),
         // v1.86: pg_sleep returns void in PG; text is the closest
         // carrier (its output renders empty, like void).
         "pg_sleep" => Ok(ColType::Text),
@@ -10782,6 +10939,23 @@ pub(crate) fn func_result_type(
         "pg_overlaps" => Ok(ColType::Bool),
         "similar_to" => Ok(ColType::Bool),
         "substring_similar" => Ok(ColType::Text),
+        // v1.94: text-search functions (PG19 pg_proc).
+        "to_tsvector" | "ts_delete" | "setweight" | "strip" | "ts_filter"
+        | "array_to_tsvector" | "tsvectorin" => Ok(ColType::TsVector),
+        "to_tsquery" | "plainto_tsquery" | "phraseto_tsquery" | "websearch_to_tsquery"
+        | "tsquery_phrase"
+        | "__tsquery_phrase"
+        | "tsquery_not"
+        | "__tsquery_not"
+        | "tsquery_and"
+        | "tsquery_or"
+        | "tsqueryin" => {
+            Ok(ColType::TsQuery)
+        }
+        "ts_rank" | "ts_rank_cd" => Ok(ColType::Float4),
+        "tsvector_to_array" => Ok(ColType::Array(crate::storage::ArrayElem::Text)),
+        "numnode" => Ok(ColType::Int),
+        "tsvectorout" | "tsqueryout" => Ok(ColType::Text),
         "length" | "char_length" | "character_length" | "octet_length" | "bit_length"
         | "position" => Ok(ColType::Int),
         // v0.79: array functions (PG19 arrayfuncs.c) — the runtime
@@ -10796,6 +10970,9 @@ pub(crate) fn func_result_type(
             Ok(ColType::Array(e)) => Ok(elem_scalar_type(e)),
             // v1.91: unnest(anymultirange) yields the component ranges.
             Ok(ColType::Multirange(e)) => Ok(ColType::Range(e)),
+            // v1.94: unnest(tsvector) yields (lexeme, positions,
+            // weights) records.
+            Ok(ColType::TsVector) => Ok(ColType::Record),
             Ok(other) => Err(exec_err(
                 "42883",
                 format!("function unnest({}) does not exist", other.sql_name()),
@@ -11307,6 +11484,8 @@ pub(crate) fn value_type_name(v: &Value) -> Cow<'static, str> {
         Value::Uuid(_) => Cow::Borrowed("uuid"),
         Value::PgLsn(_) => Cow::Borrowed("pg_lsn"), // v0.64
         Value::Record(_) => Cow::Borrowed("record"), // v0.73
+        Value::TsVector(_) => Cow::Borrowed("tsvector"), // v1.94
+        Value::TsQuery(_) => Cow::Borrowed("tsquery"), // v1.94
         // v0.79: arrays report their element type, like pg_typeof.
         Value::Array(a) => Cow::Owned(format!("{}[]", a.elem.sql_name())),
         Value::Null => Cow::Borrowed("null"),

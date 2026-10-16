@@ -1774,6 +1774,9 @@ pub(crate) enum FnKeyVal {
     // variants so a range never aliases a multirange or text key).
     Range(String),
     Multirange(String),
+    // v1.94: tsvector / tsquery cache keys (canonical text).
+    TsVector(String),
+    TsQuery(String),
     BpChar(String),
     SingleChar(u8),
     Bool(bool),
@@ -1832,6 +1835,8 @@ pub(crate) fn fn_key_val(v: &Value) -> FnKeyVal {
         Value::Jsonpath(s) => FnKeyVal::Jsonpath(s.to_string()), // v1.85
         Value::Range(r) => FnKeyVal::Range(super::ranges::range_to_text(r)), // v1.88
         Value::Multirange(m) => FnKeyVal::Multirange(super::ranges::multirange_to_text(m)),
+        Value::TsVector(v) => FnKeyVal::TsVector(super::tsearch::tsvector_to_text(v)),
+        Value::TsQuery(q) => FnKeyVal::TsQuery(super::tsearch::tsquery_to_text(q)),
         Value::BpChar(s) => FnKeyVal::BpChar(s.to_string()),
         Value::SingleChar(c) => FnKeyVal::SingleChar(*c),
         Value::Bool(b) => FnKeyVal::Bool(*b),

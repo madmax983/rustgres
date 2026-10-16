@@ -126,6 +126,10 @@ pub enum ColType {
     // 4532, tsmultirange 4533, tstzmultirange 4534, datemultirange 4535,
     // int8multirange 4536.
     Multirange(RangeElem),
+    // v1.94: PG's text-search types (pg_type.dat): tsvector 3614,
+    // tsquery 3615.
+    TsVector, // OID 3614
+    TsQuery,  // OID 3615
     // v0.78: PG's array type — carries the element type. Arrays only
     // flow through expression evaluation (like Record/Json); table
     // columns cannot be arrays (no DDL support). Values are carried as
@@ -274,6 +278,83 @@ pub struct MultiVal {
     pub ranges: Vec<RangeVal>,
 }
 
+/// v1.94: one tsvector value (PG's TSVector, deserialized). Entries are
+/// sorted by lexeme byte order (PG's `tsCompareString`); each entry's
+/// positions are sorted by position and deduplicated (the highest
+/// weight wins a position collision, like PG's `uniquePos`). A position
+/// is `(pos, weight)` with `pos` in 1..=16383 (PG's MAXENTRYPOS-1) and
+/// `weight` in 0..=3 (0=D, 1=C, 2=B, 3=A). An empty `positions` vec is
+/// PG's positionless (stripped) entry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TsVectorVal {
+    pub entries: Vec<(String, Vec<(u16, u8)>)>,
+}
+
+/// v1.94: one tsquery value (PG's TSQuery, deserialized): a query tree.
+/// `root: None` is the empty query (PG's `size == 0`), which renders as
+/// the empty string and matches nothing. Operand `id`s are assigned in
+/// PG's polish (prefix) order — operator, then right subtree, then left
+/// subtree — so ts_rank_cd can key per-operand data exactly like PG's
+/// QueryRepresentation (which is indexed by QueryItem position).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TsQueryVal {
+    pub root: Option<TsQueryNode>,
+}
+
+/// v1.94: a tsquery tree node (PG's QueryItem tree form).
+#[derive(Clone, Debug, PartialEq)]
+pub enum TsQueryNode {
+    /// A lexeme operand: `weight` is PG's bitmask (bit i set = weight
+    /// i allowed; 0 = unrestricted), `prefix` is the `:*` flag.
+    Val {
+        text: String,
+        weight: u8,
+        prefix: bool,
+        id: u32,
+    },
+    /// A stopword placeholder (PG's QI_VALSTOP). Only exists between
+    /// the morph parse and stopword cleanup; a stored query never
+    /// contains one (cleanup removes or empties the tree).
+    Stop,
+    Not(Box<TsQueryNode>),
+    And(Box<TsQueryNode>, Box<TsQueryNode>),
+    Or(Box<TsQueryNode>, Box<TsQueryNode>),
+    /// Phrase operator with distance 0..=16384 (`<->` is distance 1).
+    Phrase(Box<TsQueryNode>, Box<TsQueryNode>, u16),
+}
+
+impl TsQueryNode {
+    /// Total node count (PG's `tsquery->size`, the `numnode` result).
+    pub fn numnode(&self) -> i64 {
+        match self {
+            TsQueryNode::Val { .. } | TsQueryNode::Stop => 1,
+            TsQueryNode::Not(c) => 1 + c.numnode(),
+            TsQueryNode::And(l, r) | TsQueryNode::Or(l, r) => 1 + l.numnode() + r.numnode(),
+            TsQueryNode::Phrase(l, r, _) => 1 + l.numnode() + r.numnode(),
+        }
+    }
+
+    /// Collect the operands in polish (prefix) order: this node, then
+    /// the right subtree, then the left subtree (PG's QueryItem array
+    /// order for binary operators).
+    pub fn operands_polish(&self, out: &mut Vec<(u32, String, u8, bool)>) {
+        match self {
+            TsQueryNode::Val {
+                text,
+                weight,
+                prefix,
+                id,
+            } => out.push((*id, text.clone(), *weight, *prefix)),
+            TsQueryNode::Stop => {}
+            TsQueryNode::Not(c) => c.operands_polish(out),
+            TsQueryNode::And(l, r) | TsQueryNode::Or(l, r) | TsQueryNode::Phrase(l, r, _) => {
+                r.operands_polish(out);
+                l.operands_polish(out);
+            }
+        }
+    }
+}
+
 /// v0.78: the scalar element type of a `ColType::Array`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArrayElem {
@@ -306,6 +387,10 @@ pub enum ArrayElem {
     Bit,
     // v1.40: `tid` arrays (`_tid`, OID 1010).
     Tid,
+    // v1.94: `tsvector` arrays (`_tsvector`, OID 3616).
+    TsVector,
+    // v1.94: `tsquery` arrays (`_tsquery`, OID 3645).
+    TsQuery,
 }
 
 impl ArrayElem {
@@ -347,6 +432,11 @@ impl ArrayElem {
             // v1.88: range/multirange arrays are not supported; degrade
             // like jsonb (element kind is not representable in ArrayElem).
             ColType::Range(_) | ColType::Multirange(_) => ArrayElem::Record,
+            // v1.94: tsvector[]/tsquery[] (PG _tsvector 3616, _tsquery
+            // 3645) are real element kinds (tsvector_to_array et al.
+            // aside, plain arrays of the types are representable).
+            ColType::TsVector => ArrayElem::TsVector,
+            ColType::TsQuery => ArrayElem::TsQuery,
             // v0.81: named composites are not arrayable yet.
             ColType::Composite => ArrayElem::Record,
             ColType::PgLsn => ArrayElem::PgLsn,
@@ -383,7 +473,9 @@ impl ArrayElem {
             ArrayElem::Record => 2287,
             ArrayElem::PgLsn => 3221,
             ArrayElem::Xid => 1011,
-            ArrayElem::Tid => 1010, // v1.40: PG's `_tid` (pg_type.dat)
+            ArrayElem::Tid => 1010,      // v1.40: PG's `_tid` (pg_type.dat)
+            ArrayElem::TsVector => 3616, // v1.94: PG's `_tsvector`
+            ArrayElem::TsQuery => 3645,  // v1.94: PG's `_tsquery`
             // v1.39: PG's `_bit` array OID (pg_type.dat).
             ArrayElem::Bit => 1561,
         }
@@ -418,7 +510,9 @@ impl ArrayElem {
             ArrayElem::PgLsn => "pg_lsn",
             ArrayElem::Xid => "xid",
             ArrayElem::Bit => "bit",
-            ArrayElem::Tid => "tid", // v1.40
+            ArrayElem::Tid => "tid",           // v1.40
+            ArrayElem::TsVector => "tsvector", // v1.94
+            ArrayElem::TsQuery => "tsquery",   // v1.94
         }
     }
 
@@ -451,7 +545,9 @@ impl ArrayElem {
             ArrayElem::PgLsn => "pg_lsn",
             ArrayElem::Xid => "xid",
             ArrayElem::Bit => "bit",
-            ArrayElem::Tid => "tid", // v1.40
+            ArrayElem::Tid => "tid",           // v1.40
+            ArrayElem::TsVector => "tsvector", // v1.94
+            ArrayElem::TsQuery => "tsquery",   // v1.94
         }
     }
 }
@@ -599,6 +695,8 @@ impl ColType {
                 RangeElem::Int8 => 4536,
                 _ => 2249,
             },
+            ColType::TsVector => 3614, // TSVECTOR (v1.94)
+            ColType::TsQuery => 3615,  // TSQUERY (v1.94)
             // v0.78: PG's _<elem> array OIDs (pg_type.dat).
             ColType::Array(e) => e.array_oid() as i32,
         }
@@ -660,6 +758,8 @@ impl ColType {
                     .map(str::to_string)
                     .unwrap_or_else(|| format!("{}multirange", e.elem_typname()));
             }
+            ColType::TsVector => "tsvector", // v1.94
+            ColType::TsQuery => "tsquery",   // v1.94
             ColType::Array(_) => unreachable!("arrays return early above"),
         }
         .to_string()
@@ -720,6 +820,8 @@ impl ColType {
                     .map(str::to_string)
                     .unwrap_or_else(|| format!("{}multirange", e.elem_typname()));
             }
+            ColType::TsVector => "tsvector", // v1.94
+            ColType::TsQuery => "tsquery",   // v1.94
             ColType::Array(_) => unreachable!("arrays return early above"),
         }
         .to_string()
@@ -4519,6 +4621,10 @@ pub enum Value {
     Range(Box<RangeVal>),
     // v1.88: a multirange value (PG's MultirangeType, normalized).
     Multirange(Box<MultiVal>),
+    // v1.94: a tsvector value (PG's TSVector, deserialized).
+    TsVector(Arc<TsVectorVal>),
+    // v1.94: a tsquery value (PG's TSQuery, deserialized).
+    TsQuery(Arc<TsQueryVal>),
     // v0.73: a whole-row (composite) value — PG19's whole-row Var
     // (varattno = 0). Field names travel with the value so `row_to_json`
     // can label its object keys; the text format `(f1,f2,...)` ignores
@@ -4698,6 +4804,16 @@ impl Value {
         Value::Multirange(Box::new(m))
     }
 
+    /// v1.94: make a tsvector value from its normalized form.
+    pub fn tsvector(v: TsVectorVal) -> Value {
+        Value::TsVector(Arc::new(v))
+    }
+
+    /// v1.94: make a tsquery value from its tree form.
+    pub fn tsquery(q: TsQueryVal) -> Value {
+        Value::TsQuery(Arc::new(q))
+    }
+
     /// Text-format encoding for the wire protocol (`None` = NULL).
     /// Matches what psql prints: ints/floats via Display, bools as t/f,
     /// bytea as `\x` hex, timestamps as ISO.
@@ -4717,6 +4833,9 @@ impl Value {
             // v1.88: range_out / multirange_out (canonical text).
             Value::Range(r) => Some(crate::exec::ranges::range_to_text(r)),
             Value::Multirange(m) => Some(crate::exec::ranges::multirange_to_text(m)),
+            // v1.94: tsvector_out / tsquery_out (canonical text).
+            Value::TsVector(v) => Some(crate::exec::tsearch::tsvector_to_text(v)),
+            Value::TsQuery(q) => Some(crate::exec::tsearch::tsquery_to_text(q)),
             // v0.35: bpchar is stored blank-padded; the wire shows the
             // padded bytes, like Postgres.
             Value::BpChar(s) => Some(s.to_string()),
@@ -4836,7 +4955,9 @@ impl Value {
                     m.elem.multirange_name().unwrap_or("multirange").to_string()
                 }))
             }
-            Value::BpChar(_) => Cow::Borrowed("character"), // v0.35
+            Value::TsVector(_) => Cow::Borrowed("tsvector"), // v1.94
+            Value::TsQuery(_) => Cow::Borrowed("tsquery"),   // v1.94
+            Value::BpChar(_) => Cow::Borrowed("character"),  // v0.35
             // v0.36: PG's format_type(18) renders `"char"` (quoted).
             Value::SingleChar(_) => Cow::Borrowed("\"char\""),
             Value::Bool(_) => Cow::Borrowed("boolean"),
@@ -4873,6 +4994,8 @@ impl Value {
             // v1.88: range / multirange values know their elem.
             Value::Range(r) => ColType::Range(r.elem),
             Value::Multirange(m) => ColType::Multirange(m.elem),
+            Value::TsVector(_) => ColType::TsVector, // v1.94
+            Value::TsQuery(_) => ColType::TsQuery,   // v1.94
             // v0.35: the value alone doesn't record the typmod; Char(None)
             // is the honest fallback (bare `character`).
             Value::BpChar(_) => ColType::Char(None),
@@ -5174,6 +5297,85 @@ pub fn parse_uuid(s: &str) -> Result<[u8; 16], ()> {
     Ok(out)
 }
 
+thread_local! {
+    /// Session `extra_float_digits` (PG19 float.c): > 0 selects the
+    /// shortest round-trip rendering; <= 0 selects the legacy
+    /// fixed-significant-digit rendering (FLT_DIG/DBL_DIG + efd
+    /// digits via pg_strfromd). Installed per statement by the
+    /// server, like the datetime session context.
+    static EXTRA_FLOAT_DIGITS: std::cell::Cell<i32> = const { std::cell::Cell::new(1) };
+}
+
+pub fn set_extra_float_digits(v: i32) {
+    EXTRA_FLOAT_DIGITS.with(|c| c.set(v));
+}
+
+fn extra_float_digits() -> i32 {
+    EXTRA_FLOAT_DIGITS.with(|c| c.get())
+}
+
+/// PG19 pg_strfromd rendering: `%.*g` with `ndig` significant
+/// digits — scientific when the decimal exponent is < -4 or
+/// >= ndig, trailing zeros stripped, exponent signed with at
+/// least two digits.
+fn float_g_text(f: f64, ndig: i32) -> String {
+    if f == 0.0 {
+        return if f.is_sign_negative() {
+            "-0".to_string()
+        } else {
+            "0".to_string()
+        };
+    }
+    let ndig = ndig.clamp(1, 17) as usize;
+    let sci = format!("{:.*e}", ndig - 1, f);
+    let epos = sci.find('e').unwrap();
+    let (mant, exp_s) = sci.split_at(epos);
+    let exp: i32 = exp_s[1..].parse().unwrap_or(0);
+    let neg = mant.starts_with('-');
+    let digits: String = mant.chars().filter(|c| c.is_ascii_digit()).collect();
+    // %g: scientific if exp < -4 || exp >= ndig (exp is the power
+    // of the leading digit, i.e. value = d.ddd * 10^exp).
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    if exp < -4 || exp >= ndig as i32 {
+        let mut m = String::new();
+        m.push_str(&digits[..1]);
+        let frac = digits[1..].trim_end_matches('0');
+        if !frac.is_empty() {
+            m.push('.');
+            m.push_str(frac);
+        }
+        out.push_str(&m);
+        out.push_str(&format!("e{:+03}", exp));
+        return out;
+    }
+    if exp >= 0 {
+        let int_len = (exp + 1) as usize;
+        if digits.len() > int_len {
+            out.push_str(&digits[..int_len]);
+            let frac = digits[int_len..].trim_end_matches('0');
+            if !frac.is_empty() {
+                out.push('.');
+                out.push_str(frac);
+            }
+        } else {
+            out.push_str(&digits);
+            for _ in 0..(int_len - digits.len()) {
+                out.push('0');
+            }
+        }
+    } else {
+        out.push_str("0.");
+        for _ in 0..(-exp - 1) {
+            out.push('0');
+        }
+        out.push_str(digits.trim_end_matches('0'));
+    }
+    out
+}
+
 /// Shortest round-trip float rendering, Postgres-style.
 fn float_text(f: f64) -> String {
     if f.is_nan() {
@@ -5181,6 +5383,12 @@ fn float_text(f: f64) -> String {
     }
     if f.is_infinite() {
         return if f > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    // v1.94: extra_float_digits <= 0 -> pg_strfromd with
+    // DBL_DIG + efd significant digits (PG19 float8out).
+    let efd = extra_float_digits();
+    if efd <= 0 {
+        return float_g_text(f, 15 + efd);
     }
     // v0.22: `{}` on f64 never uses scientific notation, so huge
     // magnitudes explode into hundreds of digits. PostgreSQL's %g
@@ -5219,6 +5427,12 @@ fn float4_text(f: f32) -> String {
     }
     if f.is_infinite() {
         return if f > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    // v1.94: extra_float_digits <= 0 -> pg_strfromd with
+    // FLT_DIG + efd significant digits (PG19 float4out).
+    let efd = extra_float_digits();
+    if efd <= 0 {
+        return float_g_text(f as f64, 6 + efd);
     }
     if f != 0.0 {
         let a = f.abs();

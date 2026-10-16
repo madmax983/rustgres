@@ -28,7 +28,7 @@ Sections:
   F. partition-moving UPDATE moves chunks with the row
   G. UPDATE chunks survive a restart (WAL-logged)
   H. repeated updates: no chunk/metadata accumulation
-  I. WAL magic is RGSWAL23 (v1.93: bit_typmods in CreateTable/AlterTable;
+  I. WAL magic is RGSWAL24 (v1.94: tsvector/tsquery ColType+Value tags;
      v1.41: attnums/next_attnum/fillfactor in
      CreateTable/AlterTable; v1.80: partition fields in CreateTable/AlterTable)
 """
@@ -321,7 +321,7 @@ def main():
         stop_server(proc)
     with open(os.path.join(data_dir, "wal.log"), "rb") as f:
         magic = f.read(8)
-    check("I1 WAL magic is RGSWAL23", magic == b"RGSWAL23")
+    check("I1 WAL magic is RGSWAL24", magic == b"RGSWAL24")
     shutil.rmtree(data_dir, ignore_errors=True)
 
     print(f"protocol_test99: {passed} passed, {failed} failed")
