@@ -2,6 +2,97 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `JSON_QUERY`/`JSON_EXISTS`/`JSON_VALUE` re-parse their jsonpath literal from scratch on every row — baseline — 2026-10-16
+
+**Why this workload**: v1.92 added the SQL-standard query functions
+(`JSON_VALUE`/`JSON_QUERY`/`JSON_EXISTS`, `json.rs`'s
+`eval_sqljson_func`/`eval_sqljson_query_q`) on top of the jsonpath
+engine. This is a different call path from the older scalar
+`jsonb_path_*` functions profiled 2026-10-14
+(`eval_jsonpath_scalar`) — that round's fix cached the *document*
+text's parsed tree (`parse_jsonb`'s `JSONB_PARSE_CACHE`), not the
+jsonpath *pattern* text's parsed tree, and left `jsonpath.rs`'s
+`parse_jsonpath` (tokenize + recursive-descent parse) uncached at
+every one of its 5 call sites. No prior Bolt round has profiled the
+SQL-standard query functions or the jsonpath-pattern-parse cost in
+isolation from the then-dominant document-parse cost.
+
+`benches/profile_sqljson_queryfuncs.py` (new): 20 exact iterations of
+a 3-function SELECT (`JSON_EXISTS`/`JSON_VALUE`/`JSON_QUERY`, each
+with a literal jsonpath argument) over 1500 rows of nested order-event
+jsonb documents, over the real wire protocol, debug build, fresh data
+dir — the textbook SQL/JSON report-query shape (`JSON_EXISTS(doc,
+'$.a.b')` with a constant path), not a synthetic microbenchmark of the
+jsonpath parser alone.
+
+Reproduce:
+```bash
+cargo build
+RUSTGRES_DATA_DIR=$(mktemp -d) valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out --collect-jumps=yes --cache-sim=yes --branch-sim=yes ./target/debug/rustgres &
+python3 benches/profile_sqljson_queryfuncs.py --rows 1500 --count 20 --timeout 2400
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | head -40
+# swap --tool=dhat --dhat-out-file=/tmp/dhat.out for the allocation profile
+```
+
+**Profile** (callgrind, valgrind 3.22.0, `--collect-jumps=yes
+--cache-sim=yes --branch-sim=yes`): **18,556,724,153** total `Ir`.
+Summing the self-cost of every `jsonpath.rs` function that participates
+in tokenizing/parsing a path (`tokenize_jsonpath`, every `JpLexer::*`
+and `JpParser::*` method, `JpTok`'s `Clone`/`PartialEq`, `parse_jsonpath`
+itself) — i.e. excluding the data-dependent *evaluation* functions
+(`eval`, `eval_pred`, `jp_query_seq`, `jp_exists`, `key_access`,
+`compare_seqs`/`compare_pair`, `operand_seq`, `jp_context`) that
+genuinely differ per row and can't be cached away — gives **575,310,000
+Ir (3.10% of total)** in named-function self-cost alone. That undercounts
+the real cost: the allocator calls those parsing functions make (growing
+the token `Vec`, boxing each `JpExpr` AST node) are attributed to libc/
+`alloc::raw_vec` symbols, not to `jsonpath.rs`, so DHAT is the more
+honest measure here — same pattern as the 2026-10-14 jsonpath-cache
+baseline, which also undercounted on raw `Ir` self-cost alone.
+
+DHAT (same workload, one run): **862,466,772** total bytes,
+**13,164,200** total allocation blocks. Attributing every allocation
+whose call stack passes through `tokenize_jsonpath`, any `JpLexer`/
+`JpParser` method, or `JpTok`'s `Clone` impl (i.e. everything that
+exists only to turn the literal path *text* into a `JpPath` tree, run
+fresh on every row despite the text being byte-identical across all
+1500 rows × 20 iterations × 3 call sites):
+
+| metric | value | % of total |
+|---|---|---|
+| allocation blocks | 1,560,000 | **11.85%** |
+| allocation bytes | 106,770,000 | **12.38%** |
+
+Both clear the ≥10%-of-allocations floor independently. Top sites by
+block count: `RawVec<JpTok>::grow_one` (the token vector growing
+without a capacity hint — `tokenize_jsonpath` pushes one `JpTok` at a
+time starting from `Vec::new()`), `JpParser::parse_accessor_op`
+(boxing each parsed `JpExpr` AST node), and `JpTok::clone`.
+
+**Hypothesis**: `parse_jsonpath` (jsonpath.rs:1453) has no cache at
+any of its 5 call sites (json.rs:1402, 2543, 2544, 2704, 3767, 3881),
+unlike its sibling `parse_jsonb` (cached since 52ee619). In the
+overwhelming common case — `JSON_EXISTS(doc, '$.a.b')`,
+`JSON_VALUE`/`JSON_QUERY` with a literal path argument — the path text
+is a SQL constant, identical across every row of a SELECT and across
+every iteration of a prepared/repeated query, yet it is tokenized and
+recursive-descent-parsed into a fresh `JpPath`/`JpExpr` tree from
+scratch on every single row. `JpPath` already derives `Clone`
+(jsonpath.rs:18), so a thread-local cache keyed by the input text —
+exactly `JSONB_PARSE_CACHE`'s shape in `json.rs`, bounded the same way
+(64 entries, `src/regex.rs`'s existing `REGEX_CACHE_CAP`) — can serve a
+cached `Rc<JpPath>`'s clone instead of re-tokenizing and re-parsing.
+
+`cargo test --all-features`: 1017/1017 passed (pre-change tree,
+unmodified). `tests/conformance/schedule_runner.py --tests
+json,jsonb,json_encoding,jsonpath,jsonpath_encoding,jsonb_jsonpath,
+sqljson,sqljson_queryfuncs,sqljson_jsontable`: PASS=2844 EF=1
+REAL-FAIL=836 of 3681 scored (pre-change tree).
+
+Before profiles committed:
+`benches/profiles/{callgrind,dhat}.out.sqljsonpathcache-base-2026-10-16`.
+
 ## Bolt: default-RETURNING `JSON_OBJECT`/`JSON_ARRAY` builds a full jsonb tree it never reads — fix — 2026-10-15
 
 Fixes the target identified in the baseline entry immediately below
