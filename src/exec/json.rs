@@ -141,7 +141,7 @@ impl<'a> Parser<'a> {
                 JsonKind::Bool
             }
             Some(b'"') => {
-                let s = self.parse_string()?;
+                let s = self.parse_string(text)?;
                 JsonKind::Str(s)
             }
             Some(b'[') => {
@@ -186,7 +186,7 @@ impl<'a> Parser<'a> {
                         if self.peek() != Some(b'"') {
                             return Err(format!("expected string key at offset {}", self.pos));
                         }
-                        let key = self.parse_string()?;
+                        let key = self.parse_string(text)?;
                         self.skip_ws();
                         self.expect(b':')?;
                         let val = self.parse_value(text)?;
@@ -282,8 +282,13 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a JSON string, returning the decoded value. `self.pos` is at the
-    /// opening quote; advances past the closing quote.
-    fn parse_string(&mut self) -> Result<String, String> {
+    /// opening quote; advances past the closing quote. `text` is the whole
+    /// document (same `&str` as `self.chars`'s source) -- used to decode a
+    /// char at `self.pos` without re-validating UTF-8: `text` is already
+    /// guaranteed valid, and `self.pos` is always at a char boundary, so
+    /// `text[self.pos..].chars().next()` is an O(1) decode of just the one
+    /// leading code point, not a re-scan of the rest of the document.
+    fn parse_string(&mut self, text: &str) -> Result<String, String> {
         self.expect(b'"')?;
         let mut out = String::new();
         loop {
@@ -362,10 +367,8 @@ impl<'a> Parser<'a> {
                             self.pos
                         ));
                     }
-                    // Copy the full UTF-8 sequence for this char.
-                    let s = std::str::from_utf8(&self.chars[self.pos..])
-                        .map_err(|_| "invalid utf-8".to_string())?;
-                    let ch = s.chars().next().unwrap();
+                    // Decode just the one leading char (see doc comment).
+                    let ch = text[self.pos..].chars().next().unwrap();
                     out.push(ch);
                     self.pos += ch.len_utf8();
                 }
