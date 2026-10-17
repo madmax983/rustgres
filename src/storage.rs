@@ -5840,6 +5840,20 @@ pub struct ShellType {
 /// list (v1.32: SQL bodies may hold multiple statements; the executor
 /// runs them in order and takes the last statement's result).
 /// Re-parsed from `body` after WAL replay / checkpoint restore.
+/// v1.96: user-defined aggregate (CREATE AGGREGATE): a state
+/// transition function folded over the input rows, optionally
+/// finalized. Stored by (lowercased, possibly qualified) name.
+#[derive(Debug, Clone)]
+pub struct AggDef {
+    pub sfunc: String,
+    pub stype: String,
+    pub finalfunc: Option<String>,
+    pub initcond: Option<String>,
+    pub arg_types: Vec<String>,
+    /// v1.96: creating role (DROP AGGREGATE / privilege checks).
+    pub owner: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct FuncDef {
     pub name: String,
@@ -5858,6 +5872,10 @@ pub struct FuncDef {
     pub plpgsql: Option<crate::sql::PlpgsqlBody>,
     pub volatility: crate::sql::FuncVolatility,
     pub strict: bool,
+    /// v1.96: SECURITY DEFINER.
+    pub security_definer: bool,
+    /// v1.96: CREATE PROCEDURE (separate PG namespace from functions).
+    pub is_procedure: bool,
 }
 
 /// v1.38: a user-defined cast definition, keyed by (source, target)
@@ -5956,6 +5974,64 @@ pub struct Database {
     /// v0.11: database-level GRANT entries (CONNECT). Empty = default
     /// allow, matching a fresh PostgreSQL install's PUBLIC grant.
     pub db_acl: Vec<AclEntry>,
+    /// v1.96: the database's owning role (ALTER DATABASE ... OWNER
+    /// TO). pg_database_owner's sole implicit member. Transactional
+    /// via WriteOp::DbOwner; not checkpointed/WAL-logged in v1.96
+    /// (resets to the bootstrap owner on recovery — documented
+    /// hold-back, same class as ALTER DATABASE before this change,
+    /// which did not store it at all).
+    pub db_owner: String,
+    /// v1.96: per-schema ACLs (GRANT ON SCHEMA), keyed by schema
+    /// name. USAGE rides PRIV_USAGE, CREATE rides PRIV_REFERENCES
+    /// (the grant-parser's bit for CREATE). Transactional via
+    /// WriteOp::SchemaSet prev_acls; not checkpointed in v1.96.
+    pub schema_acls: std::collections::HashMap<String, Vec<AclEntry>>,
+    /// v1.96: ALTER DEFAULT PRIVILEGES entries for tables/sequences,
+    /// applied at CREATE time. Keyed by the creating role.
+    pub default_acls: Vec<DefaultAcl>,
+    /// v1.96: function EXECUTE ACL overrides, keyed by function name.
+    /// No entry = PG default (PUBLIC EXECUTE). Checkpointed (v22);
+    /// not WAL-logged (same class as user-defined casts).
+    pub fn_acls: HashMap<String, Vec<AclEntry>>,
+    /// v1.96: type USAGE ACL overrides, keyed by type name.
+    /// No entry = PG default (PUBLIC USAGE). Checkpointed (v22).
+    pub type_acls: HashMap<String, Vec<AclEntry>>,
+    /// v1.96: GRANT/REVOKE ON LANGUAGE (name -> ACL entries).
+    pub lang_acls: HashMap<String, Vec<AclEntry>>,
+    /// v1.96: function creator (DROP FUNCTION / GRANT permission).
+    pub fn_owners: HashMap<String, String>,
+    /// v1.96: user type/domain creator (GRANT ON TYPE permission).
+    pub type_owners: HashMap<String, String>,
+    /// v1.96: CREATE SCHEMA names (single-namespace engine; schemas
+    /// gate CREATE/DROP SCHEMA and ALTER DEFAULT PRIVILEGES IN SCHEMA
+    /// validation only).
+    pub schemas: Vec<String>,
+    /// v1.96: schema owners (pg_namespace.nspowner); absent = postgres.
+    pub schema_owners: std::collections::HashMap<String, String>,
+    /// v1.96 finishing pass: object -> schema attribution recorded at
+    /// CREATE time. Storage keys are unqualified (single-namespace
+    /// engine), so an object does not otherwise know which schema the
+    /// creating session's search_path placed it in. Consulted ONLY by
+    /// DROP SCHEMA CASCADE (which in PG removes the schema's
+    /// contents). Transactional via WriteOp::ObjSchemaSet;
+    /// checkpointed (CHKPT 23); not WAL-logged (same class as
+    /// `schemas` itself).
+    pub obj_schema: std::collections::HashMap<String, String>,
+    /// v1.96 finishing pass: CLUSTER state (table -> index it was
+    /// last clustered on) and typed-table associations (table ->
+    /// OF type). Runtime-only catalog facts PG keeps in pg_class /
+    /// pg_type; deliberately not WAL/checkpoint persisted (a restart
+    /// forgets them, which only narrows DDL acceptance).
+    pub cluster_marks: std::collections::HashMap<String, String>,
+    pub typed_tables: std::collections::HashMap<String, String>,
+    /// v1.96: large object contents (oid -> bytes) and owners.
+    /// v1.96: user-defined aggregates by name.
+    pub aggregates: std::collections::HashMap<String, AggDef>,
+    pub large_objects: std::collections::HashMap<i64, Vec<u8>>,
+    pub lo_owners: std::collections::HashMap<i64, String>,
+    /// v1.96: per-large-object ACL entries (SELECT/UPDATE bits).
+    pub lo_acls: std::collections::HashMap<i64, Vec<AclEntry>>,
+
     /// v0.37: next table OID to assign (`pg_class.oid`). Starts at
     /// `FIRST_USER_OID` (16384), like PG's `FirstNormalObjectId`.
     pub next_oid: u32,
@@ -6003,6 +6079,14 @@ pub struct ViewDef {
     pub security_invoker: bool,
     /// v1.95: WITH [LOCAL|CASCADED] CHECK OPTION present.
     pub check_option: bool,
+    /// v1.96: view ACL (GRANT SELECT/INSERT/... ON view). No default
+    /// PUBLIC access for views in PG.
+    pub acl: Vec<AclEntry>,
+    /// v1.96: materialized view (pg_class relkind 'm').
+    pub matview: bool,
+    /// v1.96: a matview created WITH NO DATA reads empty until a
+    /// REFRESH flips this.
+    pub populated: bool,
 }
 
 /// A sequence (v0.9). Bounds and parameters are transactional DDL;
@@ -6101,6 +6185,23 @@ impl Database {
             sequences: HashMap::default(),
             roles: HashMap::default(),
             db_acl: Vec::new(),
+            db_owner: "postgres".to_string(),
+            default_acls: Vec::new(),
+            fn_acls: HashMap::default(),
+            type_acls: HashMap::default(),
+            lang_acls: HashMap::default(),
+            fn_owners: HashMap::default(),
+            type_owners: HashMap::default(),
+            schemas: vec!["public".to_string(), "pg_catalog".to_string()],
+            schema_owners: std::collections::HashMap::default(),
+            obj_schema: std::collections::HashMap::default(),
+            cluster_marks: std::collections::HashMap::default(),
+            typed_tables: std::collections::HashMap::default(),
+            schema_acls: HashMap::default(),
+            aggregates: std::collections::HashMap::default(),
+            large_objects: std::collections::HashMap::default(),
+            lo_owners: std::collections::HashMap::default(),
+            lo_acls: std::collections::HashMap::default(),
             // v0.22: session-local TEMP tables live here, keyed by session id.
             temp_tables: HashMap::default(),
             temp_indexes: HashMap::default(),
@@ -6117,6 +6218,41 @@ impl Database {
         // v0.11: the bootstrap superuser always exists.
         db.roles
             .insert("postgres".to_string(), vec![Role::bootstrap_postgres()]);
+        // v1.96: seed the PG19 predefined roles (pg_authid.dat).
+        for name in PREDEFINED_ROLES {
+            let mut r = Role {
+                name: name.to_string(),
+                password: None,
+                can_login: false,
+                superuser: false,
+                bypassrls: false,
+                inherit: true,
+                createrole: false,
+                createdb: false,
+                replication: false,
+                connlimit: -1,
+                memberships: Vec::new(),
+                valid_until: None,
+                created_xmin: 0,
+                dropped_xmax: 0,
+            };
+            if *name == "pg_monitor" {
+                for parent in [
+                    "pg_read_all_settings",
+                    "pg_read_all_stats",
+                    "pg_stat_scan_tables",
+                ] {
+                    r.memberships.push(RoleMembership {
+                        role: parent.to_string(),
+                        grantor: "postgres".to_string(),
+                        admin: false,
+                        inherit: true,
+                        set: true,
+                    });
+                }
+            }
+            db.roles.insert(name.to_string(), vec![r]);
+        }
         db
     }
 
@@ -7274,6 +7410,22 @@ pub const PRIV_ALL_TABLE: u32 = PRIV_SELECT
 pub struct AclEntry {
     pub role: String,
     pub privs: u32,
+    /// v1.96: bits of `privs` held WITH GRANT OPTION.
+    pub grant_option: u32,
+    /// v1.96: role that made this grant (dependent-revoke checks).
+    /// Empty string = the object owner (implicit).
+    pub grantor: String,
+}
+
+impl AclEntry {
+    pub(crate) fn new(role: &str, privs: u32) -> Self {
+        AclEntry {
+            role: role.to_string(),
+            privs,
+            grant_option: 0,
+            grantor: String::new(),
+        }
+    }
 }
 
 /// v0.11: a column-level GRANT entry (`GRANT SELECT (a, b) ON t TO r`).
@@ -7284,6 +7436,23 @@ pub struct ColAclEntry {
     pub role: String,
     pub privs: u32,
     pub columns: Vec<String>,
+    /// v1.96: bits of `privs` held WITH GRANT OPTION.
+    pub grant_option: u32,
+    /// v1.96: role that made this grant; empty = owner.
+    pub grantor: String,
+}
+
+/// v1.96: one ALTER DEFAULT PRIVILEGES rule: objects of `kind`
+/// ('r' table / 'S' sequence) created by `creator` get `privs` for
+/// `grantee` merged into their ACL at CREATE time.
+#[derive(Clone, Debug)]
+pub struct DefaultAcl {
+    pub creator: String,
+    pub kind: char,
+    pub grantee: String,
+    pub privs: u32,
+    /// v1.96: IN SCHEMA target ("" = global rule, PG defaclnamespace 0).
+    pub schema: String,
 }
 
 /// A database role (v0.11). Versioned like tables so CREATE / DROP /
@@ -7302,6 +7471,16 @@ pub struct Role {
     /// row-level-security policy. Superusers bypass regardless (PG19
     /// `has_bypassrls_privilege`).
     pub bypassrls: bool,
+    /// v1.96: INHERIT attribute (PG19 `rolinherit`, default true): when
+    /// false, membership privileges are not inherited automatically.
+    pub inherit: bool,
+    /// v1.96: CREATEROLE / CREATEDB attributes (for pg_roles fidelity).
+    pub createrole: bool,
+    pub createdb: bool,
+    /// v1.96 (finishing pass): REPLICATION attribute (PG19
+    /// `rolreplication`). Parsed and stored for the PG19 role
+    /// permission rules and pg_roles fidelity.
+    pub replication: bool,
     /// -1 = unlimited, like PostgreSQL.
     pub connlimit: i32,
     /// Group roles this role is a member of (`GRANT group TO member`).
@@ -7325,6 +7504,41 @@ pub struct RoleMembership {
     pub role: String,
     /// The role that ran the GRANT (for pg_auth_members.grantor).
     pub grantor: String,
+    /// v1.96: WITH ADMIN OPTION (pg_auth_members.admin_option).
+    pub admin: bool,
+    /// v1.96: WITH INHERIT (pg_auth_members.inherit_option); None in
+    /// PG means "use the member's rolinherit" — we store the resolved
+    /// value at grant time except that a plain GRANT stores `true`
+    /// here and role_closure additionally ANDs the member's rolinherit.
+    pub inherit: bool,
+    /// v1.96: WITH SET (pg_auth_members.set_option): may SET ROLE.
+    pub set: bool,
+}
+
+/// v1.96: PG19 predefined roles (pg_authid.dat), seeded in every new
+/// database as non-login roles. `pg_monitor` is a default member of
+/// the three roles marked in PG's catalog.
+pub const PREDEFINED_ROLES: &[&str] = &[
+    "pg_database_owner",
+    "pg_read_all_data",
+    "pg_write_all_data",
+    "pg_monitor",
+    "pg_read_all_settings",
+    "pg_read_all_stats",
+    "pg_stat_scan_tables",
+    "pg_read_server_files",
+    "pg_write_server_files",
+    "pg_execute_server_program",
+    "pg_signal_backend",
+    "pg_checkpoint",
+    "pg_maintain",
+    "pg_use_reserved_connections",
+    "pg_create_subscription",
+    "pg_signal_autovacuum_worker",
+];
+
+pub fn is_predefined_role(name: &str) -> bool {
+    PREDEFINED_ROLES.contains(&name)
 }
 
 impl Role {
@@ -7338,6 +7552,10 @@ impl Role {
             superuser: true,
             // PG19: the bootstrap superuser's rolbypassrls is true.
             bypassrls: true,
+            inherit: true,
+            createrole: true,
+            createdb: true,
+            replication: true,
             connlimit: -1,
             memberships: Vec::new(),
             valid_until: None,
@@ -7384,6 +7602,69 @@ pub fn password_expired(valid_until: &Option<String>) -> bool {
 /// (PostgreSQL requires SET ROLE for those, which rustgres does not
 /// implement yet).
 pub fn role_closure(db: &Database, role: &str, snap: &Snapshot, own: u64) -> Vec<String> {
+    // v1.96: privilege inheritance follows a membership edge only when
+    // the EDGE has inherit_option (pg_auth_members.inherit_option).
+    // The member role's rolinherit attribute is NOT consulted here:
+    // in PG19 rolinherit is only the default applied when a new
+    // membership grant omits the INHERIT option — ALTER ROLE
+    // NOINHERIT does not retroactively disable existing edges
+    // (privileges.sql: DELETE FROM atest3 still works right after
+    // ALTER ROLE regress_priv_user1 NOINHERIT). The direct role
+    // itself is always in the closure.
+    let mut out = vec![role.to_string()];
+    let mut i = 0;
+    while i < out.len() {
+        let name = out[i].clone();
+        i += 1;
+        if let Some(r) = db.find_role(&name, snap, own) {
+            for m in &r.memberships {
+                if !m.inherit {
+                    continue;
+                }
+                if !out.iter().any(|n| n == &m.role) {
+                    out.push(m.role.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// v1.96: SET ROLE reachability (auth.c IsMemberOfRoleWithOption
+/// with ROLEOPTION_SET): `target` is reachable from `role` by
+/// following membership edges whose set_option is true.
+pub fn member_can_set_role(
+    db: &Database,
+    role: &str,
+    target: &str,
+    snap: &Snapshot,
+    own: u64,
+) -> bool {
+    let mut stack = vec![role.to_string()];
+    let mut seen: Vec<String> = Vec::new();
+    while let Some(cur) = stack.pop() {
+        if cur == target {
+            return true;
+        }
+        if seen.contains(&cur) {
+            continue;
+        }
+        seen.push(cur.clone());
+        if let Some(r) = db.find_role(&cur, snap, own) {
+            for m in &r.memberships {
+                if m.set {
+                    stack.push(m.role.clone());
+                }
+            }
+        }
+    }
+    false
+}
+
+/// v1.96: full membership closure ignoring inherit options (pg_has_role
+/// MEMBER semantics: direct or transitive membership regardless of
+/// inherit/set options).
+pub fn membership_closure(db: &Database, role: &str, snap: &Snapshot, own: u64) -> Vec<String> {
     let mut out = vec![role.to_string()];
     let mut i = 0;
     while i < out.len() {
@@ -7423,6 +7704,41 @@ pub fn table_privs_in(
         return PRIV_ALL_TABLE;
     }
     let mut privs = 0u32;
+    // v1.96: a role that inherits the OWNING role holds the owner's
+    // own ACL item (materialized at first GRANT/REVOKE; absent =
+    // all privileges). pg_database_owner as owner resolves through
+    // the database's owning role.
+    {
+        let eff_owner: &str = if t.owner == "pg_database_owner" {
+            db.db_owner.as_str()
+        } else {
+            t.owner.as_str()
+        };
+        if closure.iter().any(|n| n == eff_owner) {
+            let owner_item = t
+                .acl
+                .iter()
+                .find(|e| e.role == t.owner && (e.grantor.is_empty() || e.grantor == t.owner));
+            privs |= match owner_item {
+                Some(e) => e.privs,
+                None => PRIV_ALL_TABLE,
+            };
+        }
+    }
+    // v1.96: predefined data roles (PG19 aclchk.c IsCatalogNamespace
+    // analogues): pg_read_all_data gets SELECT on every table,
+    // pg_write_all_data gets INSERT/UPDATE/DELETE.
+    if closure.iter().any(|n| n == "pg_read_all_data") {
+        privs |= PRIV_SELECT;
+    }
+    if closure.iter().any(|n| n == "pg_write_all_data") {
+        privs |= PRIV_INSERT | PRIV_UPDATE | PRIV_DELETE;
+    }
+    // v1.96: pg_maintain members hold MAINTAIN on every table
+    // (aclchk.c ACL_MAINTAIN special case).
+    if closure.iter().any(|n| n == "pg_maintain") {
+        privs |= 512;
+    }
     for e in &t.acl {
         // v1.95: grants TO PUBLIC (ACL_ID_PUBLIC) apply to every role.
         if e.role == "public" || closure.iter().any(|n| n == &e.role) {
@@ -7486,13 +7802,37 @@ pub fn has_col_priv(
 
 /// Effective USAGE bits `role` holds on sequence `s`.
 pub fn sequence_privs(db: &Database, role: &str, s: &Sequence, snap: &Snapshot, own: u64) -> u32 {
-    if is_superuser_snap(db, role, snap, own) || s.owner == role {
-        return PRIV_USAGE;
+    if is_superuser_snap(db, role, snap, own) {
+        return PRIV_USAGE | PRIV_SELECT | PRIV_UPDATE;
+    }
+    if s.owner == role {
+        // v1.96 finishing pass: the owner's own ACL item is
+        // authoritative once materialized (acldefault gives
+        // USAGE|SELECT|UPDATE before any GRANT/REVOKE touches it;
+        // REVOKE ALL ... FROM owner must actually deny setval).
+        let mut found = false;
+        let mut p = 0u32;
+        for e in &s.acl {
+            if e.role == role {
+                found = true;
+                p |= e.privs;
+            }
+        }
+        if found {
+            return p;
+        }
+        return PRIV_USAGE | PRIV_SELECT | PRIV_UPDATE;
     }
     let closure = role_closure(db, role, snap, own);
     let mut privs = 0u32;
+    if closure.iter().any(|n| n == "pg_read_all_data") {
+        privs |= PRIV_SELECT;
+    }
+    if closure.iter().any(|n| n == "pg_write_all_data") {
+        privs |= PRIV_UPDATE;
+    }
     for e in &s.acl {
-        if closure.iter().any(|n| n == &e.role) {
+        if e.role == "public" || closure.iter().any(|n| n == &e.role) {
             privs |= e.privs;
         }
     }
@@ -7722,6 +8062,52 @@ pub enum WriteOp {
     /// ACL for undo; the record logs the new full ACL.
     DbAcl {
         prev: Vec<AclEntry>,
+    },
+    /// v1.96: ALTER DEFAULT PRIVILEGES. Undo carries the previous rules.
+    DefaultAcls {
+        prev: Vec<DefaultAcl>,
+    },
+    /// v1.96: GRANT/REVOKE ON FUNCTION / ON TYPE (fn_acls/type_acls
+    /// maps replaced wholesale; checkpointed, not WAL-logged).
+    FnTypeAcls {
+        prev_fn: std::collections::HashMap<String, Vec<AclEntry>>,
+        prev_type: std::collections::HashMap<String, Vec<AclEntry>>,
+        prev_lang: std::collections::HashMap<String, Vec<AclEntry>>,
+        prev_fn_owners: std::collections::HashMap<String, String>,
+        prev_type_owners: std::collections::HashMap<String, String>,
+    },
+    /// v1.96 finishing pass: obj_schema map replaced wholesale.
+    ObjSchemaSet {
+        prev: std::collections::HashMap<String, String>,
+    },
+    /// v1.96: CREATE/DROP SCHEMA (schema name list replaced wholesale).
+    SchemaSet {
+        prev: Vec<String>,
+        /// v1.96: previous schema-owner map.
+        prev_owners: std::collections::HashMap<String, String>,
+        /// v1.96: previous schema-ACL map.
+        prev_acls: std::collections::HashMap<String, Vec<AclEntry>>,
+    },
+    /// v1.96: ALTER DATABASE ... OWNER TO (previous owning role).
+    DbOwner {
+        prev: String,
+    },
+    /// v1.96: large object create/write/unlink (maps replaced
+    /// wholesale; LOs are small in the parity workloads).
+    LargeObjects {
+        prev: std::collections::HashMap<i64, Vec<u8>>,
+        prev_owners: std::collections::HashMap<i64, String>,
+        /// v1.96: previous LO ACL map.
+        prev_acls: std::collections::HashMap<i64, Vec<AclEntry>>,
+    },
+    /// v1.96: GRANT/REVOKE on a view + REFRESH MATERIALIZED VIEW
+    /// populated flag (the live ViewDef's acl/populated replaced).
+    ViewState {
+        name: String,
+        prev_acl: Vec<AclEntry>,
+        prev_populated: bool,
+        /// v1.96: previous owner (empty = leave owner unchanged).
+        prev_owner: String,
     },
     // --- v1.05: the lazy toast-table safety net links the new toast
     // table OID onto the main table (`pg_class.reltoastrelid`). The
@@ -8159,11 +8545,20 @@ pub fn undo_write_op(eng: &mut Engine, owns: &[u64], op: &WriteOp) {
         }
         WriteOp::AlterSequence { name, prev } => {
             if let Some(versions) = eng.db.sequences.get_mut(name) {
+                // v1.96: remove our pushed version first (see
+                // AlterRole undo), then restore prev — pushing it
+                // back when it was itself this txn's version.
+                versions.retain(|s| !owns.contains(&s.created_xmin));
+                let mut restored = false;
                 for s in versions.iter_mut() {
                     if s.created_xmin == prev.created_xmin {
                         *s = prev.clone();
+                        restored = true;
                         break;
                     }
+                }
+                if !restored {
+                    versions.push(prev.clone());
                 }
             }
         }
@@ -8211,16 +8606,89 @@ pub fn undo_write_op(eng: &mut Engine, owns: &[u64], op: &WriteOp) {
         }
         WriteOp::AlterRole { name, prev } => {
             if let Some(versions) = eng.db.roles.get_mut(name) {
+                // v1.96: drop the version this transaction pushed
+                // first (like AlterTable) — otherwise it stays
+                // "visible" to later snapshots, whose active set no
+                // longer contains the aborted xid, and rollback of
+                // a role swap (e.g. REVOKE ... in a txn) leaks.
+                versions.retain(|r| !owns.contains(&r.created_xmin));
+                // v1.96: prev may itself be an uncommitted version
+                // of THIS transaction (role altered twice in one
+                // txn, savepoint rollback): retain just removed it,
+                // so push it back when no survivor carries its xmin
+                // (the AlterTable undo shape) — otherwise the role
+                // vanishes entirely ("role does not exist").
+                let mut restored = false;
                 for r in versions.iter_mut() {
                     if r.created_xmin == prev.created_xmin {
                         *r = prev.clone();
+                        restored = true;
                         break;
                     }
+                }
+                if !restored {
+                    versions.push(prev.clone());
                 }
             }
         }
         WriteOp::DbAcl { prev } => {
             eng.db.db_acl = prev.clone();
+        }
+        WriteOp::DefaultAcls { prev } => {
+            eng.db.default_acls = prev.clone();
+        }
+        WriteOp::FnTypeAcls {
+            prev_fn,
+            prev_type,
+            prev_lang,
+            prev_fn_owners,
+            prev_type_owners,
+        } => {
+            eng.db.fn_acls = prev_fn.clone();
+            eng.db.type_acls = prev_type.clone();
+            eng.db.lang_acls = prev_lang.clone();
+            eng.db.fn_owners = prev_fn_owners.clone();
+            eng.db.type_owners = prev_type_owners.clone();
+        }
+        WriteOp::SchemaSet {
+            prev,
+            prev_owners,
+            prev_acls,
+        } => {
+            eng.db.schemas = prev.clone();
+            eng.db.schema_owners = prev_owners.clone();
+            eng.db.schema_acls = prev_acls.clone();
+        }
+        WriteOp::ObjSchemaSet { prev } => {
+            eng.db.obj_schema = prev.clone();
+        }
+        WriteOp::DbOwner { prev } => {
+            eng.db.db_owner = prev.clone();
+        }
+        WriteOp::LargeObjects {
+            prev,
+            prev_owners,
+            prev_acls,
+        } => {
+            eng.db.large_objects = prev.clone();
+            eng.db.lo_owners = prev_owners.clone();
+            eng.db.lo_acls = prev_acls.clone();
+        }
+        WriteOp::ViewState {
+            name,
+            prev_acl,
+            prev_populated,
+            prev_owner,
+        } => {
+            if let Some(vs) = eng.db.views.get_mut(name) {
+                for v in vs.iter_mut() {
+                    v.acl = prev_acl.clone();
+                    v.populated = *prev_populated;
+                    if !prev_owner.is_empty() {
+                        v.owner = prev_owner.clone();
+                    }
+                }
+            }
         }
         // --- v1.05: undo the lazy reltoastrelid link, but only if the
         // version still carries the value we set (conditional like the

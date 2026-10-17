@@ -639,6 +639,11 @@ pub(crate) fn run_func_body(
     // Run the body one query level deeper (fresh CTE scope, like a
     // subquery); the caller's scopes stay visible for outer refs.
     let mut call_q = Q {
+        // v1.96: inherit the caller's definer override (SECURITY
+        // DEFINER set it on `q` in call_user_function); dropping it
+        // made every definer-function body check privileges as the
+        // invoker instead of the owner.
+        priv_role_override: q.priv_role_override.clone(),
         eng: &mut *q.eng,
         snap: q.snap,
         own: q.own,
@@ -688,6 +693,16 @@ pub(crate) fn run_func_body(
             }
             Stmt::Insert { .. } | Stmt::Update { .. } | Stmt::Delete { .. } => {
                 last_out = Some(run_func_dml(&mut call_q, &stmt, &fdef.name)?);
+            }
+            // v1.96: GRANT/REVOKE (object and role) body statements
+            // in void functions/procedures (PG19 executes them like
+            // any body statement; the privileges suite's
+            // dogrant_ok/unwanted_grant pattern rides on this).
+            Stmt::Grant { .. }
+            | Stmt::Revoke { .. }
+            | Stmt::GrantRole { .. }
+            | Stmt::RevokeRole { .. } => {
+                last_out = Some(run_func_utility(&mut call_q, &stmt, &fdef.name)?);
             }
             // Unreachable: CREATE validated every body statement is
             // SELECT/INSERT/UPDATE/DELETE (0A000 otherwise).
@@ -763,7 +778,10 @@ pub(crate) fn run_nested_dml(
         level: w.level,
         writes: &mut *w.writes,
         session: call_q.session,
-        role: call_q.role,
+        // v1.96: nested statements inside a SECURITY DEFINER
+        // function run as the function owner (PG19 definer rights
+        // apply to DML/utility, not just SELECT checks).
+        role: call_q.priv_role_override.as_deref().unwrap_or(call_q.role),
         read_only: call_q.read_only,
         default_toast_compression: w.default_toast_compression,
         notices: Vec::new(),
@@ -781,6 +799,56 @@ pub(crate) fn run_nested_dml(
         _ => Err(exec_err(
             "XX000",
             format!("{} body DML did not produce a DML result", what),
+        )),
+    }
+}
+
+/// v1.96: run a GRANT/REVOKE body statement (object or role) from
+/// inside a SQL function body, through the same StmtCtx-from-Q
+/// construction as nested DML. The result is an empty SelectOut
+/// (utility statements produce no function result rows).
+pub(crate) fn run_func_utility(
+    call_q: &mut Q,
+    stmt: &Stmt,
+    func_name: &str,
+) -> Result<SelectOut, ExecError> {
+    let Some(w) = call_q.write.as_mut().map(QWrite::reborrow) else {
+        return Err(exec_err(
+            "0A000",
+            format!(
+                "GRANT/REVOKE is not supported in function \"{}\" here: the calling query level has no statement write context",
+                func_name
+            ),
+        ));
+    };
+    let mut ctx = StmtCtx {
+        snap: call_q.snap,
+        own: call_q.own,
+        write_xid: w.write_xid,
+        all_xids: call_q.all_xids.clone(),
+        level: w.level,
+        writes: &mut *w.writes,
+        session: call_q.session,
+        role: call_q.priv_role_override.as_deref().unwrap_or(call_q.role),
+        read_only: call_q.read_only,
+        default_toast_compression: w.default_toast_compression,
+        notices: Vec::new(),
+    };
+    let out = execute_inner(&mut *call_q.eng, &mut ctx, stmt)?;
+    for msg in ctx.notices.drain(..) {
+        push_notice(msg);
+    }
+    match out {
+        ExecResult::Command { .. } => Ok(SelectOut {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        }),
+        _ => Err(exec_err(
+            "XX000",
+            format!(
+                "function \"{}\" body utility statement produced an unexpected result",
+                func_name
+            ),
         )),
     }
 }
@@ -875,7 +943,18 @@ pub(crate) fn run_plpgsql_stmts(
     run: &mut PlpgsqlRun,
     ret_type: &str,
 ) -> Result<PlFlow, ExecError> {
-    for s in stmts {
+    for (idx, s) in stmts.iter().enumerate() {
+        // v1.96 finishing pass: reaching the parser-appended dummy
+        // RETURN on the body's main list is falling off the end,
+        // not a RETURN NULL (PG19 reports 2F005 for non-void
+        // functions; the caller decides).
+        if pb.trailing_dummy
+            && std::ptr::eq(stmts, pb.stmts.as_slice())
+            && idx + 1 == stmts.len()
+            && matches!(s, crate::sql::PlpgsqlStmt::Return(_))
+        {
+            return Ok(PlFlow::Continue);
+        }
         match s {
             crate::sql::PlpgsqlStmt::Return(sel) => {
                 let out = run_plpgsql_select(q, scopes, sel, run, "RETURN")?;
@@ -883,16 +962,79 @@ pub(crate) fn run_plpgsql_stmts(
             }
             crate::sql::PlpgsqlStmt::Utility(u) => {
                 // Utility statements execute for side effects; results
-                // are discarded. Only ANALYZE is in the bounded subset
-                // (enforced at CREATE); anything else is a corrupt
-                // catalog entry.
-                let crate::sql::Stmt::Analyze { table } = u else {
-                    return Err(exec_err(
-                        "XX000",
-                        "unsupported utility statement in plpgsql body".to_string(),
-                    ));
+                // are discarded. ANALYZE has a direct core entry;
+                // GRANT/REVOKE forms run through the generic utility
+                // path (v1.96).
+                if let crate::sql::Stmt::Analyze { table } = u {
+                    let mut dummy_notices = Vec::new();
+                    exec_analyze_core(
+                        &mut *q.eng,
+                        q.snap,
+                        q.own,
+                        q.session,
+                        q.role,
+                        table,
+                        &mut dummy_notices,
+                    )?;
+                } else {
+                    run_func_utility(q, u, "<plpgsql body>")?;
+                }
+            }
+            crate::sql::PlpgsqlStmt::Execute(sel) => {
+                // v1.96: EXECUTE <expr> — evaluate to the command
+                // string, parse it, and run it as a utility statement
+                // (side effects only; result rows are discarded in
+                // this bounded subset via the Command-only check in
+                // run_func_utility).
+                let out = run_plpgsql_select(q, scopes, sel, run, "EXECUTE")?;
+                let v = out
+                    .rows
+                    .first()
+                    .map(|r| r[0].clone())
+                    .unwrap_or(Value::Null);
+                if v == Value::Null {
+                    return Err(exec_err("22004", "EXECUTE string is null".to_string()));
+                }
+                let text = match eval_cast(&v, ColType::Text)? {
+                    Value::Text(s) | Value::BpChar(s) => s.to_string(),
+                    _ => {
+                        return Err(exec_err(
+                            "XX000",
+                            "EXECUTE expression did not produce text".to_string(),
+                        ));
+                    }
                 };
-                exec_analyze_core(&mut *q.eng, q.snap, q.own, q.session, q.role, table)?;
+                let stmt = crate::sql::parse_statement_inner(&text).map_err(sql_err)?;
+                run_func_utility(q, &stmt, "<plpgsql body>")?;
+            }
+            crate::sql::PlpgsqlStmt::Perform(sel) => {
+                // v1.96: PERFORM <expr> — evaluate for side effects,
+                // discard the result.
+                let _ = run_plpgsql_select(q, scopes, sel, run, "PERFORM")?;
+            }
+            crate::sql::PlpgsqlStmt::Assert { cond, message } => {
+                // v1.96: ASSERT — P0004 when the condition is not
+                // true (false OR NULL), message from the optional
+                // second expression (PG pl_exec.c exec_stmt_assert).
+                let out = run_plpgsql_select(q, scopes, cond, run, "ASSERT")?;
+                let ok = matches!(
+                    out.rows.first().and_then(|r| r.first()),
+                    Some(Value::Bool(true))
+                );
+                if !ok {
+                    let msg = match message {
+                        Some(m) => {
+                            let mout = run_plpgsql_select(q, scopes, m, run, "ASSERT")?;
+                            match mout.rows.first().and_then(|r| r.first()) {
+                                Some(Value::Text(s)) | Some(Value::BpChar(s)) => s.to_string(),
+                                Some(other) => format!("{:?}", other),
+                                _ => "assertion failed".to_string(),
+                            }
+                        }
+                        None => "assertion failed".to_string(),
+                    };
+                    return Err(exec_err("P0004", msg));
+                }
             }
             crate::sql::PlpgsqlStmt::Raise {
                 level,
@@ -919,7 +1061,9 @@ pub(crate) fn run_plpgsql_stmts(
                 }
                 let msg = format_raise_message(format, &vals);
                 match level {
-                    crate::sql::RaiseLevel::Notice => push_notice(msg),
+                    crate::sql::RaiseLevel::Notice | crate::sql::RaiseLevel::Warning => {
+                        push_notice(msg)
+                    }
                     crate::sql::RaiseLevel::Exception => {
                         return Err(exec_err("P0001", msg));
                     }
@@ -1031,6 +1175,8 @@ pub(crate) fn run_plpgsql_body(
     // Run the body one query level deeper (fresh CTE scope, like a
     // subquery); the caller's scopes stay visible for outer refs.
     let mut call_q = Q {
+        // v1.96: inherit the definer override (see run_func_body).
+        priv_role_override: q.priv_role_override.clone(),
         eng: &mut *q.eng,
         snap: q.snap,
         own: q.own,
@@ -1085,13 +1231,31 @@ pub(crate) fn run_plpgsql_body(
         PlFlow::Return(out) => Ok(out),
         PlFlow::Continue => {
             // v1.03: SETOF bodies fall off the end and return the
-            // accumulated RETURN NEXT rows (possibly zero). Scalar
-            // bodies cannot reach here: the parser appends an implicit
-            // `RETURN NULL`.
+            // accumulated RETURN NEXT rows (possibly zero).
+            // v1.96 finishing pass: scalar bodies reach here by
+            // falling off the end (the parser's dummy RETURN is
+            // reported as Continue by run_plpgsql_stmts). PG19:
+            // void and trigger functions may fall off; any other
+            // scalar function is 2F005.
             if !fdef.returns_set {
+                if fdef.ret_type.eq_ignore_ascii_case("void")
+                    || fdef.ret_type.eq_ignore_ascii_case("trigger")
+                {
+                    let coltype = resolve_func_type_name(
+                        call_q.eng,
+                        call_q.snap,
+                        call_q.own,
+                        call_q.session,
+                        &fdef.ret_type,
+                    )?;
+                    return Ok(SelectOut {
+                        columns: vec![(fdef.name.clone(), coltype)],
+                        rows: vec![crate::storage::Row::new(vec![Value::Null])],
+                    });
+                }
                 return Err(exec_err(
-                    "XX000",
-                    "plpgsql statement list ended without RETURN".to_string(),
+                    "2F005",
+                    "control reached end of function without RETURN".to_string(),
                 ));
             }
             let coltype = resolve_func_type_name(
@@ -1130,7 +1294,28 @@ pub(crate) fn call_user_function(
             ),
         ));
     }
-    let out = run_func_body(q, scopes, fdef, args, volatile_pending(q, fdef))?;
+    // v1.96: SECURITY DEFINER — the body executes with the function
+    // owner's privileges (priv checks consult priv_role_override).
+    let saved_override = q.priv_role_override.clone();
+    if fdef.security_definer {
+        q.priv_role_override = Some(
+            q.eng
+                .db
+                .fn_owners
+                .get(&fdef.name)
+                .cloned()
+                .unwrap_or_else(|| "postgres".to_string()),
+        );
+    }
+    let out = run_func_body(q, scopes, fdef, args, volatile_pending(q, fdef));
+    q.priv_role_override = saved_override;
+    let out = out?;
+    // v1.96: procedures and void functions have no return value —
+    // the body's result rows are discarded (PG19), never coerced
+    // to a "void" type.
+    if fdef.is_procedure || fdef.ret_type.eq_ignore_ascii_case("void") {
+        return Ok(Value::Null);
+    }
     if out.rows.is_empty() && out.columns.is_empty() {
         // STRICT-on-NULL short-circuit from run_func_body.
         return Ok(Value::Null);
@@ -1357,11 +1542,94 @@ pub(crate) fn eval_internal_function(symbol: &str, args: &[Value]) -> Result<Val
                 )),
             }
         }
+        // v1.96: the fmgr comparison family (<type><eq|ne|lt|le|gt|ge>)
+        // evaluates through the generic value ordering — this is
+        // what LANGUAGE internal definitions like leak(... AS
+        // 'int4lt') ride on.
+        _ if internal_cmp_symbol(symbol).is_some() => {
+            let op = internal_cmp_symbol(symbol).unwrap();
+            if args.len() != 2 {
+                return Err(exec_err(
+                    "42883",
+                    format!(
+                        "function {} expects 2 arguments, got {}",
+                        symbol,
+                        args.len()
+                    ),
+                ));
+            }
+            match (&args[0], &args[1]) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (a, b) => {
+                    let ord = cmp_ordering(a, b, CmpOp::Eq)?;
+                    Ok(match ord {
+                        None => Value::Null,
+                        Some(o) => Value::Bool(match op {
+                            CmpOp::Eq => o == Ordering::Equal,
+                            CmpOp::Ne => o != Ordering::Equal,
+                            CmpOp::Lt => o == Ordering::Less,
+                            CmpOp::Le => o != Ordering::Greater,
+                            CmpOp::Gt => o == Ordering::Greater,
+                            CmpOp::Ge => o != Ordering::Less,
+                            CmpOp::ImageEq => o == Ordering::Equal,
+                        }),
+                    })
+                }
+            }
+        }
         _ => Err(exec_err(
             "0A000",
             format!("internal function symbol \"{}\" is not implemented", symbol),
         )),
     }
+}
+
+/// v1.96: recognize fmgr comparison symbols `<base><op>` for the
+/// scalar families (PG19 fmgr builtins: int2eq, textlt, ...).
+pub(crate) fn internal_cmp_symbol(symbol: &str) -> Option<CmpOp> {
+    const BASES: &[&str] = &[
+        "int2",
+        "int4",
+        "int8",
+        "float4",
+        "float8",
+        "text",
+        "bpchar",
+        "name",
+        "bool",
+        "date",
+        "time",
+        "timetz",
+        "timestamp",
+        "timestamptz",
+        "interval",
+        "numeric",
+        "oid",
+        "uuid",
+        "varchar",
+        "char",
+        "money",
+        "inet",
+        "cidr",
+        "macaddr",
+        "bit",
+        "varbit",
+    ];
+    for (suffix, op) in [
+        ("eq", CmpOp::Eq),
+        ("ne", CmpOp::Ne),
+        ("lt", CmpOp::Lt),
+        ("le", CmpOp::Le),
+        ("gt", CmpOp::Gt),
+        ("ge", CmpOp::Ge),
+    ] {
+        if let Some(base) = symbol.strip_suffix(suffix) {
+            if BASES.contains(&base) {
+                return Some(op);
+            }
+        }
+    }
+    None
 }
 
 /// v0.95: parameter names for builtins that accept `name => expr`
@@ -1928,11 +2196,15 @@ pub(crate) fn eval_func(
             "session_user" => {
                 return Ok(Value::text(crate::exec::session_user_name(q.role)));
             }
-            "current_catalog" => {
+            "current_catalog" | "current_database" => {
                 return Ok(Value::text("postgres".to_string()));
             }
             _ => {}
         }
+    }
+    // v1.96: privilege/ACL function family (needs the live catalog).
+    if let Some(r) = eval_priv_func(q, scopes, name, args) {
+        return r;
     }
     // v0.97: pg_typeof is statically typed (PG19 resolves it at parse
     // analysis): a cast to a domain, or a reference to a domain-typed
@@ -2246,6 +2518,50 @@ pub(crate) fn eval_func(
             }
         }
         if let Some(fdef) = resolve_function_overload(q.eng, name, &raw_vals) {
+            // v1.96 finishing pass: a PROCEDURE reached through a
+            // function-call expression is PG19's 42809 — procedures
+            // are invoked with CALL, never from SELECT.
+            if fdef.is_procedure {
+                let tys = raw_vals
+                    .iter()
+                    .map(|v| {
+                        if matches!(v, Value::Null) {
+                            "unknown".to_string()
+                        } else {
+                            v.col_type().sql_name().to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(exec_err(
+                    "42809",
+                    format!("{}({}) is a procedure", name, tys),
+                ));
+            }
+            // v1.96: EXECUTE privilege on user functions (PG19
+            // aclcheck at parse time): the effective role needs the
+            // EXECUTE bit (PUBLIC default) unless owner/superuser.
+            {
+                let eff: &str = q.priv_role_override.as_deref().unwrap_or(q.role);
+                let owner = q
+                    .eng
+                    .db
+                    .fn_owners
+                    .get(&fdef.name)
+                    .cloned()
+                    .unwrap_or_else(|| "postgres".to_string());
+                if eff != owner.as_str()
+                    && !crate::storage::is_superuser_snap(&q.eng.db, eff, q.snap, q.own)
+                {
+                    let privs = function_privs_for(&q.eng.db, eff, &fdef.name, q.snap, q.own);
+                    if privs & crate::storage::PRIV_USAGE != crate::storage::PRIV_USAGE {
+                        return Err(exec_err(
+                            "42501",
+                            format!("permission denied for function {}", fdef.name),
+                        ));
+                    }
+                }
+            }
             // v1.36: IMMUTABLE SQL-function constant folding (PG19
             // `evaluate_function`, optimizer/util/clauses.c:5205). The
             // arguments above were evaluated per row exactly as before —
@@ -4117,7 +4433,21 @@ pub(crate) fn populate_fields(
                 Some(b) => b.clone(),
                 None => Value::Null,
             },
-            Some(JsonbVal::Null) => Value::Null,
+            // v1.96 finishing pass: an explicit JSON null still
+            // runs a DOMAIN field's constraint checks (PG19
+            // populate_domain rejects null for a NOT NULL
+            // domain); other field kinds take the null directly.
+            Some(JsonbVal::Null) => {
+                let is_domain = f
+                    .named
+                    .as_ref()
+                    .is_some_and(|n| q.eng.db.types.get(n).is_some_and(|st| st.domain.is_some()));
+                if is_domain {
+                    populate_typed(q, f, base_val, &JsonbVal::Null)?
+                } else {
+                    Value::Null
+                }
+            }
             Some(v) => populate_typed(q, f, base_val, v)?,
         });
     }
@@ -4133,6 +4463,49 @@ pub(crate) fn populate_typed(
     base: Option<&Value>,
     jsv: &JsonbVal,
 ) -> Result<Value, ExecError> {
+    let v = populate_typed_inner(q, f, base, jsv)?;
+    // v1.96 finishing pass: a field declared with a DOMAIN type
+    // must satisfy the domain's constraints on the populated
+    // value (PG19 populate_domain: NOT NULL and CHECKs run; the
+    // _valid variant turns the error into false).
+    if let Some(n) = &f.named {
+        let is_domain = q.eng.db.types.get(n).is_some_and(|st| st.domain.is_some());
+        if is_domain {
+            crate::exec::constraint::check_domain_value(q, n, &v, false)?;
+        }
+    }
+    Ok(v)
+}
+
+pub(crate) fn populate_typed_inner(
+    q: &mut Q,
+    f: &PopField,
+    base: Option<&Value>,
+    jsv: &JsonbVal,
+) -> Result<Value, ExecError> {
+    // v1.96 finishing pass: a field whose declared type is a
+    // DOMAIN rides the Composite marker (see ddl_types), but it
+    // populates as the domain's base type; the wrapper applies
+    // the domain constraint check to the result.
+    if f.ty == ColType::Composite {
+        if let Some(n) = &f.named {
+            let base_ty = q
+                .eng
+                .db
+                .types
+                .get(n)
+                .and_then(|st| st.domain.as_ref().map(|d| d.base.clone()));
+            if let Some(base_ty) = base_ty {
+                let inner = PopField {
+                    name: f.name.clone(),
+                    ty: base_ty,
+                    named: f.named.clone(),
+                    sub: None,
+                };
+                return populate_typed_inner(q, &inner, base, jsv);
+            }
+        }
+    }
     // PG's scalar hack: a JSON string for an ARRAY or COMPOSITE field
     // is fed to the type's input function as text.
     if let JsonbVal::Str(s) = jsv {
@@ -10746,6 +11119,26 @@ pub(crate) fn func_result_type(
     outer: &[&[QCol]],
     ctes: &[CteDef],
 ) -> Result<ColType, ExecError> {
+    // v1.96: user-defined aggregates — result type is the final
+    // function's return type, else the state type.
+    {
+        let base = name.rsplit('.').next().unwrap_or(name);
+        if let Some(def) = eng
+            .db
+            .aggregates
+            .get(name)
+            .or_else(|| eng.db.aggregates.get(base))
+        {
+            if let Some(ff) = &def.finalfunc {
+                if let Some(fdefs) = eng.db.functions.get(ff) {
+                    if let Some(fd) = fdefs.first() {
+                        return resolve_func_type_name(eng, snap, own, session, &fd.ret_type);
+                    }
+                }
+            }
+            return resolve_func_type_name(eng, snap, own, session, &def.stype);
+        }
+    }
     let arg0 = || expr_type(eng, snap, own, session, schemas, outer, ctes, &args[0]);
     // v1.88: range constructors and bound functions (static types).
     if let Some(e) = super::ranges::builtin_range_elem(name) {
@@ -11148,9 +11541,24 @@ pub(crate) fn func_result_type(
             Ok(ColType::Timestamptz)
         }
         "current_date" => Ok(ColType::Date),
-        "current_user" | "current_role" | "session_user" | "current_catalog" | "user" => {
-            Ok(ColType::Text)
+        "current_user" | "current_role" | "session_user" | "current_catalog"
+        | "current_database" | "user" => Ok(ColType::Text),
+        // v1.96: privilege/ACL family result types.
+        "has_table_privilege" | "has_column_privilege" | "has_sequence_privilege"
+        | "has_database_privilege" | "has_schema_privilege" | "has_function_privilege"
+        | "has_type_privilege" | "has_parameter_privilege" | "has_any_column_privilege"
+        | "has_largeobject_privilege" | "pg_has_role" | "aclcontains" => Ok(ColType::Bool),
+        "current_setting" | "makeaclitem" | "pg_get_userbyid" => Ok(ColType::Text),
+        // v1.96: large-object family result types.
+        "lo_create" | "lo_creat" | "lo_open" | "lo_close" | "lowrite" | "lo_truncate"
+        | "lo_unlink" | "lo_from_bytea" | "lo_put" => Ok(ColType::Int),
+        "lo_tell" | "lo_lseek" | "lo_tell64" | "lo_lseek64" | "lo_truncate64" => {
+            Ok(ColType::BigInt)
         }
+        "loread" | "lo_get" => Ok(ColType::Bytea),
+        "acldefault" => Ok(ColType::Text),
+        // v1.96: pg_get_acl returns aclitem[] (unnest-able).
+        "pg_get_acl" => Ok(ColType::Array(crate::storage::ArrayElem::Text)),
         "date_trunc" => match expr_type(eng, snap, own, session, schemas, outer, ctes, &args[1])? {
             ColType::Timestamptz => Ok(ColType::Timestamptz),
             // v1.86: interval truncates to interval.
@@ -11363,6 +11771,13 @@ pub(crate) fn compare_values(
         (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
         // v0.36: PG's "char" ordering is a plain byte comparison.
         (Value::SingleChar(x), Value::SingleChar(y)) => x.cmp(y),
+        // v1.96: "char" vs text ordering (char casts to text).
+        (Value::SingleChar(x), Value::Text(s)) | (Value::SingleChar(x), Value::BpChar(s)) => {
+            crate::storage::char_out(*x).cmp(&s.to_string())
+        }
+        (Value::Text(s), Value::SingleChar(y)) | (Value::BpChar(s), Value::SingleChar(y)) => {
+            s.to_string().cmp(&crate::storage::char_out(*y))
+        }
         // v0.82: PG19 record ordering for ORDER BY — lexicographic over
         // fields with NULL sorting larger (PG's default ASC NULLS LAST),
         // mirroring `cmp_records`' comparison semantics as a total order.

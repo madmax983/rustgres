@@ -2017,6 +2017,12 @@ pub struct SelectStmt {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     pub for_update: bool,
+    /// v1.96 finishing pass: ANY locking clause was written
+    /// (FOR UPDATE / SHARE / KEY SHARE / NO KEY UPDATE). Distinct
+    /// from `for_update`, which only the UPDATE-strength clauses
+    /// set (RLS policy semantics); relation-level lock legality
+    /// (e.g. matviews) keys on this flag.
+    pub lock_clause: bool,
     /// v1.14: `FOR UPDATE OF tbl [, ...]` — the locking targets (PG19).
     /// Empty when absent or for bare `FOR UPDATE` (which locks all tables).
     pub for_update_of: Vec<String>,
@@ -2073,6 +2079,7 @@ pub(crate) fn empty_select() -> SelectStmt {
         limit: None,
         offset: None,
         for_update: false,
+        lock_clause: false,
         for_update_of: Vec::new(),
         set_op: None,
         dead_rtes: 0,
@@ -2370,6 +2377,9 @@ pub struct TableDef {
     /// column (legal only with `INHERITS`); applied to the merged
     /// column list at exec, 42703 when still missing.
     pub deferred_not_null: Vec<String>,
+    /// v1.96: `CREATE TABLE name OF type_name` — a typed table whose
+    /// columns come from the named composite type (expanded at exec).
+    pub of_type: Option<String>,
 }
 
 /// v1.95: the command a row-level-security policy applies to
@@ -2493,6 +2503,9 @@ pub enum AlterAction {
     AddColumn {
         name: String,
         col_type: ColType,
+        /// v1.96: the declared named (domain/composite) type, if any —
+        /// drives the PG19 type-USAGE check at ADD COLUMN time.
+        named_type: Option<String>,
         /// v1.93: declared bit typmod for a `bit(n)` / `bit varying(n)`
         /// column (see TableDef::bit_typmods).
         bit_typmod: Option<(i32, bool)>,
@@ -2529,6 +2542,22 @@ pub enum AlterAction {
     AlterColumnSetDefault {
         name: String,
         default: DefaultExpr,
+    },
+    /// v1.96: ALTER COLUMN c TYPE t [USING ...]. v1.96 finishing
+    /// pass: the USING expression is stored and evaluated per row;
+    /// without it values go through the assignment cast and the
+    /// rewritten rows are revalidated (NOT NULL / CHECK / UNIQUE /
+    /// domain), matching PG19's table rewrite.
+    AlterColumnType {
+        name: String,
+        col_type: ColType,
+        named_type: Option<String>,
+        using_expr: Option<Expr>,
+    },
+    /// v1.96: ALTER TABLE name OF TYPE type_name (typed-table
+    /// association; validates USAGE + column shape match).
+    OfType {
+        type_name: String,
     },
     AlterColumnDropDefault {
         name: String,
@@ -2807,6 +2836,7 @@ impl TableDef {
             reloptions: Vec::new(),
             inherits: Vec::new(),
             deferred_not_null: Vec::new(),
+            of_type: None,
         }
     }
 }
@@ -3281,6 +3311,159 @@ pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>
     }
 }
 
+/// v1.96: collect every named (user) type targeted by a cast in
+/// the expression — the set PG19 checks USAGE on at parse time
+/// (aclchk type checks in parse analysis).
+pub(crate) fn collect_cast_type_names(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        // v0.95: named args are transparent to inspection.
+        Expr::NamedArg { expr, .. } => collect_cast_type_names(expr, out),
+        Expr::Column { .. } => {}
+        // v0.73: a whole-row ref depends on every column of the range.
+        Expr::WholeRow { .. } => {}
+        Expr::Arith { left, right, .. } => {
+            collect_cast_type_names(left, out);
+            collect_cast_type_names(right, out);
+        }
+        Expr::Cast { expr, .. } => collect_cast_type_names(expr, out),
+        // v0.81: composite expressions — recurse into sub-expressions.
+        Expr::CastNamed { expr, name } => {
+            out.push(name.clone());
+            collect_cast_type_names(expr, out)
+        }
+        // v1.86: AT TIME ZONE depends on both operands.
+        Expr::AtTimeZone { expr, zone } => {
+            collect_cast_type_names(expr, out);
+            if let Some(z) = zone {
+                collect_cast_type_names(z, out);
+            }
+        }
+        Expr::Row(elems) => {
+            for e in elems {
+                collect_cast_type_names(e, out);
+            }
+        }
+        Expr::FieldAccess { expr, .. } => collect_cast_type_names(expr, out),
+        Expr::Concat(a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
+            collect_cast_type_names(a, out);
+            collect_cast_type_names(b, out);
+        }
+        Expr::JsonOp { left, right, .. } => {
+            collect_cast_type_names(left, out);
+            collect_cast_type_names(right, out);
+        }
+        Expr::Not(a) => collect_cast_type_names(a, out),
+        Expr::BitNot(a) => collect_cast_type_names(a, out),
+        Expr::Neg(a) => collect_cast_type_names(a, out),
+        // v0.55: CASE — collect from every arm.
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                collect_cast_type_names(o, out);
+            }
+            for (k, r) in whens {
+                collect_cast_type_names(k, out);
+                collect_cast_type_names(r, out);
+            }
+            if let Some(e) = else_ {
+                collect_cast_type_names(e, out);
+            }
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_cast_type_names(expr, out);
+            collect_cast_type_names(pattern, out);
+        }
+        // v0.68: regex match visits both operands like LIKE.
+        Expr::Regex { expr, pattern, .. } => {
+            collect_cast_type_names(expr, out);
+            collect_cast_type_names(pattern, out);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_cast_type_names(expr, out);
+            collect_cast_type_names(low, out);
+            collect_cast_type_names(high, out);
+        }
+        Expr::IsBool { expr, .. } | Expr::IsNull { expr, .. } => collect_cast_type_names(expr, out),
+        Expr::IsDistinctFrom { left, right, .. } => {
+            collect_cast_type_names(left, out);
+            collect_cast_type_names(right, out);
+        }
+        Expr::Extract { from, .. } => collect_cast_type_names(from, out),
+        Expr::Cmp { left, right, .. } => {
+            collect_cast_type_names(left, out);
+            collect_cast_type_names(right, out);
+        }
+        Expr::Func { args, .. } => {
+            for a in args {
+                collect_cast_type_names(a, out);
+            }
+        }
+        Expr::Literal(_)
+        | Expr::Param(_)
+        | Expr::Agg { .. }
+        | Expr::WithinGroup { .. }
+        | Expr::ScalarSub(_)
+        | Expr::JsonArraySubq { .. }
+        | Expr::ArraySubquery(_)
+        | Expr::InSub { .. }
+        | Expr::Exists { .. }
+        | Expr::ResolvedCol { .. } => {}
+        // v0.87: quantified comparison — the left side is outer-scope
+        // (the subquery has its own scope, like InSub).
+        Expr::Quantified { left, .. } => collect_cast_type_names(left, out),
+        Expr::UserOp { left, right, .. } => {
+            collect_cast_type_names(left, out);
+            collect_cast_type_names(right, out);
+        }
+        // v0.79: array expressions — collect from elements/operands.
+        Expr::ArrayCtor { elems, .. } => {
+            for e in elems {
+                collect_cast_type_names(e, out);
+            }
+        }
+        Expr::Subscript { array, indices } => {
+            collect_cast_type_names(array, out);
+            for i in indices {
+                collect_cast_type_names(i, out);
+            }
+        }
+        Expr::Slice { array, bounds } => {
+            collect_cast_type_names(array, out);
+            for (l, u) in bounds {
+                if let Some(l) = l {
+                    collect_cast_type_names(l, out);
+                }
+                if let Some(u) = u {
+                    collect_cast_type_names(u, out);
+                }
+            }
+        }
+        // v0.10: window functions — collect from args, PARTITION BY and
+        // ORDER BY.
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for a in args {
+                collect_cast_type_names(a, out);
+            }
+            for p in partition_by {
+                collect_cast_type_names(p, out);
+            }
+            for o in order_by {
+                collect_cast_type_names(&o.expr, out);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // v0.11: privileges and grant targets
 // ---------------------------------------------------------------------------
@@ -3309,6 +3492,17 @@ pub enum Privilege {
     Usage,
     /// CONNECT (database).
     Connect,
+    /// v1.96: EXECUTE (functions) — rides the PRIV_USAGE bit in ACLs.
+    Execute,
+    /// v1.96: CREATE (schemas/databases) — rides PRIV_REFERENCES bit
+    /// position in schema contexts only; never stored on tables.
+    Create,
+    /// v1.96: TEMPORARY (databases).
+    Temporary,
+    /// v1.96: SET / ALTER SYSTEM (parameters) and MAINTAIN (tables).
+    Set,
+    AlterSystem,
+    Maintain,
 }
 
 impl Privilege {
@@ -3325,8 +3519,23 @@ impl Privilege {
             Privilege::All => crate::storage::PRIV_ALL_TABLE,
             Privilege::Usage => crate::storage::PRIV_USAGE,
             Privilege::Connect => crate::storage::PRIV_CONNECT,
+            Privilege::Execute => crate::storage::PRIV_USAGE,
+            Privilege::Create => crate::storage::PRIV_REFERENCES,
+            Privilege::Temporary => crate::storage::PRIV_TRUNCATE,
+            Privilege::Set => crate::storage::PRIV_USAGE,
+            Privilege::AlterSystem => crate::storage::PRIV_UPDATE,
+            Privilege::Maintain => 512,
         }
     }
+}
+
+/// v1.96: a GRANTED BY specification.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Grantor {
+    Role(String),
+    CurrentUser,
+    CurrentRole,
+    SessionUser,
 }
 
 /// What a GRANT / REVOKE applies to.
@@ -3335,6 +3544,31 @@ pub enum GrantObject {
     Table(Vec<String>),
     Sequence(String),
     Database,
+    /// v1.96: GRANT/REVOKE ON FUNCTION name(args), ... — base names.
+    Function(Vec<String>),
+    /// v1.96: GRANT/REVOKE ON LANGUAGE name.
+    Language(String),
+    /// v1.96: GRANT/REVOKE ON SCHEMA name (accepted; the engine is
+    /// single-namespace so only existence is validated).
+    Schema(String),
+    /// v1.96: GRANT/REVOKE ON TYPE name — the base name.
+    Type(String),
+    /// v1.96: GRANT/REVOKE ON DOMAIN name — shares the type ACL
+    /// store; exec validates the name is actually a domain.
+    Domain(String),
+    /// v1.96: GRANT/REVOKE ON ALL TABLES/SEQUENCES IN SCHEMA (expanded
+    /// at exec to the live object list).
+    AllTables,
+    AllSequences,
+    /// v1.96: GRANT/REVOKE ON ALL FUNCTIONS / PROCEDURES / ROUTINES
+    /// IN SCHEMA name (expanded at exec; routines = both kinds).
+    AllFunctionsInSchema(String),
+    AllProceduresInSchema(String),
+    AllRoutinesInSchema(String),
+    /// v1.96: GRANT/REVOKE ON LARGE OBJECT oid [, ...].
+    LargeObject(Vec<i64>),
+    /// v1.96: GRANT/REVOKE ON PROCEDURE name(args), ... — base names.
+    Procedure(Vec<String>),
 }
 
 /// v0.16: FETCH / MOVE direction. Counts are row counts; `None` means ALL.
@@ -3356,6 +3590,10 @@ pub enum FetchDir {
 pub struct FuncArg {
     pub name: Option<String>,
     pub type_name: String,
+    /// v1.96: the arg DEFAULT expression, when written. Carried so
+    /// CREATE FUNCTION can run the PG19 type-USAGE walk over the
+    /// casts it names (defaults are not yet evaluated at call time).
+    pub default: Option<Expr>,
 }
 
 /// v0.86: function languages we can execute. `plpgsql` is accepted only
@@ -3526,6 +3764,19 @@ pub enum PlpgsqlStmt {
     /// `SELECT <expr>` (always `Stmt::Select`); the executor appends the
     /// row to the result set and continues.
     ReturnNext(Stmt),
+    /// v1.96: `EXECUTE <expr>` — dynamic SQL. Stored as the parsed
+    /// `SELECT <expr>` (always `Stmt::Select`) yielding the command
+    /// string; the executor parses and runs it. INTO/USING clauses
+    /// are outside the bounded subset (rejected at parse).
+    Execute(Stmt),
+    /// v1.96: `PERFORM <expr>` — evaluate the expression (function
+    /// calls run for their side effects) and discard the result.
+    /// Stored as the parsed `SELECT <expr>`.
+    Perform(Stmt),
+    /// v1.96: `ASSERT <cond> [, <message>]` — raise P0004 when the
+    /// condition is not true. Both parts stored as parsed
+    /// `SELECT <expr>` statements.
+    Assert { cond: Stmt, message: Option<Stmt> },
 }
 
 /// v1.01: one `WHEN <conditions> THEN <statements>` clause.
@@ -3548,6 +3799,12 @@ pub struct PlpgsqlBody {
     pub decls: Vec<PlpgsqlDecl>,
     pub stmts: Vec<PlpgsqlStmt>,
     pub handlers: Vec<PlpgsqlHandler>,
+    /// v1.96 finishing pass: the main statement list ends with the
+    /// implicit dummy RETURN appended by
+    /// `plpgsql_ensure_trailing_return`. The executor treats
+    /// reaching it as falling off the end (PG19: 2F005 for non-void
+    /// functions), not as a real RETURN NULL.
+    pub trailing_dummy: bool,
 }
 
 /// v1.03: one scalar variable declaration (`name type`) from a plpgsql
@@ -4085,6 +4342,7 @@ pub(crate) fn parse_plpgsql_raise(rest: &str) -> Result<PlpgsqlStmt, SqlError> {
     let level = match lvl_word.to_ascii_lowercase().as_str() {
         "notice" => RaiseLevel::Notice,
         "exception" => RaiseLevel::Exception,
+        "warning" => RaiseLevel::Warning,
         _ => {
             return Err(SqlError {
                 message: format!(
@@ -4472,7 +4730,27 @@ pub(crate) fn parse_plpgsql_decls(decl_text: &str) -> Result<Vec<PlpgsqlDecl>, S
 /// v1.03: parse one statement of a FOR-loop body. Only `:=` assignment,
 /// `RETURN NEXT`, and bare `RETURN` are allowed (bounded subset).
 pub(crate) fn parse_plpgsql_for_body_stmt(text: &str) -> Result<PlpgsqlStmt, SqlError> {
-    let t = text.trim();
+    // v1.96: strip leading `--` line comments (the statement
+    // splitter keeps them attached to the following statement).
+    let mut t = text.trim();
+    loop {
+        let s = t.trim_start();
+        if let Some(rest) = s.strip_prefix("--") {
+            match rest.find('\n') {
+                Some(i) => {
+                    t = rest[i + 1..].trim();
+                }
+                None => {
+                    t = "";
+                    break;
+                }
+            }
+        } else {
+            t = s;
+            break;
+        }
+    }
+    let t = t;
     if let Some(rest) = plpgsql_strip_kw(t, "return") {
         if let Some(after) = plpgsql_strip_kw(rest.trim(), "next") {
             return parse_plpgsql_return_next(after);
@@ -4565,10 +4843,23 @@ pub(crate) fn plpgsql_validate_returns(
     stmts: &[PlpgsqlStmt],
     handlers: &[PlpgsqlHandler],
     returns_set: bool,
+    is_void: bool,
 ) -> Result<(), SqlError> {
-    fn walk(stmts: &[PlpgsqlStmt], returns_set: bool) -> Result<(), SqlError> {
+    fn walk(stmts: &[PlpgsqlStmt], returns_set: bool, is_void: bool) -> Result<(), SqlError> {
         for s in stmts {
             match s {
+                // v1.96 finishing pass: PG19 — RETURN with an
+                // expression is a compile error in a void function
+                // (and in a DO block). This parser only builds
+                // Return with an expression (a bare RETURN is a
+                // syntax error here), so any Return qualifies.
+                PlpgsqlStmt::Return(_) if is_void => {
+                    return Err(SqlError {
+                        message: "RETURN cannot have a parameter in function returning void"
+                            .to_string(),
+                        code: "42601",
+                    });
+                }
                 PlpgsqlStmt::Return(_) if returns_set => {
                     return Err(SqlError {
                         message: "RETURN with a value cannot be used in a function returning set; use RETURN NEXT".to_string(),
@@ -4581,15 +4872,15 @@ pub(crate) fn plpgsql_validate_returns(
                         code: "42601",
                     });
                 }
-                PlpgsqlStmt::ForQuery { body, .. } => walk(body, returns_set)?,
+                PlpgsqlStmt::ForQuery { body, .. } => walk(body, returns_set, is_void)?,
                 _ => {}
             }
         }
         Ok(())
     }
-    walk(stmts, returns_set)?;
+    walk(stmts, returns_set, is_void)?;
     for h in handlers {
-        walk(&h.stmts, returns_set)?;
+        walk(&h.stmts, returns_set, is_void)?;
     }
     Ok(())
 }
@@ -4644,7 +4935,27 @@ pub(crate) fn parse_plpgsql_stmt(text: &str) -> Result<PlpgsqlStmt, SqlError> {
             code: "0A000",
         }
     }
-    let t = text.trim();
+    // v1.96: strip leading `--` line comments (kept attached by
+    // the statement splitter).
+    let mut t = text.trim();
+    loop {
+        let s = t.trim_start();
+        if let Some(rest) = s.strip_prefix("--") {
+            match rest.find('\n') {
+                Some(i) => {
+                    t = rest[i + 1..].trim();
+                }
+                None => {
+                    t = "";
+                    break;
+                }
+            }
+        } else {
+            t = s;
+            break;
+        }
+    }
+    let t = t;
     if let Some(rest) = plpgsql_strip_kw(t, "return") {
         // v1.03: `RETURN NEXT <expr>` (SETOF functions only; placement is
         // validated against `returns_set` in `parse_plpgsql_body`).
@@ -4657,6 +4968,51 @@ pub(crate) fn parse_plpgsql_stmt(text: &str) -> Result<PlpgsqlStmt, SqlError> {
     if let Some(rest) = plpgsql_strip_kw(t, "raise") {
         return parse_plpgsql_raise(rest);
     }
+    // v1.96: `EXECUTE <expr>` dynamic SQL and `PERFORM <expr>`. The
+    // expression is stored as a parsed SELECT (like RETURN). EXECUTE
+    // with INTO/USING is outside the bounded subset.
+    if let Some(rest) = plpgsql_strip_kw(t, "execute") {
+        let rest = rest.trim().trim_end_matches(';').trim();
+        if plpgsql_has_bare_kw(rest, "into") || plpgsql_has_bare_kw(rest, "using") {
+            return Err(unsupported(t));
+        }
+        let sel = parse_statement(&format!("SELECT {}", rest)).map_err(|_| unsupported(t))?;
+        return match sel {
+            Stmt::Select(_) => Ok(PlpgsqlStmt::Execute(sel)),
+            _ => Err(unsupported(t)),
+        };
+    }
+    if let Some(rest) = plpgsql_strip_kw(t, "perform") {
+        let rest = rest.trim().trim_end_matches(';').trim();
+        let sel = parse_statement(&format!("SELECT {}", rest)).map_err(|_| unsupported(t))?;
+        return match sel {
+            Stmt::Select(_) => Ok(PlpgsqlStmt::Perform(sel)),
+            _ => Err(unsupported(t)),
+        };
+    }
+    // v1.96: `ASSERT <cond> [, <message>]`.
+    if let Some(rest) = plpgsql_strip_kw(t, "assert") {
+        let rest = rest.trim().trim_end_matches(';').trim();
+        let (cond_text, msg_text) = match plpgsql_top_level_comma(rest) {
+            Some(i) => (&rest[..i], Some(rest[i + 1..].trim())),
+            None => (rest, None),
+        };
+        let cond = parse_statement(&format!("SELECT {}", cond_text)).map_err(|_| unsupported(t))?;
+        let message = match msg_text {
+            Some(m) => {
+                let s = parse_statement(&format!("SELECT {}", m)).map_err(|_| unsupported(t))?;
+                match s {
+                    Stmt::Select(_) => Some(s),
+                    _ => return Err(unsupported(t)),
+                }
+            }
+            None => None,
+        };
+        return match cond {
+            Stmt::Select(_) => Ok(PlpgsqlStmt::Assert { cond, message }),
+            _ => Err(unsupported(t)),
+        };
+    }
     // v1.03: `var := <expr>` scalar assignment.
     if plpgsql_find_assign(t).is_some() {
         return parse_plpgsql_assign(t);
@@ -4664,8 +5020,101 @@ pub(crate) fn parse_plpgsql_stmt(text: &str) -> Result<PlpgsqlStmt, SqlError> {
     let stmt = parse_statement(t).map_err(|_| unsupported(t))?;
     match stmt {
         Stmt::Analyze { .. } => Ok(PlpgsqlStmt::Utility(stmt)),
+        // v1.96: plain SQL statements a body may run for effect —
+        // GRANT/REVOKE (object and role forms) execute through the
+        // utility path in the executor.
+        Stmt::Grant { .. }
+        | Stmt::Revoke { .. }
+        | Stmt::GrantRole { .. }
+        | Stmt::RevokeRole { .. } => Ok(PlpgsqlStmt::Utility(stmt)),
         _ => Err(unsupported(t)),
     }
+}
+
+/// v1.96: byte index of the first comma at paren depth 0 outside
+/// string literals (ASSERT's condition/message split).
+pub(crate) fn plpgsql_top_level_comma(text: &str) -> Option<usize> {
+    let b = text.as_bytes();
+    let mut i = 0;
+    let mut depth = 0i32;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\'' {
+                        if i + 1 < b.len() && b[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+            }
+            b',' if depth == 0 => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// v1.96: does `text` contain the bare keyword `kw` outside string
+/// literals and parentheses? (For EXECUTE's INTO/USING detection —
+/// a keyword inside a format string or a nested call is not a
+/// clause.)
+pub(crate) fn plpgsql_has_bare_kw(text: &str, kw: &str) -> bool {
+    let b = text.as_bytes();
+    let mut i = 0;
+    let mut depth = 0i32;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\'' {
+                        if i + 1 < b.len() && b[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                if depth == 0 && text[start..i].eq_ignore_ascii_case(kw) {
+                    return true;
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    false
 }
 
 /// v1.01: parse one WHEN condition (`name` or `SQLSTATE 'code'`,
@@ -4796,7 +5245,11 @@ pub(crate) fn plpgsql_push_stmt(
 /// `returns_set` selects the function's declared shape so RETURN /
 /// RETURN NEXT placement can be validated the way PG's validator does
 /// at CREATE time.
-pub fn parse_plpgsql_body(body: &str, returns_set: bool) -> Result<PlpgsqlBody, SqlError> {
+pub fn parse_plpgsql_body(
+    body: &str,
+    returns_set: bool,
+    is_void: bool,
+) -> Result<PlpgsqlBody, SqlError> {
     let unsupported = |msg: String| SqlError {
         message: msg,
         code: "0A000",
@@ -4947,12 +5400,14 @@ pub fn parse_plpgsql_body(body: &str, returns_set: bool) -> Result<PlpgsqlBody, 
     }
     // v1.03: validate RETURN / RETURN NEXT against the declared shape,
     // and that every FOR variable / := target is DECLAREd.
-    plpgsql_validate_returns(&stmts, &handlers, returns_set)?;
+    plpgsql_validate_returns(&stmts, &handlers, returns_set, is_void)?;
     plpgsql_validate_vars(&decls, &stmts, &handlers)?;
     // v1.03: a SETOF function returns its accumulated rows; no dummy
     // RETURN is appended (PG19 `add_dummy_return` only applies to
     // scalar functions).
+    let mut trailing_dummy = false;
     if !returns_set {
+        trailing_dummy = !matches!(stmts.last(), Some(PlpgsqlStmt::Return(_)));
         plpgsql_ensure_trailing_return(&mut stmts)?;
         for h in &mut handlers {
             plpgsql_ensure_trailing_return(&mut h.stmts)?;
@@ -4962,6 +5417,7 @@ pub fn parse_plpgsql_body(body: &str, returns_set: bool) -> Result<PlpgsqlBody, 
         decls,
         stmts,
         handlers,
+        trailing_dummy,
     })
 }
 
@@ -5076,14 +5532,20 @@ pub enum TriggerBodyStmt {
         format: String,
         args: Vec<Expr>,
     },
+    /// v1.96: `PERFORM <expr>` — evaluate and discard (trigger
+    /// bodies are plpgsql; CREATE CONSTRAINT TRIGGER trojan tests
+    /// rely on it).
+    Perform(Expr),
 }
 
-/// v1.00: `RAISE` levels supported in trigger bodies. Anything else
-/// (DEBUG, LOG, INFO, WARNING) is rejected at parse time with 0A000.
+/// v1.00: `RAISE` levels supported in trigger bodies. v1.96 adds
+/// WARNING (a notice-class message, like PG). DEBUG/LOG/INFO stay
+/// rejected at parse time with 0A000.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RaiseLevel {
     Notice,
     Exception,
+    Warning,
 }
 
 /// v1.38: `CREATE CAST` coercion method (PG19 `CoercionMethod`).
@@ -5196,6 +5658,9 @@ pub enum Stmt {
         // v1.95: WITH (security_invoker = ...) / trailing CHECK OPTION.
         security_invoker: bool,
         check_option: bool,
+        // v1.96: CREATE MATERIALIZED VIEW (+ WITH NO DATA).
+        matview: bool,
+        with_data: bool,
     },
     DropView {
         names: Vec<String>,
@@ -5250,6 +5715,15 @@ pub enum Stmt {
         method: CastMethod,
         context: CastContext,
     },
+    /// v1.96: DROP CAST (source AS target).
+    DropCast {
+        src: String,
+        dst: String,
+        if_exists: bool,
+        /// CASCADE/RESTRICT parsed; no dependents are modeled.
+        #[allow(dead_code)]
+        cascade: bool,
+    },
     // --- v0.85: CREATE DOMAIN (bounded): a named type over a base
     // type with optional CHECK constraints, NOT NULL, and DEFAULT.
     // `base_named` carries the named type for a composite or domain
@@ -5276,10 +5750,13 @@ pub enum Stmt {
     },
     /// v1.09: `ALTER FUNCTION name(argtypes) {VOLATILE|STABLE|IMMUTABLE}`
     /// (PG19 AlterFunctionStmt, volatility action only).
+    /// v1.96: `owner` carries ALTER FUNCTION ... OWNER TO instead
+    /// (volatility is then meaningless).
     AlterFunction {
         name: String,
         arg_types: Vec<String>,
         volatility: FuncVolatility,
+        owner: Option<String>,
     },
     // --- v0.86: CREATE FUNCTION (bounded): SQL-language and internal
     // functions, plus bounded plpgsql (v0.97: single-RETURN bodies
@@ -5302,6 +5779,11 @@ pub enum Stmt {
         or_replace: bool,
         volatility: FuncVolatility,
         strict: bool,
+        /// v1.96: SECURITY DEFINER (body runs as the function owner).
+        security_definer: bool,
+        /// v1.96: CREATE PROCEDURE (stored as a void function flagged
+        /// as a procedure; PG keeps a separate namespace).
+        procedure: bool,
     },
     DropFunction {
         name: String,
@@ -5309,6 +5791,19 @@ pub enum Stmt {
         if_exists: bool,
         /// v0.87: PG19 CASCADE/RESTRICT (RESTRICT is the default).
         cascade: bool,
+        /// v1.96: DROP PROCEDURE (vs DROP FUNCTION).
+        procedure: bool,
+        /// v1.96 finishing pass: the argument list was omitted
+        /// entirely (PG19 allows `DROP FUNCTION name` when the name
+        /// is unambiguous); exec resolves the sole overload.
+        args_omitted: bool,
+        /// v1.96 finishing pass: DROP ROUTINE — either kind matches.
+        any_kind: bool,
+    },
+    /// v1.96: CALL proc(args) (PG19 CallStmt).
+    CallProc {
+        name: String,
+        args: Vec<Expr>,
     },
     // --- v1.00: CREATE TRIGGER (bounded, PG19 `CreateTrigStmt`) ---
     CreateTrigger {
@@ -5364,6 +5859,19 @@ pub enum Stmt {
         superuser: bool,
         /// v1.95: BYPASSRLS (PG19 `rolbypassrls`); default false.
         bypassrls: bool,
+        /// v1.96: INHERIT (default) / NOINHERIT.
+        inherit: bool,
+        /// v1.96: CREATEROLE / CREATEDB attributes.
+        createrole: bool,
+        createdb: bool,
+        /// v1.96 finishing pass: REPLICATION attribute.
+        replication: bool,
+        /// v1.96: `IN ROLE x` / `ROLE x` — groups the new role joins,
+        /// as (group, admin_option) pairs.
+        member_of: Vec<(String, bool)>,
+        /// v1.96: `USER x` / `ADMIN x` (CREATE GROUP) — roles that join
+        /// the new group, as (member, admin_option) pairs.
+        members: Vec<(String, bool)>,
         /// Cleartext password from PASSWORD '...'; hashed into a SCRAM
         /// verifier at execution. None = no password (trust-only).
         password: Option<String>,
@@ -5378,6 +5886,13 @@ pub enum Stmt {
         superuser: Option<bool>,
         /// v1.95: BYPASSRLS / NOBYPASSRLS; None = leave unchanged.
         bypassrls: Option<bool>,
+        /// v1.96: INHERIT / NOINHERIT; None = unchanged.
+        inherit: Option<bool>,
+        /// v1.96: CREATEROLE / CREATEDB; None = unchanged.
+        createrole: Option<bool>,
+        createdb: Option<bool>,
+        /// v1.96 finishing pass: REPLICATION; None = unchanged.
+        replication: Option<bool>,
         /// Some(Some(pw)) = set password, Some(None) = PASSWORD NULL
         /// (remove), None = leave unchanged.
         password: Option<Option<String>>,
@@ -5432,21 +5947,169 @@ pub enum Stmt {
         privs: Vec<PrivSpec>,
         object: GrantObject,
         grantees: Vec<String>,
+        /// v1.96: GRANTED BY clause; None = current user.
+        granted_by: Option<Grantor>,
+        /// v1.96: WITH GRANT OPTION (parsed; grant-option bits are not
+        /// tracked per ACL entry — see v196 scope hold-backs).
+        grant_option: bool,
     },
     Revoke {
         privs: Vec<PrivSpec>,
         object: GrantObject,
         grantees: Vec<String>,
+        granted_by: Option<Grantor>,
+        /// v1.96: REVOKE GRANT OPTION FOR — validates, bits unchanged.
+        grant_option_for: bool,
+        /// Parsed for completeness; dependent-object cascades are not
+        /// modeled (no grant-option chains in the ACL store).
+        #[allow(dead_code)]
+        cascade: bool,
     },
     /// GRANT role [, ...] TO role [, ...] — role membership.
     GrantRole {
         roles: Vec<String>,
         grantees: Vec<String>,
+        /// v1.96: WITH ADMIN/INHERIT/SET options; None = PG default.
+        admin: Option<bool>,
+        inherit: Option<bool>,
+        set: Option<bool>,
+        granted_by: Option<Grantor>,
     },
     /// REVOKE role [, ...] FROM role [, ...] — remove membership.
     RevokeRole {
         roles: Vec<String>,
         grantees: Vec<String>,
+        /// v1.96: REVOKE {ADMIN|INHERIT|SET|GRANT} OPTION FOR:
+        /// Some('a'|'i'|'s') clears only that option; None = full revoke.
+        option_for: Option<char>,
+        granted_by: Option<Grantor>,
+        cascade: bool,
+    },
+    /// v1.96: ALTER GROUP name ADD USER ... / DROP USER ... / RENAME TO.
+    AlterGroup {
+        name: String,
+        add: Vec<String>,
+        drop: Vec<String>,
+        rename_to: Option<String>,
+    },
+    /// v1.96: LOCK [TABLE] name [, ...] IN mode MODE [NOWAIT].
+    LockTable {
+        names: Vec<String>,
+        mode: String,
+        nowait: bool,
+    },
+    /// v1.96: ALTER DEFAULT PRIVILEGES [FOR ROLE r] GRANT/REVOKE privs
+    /// ON kind TO/FROM roles. kind: 'r' tables, 'S' sequences,
+    /// 'f' functions/routines, 'T' types, 'n' schemas, 'l' large objects.
+    /// v1.96: CREATE SCHEMA [IF NOT EXISTS] name [AUTHORIZATION role].
+    CreateSchema {
+        name: String,
+        if_not_exists: bool,
+        authorization: Option<String>,
+    },
+    /// v1.96: DROP SCHEMA [IF EXISTS] name [, ...] [CASCADE|RESTRICT].
+    DropSchema {
+        names: Vec<String>,
+        if_exists: bool,
+        cascade: bool,
+    },
+    /// v1.96: REINDEX [(CONCURRENTLY)] {TABLE|INDEX|SCHEMA|DATABASE}.
+    Reindex {
+        kind: char,
+        name: Option<String>,
+        concurrently: bool,
+    },
+    /// v1.96: CLUSTER [name [USING index]].
+    ClusterStmt {
+        name: Option<String>,
+        index: Option<String>,
+    },
+    /// v1.96: REASSIGN OWNED BY role [, ...] TO role.
+    ReassignOwned {
+        from: Vec<String>,
+        to: String,
+    },
+    /// v1.96: DROP OWNED BY role [, ...] [CASCADE|RESTRICT].
+    DropOwned {
+        roles: Vec<String>,
+        cascade: bool,
+    },
+    /// v1.96: REFRESH MATERIALIZED VIEW [CONCURRENTLY] name.
+    RefreshMatView {
+        name: String,
+        concurrently: bool,
+        /// v1.96: WITH DATA (default) vs WITH NO DATA.
+        with_data: bool,
+    },
+    /// v1.96: SET CONSTRAINTS ... (accepted no-op: constraints are
+    /// always immediate in this engine).
+    SetConstraints,
+    /// v1.96: ALTER SCHEMA name OWNER TO role.
+    AlterSchemaOwner {
+        name: String,
+        new_owner: String,
+    },
+    /// v1.96 finishing pass: ALTER SCHEMA name RENAME TO new_name.
+    AlterSchemaRename {
+        name: String,
+        new_name: String,
+    },
+    /// v1.96: ALTER DATABASE name OWNER TO role (the engine hosts a
+    /// single database; the owner change is validated, not stored).
+    AlterDatabaseOwner {
+        name: String,
+        new_owner: String,
+    },
+    /// v1.96: `DO <plpgsql body>` — anonymous code block.
+    DoBlock {
+        body: String,
+    },
+    /// v1.96: ALTER TYPE name ADD ATTRIBUTE attr type.
+    AlterTypeAddAttribute {
+        name: String,
+        attr: String,
+        col_type: ColType,
+        named_type: Option<String>,
+    },
+    /// v1.96: ALTER TYPE name ALTER ATTRIBUTE attr TYPE type.
+    AlterTypeAlterAttribute {
+        name: String,
+        attr: String,
+        col_type: ColType,
+        named_type: Option<String>,
+    },
+    /// v1.96: CREATE AGGREGATE name(args) (sfunc, stype, ...).
+    CreateAggregate {
+        name: String,
+        arg_types: Vec<String>,
+        sfunc: String,
+        stype: String,
+        finalfunc: Option<String>,
+        initcond: Option<String>,
+        /// v1.96 finishing pass: moving-aggregate / parallel
+        /// properties, validated at CREATE (PG19 aggregate.c).
+        msfunc: Option<String>,
+        minvfunc: Option<String>,
+        mstype: Option<String>,
+        parallel: Option<String>,
+    },
+    /// v1.96: DROP AGGREGATE [IF EXISTS] name(args).
+    DropAggregate {
+        name: String,
+        arg_types: Vec<String>,
+        if_exists: bool,
+        cascade: bool,
+    },
+    AlterDefaultPrivileges {
+        target_role: Option<String>,
+        revoke: bool,
+        privs: Vec<PrivSpec>,
+        kind: char,
+        grantees: Vec<String>,
+        grant_option_for: bool,
+        /// v1.96: IN SCHEMA names (validated; rules stay global in
+        /// this single-namespace engine).
+        schemas: Vec<String>,
     },
     Insert {
         table: String,
@@ -5720,6 +6383,14 @@ pub enum ConflictArbiter {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConflictAction {
     DoNothing,
+    /// v1.96: PG19 DO SELECT — behaves like DO NOTHING for writes;
+    /// the WHERE is kept for privilege checks on referenced columns.
+    /// `for_update` records a FOR UPDATE / FOR NO KEY UPDATE lock
+    /// (which requires an updatable column, PG19).
+    DoSelect {
+        where_: Option<Expr>,
+        for_update: bool,
+    },
     DoUpdate {
         sets: Vec<(String, Expr)>,
         where_: Option<Expr>,
@@ -5876,6 +6547,10 @@ pub(crate) fn max_param_ctes(ctes: &[CteDef]) -> usize {
 pub(crate) fn max_param_on_conflict(oc: &OnConflict) -> usize {
     match &oc.action {
         ConflictAction::DoNothing => 0,
+        ConflictAction::DoSelect { where_, .. } => match where_ {
+            Some(w) => max_param_expr(w),
+            None => 0,
+        },
         ConflictAction::DoUpdate { sets, where_ } => {
             let mut m = 0;
             for (_, e) in sets {

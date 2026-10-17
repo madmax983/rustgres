@@ -15,11 +15,82 @@ use super::*;
 /// persists like CREATE FUNCTION.
 pub(crate) fn exec_alter_function(
     eng: &mut Engine,
-    _ctx: &mut StmtCtx,
+    ctx: &mut StmtCtx,
     name: &str,
     arg_types: &[String],
     volatility: crate::sql::FuncVolatility,
+    owner: Option<&str>,
 ) -> Result<ExecResult, ExecError> {
+    // v1.96: ALTER FUNCTION ... OWNER TO — reassign fn_owners
+    // (must be current owner or superuser; new owner must exist).
+    if let Some(new_owner) = owner {
+        if !eng.db.functions.contains_key(name) && !eng.db.aggregates.contains_key(name) {
+            return Err(exec_err(
+                "42883",
+                format!("function {}() does not exist", name),
+            ));
+        }
+        if eng.db.find_role(new_owner, ctx.snap, ctx.own).is_none() {
+            return Err(exec_err(
+                "42704",
+                format!("role \"{}\" does not exist", new_owner),
+            ));
+        }
+        let cur = eng
+            .db
+            .fn_owners
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| "postgres".to_string());
+        let is_super = eng
+            .db
+            .find_role(&ctx.role, ctx.snap, ctx.own)
+            .map(|r| r.superuser)
+            .unwrap_or(false);
+        // v1.96 finishing pass: PG19's owner-change rule (same as
+        // tables): the executor must hold the current owner's
+        // privileges (inheritance counts) AND be able to SET ROLE to
+        // the new owner — a plain non-member cannot give ownership
+        // away (alter_generic: OWNER TO user2 fails "no role
+        // membership", OWNER TO user3 succeeds via IN ROLE).
+        let closure = crate::storage::role_closure(&eng.db, ctx.role, ctx.snap, ctx.own);
+        if !is_super && !closure.iter().any(|r| r == &cur) {
+            return Err(exec_err(
+                "42501",
+                format!("must be owner of function {}", name),
+            ));
+        }
+        if !is_super
+            && ctx.role != new_owner
+            && !crate::storage::member_can_set_role(&eng.db, ctx.role, new_owner, ctx.snap, ctx.own)
+        {
+            return Err(exec_err(
+                "42501",
+                format!(
+                    "permission denied to change owner of function {}: must be able to SET ROLE to the new owner",
+                    name
+                ),
+            ));
+        }
+        let prev_fn = eng.db.fn_acls.clone();
+        let prev_type = eng.db.type_acls.clone();
+        let prev_lang = eng.db.lang_acls.clone();
+        let prev_fn_owners = eng.db.fn_owners.clone();
+        let prev_type_owners = eng.db.type_owners.clone();
+        eng.db
+            .fn_owners
+            .insert(name.to_string(), new_owner.to_string());
+        ctx.writes.push(WriteOp::FnTypeAcls {
+            prev_fn,
+            prev_type,
+            prev_lang,
+            prev_fn_owners,
+            prev_type_owners,
+        });
+        return Ok(ExecResult::Command {
+            tag: "ALTER FUNCTION".to_string(),
+        });
+    }
     let overloads = eng
         .db
         .functions
@@ -35,6 +106,14 @@ pub(crate) fn exec_alter_function(
                     .all(|(a, b)| canon_func_type_name(a) == canon_func_type_name(b))
         })
         .ok_or_else(|| exec_err("42883", format!("function {}() does not exist", name)))?;
+    // v1.96 finishing pass: PG19 distinguishes routines by kind —
+    // ALTER FUNCTION on a procedure is 42809.
+    if slot.is_procedure {
+        return Err(exec_err(
+            "42809",
+            format!("{}({}) is not a function", name, arg_types.join(", ")),
+        ));
+    }
     slot.volatility = volatility;
     Ok(ExecResult::Command {
         tag: "ALTER FUNCTION".to_string(),
@@ -80,6 +159,13 @@ pub(crate) fn resolve_func_type_name(
     // so it resolves to the defer-triggering `Composite` placeholder,
     // like shell types below.
     if name.eq_ignore_ascii_case("cstring") {
+        return Ok(ColType::Composite);
+    }
+    // v1.96: `void` is PG19's return type for procedures and
+    // no-result functions. It resolves to the defer-triggering
+    // Composite placeholder like shell types: FuncDef keeps the
+    // "void" string, and call sites special-case it.
+    if name.eq_ignore_ascii_case("void") {
         return Ok(ColType::Composite);
     }
     if let Some(st) = eng.db.types.get(name) {
@@ -322,10 +408,22 @@ pub(crate) fn parse_sql_func_body(
                 format!("syntax error in function body: {}", e.message),
             )
         })?;
+        // v1.96: void functions/procedures may carry GRANT/REVOKE
+        // statements (PG19 SQL bodies accept utility statements;
+        // the privileges suite's sro tests rely on GRANT in a body).
+        let is_void = ret_type.eq_ignore_ascii_case("void");
         if !matches!(
             stmt,
             Stmt::Select(_) | Stmt::Insert { .. } | Stmt::Update { .. } | Stmt::Delete { .. }
-        ) {
+        ) && !(is_void
+            && matches!(
+                stmt,
+                Stmt::Grant { .. }
+                    | Stmt::Revoke { .. }
+                    | Stmt::GrantRole { .. }
+                    | Stmt::RevokeRole { .. }
+            ))
+        {
             return Err(exec_err(
                 "0A000",
                 format!(
@@ -337,10 +435,13 @@ pub(crate) fn parse_sql_func_body(
         rewrite_func_arg_refs(&mut stmt, &arg_names);
         stmts.push(stmt);
     }
+    // v1.96: void functions and procedures have no return value to
+    // check — PG19 skips check_sql_fn_retval for them entirely.
+    if ret_type.eq_ignore_ascii_case("void") {
+        return Ok(stmts);
+    }
     // PG19 check_sql_fn_retval: an empty body behaves like "the last
-    // query rewrote to nothing" — return type mismatch. (No VOID
-    // carve-out: RETURNS void is 42704 in this engine today, a
-    // separate type-system gap.)
+    // query rewrote to nothing" — return type mismatch.
     let Some(last) = stmts.last() else {
         return Err(sql_func_final_42p13(ret_type));
     };
@@ -756,6 +857,7 @@ pub(crate) fn substitute_func_params(
 /// the definition transactionally. Duplicate names are 42723 unless
 /// OR REPLACE was given.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_create_function(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -768,10 +870,56 @@ pub(crate) fn exec_create_function(
     or_replace: bool,
     volatility: crate::sql::FuncVolatility,
     strict: bool,
+    security_definer: bool,
+    procedure: bool,
 ) -> Result<ExecResult, ExecError> {
     // v1.32: PG19 resolves the language first (before return-type
     // resolution): unknown LANGUAGE is 42883, not a parse error.
     let lang = resolve_func_lang(lang_name)?;
+    // v1.96 finishing pass: PG19 parameter-default rules
+    // (functioncmds.c): only input parameters may have defaults,
+    // and once an input parameter has one, every later input
+    // parameter must have one too. This engine's parser does not
+    // model arg modes — a leading OUT keyword lands in the arg
+    // NAME slot — so OUT detection uses that shape.
+    {
+        let mut seen_default = false;
+        for a in args {
+            let is_out = a.name.as_deref() == Some("out");
+            if is_out && a.default.is_some() {
+                return Err(exec_err(
+                    "42P13",
+                    "only input parameters can have default values".to_string(),
+                ));
+            }
+            if is_out {
+                continue;
+            }
+            if a.default.is_some() {
+                seen_default = true;
+            } else if seen_default {
+                return Err(exec_err(
+                    "42P13",
+                    "input parameters after one with a default value must also have defaults"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    // v1.96: language USAGE (aclchk.c): trusted languages default to
+    // PUBLIC USAGE (revocable via lang_acls); untrusted (c/internal)
+    // are superuser-only.
+    check_language_usage(eng, ctx, lang_name)?;
+    // v1.96: USAGE on argument/return types (domains, composites).
+    for a in args {
+        check_type_usage(eng, ctx, &a.type_name)?;
+        // v1.96: and on types named by casts inside arg DEFAULT
+        // expressions (priv_testfunc7a shape).
+        if let Some(d) = &a.default {
+            check_expr_cast_usages(eng, ctx, d)?;
+        }
+    }
+    check_type_usage(eng, ctx, ret_type)?;
     // PG19: the return type must exist at CREATE time.
     // v1.00: `RETURNS trigger` is PG19's trigger pseudo-type — valid
     // only for trigger functions (which must be LANGUAGE plpgsql here).
@@ -815,6 +963,19 @@ pub(crate) fn exec_create_function(
     // stored and the parsed `PlpgsqlBody` goes in `FuncDef.plpgsql`.
     // v1.00: trigger functions bypass the desugar entirely (their raw
     // body was validated against the trigger grammar above).
+    // v1.96 finishing pass: a void plpgsql function must not
+    // RETURN a value (PG19 rejects it at CREATE). The single-RETURN
+    // desugar below would otherwise smuggle it past the body
+    // validator, so run the validator explicitly for void
+    // functions; only the void-RETURN error is fatal here (other
+    // parse gaps belong to the desugar path's subset).
+    if lang == crate::sql::FuncLang::Plpgsql && ret_type.eq_ignore_ascii_case("void") {
+        if let Err(e) = crate::sql::parse_plpgsql_body(body, returns_set, true) {
+            if e.message.contains("RETURN cannot have a parameter") {
+                return Err(exec_err(e.code, format!("plpgsql: {}", e.message)));
+            }
+        }
+    }
     let owned_body: String;
     let mut plpgsql_body: Option<crate::sql::PlpgsqlBody> = None;
     let body: &str = if is_trigger_fn {
@@ -834,8 +995,12 @@ pub(crate) fn exec_create_function(
                 &owned_body
             }
             None => {
-                let mut pb = crate::sql::parse_plpgsql_body(body, returns_set)
-                    .map_err(|e| exec_err(e.code, format!("plpgsql: {}", e.message)))?;
+                let mut pb = crate::sql::parse_plpgsql_body(
+                    body,
+                    returns_set,
+                    ret_type.eq_ignore_ascii_case("void"),
+                )
+                .map_err(|e| exec_err(e.code, format!("plpgsql: {}", e.message)))?;
                 // v1.03: resolve DECLAREd variable types now (like PG's
                 // plpgsql validator at CREATE time).
                 for d in &pb.decls {
@@ -889,7 +1054,9 @@ pub(crate) fn exec_create_function(
         // fmgr lookup); unknown symbols are 0A000. v1.38: the int4/int8
         // I/O symbols (PG19 int.c) join int4eq — the float4/float8
         // conformance types are defined in terms of them.
-        if !matches!(body, "int4eq" | "int4in" | "int4out" | "int8in" | "int8out") {
+        if !matches!(body, "int4eq" | "int4in" | "int4out" | "int8in" | "int8out")
+            && super::funcs::internal_cmp_symbol(body).is_none()
+        {
             return Err(exec_err(
                 "0A000",
                 format!("unsupported internal function \"{}\"", body),
@@ -936,7 +1103,46 @@ pub(crate) fn exec_create_function(
         plpgsql: plpgsql_body,
         volatility,
         strict,
+        security_definer,
+        is_procedure: procedure,
     };
+    // v1.96: record the function owner (DROP FUNCTION / GRANT checks).
+    {
+        let prev_fn = eng.db.fn_acls.clone();
+        let prev_type = eng.db.type_acls.clone();
+        let prev_lang = eng.db.lang_acls.clone();
+        let prev_fn_owners = eng.db.fn_owners.clone();
+        let prev_type_owners = eng.db.type_owners.clone();
+        if prev_fn_owners.get(name) != Some(&ctx.role.to_string()) {
+            eng.db
+                .fn_owners
+                .insert(name.to_string(), ctx.role.to_string());
+            // v1.96: a brand-new routine takes its initial ACL from
+            // ALTER DEFAULT PRIVILEGES rules when any exist for the
+            // creator (PG: acldefault modified by the rules — a
+            // REVOKE ... FROM public rule erases the default PUBLIC
+            // EXECUTE). CREATE OR REPLACE keeps the existing ACL.
+            if !prev_fn_owners.contains_key(name) {
+                if let Some(init) = crate::exec::privilege::adp_initial_acl(
+                    &eng.db,
+                    ctx.role,
+                    'f',
+                    name,
+                    crate::storage::PRIV_USAGE,
+                    crate::storage::PRIV_USAGE,
+                ) {
+                    eng.db.fn_acls.insert(name.to_string(), init);
+                }
+            }
+            ctx.writes.push(WriteOp::FnTypeAcls {
+                prev_fn,
+                prev_type,
+                prev_lang,
+                prev_fn_owners,
+                prev_type_owners,
+            });
+        }
+    }
     // v0.87: insert or replace the specific overload.
     {
         let overloads = eng.db.functions.entry(name.to_string()).or_default();
@@ -979,6 +1185,8 @@ pub(crate) fn exec_create_function(
         added,
         prev,
     });
+    // v1.96 finishing pass: schema attribution for DROP SCHEMA CASCADE.
+    note_obj_schema(eng, ctx, name, name);
     Ok(ExecResult::Command {
         tag: "CREATE FUNCTION".to_string(),
     })
@@ -992,6 +1200,7 @@ pub(crate) fn exec_create_function(
 /// mismatch). PG19 RESTRICT (the default) fails with 2BP01 if an operator
 /// still uses the function as its procedure; CASCADE drops those
 /// operators too.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_drop_function(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -999,9 +1208,40 @@ pub(crate) fn exec_drop_function(
     arg_types: &[String],
     if_exists: bool,
     cascade: bool,
+    procedure: bool,
+    args_omitted: bool,
+    any_kind: bool,
 ) -> Result<ExecResult, ExecError> {
     // v0.87: drop the specific overload by signature.
-    let prev = find_function_by_signature(eng, name, arg_types);
+    // v1.96 finishing pass: with the argument list omitted, resolve
+    // by name alone — exactly one routine of the addressed kind must
+    // exist (PG19: otherwise "function name is not unique", 42725).
+    let prev = if args_omitted {
+        let cands: Vec<crate::storage::FuncDef> = eng
+            .db
+            .functions
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|f| any_kind || f.is_procedure == procedure)
+            .collect();
+        match cands.len() {
+            0 => None,
+            1 => Some(cands.into_iter().next().unwrap()),
+            _ => {
+                return Err(exec_err(
+                    "42725",
+                    format!(
+                        "function name \"{}\" is not unique; specify the argument list to identify the routine to drop",
+                        name
+                    ),
+                ));
+            }
+        }
+    } else {
+        find_function_by_signature(eng, name, arg_types)
+    };
     let Some(dropped) = prev else {
         if !if_exists {
             return Err(exec_err(
@@ -1010,9 +1250,55 @@ pub(crate) fn exec_drop_function(
             ));
         }
         return Ok(ExecResult::Command {
-            tag: "DROP FUNCTION".to_string(),
+            tag: if procedure {
+                "DROP PROCEDURE".to_string()
+            } else {
+                "DROP FUNCTION".to_string()
+            },
         });
     };
+    // v1.96: DROP FUNCTION and DROP PROCEDURE address disjoint
+    // namespaces in PG19. (DROP ROUTINE addresses either.)
+    if !any_kind && dropped.is_procedure != procedure {
+        if if_exists {
+            return Ok(ExecResult::Command {
+                tag: if procedure {
+                    "DROP PROCEDURE".to_string()
+                } else {
+                    "DROP FUNCTION".to_string()
+                },
+            });
+        }
+        return Err(exec_err(
+            "42883",
+            format!(
+                "{} {}() does not exist",
+                if procedure { "procedure" } else { "function" },
+                name
+            ),
+        ));
+    }
+    // v1.96: only the owner (or a superuser) may drop a routine.
+    {
+        let owner = eng
+            .db
+            .fn_owners
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| "postgres".to_string());
+        if owner != ctx.role
+            && !crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own)
+        {
+            return Err(exec_err(
+                "42501",
+                format!(
+                    "must be owner of {} {}",
+                    if procedure { "procedure" } else { "function" },
+                    name
+                ),
+            ));
+        }
+    }
     // v0.87: PG19 dependency checking — an operator whose procedure is
     // this function blocks RESTRICT (2BP01); CASCADE drops it.
     let dependent_ops: Vec<(String, OperDef)> = eng
@@ -1023,7 +1309,7 @@ pub(crate) fn exec_drop_function(
             defs.iter()
                 .filter(|d| {
                     d.procedure == name
-                        && find_function_by_signature(eng, name, arg_types)
+                        && find_function_by_signature(eng, name, &dropped.arg_types)
                             .is_some_and(|f| f.arg_types == dropped.arg_types)
                 })
                 .map(|d| (op_name.clone(), d.clone()))
@@ -1078,13 +1364,181 @@ pub(crate) fn exec_drop_function(
             eng.db.functions.remove(name);
         }
     }
+    // v1.96: when the last overload goes, the owner/ACL records go
+    // too (PG drops the pg_proc row; stale fn_owners entries were
+    // blocking DROP ROLE for long-dropped routines).
+    if !eng.db.functions.contains_key(name)
+        && (eng.db.fn_owners.contains_key(name) || eng.db.fn_acls.contains_key(name))
+    {
+        let prev_fn = eng.db.fn_acls.clone();
+        let prev_type = eng.db.type_acls.clone();
+        let prev_lang = eng.db.lang_acls.clone();
+        let prev_fn_owners = eng.db.fn_owners.clone();
+        let prev_type_owners = eng.db.type_owners.clone();
+        eng.db.fn_owners.remove(name);
+        eng.db.fn_acls.remove(name);
+        ctx.writes.push(WriteOp::FnTypeAcls {
+            prev_fn,
+            prev_type,
+            prev_lang,
+            prev_fn_owners,
+            prev_type_owners,
+        });
+        forget_obj_schema(eng, ctx, name);
+    }
     ctx.writes.push(WriteOp::DropFunction {
         name: name.to_string(),
         prev: Some(dropped),
     });
     Ok(ExecResult::Command {
-        tag: "DROP FUNCTION".to_string(),
+        tag: if procedure {
+            "DROP PROCEDURE".to_string()
+        } else {
+            "DROP FUNCTION".to_string()
+        },
     })
+}
+
+/// v1.96: CALL proc(args) — evaluate the procedure body for its side
+/// effects; the (single) result row, if any, is discarded.
+pub(crate) fn exec_call_proc(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    args: &[crate::sql::Expr],
+) -> Result<ExecResult, ExecError> {
+    let base = name.rsplit('.').next().unwrap_or(name);
+    let overloads = eng
+        .db
+        .functions
+        .get(name)
+        .or_else(|| eng.db.functions.get(base));
+    let Some(overloads) = overloads else {
+        return Err(exec_err(
+            "42883",
+            format!("procedure {}() does not exist", name),
+        ));
+    };
+    let fdef = overloads
+        .iter()
+        .find(|f| f.is_procedure && f.arg_types.len() == args.len())
+        .cloned();
+    let Some(fdef) = fdef else {
+        return Err(exec_err(
+            "42883",
+            format!("procedure {}() does not exist", name),
+        ));
+    };
+    // EXECUTE privilege (PG19: CALL checks the procedure ACL).
+    let privs = function_privs_for(&eng.db, ctx.role, &fdef.name, ctx.snap, ctx.own);
+    if privs & crate::storage::PRIV_USAGE != crate::storage::PRIV_USAGE {
+        return Err(exec_err(
+            "42501",
+            format!("permission denied for procedure {}", fdef.name),
+        ));
+    }
+    let mut lock_ids: Vec<(String, u64)> = Vec::new();
+    let mut q = Q {
+        eng,
+        snap: ctx.snap,
+        own: ctx.own,
+        all_xids: ctx.all_xids.clone(),
+        session: ctx.session,
+        role: ctx.role,
+        read_only: ctx.read_only,
+        depth: 0,
+        lock_ids: &mut lock_ids,
+        ctes: Vec::new(),
+        wctx: None,
+        srf_vals: Vec::new(),
+        priv_scopes: Vec::new(),
+        priv_role_override: None,
+        hashed_exists: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
+        immutable_fn_cache: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
+        plan_fold_memo: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
+        hashed_in: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        pending_updates: None,
+        write: Some(qwrite_from_ctx(
+            &mut *ctx.writes,
+            ctx.write_xid,
+            ctx.level,
+            ctx.default_toast_compression,
+        )),
+    };
+    let mut vals = Vec::with_capacity(args.len());
+    for a in args {
+        vals.push(eval_expr(&mut q, &[], a)?);
+    }
+    let _ = call_user_function(&mut q, &[], &fdef, &vals)?;
+    Ok(ExecResult::Command {
+        tag: "CALL".to_string(),
+    })
+}
+
+/// v1.96: `DO <body>` — run an anonymous plpgsql block (no args, no
+/// return value; the tag is DO). The body parses through the same
+/// plpgsql parser as function bodies, so EXECUTE/PERFORM/RAISE and
+/// EXCEPTION handlers behave identically.
+pub(crate) fn exec_do_block(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    body: &str,
+) -> Result<ExecResult, ExecError> {
+    let pb = crate::sql::parse_plpgsql_body(body, false, true).map_err(sql_err)?;
+    let mut lock_ids: Vec<(String, u64)> = Vec::new();
+    let mut q = Q {
+        eng,
+        snap: ctx.snap,
+        own: ctx.own,
+        all_xids: ctx.all_xids.clone(),
+        session: ctx.session,
+        role: ctx.role,
+        read_only: ctx.read_only,
+        depth: 0,
+        lock_ids: &mut lock_ids,
+        ctes: Vec::new(),
+        wctx: None,
+        srf_vals: Vec::new(),
+        priv_scopes: Vec::new(),
+        priv_role_override: None,
+        hashed_exists: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
+        immutable_fn_cache: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
+        plan_fold_memo: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
+        hashed_in: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        pending_updates: None,
+        write: Some(qwrite_from_ctx(
+            &mut *ctx.writes,
+            ctx.write_xid,
+            ctx.level,
+            ctx.default_toast_compression,
+        )),
+    };
+    let mut run = PlpgsqlRun {
+        params: vec![None; pb.decls.len()],
+        nargs: 0,
+        accum: Vec::new(),
+    };
+    match run_plpgsql_stmts(&mut q, &[], &pb.stmts, &pb, &mut run, "void") {
+        Ok(_) => Ok(ExecResult::Command {
+            tag: "DO".to_string(),
+        }),
+        Err(e) => {
+            let handler = pb.handlers.iter().find(|h| {
+                h.sqlstates
+                    .iter()
+                    .any(|c| crate::sql::plpgsql_condition_matches(c, &e.code))
+            });
+            match handler {
+                Some(h) => {
+                    run_plpgsql_stmts(&mut q, &[], &h.stmts, &pb, &mut run, "void")?;
+                    Ok(ExecResult::Command {
+                        tag: "DO".to_string(),
+                    })
+                }
+                None => Err(e),
+            }
+        }
+    }
 }
 
 /// v1.00: `CREATE TRIGGER` (bounded, PG19 `CreateTrigStmt`). The
@@ -1670,11 +2124,20 @@ pub(crate) fn rewrite_plpgsql_body_refs(
     }
     fn rewrite_stmt(s: &mut crate::sql::PlpgsqlStmt, all_names: &[Option<String>]) {
         match s {
-            crate::sql::PlpgsqlStmt::Return(sel) | crate::sql::PlpgsqlStmt::ReturnNext(sel) => {
+            crate::sql::PlpgsqlStmt::Return(sel)
+            | crate::sql::PlpgsqlStmt::ReturnNext(sel)
+            | crate::sql::PlpgsqlStmt::Execute(sel)
+            | crate::sql::PlpgsqlStmt::Perform(sel) => {
                 rewrite_func_arg_refs(sel, all_names);
             }
             crate::sql::PlpgsqlStmt::Assign { select, .. } => {
                 rewrite_func_arg_refs(select, all_names);
+            }
+            crate::sql::PlpgsqlStmt::Assert { cond, message } => {
+                rewrite_func_arg_refs(cond, all_names);
+                if let Some(m) = message {
+                    rewrite_func_arg_refs(m, all_names);
+                }
             }
             crate::sql::PlpgsqlStmt::ForQuery { query, body, .. } => {
                 rewrite_query(query, all_names);
@@ -1722,7 +2185,7 @@ pub(crate) fn rebuild_function_bodies(
             crate::sql::desugar_plpgsql_body(body).ok()
         };
         if desugared.is_none() {
-            if let Ok(mut pb) = crate::sql::parse_plpgsql_body(body, returns_set) {
+            if let Ok(mut pb) = crate::sql::parse_plpgsql_body(body, returns_set, false) {
                 rewrite_plpgsql_body_refs(&mut pb, arg_names);
                 return (None, Some(pb));
             }
@@ -1751,4 +2214,306 @@ pub(crate) fn rebuild_function_bodies(
         stmts.push(stmt);
     }
     (Some(stmts), None)
+}
+
+/// v1.96: CREATE FUNCTION language permission (PG19 aclchk.c
+/// language ACL): untrusted languages (c, internal) are
+/// superuser-only; trusted ones default to PUBLIC USAGE unless
+/// revoked (lang_acls).
+pub(crate) fn check_language_usage(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    lang_name: &str,
+) -> Result<(), ExecError> {
+    let lname = lang_name.to_ascii_lowercase();
+    if crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own) {
+        return Ok(());
+    }
+    if lname == "c" || lname == "internal" {
+        return Err(exec_err(
+            "42501",
+            format!("permission denied for language \"{}\"", lname),
+        ));
+    }
+    let closure = crate::storage::role_closure(&eng.db, ctx.role, ctx.snap, ctx.own);
+    let privs = match eng.db.lang_acls.get(&lname) {
+        None => crate::storage::PRIV_USAGE,
+        Some(entries) => {
+            // v1.96: once a language HAS an ACL, it is authoritative
+            // — no public entry means PUBLIC holds nothing (the
+            // default applies only while the ACL is NULL, i.e. the
+            // map has no key at all). This is what makes
+            // CREATE FUNCTION fail for regress_priv_user2 after
+            // REVOKE ALL ON LANGUAGE sql FROM PUBLIC.
+            let mut p = match entries.iter().find(|e| e.role == "public") {
+                Some(e) => e.privs,
+                None => 0,
+            };
+            for e in entries {
+                if e.role != "public" && closure.iter().any(|n| n == &e.role) {
+                    p |= e.privs;
+                }
+            }
+            p
+        }
+    };
+    if privs & crate::storage::PRIV_USAGE != crate::storage::PRIV_USAGE {
+        return Err(exec_err(
+            "42501",
+            format!("permission denied for language \"{}\"", lname),
+        ));
+    }
+    Ok(())
+}
+
+/// v1.96: CREATE AGGREGATE — register the definition (the fold runs
+/// in agg evaluation via the sfunc).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn exec_create_aggregate(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    arg_types: &[String],
+    sfunc: &str,
+    stype: &str,
+    finalfunc: &Option<String>,
+    initcond: &Option<String>,
+    msfunc: &Option<String>,
+    minvfunc: &Option<String>,
+    mstype: &Option<String>,
+    parallel: &Option<String>,
+) -> Result<ExecResult, ExecError> {
+    let _ = msfunc;
+    // v1.96 finishing pass: PG19 aggregate definition validation
+    // (aggregate.c / functioncmds.c): PARALLEL takes a fixed value
+    // set; the transition function's signature must be exactly
+    // (stype, input...) -> stype with no coercion of the state
+    // argument; the inverse transition function must return the
+    // (moving) state type.
+    if let Some(p) = parallel {
+        let v = p.to_ascii_lowercase();
+        if v != "safe" && v != "restricted" && v != "unsafe" {
+            return Err(exec_err(
+                "42P13",
+                "parameter \"parallel\" must be SAFE, RESTRICTED, or UNSAFE".to_string(),
+            ));
+        }
+    }
+    // Polymorphic aggregates (anyelement & family) resolve their
+    // state type at call time; PG19's static checks don't apply.
+    let polymorphic = stype.starts_with("any") || arg_types.iter().any(|t| t.starts_with("any"));
+    if !polymorphic {
+        let canon = |s: &str| crate::sql::coltype_by_name(s).unwrap_or(ColType::Composite);
+        let defs_of = |n: &str| {
+            let k = n.to_ascii_lowercase();
+            let b = k.rsplit('.').next().unwrap_or(&k).to_string();
+            eng.db
+                .functions
+                .get(&k)
+                .or_else(|| eng.db.functions.get(&b))
+        };
+        if let Some(defs) = defs_of(sfunc) {
+            let want: Vec<ColType> = std::iter::once(stype.to_string())
+                .chain(arg_types.iter().cloned())
+                .map(|s| canon(&s))
+                .collect();
+            let st = canon(stype);
+            let mut any_named = false;
+            let mut exact = false;
+            for d in defs.iter().filter(|d| !d.is_procedure) {
+                any_named = true;
+                let params: Vec<ColType> = d.arg_types.iter().map(|s| canon(s)).collect();
+                if params == want {
+                    if canon(&d.ret_type) != st {
+                        return Err(exec_err(
+                            "42P13",
+                            format!(
+                                "return type of transition function {} is not {}",
+                                sfunc, stype
+                            ),
+                        ));
+                    }
+                    exact = true;
+                }
+            }
+            if any_named && !exact {
+                let sig = vec![stype; want.len()].join(", ");
+                return Err(exec_err(
+                    "42P13",
+                    format!(
+                        "function {}({}) requires run-time type coercion",
+                        sfunc, sig
+                    ),
+                ));
+            }
+        }
+        if let Some(inv) = minvfunc {
+            if let Some(defs) = defs_of(inv) {
+                let target_name = mstype.as_deref().unwrap_or(stype);
+                let target = canon(target_name);
+                if let Some(d) = defs.iter().find(|d| !d.is_procedure) {
+                    if canon(&d.ret_type) != target {
+                        return Err(exec_err(
+                            "42P13",
+                            format!(
+                                "return type of inverse transition function {} is not {}",
+                                inv, target_name
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let key = name.to_ascii_lowercase();
+    if eng.db.aggregates.contains_key(&key) {
+        return Err(exec_err(
+            "42723",
+            format!(
+                "function \"{}\" already exists with same argument types",
+                name
+            ),
+        ));
+    }
+    // v1.96: aggregate argument/state types need USAGE (PG19
+    // parse-time type check, same as function args).
+    for t in arg_types.iter().chain(std::iter::once(&stype.to_string())) {
+        check_type_usage(eng, ctx, t)?;
+    }
+    // The sfunc must exist (PG19 resolves it at CREATE).
+    let sfunc_key = sfunc.to_ascii_lowercase();
+    let bare = sfunc_key
+        .rsplit('.')
+        .next()
+        .unwrap_or(&sfunc_key)
+        .to_string();
+    // v1.96: the builtin int transition/accumulator functions
+    // (int4pl & family) are pg_proc entries too.
+    let builtin_agg_sfunc = matches!(
+        bare.as_str(),
+        "int2pl"
+            | "int4pl"
+            | "int8pl"
+            | "int2mi"
+            | "int4mi"
+            | "int8mi"
+            | "int2mul"
+            | "int4mul"
+            | "int8mul"
+            | "int2div"
+            | "int4div"
+            | "int8div"
+            | "int2_sum"
+            | "int4_sum"
+            | "int8_sum"
+            | "int2_avg_accum"
+            | "int4_avg_accum"
+            | "int8_avg_accum"
+            | "numeric_add"
+            | "numeric_sub"
+            | "numeric_mul"
+            | "float8pl"
+            | "float8mi"
+            | "float8mul"
+            | "float8div"
+    );
+    if !eng.db.functions.contains_key(&sfunc_key)
+        && !eng.db.functions.contains_key(&bare)
+        && !crate::sql::is_builtin_fn(&bare)
+        && !builtin_agg_sfunc
+    {
+        return Err(exec_err(
+            "42883",
+            format!("function {} does not exist", sfunc),
+        ));
+    }
+    eng.db.aggregates.insert(
+        key.clone(),
+        crate::storage::AggDef {
+            sfunc: sfunc_key,
+            stype: stype.to_string(),
+            finalfunc: finalfunc.clone(),
+            initcond: initcond.clone(),
+            arg_types: arg_types.to_vec(),
+            owner: ctx.role.to_string(),
+        },
+    );
+    // v1.96: record routine ownership like functions (shared map).
+    if !eng.db.fn_owners.contains_key(&key) {
+        let prev_fn = eng.db.fn_acls.clone();
+        let prev_type = eng.db.type_acls.clone();
+        let prev_lang = eng.db.lang_acls.clone();
+        let prev_fn_owners = eng.db.fn_owners.clone();
+        let prev_type_owners = eng.db.type_owners.clone();
+        eng.db.fn_owners.insert(key.clone(), ctx.role.to_string());
+        // v1.96: ADP initial ACL for the new aggregate (kind 'f').
+        if let Some(init) = crate::exec::privilege::adp_initial_acl(
+            &eng.db,
+            ctx.role,
+            'f',
+            &key,
+            crate::storage::PRIV_USAGE,
+            crate::storage::PRIV_USAGE,
+        ) {
+            eng.db.fn_acls.insert(key.clone(), init);
+        }
+        ctx.writes.push(WriteOp::FnTypeAcls {
+            prev_fn,
+            prev_type,
+            prev_lang,
+            prev_fn_owners,
+            prev_type_owners,
+        });
+    }
+    Ok(ExecResult::Command {
+        tag: "CREATE AGGREGATE".to_string(),
+    })
+}
+
+/// v1.96: DROP AGGREGATE.
+pub(crate) fn exec_drop_aggregate(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    _arg_types: &[String],
+    if_exists: bool,
+    _cascade: bool,
+) -> Result<ExecResult, ExecError> {
+    let key = name.to_ascii_lowercase();
+    if let Some(def) = eng.db.aggregates.get(&key) {
+        if def.owner != ctx.role
+            && !crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own)
+        {
+            return Err(exec_err(
+                "42501",
+                format!("must be owner of function {}", name),
+            ));
+        }
+    }
+    if eng.db.aggregates.remove(&key).is_none() && !if_exists {
+        return Err(exec_err(
+            "42883",
+            format!("function {} does not exist", name),
+        ));
+    }
+    // v1.96: clean the shared owner/ACL records for the aggregate.
+    if eng.db.fn_owners.contains_key(&key) || eng.db.fn_acls.contains_key(&key) {
+        let prev_fn = eng.db.fn_acls.clone();
+        let prev_type = eng.db.type_acls.clone();
+        let prev_lang = eng.db.lang_acls.clone();
+        let prev_fn_owners = eng.db.fn_owners.clone();
+        let prev_type_owners = eng.db.type_owners.clone();
+        eng.db.fn_owners.remove(&key);
+        eng.db.fn_acls.remove(&key);
+        ctx.writes.push(WriteOp::FnTypeAcls {
+            prev_fn,
+            prev_type,
+            prev_lang,
+            prev_fn_owners,
+            prev_type_owners,
+        });
+    }
+    Ok(ExecResult::Command {
+        tag: "DROP AGGREGATE".to_string(),
+    })
 }

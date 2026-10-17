@@ -6,6 +6,7 @@ use super::*;
 // v0.9: views.
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_create_view(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -15,6 +16,8 @@ pub(crate) fn exec_create_view(
     or_replace: bool,
     security_invoker: bool,
     check_option: bool,
+    matview: bool,
+    with_data: bool,
 ) -> Result<ExecResult, ExecError> {
     // A table by this name blocks the view (Postgres shares the namespace).
     if eng
@@ -50,6 +53,8 @@ pub(crate) fn exec_create_view(
             ));
         }
     };
+    // v1.96: USAGE on cast targets in the view query (PG19).
+    check_select_cast_usages(eng, ctx, &select)?;
     let mut deps = Vec::new();
     collect_table_refs(&select, &mut deps);
     // Every referenced relation must exist (as a table or view).
@@ -66,6 +71,55 @@ pub(crate) fn exec_create_view(
             ));
         }
     }
+    // v1.96 finishing pass: PG19 — materialized views must not
+    // use temporary objects (the matview outlives the session).
+    if matview {
+        for d in &deps {
+            if eng.db.is_temp_table(ctx.session, d) {
+                return Err(exec_err(
+                    "0A000",
+                    "materialized views must not use temporary objects".to_string(),
+                ));
+            }
+        }
+    }
+    // v1.96 finishing pass: a materialized view created WITH DATA
+    // is populated at creation in PG19 — the query runs now and
+    // its errors (division by zero, bad casts, ...) fail the
+    // CREATE. The engine computes matview rows lazily at scan
+    // time, so this is a validation execution only.
+    if matview && with_data {
+        let mut lock_ids = Vec::new();
+        let mut q = Q {
+            eng: &mut *eng,
+            snap: ctx.snap,
+            own: ctx.own,
+            all_xids: ctx.all_xids.clone(),
+            session: ctx.session,
+            role: ctx.role,
+            read_only: false,
+            depth: 0,
+            lock_ids: &mut lock_ids,
+            ctes: Vec::new(),
+            wctx: None,
+            srf_vals: Vec::new(),
+            priv_scopes: Vec::new(),
+            priv_role_override: None,
+            hashed_exists: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashMap::new(),
+            )),
+            immutable_fn_cache: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashMap::new(),
+            )),
+            plan_fold_memo: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashMap::new(),
+            )),
+            hashed_in: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            pending_updates: None,
+            write: None,
+        };
+        run_select(&mut q, &select, &[])?;
+    }
     if existing {
         // OR REPLACE: drop the old definition first (same statement).
         drop_view_internal(eng, ctx, name)?;
@@ -80,13 +134,21 @@ pub(crate) fn exec_create_view(
         owner: ctx.role.to_string(),
         security_invoker,
         check_option,
+        acl: Vec::new(),
+        matview,
+        populated: with_data || !matview,
     };
     eng.db.views.entry(name.to_string()).or_default().push(def);
+    note_obj_schema(eng, ctx, name, name);
     ctx.writes.push(WriteOp::CreateView {
         name: name.to_string(),
     });
     Ok(ExecResult::Command {
-        tag: "CREATE VIEW".to_string(),
+        tag: if matview {
+            "CREATE MATERIALIZED VIEW".to_string()
+        } else {
+            "CREATE VIEW".to_string()
+        },
     })
 }
 
@@ -162,5 +224,132 @@ pub(crate) fn drop_view_internal(
         name: name.to_string(),
         view: snapshot,
     });
+    forget_obj_schema(eng, ctx, name);
     Ok(())
+}
+
+/// v1.96: REFRESH MATERIALIZED VIEW — re-materialize (the engine
+/// evaluates views at read time, so this just flips `populated`).
+pub(crate) fn exec_refresh_matview(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    with_data: bool,
+    concurrently: bool,
+) -> Result<ExecResult, ExecError> {
+    let v = eng
+        .db
+        .find_view(name, ctx.snap, ctx.own)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
+        .clone();
+    if !v.matview {
+        return Err(exec_err(
+            "42809",
+            format!("\"{}\" is not a materialized view", name),
+        ));
+    }
+    // v1.96 finishing pass: PG19 REFRESH option guards
+    // (matview.c): CONCURRENTLY conflicts with WITH NO DATA, and
+    // requires a unique, non-partial index on the matview.
+    if concurrently && !with_data {
+        return Err(exec_err(
+            "0A000",
+            "REFRESH options CONCURRENTLY and WITH NO DATA cannot be used together".to_string(),
+        ));
+    }
+    if concurrently {
+        let has_unique = eng.db.indexes.values().any(|ix| {
+            ix.def.table == name
+                && ix.def.unique
+                && ix.def.predicate.is_none()
+                && ix.def.exprs.iter().all(|e| e.is_none())
+                && crate::storage::index_visible(&ix.def, ctx.snap, &[ctx.own])
+        });
+        if !has_unique {
+            return Err(exec_err(
+                "0A000",
+                format!("cannot refresh materialized view \"{}\" concurrently", name),
+            ));
+        }
+    }
+    let closure = crate::storage::role_closure(&eng.db, ctx.role, ctx.snap, ctx.own);
+    let ok = v.owner == ctx.role
+        || crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own)
+        || closure.iter().any(|r| r == "pg_maintain")
+        // v1.96: an explicit MAINTAIN grant on the matview itself.
+        || v.acl.iter().any(|e| {
+            e.privs & 512 != 0
+                && (e.role == "public" || closure.iter().any(|n| n == &e.role))
+        });
+    if !ok {
+        return Err(exec_err(
+            "42501",
+            format!(
+                "permission denied: must be owner of materialized view \"{}\"",
+                name
+            ),
+        ));
+    }
+    // v1.96 finishing pass: PG19 REFRESH WITH DATA actually
+    // populates the matview — the query runs now and its errors
+    // fail the REFRESH. The engine computes matview rows lazily
+    // at scan time, so this is a validation execution only.
+    if with_data {
+        let stmt = parse_statement(&v.query).map_err(sql_err)?;
+        let select = match stmt {
+            Stmt::Select(s) => s,
+            _ => {
+                return Err(exec_err(
+                    "42601",
+                    "materialized view query must be a SELECT".to_string(),
+                ));
+            }
+        };
+        let mut lock_ids: Vec<(String, u64)> = Vec::new();
+        let mut q = Q {
+            eng: &mut *eng,
+            snap: ctx.snap,
+            own: ctx.own,
+            all_xids: ctx.all_xids.clone(),
+            session: ctx.session,
+            role: ctx.role,
+            read_only: false,
+            depth: 0,
+            lock_ids: &mut lock_ids,
+            ctes: Vec::new(),
+            wctx: None,
+            srf_vals: Vec::new(),
+            priv_scopes: Vec::new(),
+            priv_role_override: None,
+            hashed_exists: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashMap::new(),
+            )),
+            immutable_fn_cache: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashMap::new(),
+            )),
+            plan_fold_memo: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashMap::new(),
+            )),
+            hashed_in: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            pending_updates: None,
+            write: None,
+        };
+        run_select(&mut q, &select, &[])?;
+    }
+    let prev_acl = v.acl.clone();
+    let prev_populated = v.populated;
+    let live = eng
+        .db
+        .find_view_mut(name, ctx.snap, ctx.own)
+        .expect("visible");
+    live.populated = with_data;
+    ctx.writes.push(WriteOp::ViewState {
+        name: name.to_string(),
+        prev_acl,
+        prev_populated,
+        prev_owner: String::new(),
+    });
+    Ok(ExecResult::Command {
+        tag: "REFRESH MATERIALIZED VIEW".to_string(),
+    })
 }

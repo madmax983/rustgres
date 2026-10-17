@@ -378,6 +378,8 @@ pub(crate) fn run_select_inner(
             || stmt_uses_pg_column_compression(stmt)
             || stmt_uses_tableoid(stmt)
             || stmt_uses_xmin_xmax(stmt),
+        stmt.for_update,
+        stmt.lock_clause,
         order_hint.as_ref(),
         early_limit,
     )?;
@@ -415,7 +417,7 @@ pub(crate) fn run_select_inner(
         owned_stmt = s;
         &owned_stmt
     };
-    let agg = is_agg_query(stmt);
+    let agg = is_agg_query(stmt) || contains_user_agg(&q.eng.db, stmt);
     // v0.10: precompute window values for the non-aggregated case
     // (the aggregated case is handled inside exec_agg, where groups
     // are available).

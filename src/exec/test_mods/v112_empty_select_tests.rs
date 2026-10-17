@@ -197,11 +197,13 @@ fn v112_empty_select_still_rejects_bogus() {
     assert_eq!(err.code, "42601");
     let err = run(&mut eng, "SELECT 1 2;").unwrap_err();
     assert_eq!(err.code, "42601");
-    // DISTINCT over zero columns dedups to a single empty row (PG19).
-    assert_eq!(
-        shape(run(&mut eng, "SELECT DISTINCT FROM generate_series(1, 3);").unwrap()),
-        (0, 1)
-    );
+    // v1.96 correction: PG19 gram.y's DISTINCT production is
+    // `SELECT distinct_clause target_list` — the target list is
+    // NOT optional there (only the plain production uses
+    // opt_target_list), so DISTINCT over zero columns is a
+    // syntax error. The earlier assertion claimed otherwise.
+    let err = run(&mut eng, "SELECT DISTINCT FROM generate_series(1, 3);").unwrap_err();
+    assert_eq!(err.code, "42601");
 }
 
 /// v1.13: `tableoid` system column — the OID of the partition leaf

@@ -47,6 +47,21 @@ pub(crate) fn session_user_name(fallback: &str) -> String {
     SESSION_USER.with(|s| s.borrow().clone().unwrap_or_else(|| fallback.to_string()))
 }
 
+thread_local! {
+    /// v1.96: per-statement GUC snapshot installed by the server for
+    /// current_setting() (session.gucs + computed values like `role`).
+    static CURRENT_SETTINGS: RefCell<std::collections::HashMap<String, String>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+pub fn set_current_settings(map: std::collections::HashMap<String, String>) {
+    CURRENT_SETTINGS.with(|c| *c.borrow_mut() = map);
+}
+
+pub(crate) fn installed_guc(name: &str) -> Option<String> {
+    CURRENT_SETTINGS.with(|c| c.borrow().get(name).cloned())
+}
+
 /// Install the session's `row_security` GUC for one statement
 /// (server.rs calls this next to the extra_float_digits install).
 pub fn set_row_security(on: bool) {
@@ -386,6 +401,7 @@ pub(crate) fn rls_check_using_as_check_ctx(
         wctx: None,
         srf_vals: Vec::new(),
         priv_scopes: Vec::new(),
+        priv_role_override: None,
         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
         immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
         plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
@@ -433,6 +449,7 @@ pub(crate) fn rls_check_new_row_ctx(
         wctx: None,
         srf_vals: Vec::new(),
         priv_scopes: Vec::new(),
+        priv_role_override: None,
         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
         immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
         plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
@@ -539,6 +556,13 @@ pub(crate) fn exec_create_policy(
     check_sql: &Option<String>,
 ) -> Result<ExecResult, ExecError> {
     require_table_owner(eng, ctx, table)?;
+    // v1.96: USAGE on cast targets in USING / WITH CHECK (PG19).
+    if let Some(e) = using_expr {
+        check_expr_cast_usages(eng, ctx, e)?;
+    }
+    if let Some(e) = check_expr {
+        check_expr_cast_usages(eng, ctx, e)?;
+    }
     let t = policy_target_table(eng, ctx, table)?;
     validate_policy_shape(eng, ctx, cmd, roles, using_expr, check_expr, false)?;
     if t.policies.iter().any(|p| p.name == name) {
@@ -580,6 +604,12 @@ pub(crate) fn exec_alter_policy(
     has_check: bool,
 ) -> Result<ExecResult, ExecError> {
     require_table_owner(eng, ctx, table)?;
+    if let Some(e) = using_expr {
+        check_expr_cast_usages(eng, ctx, e)?;
+    }
+    if let Some(e) = check_expr {
+        check_expr_cast_usages(eng, ctx, e)?;
+    }
     let t = policy_target_table(eng, ctx, table)?;
     let idx = t
         .policies

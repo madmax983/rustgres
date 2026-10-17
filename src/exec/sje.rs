@@ -1381,6 +1381,11 @@ pub(crate) fn plan_from_item(
             if name == "information_schema.tables"
                 || name == "information_schema.columns"
                 || name == "information_schema.sequences"
+                || name == "information_schema.table_privileges"
+                || name == "information_schema.role_table_grants"
+                || name == "information_schema.column_privileges"
+                || name == "information_schema.enabled_roles"
+                || name == "information_schema.applicable_roles"
             {
                 return Ok(PlanNode::SeqScan {
                     table: name.clone(),
@@ -1461,6 +1466,36 @@ pub(crate) fn plan_from_item(
                     filter: None,
                     rows,
                     // v1.46: VERBOSE `Output:`.
+                    output: scan_output(name, None, &[], where_, &[]),
+                });
+            }
+            // v1.96: large-object + namespace + default-ACL catalogs.
+            if matches!(
+                name.as_str(),
+                "pg_largeobject"
+                    | "pg_largeobject_metadata"
+                    | "pg_namespace"
+                    | "pg_default_acl"
+                    | "pg_shdepend"
+                    | "pg_aios"
+                    | "pg_backend_memory_contexts"
+                    | "pg_shmem_allocations"
+            ) && eng.db.find_table(name, snap, &[own], session).is_none()
+            {
+                let (_, rows) = match name.as_str() {
+                    "pg_largeobject" | "pg_largeobject_metadata" => {
+                        pg_largeobject_scan(&eng.db, name)
+                    }
+                    "pg_namespace" => pg_namespace_scan(&eng.db),
+                    "pg_default_acl" => pg_default_acl_scan(&eng.db),
+                    "pg_shdepend" => pg_shdepend_scan(&eng.db, snap, own, session),
+                    _ => pg_empty_stub_scan(name),
+                };
+                return Ok(PlanNode::SeqScan {
+                    table: name.clone(),
+                    alias: None,
+                    filter: None,
+                    rows: rows.len() as u64,
                     output: scan_output(name, None, &[], where_, &[]),
                 });
             }

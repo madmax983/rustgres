@@ -15,6 +15,46 @@ pub(crate) fn type_name_known(eng: &Engine, name: &str) -> bool {
 /// which must name a builtin type or an existing shell type. Other
 /// attributes are accepted by the parser and ignored here (no I/O
 /// functions exist in v0.22).
+/// v1.96: record a type/domain owner (GRANT ... ON TYPE owner
+/// checks and the type-USAGE owner exemption read type_owners).
+pub(crate) fn record_type_owner(eng: &mut Engine, ctx: &mut StmtCtx, name: &str) {
+    if eng.db.type_owners.get(name).map(|o| o.as_str()) == Some(ctx.role) {
+        return;
+    }
+    let prev_fn = eng.db.fn_acls.clone();
+    let prev_type = eng.db.type_acls.clone();
+    let prev_lang = eng.db.lang_acls.clone();
+    let prev_fn_owners = eng.db.fn_owners.clone();
+    let prev_type_owners = eng.db.type_owners.clone();
+    let is_new = !prev_type_owners.contains_key(name);
+    eng.db
+        .type_owners
+        .insert(name.to_string(), ctx.role.to_string());
+    // v1.96: a brand-new type/domain takes its initial ACL from
+    // ALTER DEFAULT PRIVILEGES rules for the creator when any exist
+    // (kind 'T'; a REVOKE USAGE ... FROM public rule erases the
+    // default PUBLIC USAGE).
+    if is_new {
+        if let Some(init) = crate::exec::privilege::adp_initial_acl(
+            &eng.db,
+            ctx.role,
+            'T',
+            name,
+            crate::storage::PRIV_USAGE,
+            crate::storage::PRIV_USAGE,
+        ) {
+            eng.db.type_acls.insert(name.to_string(), init);
+        }
+    }
+    ctx.writes.push(WriteOp::FnTypeAcls {
+        prev_fn,
+        prev_type,
+        prev_lang,
+        prev_fn_owners,
+        prev_type_owners,
+    });
+}
+
 pub(crate) fn exec_create_type(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -38,7 +78,9 @@ pub(crate) fn exec_create_type(
             if *fty == ColType::Composite {
                 let nested_name = nested.as_deref().unwrap_or(name);
                 match eng.db.types.get(nested_name) {
-                    Some(st) if st.composite.is_some() => {}
+                    // v1.96: a field may be of composite OR domain
+                    // type (both ride the Composite marker).
+                    Some(st) if st.composite.is_some() || st.domain.is_some() => {}
                     _ => {
                         return Err(exec_err(
                             "42704",
@@ -46,6 +88,8 @@ pub(crate) fn exec_create_type(
                         ));
                     }
                 }
+                // v1.96: USAGE on the field's type (PG19).
+                check_type_usage(eng, ctx, nested_name)?;
             }
         }
         eng.db.types.insert(
@@ -61,6 +105,7 @@ pub(crate) fn exec_create_type(
             name: name.to_string(),
             prev,
         });
+        record_type_owner(eng, ctx, name);
         return Ok(ExecResult::Command {
             tag: "CREATE TYPE".to_string(),
         });
@@ -119,6 +164,7 @@ pub(crate) fn exec_create_type(
         name: name.to_string(),
         prev,
     });
+    record_type_owner(eng, ctx, name);
     Ok(ExecResult::Command {
         tag: "CREATE TYPE".to_string(),
     })
@@ -207,9 +253,11 @@ pub(crate) fn exec_create_range_type(
         },
     );
     ctx.writes.push(WriteOp::CreateType {
-        name: mname,
+        name: mname.clone(),
         prev: prev_m,
     });
+    record_type_owner(eng, ctx, name);
+    record_type_owner(eng, ctx, &mname);
     Ok(ExecResult::Command {
         tag: "CREATE TYPE".to_string(),
     })
@@ -217,6 +265,27 @@ pub(crate) fn exec_create_range_type(
 
 /// v0.22: bounded DROP TYPE. Dependents are not tracked (CASCADE is
 /// accepted and ignored); only the registry entry is removed.
+/// v1.96: remove a dropped type/domain's owner + ACL records
+/// (stale entries blocked DROP ROLE for long-dropped types).
+pub(crate) fn clean_type_owner_acl(eng: &mut Engine, ctx: &mut StmtCtx, name: &str) {
+    if eng.db.type_owners.contains_key(name) || eng.db.type_acls.contains_key(name) {
+        let prev_fn = eng.db.fn_acls.clone();
+        let prev_type = eng.db.type_acls.clone();
+        let prev_lang = eng.db.lang_acls.clone();
+        let prev_fn_owners = eng.db.fn_owners.clone();
+        let prev_type_owners = eng.db.type_owners.clone();
+        eng.db.type_owners.remove(name);
+        eng.db.type_acls.remove(name);
+        ctx.writes.push(WriteOp::FnTypeAcls {
+            prev_fn,
+            prev_type,
+            prev_lang,
+            prev_fn_owners,
+            prev_type_owners,
+        });
+    }
+}
+
 pub(crate) fn exec_drop_type(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -230,6 +299,9 @@ pub(crate) fn exec_drop_type(
                 "42704",
                 format!("type \"{}\" does not exist", name),
             ));
+        }
+        if prev.is_some() {
+            clean_type_owner_acl(eng, ctx, name);
         }
         // v1.88: dropping a range type also drops its multirange
         // companion (PG dependency semantics).
@@ -338,12 +410,6 @@ pub(crate) fn exec_create_cast(
     context: crate::sql::CastContext,
 ) -> Result<ExecResult, ExecError> {
     use crate::sql::CastMethod;
-    if method != CastMethod::Binary {
-        return Err(exec_err(
-            "0A000",
-            "CREATE CAST WITH FUNCTION / WITH INOUT is not implemented; only WITHOUT FUNCTION (binary) casts are supported".to_string(),
-        ));
-    }
     // PG19: both types must exist (typenameTypeId -> 42704).
     for name in [src, dst] {
         let known = crate::sql::coltype_by_name(name).is_ok() || eng.db.types.contains_key(name);
@@ -353,6 +419,38 @@ pub(crate) fn exec_create_cast(
                 format!("type \"{}\" does not exist", name),
             ));
         }
+    }
+    // v1.96: naming a user type/domain in CREATE CAST needs USAGE
+    // on both endpoints (PG19 parse-time type check).
+    check_type_usage(eng, ctx, src)?;
+    check_type_usage(eng, ctx, dst)?;
+    if method != CastMethod::Binary {
+        // v1.96: WITH FUNCTION / WITH INOUT casts are recorded in
+        // the cast catalog (the function association itself is not
+        // modeled: casts between domains evaluate through domain
+        // coercion in this engine). Duplicates are 42710.
+        let key = (src.to_string(), dst.to_string());
+        if eng.db.casts.contains_key(&key) {
+            return Err(exec_err(
+                "42710",
+                format!(
+                    "cast from type \"{}\" to type \"{}\" already exists",
+                    src, dst
+                ),
+            ));
+        }
+        let prev = eng
+            .db
+            .casts
+            .insert(key.clone(), crate::storage::CastDef { context });
+        ctx.writes.push(WriteOp::CreateCast {
+            src: key.0,
+            dst: key.1,
+            prev,
+        });
+        return Ok(ExecResult::Command {
+            tag: "CREATE CAST".to_string(),
+        });
     }
     // PG19: must be superuser to create a cast WITHOUT FUNCTION.
     if !crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own) {
@@ -447,6 +545,281 @@ pub(crate) fn exec_create_cast(
     })
 }
 
+/// v1.96: DROP CAST (source AS target) — removes a user cast from
+/// the catalog (either key spelling: the as-written names used by
+/// WITH FUNCTION casts, or the canonical sql_name keys used by
+/// binary casts). Missing casts are 42883 unless IF EXISTS.
+pub(crate) fn exec_drop_cast(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    src: &str,
+    dst: &str,
+    if_exists: bool,
+) -> Result<ExecResult, ExecError> {
+    let mut key = (src.to_string(), dst.to_string());
+    if !eng.db.casts.contains_key(&key) {
+        if let (Some(s), Some(d)) = (cast_type_key(eng, src), cast_type_key(eng, dst)) {
+            key = (s, d);
+        }
+    }
+    match eng.db.casts.remove(&key) {
+        Some(prev) => {
+            ctx.writes.push(WriteOp::CreateCast {
+                src: key.0,
+                dst: key.1,
+                prev: Some(prev),
+            });
+            Ok(ExecResult::Command {
+                tag: "DROP CAST".to_string(),
+            })
+        }
+        None => {
+            if if_exists {
+                Ok(ExecResult::Command {
+                    tag: "DROP CAST".to_string(),
+                })
+            } else {
+                Err(exec_err(
+                    "42883",
+                    format!(
+                        "cast from type \"{}\" to type \"{}\" does not exist",
+                        src, dst
+                    ),
+                ))
+            }
+        }
+    }
+}
+
+/// v1.96: ALTER TYPE name ADD ATTRIBUTE — appends a field to a
+/// composite type (PG19: USAGE on the attribute's type is checked;
+/// duplicates are 42701).
+/// v1.96 finishing pass: does composite type `root` transitively
+/// contain `target` as an attribute type (PG19's "composite type
+/// cannot be made a member of itself" rule)? Range types over
+/// composite subtypes are not constructible in this engine, so
+/// only composite attribute chains are walked.
+pub(crate) fn composite_type_contains(
+    db: &crate::storage::Database,
+    root: &str,
+    target: &str,
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    if root == target {
+        return true;
+    }
+    // Composite attributes from CREATE TYPE definitions.
+    if let Some(st) = db.types.get(root) {
+        if let Some(attrs) = &st.composite {
+            for (_, _, nested) in attrs {
+                if let Some(n) = nested {
+                    if composite_type_contains(db, n, target, depth + 1) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    // A table's rowtype is its composite form too (PG19): walk the
+    // table's own named-composite columns.
+    let from_table: Vec<Option<String>> = db
+        .tables
+        .get(root)
+        .and_then(|vs| vs.last())
+        .map(|t| t.composite_types.clone())
+        .or_else(|| {
+            db.temp_tables
+                .values()
+                .find_map(|m| m.get(root))
+                .map(|t| t.composite_types.clone())
+        })
+        .unwrap_or_default();
+    for n in from_table.into_iter().flatten() {
+        if composite_type_contains(db, &n, target, depth + 1) {
+            return true;
+        }
+    }
+    false
+}
+
+/// v1.96 finishing pass: shared guards for ALTER TYPE ... ADD /
+/// ALTER ATTRIBUTE (PG19 typecmds.c): a type used by a table column
+/// cannot have its attributes changed; the incoming attribute type
+/// must exist; and a composite type cannot (transitively) become a
+/// member of itself — including through a range/multirange
+/// companion named after it, whose subtype is the type itself.
+pub(crate) fn alter_type_attr_guards(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    type_name: &str,
+    new_named: Option<&str>,
+) -> Result<(), ExecError> {
+    let names: Vec<String> = eng.db.tables.keys().cloned().collect();
+    for tname in &names {
+        if let Some(t) = eng
+            .db
+            .find_table(tname, ctx.snap, &ctx.all_xids, ctx.session)
+        {
+            for (i, (cn, _)) in t.columns.iter().enumerate() {
+                if t.composite_types.get(i).and_then(|o| o.as_deref()) == Some(type_name) {
+                    return Err(exec_err(
+                        "2BP01",
+                        format!(
+                            "cannot alter type \"{}\" because column \"{}.{}\" uses it",
+                            type_name, tname, cn
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(n) = new_named {
+        const BUILTIN_RANGES: [&str; 12] = [
+            "int4range",
+            "int8range",
+            "numrange",
+            "tsrange",
+            "tstzrange",
+            "daterange",
+            "int4multirange",
+            "int8multirange",
+            "nummultirange",
+            "tsmultirange",
+            "tstzmultirange",
+            "datemultirange",
+        ];
+        if !eng.db.types.contains_key(n) && !BUILTIN_RANGES.contains(&n) {
+            let companion_of_self = n.strip_suffix("multirange") == Some(type_name)
+                || n.strip_suffix("range") == Some(type_name);
+            if companion_of_self {
+                return Err(exec_err(
+                    "42P16",
+                    format!(
+                        "composite type {} cannot be made a member of itself",
+                        type_name
+                    ),
+                ));
+            }
+            return Err(exec_err("42704", format!("type \"{}\" does not exist", n)));
+        }
+        if composite_type_contains(&eng.db, n, type_name, 0) {
+            return Err(exec_err(
+                "42P16",
+                format!(
+                    "composite type {} cannot be made a member of itself",
+                    type_name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn exec_alter_type_add_attribute(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    attr: &str,
+    col_type: &ColType,
+    named_type: Option<&str>,
+) -> Result<ExecResult, ExecError> {
+    let prev = match eng.db.types.get(name) {
+        Some(st) => st.clone(),
+        None => {
+            return Err(exec_err(
+                "42704",
+                format!("type \"{}\" does not exist", name),
+            ));
+        }
+    };
+    if prev.composite.is_none() {
+        return Err(exec_err(
+            "42809",
+            format!("type \"{}\" is not a composite type", name),
+        ));
+    }
+    if let Some(n) = named_type {
+        check_type_usage(eng, ctx, n)?;
+    }
+    alter_type_attr_guards(eng, ctx, name, named_type)?;
+    let mut next = prev.clone();
+    let fields = next.composite.as_mut().expect("composite checked");
+    if fields.iter().any(|(f, _, _)| f == attr) {
+        return Err(exec_err(
+            "42701",
+            format!("attribute \"{}\" of type \"{}\" already exists", attr, name),
+        ));
+    }
+    fields.push((
+        attr.to_string(),
+        *col_type,
+        named_type.map(|s| s.to_string()),
+    ));
+    eng.db.types.insert(name.to_string(), next);
+    ctx.writes.push(WriteOp::CreateType {
+        name: name.to_string(),
+        prev: Some(prev),
+    });
+    Ok(ExecResult::Command {
+        tag: "ALTER TYPE".to_string(),
+    })
+}
+
+/// v1.96: ALTER TYPE name ALTER ATTRIBUTE attr TYPE type.
+pub(crate) fn exec_alter_type_alter_attribute(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    attr: &str,
+    col_type: &ColType,
+    named_type: Option<&str>,
+) -> Result<ExecResult, ExecError> {
+    let prev = match eng.db.types.get(name) {
+        Some(st) => st.clone(),
+        None => {
+            return Err(exec_err(
+                "42704",
+                format!("type \"{}\" does not exist", name),
+            ));
+        }
+    };
+    if prev.composite.is_none() {
+        return Err(exec_err(
+            "42809",
+            format!("type \"{}\" is not a composite type", name),
+        ));
+    }
+    if let Some(n) = named_type {
+        check_type_usage(eng, ctx, n)?;
+    }
+    alter_type_attr_guards(eng, ctx, name, named_type)?;
+    let mut next = prev.clone();
+    let fields = next.composite.as_mut().expect("composite checked");
+    match fields.iter_mut().find(|(f, _, _)| f == attr) {
+        Some(slot) => {
+            slot.1 = *col_type;
+            slot.2 = named_type.map(|s| s.to_string());
+        }
+        None => {
+            return Err(exec_err(
+                "42703",
+                format!("attribute \"{}\" of type \"{}\" does not exist", attr, name),
+            ));
+        }
+    }
+    eng.db.types.insert(name.to_string(), next);
+    ctx.writes.push(WriteOp::CreateType {
+        name: name.to_string(),
+        prev: Some(prev),
+    });
+    Ok(ExecResult::Command {
+        tag: "ALTER TYPE".to_string(),
+    })
+}
+
 /// v0.85: CREATE DOMAIN — a named type over a base type with CHECK
 /// constraints (PG19 `coerce_to_domain`). The base resolves against
 /// the type catalog: builtins pass through, a named composite base
@@ -471,6 +844,17 @@ pub(crate) fn exec_create_domain(
             "42710",
             format!("type \"{}\" already exists", name),
         ));
+    }
+    // v1.96: USAGE on the base type and on cast targets inside the
+    // domain's CHECK / DEFAULT expressions (PG19 parse-time checks).
+    if let Some(bn) = base_named {
+        check_type_usage(eng, ctx, bn)?;
+    }
+    for c in checks {
+        check_expr_cast_usages(eng, ctx, &c.expr)?;
+    }
+    if let Some(crate::sql::DefaultExpr::Expr(e)) = default {
+        check_expr_cast_usages(eng, ctx, e)?;
     }
     let (base_ty, resolved_named, base_domain) = match base_named {
         None => (base.clone(), None, None),
@@ -558,6 +942,7 @@ pub(crate) fn exec_create_domain(
         name: name.to_string(),
         prev: None,
     });
+    record_type_owner(eng, ctx, name);
     Ok(ExecResult::Command {
         tag: "CREATE DOMAIN".to_string(),
     })
@@ -593,6 +978,7 @@ pub(crate) fn exec_drop_domain(
             name: name.clone(),
             prev,
         });
+        clean_type_owner_acl(eng, ctx, name);
     }
     Ok(ExecResult::Command {
         tag: "DROP DOMAIN".to_string(),

@@ -796,6 +796,14 @@ pub(crate) fn alter_inherit(
     parent_name: &str,
     link: bool,
 ) -> Result<ExecResult, ExecError> {
+    // v1.96 finishing pass: PG19 forbids changing the inheritance
+    // of a typed table.
+    if eng.db.typed_tables.contains_key(child_name) {
+        return Err(exec_err(
+            "42P16",
+            "cannot change inheritance of typed table".to_string(),
+        ));
+    }
     // v0.11: every ALTER TABLE needs owner-or-superuser; PG requires
     // ownership of the parent too (the child was checked in
     // `exec_alter_one`).
@@ -1298,6 +1306,10 @@ pub(crate) fn exec_trigger_body(
                 // Coerce like a normal INSERT assignment would.
                 row[idx] = coerce_value(val, &cols[idx].1, col)?;
             }
+            TriggerBodyStmt::Perform(expr) => {
+                // v1.96: evaluate for side effects, discard result.
+                let _ = eval_trigger_expr(eng, ctx, table, cols, &row, expr)?;
+            }
             TriggerBodyStmt::ReturnNew => return Ok(Some(row)),
             TriggerBodyStmt::ReturnOld => {
                 // v1.00: INSERT has no OLD row. PG would return the
@@ -1317,7 +1329,7 @@ pub(crate) fn exec_trigger_body(
                     .collect::<Result<Vec<_>, _>>()?;
                 let msg = format_raise_message(format, &vals);
                 match level {
-                    RaiseLevel::Notice => ctx.notices.push(msg),
+                    RaiseLevel::Notice | RaiseLevel::Warning => ctx.notices.push(msg),
                     RaiseLevel::Exception => return Err(exec_err("P0001", msg)),
                 }
             }
@@ -1424,6 +1436,7 @@ pub(crate) fn eval_partition_key_expr(
         role,
         read_only: false,
         priv_scopes: Vec::new(),
+        priv_role_override: None,
         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
         immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
         plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
@@ -2462,6 +2475,7 @@ pub(crate) fn create_table_from_def(
             ctx.writes.push(WriteOp::CreateTable {
                 name: name.to_string(),
             });
+            note_obj_schema(eng, ctx, name, name);
             for fk in &def.fks {
                 validate_fk_def(eng, ctx, name, fk)?;
             }
@@ -2500,6 +2514,7 @@ pub(crate) fn create_table_from_def(
     ctx.writes.push(WriteOp::CreateTable {
         name: name.to_string(),
     });
+    note_obj_schema(eng, ctx, name, name);
     // Validate foreign keys after the table exists so self-references
     // resolve. On failure the statement aborts and undo removes the
     // table (statement atomicity).

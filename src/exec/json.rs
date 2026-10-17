@@ -5004,6 +5004,7 @@ pub(crate) fn eval_json_array_subq_ctor(
             wctx: None,
             srf_vals: Vec::new(),
             priv_scopes: q.priv_scopes.clone(),
+            priv_role_override: q.priv_role_override.clone(),
             hashed_exists: q.hashed_exists.clone(),
             immutable_fn_cache: q.immutable_fn_cache.clone(),
             plan_fold_memo: q.plan_fold_memo.clone(),

@@ -174,12 +174,20 @@ end$$;",
     assert_eq!(rows_of(r.unwrap()), vec![vec!["-2"]]);
 }
 
-/// v1.02: unsupported RAISE levels (DEBUG/LOG/INFO/WARNING) are an
+/// v1.02: unsupported RAISE levels (DEBUG/LOG/INFO) are an
 /// honest 0A000 at parse, like the v1.00 trigger bodies.
+/// v1.96: WARNING joined NOTICE/EXCEPTION as a supported level
+/// (PG19 supports it; the privileges suite's plpgsql bodies use it),
+/// so it must now CREATE cleanly instead of erroring.
 #[test]
 fn raise_unsupported_level_is_0a000() {
     let mut eng = engine();
-    for level in ["debug", "log", "info", "warning"] {
+    let (r, _) = run_n(
+        &mut eng,
+        "create function lvl102w() returns int as 'begin raise warning ''x''; return 1; end' language plpgsql",
+    );
+    r.unwrap();
+    for level in ["debug", "log", "info"] {
         let (r, _) = run_n(
             &mut eng,
             &format!(

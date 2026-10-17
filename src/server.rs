@@ -2288,6 +2288,9 @@ fn read_only_violation(
         Stmt::DropPolicy { .. } => Some("DROP POLICY"),
         Stmt::Grant { .. } => Some("GRANT"),
         Stmt::Revoke { .. } => Some("REVOKE"),
+        Stmt::AlterGroup { .. } => Some("ALTER GROUP"),
+        Stmt::LockTable { .. } => Some("LOCK TABLE"),
+        Stmt::AlterDefaultPrivileges { .. } => Some("ALTER DEFAULT PRIVILEGES"),
         Stmt::GrantRole { .. } => Some("GRANT"),
         Stmt::RevokeRole { .. } => Some("REVOKE"),
         _ => None,
@@ -2677,21 +2680,23 @@ fn stmt_set_role(
                     message: format!("role \"{}\" does not exist", name),
                 });
             }
-            // PG19 `member_can_set_role`: a superuser, or the session
-            // user is a member of the target role.
+            // PG19 `member_can_set_role` (auth.c
+            // IsMemberOfRoleWithOption SET): a superuser, or the
+            // session user reaches the target role through membership
+            // edges that all carry SET OPTION (v1.96).
             let allowed = crate::storage::is_superuser_snap(
                 &guard.db,
                 &session.session_user,
                 &snap,
                 u64::MAX,
-            ) || crate::storage::role_closure(
-                &guard.db,
-                &session.session_user,
-                &snap,
-                u64::MAX,
-            )
-            .iter()
-            .any(|r| r == &name);
+            ) || name == session.session_user
+                || crate::storage::member_can_set_role(
+                    &guard.db,
+                    &session.session_user,
+                    &name,
+                    &snap,
+                    u64::MAX,
+                );
             if !allowed {
                 return Err(ExecError {
                     detail: None,
@@ -2759,6 +2764,8 @@ fn is_generic_guc(name: &str) -> bool {
     matches!(
         name,
         "enable_seqscan"
+            | "default_statistics_target"
+            | "lo_compat_privileges"
             | "enable_indexscan"
             | "enable_bitmapscan"
             | "enable_indexonlyscan"
@@ -2859,6 +2866,9 @@ fn guc_default(name: &str) -> &'static str {
         "timezone" => "GMT",
         "search_path" => "\"$user\", public",
         "default_table_access_method" => "heap",
+        // v1.96: PG19 boot_vals.
+        "default_statistics_target" => "100",
+        "lo_compat_privileges" => "off",
         _ => "on",
     }
 }
@@ -3140,6 +3150,25 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
             }
             Ok(i.to_string())
         }
+        // v1.96: int GUC (PG19 range 1..10000).
+        "default_statistics_target" => {
+            let i: i64 = value.trim().parse().map_err(|_| invalid())?;
+            if !(1..=10000).contains(&i) {
+                return Err(ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!(
+                        "{} is outside the valid range for parameter \"default_statistics_target\" (1 .. 10000)",
+                        value
+                    ),
+                });
+            }
+            Ok(i.to_string())
+        }
+        // v1.96: bool GUC (PG19 guc_tables.c).
+        "lo_compat_privileges" => parse_bool_guc(value)
+            .map(|b| (if b { "on" } else { "off" }).to_string())
+            .ok_or_else(invalid),
         "plan_cache_mode" => match value.trim().to_ascii_lowercase().as_str() {
             "auto" | "force_generic_plan" | "force_custom_plan" => {
                 Ok(value.trim().to_ascii_lowercase())
@@ -3442,6 +3471,8 @@ fn name_to_static(name: &str) -> &'static str {
         "timezone" => "timezone",
         "search_path" => "search_path",
         "default_table_access_method" => "default_table_access_method",
+        "default_statistics_target" => "default_statistics_target",
+        "lo_compat_privileges" => "lo_compat_privileges",
         _ => "unrecognized",
     }
 }
@@ -3904,6 +3935,38 @@ fn run_statement(
             .unwrap_or(true);
         crate::exec::set_row_security(rs);
         crate::exec::set_session_user(&session.session_user);
+        // v1.96: current_setting() snapshot: the session's GUC map
+        // plus computed values.
+        {
+            let mut map: std::collections::HashMap<String, String> = session.gucs.clone();
+            for n in [
+                "server_version",
+                "server_version_num",
+                "datestyle",
+                "timezone",
+                "extra_float_digits",
+                "row_security",
+                "transaction_isolation",
+                "default_transaction_isolation",
+            ] {
+                if let Some(v) = guc_value(session, n) {
+                    map.insert(n.to_string(), v);
+                }
+            }
+            map.insert(
+                "role".to_string(),
+                if session.role == session.session_user {
+                    "none".to_string()
+                } else {
+                    session.role.clone()
+                },
+            );
+            map.insert(
+                "session_authorization".to_string(),
+                session.session_user.clone(),
+            );
+            crate::exec::set_current_settings(map);
+        }
     }
     let owned;
     let stmt = match stmt {
@@ -4061,9 +4124,20 @@ fn run_statement(
             verbose,
             analyze,
         } => {
-            let out = txn_vacuum(engine, session, table.as_deref(), *verbose)?;
+            let mut vac_notices: Vec<String> = Vec::new();
+            let out = txn_vacuum(
+                engine,
+                session,
+                table.as_deref(),
+                *verbose,
+                &mut vac_notices,
+            )?;
+            let vac_skipped = !vac_notices.is_empty();
+            session.pending_notices.extend(vac_notices);
             // v0.14: `VACUUM ANALYZE` also collects planner statistics.
-            if *analyze {
+            // v1.96: when VACUUM skipped the table (permission
+            // warning), PG does not analyze it either.
+            if *analyze && !vac_skipped {
                 let a = Stmt::Analyze {
                     table: table.clone(),
                 };
@@ -4425,6 +4499,13 @@ fn auto_vacuum(engine: &mut Engine, writes: &[WriteOp]) {
             | WriteOp::DropRole { .. }
             | WriteOp::AlterRole { .. }
             | WriteOp::DbAcl { .. }
+            | WriteOp::DefaultAcls { .. }
+            | WriteOp::FnTypeAcls { .. }
+            | WriteOp::SchemaSet { .. }
+            | WriteOp::ObjSchemaSet { .. }
+            | WriteOp::LargeObjects { .. }
+            | WriteOp::DbOwner { .. }
+            | WriteOp::ViewState { .. }
             // v0.22: temp tables are single-version; their DDL leaves
             // no dead versions to reap. Shell types likewise.
             | WriteOp::CreateTempTable { .. }
@@ -4728,6 +4809,7 @@ fn txn_vacuum(
     session: &Session,
     table: Option<&str>,
     verbose: bool,
+    notices: &mut Vec<String>,
 ) -> Result<ExecResult, ExecError> {
     if session.txn.is_some() {
         return Err(err_25001("VACUUM cannot run inside a transaction block"));
@@ -4745,6 +4827,10 @@ fn txn_vacuum(
             .map(|t| {
                 t.owner == session.role
                     || crate::storage::is_superuser_snap(db, &session.role, snap, u64::MAX)
+                    // v1.96: MAINTAIN privilege permits VACUUM (PG19).
+                    || crate::storage::table_privs(db, &session.role, t, snap, u64::MAX)
+                        & 512
+                        != 0
             })
             .unwrap_or(false)
     };
@@ -4763,11 +4849,12 @@ fn txn_vacuum(
             });
         }
         if !is_owner(&guard.db, &snap, name) {
-            return Err(ExecError {
-                detail: None,
-                code: "42501",
-                message: format!("permission denied: must be owner of table \"{}\"", name),
-            });
+            // v1.96: PG19 VACUUM warns and skips (no error).
+            notices.push(format!(
+                "permission denied to vacuum \"{}\", skipping it",
+                name
+            ));
+            return Ok(cmd("VACUUM"));
         }
     }
     // v0.85: vacuum a temp table when the name resolves to one; otherwise
@@ -6807,6 +6894,10 @@ mod tests {
                         can_login: true,
                         superuser: false,
                         bypassrls: false,
+                        inherit: true,
+                        createrole: false,
+                        createdb: false,
+                        replication: false,
                         connlimit: -1,
                         memberships: Vec::new(),
                         valid_until: None,

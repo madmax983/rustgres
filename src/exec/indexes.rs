@@ -331,6 +331,20 @@ pub(crate) fn exec_create_index(
 ) -> Result<ExecResult, ExecError> {
     // v0.11: indexing a table needs its owner (or a superuser).
     require_table_owner(eng, ctx, table)?;
+    // v1.96: USAGE on cast targets inside index expressions and the
+    // predicate (PG19 parse-time type check).
+    for c in columns.iter() {
+        if let Some(src) = &c.expr {
+            if let Ok(e) = crate::sql::parse_expr_str(src) {
+                check_expr_cast_usages(eng, ctx, &e)?;
+            }
+        }
+    }
+    if let Some(src) = predicate {
+        if let Ok(e) = crate::sql::parse_expr_str(src) {
+            check_expr_cast_usages(eng, ctx, &e)?;
+        }
+    }
     // v0.87: temp tables use the session-local temp index map.
     let is_temp = eng.db.is_temp_table(ctx.session, table);
     // v1.92: PG19 checks expression/predicate immutability while
@@ -400,6 +414,68 @@ pub(crate) fn exec_create_index(
             format!("relation \"{}\" already exists", name),
         ));
     }
+    // v1.96 finishing pass: indexes on materialized views. The
+    // view's output schema and current rows are computed once,
+    // here, and used for column resolution and the initial build
+    // (matview rows are otherwise computed lazily at scan time).
+    let mut mv_col_names: Option<Vec<String>> = None;
+    let mut mv_rows: Option<Vec<crate::storage::Row>> = None;
+    if eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+        .is_none()
+    {
+        if let Some(v) = eng
+            .db
+            .find_view(table, ctx.snap, ctx.own)
+            .filter(|v| v.matview)
+            .cloned()
+        {
+            let stmt = parse_statement(&v.query).map_err(sql_err)?;
+            if let Stmt::Select(sel) = stmt {
+                let mut lock_ids = Vec::new();
+                let mut q = Q {
+                    eng: &mut *eng,
+                    snap: ctx.snap,
+                    own: ctx.own,
+                    all_xids: ctx.all_xids.clone(),
+                    session: ctx.session,
+                    role: ctx.role,
+                    read_only: false,
+                    depth: 0,
+                    lock_ids: &mut lock_ids,
+                    ctes: Vec::new(),
+                    wctx: None,
+                    srf_vals: Vec::new(),
+                    priv_scopes: Vec::new(),
+                    priv_role_override: None,
+                    hashed_exists: std::rc::Rc::new(std::cell::RefCell::new(
+                        std::collections::HashMap::new(),
+                    )),
+                    immutable_fn_cache: std::rc::Rc::new(std::cell::RefCell::new(
+                        std::collections::HashMap::new(),
+                    )),
+                    plan_fold_memo: std::rc::Rc::new(std::cell::RefCell::new(
+                        std::collections::HashMap::new(),
+                    )),
+                    hashed_in: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+                    pending_updates: None,
+                    write: None,
+                };
+                let out = run_select(&mut q, &sel, &[])?;
+                mv_col_names = Some(
+                    out.columns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (cn, _))| {
+                            v.col_aliases.get(i).cloned().unwrap_or_else(|| cn.clone())
+                        })
+                        .collect(),
+                );
+                mv_rows = Some(out.rows.iter().map(|r| r.clone()).collect());
+            }
+        }
+    }
     // v0.88: expression / partial indexes are catalog-only for now: the
     // v0.88 planner has no expression evaluation or predicate
     // implication, so they are stored but never built, maintained, or
@@ -408,10 +484,18 @@ pub(crate) fn exec_create_index(
     // Resolve the table and plain columns (immutable borrows only).
     // Expression key columns carry usize::MAX (no single position).
     let (cols, col_names, descs, nulls_firsts, exprs) = {
-        let t = eng
-            .db
-            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
-            .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
+        let table_col_names: Vec<String> = match &mv_col_names {
+            Some(names) => names.clone(),
+            None => eng
+                .db
+                .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+                .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?
+                .columns
+                .iter()
+                .map(|(n, _)| n.clone())
+                .collect(),
+        };
+        let t = &table_col_names;
         let mut cols = Vec::with_capacity(columns.len());
         let mut col_names = Vec::with_capacity(columns.len());
         let mut descs = Vec::with_capacity(columns.len());
@@ -421,7 +505,7 @@ pub(crate) fn exec_create_index(
         for c in columns {
             match (&c.name, &c.expr) {
                 (Some(n), None) => {
-                    let pos = t.column_index(n).ok_or_else(|| {
+                    let pos = t.iter().position(|cn| cn == n).ok_or_else(|| {
                         exec_err(
                             "42703",
                             format!("column \"{}\" of relation \"{}\" does not exist", n, table),
@@ -475,7 +559,27 @@ pub(crate) fn exec_create_index(
         predicate: predicate.map(|s| s.to_string()),
         planner_usable,
     });
-    if planner_usable {
+    if planner_usable && mv_rows.is_some() {
+        // Matview build: keys come from the rows computed above;
+        // entry ids are positional (the planner never scans a
+        // matview through its indexes in this engine).
+        let rows = mv_rows.as_ref().expect("checked");
+        for (i, vals) in rows.iter().enumerate() {
+            let key = ix.key_for(vals);
+            ix.insert(key, i as u64);
+        }
+        if unique {
+            for (key, ids) in &ix.tree {
+                if key.0.iter().any(|v| matches!(v, Value::Null)) {
+                    continue;
+                }
+                if ids.len() >= 2 {
+                    return Err(unique_violation_err(name));
+                }
+            }
+        }
+    }
+    if planner_usable && mv_rows.is_none() {
         // Build + backfill from every version of the visible table
         // version; visibility is resolved at scan time, so uncommitted
         // and dead versions get entries too (like Postgres' heap/index

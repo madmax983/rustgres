@@ -33,7 +33,7 @@ pub(crate) const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK16";
 /// v1.94: version 20 adds the tsvector / tsquery column types and
 /// value tags to table and row images. v19 checkpoints are refused;
 /// remove the data directory to start fresh.
-pub(crate) const CHKPT_VERSION: u32 = 21;
+pub(crate) const CHKPT_VERSION: u32 = 23;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -85,9 +85,16 @@ pub(crate) const CHKPT_VERSION: u32 = 21;
 /// v1.95: `RGSWAL25` — role records carry `bypassrls` (trailing byte);
 /// table RLS flags + policies ride the s-expr constraints string
 /// (decoded optionally, so older logs still read).
-pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL25";
+/// v1.96: `RGSWAL26` — function records carry security_definer /
+/// is_procedure; view records carry a schema field; ACL entries carry
+/// (grant_option, grantor); membership records carry option triples.
+/// v1.96 finishing pass: `RGSWAL27` — role records carry `replication`
+/// (trailing byte). WAL_MAGIC and WAL_VERSION must move together:
+/// recovery derives the decode version from the magic, so a stale
+/// magic makes new records decode one version short (trailing bytes).
+pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL27";
 /// v1.80: the format version number in [`WAL_MAGIC`].
-pub(crate) const WAL_VERSION: u32 = 25;
+pub(crate) const WAL_VERSION: u32 = 27;
 /// v1.80: oldest WAL format this build can replay.
 pub(crate) const MIN_READABLE_WAL_VERSION: u32 = 20;
 pub(crate) const WAL_HEADER_LEN: u64 = 16;
@@ -583,6 +590,10 @@ impl Wal {
                 // v1.95 (checkpoint v21): view options.
                 v_body.u8(v.security_invoker as u8);
                 v_body.u8(v.check_option as u8);
+                // v1.96 (checkpoint v22): acl + matview state.
+                v_body.acl_list(&v.acl.iter().map(WalAcl::of).collect::<Vec<_>>());
+                v_body.u8(v.matview as u8);
+                v_body.u8(v.populated as u8);
                 n_views += 1;
             }
         }
@@ -642,6 +653,98 @@ impl Wal {
         let mut a_body = Enc::new();
         a_body.acl_list(&eng.db.db_acl.iter().map(WalAcl::of).collect::<Vec<_>>());
         img.bytes(&a_body.buf);
+
+        // v1.96 (checkpoint v22): ALTER DEFAULT PRIVILEGES rules.
+        img.u32(eng.db.default_acls.len() as u32);
+        for da in &eng.db.default_acls {
+            img.str(&da.creator);
+            img.u8(da.kind as u8);
+            img.str(&da.grantee);
+            img.u32(da.privs);
+            // v1.96 (checkpoint v22): IN SCHEMA target.
+            img.str(&da.schema);
+        }
+        // v1.96 (checkpoint v22): function/type ACL override maps.
+        for map in [&eng.db.fn_acls, &eng.db.type_acls] {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            img.u32(keys.len() as u32);
+            for k in keys {
+                img.str(k);
+                img.acl_list(&map[k].iter().map(WalAcl::of).collect::<Vec<_>>());
+            }
+        }
+        // v1.96 (checkpoint v22): language ACLs, fn/type owners,
+        // schema names, large objects.
+        {
+            let mut keys: Vec<&String> = eng.db.lang_acls.keys().collect();
+            keys.sort();
+            img.u32(keys.len() as u32);
+            for k in keys {
+                img.str(k);
+                img.acl_list(
+                    &eng.db.lang_acls[k]
+                        .iter()
+                        .map(WalAcl::of)
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        for map in [&eng.db.fn_owners, &eng.db.type_owners] {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            img.u32(keys.len() as u32);
+            for k in keys {
+                img.str(k);
+                img.str(&map[k]);
+            }
+        }
+        img.u32(eng.db.schemas.len() as u32);
+        for s in &eng.db.schemas {
+            img.str(s);
+        }
+        // v1.96 (checkpoint v22): schema owners.
+        {
+            let mut keys: Vec<&String> = eng.db.schema_owners.keys().collect();
+            keys.sort();
+            img.u32(keys.len() as u32);
+            for k in keys {
+                img.str(k);
+                img.str(&eng.db.schema_owners[k]);
+            }
+        }
+        // v1.96 finishing pass (checkpoint v23): object -> schema
+        // attribution for DROP SCHEMA CASCADE.
+        {
+            let mut keys: Vec<&String> = eng.db.obj_schema.keys().collect();
+            keys.sort();
+            img.u32(keys.len() as u32);
+            for k in keys {
+                img.str(k);
+                img.str(&eng.db.obj_schema[k]);
+            }
+        }
+        {
+            let mut keys: Vec<&i64> = eng.db.large_objects.keys().collect();
+            keys.sort();
+            img.u32(keys.len() as u32);
+            for k in keys {
+                img.u64(*k as u64);
+                let data = &eng.db.large_objects[k];
+                img.u32(data.len() as u32);
+                img.bytes(data);
+                img.str(
+                    eng.db
+                        .lo_owners
+                        .get(k)
+                        .map(|s| s.as_str())
+                        .unwrap_or("postgres"),
+                );
+                // v1.96 (checkpoint v22): the LO's ACL entries.
+                let acl = eng.db.lo_acls.get(k).map(|v| v.as_slice()).unwrap_or(&[]);
+                img.acl_list(&acl.iter().map(WalAcl::of).collect::<Vec<_>>());
+            }
+        }
 
         // v0.13: replication slots (cluster-global). `active` is not
         // persisted — a slot is never active across a restart.
@@ -774,6 +877,9 @@ impl Wal {
                     crate::sql::FuncVolatility::Immutable => 2,
                 });
                 img.u8(if f.strict { 1 } else { 0 });
+                // v1.96 (checkpoint v22): SECURITY DEFINER + procedure.
+                img.u8(if f.security_definer { 1 } else { 0 });
+                img.u8(if f.is_procedure { 1 } else { 0 });
             }
         }
 
@@ -818,6 +924,38 @@ impl Wal {
                 }
                 img.u8(if d.hashes { 1 } else { 0 });
                 img.u8(if d.merges { 1 } else { 0 });
+            }
+        }
+
+        // v1.96 (checkpoint v22): user-defined aggregates.
+        {
+            let mut a_names: Vec<&String> = eng.db.aggregates.keys().collect();
+            a_names.sort();
+            img.u32(a_names.len() as u32);
+            for name in a_names {
+                let a = &eng.db.aggregates[name];
+                img.str(name);
+                img.str(&a.sfunc);
+                img.str(&a.stype);
+                match &a.finalfunc {
+                    Some(s) => {
+                        img.u8(1);
+                        img.str(s);
+                    }
+                    None => img.u8(0),
+                }
+                match &a.initcond {
+                    Some(s) => {
+                        img.u8(1);
+                        img.str(s);
+                    }
+                    None => img.u8(0),
+                }
+                img.u32(a.arg_types.len() as u32);
+                for t in &a.arg_types {
+                    img.str(t);
+                }
+                img.str(&a.owner);
             }
         }
 
@@ -1236,6 +1374,15 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         // v1.95 (checkpoint v21): view options.
         let security_invoker = d.u8().map_err(|e| bad(&e))? != 0;
         let check_option = d.u8().map_err(|e| bad(&e))? != 0;
+        // v1.96 (checkpoint v22): acl + matview state.
+        let acl: Vec<crate::storage::AclEntry> = d
+            .acl_list()
+            .map_err(|e| bad(&e))?
+            .into_iter()
+            .map(WalAcl::into_entry)
+            .collect();
+        let matview = d.u8().map_err(|e| bad(&e))? != 0;
+        let populated = d.u8().map_err(|e| bad(&e))? != 0;
         eng.db
             .views
             .entry(name.clone())
@@ -1249,6 +1396,9 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 owner,
                 security_invoker,
                 check_option,
+                acl,
+                matview,
+                populated,
             });
     }
     // v0.9: sequences, with their current values.
@@ -1281,6 +1431,10 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 can_login: wr.can_login,
                 superuser: wr.superuser,
                 bypassrls: wr.bypassrls,
+                inherit: wr.inherit,
+                createrole: wr.createrole,
+                createdb: wr.createdb,
+                replication: wr.replication,
                 connlimit: wr.connlimit,
                 memberships: wr
                     .memberships
@@ -1288,6 +1442,9 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                     .map(|m| crate::storage::RoleMembership {
                         role: m.role,
                         grantor: m.grantor,
+                        admin: m.admin,
+                        inherit: m.inherit,
+                        set: m.set,
                     })
                     .collect(),
                 valid_until: wr.valid_until,
@@ -1302,6 +1459,102 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         .into_iter()
         .map(WalAcl::into_entry)
         .collect();
+    // v1.96 (checkpoint v22): default-privilege rules.
+    {
+        let n = d.u32().map_err(|e| bad(&e))? as usize;
+        for _ in 0..n {
+            let creator = d.str().map_err(|e| bad(&e))?;
+            let kind = d.u8().map_err(|e| bad(&e))? as char;
+            let grantee = d.str().map_err(|e| bad(&e))?;
+            let privs = d.u32().map_err(|e| bad(&e))?;
+            let schema = d.str().map_err(|e| bad(&e))?;
+            eng.db.default_acls.push(crate::storage::DefaultAcl {
+                creator,
+                kind,
+                grantee,
+                privs,
+                schema,
+            });
+        }
+    }
+    // v1.96 (checkpoint v22): function/type ACL override maps.
+    for map in [&mut eng.db.fn_acls, &mut eng.db.type_acls] {
+        let n = d.u32().map_err(|e| bad(&e))? as usize;
+        for _ in 0..n {
+            let k = d.str().map_err(|e| bad(&e))?;
+            let entries = d
+                .acl_list()
+                .map_err(|e| bad(&e))?
+                .into_iter()
+                .map(WalAcl::into_entry)
+                .collect();
+            map.insert(k, entries);
+        }
+    }
+    // v1.96 (checkpoint v22): language ACLs, fn/type owners, schemas,
+    // large objects (adjacent to the fn/type ACL section).
+    {
+        let n = d.u32().map_err(|e| bad(&e))? as usize;
+        for _ in 0..n {
+            let k = d.str().map_err(|e| bad(&e))?;
+            let entries = d
+                .acl_list()
+                .map_err(|e| bad(&e))?
+                .into_iter()
+                .map(WalAcl::into_entry)
+                .collect();
+            eng.db.lang_acls.insert(k, entries);
+        }
+    }
+    for map in [&mut eng.db.fn_owners, &mut eng.db.type_owners] {
+        let n = d.u32().map_err(|e| bad(&e))? as usize;
+        for _ in 0..n {
+            let k = d.str().map_err(|e| bad(&e))?;
+            let v = d.str().map_err(|e| bad(&e))?;
+            map.insert(k, v);
+        }
+    }
+    {
+        let n = d.u32().map_err(|e| bad(&e))? as usize;
+        eng.db.schemas.clear();
+        for _ in 0..n {
+            eng.db.schemas.push(d.str().map_err(|e| bad(&e))?);
+        }
+        // v1.96 (checkpoint v22): schema owners.
+        let n = d.u32().map_err(|e| bad(&e))? as usize;
+        for _ in 0..n {
+            let k = d.str().map_err(|e| bad(&e))?;
+            let v = d.str().map_err(|e| bad(&e))?;
+            eng.db.schema_owners.insert(k, v);
+        }
+        // v1.96 finishing pass (checkpoint v23): object -> schema
+        // attribution.
+        let n = d.u32().map_err(|e| bad(&e))? as usize;
+        for _ in 0..n {
+            let k = d.str().map_err(|e| bad(&e))?;
+            let v = d.str().map_err(|e| bad(&e))?;
+            eng.db.obj_schema.insert(k, v);
+        }
+        let n = d.u32().map_err(|e| bad(&e))? as usize;
+        for _ in 0..n {
+            let oid = d.u64().map_err(|e| bad(&e))? as i64;
+            let len = d.u32().map_err(|e| bad(&e))? as usize;
+            let data = d.take(len).map_err(|e| bad(&e))?.to_vec();
+            let owner = d.str().map_err(|e| bad(&e))?;
+            eng.db.large_objects.insert(oid, data);
+            eng.db.lo_owners.insert(oid, owner);
+            // v1.96 (checkpoint v22): the LO's ACL entries.
+            let acl: Vec<crate::storage::AclEntry> = d
+                .acl_list()
+                .map_err(|e| bad(&e))?
+                .into_iter()
+                .map(WalAcl::into_entry)
+                .collect();
+            if !acl.is_empty() {
+                eng.db.lo_acls.insert(oid, acl);
+            }
+        }
+    }
     // v0.13: replication slots. (v6 images only; v5 and older are
     // refused loudly by the version check at the top of this function.)
     let n_slots = d.u32().map_err(|e| bad(&e))?;
@@ -1435,6 +1688,9 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 b => return Err(bad(&format!("corrupt function volatility {}", b))),
             };
             let strict = d.u8().map_err(|e| bad(&e))? != 0;
+            // v1.96 (checkpoint v22): SECURITY DEFINER + procedure.
+            let security_definer = d.u8().map_err(|e| bad(&e))? != 0;
+            let is_procedure = d.u8().map_err(|e| bad(&e))? != 0;
             let (parsed, plpgsql) =
                 crate::exec::rebuild_function_bodies(lang, &arg_names, &body, returns_set);
             overloads.push(crate::storage::FuncDef {
@@ -1450,6 +1706,8 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 plpgsql,
                 volatility,
                 strict,
+                security_definer,
+                is_procedure,
             });
         }
         eng.db.functions.insert(name, overloads);
@@ -1496,6 +1754,40 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
             });
         }
         eng.db.operators.insert(name, defs);
+    }
+    // v1.96 (checkpoint v22): user-defined aggregates.
+    let n_aggs = d.u32().map_err(|e| bad(&e))? as usize;
+    for _ in 0..n_aggs {
+        let name = d.str().map_err(|e| bad(&e))?;
+        let sfunc = d.str().map_err(|e| bad(&e))?;
+        let stype = d.str().map_err(|e| bad(&e))?;
+        let finalfunc = if d.u8().map_err(|e| bad(&e))? != 0 {
+            Some(d.str().map_err(|e| bad(&e))?)
+        } else {
+            None
+        };
+        let initcond = if d.u8().map_err(|e| bad(&e))? != 0 {
+            Some(d.str().map_err(|e| bad(&e))?)
+        } else {
+            None
+        };
+        let na = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut arg_types = Vec::with_capacity(na);
+        for _ in 0..na {
+            arg_types.push(d.str().map_err(|e| bad(&e))?);
+        }
+        let owner = d.str().map_err(|e| bad(&e))?;
+        eng.db.aggregates.insert(
+            name,
+            crate::storage::AggDef {
+                sfunc,
+                stype,
+                finalfunc,
+                initcond,
+                arg_types,
+                owner,
+            },
+        );
     }
     d.end().map_err(|e| bad(&e))?;
     Ok((eng, wal_end))

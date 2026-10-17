@@ -53,6 +53,7 @@ fn alter_function_immutable_parses() {
             name,
             arg_types,
             volatility,
+            ..
         } => {
             assert_eq!(name, "f");
             assert_eq!(arg_types, vec!["int".to_string()]);
@@ -69,6 +70,7 @@ fn alter_function_stable_parses() {
             name,
             arg_types,
             volatility,
+            ..
         } => {
             assert_eq!(name, "f");
             assert_eq!(arg_types.len(), 2);

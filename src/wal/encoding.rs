@@ -1140,6 +1140,19 @@ impl Enc {
                 self.acl_list(acl);
                 self.u64(*xmin);
             }
+            WalRecord::DefaultAcls { rules, xmin } => {
+                self.u8(30);
+                self.u32(rules.len() as u32);
+                for r in rules {
+                    self.str(&r.creator);
+                    self.u8(r.kind);
+                    self.str(&r.grantee);
+                    self.u32(r.privs);
+                    // v1.96 (RGSWAL26): IN SCHEMA target.
+                    self.str(&r.schema);
+                }
+                self.u64(*xmin);
+            }
             // v0.13: replication slot metadata.
             WalRecord::ReplSlotCreate {
                 name,
@@ -1255,6 +1268,8 @@ impl Enc {
                 body,
                 volatility,
                 strict,
+                security_definer,
+                is_procedure,
                 xmin,
             } => {
                 self.u8(24);
@@ -1279,6 +1294,9 @@ impl Enc {
                 self.str(body);
                 self.u8(*volatility);
                 self.u8(if *strict { 1 } else { 0 });
+                // v1.96 (RGSWAL26): SECURITY DEFINER, then procedure.
+                self.u8(if *security_definer { 1 } else { 0 });
+                self.u8(if *is_procedure { 1 } else { 0 });
                 self.u64(*xmin);
             }
             WalRecord::DropFunction {
@@ -1357,6 +1375,9 @@ impl Enc {
         for e in acl {
             self.str(&e.role);
             self.u32(e.privs);
+            // v1.96 (RGSWAL26 / CHKPT 22): grant option + grantor.
+            self.u32(e.grant_option);
+            self.str(&e.grantor);
         }
     }
 
@@ -1492,6 +1513,9 @@ impl Enc {
             for c in &e.columns {
                 self.str(c);
             }
+            // v1.96 (RGSWAL26 / CHKPT 22): grant option + grantor.
+            self.u32(e.grant_option);
+            self.str(&e.grantor);
         }
     }
 
@@ -1518,6 +1542,10 @@ impl Enc {
         for m in &r.memberships {
             self.str(&m.role);
             self.str(&m.grantor);
+            // v1.96 (RGSWAL26): membership options.
+            self.u8(m.admin as u8);
+            self.u8(m.inherit as u8);
+            self.u8(m.set as u8);
         }
         match &r.valid_until {
             Some(v) => {
@@ -1528,6 +1556,12 @@ impl Enc {
         }
         // v1.95 (RGSWAL25): bypassrls, trailing.
         self.u8(r.bypassrls as u8);
+        // v1.96 (RGSWAL26): rolinherit/createrole/createdb, trailing.
+        self.u8(r.inherit as u8);
+        self.u8(r.createrole as u8);
+        self.u8(r.createdb as u8);
+        // v1.96 finishing pass (RGSWAL27): rolreplication, trailing.
+        self.u8(r.replication as u8);
     }
 
     pub(crate) fn sequence(&mut self, s: &WalSequence) {
@@ -2327,6 +2361,25 @@ impl<'a> Dec<'a> {
                 let xmin = self.u64()?;
                 Ok(WalRecord::DbAcl { acl, xmin })
             }
+            30 => {
+                let n = self.u32()? as usize;
+                let mut rules = Vec::with_capacity(n);
+                for _ in 0..n {
+                    rules.push(WalDefaultAcl {
+                        creator: self.str()?,
+                        kind: self.u8()?,
+                        grantee: self.str()?,
+                        privs: self.u32()?,
+                        schema: if self.wal_version >= 26 {
+                            self.str()?
+                        } else {
+                            String::new()
+                        },
+                    });
+                }
+                let xmin = self.u64()?;
+                Ok(WalRecord::DefaultAcls { rules, xmin })
+            }
             18 => {
                 let table = self.str()?;
                 let no = self.u32()? as usize;
@@ -2469,6 +2522,17 @@ impl<'a> Dec<'a> {
                 let body = self.str()?;
                 let volatility = self.u8()?;
                 let strict = self.u8()? != 0;
+                // v1.96: SECURITY DEFINER rides RGSWAL26+ only.
+                let security_definer = if self.wal_version >= 26 {
+                    self.u8()? != 0
+                } else {
+                    false
+                };
+                let is_procedure = if self.wal_version >= 26 {
+                    self.u8()? != 0
+                } else {
+                    false
+                };
                 let xmin = self.u64()?;
                 Ok(WalRecord::CreateFunction {
                     name,
@@ -2480,6 +2544,8 @@ impl<'a> Dec<'a> {
                     body,
                     volatility,
                     strict,
+                    security_definer,
+                    is_procedure,
                     xmin,
                 })
             }
@@ -2610,9 +2676,19 @@ impl<'a> Dec<'a> {
         let n = self.u32()? as usize;
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
+            let role = self.str()?;
+            let privs = self.u32()?;
+            // v1.96: grant option + grantor ride RGSWAL26+ only.
+            let (grant_option, grantor) = if self.wal_version >= 26 {
+                (self.u32()?, self.str()?)
+            } else {
+                (0, String::new())
+            };
             out.push(WalAcl {
-                role: self.str()?,
-                privs: self.u32()?,
+                role,
+                privs,
+                grant_option,
+                grantor,
             });
         }
         Ok(out)
@@ -2765,10 +2841,18 @@ impl<'a> Dec<'a> {
             for _ in 0..m {
                 columns.push(self.str()?);
             }
+            // v1.96: grant option + grantor ride RGSWAL26+ only.
+            let (grant_option, grantor) = if self.wal_version >= 26 {
+                (self.u32()?, self.str()?)
+            } else {
+                (0, String::new())
+            };
             out.push(WalColAcl {
                 role,
                 privs,
                 columns,
+                grant_option,
+                grantor,
             });
         }
         Ok(out)
@@ -2808,9 +2892,19 @@ impl<'a> Dec<'a> {
         let n_members = self.u32()? as usize;
         let mut memberships = Vec::with_capacity(n_members);
         for _ in 0..n_members {
+            let (mrole, mgrantor) = (self.str()?, self.str()?);
+            // v1.96: membership options ride RGSWAL26+ only.
+            let (admin, minherit, mset) = if self.wal_version >= 26 {
+                (self.u8()? != 0, self.u8()? != 0, self.u8()? != 0)
+            } else {
+                (false, true, true)
+            };
             memberships.push(WalMembership {
-                role: self.str()?,
-                grantor: self.str()?,
+                role: mrole,
+                grantor: mgrantor,
+                admin,
+                inherit: minherit,
+                set: mset,
             });
         }
         let valid_until = if self.u8()? != 0 {
@@ -2824,11 +2918,27 @@ impl<'a> Dec<'a> {
         } else {
             false
         };
+        // v1.96: inherit/createrole/createdb ride RGSWAL26+.
+        let (inherit, createrole, createdb) = if self.wal_version >= 26 {
+            (self.u8()? != 0, self.u8()? != 0, self.u8()? != 0)
+        } else {
+            (true, false, false)
+        };
+        // v1.96 finishing pass: replication rides RGSWAL27+.
+        let replication = if self.wal_version >= 27 {
+            self.u8()? != 0
+        } else {
+            false
+        };
         Ok(WalRole {
             password,
             can_login,
             superuser,
             bypassrls,
+            inherit,
+            createrole,
+            createdb,
+            replication,
             connlimit,
             memberships,
             valid_until,

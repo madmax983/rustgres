@@ -1234,6 +1234,7 @@ pub(crate) fn eval_row_subquery(
 ) -> Result<Value, ExecError> {
     let out = {
         let mut sub_q = Q {
+            priv_role_override: None,
             eng: &mut *q.eng,
             snap: q.snap,
             own: q.own,
@@ -1652,6 +1653,24 @@ pub(crate) fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, 
             if *to == ColType::Regclass {
                 return eval_regclass_cast(q, &v);
             }
+            // v1.96: an array-to-array cast runs the ELEMENT cast
+            // function; PG checks EXECUTE on it (REVOKE ALL ON
+            // FUNCTION int8(integer) FROM PUBLIC denies the cast).
+            if let (ColType::Array(elem), Value::Array(av)) = (to, &v) {
+                let src_name = elem_scalar_type(av.elem).pg_typname();
+                let dst_name = elem.pg_typname();
+                if src_name != dst_name {
+                    let role = q.priv_role_override.as_deref().unwrap_or(q.role);
+                    let privs =
+                        crate::exec::function_privs_for(&q.eng.db, role, &dst_name, q.snap, q.own);
+                    if privs & crate::storage::PRIV_USAGE != crate::storage::PRIV_USAGE {
+                        return Err(exec_err(
+                            "42501",
+                            format!("permission denied for function {}", dst_name),
+                        ));
+                    }
+                }
+            }
             eval_cast(&v, *to)
         }
         // v1.86: `expr AT TIME ZONE zone` / `AT LOCAL` (PG19
@@ -1927,6 +1946,7 @@ pub(crate) fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, 
         Expr::ScalarSub(sub) => {
             let out = {
                 let mut sub_q = Q {
+                    priv_role_override: None,
                     eng: &mut *q.eng,
                     snap: q.snap,
                     own: q.own,
@@ -1978,6 +1998,7 @@ pub(crate) fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, 
         Expr::ArraySubquery(sub) => {
             let out = {
                 let mut sub_q = Q {
+                    priv_role_override: None,
                     eng: &mut *q.eng,
                     snap: q.snap,
                     own: q.own,
@@ -2059,6 +2080,7 @@ pub(crate) fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, 
             }
             let out = {
                 let mut sub_q = Q {
+                    priv_role_override: None,
                     eng: &mut *q.eng,
                     snap: q.snap,
                     own: q.own,
@@ -2756,6 +2778,11 @@ pub(crate) fn subplan_inner_is_base_table(q: &Q, name: &str) -> bool {
     if name == "information_schema.tables"
         || name == "information_schema.columns"
         || name == "information_schema.sequences"
+        || name == "information_schema.table_privileges"
+        || name == "information_schema.role_table_grants"
+        || name == "information_schema.column_privileges"
+        || name == "information_schema.enabled_roles"
+        || name == "information_schema.applicable_roles"
     {
         return false;
     }
@@ -3120,6 +3147,7 @@ pub(crate) fn eval_hashed_in(
             // cache.
             let out = {
                 let mut sub_q = Q {
+                    priv_role_override: None,
                     eng: &mut *q.eng,
                     snap: q.snap,
                     own: q.own,
@@ -3446,6 +3474,7 @@ pub(crate) fn eval_in_value(
     }
     let out = {
         let mut sub_q = Q {
+            priv_role_override: None,
             eng: &mut *q.eng,
             snap: q.snap,
             own: q.own,
@@ -3606,6 +3635,7 @@ pub(crate) fn eval_quantified_value(
     let is_row = left_vals.len() > 1 || matches!(&lv, Value::Record(_));
     let out = {
         let mut sub_q = Q {
+            priv_role_override: None,
             eng: &mut *q.eng,
             snap: q.snap,
             own: q.own,
@@ -4306,6 +4336,13 @@ pub(crate) fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ord
         // v0.36: PG's "char" comparison is a plain byte comparison
         // (chareq/charlt compare the single byte).
         (Value::SingleChar(x), Value::SingleChar(y)) => Ok(Some(x.cmp(y))),
+        // v1.96: "char" vs text — PG casts the char to text.
+        (Value::SingleChar(x), Value::Text(s)) | (Value::SingleChar(x), Value::BpChar(s)) => {
+            Ok(Some(crate::storage::char_out(*x).cmp(&s.to_string())))
+        }
+        (Value::Text(s), Value::SingleChar(y)) | (Value::BpChar(s), Value::SingleChar(y)) => {
+            Ok(Some(s.to_string().cmp(&crate::storage::char_out(*y))))
+        }
         // v0.81: PG19 record comparison (`record_eq`, `record_lt`, ...).
         // NULL fields: `=` is NULL (not false) if any field pair is
         // NULL and all others equal; ordering treats NULL as larger
@@ -4418,6 +4455,11 @@ pub(crate) fn regclass_value_oid(q: &mut Q, v: &Value) -> Result<u32, ExecError>
                 Ok(0)
             } else if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
                 Ok(s.parse::<u32>().unwrap_or(0))
+            } else if let Some(oid) = crate::exec::catalog_name_oid(s) {
+                // v1.96: catalog names resolve to their fixed OIDs,
+                // mirroring eval_regclass_cast (pg_default_acl & co.
+                // are not user tables).
+                Ok(oid)
             } else {
                 let t = q
                     .eng
@@ -4803,6 +4845,7 @@ pub(crate) fn eval_dml_expr(
         wctx: None,
         srf_vals: Vec::new(),
         priv_scopes: Vec::new(),
+        priv_role_override: None,
         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
         immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
         plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),

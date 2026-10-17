@@ -428,7 +428,14 @@ fn v191_companion_create_type_reaches_wal() {
         notices: Vec::new(),
     };
     execute(&mut eng, &mut ctx, &stmt).unwrap();
-    assert_eq!(writes.len(), 2, "range + companion CreateType ops");
+    // v1.96: CREATE TYPE also emits FnTypeAcls ops (type-owner
+    // tracking); the regression invariant is that BOTH CreateType
+    // ops are present — count those, not the total op stream.
+    let n_create_type = writes
+        .iter()
+        .filter(|w| matches!(w, WriteOp::CreateType { .. }))
+        .count();
+    assert_eq!(n_create_type, 2, "range + companion CreateType ops");
     let recs = crate::wal::records_for_commit(&eng, 9, &writes, 0).unwrap();
     assert_eq!(recs.len(), 2, "both CreateType ops must reach the WAL");
     match &recs[1] {
