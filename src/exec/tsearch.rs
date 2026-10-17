@@ -1743,18 +1743,37 @@ fn region_end(w: &[char], start: usize) -> usize {
     i
 }
 
+/// Length of `cand` if it is an exact suffix of `w`, else `None`.
+/// Every suffix table in this stemmer is ASCII English morphological
+/// endings, so a byte of `cand` equals its codepoint: comparing
+/// against `cand.as_bytes()` avoids re-decoding `cand` as UTF-8
+/// (`.chars()`) for every candidate, and `cand.len()` is already its
+/// char count without an O(n) `.chars().count()` scan.
+fn ascii_suffix_len(w: &[char], cand: &str) -> Option<usize> {
+    let bytes = cand.as_bytes();
+    let clen = bytes.len();
+    if clen <= w.len()
+        && w[w.len() - clen..]
+            .iter()
+            .zip(bytes)
+            .all(|(&c, &b)| c as u32 == b as u32)
+    {
+        Some(clen)
+    } else {
+        None
+    }
+}
+
 fn longest_suffix<'a>(w: &[char], table: &[&'a str]) -> Option<&'a str> {
-    let mut best: Option<&str> = None;
+    let mut best: Option<(&str, usize)> = None;
     for cand in table {
-        let clen = cand.chars().count();
-        if clen <= w.len()
-            && w[w.len() - clen..].iter().copied().eq(cand.chars())
-            && best.map(|b| clen > b.chars().count()).unwrap_or(true)
+        if let Some(clen) = ascii_suffix_len(w, cand)
+            && best.map(|(_, bl)| clen > bl).unwrap_or(true)
         {
-            best = Some(cand);
+            best = Some((cand, clen));
         }
     }
-    best
+    best.map(|(s, _)| s)
 }
 
 fn strip_suffix(w: &mut Vec<char>, suffix: &str) -> usize {
@@ -1972,17 +1991,17 @@ fn step_2(w: &mut Vec<char>, p1: usize) {
         ("lessli", "less"),
         ("li", ""), // only when preceded by a valid LI letter
     ];
-    let mut best: Option<&(&str, &str)> = None;
+    let mut best: Option<(&(&str, &str), usize)> = None;
     for entry in TABLE {
-        let clen = entry.0.chars().count();
-        if clen <= w.len()
-            && w[w.len() - clen..].iter().copied().eq(entry.0.chars())
-            && best.map(|b| clen > b.0.chars().count()).unwrap_or(true)
+        if let Some(clen) = ascii_suffix_len(w, entry.0)
+            && best.map(|(_, bl)| clen > bl).unwrap_or(true)
         {
-            best = Some(entry);
+            best = Some((entry, clen));
         }
     }
-    let Some(&(suf, repl)) = best else { return };
+    let Some(&(suf, repl)) = best.map(|(e, _)| e) else {
+        return;
+    };
     let start = w.len() - suf.chars().count();
     if start < p1 {
         return;
@@ -2016,17 +2035,15 @@ fn step_3(w: &mut Vec<char>, p1: usize, p2: usize) {
         ("ness", "", false),
         ("ative", "", true),
     ];
-    let mut best: Option<&(&str, &str, bool)> = None;
+    let mut best: Option<(&(&str, &str, bool), usize)> = None;
     for entry in TABLE {
-        let clen = entry.0.chars().count();
-        if clen <= w.len()
-            && w[w.len() - clen..].iter().copied().eq(entry.0.chars())
-            && best.map(|b| clen > b.0.chars().count()).unwrap_or(true)
+        if let Some(clen) = ascii_suffix_len(w, entry.0)
+            && best.map(|(_, bl)| clen > bl).unwrap_or(true)
         {
-            best = Some(entry);
+            best = Some((entry, clen));
         }
     }
-    let Some(&(suf, repl, need_r2)) = best else {
+    let Some(&(suf, repl, need_r2)) = best.map(|(e, _)| e) else {
         return;
     };
     let start = w.len() - suf.chars().count();
