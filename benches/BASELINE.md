@@ -2,6 +2,72 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: the Snowball English stemmer re-decodes ASCII suffix tables as UTF-8 on every candidate — baseline — 2026-10-17
+
+**Why this workload**: v1.94 (2026-10-14/15, text search types) added
+`to_tsvector`/`to_tsquery` and the whole tsvector/tsquery machinery;
+two prior Bolt rounds on this branch (`#49`, `#52`, both still open)
+targeted `json::parse_string` and jsonpath-tree caching — unrelated
+functions, no overlap. No prior round has profiled the stemmer.
+`benches/profile_tsearch.py` (new) indexes 600 realistic multi-sentence
+documents (mixed stopwords, punctuation, and words in multiple
+inflections so the stemmer does real work, not dictionary lookups on
+a handful of distinct forms) via inline `to_tsvector('english', body)`
+— the textbook "build the search column at write time" usage — then
+runs 15 exact iterations of a ranked multi-term search (`tsv @@
+to_tsquery(...) ORDER BY ts_rank(...) DESC LIMIT 10`), over the real
+wire protocol, debug build, fresh data dir.
+
+Reproduce:
+```bash
+cargo build
+RUSTGRES_DATA_DIR=$(mktemp -d) valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out --collect-jumps=yes --cache-sim=yes ./target/debug/rustgres &
+python3 benches/profile_tsearch.py --rows 600 --count 15 --timeout 1800
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | head -60
+```
+
+📈 **Profile** (Callgrind, valgrind 3.22.0, current HEAD v1.95): **6,612,813,542**
+total `Ir`. Three near-identical functions in `src/exec/tsearch.rs`
+dominate the whole profile — each scans a static table of ASCII
+suffix strings, picking the longest one that matches the end of the
+word being stemmed:
+
+| function | inclusive `Ir` | % of total |
+|---|---|---|
+| `longest_suffix` (steps 1a/1b/4/5a) | 1,854,569,604 | **28.05%** |
+| `step_2`'s inline duplicate of the same pattern | 1,119,776,426 | **16.93%** |
+| `step_3`'s inline duplicate of the same pattern | 425,855,410 | **6.44%** |
+| **combined** | **3,400,201,440** | **51.42%** |
+
+clearing the ≥5%-of-profile floor by over 10x.
+
+💡 **Hypothesis**: all three loops share the exact same anti-pattern
+(`let clen = cand.chars().count(); ... w[w.len()-clen..].iter().copied().eq(cand.chars()) ...
+best.map(|b| clen > b.chars().count())`): for every one of the (up to
+25) ASCII literal candidates in a suffix table, they (a) call
+`.chars().count()` to get `clen` — an O(n) UTF-8-decode loop to count
+codepoints in a string whose byte length already equals its char
+count, because every suffix table in this stemmer is plain ASCII
+English morphological endings (`"sses"`, `"ational"`, `"ic"`, …); (b)
+re-derive the *previous best's* length the same expensive way *again*
+on every single iteration instead of caching it once; and (c) compare
+`w`'s tail against `cand.chars()` through the generic
+`Copied<Iter<char>>::eq::<Chars>` fold, which decodes `cand` from UTF-8
+one codepoint at a time via `next_code_point` even though every byte
+of an ASCII literal already *is* its codepoint. Callgrind's own callee
+breakdown of `longest_suffix` confirms this exactly: 16.07% of total
+`Ir` in the `eq::<Chars>` comparison itself (2,531,762 calls) and a
+further 6.11% in `Chars::count` alone (2,563,356 calls) — pure,
+avoidable UTF-8-decode overhead on data that was ASCII at compile
+time.
+
+`cargo test --all-features`: 1055/1055 passed (pre-change tree,
+unmodified). `tests/conformance/schedule_runner.py --tests tsearch`:
+PASS=326/REAL-FAIL=119 (of 326+119 scored tsearch cases).
+
+Before profile committed: `benches/profiles/callgrind.out.tsearch-base-2026-10-17`.
+
 ## Bolt: default-RETURNING `JSON_OBJECT`/`JSON_ARRAY` builds a full jsonb tree it never reads — fix — 2026-10-15
 
 Fixes the target identified in the baseline entry immediately below
