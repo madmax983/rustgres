@@ -2,6 +2,71 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: the Snowball English stemmer re-decodes ASCII suffix tables as UTF-8 on every candidate — fix — 2026-10-17
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec/tsearch.rs`: a new shared helper, `ascii_suffix_len(w,
+cand)`, replaces the three copies of the same anti-pattern
+(`longest_suffix`'s body, and the inline duplicates in `step_2` and
+`step_3`). It takes `cand`'s length from `cand.as_bytes().len()` (O(1),
+exact for the ASCII-only suffix literals every table holds — no
+`.chars().count()` UTF-8 decode) and compares `w`'s tail against
+`cand`'s bytes by codepoint (`c as u32 == b as u32`) instead of
+against `cand.chars()`, so `cand` is never decoded from UTF-8 at all.
+All three call sites now track the running best's length alongside
+the candidate (`Option<(_, usize)>`) instead of re-deriving it from
+`.chars().count()` on every iteration. Behavior is unchanged: same
+"first entry wins a length tie" rule (`>`, not `>=`), same bounds
+check (`clen <= w.len()`) before slicing `w`'s tail.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_tsearch.py --rows 600 --count 15`),
+same workload, same machine, same session.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes`):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total `Ir` | 6,612,813,542 | 5,721,497,572 | **-13.48%** |
+| `longest_suffix`+`step_2`+`step_3` inclusive `Ir` | 3,400,201,440 (51.42% of total) | 2,508,066,666 (43.84% of new total) | **-892,134,774** |
+
+The target-region inclusive-`Ir` reduction (892,134,774) accounts for
+essentially the entire total-`Ir` reduction (891,315,970) — the
+savings are exactly where the hypothesis said they'd be. The call
+counts into the replaced comparison match exactly
+(`ascii_suffix_len` is called 2,563,356 + 1,792,450 + 645,282 =
+5,001,088 times across the three sites, matching the old `Chars::count`
+call count of 2,563,356 + 1,794,947 + 647,452 = 5,005,755 within
+rounding of shared candidates), and the after-profile's call tree
+under all three functions no longer has *any* `Chars::count` or
+`Copied<Iter<char>>::eq::<Chars>` children — the UTF-8-decode overhead
+is gone, not just reduced.
+
+The -13.48% total-`Ir` delta clears the ≥5%-of-profile floor by
+nearly 3x.
+
+`cargo test --all-features`: 1055/1055 passed, unchanged (same count
+as the pre-change tree). `cargo fmt --all -- --check`: clean.
+`cargo clippy --all-targets --all-features -- -D warnings`: same
+pre-existing toolchain/lint-version mismatch noted throughout this
+file (826 errors on both trees, none in `tsearch.rs`); zero net new
+errors/warnings from this diff. `tests/conformance/schedule_runner.py
+--tests tsearch`: identical PASS=326/REAL-FAIL=119 on both trees —
+zero behavior change, including the `v194_stemmer` unit test.
+
+Before/after profiles committed:
+`benches/profiles/callgrind.out.tsearch-{base,after}-2026-10-17`.
+
+**Reproduce**: check out the parent (baseline) commit, `cargo build`,
+repeat the Callgrind command in the baseline entry's "Reproduce"
+section for the before numbers; check out this commit, `cargo build`,
+repeat for the after numbers.
+
 ## Bolt: the Snowball English stemmer re-decodes ASCII suffix tables as UTF-8 on every candidate — baseline — 2026-10-17
 
 **Why this workload**: v1.94 (2026-10-14/15, text search types) added
