@@ -213,14 +213,23 @@ fn create_cast_validation_matrix() {
         err_code(&mut eng, "CREATE CAST (integer AS c138) WITHOUT FUNCTION"),
         "42710"
     );
-    // WITH FUNCTION is out of scope -> 0A000, like PG19's
-    // "not yet implemented".
+    // v1.96: WITH FUNCTION casts are recorded in the cast catalog
+    // (the function association itself is not modeled — casts
+    // evaluate through the engine's coercion machinery). This
+    // supersedes the v1.38 honest-0A000 pin; the privileges suite's
+    // domain casts (priv_testdomain1 -> priv_testdomain3a/b) need
+    // the CREATE to succeed. Duplicates are 42710.
+    run(
+        &mut eng,
+        "CREATE CAST (integer AS bigint) WITH FUNCTION int4larger",
+    )
+    .unwrap();
     assert_eq!(
         err_code(
             &mut eng,
             "CREATE CAST (integer AS bigint) WITH FUNCTION int4larger"
         ),
-        "0A000"
+        "42710"
     );
 }
 

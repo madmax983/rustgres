@@ -85,6 +85,7 @@ pub(crate) fn eval_default(
                 wctx: None,
                 srf_vals: Vec::new(),
                 priv_scopes: Vec::new(),
+                priv_role_override: None,
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
                 plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
@@ -346,6 +347,7 @@ pub(crate) fn check_row_constraints(
                 wctx: None,
                 srf_vals: Vec::new(),
                 priv_scopes: Vec::new(),
+                priv_role_override: None,
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
                 plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
@@ -389,6 +391,7 @@ pub(crate) fn check_row_constraints(
             wctx: None,
             srf_vals: Vec::new(),
             priv_scopes: Vec::new(),
+            priv_role_override: None,
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
             immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
             plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
@@ -459,6 +462,22 @@ pub(crate) fn fk_ref_cols(parent_meta: &TableMeta, fk: &FkDef) -> Result<Vec<Str
 /// row version being replaced (self-referencing UPDATE).
 ///
 /// MATCH SIMPLE semantics: a NULL in any referencing column skips the
+/// v1.96 finishing pass: FK key equality with PG semantics —
+/// cross-type numeric representations compare by value (an
+/// ALTER COLUMN TYPE int->bigint on either side must not unlink
+/// the constraint), where raw `Value` equality would miss.
+pub(crate) fn fk_key_eq(a: &Value, b: &Value) -> bool {
+    if a == b {
+        return true;
+    }
+    if matches!(a, Value::Null) || matches!(b, Value::Null) {
+        return false;
+    }
+    compare_values(a, b, false, None)
+        .map(|o| o == std::cmp::Ordering::Equal)
+        .unwrap_or(false)
+}
+
 /// check. Violation is SQLSTATE 23503.
 pub(crate) fn check_fk_child_row(
     eng: &Engine,
@@ -503,7 +522,7 @@ pub(crate) fn check_fk_child_row(
             parent_pos
                 .iter()
                 .zip(key.iter())
-                .all(|(&pi, kv)| vals[pi] == *kv)
+                .all(|(&pi, kv)| fk_key_eq(&vals[pi], kv))
         };
         let self_ref = fk.ref_table == child_table;
         let found = parent
@@ -638,7 +657,9 @@ pub(crate) fn plan_fk_cascade(
                 .as_ref()
                 .map(|nv| parent_pos.iter().map(|&i| nv[i].clone()).collect());
             if let Some(nk) = &new_key {
-                if nk == &old_key {
+                if nk.len() == old_key.len()
+                    && nk.iter().zip(old_key.iter()).all(|(a, b)| fk_key_eq(a, b))
+                {
                     continue; // key unchanged: nothing to do
                 }
             }
@@ -660,7 +681,7 @@ pub(crate) fn plan_fk_cascade(
                         child_pos
                             .iter()
                             .zip(old_key.iter())
-                            .all(|(&ci, kv)| r.values[ci] == *kv)
+                            .all(|(&ci, kv)| fk_key_eq(&r.values[ci], kv))
                     })
                     .map(|r| (r.id, r.xmax, r.values.clone()))
                     .collect()

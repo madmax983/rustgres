@@ -1191,6 +1191,48 @@ pub(crate) fn eval_assign_cast(v: &Value, to: &ColType) -> Result<Value, ExecErr
 /// `regclassout`: OID 0 renders as `"-"`, a known visible relation
 /// renders as its name, and any other OID renders as its decimal
 /// string (never an error).
+/// v1.96: PG catalog relation names and their (eternal) OIDs —
+/// 'pg_class'::regclass must resolve even though catalogs are
+/// virtual in this engine.
+pub(crate) fn catalog_name_oid(name: &str) -> Option<u32> {
+    let base = name.rsplit('.').next().unwrap_or(name);
+    Some(match base {
+        "pg_aggregate" => 2600,
+        "pg_am" => 2601,
+        "pg_type" => 1247,
+        "pg_attribute" => 1249,
+        "pg_proc" => 1255,
+        "pg_class" => 1259,
+        "pg_authid" => 1260,
+        "pg_auth_members" => 1261,
+        "pg_database" => 1262,
+        "pg_tablespace" => 1213,
+        "pg_shdepend" => 1214,
+        "pg_cast" => 2605,
+        "pg_constraint" => 2606,
+        "pg_conversion" => 2607,
+        "pg_description" => 2609,
+        "pg_index" => 2610,
+        "pg_language" => 2612,
+        "pg_largeobject" => 2613,
+        "pg_namespace" => 2615,
+        "pg_opclass" => 2616,
+        "pg_operator" => 2617,
+        "pg_rewrite" => 2618,
+        "pg_statistic" => 2619,
+        "pg_trigger" => 2620,
+        "pg_foreign_data_wrapper" => 2328,
+        "pg_foreign_server" => 1417,
+        "pg_shdescription" => 2396,
+        "pg_largeobject_metadata" => 2995,
+        "pg_extension" => 3079,
+        "pg_policy" => 3256,
+        "pg_collation" => 3456,
+        "pg_default_acl" => 826,
+        _ => return None,
+    })
+}
+
 pub(crate) fn regclass_display(q: &Q, oid: u32) -> String {
     if oid == 0 {
         return "-".to_string();
@@ -1201,6 +1243,26 @@ pub(crate) fn regclass_display(q: &Q, oid: u32) -> String {
             .any(|t| t.oid == oid && crate::storage::table_visible(t, q.snap, &q.all_xids))
         {
             return name.clone();
+        }
+    }
+    // v1.96: catalog OIDs render as their catalog name.
+    for cand in [
+        "pg_class",
+        "pg_attribute",
+        "pg_type",
+        "pg_proc",
+        "pg_authid",
+        "pg_auth_members",
+        "pg_database",
+        "pg_namespace",
+        "pg_language",
+        "pg_largeobject",
+        "pg_largeobject_metadata",
+        "pg_default_acl",
+        "pg_shdepend",
+    ] {
+        if catalog_name_oid(cand) == Some(oid) {
+            return cand.to_string();
         }
     }
     oid.to_string()
@@ -1218,11 +1280,30 @@ pub(crate) fn eval_regclass_cast(q: &mut Q, v: &Value) -> Result<Value, ExecErro
         Value::BigInt(i) => *i as u32,
         Value::SmallInt(i) => *i as u32,
         Value::Text(s) => {
+            // v1.96 finishing pass: PG regclassin validates a schema
+            // qualifier — an unknown schema is 42P01, not a silent
+            // strip (catalog_name_oid/find_table otherwise ignore the
+            // prefix entirely).
+            if let Some((schema, _)) = s.split_once('.') {
+                let schema = schema.trim_matches('"');
+                let known = schema == "pg_catalog"
+                    || schema == "public"
+                    || q.eng.db.schemas.iter().any(|x| x == schema);
+                if !known {
+                    return Err(exec_err(
+                        "42P01",
+                        format!("relation \"{}\" does not exist", s),
+                    ));
+                }
+            }
             if s.as_ref() == "-" {
                 0
             } else if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
                 // PG's parseNumericOid: overflow fails soft to InvalidOid.
                 s.parse::<u32>().unwrap_or(0)
+            } else if let Some(oid) = catalog_name_oid(s) {
+                // v1.96: catalog names resolve to their fixed OIDs.
+                oid
             } else {
                 // A relation name: must resolve, like PG (42P01).
                 let t = q
@@ -1313,6 +1394,23 @@ pub(crate) fn apply_binary_cast(q: &Q, v: &Value, name: &str) -> Result<Option<V
 }
 
 pub(crate) fn eval_cast_named(q: &mut Q, v: &Value, name: &str) -> Result<Value, ExecError> {
+    // v1.96: an array-to-array cast runs the ELEMENT cast function
+    // (pg_cast entry for the element pair); PG checks EXECUTE on it
+    // at parse time — REVOKE ALL ON FUNCTION int8(integer) FROM
+    // PUBLIC makes '{1}'::int4[]::int8[] fail for non-superusers.
+    if let (Some(elem_name), Value::Array(av)) = (name.strip_prefix('_'), v) {
+        let src_name = elem_scalar_type(av.elem).pg_typname();
+        if src_name != elem_name {
+            let role = q.priv_role_override.as_deref().unwrap_or(q.role);
+            let privs = function_privs_for(&q.eng.db, role, elem_name, q.snap, q.own);
+            if privs & crate::storage::PRIV_USAGE != crate::storage::PRIV_USAGE {
+                return Err(exec_err(
+                    "42501",
+                    format!("permission denied for function {}", elem_name),
+                ));
+            }
+        }
+    }
     // v0.85: cast to a domain — coerce to the base type, then enforce
     // the domain's constraints (PG19 coerce_to_domain). NULL still goes
     // through so NOT NULL domains can reject it (23502); plain casts
@@ -1338,6 +1436,95 @@ pub(crate) fn eval_cast_named(q: &mut Q, v: &Value, name: &str) -> Result<Value,
     }
     if v == &Value::Null {
         return Ok(Value::Null);
+    }
+    // v1.96: aclitem input (acl.c aclparse): validate and re-render
+    // in canonical form. An aclitem rides as its text rendering.
+    if name == "aclitem" {
+        return match v {
+            Value::Text(s) | Value::BpChar(s) => {
+                crate::exec::pg_input_validate_aclitem(q, s).map_err(|f| match f {
+                    crate::exec::PgInputFailure::Soft(e) => exec_err(e.code, e.message.clone()),
+                    crate::exec::PgInputFailure::Hard(e) => e,
+                })?;
+                Ok(Value::text(crate::exec::normalize_aclitem(s)))
+            }
+            other => Err(exec_err(
+                "42846",
+                format!("cannot cast type {} to aclitem", other.type_name()),
+            )),
+        };
+    }
+    // v1.96: regrole (oid.c regrolein/regroleout). A name input
+    // produces the role's OID (Int), so `pg_auth_members.roleid =
+    // 'x'::regrole` compares OID-to-OID; an OID input produces the
+    // role name text, so `member::regrole` displays the name.
+    if name == "regrole" {
+        return match v {
+            Value::Text(s) | Value::BpChar(s) => {
+                let raw = s.to_string();
+                if raw == "-" {
+                    return Ok(Value::Int(0));
+                }
+                if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) {
+                    return Ok(Value::Int(raw.parse::<i64>().unwrap_or(0)));
+                }
+                let rname = raw.rsplit('.').next().unwrap_or(&raw).to_string();
+                if q.eng.db.find_role(&rname, q.snap, q.own).is_some() {
+                    Ok(Value::Int(crate::exec::role_oid(&rname) as i64))
+                } else {
+                    Err(exec_err(
+                        "42704",
+                        format!("role \"{}\" does not exist", rname),
+                    ))
+                }
+            }
+            Value::Int(i) | Value::BigInt(i) => {
+                match crate::exec::role_name_for_oid(q, *i as u32) {
+                    Some(n) => Ok(Value::text(n)),
+                    None => Ok(Value::text(i.to_string())),
+                }
+            }
+            Value::SmallInt(i) => match crate::exec::role_name_for_oid(q, *i as u32) {
+                Some(n) => Ok(Value::text(n)),
+                None => Ok(Value::text(i.to_string())),
+            },
+            other => Err(exec_err(
+                "42846",
+                format!("cannot cast type {} to regrole", other.type_name()),
+            )),
+        };
+    }
+    // v1.96: cast to oid. A regclass display string (the only
+    // name-carrying text that reaches an oid cast) resolves through
+    // the catalog/table maps; digit strings parse directly (oidin).
+    if name == "oid" {
+        return match v {
+            Value::Int(i) | Value::BigInt(i) => Ok(Value::Int(*i)),
+            Value::SmallInt(i) => Ok(Value::Int(*i as i64)),
+            Value::Text(s) | Value::BpChar(s) => {
+                let raw = s.to_string();
+                if raw == "-" {
+                    return Ok(Value::Int(0));
+                }
+                if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) {
+                    return Ok(Value::Int(raw.parse::<i64>().unwrap_or(0)));
+                }
+                if let Some(oid) = catalog_name_oid(&raw) {
+                    return Ok(Value::Int(oid as i64));
+                }
+                match q.eng.db.find_table(&raw, q.snap, &q.all_xids, q.session) {
+                    Some(t) => Ok(Value::Int(t.oid as i64)),
+                    None => Err(exec_err(
+                        "22P02",
+                        format!("invalid input syntax for type oid: \"{}\"", raw),
+                    )),
+                }
+            }
+            other => Err(exec_err(
+                "42846",
+                format!("cannot cast type {} to oid", other.type_name()),
+            )),
+        };
     }
     // v1.88: cast to a user-defined range / multirange type
     // (CREATE TYPE ... AS RANGE registration in the type catalog).
@@ -1517,6 +1704,35 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
     }
     match to {
         ColType::Text => Ok(text_value_of(&[v])),
+        // v1.94: cast to tsvector (PG tsvectorin on text; a tsquery
+        // has no cast to tsvector — 42804 like PG).
+        ColType::TsVector => match v {
+            Value::Text(t) | Value::BpChar(t) => {
+                super::tsearch::parse_tsvector(t).map(Value::tsvector)
+            }
+            Value::TsVector(_) => Ok(v.clone()),
+            other => Err(exec_err(
+                "42804",
+                format!(
+                    "cannot cast type {} to tsvector",
+                    other.type_name().to_lowercase()
+                ),
+            )),
+        },
+        // v1.94: cast to tsquery (PG tsqueryin on text).
+        ColType::TsQuery => match v {
+            Value::Text(t) | Value::BpChar(t) => {
+                super::tsearch::parse_tsquery(t).map(Value::tsquery)
+            }
+            Value::TsQuery(_) => Ok(v.clone()),
+            other => Err(exec_err(
+                "42804",
+                format!(
+                    "cannot cast type {} to tsquery",
+                    other.type_name().to_lowercase()
+                ),
+            )),
+        },
         // v1.88: cast to a range type (PG range_in on text; a range of
         // the same elem passes through; anything else is 42804).
         ColType::Range(elem) => match v {

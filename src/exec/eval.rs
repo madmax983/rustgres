@@ -636,6 +636,44 @@ pub(crate) fn unnest_rows(v: &Value) -> Result<Vec<Value>, ExecError> {
         // v1.91: unnest(anymultirange) yields one row per component
         // range (PG multirange_unnest).
         Value::Multirange(m) => Ok(m.ranges.iter().cloned().map(Value::range).collect()),
+        // v1.94: unnest(tsvector) yields one (lexeme, positions,
+        // weights) record per entry (PG tsvector_unnest). A stripped
+        // entry (no positions) yields NULL positions and weights.
+        Value::TsVector(v) => Ok(v
+            .entries
+            .iter()
+            .map(|(lex, positions)| {
+                let (pos_arr, w_arr) = if positions.is_empty() {
+                    (Value::Null, Value::Null)
+                } else {
+                    (
+                        Value::Array(Box::new(crate::storage::ArrayVal {
+                            elem: crate::storage::ArrayElem::SmallInt,
+                            dims: vec![positions.len() as i32],
+                            lower: vec![1],
+                            elems: positions
+                                .iter()
+                                .map(|(p, _)| Value::SmallInt(*p as i16))
+                                .collect(),
+                        })),
+                        Value::Array(Box::new(crate::storage::ArrayVal {
+                            elem: crate::storage::ArrayElem::Text,
+                            dims: vec![positions.len() as i32],
+                            lower: vec![1],
+                            elems: positions
+                                .iter()
+                                .map(|(_, w)| Value::text(((b'D' - w) as char).to_string()))
+                                .collect(),
+                        })),
+                    )
+                };
+                Value::Record(vec![
+                    ("lexeme".to_string(), Value::text(lex.clone())),
+                    ("positions".to_string(), pos_arr),
+                    ("weights".to_string(), w_arr),
+                ])
+            })
+            .collect()),
         Value::Text(s) | Value::BpChar(s) => {
             let a = parse_array_literal(s, crate::storage::ArrayElem::Text)?;
             Ok(a.elems)
@@ -1179,6 +1217,8 @@ pub(crate) fn elem_scalar_type(elem: crate::storage::ArrayElem) -> ColType {
         E::Record => ColType::Record,
         E::PgLsn => ColType::PgLsn,
         E::Xid => ColType::Xid,
+        E::TsVector => ColType::TsVector, // v1.94
+        E::TsQuery => ColType::TsQuery,   // v1.94
     }
 }
 
@@ -1194,6 +1234,7 @@ pub(crate) fn eval_row_subquery(
 ) -> Result<Value, ExecError> {
     let out = {
         let mut sub_q = Q {
+            priv_role_override: None,
             eng: &mut *q.eng,
             snap: q.snap,
             own: q.own,
@@ -1612,6 +1653,24 @@ pub(crate) fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, 
             if *to == ColType::Regclass {
                 return eval_regclass_cast(q, &v);
             }
+            // v1.96: an array-to-array cast runs the ELEMENT cast
+            // function; PG checks EXECUTE on it (REVOKE ALL ON
+            // FUNCTION int8(integer) FROM PUBLIC denies the cast).
+            if let (ColType::Array(elem), Value::Array(av)) = (to, &v) {
+                let src_name = elem_scalar_type(av.elem).pg_typname();
+                let dst_name = elem.pg_typname();
+                if src_name != dst_name {
+                    let role = q.priv_role_override.as_deref().unwrap_or(q.role);
+                    let privs =
+                        crate::exec::function_privs_for(&q.eng.db, role, &dst_name, q.snap, q.own);
+                    if privs & crate::storage::PRIV_USAGE != crate::storage::PRIV_USAGE {
+                        return Err(exec_err(
+                            "42501",
+                            format!("permission denied for function {}", dst_name),
+                        ));
+                    }
+                }
+            }
             eval_cast(&v, *to)
         }
         // v1.86: `expr AT TIME ZONE zone` / `AT LOCAL` (PG19
@@ -1887,6 +1946,7 @@ pub(crate) fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, 
         Expr::ScalarSub(sub) => {
             let out = {
                 let mut sub_q = Q {
+                    priv_role_override: None,
                     eng: &mut *q.eng,
                     snap: q.snap,
                     own: q.own,
@@ -1938,6 +1998,7 @@ pub(crate) fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, 
         Expr::ArraySubquery(sub) => {
             let out = {
                 let mut sub_q = Q {
+                    priv_role_override: None,
                     eng: &mut *q.eng,
                     snap: q.snap,
                     own: q.own,
@@ -2019,6 +2080,7 @@ pub(crate) fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, 
             }
             let out = {
                 let mut sub_q = Q {
+                    priv_role_override: None,
                     eng: &mut *q.eng,
                     snap: q.snap,
                     own: q.own,
@@ -2716,6 +2778,11 @@ pub(crate) fn subplan_inner_is_base_table(q: &Q, name: &str) -> bool {
     if name == "information_schema.tables"
         || name == "information_schema.columns"
         || name == "information_schema.sequences"
+        || name == "information_schema.table_privileges"
+        || name == "information_schema.role_table_grants"
+        || name == "information_schema.column_privileges"
+        || name == "information_schema.enabled_roles"
+        || name == "information_schema.applicable_roles"
     {
         return false;
     }
@@ -3080,6 +3147,7 @@ pub(crate) fn eval_hashed_in(
             // cache.
             let out = {
                 let mut sub_q = Q {
+                    priv_role_override: None,
                     eng: &mut *q.eng,
                     snap: q.snap,
                     own: q.own,
@@ -3406,6 +3474,7 @@ pub(crate) fn eval_in_value(
     }
     let out = {
         let mut sub_q = Q {
+            priv_role_override: None,
             eng: &mut *q.eng,
             snap: q.snap,
             own: q.own,
@@ -3566,6 +3635,7 @@ pub(crate) fn eval_quantified_value(
     let is_row = left_vals.len() > 1 || matches!(&lv, Value::Record(_));
     let out = {
         let mut sub_q = Q {
+            priv_role_override: None,
             eng: &mut *q.eng,
             snap: q.snap,
             own: q.own,
@@ -3681,6 +3751,54 @@ pub(crate) fn eval_quantified_value(
 /// is true (else NULL if any is NULL, else false); ALL is false if
 /// any is false (else NULL if any is NULL, else true). A NULL array
 /// yields NULL; an empty array yields false (ANY) / true (ALL).
+/// v1.94: `expr @@ ANY|ALL (array)` (PG's ScalarArrayOp three-valued
+/// logic over the ts match operator). PG coerces an untyped array
+/// literal to tsquery[] but does NOT implicitly cast a typed text[] —
+/// that is 42883 `operator does not exist: tsvector @@ text`.
+fn eval_any_all_ts(left: &Value, arr_val: &Value, is_all: bool) -> Result<Value, ExecError> {
+    let elems: Vec<Value> = match arr_val {
+        Value::Null => return Ok(Value::Null),
+        Value::Text(s) => parse_array_literal(s, crate::storage::ArrayElem::Text)?.elems,
+        Value::Array(a) => {
+            if a.elems.iter().any(|e| matches!(e, Value::Text(_))) {
+                return Err(exec_err(
+                    "42883",
+                    format!("operator does not exist: {} @@ text", left.type_name()),
+                ));
+            }
+            a.elems.clone()
+        }
+        other => {
+            return Err(exec_err(
+                "42821",
+                format!(
+                    "op ANY/ALL (array) requires array on right side, not {}",
+                    other.type_name()
+                ),
+            ));
+        }
+    };
+    let mut saw_null = false;
+    for elem in &elems {
+        match crate::exec::json::eval_json_op(JsonOp::PathMatch, left, elem)? {
+            Value::Bool(true) if !is_all => return Ok(Value::Bool(true)),
+            Value::Bool(false) if is_all => return Ok(Value::Bool(false)),
+            Value::Null => saw_null = true,
+            Value::Bool(_) => {}
+            _ => {
+                return Err(exec_err(
+                    "XX000",
+                    "internal error: non-boolean @@ result".to_string(),
+                ));
+            }
+        }
+    }
+    if saw_null {
+        return Ok(Value::Null);
+    }
+    Ok(Value::Bool(is_all))
+}
+
 pub(crate) fn eval_any_all_array(
     q: &mut Q,
     scopes: &[Scope],
@@ -3712,6 +3830,10 @@ pub(crate) fn eval_any_all_array(
             ));
         }
     };
+    // v1.94: the ts @@ operator has its own array handling (above).
+    if op_txt == "@@" {
+        return eval_any_all_ts(left, &vals[3], is_all);
+    }
     let arr = match &vals[3] {
         Value::Null => return Ok(Value::Null),
         Value::Array(a) => a,
@@ -4098,8 +4220,35 @@ pub(crate) fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ord
         }
         _ => {}
     }
+    // v1.94: unknown-literal coercion for the text-search types — a
+    // text operand against a tsvector/tsquery parses as that type.
+    match (a, b) {
+        (Value::Text(t) | Value::BpChar(t), Value::TsVector(_)) => {
+            let parsed = crate::exec::tsearch::parse_tsvector(t)?;
+            return cmp_ordering(&Value::tsvector(parsed), b, op);
+        }
+        (Value::TsVector(_), Value::Text(t) | Value::BpChar(t)) => {
+            let parsed = crate::exec::tsearch::parse_tsvector(t)?;
+            return cmp_ordering(a, &Value::tsvector(parsed), op);
+        }
+        (Value::Text(t) | Value::BpChar(t), Value::TsQuery(_)) => {
+            let parsed = crate::exec::tsearch::parse_tsquery(t)?;
+            return cmp_ordering(&Value::tsquery(parsed), b, op);
+        }
+        (Value::TsQuery(_), Value::Text(t) | Value::BpChar(t)) => {
+            let parsed = crate::exec::tsearch::parse_tsquery(t)?;
+            return cmp_ordering(a, &Value::tsquery(parsed), op);
+        }
+        _ => {}
+    }
     match (a, b) {
         (Value::Null, _) | (_, Value::Null) => Ok(None),
+        // v1.94: tsvector / tsquery comparisons (PG tsvector_cmp /
+        // tsquery_cmp).
+        (Value::TsVector(x), Value::TsVector(y)) => {
+            Ok(Some(crate::exec::tsearch::tsvector_cmp(x, y)))
+        }
+        (Value::TsQuery(x), Value::TsQuery(y)) => Ok(Some(crate::exec::tsearch::tsquery_cmp(x, y))),
         // v1.88: range / multirange comparisons (PG range_cmp /
         // multirange_cmp; range vs multirange of the same elem compare
         // by wrapping the range — PG forbids mixing range types).
@@ -4187,6 +4336,13 @@ pub(crate) fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ord
         // v0.36: PG's "char" comparison is a plain byte comparison
         // (chareq/charlt compare the single byte).
         (Value::SingleChar(x), Value::SingleChar(y)) => Ok(Some(x.cmp(y))),
+        // v1.96: "char" vs text — PG casts the char to text.
+        (Value::SingleChar(x), Value::Text(s)) | (Value::SingleChar(x), Value::BpChar(s)) => {
+            Ok(Some(crate::storage::char_out(*x).cmp(&s.to_string())))
+        }
+        (Value::Text(s), Value::SingleChar(y)) | (Value::BpChar(s), Value::SingleChar(y)) => {
+            Ok(Some(s.to_string().cmp(&crate::storage::char_out(*y))))
+        }
         // v0.81: PG19 record comparison (`record_eq`, `record_lt`, ...).
         // NULL fields: `=` is NULL (not false) if any field pair is
         // NULL and all others equal; ordering treats NULL as larger
@@ -4299,6 +4455,11 @@ pub(crate) fn regclass_value_oid(q: &mut Q, v: &Value) -> Result<u32, ExecError>
                 Ok(0)
             } else if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
                 Ok(s.parse::<u32>().unwrap_or(0))
+            } else if let Some(oid) = crate::exec::catalog_name_oid(s) {
+                // v1.96: catalog names resolve to their fixed OIDs,
+                // mirroring eval_regclass_cast (pg_default_acl & co.
+                // are not user tables).
+                Ok(oid)
             } else {
                 let t = q
                     .eng
@@ -4684,6 +4845,7 @@ pub(crate) fn eval_dml_expr(
         wctx: None,
         srf_vals: Vec::new(),
         priv_scopes: Vec::new(),
+        priv_role_override: None,
         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
         immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
         plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),

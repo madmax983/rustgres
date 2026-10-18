@@ -9,10 +9,145 @@ pub(crate) fn exec_create(
     def: &TableDef,
     temp: bool,
 ) -> Result<ExecResult, ExecError> {
+    // v1.96 finishing pass: PG19 schema guards for CREATE TABLE:
+    // system catalog tables need allow_system_table_mods, and a
+    // TEMP table cannot be explicitly placed in a non-temp schema.
+    if let Some((schema, rest)) = name.split_once('.') {
+        if schema == "pg_catalog" {
+            return Err(exec_err(
+                "42501",
+                format!("permission denied to create \"pg_catalog.{}\"", rest),
+            ));
+        }
+        if temp && schema != "pg_temp" {
+            return Err(exec_err(
+                "42P16",
+                "cannot create temporary relation in non-temporary schema".to_string(),
+            ));
+        }
+    }
+    // v1.96: typed tables (`CREATE TABLE name OF type`) — expand the
+    // composite type's fields into the column list (USAGE on the
+    // type is required, PG19 aclchk).
+    let was_typed_table = def.of_type.is_some();
+    let typed_of = def.of_type.clone();
+    let expanded;
+    let def = if let Some(tname) = &def.of_type {
+        check_type_usage(eng, ctx, tname)?;
+        let st = match eng.db.types.get(tname) {
+            Some(st) => st,
+            None => {
+                return Err(exec_err(
+                    "42704",
+                    format!("type \"{}\" does not exist", tname),
+                ));
+            }
+        };
+        let fields = match &st.composite {
+            Some(f) => f.clone(),
+            None => {
+                return Err(exec_err(
+                    "42809",
+                    format!("type \"{}\" is not a composite type", tname),
+                ));
+            }
+        };
+        let mut d = def.clone();
+        d.of_type = None;
+        for (fname, fty, named) in &fields {
+            d.columns.push((fname.clone(), *fty));
+            let mut comp = None;
+            let mut dom = None;
+            if let Some(n) = named {
+                match eng.db.types.get(n) {
+                    Some(s2) if s2.domain.is_some() => dom = Some(n.clone()),
+                    _ => comp = Some(n.clone()),
+                }
+            }
+            d.composite_types.push(comp);
+            d.domain_types.push(dom);
+            d.bit_typmods.push(None);
+            d.domain_elem.push(false);
+            d.not_null.push(false);
+            d.defaults.push(None);
+            d.serial.push(None);
+            d.compression.push(None);
+            d.storage.push(None);
+        }
+        expanded = d;
+        &expanded
+    } else {
+        def
+    };
     // v0.70: use the effective definition (PARTITION OF inherits the
     // parent's constraints into the cloned def) for the backing indexes,
     // so inherited PRIMARY KEY / UNIQUE constraints get their indexes.
     let eff_def = create_table_from_def(eng, ctx, name, def, temp)?;
+    if let Some(tname) = &typed_of {
+        eng.db.typed_tables.insert(name.to_string(), tname.clone());
+    }
+    // v1.96: PG19 type-USAGE checks (aclchk at parse time): column
+    // types (incl. LIKE-copied ones), CHECK/DEFAULT cast targets and
+    // PARTITION BY expression cast targets all need USAGE on the
+    // named type/domain for the creating role. An error here aborts
+    // the statement, rolling the just-created table back.
+    if !was_typed_table {
+        for n in eff_def
+            .composite_types
+            .iter()
+            .chain(eff_def.domain_types.iter())
+            .flatten()
+        {
+            check_type_usage(eng, ctx, n)?;
+        }
+        for c in &eff_def.checks {
+            check_expr_cast_usages(eng, ctx, &c.expr)?;
+        }
+        for d in eff_def.defaults.iter().flatten() {
+            if let crate::sql::DefaultExpr::Expr(e) = d {
+                check_expr_cast_usages(eng, ctx, e)?;
+            }
+        }
+        if let Some(p) = &eff_def.partition {
+            for k in &p.keys {
+                if let crate::sql::PartitionKeyDef::Expr(e) = k {
+                    check_expr_cast_usages(eng, ctx, e)?;
+                }
+            }
+        }
+    }
+    // v1.96: ALTER DEFAULT PRIVILEGES for the creating role.
+    if !temp {
+        let defaults = default_acl_entries_for(&eng.db, ctx.role, 'r', name);
+        if !defaults.is_empty() {
+            if let Some(t) = eng
+                .db
+                .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                .cloned()
+            {
+                let mut next = t;
+                for e in defaults {
+                    let g = if e.grantor.is_empty() {
+                        ctx.role.to_string()
+                    } else {
+                        e.grantor.clone()
+                    };
+                    let _ = apply_acl_delta(
+                        &mut next.acl,
+                        &[e.role.clone()],
+                        &[(g, e.privs)],
+                        false,
+                        false,
+                        e.grant_option != 0,
+                        false,
+                        false,
+                        &ctx.role.to_string(),
+                    );
+                }
+                alter_swap(eng, ctx, name, None, next, None)?;
+            }
+        }
+    }
     // Backing unique indexes for PRIMARY KEY / UNIQUE constraints. The
     // table is empty, so no duplicate check is needed. (v0.22: temp
     // tables get none — the global index map cannot represent them.)
@@ -93,6 +228,7 @@ pub(crate) fn create_serial_sequence(
     eng.db.sequences.entry(name.clone()).or_default().push(seq);
     ctx.writes
         .push(WriteOp::CreateSequence { name: name.clone() });
+    note_obj_schema(eng, ctx, &name, &name);
     Ok(name)
 }
 

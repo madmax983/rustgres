@@ -122,6 +122,11 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 password: role.password.clone().map(WalVerifier::into_verifier),
                 can_login: role.can_login,
                 superuser: role.superuser,
+                bypassrls: role.bypassrls,
+                inherit: role.inherit,
+                createrole: role.createrole,
+                createdb: role.createdb,
+                replication: role.replication,
                 connlimit: role.connlimit,
                 memberships: role
                     .memberships
@@ -129,6 +134,9 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     .map(|m| crate::storage::RoleMembership {
                         role: m.role.clone(),
                         grantor: m.grantor.clone(),
+                        admin: m.admin,
+                        inherit: m.inherit,
+                        set: m.set,
                     })
                     .collect(),
                 valid_until: role.valid_until.clone(),
@@ -167,6 +175,11 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 password: role.password.clone().map(WalVerifier::into_verifier),
                 can_login: role.can_login,
                 superuser: role.superuser,
+                bypassrls: role.bypassrls,
+                inherit: role.inherit,
+                createrole: role.createrole,
+                createdb: role.createdb,
+                replication: role.replication,
                 connlimit: role.connlimit,
                 memberships: role
                     .memberships
@@ -174,6 +187,9 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     .map(|m| crate::storage::RoleMembership {
                         role: m.role.clone(),
                         grantor: m.grantor.clone(),
+                        admin: m.admin,
+                        inherit: m.inherit,
+                        set: m.set,
                     })
                     .collect(),
                 valid_until: role.valid_until.clone(),
@@ -187,6 +203,12 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 eng.txns.next_xid = *xmin + 1;
             }
             eng.db.db_acl = acl.iter().cloned().map(WalAcl::into_entry).collect();
+        }
+        WalRecord::DefaultAcls { rules, xmin } => {
+            if *xmin >= eng.txns.next_xid {
+                eng.txns.next_xid = *xmin + 1;
+            }
+            eng.db.default_acls = rules.iter().cloned().map(WalDefaultAcl::into_rule).collect();
         }
         // v0.82: type DDL replay — rebuild the catalog entry exactly.
         WalRecord::CreateType {
@@ -250,6 +272,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             body,
             volatility,
             strict,
+            security_definer,
+            is_procedure,
             xmin,
         } => {
             if *xmin >= eng.txns.next_xid {
@@ -290,6 +314,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     plpgsql,
                     volatility,
                     strict: *strict,
+                    security_definer: *security_definer,
+                    is_procedure: *is_procedure,
                 };
                 let overloads = eng.db.functions.entry(name.clone()).or_default();
                 if let Some(slot) = overloads.iter_mut().find(|f| f.arg_types == def.arg_types) {
@@ -349,6 +375,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
         | WalRecord::DropRole { .. }
         | WalRecord::AlterRole { .. }
         | WalRecord::DbAcl { .. }
+        | WalRecord::DefaultAcls { .. }
         | WalRecord::CreateType { .. }
         | WalRecord::DropType { .. }
         // v0.86: function/operator records likewise.
@@ -463,6 +490,9 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     t.uniques = dc.uniques;
                     t.pkey = dc.pkey;
                     t.fks = dc.fks;
+                    t.rls_enabled = dc.rls_enabled;
+                    t.rls_forced = dc.rls_forced;
+                    t.policies = dc.policies;
                 }
                 Err(e) => {
                     return Err(format!(
@@ -756,6 +786,9 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     t.uniques = dc.uniques;
                     t.pkey = dc.pkey;
                     t.fks = dc.fks;
+                    t.rls_enabled = dc.rls_enabled;
+                    t.rls_forced = dc.rls_forced;
+                    t.policies = dc.policies;
                 }
                 Err(e) => {
                     return Err(format!(
@@ -827,6 +860,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             col_aliases,
             deps,
             owner,
+            security_invoker,
+            check_option,
             xmin,
         } => {
             eng.db
@@ -834,6 +869,9 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 .entry(name.clone())
                 .or_default()
                 .push(crate::storage::ViewDef {
+                acl: Vec::new(),
+                matview: false,
+                populated: true,
                     query: query.clone(),
                     col_aliases: col_aliases.clone(),
                     deps: deps.clone(),
@@ -841,6 +879,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     dropped_xmax: 0,
                     // v0.11: owner comes from the record.
                     owner: owner.clone(),
+                    security_invoker: *security_invoker,
+                    check_option: *check_option,
                 });
         }
         WalRecord::DropView { name, xmax } => {
@@ -1327,6 +1367,8 @@ pub fn records_for_commit(
                     col_aliases: ours.col_aliases.clone(),
                     deps: ours.deps.clone(),
                     owner: ours.owner.clone(),
+                    security_invoker: ours.security_invoker,
+                    check_option: ours.check_option,
                     xmin: own,
                 });
             }
@@ -1488,6 +1530,26 @@ pub fn records_for_commit(
                     xmin: own,
                 });
             }
+            WriteOp::DefaultAcls { .. } => {
+                out.push(WalRecord::DefaultAcls {
+                    rules: eng.db.default_acls.iter().map(WalDefaultAcl::of).collect(),
+                    xmin: own,
+                });
+            }
+            // v1.96: function/type ACLs are checkpoint-only (like casts).
+            WriteOp::FnTypeAcls { .. } => {
+                i += 1;
+                continue;
+            }
+            // v1.96: schemas and large objects are checkpoint-only too.
+            WriteOp::SchemaSet { .. }
+            | WriteOp::ObjSchemaSet { .. }
+            | WriteOp::LargeObjects { .. }
+            | WriteOp::DbOwner { .. }
+            | WriteOp::ViewState { .. } => {
+                i += 1;
+                continue;
+            }
             WriteOp::DropTable { name, .. } => {
                 let won = eng
                     .db
@@ -1589,6 +1651,8 @@ pub fn records_for_commit(
                             crate::sql::FuncVolatility::Immutable => 2,
                         },
                         strict: f.strict,
+                        security_definer: f.security_definer,
+                        is_procedure: f.is_procedure,
                         xmin: own,
                     });
                 }

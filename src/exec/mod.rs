@@ -42,10 +42,10 @@ pub(crate) use crate::sql::{
     CteDef, CteMaterialize, DefaultExpr, ExplainFormat, Expr, FkAction, FkDef, FrameBound,
     FrameExclusion, FromItem, IndexColSpec, InsertIndirection, InsertTarget, InsertValue,
     IsolationLevel, JoinKind, JsonOp, JsonTableSpec, JtBehavior, JtColumn, Literal, OnConflict,
-    OrderTerm, OrderedSetAgg, QuantKind, QuantOp, RaiseLevel, SelectItem, SelectStmt, SequenceOpts,
-    SerialKind, SetOpKind, SetOpRoot, SqlError, Stmt, TableDef, TriggerBodyStmt, TriggerDef,
-    TriggerTiming, UniqueDef, WindowFrame, WindowFunc, collect_col_refs, collect_table_refs,
-    parse_statement, parse_trigger_body, trig_event, validate_constraint_expr,
+    OrderTerm, OrderedSetAgg, PolicyCmd, QuantKind, QuantOp, RaiseLevel, SelectItem, SelectStmt,
+    SequenceOpts, SerialKind, SetOpKind, SetOpRoot, SqlError, Stmt, TableDef, TriggerBodyStmt,
+    TriggerDef, TriggerTiming, UniqueDef, WindowFrame, WindowFunc, collect_col_refs,
+    collect_table_refs, parse_statement, parse_trigger_body, trig_event, validate_constraint_expr,
 };
 pub(crate) use crate::storage::index_visible;
 pub(crate) use crate::storage::{
@@ -91,13 +91,16 @@ mod orderby;
 mod params;
 mod partition;
 mod pg_input;
+mod privfuncs;
 mod privilege;
 mod project;
 pub(crate) mod ranges;
 mod reorder;
+mod rls;
 mod roles;
 mod seq;
 mod sje;
+pub(crate) mod tsearch;
 mod views;
 mod window;
 
@@ -258,6 +261,12 @@ mod v192_sqljson_queryfuncs_tests;
 #[path = "test_mods/v193_bit_tests.rs"]
 mod v193_bit_tests;
 #[cfg(test)]
+#[path = "test_mods/v194_tsearch_tests.rs"]
+mod v194_tsearch_tests;
+#[cfg(test)]
+#[path = "test_mods/v195_rls_tests.rs"]
+mod v195_rls_tests;
+#[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;
 
@@ -291,9 +300,11 @@ pub(crate) use orderby::*;
 pub(crate) use params::*;
 pub(crate) use partition::*;
 pub(crate) use pg_input::*;
+pub(crate) use privfuncs::*;
 pub(crate) use privilege::*;
 pub(crate) use project::*;
 pub(crate) use reorder::*;
+pub(crate) use rls::*;
 pub(crate) use roles::*;
 pub(crate) use seq::*;
 pub(crate) use sje::*;

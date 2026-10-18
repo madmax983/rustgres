@@ -485,9 +485,12 @@ def t_ownership():
         # cannot drop role owning objects
         _, _, codes = c.q("DROP ROLE alice")
         check("drop-role-owns-table", codes == ["2BP01"], str(codes))
-        # bootstrap postgres cannot be dropped
+        # The current user cannot be dropped (PG19 user.c
+        # DropRole: the GetUserId check fires before the privilege
+        # checks -> 55006. Pre-v1.96 the engine answered 42501 and
+        # this test encoded that; v1.96 follows PG19.)
         _, _, codes = c.q("DROP ROLE postgres")
-        check("drop-postgres", codes == ["42501"], str(codes))
+        check("drop-postgres", codes == ["55006"], str(codes))
         c.close()
     finally:
         srv.stop()
@@ -667,7 +670,10 @@ def t_recovery_v11():
         _, _, codes = a.q("SELECT b FROM t")
         check("recov-col-deny", codes == ["42501"], str(codes))
         _, rows, _ = a.q("SELECT count(*) FROM pg_auth_members")
-        check("recov-members", rows == [("1",)], str(rows))
+        # v1.96: +3 predefined pg_monitor memberships (PG19-identical:
+        # pg_monitor is a member of pg_read_all_settings,
+        # pg_read_all_stats, pg_stat_scan_tables).
+        check("recov-members", rows == [("4",)], str(rows))
         a.close()
         c = Conn(srv2.port)
         _, rows, _ = c.q("SELECT rolvaliduntil FROM pg_roles WHERE rolname='tmp'")
@@ -758,7 +764,8 @@ def t_membership():
         tags, _, codes = c.q("GRANT readers TO alice")
         check("grant-role-dup", tags == ["GRANT"] and not codes, str((tags, codes)))
         _, rows, _ = c.q("SELECT count(*) FROM pg_auth_members")
-        check("members-count", rows == [("3",)], str(rows))
+        # 3 edges above + 3 predefined pg_monitor memberships (v1.96).
+        check("members-count", rows == [("6",)], str(rows))
         # self-membership rejected
         _, _, codes = c.q("GRANT readers TO readers")
         check("grant-self", codes == ["42501"], str(codes))
@@ -802,10 +809,18 @@ def t_membership():
         c = Conn(srv.port)
         _, rows, _ = c.q("SELECT admin_option FROM pg_auth_members")
         check("auth-members-admin", rows and all(r == ("f",) for r in rows), str(rows))
-        # DROP ROLE cleans up membership edges
-        c.q("DROP ROLE readers")
+        # v1.96 (PG19 checkSharedDependencies): DROP ROLE is blocked
+        # (2BP01) while the role still holds granted privileges.
+        _, _, codes = c.q("DROP ROLE readers")
+        check("drop-role-blocked-by-grants", codes == ["2BP01"], str(codes))
+        c.q("REVOKE SELECT ON t FROM readers")
+        tags, _, codes = c.q("DROP ROLE readers")
+        check("drop-role-after-revoke", tags == ["DROP ROLE"] and not codes,
+              str((tags, codes)))
+        # DROP ROLE cleans up membership edges; what remains is
+        # devs->bob plus the 3 predefined pg_monitor memberships.
         _, rows, _ = c.q("SELECT count(*) FROM pg_auth_members")
-        check("drop-role-cleans-members", rows == [("1",)], str(rows))
+        check("drop-role-cleans-members", rows == [("4",)], str(rows))
         c.close()
         b = Conn(srv.port, user="bob")
         _, _, codes = b.q("SELECT a FROM t")
@@ -902,8 +917,11 @@ def t_column_privs():
         check("grant-col-unknown", codes == ["42703"], str(codes))
         _, _, codes = c.q("GRANT DELETE (a) ON t TO alice")
         check("grant-col-delete", codes == ["42601"], str(codes))
-        _, _, codes = c.q("GRANT ALL (a) ON t TO alice")
-        check("grant-col-all", codes == ["42601"], str(codes))
+        # v1.96: GRANT ALL (cols) is legal PG19 (gram.y privileges:
+        # ALL '(' columnList ')') and expands to the column-grantable
+        # set (SELECT/INSERT/UPDATE/REFERENCES) on those columns.
+        tags, _, codes = c.q("GRANT ALL (a) ON t TO alice")
+        check("grant-col-all", tags == ["GRANT"] and not codes, str((tags, codes)))
         c.close()
         a = Conn(srv.port, user="alice")
         _, rows, codes = a.q("SELECT a, b FROM t")
@@ -954,10 +972,13 @@ def t_ddl_audit():
         c.q("CREATE VIEW v AS SELECT * FROM t")
         c.close()
         a = Conn(srv.port, user="alice")
-        _, _, codes = a.q("ANALYZE t")
-        check("analyze-deny", codes == ["42501"], str(codes))
-        _, _, codes = a.q("VACUUM t")
-        check("vacuum-deny", codes == ["42501"], str(codes))
+        # v1.96 (PG19 vacuum.c): ANALYZE/VACUUM on a named table the
+        # role may not maintain warns "permission denied ... skipping
+        # it" and succeeds, rather than erroring 42501.
+        tags, _, codes = a.q("ANALYZE t")
+        check("analyze-deny", tags == ["ANALYZE"] and not codes, str((tags, codes)))
+        tags, _, codes = a.q("VACUUM t")
+        check("vacuum-deny", tags == ["VACUUM"] and not codes, str((tags, codes)))
         _, _, codes = a.q("CREATE OR REPLACE VIEW v AS SELECT * FROM t")
         check("or-replace-view-deny", codes == ["42501"], str(codes))
         # plain ANALYZE/VACUUM touch nothing owned: no error

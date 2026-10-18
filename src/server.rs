@@ -77,6 +77,11 @@ pub(crate) struct Session {
     /// ROLE` changes `role`; `RESET ROLE` / `SET ROLE NONE` restore it
     /// (PG19: the role GUC resets to the session user).
     session_user: String,
+    /// v1.95: the authenticated user, immutable for the connection.
+    /// `SET SESSION AUTHORIZATION` rewrites `session_user` (and
+    /// `role`); RESET / DEFAULT restores this value (PG19
+    /// AuthenticatedUserId).
+    auth_user: String,
     /// v1.07: validated-but-unmodeled session GUCs (planner knobs like
     /// `enable_seqscan`, formatting knobs like `extra_float_digits`).
     /// Values are PG19-validated and stored in canonical text form;
@@ -271,6 +276,12 @@ enum SavedGuc {
     /// v1.07: validated-but-unmodeled GUCs (planner knobs etc.): the
     /// pre-change entry of `session.gucs` (None = was at default).
     Generic(Option<String>),
+    /// v1.95: `SET SESSION AUTHORIZATION`: pre-change session user
+    /// and current role.
+    SessionAuth {
+        user: String,
+        role: String,
+    },
     /// v1.07: `SET TRANSACTION` characteristics: pre-change values of
     /// the current transaction's read-only flag, isolation level and
     /// deferrable flag. (PG19 routes SET TRANSACTION through the GUC
@@ -315,6 +326,10 @@ fn guc_saved_value(session: &Session, name: &str) -> Option<SavedGuc> {
             session.default_txn_deferrable,
         )),
         "role" => Some(SavedGuc::Role(session.role.clone())),
+        "session_authorization" => Some(SavedGuc::SessionAuth {
+            user: session.session_user.clone(),
+            role: session.role.clone(),
+        }),
         _ => None,
     }
 }
@@ -322,6 +337,10 @@ fn guc_saved_value(session: &Session, name: &str) -> Option<SavedGuc> {
 /// v0.66: write a saved GUC value back into the session.
 fn restore_saved_guc(session: &mut Session, name: &str, saved: SavedGuc) {
     match (name, saved) {
+        ("session_authorization", SavedGuc::SessionAuth { user, role }) => {
+            session.session_user = user;
+            session.role = role;
+        }
         ("default_transaction_read_only", SavedGuc::ReadOnly(v)) => {
             session.default_txn_read_only = v;
         }
@@ -441,6 +460,7 @@ impl Session {
         Session {
             sid: NEXT_SID.fetch_add(1, Ordering::Relaxed),
             session_user: role.clone(),
+            auth_user: role.clone(),
             role,
             // v1.07: no unmodeled GUCs set on a fresh session.
             gucs: HashMap::new(),
@@ -2262,8 +2282,15 @@ fn read_only_violation(
         Stmt::CreateRole { .. } => Some("CREATE ROLE"),
         Stmt::AlterRole { .. } => Some("ALTER ROLE"),
         Stmt::DropRole { .. } => Some("DROP ROLE"),
+        // v1.95: policy DDL tags.
+        Stmt::CreatePolicy { .. } => Some("CREATE POLICY"),
+        Stmt::AlterPolicy { .. } => Some("ALTER POLICY"),
+        Stmt::DropPolicy { .. } => Some("DROP POLICY"),
         Stmt::Grant { .. } => Some("GRANT"),
         Stmt::Revoke { .. } => Some("REVOKE"),
+        Stmt::AlterGroup { .. } => Some("ALTER GROUP"),
+        Stmt::LockTable { .. } => Some("LOCK TABLE"),
+        Stmt::AlterDefaultPrivileges { .. } => Some("ALTER DEFAULT PRIVILEGES"),
         Stmt::GrantRole { .. } => Some("GRANT"),
         Stmt::RevokeRole { .. } => Some("REVOKE"),
         _ => None,
@@ -2380,6 +2407,7 @@ fn guc_value(session: &Session, name: &str) -> Option<String> {
         // v1.07: `role` / `session_user` (PG19).
         "role" => Some(session.role.clone()),
         "session_user" => Some(session.session_user.clone()),
+        "session_authorization" => Some(session.session_user.clone()),
         // v1.07: generic validated GUCs (stored value or compiled
         // default).
         _ if is_generic_guc(name) => Some(
@@ -2567,6 +2595,67 @@ fn stmt_set_transaction_snapshot(session: &mut Session, id: &str) -> Result<Exec
 /// Otherwise the target role must exist (42704) and the session user
 /// must be a superuser or a member of it (42501,
 /// "permission denied to set role").
+/// v1.95: SET [LOCAL] SESSION AUTHORIZATION (PG19 variable.c
+/// check_session_authorization + SetSessionAuthorization): only a
+/// superuser may change to a *different* user; the target becomes both
+/// the session user and the current role. `None` (DEFAULT/NONE/RESET)
+/// restores the authenticated user.
+fn stmt_set_session_authorization(
+    engine: &Arc<Mutex<Engine>>,
+    session: &mut Session,
+    target: Option<String>,
+    local: bool,
+) -> Result<ExecResult, ExecError> {
+    if local && session.txn.is_none() {
+        return Err(err_25001(
+            "SET LOCAL can only be used within a transaction block",
+        ));
+    }
+    let new_user = match target {
+        None => session.auth_user.clone(),
+        Some(name) => {
+            let name = name.to_ascii_lowercase();
+            let guard = lock_engine(engine);
+            let snap = guard.take_snapshot();
+            if guard.db.find_role(&name, &snap, u64::MAX).is_none() {
+                return Err(ExecError {
+                    detail: None,
+                    code: "42704",
+                    message: format!("role \"{}\" does not exist", name),
+                });
+            }
+            // PG19 variable.c: "in case of multiple SETs in a single
+            // session, the original authenticated user's superuserness
+            // is what matters" — the test is against AuthenticatedUserId,
+            // not the current session user.
+            let allowed = name == session.auth_user
+                || crate::storage::is_superuser_snap(
+                    &guard.db,
+                    &session.auth_user,
+                    &snap,
+                    u64::MAX,
+                );
+            if !allowed {
+                return Err(ExecError {
+                    detail: None,
+                    code: "42501",
+                    message: format!(
+                        "permission denied to set session authorization \"{}\"",
+                        name
+                    ),
+                });
+            }
+            name
+        }
+    };
+    push_guc_entry(session, "session_authorization", local);
+    session.session_user = new_user.clone();
+    session.role = new_user;
+    Ok(ExecResult::Command {
+        tag: "SET".to_string(),
+    })
+}
+
 fn stmt_set_role(
     engine: &Arc<Mutex<Engine>>,
     session: &mut Session,
@@ -2591,21 +2680,23 @@ fn stmt_set_role(
                     message: format!("role \"{}\" does not exist", name),
                 });
             }
-            // PG19 `member_can_set_role`: a superuser, or the session
-            // user is a member of the target role.
+            // PG19 `member_can_set_role` (auth.c
+            // IsMemberOfRoleWithOption SET): a superuser, or the
+            // session user reaches the target role through membership
+            // edges that all carry SET OPTION (v1.96).
             let allowed = crate::storage::is_superuser_snap(
                 &guard.db,
                 &session.session_user,
                 &snap,
                 u64::MAX,
-            ) || crate::storage::role_closure(
-                &guard.db,
-                &session.session_user,
-                &snap,
-                u64::MAX,
-            )
-            .iter()
-            .any(|r| r == &name);
+            ) || name == session.session_user
+                || crate::storage::member_can_set_role(
+                    &guard.db,
+                    &session.session_user,
+                    &name,
+                    &snap,
+                    u64::MAX,
+                );
             if !allowed {
                 return Err(ExecError {
                     detail: None,
@@ -2673,6 +2764,8 @@ fn is_generic_guc(name: &str) -> bool {
     matches!(
         name,
         "enable_seqscan"
+            | "default_statistics_target"
+            | "lo_compat_privileges"
             | "enable_indexscan"
             | "enable_bitmapscan"
             | "enable_indexonlyscan"
@@ -2773,6 +2866,9 @@ fn guc_default(name: &str) -> &'static str {
         "timezone" => "GMT",
         "search_path" => "\"$user\", public",
         "default_table_access_method" => "heap",
+        // v1.96: PG19 boot_vals.
+        "default_statistics_target" => "100",
+        "lo_compat_privileges" => "off",
         _ => "on",
     }
 }
@@ -3054,6 +3150,25 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
             }
             Ok(i.to_string())
         }
+        // v1.96: int GUC (PG19 range 1..10000).
+        "default_statistics_target" => {
+            let i: i64 = value.trim().parse().map_err(|_| invalid())?;
+            if !(1..=10000).contains(&i) {
+                return Err(ExecError {
+                    detail: None,
+                    code: "22023",
+                    message: format!(
+                        "{} is outside the valid range for parameter \"default_statistics_target\" (1 .. 10000)",
+                        value
+                    ),
+                });
+            }
+            Ok(i.to_string())
+        }
+        // v1.96: bool GUC (PG19 guc_tables.c).
+        "lo_compat_privileges" => parse_bool_guc(value)
+            .map(|b| (if b { "on" } else { "off" }).to_string())
+            .ok_or_else(invalid),
         "plan_cache_mode" => match value.trim().to_ascii_lowercase().as_str() {
             "auto" | "force_generic_plan" | "force_custom_plan" => {
                 Ok(value.trim().to_ascii_lowercase())
@@ -3356,6 +3471,8 @@ fn name_to_static(name: &str) -> &'static str {
         "timezone" => "timezone",
         "search_path" => "search_path",
         "default_table_access_method" => "default_table_access_method",
+        "default_statistics_target" => "default_statistics_target",
+        "lo_compat_privileges" => "lo_compat_privileges",
         _ => "unrecognized",
     }
 }
@@ -3663,6 +3780,16 @@ fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecE
                 tag: "RESET".to_string(),
             })
         }
+        // v1.95: RESET SESSION AUTHORIZATION restores the
+        // authenticated user as both session user and current role.
+        "session_authorization" => {
+            push_guc_entry(session, "session_authorization", false);
+            session.session_user = session.auth_user.clone();
+            session.role = session.auth_user.clone();
+            Ok(ExecResult::Command {
+                tag: "RESET".to_string(),
+            })
+        }
         "bytea_output" => {
             push_guc_entry(session, "bytea_output", false);
             session.bytea_output = crate::storage::ByteaOutput::Hex;
@@ -3790,6 +3917,56 @@ fn run_statement(
         let tz = guc_value(session, "timezone").unwrap_or_else(|| "GMT".to_string());
         let now = session.txn.as_ref().map(|t| t.start_micros).unwrap_or(0);
         crate::datetime::set_session_context(&ds, &tz, now);
+        // v1.94: float output honors extra_float_digits (PG19
+        // float.c) — suites like tstypes SET it to 0 and expect
+        // the legacy %.6g float4 rendering.
+        let efd: i32 = guc_value(session, "extra_float_digits")
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1);
+        crate::storage::set_extra_float_digits(efd);
+        // v1.95: row_security GUC for RLS evaluation (default on).
+        let rs = guc_value(session, "row_security")
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "off" | "false" | "no" | "0"
+                )
+            })
+            .unwrap_or(true);
+        crate::exec::set_row_security(rs);
+        crate::exec::set_session_user(&session.session_user);
+        // v1.96: current_setting() snapshot: the session's GUC map
+        // plus computed values.
+        {
+            let mut map: std::collections::HashMap<String, String> = session.gucs.clone();
+            for n in [
+                "server_version",
+                "server_version_num",
+                "datestyle",
+                "timezone",
+                "extra_float_digits",
+                "row_security",
+                "transaction_isolation",
+                "default_transaction_isolation",
+            ] {
+                if let Some(v) = guc_value(session, n) {
+                    map.insert(n.to_string(), v);
+                }
+            }
+            map.insert(
+                "role".to_string(),
+                if session.role == session.session_user {
+                    "none".to_string()
+                } else {
+                    session.role.clone()
+                },
+            );
+            map.insert(
+                "session_authorization".to_string(),
+                session.session_user.clone(),
+            );
+            crate::exec::set_current_settings(map);
+        }
     }
     let owned;
     let stmt = match stmt {
@@ -3947,9 +4124,20 @@ fn run_statement(
             verbose,
             analyze,
         } => {
-            let out = txn_vacuum(engine, session, table.as_deref(), *verbose)?;
+            let mut vac_notices: Vec<String> = Vec::new();
+            let out = txn_vacuum(
+                engine,
+                session,
+                table.as_deref(),
+                *verbose,
+                &mut vac_notices,
+            )?;
+            let vac_skipped = !vac_notices.is_empty();
+            session.pending_notices.extend(vac_notices);
             // v0.14: `VACUUM ANALYZE` also collects planner statistics.
-            if *analyze {
+            // v1.96: when VACUUM skipped the table (permission
+            // warning), PG does not analyze it either.
+            if *analyze && !vac_skipped {
                 let a = Stmt::Analyze {
                     table: table.clone(),
                 };
@@ -4015,6 +4203,12 @@ fn run_statement(
                     SetValue::Str(s) => Some(s.clone()),
                 };
                 stmt_set_role(engine, session, target, *local)
+            } else if name == "session_authorization" {
+                let target = match value {
+                    SetValue::Default => None,
+                    SetValue::Str(s) => Some(s.clone()),
+                };
+                stmt_set_session_authorization(engine, session, target, *local)
             } else {
                 stmt_set_guc(session, name, value, *local)
             }
@@ -4305,6 +4499,13 @@ fn auto_vacuum(engine: &mut Engine, writes: &[WriteOp]) {
             | WriteOp::DropRole { .. }
             | WriteOp::AlterRole { .. }
             | WriteOp::DbAcl { .. }
+            | WriteOp::DefaultAcls { .. }
+            | WriteOp::FnTypeAcls { .. }
+            | WriteOp::SchemaSet { .. }
+            | WriteOp::ObjSchemaSet { .. }
+            | WriteOp::LargeObjects { .. }
+            | WriteOp::DbOwner { .. }
+            | WriteOp::ViewState { .. }
             // v0.22: temp tables are single-version; their DDL leaves
             // no dead versions to reap. Shell types likewise.
             | WriteOp::CreateTempTable { .. }
@@ -4608,6 +4809,7 @@ fn txn_vacuum(
     session: &Session,
     table: Option<&str>,
     verbose: bool,
+    notices: &mut Vec<String>,
 ) -> Result<ExecResult, ExecError> {
     if session.txn.is_some() {
         return Err(err_25001("VACUUM cannot run inside a transaction block"));
@@ -4625,6 +4827,10 @@ fn txn_vacuum(
             .map(|t| {
                 t.owner == session.role
                     || crate::storage::is_superuser_snap(db, &session.role, snap, u64::MAX)
+                    // v1.96: MAINTAIN privilege permits VACUUM (PG19).
+                    || crate::storage::table_privs(db, &session.role, t, snap, u64::MAX)
+                        & 512
+                        != 0
             })
             .unwrap_or(false)
     };
@@ -4643,11 +4849,12 @@ fn txn_vacuum(
             });
         }
         if !is_owner(&guard.db, &snap, name) {
-            return Err(ExecError {
-                detail: None,
-                code: "42501",
-                message: format!("permission denied: must be owner of table \"{}\"", name),
-            });
+            // v1.96: PG19 VACUUM warns and skips (no error).
+            notices.push(format!(
+                "permission denied to vacuum \"{}\", skipping it",
+                name
+            ));
+            return Ok(cmd("VACUUM"));
         }
     }
     // v0.85: vacuum a temp table when the name resolves to one; otherwise
@@ -5623,6 +5830,7 @@ mod tests {
             sid: 4242,
             role: "postgres".to_string(),
             session_user: "postgres".to_string(),
+            auth_user: "postgres".to_string(),
             gucs: HashMap::new(),
             stmts: HashMap::new(),
             portals: HashMap::new(),
@@ -5821,6 +6029,7 @@ mod tests {
             sid: 4243,
             role: "postgres".to_string(),
             session_user: "postgres".to_string(),
+            auth_user: "postgres".to_string(),
             gucs: HashMap::new(),
             stmts: HashMap::new(),
             portals: HashMap::new(),
@@ -6660,6 +6869,68 @@ mod tests {
         assert_eq!(session.role, "postgres");
         assert_eq!(show_text(&session, "role"), "postgres");
         assert_eq!(show_text(&session, "session_user"), "postgres");
+    }
+
+    // v1.95: SET SESSION AUTHORIZATION — the permission test keys off
+    // the AUTHENTICATED user (PG19 variable.c), so a superuser-authenticated
+    // session can switch repeatedly without RESET in between; RESET
+    // restores the authenticated user.
+    #[test]
+    fn v195_set_session_authorization() {
+        let engine = Arc::new(Mutex::new(Engine::new()));
+        {
+            let mut guard = engine.lock().unwrap();
+            // Bootstrap-visible roles (created_xmin 0), like the
+            // production state after CREATE USER commits.
+            for r in ["alice", "bob"] {
+                guard
+                    .db
+                    .roles
+                    .entry(r.to_string())
+                    .or_default()
+                    .push(crate::storage::Role {
+                        name: r.to_string(),
+                        password: None,
+                        can_login: true,
+                        superuser: false,
+                        bypassrls: false,
+                        inherit: true,
+                        createrole: false,
+                        createdb: false,
+                        replication: false,
+                        connlimit: -1,
+                        memberships: Vec::new(),
+                        valid_until: None,
+                        created_xmin: 0,
+                        dropped_xmax: 0,
+                    });
+            }
+        }
+        let mut session = session_no_txn();
+        // Unknown role: 42704.
+        let e =
+            stmt_set_session_authorization(&engine, &mut session, Some("nosuchrole".into()), false)
+                .unwrap_err();
+        assert_eq!(e.code, "42704");
+        // Superuser-authenticated: switch alice -> bob directly.
+        stmt_set_session_authorization(&engine, &mut session, Some("alice".into()), false).unwrap();
+        assert_eq!(session.session_user, "alice");
+        assert_eq!(session.role, "alice");
+        stmt_set_session_authorization(&engine, &mut session, Some("bob".into()), false).unwrap();
+        assert_eq!(session.session_user, "bob");
+        // RESET (None) restores the authenticated user.
+        stmt_set_session_authorization(&engine, &mut session, None, false).unwrap();
+        assert_eq!(session.session_user, "postgres");
+        assert_eq!(session.role, "postgres");
+        // A non-superuser authenticated session may not switch away.
+        session.auth_user = "alice".to_string();
+        session.session_user = "alice".to_string();
+        session.role = "alice".to_string();
+        let e = stmt_set_session_authorization(&engine, &mut session, Some("bob".into()), false)
+            .unwrap_err();
+        assert_eq!(e.code, "42501");
+        // ... but switching to itself is fine.
+        stmt_set_session_authorization(&engine, &mut session, Some("alice".into()), false).unwrap();
     }
 
     // ------------------------------------------------------------------

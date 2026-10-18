@@ -179,6 +179,9 @@ fn type_tag(v: &Value) -> u8 {
         // v1.88: ranges (append-only).
         Value::Range(_) => 25,
         Value::Multirange(_) => 26,
+        // v1.94: text-search types (append-only).
+        Value::TsVector(_) => 27,
+        Value::TsQuery(_) => 28,
     }
 }
 

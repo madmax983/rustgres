@@ -1002,10 +1002,19 @@ pub(crate) fn eval_function_item(
                 "function unnest() does not exist".to_string(),
             ));
         }
-        // v1.92: an array of a named composite expands to the
-        // composite's columns (the rows already carry the fields,
-        // expanded by eval_table_function).
-        if let Some(fields) = unnest_record_elem_fields(q.eng, q.snap, q.own, q.session, &args[0]) {
+        // v1.94: unnest(tsvector) expands to PG tsvector_unnest's
+        // three OUT columns (lexeme text, positions int2[], weights
+        // text[]); eval_table_function already expanded the row
+        // Records into cells under those names.
+        if matches!(arg_vals[0], Value::TsVector(_)) {
+            vec![
+                ColType::Text,
+                ColType::Array(crate::storage::ArrayElem::SmallInt),
+                ColType::Array(crate::storage::ArrayElem::Text),
+            ]
+        } else if let Some(fields) =
+            unnest_record_elem_fields(q.eng, q.snap, q.own, q.session, &args[0])
+        {
             fields.into_iter().map(|(_, t)| t).collect::<Vec<ColType>>()
         } else {
             let elem_ty = match &arg_vals[0] {
@@ -1778,7 +1787,9 @@ pub(crate) fn eval_cross_nest_join(
             row: &l.cells,
             prov: None,
         });
-        let (_, rrows) = build_source(q, outer, right, None, need_prov, None, None, &prefix2)?;
+        let (_, rrows) = build_source(
+            q, outer, right, None, need_prov, need_prov, need_prov, None, None, &prefix2,
+        )?;
         let mut matched_right = vec![false; rrows.len()];
         let mut matched = false;
         for (ri, r) in rrows.iter().enumerate() {
@@ -1859,6 +1870,7 @@ pub(crate) fn eval_lateral_right(
             // in the statically-computed layout.
             let out = {
                 let mut sub_q = Q {
+                    priv_role_override: None,
                     eng: &mut *q.eng,
                     snap: q.snap,
                     own: q.own,
@@ -2163,6 +2175,32 @@ pub(crate) fn lateral_function_schema(
             let (names, types): (Vec<String>, Vec<ColType>) = fields.into_iter().unzip();
             return function_item_schema(name, &names, &types, alias, col_aliases);
         }
+        // v1.94: unnest(tsvector) — PG tsvector_unnest's OUT columns
+        // (lexeme text, positions int2[], weights text[]).
+        let ts_arg = matches!(
+            unnest_arg_field_type(eng, snap, own, session, &args[0]),
+            Some(ColType::TsVector)
+        ) || matches!(
+            expr_type(eng, snap, own, session, &[left], &[], &[], &args[0]),
+            Ok(ColType::TsVector)
+        );
+        if ts_arg {
+            let names: Vec<String> = ["lexeme", "positions", "weights"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            return function_item_schema(
+                name,
+                &names,
+                &[
+                    ColType::Text,
+                    ColType::Array(crate::storage::ArrayElem::SmallInt),
+                    ColType::Array(crate::storage::ArrayElem::Text),
+                ],
+                alias,
+                col_aliases,
+            );
+        }
         let schemas = [left];
         // v1.92: a field-access argument's type comes from the
         // field definition (expr_type returns the record
@@ -2261,6 +2299,14 @@ pub(crate) fn build_source(
     // pass can lock them. Otherwise provenance stays empty and costs
     // nothing per row.
     need_prov: bool,
+    // v1.96: true only for an actual row-locking clause (FOR UPDATE /
+    // FOR NO KEY UPDATE / FOR SHARE / FOR KEY SHARE). Provenance needs
+    // (tableoid, xmin/xmax, pg_column_compression) set need_prov but
+    // must NOT demand UPDATE privilege — only locking does (PG19).
+    for_update: bool,
+    // v1.96 finishing pass: any locking clause at all (incl. FOR
+    // SHARE / FOR KEY SHARE, which leave for_update false).
+    any_lock: bool,
     // v0.8: when the whole query is a plain single-table SELECT whose
     // ORDER BY matches an index, the table streams out of the index in
     // ORDER BY order and run_select skips the sort. Only ever set on the
@@ -2338,9 +2384,79 @@ pub(crate) fn build_source(
                     .collect();
                 return Ok((apply_aliases(schema)?, rows));
             }
+            // v1.96: information_schema privilege views.
+            if name == "information_schema.table_privileges"
+                || name == "information_schema.role_table_grants"
+                || name == "information_schema.column_privileges"
+                || name == "information_schema.enabled_roles"
+                || name == "information_schema.applicable_roles"
+            {
+                let (schema, rows) = match name.as_str() {
+                    "information_schema.table_privileges" => {
+                        info_table_privileges_scan(&q.eng.db, q.snap, q.own, &q.role, false)
+                    }
+                    "information_schema.role_table_grants" => {
+                        info_table_privileges_scan(&q.eng.db, q.snap, q.own, &q.role, true)
+                    }
+                    "information_schema.column_privileges" => {
+                        info_column_privileges_scan(&q.eng.db, q.snap, q.own, &q.role)
+                    }
+                    "information_schema.enabled_roles" => {
+                        info_roles_scan(&q.eng.db, q.snap, q.own, &q.role, false)
+                    }
+                    _ => info_roles_scan(&q.eng.db, q.snap, q.own, &q.role, true),
+                };
+                let schema: Vec<QCol> = schema
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                return Ok((apply_aliases(schema)?, rows));
+            }
             // v0.9: a view name expands to its stored SELECT. Views are
             // checked before tables (a table would have blocked CREATE VIEW).
             if let Some(view) = q.eng.db.find_view(name, q.snap, q.own).cloned() {
+                // v1.96 finishing pass: PG19 execMain — a locking
+                // clause (FOR UPDATE / FOR SHARE / ...) cannot target
+                // a materialized view (42809).
+                if any_lock && view.matview {
+                    return Err(exec_err(
+                        "42809",
+                        format!("cannot lock rows in materialized view \"{}\"", name),
+                    ));
+                }
+                // v1.96 finishing pass: the lock also reaches the
+                // view's base relations — a matview anywhere in the
+                // dependency closure errors the same way (PG19
+                // CheckTableNotInUse-style recursion in execMain).
+                if any_lock {
+                    let mut stack: Vec<String> = view.deps.clone();
+                    let mut seen: Vec<String> = Vec::new();
+                    let mut culprit: Option<String> = None;
+                    while let Some(d) = stack.pop() {
+                        if seen.contains(&d) {
+                            continue;
+                        }
+                        seen.push(d.clone());
+                        if let Some(dv) = q.eng.db.find_view(&d, q.snap, q.own) {
+                            if dv.matview {
+                                culprit = Some(d);
+                                break;
+                            }
+                            if seen.len() < 64 {
+                                stack.extend(dv.deps.iter().cloned());
+                            }
+                        }
+                    }
+                    if let Some(c) = culprit {
+                        return Err(exec_err(
+                            "42809",
+                            format!("cannot lock rows in materialized view \"{}\"", c),
+                        ));
+                    }
+                }
                 let stmt = parse_statement(&view.query).map_err(sql_err)?;
                 let select = match stmt {
                     Stmt::Select(s) => s,
@@ -2360,9 +2476,21 @@ pub(crate) fn build_source(
                     ));
                 }
                 q.depth += 1;
+                // v1.96: definer rights — the view's internal
+                // relations are privilege-checked as the view owner
+                // (unless security_invoker).
+                let saved_override = q.priv_role_override.clone();
+                if !view.security_invoker {
+                    q.priv_role_override = Some(view.owner.clone());
+                }
                 let out = run_select(q, &select, outer);
+                q.priv_role_override = saved_override;
                 q.depth -= 1;
-                let out = out?;
+                let mut out = out?;
+                // v1.96: an unpopulated matview reads empty.
+                if view.matview && !view.populated {
+                    out.rows.clear();
+                }
                 let schema: Vec<QCol> = out
                     .columns
                     .into_iter()
@@ -2472,6 +2600,27 @@ pub(crate) fn build_source(
                 let (_, rows) = pg_sequences_scan(&q.eng.db, q.snap, q.own);
                 return Ok((apply_aliases(schema)?, rows));
             }
+            // v1.95: pg_policies / pg_policy are virtual too.
+            if matches!(name.as_str(), "pg_policies" | "pg_policy")
+                && q.eng
+                    .db
+                    .find_table(name, q.snap, &q.all_xids, q.session)
+                    .is_none()
+            {
+                let (schema, rows) = if name == "pg_policies" {
+                    pg_policies_scan(&q.eng.db, q.snap, q.own, q.session)
+                } else {
+                    pg_policy_scan(&q.eng.db, q.snap, q.own, q.session)
+                };
+                let schema: Vec<QCol> = schema
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                return Ok((apply_aliases(schema)?, rows));
+            }
             // v0.11: the role catalogs are virtual too.
             if matches!(
                 name.as_str(),
@@ -2483,6 +2632,63 @@ pub(crate) fn build_source(
                 .is_none()
             {
                 let (schema, rows) = pg_auth_scan(&q.eng.db, q.snap, q.own, q.role, name);
+                let schema: Vec<QCol> = schema
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                return Ok((apply_aliases(schema)?, rows));
+            }
+            // v1.96: pg_largeobject itself is NOT publicly readable
+            // (PG: relacl grants nothing; only the metadata view is
+            // public) — non-superusers get 42501 even for LIMIT 0.
+            if name == "pg_largeobject"
+                && q.eng
+                    .db
+                    .find_table(name, q.snap, &q.all_xids, q.session)
+                    .is_none()
+            {
+                let actor = q.priv_role_override.as_deref().unwrap_or(q.role);
+                if !crate::storage::is_superuser_snap(&q.eng.db, actor, q.snap, q.own) {
+                    return Err(exec_err(
+                        "42501",
+                        "permission denied for table pg_largeobject".to_string(),
+                    ));
+                }
+            }
+            // v1.96: large-object + namespace + default-ACL +
+            // dependency virtual catalogs.
+            if matches!(
+                name.as_str(),
+                "pg_largeobject"
+                    | "pg_largeobject_metadata"
+                    | "pg_namespace"
+                    | "pg_default_acl"
+                    | "pg_shdepend"
+                    | "pg_aios"
+                    | "pg_backend_memory_contexts"
+                    | "pg_shmem_allocations"
+                    | "pg_stat_activity"
+                    | "pg_database"
+            ) && q
+                .eng
+                .db
+                .find_table(name, q.snap, &q.all_xids, q.session)
+                .is_none()
+            {
+                let (schema, rows) = match name.as_str() {
+                    "pg_largeobject" | "pg_largeobject_metadata" => {
+                        pg_largeobject_scan(&q.eng.db, &name)
+                    }
+                    "pg_database" => pg_database_scan(&q.eng.db),
+                    "pg_namespace" => pg_namespace_scan(&q.eng.db),
+                    "pg_default_acl" => pg_default_acl_scan(&q.eng.db),
+                    "pg_shdepend" => pg_shdepend_scan(&q.eng.db, q.snap, q.own, q.session),
+                    "pg_stat_activity" => pg_stat_activity_scan(&q.eng.db, q.role, q.session),
+                    _ => pg_empty_stub_scan(&name),
+                };
                 let schema: Vec<QCol> = schema
                     .into_iter()
                     .map(|mut c| {
@@ -2514,7 +2720,11 @@ pub(crate) fn build_source(
             // the statement is FOR UPDATE, like PostgreSQL). Existence is
             // still reported as 42P01 when the table is missing.
             {
-                let (eng, snap, own, role) = (&q.eng, q.snap, q.own, q.role);
+                // v1.96: the effective role honors view-owner /
+                // SECURITY DEFINER overrides (definer rights inside
+                // views and definer functions).
+                let eff_role: &str = q.priv_role_override.as_deref().unwrap_or(q.role);
+                let (eng, snap, own, role) = (&q.eng, q.snap, q.own, eff_role);
                 if let Some(t) = eng.db.find_table(name, snap, &[own], q.session) {
                     let have = crate::storage::table_privs(&eng.db, role, t, snap, own);
                     // v0.11: table-level SELECT, or any column-level
@@ -2530,7 +2740,7 @@ pub(crate) fn build_source(
                             snap,
                             own,
                         );
-                    let update_ok = !need_prov
+                    let update_ok = !for_update
                         || have & crate::storage::PRIV_UPDATE == crate::storage::PRIV_UPDATE;
                     if !select_ok || !update_ok {
                         return Err(exec_err(
@@ -2538,7 +2748,7 @@ pub(crate) fn build_source(
                             format!(
                                 "permission denied for table \"{}\" (needs {})",
                                 name,
-                                if need_prov {
+                                if for_update {
                                     "SELECT, UPDATE"
                                 } else {
                                     "SELECT"
@@ -2570,6 +2780,13 @@ pub(crate) fn build_source(
                     .as_ref()
                     .map(|p| !p.children.is_empty())
                     .unwrap_or(false);
+                // v1.95: when RLS will filter this scan, an index-order
+                // scan's early LIMIT budget would truncate rows before
+                // the policy qual runs (PG applies quals before
+                // LIMIT). Drop the hint; the plain paths return the
+                // full row set and the filter below applies.
+                let order_hint = if t.rls_enabled { None } else { order_hint };
+                let early_limit = if t.rls_enabled { None } else { early_limit };
                 // v0.96: table inheritance — a plain `FROM t` scans t plus
                 // all recursive inheritance descendants (PG's Append
                 // plan); `FROM ONLY t` scans just t. Inheritance and
@@ -2777,6 +2994,39 @@ pub(crate) fn build_source(
                 };
                 (schema, rows)
             };
+            // v1.95: row-level security — filter the base table's rows
+            // through the SELECT USING group (plus the UPDATE group for
+            // FOR UPDATE scans, rowsecurity.c). Applies to every access
+            // path above (seq/index/partition/inheritance) because they
+            // all funnel into `rows` here. Skipped entirely for CTE /
+            // virtual-catalog names (handled by earlier returns).
+            let rows = {
+                let t = q
+                    .eng
+                    .db
+                    .find_table(name, q.snap, &q.all_xids, q.session)
+                    .cloned();
+                match t {
+                    Some(t) if t.rls_enabled => {
+                        let mut cmds = vec![PolicyCmd::Select];
+                        if need_prov {
+                            cmds.push(PolicyCmd::Update);
+                        }
+                        // Order-hint early termination may have cut the
+                        // scan short; RLS filtering after a LIMIT budget
+                        // is still correct PG-wise only if the full
+                        // ordered stream is filtered first — the hint
+                        // path is taken only for plain SELECTs, where
+                        // an under-filled LIMIT is observable. PG
+                        // applies quals before LIMIT, so re-run
+                        // unfiltered is not possible here; the planner
+                        // hint is disabled for RLS tables upstream
+                        // (plan-time), making this a plain filter.
+                        rls_filter_qrows(q, &t, name, &cmds, &schema, rows)?
+                    }
+                    _ => rows,
+                }
+            };
             // v0.89: volatile function bodies see the in-flight UPDATE's
             // already-planned rows instead of the statement snapshot.
             let rows = apply_pending_overlay(q, name, &schema, rows);
@@ -2816,6 +3066,7 @@ pub(crate) fn build_source(
             // unsupported).
             let out = {
                 let mut sub_q = Q {
+                    priv_role_override: None,
                     eng: &mut *q.eng,
                     snap: q.snap,
                     own: q.own,
@@ -2951,8 +3202,9 @@ pub(crate) fn build_source(
             alias,
             col_aliases,
         } => {
-            let (lschema0, lrows0) =
-                build_source(q, outer, left, where_, need_prov, None, None, prefix)?;
+            let (lschema0, lrows0) = build_source(
+                q, outer, left, where_, need_prov, for_update, any_lock, None, None, prefix,
+            )?;
             // v1.10: LATERAL evaluation. PG19 (`LATERAL_P
             // select_with_parens` / `LATERAL_P func_table`) evaluates a
             // LATERAL right-hand item once per left row, with the left
@@ -3087,8 +3339,9 @@ pub(crate) fn build_source(
                     need_prov,
                 );
             }
-            let (rschema0, rrows0) =
-                build_source(q, outer, right, where_, need_prov, None, None, prefix)?;
+            let (rschema0, rrows0) = build_source(
+                q, outer, right, where_, need_prov, for_update, any_lock, None, None, prefix,
+            )?;
             // v0.23: resolve merged columns and the output layout (shared
             // with the describe path so both agree exactly).
             let layout = plan_join(

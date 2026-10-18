@@ -301,6 +301,7 @@ pub(crate) fn materialize_dml_ctes(
         wctx: None,
         srf_vals: Vec::new(),
         priv_scopes: Vec::new(),
+        priv_role_override: None,
         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
         immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
         plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
@@ -1315,6 +1316,8 @@ pub(crate) fn exec_create_table_as(
     if_not_exists: bool,
     with_data: bool,
 ) -> Result<ExecResult, ExecError> {
+    // v1.96: USAGE on cast targets in the query (PG19 parse-time).
+    check_select_cast_usages(eng, ctx, select)?;
     // Existence check first, like CREATE TABLE (42P07).
     if eng
         .db
@@ -1350,6 +1353,7 @@ pub(crate) fn exec_create_table_as(
             wctx: None,
             srf_vals: Vec::new(),
             priv_scopes: Vec::new(),
+            priv_role_override: None,
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
             immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
             plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
@@ -1419,6 +1423,7 @@ pub(crate) fn exec_create_table_as(
         reloptions: Vec::new(),
         inherits: Vec::new(),
         deferred_not_null: Vec::new(),
+        of_type: None,
     };
     // CTAS definitions never carry constraints; the effective def is discarded.
     let _ = create_table_from_def(eng, ctx, name, &def, temp)?;
@@ -1511,6 +1516,8 @@ pub(crate) fn array_elem_coltype(e: ArrayElem) -> ColType {
         ArrayElem::Record => ColType::Composite,
         ArrayElem::PgLsn => ColType::PgLsn,
         ArrayElem::Xid => ColType::Xid,
+        ArrayElem::TsVector => ColType::TsVector, // v1.94
+        ArrayElem::TsQuery => ColType::TsQuery,   // v1.94
     }
 }
 
@@ -1778,6 +1785,119 @@ pub(crate) fn exec_insert(
     } else {
         require_table_priv(eng, ctx, table, crate::storage::PRIV_INSERT, "INSERT")?;
     }
+    // v1.96: ON CONFLICT privilege checks (PG19 aclchk for
+    // ModifyTable): DO UPDATE needs UPDATE on its SET columns;
+    // the inference (arbiter) columns, SET/WHERE expression reads,
+    // EXCLUDED.* reads and RETURNING columns all need SELECT;
+    // DO SELECT FOR UPDATE needs an updatable column.
+    if let Some(oc) = on_conflict {
+        let mut exprs: Vec<&Expr> = Vec::new();
+        // RETURNING expressions read the affected row.
+        let returning_exprs: Vec<&Expr> = returning
+            .iter()
+            .filter_map(|i| match i {
+                crate::sql::SelectItem::Expr { expr, .. } => Some(expr),
+                _ => None,
+            })
+            .collect();
+        match &oc.action {
+            crate::sql::ConflictAction::DoUpdate { sets, where_ } => {
+                require_column_privs(
+                    eng,
+                    ctx,
+                    table,
+                    &sets.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                    crate::storage::PRIV_UPDATE,
+                    "UPDATE",
+                )?;
+                exprs.extend(sets.iter().map(|(_, e)| e));
+                if let Some(w) = where_ {
+                    exprs.push(w);
+                }
+                exprs.extend(returning_exprs.iter().copied());
+            }
+            crate::sql::ConflictAction::DoSelect { where_, for_update } => {
+                // v1.96 finishing pass: PG19 analyze.c — DO SELECT
+                // requires a RETURNING clause (42601), unconditionally.
+                if returning.is_empty() {
+                    return Err(exec_err(
+                        "42601",
+                        "ON CONFLICT DO SELECT requires a RETURNING clause",
+                    ));
+                }
+                if *for_update {
+                    // PG19: DO SELECT FOR UPDATE requires UPDATE on
+                    // the table or on at least one column.
+                    let t = eng
+                        .db
+                        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session);
+                    let ok = match t {
+                        Some(t) => {
+                            let closure =
+                                crate::storage::role_closure(&eng.db, ctx.role, ctx.snap, ctx.own);
+                            crate::storage::table_privs_in(
+                                &eng.db, ctx.role, t, &closure, ctx.snap, ctx.own,
+                            ) & crate::storage::PRIV_UPDATE
+                                == crate::storage::PRIV_UPDATE
+                                || t.columns.iter().any(|(cn, _)| {
+                                    crate::storage::column_privs_in(
+                                        &eng.db, ctx.role, t, cn, &closure, ctx.snap, ctx.own,
+                                    ) & crate::storage::PRIV_UPDATE
+                                        == crate::storage::PRIV_UPDATE
+                                })
+                        }
+                        None => false,
+                    };
+                    if !ok {
+                        return Err(exec_err(
+                            "42501",
+                            format!(
+                                "permission denied for table \"{}\"",
+                                table.rsplit('.').next().unwrap_or(table)
+                            ),
+                        ));
+                    }
+                }
+                if let Some(w) = where_ {
+                    exprs.push(w);
+                }
+                exprs.extend(returning_exprs.iter().copied());
+            }
+            crate::sql::ConflictAction::DoNothing => {}
+        }
+        // The arbiter columns themselves are read by DO UPDATE
+        // (inference requires SELECT, PG19).
+        let mut arbiter_refs: Vec<Expr> = Vec::new();
+        if matches!(oc.action, crate::sql::ConflictAction::DoUpdate { .. }) {
+            let arbiter_cols: Vec<String> = match &oc.arbiter {
+                crate::sql::ConflictArbiter::Columns(cols) => cols.clone(),
+                crate::sql::ConflictArbiter::Constraint(cname) => eng
+                    .db
+                    .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+                    .map(|t| {
+                        t.uniques
+                            .iter()
+                            .chain(t.pkey.iter())
+                            .find(|u| &u.name == cname)
+                            .map(|u| u.cols.clone())
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default(),
+                crate::sql::ConflictArbiter::None => Vec::new(),
+            };
+            for c in &arbiter_cols {
+                arbiter_refs.push(Expr::Column {
+                    table: None,
+                    name: c.clone(),
+                });
+            }
+        }
+        let arbiter_exprs: Vec<&Expr> = arbiter_refs.iter().collect();
+        exprs.extend(arbiter_exprs.iter().copied());
+        if !exprs.is_empty() {
+            check_dml_read_cols(eng, ctx, table, None, &exprs, &[])?;
+        }
+    }
     // v0.12/v0.84: duplicate target columns are 42701 in PostgreSQL —
     // but only for whole-column duplicates. PG19
     // (transformInsertTargetList) allows repeated *partial* (indirection)
@@ -1826,6 +1946,7 @@ pub(crate) fn exec_insert(
             wctx: None,
             srf_vals: Vec::new(),
             priv_scopes: Vec::new(),
+            priv_role_override: None,
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
             immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
             plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
@@ -1958,6 +2079,7 @@ pub(crate) fn exec_insert(
                         wctx: None,
                         srf_vals: Vec::new(),
                         priv_scopes: Vec::new(),
+                        priv_role_override: None,
                         hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                         immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
                         plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
@@ -2097,6 +2219,7 @@ pub(crate) fn exec_insert(
                 wctx: None,
                 srf_vals: Vec::new(),
                 priv_scopes: Vec::new(),
+                priv_role_override: None,
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
                 plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
@@ -2336,6 +2459,44 @@ pub(crate) fn exec_insert(
         }
         fired
     };
+    // v1.95: row-level security WITH CHECK on every new row (PG19
+    // ExecWithCheckOptions, WCO_RLS_INSERT_CHECK; the SELECT policies
+    // join as checks when RETURNING requires SELECT perms). Runs on
+    // the post-trigger rows, before conflict arbitration — PG checks
+    // the proposed row as part of speculative insertion too.
+    {
+        let t = eng
+            .db
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+            .expect("target still visible");
+        if t.rls_enabled {
+            let t = t.clone();
+            let schema: Vec<QCol> = t
+                .columns
+                .iter()
+                .map(|(n, ty)| QCol {
+                    qual: table.to_string(),
+                    name: n.clone(),
+                    ty: *ty,
+                    hidden: false,
+                    src_ord: 0,
+                })
+                .collect();
+            for row in &new_rows {
+                rls_check_new_row_ctx(
+                    eng,
+                    ctx,
+                    &t,
+                    table,
+                    PolicyCmd::Insert,
+                    !returning.is_empty(),
+                    false,
+                    &schema,
+                    &row[..],
+                )?;
+            }
+        }
+    }
     // v0.10: plan the per-row ON CONFLICT resolution. No mutation happens
     // here, so a failed row still leaves the statement atomic. Tracks:
     // - inserts: (new row id, values) to insert,
@@ -2348,6 +2509,9 @@ pub(crate) fn exec_insert(
     let mut inserts: Vec<(u64, Row)> = Vec::new();
     let mut updates: Vec<(String, u64, u64, Row)> = Vec::new();
     let mut ret_rows: Vec<Row> = Vec::new();
+    // v1.96: rows produced by ON CONFLICT DO SELECT (subset of
+    // ret_rows) — the statement result when no RETURNING is given.
+    let mut doselect_out: Vec<(Row, RowProv)> = Vec::new();
     // v1.40: per-row provenance for RETURNING system columns, parallel
     // to ret_rows. `table` is the leaf holding the post-DML version
     // (partition routing); `qual` is the target's range qualifier.
@@ -2370,6 +2534,10 @@ pub(crate) fn exec_insert(
         // affected twice by the same statement (21000). Tracks
         // (conflict-search table, row id) of completed DO UPDATEs.
         let mut do_updated: std::collections::HashSet<(String, u64)> =
+            std::collections::HashSet::new();
+        // v1.96 finishing pass: same second-time tracking for
+        // DO SELECT (PG19 nodeModifyTable 21000).
+        let mut do_selected: std::collections::HashSet<(String, u64)> =
             std::collections::HashSet::new();
         let mut planned_leaf: HashMap<u64, String> = HashMap::new();
         // Schemas for DO UPDATE evaluation: excluded first, target last
@@ -2484,6 +2652,121 @@ pub(crate) fn exec_insert(
             match &plan.action {
                 ConflictAction::DoNothing => {
                     // Skipped: contributes no row and no RETURNING output.
+                }
+                ConflictAction::DoSelect { where_, for_update } => {
+                    // v1.96: PG19 ON CONFLICT DO SELECT — the
+                    // conflicting (existing) row is returned as if
+                    // selected: it feeds RETURNING, and without
+                    // RETURNING it forms the statement's result set.
+                    // The optional WHERE filters the existing row.
+                    // v1.96 finishing pass: plain DO SELECT may
+                    // return the same row repeatedly, but FOR UPDATE
+                    // locks it: PG19 nodeModifyTable raises 21000
+                    // when the lock target was inserted by this same
+                    // statement (it is already "affected") or was
+                    // already selected FOR UPDATE by it.
+                    if *for_update
+                        && (latest.contains_key(&tid) || !do_selected.insert((ctable.clone(), tid)))
+                    {
+                        return Err(exec_err(
+                            "21000",
+                            "ON CONFLICT DO SELECT command cannot affect row a second time",
+                        ));
+                    }
+                    let target_values: Row = match latest.get(&tid) {
+                        Some(v) => v.clone(),
+                        None => row_values_by_id(eng, ctx, &ctable, tid)
+                            .ok_or_else(|| exec_err("XX000", "upsert conflict target vanished"))?,
+                    };
+                    let target_parent: Vec<Value> = if partitioned_upsert {
+                        let lu = &leaf_ctxs[&ctable];
+                        remap_row_to_parent(&lu.cols, &meta_for_upsert.columns, &target_values[..])
+                    } else {
+                        target_values.to_vec()
+                    };
+                    // v1.96 finishing pass: RLS for the DO SELECT path
+                    // (PG19 rowsecurity.c ON CONFLICT block): the
+                    // existing row must pass the SELECT policies'
+                    // USING group as a check (WCO_RLS_CONFLICT_CHECK);
+                    // FOR UPDATE additionally applies the UPDATE
+                    // policies' USING group. Mirrors the DO UPDATE
+                    // block below.
+                    {
+                        let tdef = eng
+                            .db
+                            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+                            .expect("target still visible")
+                            .clone();
+                        if tdef.rls_enabled {
+                            let schema: Vec<QCol> = meta_for_upsert
+                                .columns
+                                .iter()
+                                .map(|(n, ty)| QCol {
+                                    qual: table.to_string(),
+                                    name: n.clone(),
+                                    ty: *ty,
+                                    hidden: false,
+                                    src_ord: 0,
+                                })
+                                .collect();
+                            rls_check_using_as_check_ctx(
+                                eng,
+                                ctx,
+                                &tdef,
+                                table,
+                                PolicyCmd::Select,
+                                &schema,
+                                &target_parent[..],
+                            )?;
+                            if *for_update {
+                                rls_check_using_as_check_ctx(
+                                    eng,
+                                    ctx,
+                                    &tdef,
+                                    table,
+                                    PolicyCmd::Update,
+                                    &schema,
+                                    &target_parent[..],
+                                )?;
+                            }
+                        }
+                    }
+                    if let Some(w) = where_ {
+                        let (excl_schema, tgt_schema) = mk_schemas();
+                        let frames: Vec<(&[QCol], &[Value])> = vec![
+                            (&excl_schema, &values[..]),
+                            (&tgt_schema, &target_parent[..]),
+                        ];
+                        let v = eval_dml_expr(
+                            eng,
+                            ctx.snap,
+                            ctx.own,
+                            ctx.session,
+                            ctx.role,
+                            &frames,
+                            None,
+                            w,
+                            &ctes,
+                            None,
+                            Some(qwrite_from_ctx(
+                                &mut *ctx.writes,
+                                ctx.write_xid,
+                                ctx.level,
+                                ctx.default_toast_compression,
+                            )),
+                        )?;
+                        if v != Value::Bool(true) {
+                            continue;
+                        }
+                    }
+                    let rp = RowProv {
+                        qual: table.to_string(),
+                        table: ctable.clone(),
+                        row_id: tid,
+                    };
+                    ret_rows.push(Row::new(target_parent.clone()));
+                    ret_prov.push(rp.clone());
+                    doselect_out.push((Row::new(target_parent), rp));
                 }
                 ConflictAction::DoUpdate { sets, where_ } => {
                     // v0.71: PG19 deterministic DO UPDATE — a row
@@ -2654,6 +2937,52 @@ pub(crate) fn exec_insert(
                         &[],
                         Some(tid),
                     )?;
+                    // v1.95: row-level security for the DO UPDATE path
+                    // (PG19 rowsecurity.c ON CONFLICT block): the
+                    // existing row must pass the UPDATE policies' USING
+                    // group as a check (WCO_RLS_CONFLICT_CHECK — an
+                    // error, not a skip), and the new row must pass
+                    // the UPDATE WITH CHECK group.
+                    {
+                        let tdef = eng
+                            .db
+                            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+                            .expect("target still visible")
+                            .clone();
+                        if tdef.rls_enabled {
+                            let schema: Vec<QCol> = meta_for_upsert
+                                .columns
+                                .iter()
+                                .map(|(n, ty)| QCol {
+                                    qual: table.to_string(),
+                                    name: n.clone(),
+                                    ty: *ty,
+                                    hidden: false,
+                                    src_ord: 0,
+                                })
+                                .collect();
+                            rls_check_using_as_check_ctx(
+                                eng,
+                                ctx,
+                                &tdef,
+                                table,
+                                PolicyCmd::Update,
+                                &schema,
+                                &target_parent[..],
+                            )?;
+                            rls_check_new_row_ctx(
+                                eng,
+                                ctx,
+                                &tdef,
+                                table,
+                                PolicyCmd::Update,
+                                !returning.is_empty(),
+                                false,
+                                &schema,
+                                &new_values[..],
+                            )?;
+                        }
+                    }
                     // prev xmax for the WAL undo record.
                     let prev_xmax: u64 = if is_planned {
                         0
@@ -2709,7 +3038,7 @@ pub(crate) fn exec_insert(
             });
         }
     }
-    let n = inserts.len() + updates.len();
+    let n = inserts.len() + updates.len() + doselect_out.len();
     // Every row inserted/updated below pushes exactly one WriteOp onto
     // ctx.writes; reserving for the known total up front avoids the
     // repeated grow-and-copy of pushing into it unsized (measured via
@@ -2797,7 +3126,25 @@ pub(crate) fn exec_insert(
         rp.row_id = *new_id;
     }
     // v0.10: RETURNING.
-    let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Row>) = if returning.is_empty() {
+    // v1.96: ON CONFLICT DO SELECT without RETURNING still returns
+    // the selected rows (all columns) as the statement result.
+    let star_items = [crate::sql::SelectItem::All];
+    let (eff_returning, eff_rows): (&[crate::sql::SelectItem], Vec<(Row, RowProv)>) =
+        if !returning.is_empty() {
+            (
+                returning,
+                ret_rows
+                    .iter()
+                    .cloned()
+                    .zip(ret_prov.iter().cloned())
+                    .collect(),
+            )
+        } else if !doselect_out.is_empty() {
+            (&star_items, doselect_out.clone())
+        } else {
+            (returning, Vec::new())
+        };
+    let (ret_cols, ret_out): (Vec<(String, ColType)>, Vec<Row>) = if eff_returning.is_empty() {
         (Vec::new(), Vec::new())
     } else {
         let (cols, returning_expanded) = describe_returning(
@@ -2808,7 +3155,7 @@ pub(crate) fn exec_insert(
             table,
             table,
             &[],
-            returning,
+            eff_returning,
         )?;
         let schema: Vec<QCol> = meta_for_upsert
             .columns
@@ -2822,9 +3169,9 @@ pub(crate) fn exec_insert(
                 src_ord: 0,
             })
             .collect();
-        let mut out_rows = Vec::with_capacity(ret_rows.len());
+        let mut out_rows = Vec::with_capacity(eff_rows.len());
         // v1.40: per-row provenance drives RETURNING system columns.
-        for (values, rp) in ret_rows.iter().zip(ret_prov.iter()) {
+        for (values, rp) in eff_rows.iter().map(|(v, p)| (v, p)) {
             out_rows.push(Row::new(project_returning(
                 eng,
                 ctx.snap,
@@ -2983,6 +3330,15 @@ pub(crate) fn exec_update(
         crate::storage::PRIV_UPDATE,
         "UPDATE",
     )?;
+    // v1.96: columns READ by SET expressions / WHERE need SELECT
+    // (PG19 ExecCheckRTEPerms selectedCols on the target relation).
+    {
+        let mut exprs: Vec<&Expr> = sets.iter().map(|(_, e)| e).collect();
+        if let Some(w) = where_ {
+            exprs.push(w);
+        }
+        check_dml_read_cols(eng, ctx, table, alias.as_deref(), &exprs, &[])?;
+    }
     // v0.12: duplicate SET targets are 42701 in PostgreSQL
     // ("multiple assignments to same column"), not silently accepted.
     {
@@ -3134,6 +3490,58 @@ pub(crate) fn exec_update(
                 vis.push((leaf.clone(), leaf_cols.clone(), r.id, r.xmax, pv));
             }
         }
+        // v1.95: row-level security — the target's UPDATE USING group
+        // (plus the SELECT group when the statement requires SELECT
+        // perms: a WHERE clause or RETURNING, rowsecurity.c) filters
+        // the candidate rows; invisible rows are simply not updated.
+        {
+            let tdef = eng
+                .db
+                .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+                .expect("target still visible")
+                .clone();
+            if tdef.rls_enabled {
+                let mut cmds = vec![PolicyCmd::Update];
+                if where_.is_some() || !returning.is_empty() {
+                    cmds.push(PolicyCmd::Select);
+                }
+                let mut lock_ids = Vec::new();
+                let mut q = Q {
+                    eng: &mut *eng,
+                    snap: ctx.snap,
+                    own: ctx.own,
+                    all_xids: ctx.all_xids.clone(),
+                    session: ctx.session,
+                    role: ctx.role,
+                    read_only: ctx.read_only,
+                    depth: 0,
+                    lock_ids: &mut lock_ids,
+                    ctes: ctes.clone(),
+                    wctx: None,
+                    srf_vals: Vec::new(),
+                    priv_scopes: Vec::new(),
+                    priv_role_override: None,
+                    hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+                    immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+                    plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
+                    hashed_in: Rc::new(RefCell::new(Vec::new())),
+                    pending_updates: None,
+                    write: Some(qwrite_from_ctx(
+                        &mut *ctx.writes,
+                        ctx.write_xid,
+                        ctx.level,
+                        ctx.default_toast_compression,
+                    )),
+                };
+                let mut kept = Vec::with_capacity(vis.len());
+                for entry in vis {
+                    if rls_visible_q(&mut q, &tdef, table, &cmds, &schema, &entry.4)? {
+                        kept.push(entry);
+                    }
+                }
+                vis = kept;
+            }
+        }
         let mut plan: Vec<(String, u64, u64, Row)> = Vec::new();
         let mut moves: Vec<(String, u64, u64, String, Row)> = Vec::new();
         let mut ret_new: Vec<Row> = Vec::new();
@@ -3163,6 +3571,7 @@ pub(crate) fn exec_update(
                 wctx: None,
                 srf_vals: Vec::new(),
                 priv_scopes: Vec::new(),
+                priv_role_override: None,
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
                 plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
@@ -3175,7 +3584,8 @@ pub(crate) fn exec_update(
                     ctx.default_toast_compression,
                 )),
             };
-            let (fschema, frows) = build_from(&mut q, &[], from, None, false, None, None)?;
+            let (fschema, frows) =
+                build_from(&mut q, &[], from, None, false, false, false, None, None)?;
             Some((fschema, frows))
         };
         // For RETURNING with FROM: the FROM row used for each updated target
@@ -3519,6 +3929,43 @@ pub(crate) fn exec_update(
         let from_schema = from_data.map(|(s, _)| s);
         (plan, moves, ret_new, ret_from, ret_prov_ids, from_schema)
     };
+    // v1.95: row-level security WITH CHECK on every updated row's new
+    // version (WCO_RLS_UPDATE_CHECK; SELECT policies join as checks
+    // when RETURNING is present). ret_new is in target (parent)
+    // column order, matching the target schema built here.
+    {
+        let tdef = eng
+            .db
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+            .expect("target still visible")
+            .clone();
+        if tdef.rls_enabled {
+            let schema: Vec<QCol> = tdef
+                .columns
+                .iter()
+                .map(|(n, ty)| QCol {
+                    qual: table.to_string(),
+                    name: n.clone(),
+                    ty: *ty,
+                    hidden: false,
+                    src_ord: 0,
+                })
+                .collect();
+            for row in &ret_new {
+                rls_check_new_row_ctx(
+                    eng,
+                    ctx,
+                    &tdef,
+                    table,
+                    PolicyCmd::Update,
+                    !returning.is_empty(),
+                    false,
+                    &schema,
+                    &row[..],
+                )?;
+            }
+        }
+    }
     // Apply: UPDATE = delete old version + insert new version, per leaf.
     // v0.70: moved rows are deleted from their source leaf and inserted
     // into the routed destination leaf.
@@ -3782,6 +4229,10 @@ pub(crate) fn exec_delete(
 ) -> Result<ExecResult, ExecError> {
     // v0.11: DELETE needs DELETE privilege on the table.
     require_table_priv(eng, ctx, table, crate::storage::PRIV_DELETE, "DELETE")?;
+    // v1.96: columns READ by the WHERE clause need SELECT.
+    if let Some(w) = where_ {
+        check_dml_read_cols(eng, ctx, table, alias.as_deref(), &[w], &[])?;
+    }
     // v0.65: an alias makes it the visible qualifier in WHERE/RETURNING
     // (PG's alias clause); storage and privileges use the real name.
     let qual = alias.as_deref().unwrap_or(table);
@@ -3863,6 +4314,60 @@ pub(crate) fn exec_delete(
             }
             v
         };
+        // v1.95: row-level security — the target's DELETE USING group
+        // (plus the SELECT group when a WHERE clause or RETURNING
+        // requires SELECT perms) filters candidate rows; invisible
+        // rows are simply not deleted.
+        let vis: Vec<(String, u64, u64, Row, Row, Vec<u32>)> = {
+            let tdef = eng
+                .db
+                .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+                .expect("target still visible")
+                .clone();
+            if !tdef.rls_enabled {
+                vis
+            } else {
+                let mut cmds = vec![PolicyCmd::Delete];
+                if where_.is_some() || !returning.is_empty() {
+                    cmds.push(PolicyCmd::Select);
+                }
+                let mut lock_ids = Vec::new();
+                let mut q = Q {
+                    eng: &mut *eng,
+                    snap: ctx.snap,
+                    own: ctx.own,
+                    all_xids: ctx.all_xids.clone(),
+                    session: ctx.session,
+                    role: ctx.role,
+                    read_only: ctx.read_only,
+                    depth: 0,
+                    lock_ids: &mut lock_ids,
+                    ctes: ctes.clone(),
+                    wctx: None,
+                    srf_vals: Vec::new(),
+                    priv_scopes: Vec::new(),
+                    priv_role_override: None,
+                    hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+                    immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+                    plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
+                    hashed_in: Rc::new(RefCell::new(Vec::new())),
+                    pending_updates: None,
+                    write: Some(qwrite_from_ctx(
+                        &mut *ctx.writes,
+                        ctx.write_xid,
+                        ctx.level,
+                        ctx.default_toast_compression,
+                    )),
+                };
+                let mut kept = Vec::with_capacity(vis.len());
+                for entry in vis {
+                    if rls_visible_q(&mut q, &tdef, table, &cmds, &schema, &entry.3)? {
+                        kept.push(entry);
+                    }
+                }
+                kept
+            }
+        };
         let mut plan = Vec::new();
         // v0.76: the USING row matched for each deleted target row,
         // parallel to `plan` (None without USING) — RETURNING may
@@ -3889,6 +4394,7 @@ pub(crate) fn exec_delete(
                 wctx: None,
                 srf_vals: Vec::new(),
                 priv_scopes: Vec::new(),
+                priv_role_override: None,
                 hashed_exists: Rc::new(RefCell::new(HashMap::new())),
                 immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
                 plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
@@ -3901,7 +4407,8 @@ pub(crate) fn exec_delete(
                     ctx.default_toast_compression,
                 )),
             };
-            let (uschema, urows) = build_from(&mut q, &[], using, None, false, None, None)?;
+            let (uschema, urows) =
+                build_from(&mut q, &[], using, None, false, false, false, None, None)?;
             Some((uschema, urows))
         };
         for (leaf, id, xmax, values, leaf_values, _toast) in &vis {
@@ -4342,6 +4849,10 @@ pub(crate) fn exec_drop(
             continue;
         }
         drop_one_table(eng, ctx, name, if_exists, cascade, &mut dropped)?;
+    }
+    // v1.96 finishing pass: schema attribution dies with the table.
+    for name in &dropped {
+        forget_obj_schema(eng, ctx, name);
     }
     Ok(ExecResult::Command {
         tag: "DROP TABLE".to_string(),

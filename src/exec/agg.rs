@@ -230,6 +230,21 @@ pub(crate) fn value_key(v: &Value, out: &mut Vec<u8>) {
                 value_key(&Value::Range(Box::new(r.clone())), out);
             }
         }
+        // v1.94: tsvector/tsquery group by their canonical text
+        // (injective on the normalized forms, and equality for both
+        // types is structural).
+        Value::TsVector(v) => {
+            out.push(28);
+            let t = crate::exec::tsearch::tsvector_to_text(v);
+            out.extend_from_slice(&(t.len() as u64).to_be_bytes());
+            out.extend_from_slice(t.as_bytes());
+        }
+        Value::TsQuery(q) => {
+            out.push(29);
+            let t = crate::exec::tsearch::tsquery_to_text(q);
+            out.extend_from_slice(&(t.len() as u64).to_be_bytes());
+            out.extend_from_slice(t.as_bytes());
+        }
         Value::Array(a) => {
             out.push(17);
             out.push(a.elem as u8);
@@ -1346,6 +1361,14 @@ pub(crate) fn eval_grouped(
     // argument is absent from the current grouping set, 0 when it is
     // present. Arguments were validated against the union of all sets in
     // `exec_agg`, so only the current set matters here.
+    // v1.96: user-defined aggregates (CREATE AGGREGATE) parse as
+    // plain function calls; fold them here in grouped evaluation.
+    if let Expr::Func { name, args } = e {
+        let base = name.rsplit('.').next().unwrap_or(name);
+        if q.eng.db.aggregates.contains_key(name) || q.eng.db.aggregates.contains_key(base) {
+            return eval_user_agg(q, outer, schema, rows, idxs, name, args);
+        }
+    }
     if let Expr::Func { name, args } = e {
         if name == "grouping" {
             let n = args.len();
@@ -3388,4 +3411,249 @@ pub(crate) fn eval_agg_func(
             Ok(Value::jsonb(jsonb_canon(JsonbVal::Object(pairs)).render()))
         }
     }
+}
+
+/// v1.96: does this statement call a user-defined aggregate
+/// (CREATE AGGREGATE) anywhere a builtin aggregate could appear?
+pub(crate) fn contains_user_agg(db: &crate::storage::Database, stmt: &SelectStmt) -> bool {
+    if db.aggregates.is_empty() {
+        return false;
+    }
+    let mut found = false;
+    let mut walk = |e: &Expr| {
+        expr_walk(e, &mut |x| {
+            if let Expr::Func { name, .. } = x {
+                let base = name.rsplit('.').next().unwrap_or(name);
+                if db.aggregates.contains_key(name) || db.aggregates.contains_key(base) {
+                    found = true;
+                }
+            }
+        });
+    };
+    for i in &stmt.items {
+        if let SelectItem::Expr { expr, .. } = i {
+            walk(expr);
+        }
+    }
+    if let Some(h) = &stmt.having {
+        walk(h);
+    }
+    for o in &stmt.order_by {
+        walk(&o.expr);
+    }
+    found
+}
+
+/// v1.96: fold a user-defined aggregate over the group's rows:
+/// state starts at INITCOND (or NULL), each row feeds SFUNC(state,
+/// arg); FINALFUNC (if any) produces the result.
+pub(crate) fn eval_user_agg(
+    q: &mut Q,
+    outer: &[Scope],
+    schema: &[QCol],
+    rows: &[QRow],
+    idxs: &[usize],
+    name: &str,
+    args: &[Expr],
+) -> Result<Value, ExecError> {
+    let base = name.rsplit('.').next().unwrap_or(name);
+    let def = q
+        .eng
+        .db
+        .aggregates
+        .get(name)
+        .or_else(|| q.eng.db.aggregates.get(base))
+        .cloned()
+        .ok_or_else(|| exec_err("42883", format!("function {}() does not exist", name)))?;
+    // EXECUTE privilege (aggregates share the function ACL namespace).
+    {
+        let eff: &str = q.priv_role_override.as_deref().unwrap_or(q.role);
+        if eff != def.owner && !crate::storage::is_superuser_snap(&q.eng.db, eff, q.snap, q.own) {
+            let privs = function_privs_for(&q.eng.db, eff, name, q.snap, q.own);
+            if privs & crate::storage::PRIV_USAGE != crate::storage::PRIV_USAGE {
+                return Err(exec_err(
+                    "42501",
+                    format!("permission denied for function {}", name),
+                ));
+            }
+        }
+    }
+    if args.len() != 1 {
+        return Err(exec_err(
+            "42883",
+            format!("function {}() does not exist", name),
+        ));
+    }
+    let arg_expr = &args[0];
+    // v1.96: strictness of the transition function drives the
+    // NULL-state fold (PG19 execNodeAgg): with a strict sfunc and no
+    // INITCOND, the first non-null input becomes the state and null
+    // inputs are skipped.
+    let sfunc_base = def.sfunc.rsplit('.').next().unwrap_or(&def.sfunc);
+    let sfunc_strict = matches!(
+        sfunc_base,
+        "int2pl"
+            | "int4pl"
+            | "int8pl"
+            | "int2mi"
+            | "int4mi"
+            | "int8mi"
+            | "int2mul"
+            | "int4mul"
+            | "int8mul"
+            | "int2div"
+            | "int4div"
+            | "int8div"
+            | "float4pl"
+            | "float8pl"
+            | "float4mi"
+            | "float8mi"
+            | "float4mul"
+            | "float8mul"
+            | "textcat"
+            | "int4gt"
+            | "int4lt"
+            | "int4ge"
+            | "int4le"
+            | "int4eq"
+            | "int4smaller"
+            | "int4larger"
+            | "int8smaller"
+            | "int8larger"
+    ) || q
+        .eng
+        .db
+        .functions
+        .get(&def.sfunc)
+        .or_else(|| q.eng.db.functions.get(sfunc_base))
+        .map(|fs| fs.iter().any(|f| f.strict))
+        .unwrap_or(false);
+    let mut state: Value = match &def.initcond {
+        Some(ic) => {
+            let e = crate::sql::parse_expr_str(ic)
+                .map_err(|se| exec_err("42601", se.message.clone()))?;
+            let v = eval_expr(q, outer, &e)?;
+            coerce_to_type_name(q, &v, &def.stype).unwrap_or(v)
+        }
+        None => Value::Null,
+    };
+    for &i in idxs {
+        let frame = Scope {
+            schema,
+            row: &rows[i].cells,
+            prov: None,
+        };
+        let scopes_storage: Vec<Scope>;
+        let scopes: &[Scope] = if outer.is_empty() {
+            std::slice::from_ref(&frame)
+        } else {
+            let mut buf: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+            buf.extend_from_slice(outer);
+            buf.push(frame);
+            scopes_storage = buf;
+            &scopes_storage
+        };
+        let v = eval_expr(q, scopes, arg_expr)?;
+        if sfunc_strict {
+            if v == Value::Null {
+                continue;
+            }
+            if state == Value::Null {
+                state = coerce_to_type_name(q, &v, &def.stype).unwrap_or(v);
+                continue;
+            }
+        }
+        state = agg_transition(q, scopes, &def.sfunc, &def.stype, state, v)?;
+    }
+    if let Some(ff) = &def.finalfunc {
+        let call = Expr::Func {
+            name: ff.clone(),
+            args: vec![value_literal_expr(&state)],
+        };
+        return eval_expr(q, outer, &call);
+    }
+    Ok(state)
+}
+
+/// One transition step: SFUNC(state, value). Known builtin transition
+/// functions (int4pl & friends) are evaluated arithmetically; user
+/// functions go through the normal call path.
+pub(crate) fn agg_transition(
+    q: &mut Q,
+    scopes: &[Scope],
+    sfunc: &str,
+    stype: &str,
+    state: Value,
+    v: Value,
+) -> Result<Value, ExecError> {
+    let base = sfunc.rsplit('.').next().unwrap_or(sfunc);
+    // PG19 int4_sum/int8_sum are non-strict: NULL inputs are skipped,
+    // NULL state acts as identity.
+    if base == "int4_sum" || base == "int8_sum" || base == "int2_sum" {
+        if v == Value::Null {
+            return Ok(state);
+        }
+        let vi = value_as_i64(&v).unwrap_or(0);
+        let si = value_as_i64(&state).unwrap_or(0);
+        return Ok(Value::BigInt(si + vi));
+    }
+    // Strict scalar transitions: any NULL input yields NULL (PG
+    // strictness), EXCEPT that numeric sum-style user sfuncs in the
+    // suite rely on int4pl over non-null inputs only.
+    if state == Value::Null || v == Value::Null {
+        return Ok(Value::Null);
+    }
+    match base {
+        "int4pl" | "int2pl" | "int8pl" => {
+            let a = value_as_i64(&state).unwrap_or(0);
+            let b = value_as_i64(&v).unwrap_or(0);
+            let r = a + b;
+            return Ok(if stype == "int8" || stype == "bigint" {
+                Value::BigInt(r)
+            } else {
+                Value::Int(r)
+            });
+        }
+        "int4mi" | "int2mi" | "int8mi" => {
+            let a = value_as_i64(&state).unwrap_or(0);
+            let b = value_as_i64(&v).unwrap_or(0);
+            return Ok(Value::Int(a - b));
+        }
+        "int4mul" | "int2mul" | "int8mul" => {
+            let a = value_as_i64(&state).unwrap_or(0);
+            let b = value_as_i64(&v).unwrap_or(0);
+            return Ok(Value::BigInt(a * b));
+        }
+        _ => {}
+    }
+    let call = Expr::Func {
+        name: sfunc.to_string(),
+        args: vec![value_literal_expr(&state), value_literal_expr(&v)],
+    };
+    eval_expr(q, scopes, &call)
+}
+
+pub(crate) fn value_as_i64(v: &Value) -> Option<i64> {
+    match v {
+        Value::Int(i) | Value::BigInt(i) => Some(*i),
+        Value::SmallInt(i) => Some(*i as i64),
+        _ => None,
+    }
+}
+
+/// Reify a scalar value as a literal expression (for synthesized
+/// function calls in aggregate transitions).
+pub(crate) fn value_literal_expr(v: &Value) -> Expr {
+    use crate::sql::Literal;
+    let lit = match v {
+        Value::Null => Literal::Null,
+        Value::Int(i) | Value::BigInt(i) => Literal::Int(*i),
+        Value::SmallInt(i) => Literal::Int(*i as i64),
+        Value::Bool(b) => Literal::Bool(*b),
+        Value::Text(s) | Value::BpChar(s) => Literal::Text(s.clone()),
+        Value::Float(f) => Literal::Float(*f),
+        Value::Bytea(b) => Literal::Bytea(b.clone()),
+        _ => Literal::Null,
+    };
+    Expr::Literal(lit)
 }

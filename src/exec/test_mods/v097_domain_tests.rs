@@ -523,16 +523,17 @@ fn plpgsql_exceptions() {
         )
         .unwrap();
     assert_eq!(err_code(&mut eng, "SELECT herr101()"), "22012");
-    // Implicit RETURN NULL when the sequence has no RETURN.
+    // v1.96 correction: PG19 does NOT implicitly return NULL
+    // when a non-void function's body falls off the end — the
+    // call is 2F005 (plpgsql suite: missing_return_expr). The
+    // pre-v1.96 assertion of a NULL row encoded the old dummy
+    // RETURN behavior, which PG19's gram/pl_exec rules contradict.
     run(
             &mut eng,
             "CREATE FUNCTION nullret101() returns int as 'begin analyze t101a; end' language plpgsql volatile",
         )
         .unwrap();
-    assert_eq!(
-        rows_of(run(&mut eng, "SELECT nullret101()").unwrap()),
-        vec![vec!["NULL"]]
-    );
+    assert_eq!(err_code(&mut eng, "SELECT nullret101()"), "2F005");
     // v1.03: `:=` is supported but requires DECLARE — undeclared
     // target is 42601 (was 0A000 in v1.01 when `:=` was unsupported).
     assert_eq!(
@@ -572,9 +573,21 @@ fn plpgsql_exceptions() {
         "42601"
     );
     // Missing EXCEPTION keyword / missing THEN are syntax errors.
-    assert!(parse_plpgsql_body("begin return 1; when others then return 2; end", false).is_err());
     assert!(
-        parse_plpgsql_body("begin return 1; exception when others return 2; end", false).is_err()
+        parse_plpgsql_body(
+            "begin return 1; when others then return 2; end",
+            false,
+            false
+        )
+        .is_err()
+    );
+    assert!(
+        parse_plpgsql_body(
+            "begin return 1; exception when others return 2; end",
+            false,
+            false
+        )
+        .is_err()
     );
     // Condition matching unit coverage (PG19 pl_exec.c rules).
     // (The parser normalizes OTHERS to the uppercase sentinel.)
@@ -590,6 +603,7 @@ fn plpgsql_exceptions() {
     // Named conditions resolve through the errcodes table.
     let pb = parse_plpgsql_body(
         "begin return 1; exception when division_by_zero or unique_violation then return 0; end",
+        false,
         false,
     )
     .unwrap();

@@ -250,6 +250,38 @@ pub(crate) fn exec_create_sequence(
             }
         };
     }
+    // v1.96: ALTER DEFAULT PRIVILEGES for sequences.
+    let seq_defaults = default_acl_entries_for(&eng.db, ctx.role, 'S', name);
+    if !seq_defaults.is_empty() && !seq.acl.iter().any(|e| e.role == ctx.role) {
+        // PG: the initial ACL is acldefault (owner item present)
+        // modified by the default-privilege rules.
+        seq.acl.push(crate::storage::AclEntry {
+            role: ctx.role.to_string(),
+            privs: crate::storage::PRIV_USAGE
+                | crate::storage::PRIV_SELECT
+                | crate::storage::PRIV_UPDATE,
+            grant_option: 0,
+            grantor: ctx.role.to_string(),
+        });
+    }
+    for e in seq_defaults {
+        let g = if e.grantor.is_empty() {
+            ctx.role.to_string()
+        } else {
+            e.grantor.clone()
+        };
+        let _ = apply_acl_delta(
+            &mut seq.acl,
+            &[e.role.clone()],
+            &[(g, e.privs)],
+            false,
+            false,
+            e.grant_option != 0,
+            false,
+            false,
+            &ctx.role.to_string(),
+        );
+    }
     eng.db
         .sequences
         .entry(name.to_string())
@@ -258,6 +290,7 @@ pub(crate) fn exec_create_sequence(
     ctx.writes.push(WriteOp::CreateSequence {
         name: name.to_string(),
     });
+    note_obj_schema(eng, ctx, name, name);
     Ok(ExecResult::Command {
         tag: "CREATE SEQUENCE".to_string(),
     })
@@ -445,6 +478,7 @@ pub(crate) fn exec_drop_sequence(
             name: name.clone(),
             seq: prev,
         });
+        forget_obj_schema(eng, ctx, name);
     }
     Ok(ExecResult::Command {
         tag: "DROP SEQUENCE".to_string(),
@@ -607,9 +641,11 @@ pub fn seq_setval(
     is_called: bool,
 ) -> Result<i64, ExecError> {
     // v0.11: setval needs USAGE on the sequence.
+    // v1.96 finishing pass: PG19 requires UPDATE for setval (not
+    // USAGE — nextval is the USAGE-gated one).
     if let Some(s) = eng.db.find_sequence(name, snap, own) {
         let have = crate::storage::sequence_privs(&eng.db, role, s, snap, own);
-        if have & crate::storage::PRIV_USAGE == 0 {
+        if have & crate::storage::PRIV_UPDATE == 0 {
             return Err(exec_err(
                 "42501",
                 format!("permission denied for sequence \"{}\"", name),

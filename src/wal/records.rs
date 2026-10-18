@@ -184,6 +184,9 @@ pub enum WalRecord {
         deps: Vec<String>,
         /// v0.11: creating role.
         owner: String,
+        /// v1.95 (RGSWAL25): view options.
+        security_invoker: bool,
+        check_option: bool,
         xmin: u64,
     },
     DropView {
@@ -228,6 +231,11 @@ pub enum WalRecord {
     },
     DbAcl {
         acl: Vec<WalAcl>,
+        xmin: u64,
+    },
+    /// v1.96 (tag 30): ALTER DEFAULT PRIVILEGES rules, replaced wholesale.
+    DefaultAcls {
+        rules: Vec<WalDefaultAcl>,
         xmin: u64,
     },
     // --- v0.13: replication slot metadata (non-transactional, like
@@ -277,6 +285,10 @@ pub enum WalRecord {
         body: String,
         volatility: u8,
         strict: bool,
+        /// v1.96 (RGSWAL26): SECURITY DEFINER.
+        security_definer: bool,
+        /// v1.96 (RGSWAL26): CREATE PROCEDURE flag.
+        is_procedure: bool,
         xmin: u64,
     },
     DropFunction {
@@ -323,6 +335,9 @@ pub struct WalOperDef {
 pub struct WalAcl {
     pub role: String,
     pub privs: u32,
+    /// v1.96 (RGSWAL26): grant-option bits and grantor.
+    pub grant_option: u32,
+    pub grantor: String,
 }
 
 /// v0.85: a domain definition in WAL/checkpoint form. CHECKs and the
@@ -344,12 +359,16 @@ impl WalAcl {
         WalAcl {
             role: e.role.clone(),
             privs: e.privs,
+            grant_option: e.grant_option,
+            grantor: e.grantor.clone(),
         }
     }
     pub fn into_entry(self) -> crate::storage::AclEntry {
         crate::storage::AclEntry {
             role: self.role,
             privs: self.privs,
+            grant_option: self.grant_option,
+            grantor: self.grantor,
         }
     }
 }
@@ -360,6 +379,9 @@ pub struct WalColAcl {
     pub role: String,
     pub privs: u32,
     pub columns: Vec<String>,
+    /// v1.96 (RGSWAL26): grant-option bits and grantor.
+    pub grant_option: u32,
+    pub grantor: String,
 }
 
 impl WalColAcl {
@@ -368,6 +390,8 @@ impl WalColAcl {
             role: e.role.clone(),
             privs: e.privs,
             columns: e.columns.clone(),
+            grant_option: e.grant_option,
+            grantor: e.grantor.clone(),
         }
     }
     pub fn into_entry(self) -> crate::storage::ColAclEntry {
@@ -375,6 +399,8 @@ impl WalColAcl {
             role: self.role,
             privs: self.privs,
             columns: self.columns,
+            grant_option: self.grant_option,
+            grantor: self.grantor,
         }
     }
 }
@@ -417,6 +443,46 @@ pub struct WalRole {
     pub connlimit: i32,
     pub memberships: Vec<WalMembership>,
     pub valid_until: Option<String>,
+    /// v1.95: BYPASSRLS (trailing; RGSWAL25).
+    pub bypassrls: bool,
+    /// v1.96 (RGSWAL26): rolinherit + membership options + createrole/createdb.
+    pub inherit: bool,
+    pub createrole: bool,
+    pub createdb: bool,
+    /// v1.96 finishing pass (RGSWAL27): rolreplication, trailing.
+    pub replication: bool,
+}
+
+/// v1.96: WAL form of one default-privilege rule.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WalDefaultAcl {
+    pub creator: String,
+    pub kind: u8,
+    pub grantee: String,
+    pub privs: u32,
+    /// v1.96 (RGSWAL26): IN SCHEMA target ("" = global).
+    pub schema: String,
+}
+
+impl WalDefaultAcl {
+    pub fn of(d: &crate::storage::DefaultAcl) -> Self {
+        WalDefaultAcl {
+            creator: d.creator.clone(),
+            kind: d.kind as u8,
+            grantee: d.grantee.clone(),
+            privs: d.privs,
+            schema: d.schema.clone(),
+        }
+    }
+    pub fn into_rule(self) -> crate::storage::DefaultAcl {
+        crate::storage::DefaultAcl {
+            creator: self.creator,
+            kind: self.kind as char,
+            grantee: self.grantee,
+            privs: self.privs,
+            schema: self.schema,
+        }
+    }
 }
 
 /// WAL form of one `GRANT group TO member` edge.
@@ -424,6 +490,9 @@ pub struct WalRole {
 pub struct WalMembership {
     pub role: String,
     pub grantor: String,
+    pub admin: bool,
+    pub inherit: bool,
+    pub set: bool,
 }
 
 impl WalRole {
@@ -432,6 +501,11 @@ impl WalRole {
             password: r.password.as_ref().map(WalVerifier::of),
             can_login: r.can_login,
             superuser: r.superuser,
+            bypassrls: r.bypassrls,
+            inherit: r.inherit,
+            createrole: r.createrole,
+            createdb: r.createdb,
+            replication: r.replication,
             connlimit: r.connlimit,
             memberships: r
                 .memberships
@@ -439,6 +513,9 @@ impl WalRole {
                 .map(|m| WalMembership {
                     role: m.role.clone(),
                     grantor: m.grantor.clone(),
+                    admin: m.admin,
+                    inherit: m.inherit,
+                    set: m.set,
                 })
                 .collect(),
             valid_until: r.valid_until.clone(),

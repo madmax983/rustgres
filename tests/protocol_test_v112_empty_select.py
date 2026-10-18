@@ -146,8 +146,13 @@ def main():
         q(s, "insert into es_proto values (1), (2)")
         nf, rows, tag, err = q(s, "select from es_proto;")
         check("select from table -> 2 rows", err is None and nf == 0 and len(rows) == 2, (nf, len(rows), err))
+        # v1.96 correction: PG19 gram.y's DISTINCT production is
+        # `SELECT distinct_clause target_list` and target_list has
+        # no empty alternative (only opt_target_list, used by the
+        # plain production, may be empty) -- so this is a syntax
+        # error in PG19, not a one-row result.
         nf, rows, tag, err = q(s, "select distinct from generate_series(1,3);")
-        check("select distinct from -> 1 row", err is None and nf == 0 and len(rows) == 1, (nf, len(rows), err))
+        check("select distinct from -> syntax error (PG19 gram.y)", err is not None and "42601" in str(err), (nf, len(rows), err))
 
         # --- set operations over zero-column branches (PG19 counts) ---
         cases = [

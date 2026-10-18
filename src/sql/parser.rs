@@ -175,6 +175,20 @@ impl Parser {
         }
     }
 
+    /// v1.96: an identifier optionally qualified by dots
+    /// (`schema.name`), returned in dotted form.
+    pub(crate) fn expect_qualified_ident(&mut self) -> Result<String, SqlError> {
+        let mut name = self.expect_ident()?;
+        while *self.peek() == Token::Dot
+            && matches!(self.peek2(), Token::Ident(_) | Token::QIdent(_))
+        {
+            self.next(); // '.'
+            let part = self.expect_ident()?;
+            name = format!("{}.{}", name, part);
+        }
+        Ok(name)
+    }
+
     pub(crate) fn expect_ident(&mut self) -> Result<String, SqlError> {
         match self.next() {
             Token::Ident(s) => Ok(s),
@@ -291,6 +305,7 @@ impl Parser {
             "table" => Ok(Stmt::Select(self.parse_table_query()?)),
             "drop" => self.parse_drop(),
             // --- v0.11: GRANT / REVOKE
+            "lock" => self.parse_lock(),
             "grant" => self.parse_grant(),
             "revoke" => self.parse_revoke(),
             // --- v0.5: UPDATE / DELETE
@@ -597,7 +612,31 @@ impl Parser {
                 Token::Ident(s) if s == "table" => self.parse_alter(),
                 Token::Ident(s) if s == "sequence" => self.parse_alter_sequence(),
                 Token::Ident(s) if s == "domain" => self.parse_alter_domain(),
+                Token::Ident(s) if s == "type" => self.parse_alter_type(),
                 Token::Ident(s) if s == "function" => self.parse_alter_function(),
+                Token::Ident(s) if s == "policy" => self.parse_alter_policy(),
+                Token::Ident(s) if s == "default" => self.parse_alter_default_privileges(),
+                Token::Ident(s) if s == "schema" => {
+                    self.next(); // 'schema'
+                    let name = self.expect_ident()?;
+                    if self.eat_keyword("rename") {
+                        self.expect_keyword("to")?;
+                        let new_name = self.expect_ident()?;
+                        return Ok(Stmt::AlterSchemaRename { name, new_name });
+                    }
+                    self.expect_keyword("owner")?;
+                    self.expect_keyword("to")?;
+                    let new_owner = self.expect_ident()?;
+                    Ok(Stmt::AlterSchemaOwner { name, new_owner })
+                }
+                Token::Ident(s) if s == "database" => {
+                    self.next(); // 'database'
+                    let name = self.expect_ident()?;
+                    self.expect_keyword("owner")?;
+                    self.expect_keyword("to")?;
+                    let new_owner = self.expect_ident()?;
+                    Ok(Stmt::AlterDatabaseOwner { name, new_owner })
+                }
                 Token::Ident(s) if s == "role" || s == "user" || s == "group" => {
                     self.parse_alter_role()
                 }
@@ -625,11 +664,68 @@ impl Parser {
                     self.pos = save;
                 }
                 let name = self.expect_ident()?;
+                // v1.95: RESET SESSION AUTHORIZATION (two-word name).
+                if name == "session"
+                    && matches!(self.peek(), Token::Ident(s) if s == "authorization")
+                {
+                    self.next();
+                    return Ok(Stmt::Reset {
+                        name: "session_authorization".to_string(),
+                    });
+                }
                 Ok(Stmt::Reset { name })
             }
             // --- v0.10: WITH [RECURSIVE] ... / COPY
             "with" => self.parse_with(),
             "copy" => self.parse_copy(),
+            // v1.96: DO [LANGUAGE x] 'plpgsql body' (either order).
+            "do" => {
+                if self.eat_keyword("language") {
+                    let _ = self.expect_ident()?;
+                }
+                let body = match self.next() {
+                    Token::Str(s) => s,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected string literal after DO, found {:?}",
+                            other
+                        )));
+                    }
+                };
+                if self.eat_keyword("language") {
+                    let _ = self.expect_ident()?;
+                }
+                Ok(Stmt::DoBlock { body })
+            }
+            // v1.96: CALL proc(args).
+            "call" => {
+                let name = self.expect_qualified_ident()?;
+                self.expect(Token::LParen, "'('")?;
+                let mut cargs = Vec::new();
+                if *self.peek() != Token::RParen {
+                    loop {
+                        cargs.push(self.parse_or()?);
+                        match self.next() {
+                            Token::Comma => continue,
+                            Token::RParen => break,
+                            other => {
+                                return Err(err(format!(
+                                    "syntax error: expected ',' or ')' in CALL, found {:?}",
+                                    other
+                                )));
+                            }
+                        }
+                    }
+                } else {
+                    self.next(); // ')'
+                }
+                Ok(Stmt::CallProc { name, args: cargs })
+            }
+            // --- v1.96: REINDEX / CLUSTER / REASSIGN OWNED / REFRESH
+            "reindex" => self.parse_reindex(),
+            "cluster" => self.parse_cluster(),
+            "reassign" => self.parse_reassign_owned(),
+            "refresh" => self.parse_refresh(),
             _ => Err(err(format!("syntax error at or near \"{}\"", kw))),
         }
     }
@@ -792,6 +888,10 @@ impl Parser {
             "jsonb" => Ok(ColType::Jsonb),
             // v1.85: PG's `jsonpath` type (pg_type.dat, oid 4072).
             "jsonpath" => Ok(ColType::Jsonpath),
+            // v1.94: PG's text-search types (pg_type.dat, oids
+            // 3614/3615).
+            "tsvector" => Ok(ColType::TsVector),
+            "tsquery" => Ok(ColType::TsQuery),
             // v1.88: PG's builtin range types (pg_type.dat).
             "int4range" => Ok(ColType::Range(crate::storage::RangeElem::Int4)),
             "int8range" => Ok(ColType::Range(crate::storage::RangeElem::Int8)),
@@ -1065,10 +1165,44 @@ impl Parser {
                 | "datemultirange"
                 | "tsmultirange"
                 | "tstzmultirange"
+                | "tsvector" // v1.94
+                | "tsquery" // v1.94
         )
     }
 
     pub(crate) fn parse_create(&mut self) -> Result<Stmt, SqlError> {
+        // v1.96: CREATE SCHEMA [IF NOT EXISTS] name [AUTHORIZATION r]
+        // (also CREATE SCHEMA AUTHORIZATION r).
+        if matches!(self.peek(), Token::Ident(s) if s == "schema") {
+            self.next();
+            let if_not_exists = if self.eat_keyword("if") {
+                self.expect_keyword("not")?;
+                self.expect_keyword("exists")?;
+                true
+            } else {
+                false
+            };
+            let mut authorization = None;
+            let name = if self.eat_keyword("authorization") {
+                let r = self.expect_ident()?;
+                authorization = Some(r.clone());
+                r
+            } else {
+                self.expect_ident()?
+            };
+            if self.eat_keyword("authorization") {
+                authorization = Some(self.expect_ident()?);
+            }
+            return Ok(Stmt::CreateSchema {
+                name,
+                if_not_exists,
+                authorization,
+            });
+        }
+        // v1.96: CREATE AGGREGATE name (args) (sfunc = f, stype = t [, ...]).
+        if matches!(self.peek(), Token::Ident(s) if s == "aggregate") {
+            return self.parse_create_aggregate();
+        }
         // v0.11: CREATE ROLE / USER / GROUP
         if matches!(self.peek(), Token::Ident(s) if s == "role" || s == "user" || s == "group") {
             return self.parse_create_role();
@@ -1093,12 +1227,19 @@ impl Parser {
         if matches!(self.peek(), Token::Ident(s) if s == "function") {
             return self.parse_create_function(false);
         }
+        if matches!(self.peek(), Token::Ident(s) if s == "procedure") {
+            return self.parse_create_procedure();
+        }
         if matches!(self.peek(), Token::Ident(s) if s == "operator") {
             return self.parse_create_operator();
         }
         // v1.00: CREATE [CONSTRAINT] TRIGGER (bounded).
         if matches!(self.peek(), Token::Ident(s) if s == "trigger") {
             return self.parse_create_trigger();
+        }
+        // v1.95: CREATE POLICY name ON table ... (PG19).
+        if matches!(self.peek(), Token::Ident(s) if s == "policy") {
+            return self.parse_create_policy();
         }
         // CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (col [, ...])
         let unique = self.eat_keyword("unique");
@@ -1330,7 +1471,7 @@ impl Parser {
         } else {
             false
         };
-        let name = self.expect_ident()?;
+        let name = self.parse_table_name()?;
         // v0.69: `CREATE TABLE name PARTITION OF parent ...` (no column list).
         if matches!(self.peek(), Token::Ident(s) if s == "partition") {
             // Distinguish `PARTITION OF` from `PARTITION BY`: only OF
@@ -1342,6 +1483,15 @@ impl Parser {
             if is_of {
                 return self.parse_create_partition_of(name, temp);
             }
+        }
+        // v1.96: `CREATE TABLE name OF type_name` (typed table; the
+        // columns come from the composite type, expanded at exec).
+        if self.eat_keyword("of") {
+            let tname = self.parse_table_name()?;
+            let base = tname.rsplit('.').next().unwrap_or(&tname).to_string();
+            let mut def = TableDef::empty();
+            def.of_type = Some(base);
+            return Ok(Stmt::CreateTable { name, def, temp });
         }
         // v0.48: `CREATE TABLE name AS <query>` (CTAS) versus the
         // column-definition list. A parenthesized group after the name
@@ -1468,6 +1618,7 @@ impl Parser {
             reloptions: Vec::new(),
             inherits: Vec::new(),
             deferred_not_null: Vec::new(),
+            of_type: None,
         };
         Ok(Stmt::CreateTable { name, def, temp })
     }
@@ -1869,7 +2020,7 @@ impl Parser {
     /// lists are unaffected).
     pub(crate) fn parse_alter(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("table")?;
-        let name = self.expect_ident()?;
+        let name = self.parse_table_name()?;
         let mut actions = Vec::new();
         loop {
             actions.push(self.parse_alter_action()?);
@@ -2067,6 +2218,33 @@ impl Parser {
     }
 
     pub(crate) fn parse_alter_action(&mut self) -> Result<AlterAction, SqlError> {
+        // v1.96: ALTER TABLE t OF TYPE type_name (the suite's PG19
+        // spelling omits TYPE: `OF priv_testtype1`).
+        if self.eat_keyword("of") {
+            let _ = self.eat_keyword("type");
+            let tname = self.parse_table_name()?;
+            let base = tname.rsplit('.').next().unwrap_or(&tname).to_string();
+            return Ok(AlterAction::OfType { type_name: base });
+        }
+        // v1.95: ALTER TABLE t {ENABLE|DISABLE|FORCE} ROW LEVEL SECURITY.
+        if self.eat_keyword("enable") {
+            self.expect_keyword("row")?;
+            self.expect_keyword("level")?;
+            self.expect_keyword("security")?;
+            return Ok(AlterAction::EnableRowSecurity);
+        }
+        if self.eat_keyword("disable") {
+            self.expect_keyword("row")?;
+            self.expect_keyword("level")?;
+            self.expect_keyword("security")?;
+            return Ok(AlterAction::DisableRowSecurity);
+        }
+        if self.eat_keyword("force") {
+            self.expect_keyword("row")?;
+            self.expect_keyword("level")?;
+            self.expect_keyword("security")?;
+            return Ok(AlterAction::ForceRowSecurity);
+        }
         // v0.69: ALTER TABLE parent ATTACH PARTITION child FOR VALUES ...
         if self.eat_keyword("attach") {
             self.expect_keyword("partition")?;
@@ -2147,6 +2325,7 @@ impl Parser {
             return Ok(AlterAction::AddColumn {
                 name: col.name,
                 col_type: col.col_type,
+                named_type: col.composite_name,
                 bit_typmod: col.bit_typmod,
                 not_null,
                 default,
@@ -2178,6 +2357,21 @@ impl Parser {
         if self.eat_keyword("alter") {
             self.eat_keyword("column");
             let cname = self.expect_ident()?;
+            // v1.96: ALTER COLUMN c TYPE t [USING expr].
+            if self.eat_keyword("type") {
+                let (col_type, named_type) = self.parse_col_type()?;
+                let using_expr = if self.eat_keyword("using") {
+                    Some(self.parse_or()?)
+                } else {
+                    None
+                };
+                return Ok(AlterAction::AlterColumnType {
+                    name: cname,
+                    col_type,
+                    named_type,
+                    using_expr,
+                });
+            }
             if self.eat_keyword("set") {
                 // v0.37: ALTER COLUMN c SET STORAGE mode
                 if self.eat_keyword("storage") {
@@ -2230,6 +2424,13 @@ impl Parser {
             return Ok(AlterAction::Inherit { parent });
         }
         if self.eat_keyword("no") {
+            // v1.95: NO FORCE ROW LEVEL SECURITY.
+            if self.eat_keyword("force") {
+                self.expect_keyword("row")?;
+                self.expect_keyword("level")?;
+                self.expect_keyword("security")?;
+                return Ok(AlterAction::NoForceRowSecurity);
+            }
             self.expect_keyword("inherit")?;
             let parent = self.expect_ident()?;
             return Ok(AlterAction::NoInherit { parent });
@@ -2343,7 +2544,7 @@ impl Parser {
     ///   (input/output functions, etc.) are accepted and ignored.
     pub(crate) fn parse_create_type(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("type")?;
-        let name = self.expect_ident()?;
+        let name = self.parse_table_name()?;
         // v0.81: `CREATE TYPE name AS (field type, ...)` — PG19 named
         // composite type. The fields are parsed like table columns
         // (type names may themselves be composites).
@@ -2598,7 +2799,9 @@ impl Parser {
     /// once at execution time.
     pub(crate) fn parse_create_function(&mut self, or_replace: bool) -> Result<Stmt, SqlError> {
         self.expect_keyword("function")?;
-        let name = self.expect_ident()?;
+        // v1.96: schema-qualified names keep their qualifier (the
+        // engine stores the dotted name; single-namespace catalog).
+        let name = self.expect_qualified_ident()?;
         self.expect(Token::LParen, "'('")?;
         let mut args = Vec::new();
         if *self.peek() != Token::RParen {
@@ -2625,7 +2828,18 @@ impl Parser {
         let mut body: Option<String> = None;
         let mut volatility = FuncVolatility::Volatile;
         let mut strict = false;
+        let mut security_definer = false;
         loop {
+            // v1.96: SECURITY DEFINER | SECURITY INVOKER.
+            if self.eat_keyword("security") {
+                if self.eat_keyword("definer") {
+                    security_definer = true;
+                } else {
+                    self.expect_keyword("invoker")?;
+                    security_definer = false;
+                }
+                continue;
+            }
             if self.eat_keyword("language") {
                 // v1.32: PG19 parses any language name (gram.y
                 // CreateFunctionStmt); unknown languages fail at CREATE
@@ -2673,6 +2887,72 @@ impl Parser {
                             other
                         )));
                     }
+                }
+            } else if self.eat_keyword("set") {
+                // v1.96: `SET var = value` / `SET var TO value` /
+                // `RESET var` as a function option (PG19
+                // functionSetArg). Parsed and discarded — per-function
+                // GUC defaults are not modeled.
+                // PG19 guc.c: GUC_NO_RESET parameters (seed,
+                // transaction_deferrable, transaction_isolation,
+                // transaction_read_only) cannot be SET in a function
+                // at all (GUC_ACTION_SAVE) — 0A000.
+                let var = self.expect_ident()?;
+                let mut dotted = false;
+                if *self.peek() == Token::Dot {
+                    dotted = true;
+                    self.next();
+                    let _ = self.expect_ident()?;
+                }
+                if !dotted {
+                    let lv = var.to_ascii_lowercase();
+                    if matches!(
+                        lv.as_str(),
+                        "seed"
+                            | "transaction_deferrable"
+                            | "transaction_isolation"
+                            | "transaction_read_only"
+                    ) {
+                        return Err(SqlError {
+                            message: format!(
+                                "parameter \"{}\" cannot be set locally in functions",
+                                lv
+                            ),
+                            code: "0A000",
+                        });
+                    }
+                }
+                if *self.peek() == Token::Eq {
+                    self.next();
+                } else {
+                    let _ = self.eat_keyword("to");
+                }
+                match self.next() {
+                    Token::Str(_) | Token::Number(_) | Token::Ident(_) | Token::QIdent(_) => {}
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected value in function SET clause, found {:?}",
+                            other
+                        )));
+                    }
+                }
+            } else if self.eat_keyword("reset") {
+                // v1.96: PG19 guc.c — GUC_NO_RESET parameters cannot
+                // be reset anywhere (RESET in a function option list
+                // hits the same guard as RESET proper): 0A000.
+                let var = self.expect_ident()?;
+                let lv = var.to_ascii_lowercase();
+                if matches!(
+                    lv.as_str(),
+                    "seed"
+                        | "transaction_deferrable"
+                        | "transaction_isolation"
+                        | "transaction_read_only"
+                ) {
+                    return Err(SqlError {
+                        message: format!("parameter \"{}\" cannot be reset", lv),
+                        code: "0A000",
+                    });
                 }
             } else if self.eat_keyword("as") {
                 match self.next() {
@@ -2723,6 +3003,80 @@ impl Parser {
             or_replace,
             volatility,
             strict,
+            security_definer,
+            procedure: false,
+        })
+    }
+
+    /// v1.96: `CREATE PROCEDURE name ([argname] type [, ...])
+    /// [LANGUAGE lang] [AS 'body'] ...` — a function with no return
+    /// value (PG19 CreateProcedureStmt shares CreateFunctionStmt).
+    pub(crate) fn parse_create_procedure(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("procedure")?;
+        let name = self.expect_qualified_ident()?;
+        self.expect(Token::LParen, "'('")?;
+        let mut args = Vec::new();
+        if *self.peek() != Token::RParen {
+            loop {
+                args.push(self.parse_func_arg()?);
+                match self.next() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')', found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+        } else {
+            self.next(); // ')'
+        }
+        let mut lang_name: Option<String> = None;
+        let mut body: Option<String> = None;
+        let mut security_definer = false;
+        loop {
+            if self.eat_keyword("language") {
+                lang_name = Some(self.expect_ident()?);
+            } else if self.eat_keyword("security") {
+                if self.eat_keyword("definer") {
+                    security_definer = true;
+                } else {
+                    self.expect_keyword("invoker")?;
+                }
+            } else if self.eat_keyword("as") {
+                match self.next() {
+                    Token::Str(s) => {
+                        if body.is_none() {
+                            body = Some(s);
+                        }
+                    }
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected procedure body string, found {:?}",
+                            other
+                        )));
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        let lang_name = lang_name.unwrap_or_else(|| "sql".to_string());
+        let body = body.ok_or_else(|| err("syntax error: expected AS 'body'".to_string()))?;
+        Ok(Stmt::CreateFunction {
+            name,
+            args,
+            ret_type: "void".to_string(),
+            returns_set: false,
+            lang_name,
+            body,
+            or_replace: false,
+            volatility: FuncVolatility::Volatile,
+            strict: false,
+            security_definer,
+            procedure: true,
         })
     }
 
@@ -2735,24 +3089,36 @@ impl Parser {
         let w1 = self.expect_ident()?;
         let bare_type = matches!(self.peek(), Token::Comma | Token::RParen)
             || (w1 == "double" && matches!(self.peek(), Token::Ident(s) if s == "precision"));
-        if bare_type {
+        let mut arg = if bare_type {
             let type_name = if w1 == "double" {
                 self.next(); // 'precision'
                 "double precision".to_string()
             } else {
                 w1
             };
-            Ok(FuncArg {
+            FuncArg {
                 name: None,
                 type_name,
-            })
+                default: None,
+            }
         } else {
             let type_name = self.parse_func_type_name()?;
-            Ok(FuncArg {
+            FuncArg {
                 name: Some(w1),
                 type_name,
-            })
+                default: None,
+            }
+        };
+        // v1.96: arg DEFAULT expr / `= expr` — parsed and carried so
+        // CREATE FUNCTION can run the type-USAGE walk over its casts
+        // (defaults are not evaluated by this engine's call path).
+        if self.eat_keyword("default") || matches!(self.peek(), Token::Eq) {
+            if matches!(self.peek(), Token::Eq) {
+                self.next();
+            }
+            arg.default = Some(self.parse_or()?);
         }
+        Ok(arg)
     }
 
     /// v0.86: a type name as written for function signatures: an
@@ -2775,33 +3141,48 @@ impl Parser {
     /// v0.86: `DROP FUNCTION [IF EXISTS] name ([type [, ...]])`.
     /// Argument names are accepted and ignored (PG allows them).
     pub(crate) fn parse_drop_function(&mut self) -> Result<Stmt, SqlError> {
-        self.expect_keyword("function")?;
+        // v1.96: DROP FUNCTION and DROP PROCEDURE share the grammar.
+        // v1.96 finishing pass: DROP ROUTINE too, and the argument
+        // list is optional (PG19 DropFunctionStmt: the parens may be
+        // omitted, in which case the name must be unambiguous).
+        let (procedure, any_kind) = if self.eat_keyword("procedure") {
+            (true, false)
+        } else if self.eat_keyword("routine") {
+            (false, true)
+        } else {
+            self.expect_keyword("function")?;
+            (false, false)
+        };
         let if_exists = if self.eat_keyword("if") {
             self.expect_keyword("exists")?;
             true
         } else {
             false
         };
-        let name = self.expect_ident()?;
-        self.expect(Token::LParen, "'('")?;
+        let name = self.expect_qualified_ident()?;
         let mut arg_types = Vec::new();
-        if *self.peek() != Token::RParen {
-            loop {
-                let arg = self.parse_func_arg()?;
-                arg_types.push(arg.type_name);
-                match self.next() {
-                    Token::Comma => continue,
-                    Token::RParen => break,
-                    other => {
-                        return Err(err(format!(
-                            "syntax error: expected ',' or ')', found {:?}",
-                            other
-                        )));
+        let mut args_omitted = true;
+        if *self.peek() == Token::LParen {
+            args_omitted = false;
+            self.next();
+            if *self.peek() != Token::RParen {
+                loop {
+                    let arg = self.parse_func_arg()?;
+                    arg_types.push(arg.type_name);
+                    match self.next() {
+                        Token::Comma => continue,
+                        Token::RParen => break,
+                        other => {
+                            return Err(err(format!(
+                                "syntax error: expected ',' or ')', found {:?}",
+                                other
+                            )));
+                        }
                     }
                 }
+            } else {
+                self.next(); // ')'
             }
-        } else {
-            self.next(); // ')'
         }
         // v0.87: optional CASCADE / RESTRICT (PG19; RESTRICT default).
         let cascade = if self.eat_keyword("cascade") {
@@ -2815,6 +3196,9 @@ impl Parser {
             arg_types,
             if_exists,
             cascade,
+            procedure,
+            args_omitted,
+            any_kind,
         })
     }
 
@@ -2871,6 +3255,23 @@ impl Parser {
         }
         self.expect_keyword("on")?;
         let table = self.expect_ident()?;
+        // v1.96: constraint-trigger deferrable options
+        // `[NOT] DEFERRABLE` / `INITIALLY DEFERRED|IMMEDIATE`
+        // (parsed; deferral itself is not enforced, like WHEN).
+        loop {
+            if self.eat_keyword("not") {
+                self.expect_keyword("deferrable")?;
+            } else if self.eat_keyword("deferrable") {
+            } else if self.eat_keyword("initially") {
+                if !(self.eat_keyword("deferred") || self.eat_keyword("immediate")) {
+                    return Err(err(
+                        "syntax error: expected DEFERRED or IMMEDIATE".to_string()
+                    ));
+                }
+            } else {
+                break;
+            }
+        }
         // Optional WHEN clause (parsed; not evaluated in v1.00).
         let when = if self.eat_keyword("when") {
             self.expect(Token::LParen, "'('")?;
@@ -2946,6 +3347,186 @@ impl Parser {
             false
         };
         Ok(Stmt::DropTrigger {
+            name,
+            table,
+            if_exists,
+            cascade,
+        })
+    }
+
+    /// v1.95: `( <expr> )` for policy USING / WITH CHECK clauses.
+    /// Returns the AST plus the expr's source SQL (rendered back from
+    /// the consumed tokens): policy exprs are persisted via the SQL
+    /// text because the s-expr codec cannot represent subqueries.
+    pub(crate) fn parse_paren_policy_expr(&mut self) -> Result<(Expr, String), SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let start = self.pos;
+        let e = self.parse_or()?;
+        let sql = self.tokens[start..self.pos]
+            .iter()
+            .map(token_sql)
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.expect(Token::RParen, "')'")?;
+        Ok((e, sql))
+    }
+
+    /// v1.95: policy TO list: `role [, ...]` or PUBLIC. Empty = PUBLIC.
+    pub(crate) fn parse_policy_roles(&mut self) -> Result<Vec<String>, SqlError> {
+        let mut roles = Vec::new();
+        loop {
+            if self.eat_keyword("public") {
+                // PUBLIC is recorded as the empty list (PG19 ACL_ID_PUBLIC).
+                roles.clear();
+            } else {
+                roles.push(self.expect_ident()?);
+            }
+            if !matches!(self.peek(), Token::Comma) {
+                break;
+            }
+            self.next();
+        }
+        Ok(roles)
+    }
+
+    /// v1.95: `CREATE POLICY name ON table [AS PERMISSIVE|RESTRICTIVE]
+    /// [FOR ALL|SELECT|INSERT|UPDATE|DELETE] [TO roles] [USING (e)]
+    /// [WITH CHECK (e)]` (PG19 gram.y CreatePolicyStmt).
+    pub(crate) fn parse_create_policy(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("policy")?;
+        let name = self.expect_ident()?;
+        self.expect_keyword("on")?;
+        let table = self.expect_ident()?;
+        let mut permissive = true;
+        let mut cmd = PolicyCmd::All;
+        let mut roles: Vec<String> = Vec::new();
+        let mut using_expr: Option<Expr> = None;
+        let mut check_expr: Option<Expr> = None;
+        let mut using_sql: Option<String> = None;
+        let mut check_sql: Option<String> = None;
+        loop {
+            if self.eat_keyword("as") {
+                if self.eat_keyword("permissive") {
+                    permissive = true;
+                } else if self.eat_keyword("restrictive") {
+                    permissive = false;
+                } else {
+                    return Err(err(
+                        "syntax error: expected PERMISSIVE or RESTRICTIVE".to_string()
+                    ));
+                }
+            } else if self.eat_keyword("for") {
+                let c = self.expect_ident()?;
+                cmd = PolicyCmd::from_name(&c).ok_or_else(|| {
+                    err(format!(
+                        "syntax error: expected ALL, SELECT, INSERT, UPDATE or DELETE, found \"{}\"",
+                        c
+                    ))
+                })?;
+            } else if self.eat_keyword("to") {
+                roles = self.parse_policy_roles()?;
+            } else if self.eat_keyword("using") {
+                let (e, s) = self.parse_paren_policy_expr()?;
+                using_expr = Some(e);
+                using_sql = Some(s);
+            } else if self.eat_keyword("with") {
+                self.expect_keyword("check")?;
+                let (e, s) = self.parse_paren_policy_expr()?;
+                check_expr = Some(e);
+                check_sql = Some(s);
+            } else {
+                break;
+            }
+        }
+        Ok(Stmt::CreatePolicy {
+            name,
+            table,
+            permissive,
+            cmd,
+            roles,
+            using_expr,
+            check_expr,
+            using_sql,
+            check_sql,
+        })
+    }
+
+    /// v1.95: `ALTER POLICY name ON table [RENAME TO n] [TO roles]
+    /// [USING (e)] [WITH CHECK (e)]` (PG19 AlterPolicyStmt).
+    pub(crate) fn parse_alter_policy(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("policy")?;
+        let name = self.expect_ident()?;
+        self.expect_keyword("on")?;
+        let table = self.expect_ident()?;
+        if self.eat_keyword("rename") {
+            self.expect_keyword("to")?;
+            let new_name = self.expect_ident()?;
+            return Ok(Stmt::AlterPolicy {
+                name,
+                table,
+                rename_to: Some(new_name),
+                roles: None,
+                using_expr: None,
+                check_expr: None,
+                using_sql: None,
+                check_sql: None,
+                has_using: false,
+                has_check: false,
+            });
+        }
+        let mut roles: Option<Vec<String>> = None;
+        let mut using_expr: Option<Expr> = None;
+        let mut check_expr: Option<Expr> = None;
+        let mut using_sql: Option<String> = None;
+        let mut check_sql: Option<String> = None;
+        let mut has_using = false;
+        let mut has_check = false;
+        loop {
+            if self.eat_keyword("to") {
+                roles = Some(self.parse_policy_roles()?);
+            } else if self.eat_keyword("using") {
+                let (e, s) = self.parse_paren_policy_expr()?;
+                using_expr = Some(e);
+                using_sql = Some(s);
+                has_using = true;
+            } else if self.eat_keyword("with") {
+                self.expect_keyword("check")?;
+                let (e, s) = self.parse_paren_policy_expr()?;
+                check_expr = Some(e);
+                check_sql = Some(s);
+                has_check = true;
+            } else {
+                break;
+            }
+        }
+        Ok(Stmt::AlterPolicy {
+            name,
+            table,
+            rename_to: None,
+            roles,
+            using_expr,
+            check_expr,
+            using_sql,
+            check_sql,
+            has_using,
+            has_check,
+        })
+    }
+
+    /// v1.95: `DROP POLICY [IF EXISTS] name ON table [CASCADE|RESTRICT]`.
+    pub(crate) fn parse_drop_policy(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("policy")?;
+        let if_exists = if self.eat_keyword("if") {
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.expect_ident()?;
+        self.expect_keyword("on")?;
+        let table = self.expect_ident()?;
+        let cascade = self.parse_cascade_opt()?;
+        Ok(Stmt::DropPolicy {
             name,
             table,
             if_exists,
@@ -3032,10 +3613,11 @@ impl Parser {
                 }
             }
         }
-        // `RAISE NOTICE|EXCEPTION '<format>' [, <expr> ...]`.
+        // `RAISE NOTICE|EXCEPTION|WARNING '<format>' [, <expr> ...]`.
         if matches!(self.peek(), Token::Ident(s) if s == "raise") {
             self.next();
             let level = match self.next() {
+                Token::Ident(s) if s == "warning" => RaiseLevel::Warning,
                 Token::Ident(s) if s == "notice" => RaiseLevel::Notice,
                 Token::Ident(s) if s == "exception" => RaiseLevel::Exception,
                 other => {
@@ -3067,6 +3649,12 @@ impl Parser {
                 format,
                 args,
             });
+        }
+        // v1.96: `PERFORM <expr>`.
+        if matches!(self.peek(), Token::Ident(s) if s == "perform") {
+            self.next();
+            let expr = self.parse_or()?;
+            return Ok(TriggerBodyStmt::Perform(expr));
         }
         Err(err(format!(
             "syntax error in trigger body: unexpected {:?}",
@@ -3133,6 +3721,25 @@ impl Parser {
     pub(crate) fn parse_operator_name(&mut self) -> Result<String, SqlError> {
         match self.next() {
             Token::Eq => Ok("=".to_string()),
+            // v1.96: symbolic operator tokens beyond Op (e.g. `!!`).
+            Token::BangBang => Ok("!!".to_string()),
+            // v1.96: multi-char operators from paired tokens.
+            Token::Shr => {
+                if matches!(self.peek(), Token::Gt) {
+                    self.next();
+                    Ok(">>>".to_string())
+                } else {
+                    Ok(">>".to_string())
+                }
+            }
+            Token::Shl => {
+                if matches!(self.peek(), Token::Lt) {
+                    self.next();
+                    Ok("<<<".to_string())
+                } else {
+                    Ok("<<".to_string())
+                }
+            }
             Token::Op(s) => Ok(s),
             other => Err(err(format!(
                 "syntax error: expected operator name, found {:?}",
@@ -3146,6 +3753,95 @@ impl Parser {
     /// [, HASHES] [, MERGES])` — PG19 DefineOpStmt, bounded: the name
     /// is `=` or a `?`-led operator; only PROCEDURE/LEFTARG/RIGHTARG
     /// affect execution (IN-subquery equality), the rest are stored.
+    /// v1.96: CREATE AGGREGATE name ( [argmode] [argname] argtype [, ...] )
+    /// ( sfunc = fn, stype = type [, finalfunc = fn] [, initcond = lit] ... )
+    pub(crate) fn parse_create_aggregate(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("aggregate")?;
+        let name = self.parse_table_name()?;
+        self.expect(Token::LParen, "'('")?;
+        let mut arg_types = Vec::new();
+        if *self.peek() != Token::RParen {
+            loop {
+                if matches!(self.peek(), Token::Star) {
+                    self.next();
+                    arg_types.push("*".to_string());
+                } else {
+                    let arg = self.parse_func_arg()?;
+                    arg_types.push(arg.type_name);
+                }
+                match self.next() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')' in aggregate arguments, found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+        } else {
+            self.next();
+        }
+        self.expect(Token::LParen, "'('")?;
+        let mut sfunc = None;
+        let mut stype = None;
+        let mut finalfunc = None;
+        let mut initcond = None;
+        let mut msfunc = None;
+        let mut minvfunc = None;
+        let mut mstype = None;
+        let mut parallel = None;
+        loop {
+            let key = self.expect_ident()?;
+            self.expect(Token::Eq, "'='")?;
+            let val = match self.next() {
+                Token::Ident(s) => s,
+                Token::Str(s) => s.to_string(),
+                Token::Number(s) => s.to_string(),
+                other => {
+                    return Err(err(format!(
+                        "syntax error: bad aggregate option value {:?}",
+                        other
+                    )));
+                }
+            };
+            match key.as_str() {
+                "sfunc" => sfunc = Some(val),
+                "stype" => stype = Some(val),
+                "finalfunc" => finalfunc = Some(val),
+                "initcond" => initcond = Some(val),
+                "msfunc" => msfunc = Some(val),
+                "minvfunc" => minvfunc = Some(val),
+                "mstype" => mstype = Some(val),
+                "parallel" => parallel = Some(val),
+                _ => {}
+            }
+            match self.next() {
+                Token::Comma => continue,
+                Token::RParen => break,
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected ',' or ')' in aggregate definition, found {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+        Ok(Stmt::CreateAggregate {
+            name,
+            arg_types,
+            sfunc: sfunc.ok_or_else(|| err("CREATE AGGREGATE requires SFUNC".to_string()))?,
+            stype: stype.ok_or_else(|| err("CREATE AGGREGATE requires STYPE".to_string()))?,
+            finalfunc,
+            initcond,
+            msfunc,
+            minvfunc,
+            mstype,
+            parallel,
+        })
+    }
+
     pub(crate) fn parse_create_operator(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("operator")?;
         let name = self.parse_operator_name()?;
@@ -3214,6 +3910,23 @@ impl Parser {
     pub(crate) fn parse_oper_name(&mut self) -> Result<String, SqlError> {
         match self.next() {
             Token::Eq => Ok("=".to_string()),
+            Token::BangBang => Ok("!!".to_string()),
+            Token::Shr => {
+                if matches!(self.peek(), Token::Gt) {
+                    self.next();
+                    Ok(">>>".to_string())
+                } else {
+                    Ok(">>".to_string())
+                }
+            }
+            Token::Shl => {
+                if matches!(self.peek(), Token::Lt) {
+                    self.next();
+                    Ok("<<<".to_string())
+                } else {
+                    Ok("<<".to_string())
+                }
+            }
             Token::Op(s) => Ok(s),
             other => Err(err(format!(
                 "syntax error: expected operator name, found {:?}",
@@ -3228,7 +3941,7 @@ impl Parser {
     /// (CHECK / NOT NULL / DEFAULT; no UNIQUE/PKEY/FK on domains).
     pub(crate) fn parse_create_domain(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("domain")?;
-        let name = self.expect_ident()?;
+        let name = self.parse_table_name()?;
         self.expect_keyword("as")?;
         let (base, base_named) = self.parse_type_name()?;
         // v1.92: capture a bit base's typmod before anything else
@@ -3337,6 +4050,41 @@ impl Parser {
     /// `DROP NOT NULL`, `SET DEFAULT expr`, `DROP DEFAULT`.
     /// OWNER TO / RENAME / SET SCHEMA / VALIDATE CONSTRAINT are not
     /// supported (honest 0A000 via the fallthrough).
+    /// v1.96: ALTER TYPE name ADD ATTRIBUTE a type |
+    /// ALTER TYPE name ALTER ATTRIBUTE a TYPE type [CASCADE|RESTRICT].
+    pub(crate) fn parse_alter_type(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("type")?;
+        let tname = self.parse_table_name()?;
+        let name = tname.rsplit('.').next().unwrap_or(&tname).to_string();
+        if self.eat_keyword("add") {
+            self.expect_keyword("attribute")?;
+            let attr = self.expect_ident()?;
+            let (col_type, named_type) = self.parse_col_type()?;
+            return Ok(Stmt::AlterTypeAddAttribute {
+                name,
+                attr,
+                col_type,
+                named_type,
+            });
+        }
+        if self.eat_keyword("alter") {
+            self.expect_keyword("attribute")?;
+            let attr = self.expect_ident()?;
+            self.expect_keyword("type")?;
+            let (col_type, named_type) = self.parse_col_type()?;
+            let _ = self.eat_keyword("cascade") || self.eat_keyword("restrict");
+            return Ok(Stmt::AlterTypeAlterAttribute {
+                name,
+                attr,
+                col_type,
+                named_type,
+            });
+        }
+        Err(err(
+            "syntax error: expected ADD ATTRIBUTE or ALTER ATTRIBUTE in ALTER TYPE".to_string(),
+        ))
+    }
+
     pub(crate) fn parse_alter_domain(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("domain")?;
         let name = self.expect_ident()?;
@@ -3407,9 +4155,27 @@ impl Parser {
     /// RENAME) are an honest 0A000.
     pub(crate) fn parse_alter_function(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("function")?;
-        let name = self.expect_ident()?;
-        self.expect(Token::LParen, "'('")?;
+        let name = self.parse_table_name()?;
+        // v1.96: the argument list is optional when the action does
+        // not need it (PG19: ALTER FUNCTION name OWNER TO ... with
+        // no parens resolves the unique overload).
         let mut arg_types = Vec::new();
+        if !matches!(self.peek(), Token::LParen) {
+            if self.eat_keyword("owner") {
+                self.expect_keyword("to")?;
+                let new_owner = self.expect_ident()?;
+                return Ok(Stmt::AlterFunction {
+                    name,
+                    arg_types,
+                    volatility: FuncVolatility::Volatile,
+                    owner: Some(new_owner),
+                });
+            }
+            return Err(err(
+                "syntax error: expected '(' or OWNER in ALTER FUNCTION".to_string()
+            ));
+        }
+        self.expect(Token::LParen, "'('")?;
         if *self.peek() != Token::RParen {
             loop {
                 // Argument can be `[name] type`; we only need the type
@@ -3444,6 +4210,17 @@ impl Parser {
         } else {
             self.next(); // ')'
         }
+        // v1.96: ALTER FUNCTION name(args) OWNER TO new_owner.
+        if self.eat_keyword("owner") {
+            self.expect_keyword("to")?;
+            let new_owner = self.expect_ident()?;
+            return Ok(Stmt::AlterFunction {
+                name,
+                arg_types,
+                volatility: FuncVolatility::Volatile,
+                owner: Some(new_owner),
+            });
+        }
         let volatility = if self.eat_keyword("immutable") {
             FuncVolatility::Immutable
         } else if self.eat_keyword("stable") {
@@ -3462,6 +4239,7 @@ impl Parser {
             name,
             arg_types,
             volatility,
+            owner: None,
         })
     }
 
@@ -3636,7 +4414,7 @@ impl Parser {
 
     pub(crate) fn parse_insert(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("into")?;
-        let table = self.expect_ident()?;
+        let table = self.parse_table_name()?;
         // v0.72: `INSERT INTO t (SELECT ...)` — a parenthesized query
         // is a row source, not a column list (PG19). Peek past the
         // paren: a query starter means "no column list".
@@ -3864,6 +4642,25 @@ impl Parser {
         let action = if self.eat_keyword("do") {
             if self.eat_keyword("nothing") {
                 ConflictAction::DoNothing
+            } else if self.eat_keyword("select") {
+                // v1.96: PG19 ON CONFLICT DO SELECT [FOR strength]
+                // [WHERE ...] — no update; the conflicting row is
+                // locked (strength ignored) and filtered by WHERE.
+                let mut for_update = false;
+                if self.eat_keyword("for") {
+                    let _ = self.eat_keyword("no") || self.eat_keyword("key");
+                    if self.eat_keyword("update") {
+                        for_update = true;
+                    } else {
+                        let _ = self.eat_keyword("share");
+                    }
+                }
+                let where_ = if self.eat_keyword("where") {
+                    Some(self.parse_or()?)
+                } else {
+                    None
+                };
+                ConflictAction::DoSelect { where_, for_update }
             } else if self.eat_keyword("update") {
                 self.expect_keyword("set")?;
                 let mut sets = Vec::new();
@@ -4652,6 +5449,28 @@ impl Parser {
             }
             return Ok(expr);
         }
+        // v1.96: multi-token user operators `<<<` / `>>>` (PG19 Op
+        // precedence): the tokenizer emits Shl+Lt / Shr+Gt pairs.
+        if *self.peek() == Token::Shl && matches!(self.peek2(), Token::Lt) {
+            self.next();
+            self.next();
+            let right = self.parse_bitor()?;
+            return Ok(Expr::UserOp {
+                op: "<<<".to_string(),
+                left: Box::new(left),
+                right: Box::new(right),
+            });
+        }
+        if *self.peek() == Token::Shr && matches!(self.peek2(), Token::Gt) {
+            self.next();
+            self.next();
+            let right = self.parse_bitor()?;
+            return Ok(Expr::UserOp {
+                op: ">>>".to_string(),
+                left: Box::new(left),
+                right: Box::new(right),
+            });
+        }
         let op: Option<QuantOp> = match self.peek() {
             Token::Eq => Some(QuantOp::Cmp(CmpOp::Eq)),
             Token::Neq => Some(QuantOp::Cmp(CmpOp::Ne)),
@@ -5007,8 +5826,20 @@ impl Parser {
         let mut left = self.parse_concat()?;
         loop {
             let op = match self.peek() {
-                Token::Shl => ArithOp::Shl,
-                Token::Shr => ArithOp::Shr,
+                Token::Shl => {
+                    // v1.96: `<<<` is a user operator, not a shift.
+                    if matches!(self.peek2(), Token::Lt) {
+                        break;
+                    }
+                    ArithOp::Shl
+                }
+                Token::Shr => {
+                    // v1.96: `>>>` is a user operator, not a shift.
+                    if matches!(self.peek2(), Token::Gt) {
+                        break;
+                    }
+                    ArithOp::Shr
+                }
                 _ => break,
             };
             self.next();
@@ -5051,6 +5882,40 @@ impl Parser {
                 _ => None,
             } {
                 self.next();
+                // v1.94: `@@ ANY|ALL|SOME (array)` — PG resolves the
+                // quantified form through the scalar @@ operator;
+                // desugar to the hidden __any_all_array builtin like
+                // quantified comparisons do.
+                if jop == JsonOp::PathMatch {
+                    let quant = match self.peek() {
+                        Token::Ident(s)
+                            if matches!(
+                                s.to_ascii_lowercase().as_str(),
+                                "any" | "all" | "some"
+                            ) && *self.peek2() == Token::LParen =>
+                        {
+                            Some(s.to_ascii_lowercase())
+                        }
+                        _ => None,
+                    };
+                    if let Some(quant) = quant {
+                        self.next(); // quantifier word
+                        self.next(); // '('
+                        let arr = self.parse_or()?;
+                        self.expect(Token::RParen, "')'")?;
+                        let quant_txt = if quant == "all" { "all" } else { "any" };
+                        left = Expr::Func {
+                            name: "__any_all_array".to_string(),
+                            args: vec![
+                                left,
+                                Expr::Literal(Literal::Text("@@".into())),
+                                Expr::Literal(Literal::Text(quant_txt.into())),
+                                arr,
+                            ],
+                        };
+                        continue;
+                    }
+                }
                 let right = self.parse_add()?;
                 left = Expr::JsonOp {
                     op: jop,
@@ -5063,6 +5928,22 @@ impl Parser {
                 self.next();
                 let right = self.parse_add()?;
                 left = Expr::Concat(Box::new(left), Box::new(right));
+                continue;
+            }
+            // v1.94: the tsquery phrase operator `<->` / `<N>` is a
+            // gram.y `Op` too; desugar to the `tsquery_phrase`
+            // function (PG exposes it as a real function, oid 3435).
+            if let Token::PhraseOp(dist) = *self.peek() {
+                self.next();
+                let right = self.parse_add()?;
+                let mut args = vec![left, right];
+                if dist != 1 {
+                    args.push(Expr::Literal(Literal::Int(dist)));
+                }
+                left = Expr::Func {
+                    name: "__tsquery_phrase".to_string(),
+                    args,
+                };
                 continue;
             }
             break;
@@ -5285,6 +6166,30 @@ impl Parser {
     /// desugar like Postgres' parser does: `~x` -> bitwise NOT,
     /// `@x` -> `abs(x)`, `|/x` -> `sqrt(x)`, `||/x` -> `cbrt(x)`.
     pub(crate) fn parse_unary(&mut self) -> Result<Expr, SqlError> {
+        // v1.94: PG19's tsquery NOT prefix operator is the glued
+        // `!!` token; desugar to the `tsquery_not` function over a
+        // unary operand (so `!!'x'::tsquery` is NOT('x'::tsquery)).
+        if *self.peek() == Token::BangBang {
+            self.next();
+            let inner = self.parse_cast()?;
+            return Ok(Expr::Func {
+                name: "__tsquery_not".to_string(),
+                args: vec![inner],
+            });
+        }
+        // v1.94: a lone `!` is an Op token in PG19 too, but no
+        // operator of that name exists — it parses, then fails
+        // resolution with 42883 "operator does not exist: ! <type>".
+        // Desugar to an internal call whose evaluation raises
+        // exactly that (see tsearch::try_eval_ts_func).
+        if *self.peek() == Token::Bang {
+            self.next();
+            let inner = self.parse_cast()?;
+            return Ok(Expr::Func {
+                name: "__prefix_bang".to_string(),
+                args: vec![inner],
+            });
+        }
         match self.peek() {
             Token::Minus => {
                 self.next();
@@ -5572,7 +6477,18 @@ impl Parser {
                     return self.parse_call(name);
                 }
                 // `current_date` / `current_timestamp` without parens.
-                if name == "current_date" || name == "current_timestamp" {
+                // v1.95: the SQL value functions for role context are
+                // likewise paren-less keywords (PG gram.y
+                // SQLValueFunction): current_user, current_role,
+                // session_user, current_catalog, and USER.
+                if name == "current_date"
+                    || name == "current_timestamp"
+                    || name == "current_user"
+                    || name == "current_role"
+                    || name == "session_user"
+                    || name == "current_catalog"
+                    || name == "user"
+                {
                     return Ok(Expr::Func {
                         name,
                         args: Vec::new(),
@@ -5588,6 +6504,12 @@ impl Parser {
                         return Ok(Expr::WholeRow { qual: name });
                     }
                     let col = self.expect_ident()?;
+                    // v1.96: schema-qualified function call
+                    // `schema.func(...)` (was misread as a column ref,
+                    // breaking e.g. PERFORM public.f()).
+                    if *self.peek() == Token::LParen {
+                        return self.parse_call(format!("{}.{}", name, col));
+                    }
                     return Ok(Expr::Column {
                         table: Some(name),
                         name: col,
@@ -5647,6 +6569,10 @@ impl Parser {
                         return Ok(Expr::WholeRow { qual: name });
                     }
                     let col = self.expect_ident()?;
+                    // v1.96: schema-qualified function call.
+                    if *self.peek() == Token::LParen {
+                        return self.parse_call(format!("{}.{}", name, col));
+                    }
                     return Ok(Expr::Column {
                         table: Some(name),
                         name: col,
@@ -7939,7 +8865,49 @@ impl Parser {
 
     /// v0.17: `SET TRANSACTION ...`, `SET SESSION CHARACTERISTICS ...`,
     /// or `SET name = value` / `SET name TO value`.
+    /// v1.95: the value part of SET [SESSION|LOCAL] SESSION
+    /// AUTHORIZATION: a role name (identifier or string literal),
+    /// DEFAULT, or NONE — the latter two reset to the authenticated
+    /// user (server-side).
+    fn parse_session_authorization(&mut self, local: bool) -> Result<Stmt, SqlError> {
+        let value = match self.next() {
+            Token::Str(s) => SetValue::Str(s),
+            Token::Ident(s) if s == "default" || s == "none" => SetValue::Default,
+            Token::Ident(s) => SetValue::Str(s.to_ascii_lowercase()),
+            other => {
+                return Err(err(format!(
+                    "syntax error: expected role name after SESSION AUTHORIZATION, found {:?}",
+                    other
+                )));
+            }
+        };
+        Ok(Stmt::Set {
+            name: "session_authorization".to_string(),
+            value,
+            local,
+        })
+    }
+
     pub(crate) fn parse_set(&mut self) -> Result<Stmt, SqlError> {
+        // v1.96: SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED |
+        // IMMEDIATE } — accepted no-op.
+        if self.eat_keyword("constraints") {
+            if self.eat_keyword("all") {
+                // done
+            } else {
+                loop {
+                    let _ = self.expect_ident()?;
+                    if !matches!(self.peek(), Token::Comma) {
+                        break;
+                    }
+                    self.next();
+                }
+            }
+            if !self.eat_keyword("deferred") {
+                self.expect_keyword("immediate")?;
+            }
+            return Ok(Stmt::SetConstraints);
+        }
         if self.eat_keyword("transaction") {
             // v1.07: SET TRANSACTION SNAPSHOT 'snapshot-id' (PG19 special
             // syntax, not combinable with other modes).
@@ -7970,6 +8938,29 @@ impl Parser {
             });
         }
         if self.eat_keyword("session") {
+            // v1.95: SET SESSION AUTHORIZATION {name | 'name' | DEFAULT
+            // | NONE} (PG19 gram.y set_rest SESSION_AUTHORIZATION).
+            if self.eat_keyword("authorization") {
+                return self.parse_session_authorization(false);
+            }
+            // v1.96: SET SESSION ROLE name | 'name' | NONE | DEFAULT.
+            if self.eat_keyword("role") {
+                let role_name = match self.next() {
+                    Token::Str(s) => s,
+                    Token::Ident(s) => s,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected role name after SET SESSION ROLE, found {:?}",
+                            other
+                        )));
+                    }
+                };
+                return Ok(Stmt::Set {
+                    name: "role".to_string(),
+                    value: SetValue::Str(role_name),
+                    local: false,
+                });
+            }
             // SET SESSION CHARACTERISTICS AS TRANSACTION mode [, ...]
             self.expect_keyword("characteristics")?;
             self.expect_keyword("as")?;
@@ -7990,6 +8981,15 @@ impl Parser {
         let local = self.eat_keyword("local");
         if !local {
             self.eat_keyword("session");
+        }
+        // v1.95: SET [LOCAL] SESSION AUTHORIZATION ... — the two-word
+        // variable name after the scope word.
+        if self.peek_ident() == Some("session")
+            && matches!(self.peek2(), Token::Ident(s) if s == "authorization")
+        {
+            self.next();
+            self.next();
+            return self.parse_session_authorization(local);
         }
         // v1.86: `SET TIME ZONE value` — the SQL-standard spelling of
         // SET timezone (PG19 gram.y SetTimeZoneStmt). Values: a zone
@@ -8128,6 +9128,45 @@ impl Parser {
                     other
                 )));
             }
+        };
+        // v1.96 finishing pass: PG19 var_list — the list-valued
+        // search_path GUC accepts comma-separated values
+        // (`SET search_path = alt_nsp1, public`), stored in PG's
+        // flattened ", "-joined representation. (Other GUCs keep the
+        // single-value grammar.)
+        let value = if name == "search_path" && matches!(self.peek(), Token::Comma) {
+            let first = match &value {
+                SetValue::Str(s) => s.clone(),
+                _ => {
+                    return Err(err(
+                        "syntax error: unexpected SET search_path value".to_string()
+                    ));
+                }
+            };
+            // PG19 gram.y: a NULL list element stands alone
+            // (`SET search_path = null` is the empty list);
+            // `null, ...` is a syntax error.
+            if first.eq_ignore_ascii_case("null") {
+                return Err(err("syntax error at or near \",\"".to_string()));
+            }
+            let mut parts = vec![first];
+            while matches!(self.peek(), Token::Comma) {
+                self.next();
+                match self.next() {
+                    Token::Ident(s) => parts.push(s),
+                    Token::Str(s) => parts.push(s),
+                    Token::Number(n) => parts.push(n),
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: unexpected SET search_path value {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+            SetValue::Str(parts.join(", "))
+        } else {
+            value
         };
         Ok(Stmt::Set { name, value, local })
     }
@@ -8675,8 +9714,14 @@ impl Parser {
         // (select_core_follows), which PG19's grammar permits for any
         // simple SELECT: gram.y's opt_target_list has an /* EMPTY */
         // alternative (~/workspace/pg19src/pg19/src/backend/parser/gram.y,
-        // lines 17540-17542; simple_select at 13201). No post-loop
-        // rejection needed.
+        // lines 17540-17542; simple_select at 13201).
+        // v1.96 finishing pass: BUT the DISTINCT production
+        // (simple_select: SELECT distinct_clause target_list) requires
+        // a NON-EMPTY target_list — `SELECT DISTINCT FROM t` is a
+        // syntax error in PG19 even though `SELECT FROM t` is legal.
+        if (distinct || !distinct_on.is_empty()) && items.is_empty() {
+            return Err(err("syntax error at or near \"from\"".to_string()));
+        }
         let from = if self.eat_keyword("from") {
             self.parse_from()?
         } else {
@@ -8712,6 +9757,7 @@ impl Parser {
             limit: None,
             offset: None,
             for_update: false,
+            lock_clause: false,
             for_update_of: Vec::new(),
             set_op: None,
             dead_rtes: 0,
@@ -8732,6 +9778,19 @@ impl Parser {
     /// syntax error.
     pub(crate) fn parse_order_term(&mut self) -> Result<OrderTerm, SqlError> {
         let expr = self.parse_or()?;
+        // v1.96: ORDER BY expr COLLATE name — collation is accepted
+        // and ignored (single-collation engine, byte order).
+        if self.eat_keyword("collate") {
+            match self.next() {
+                Token::Str(_) | Token::Ident(_) | Token::QIdent(_) => {}
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected collation name, found {:?}",
+                        other
+                    )));
+                }
+            }
+        }
         let desc = if self.eat_keyword("using") {
             match self.next() {
                 Token::Lt => false,
@@ -8824,15 +9883,37 @@ impl Parser {
                 break;
             }
         }
-        let for_update = if self.eat_keyword("for") {
-            self.expect_keyword("update")?;
-            true
+        // v1.95: all four PG19 locking strengths. UPDATE and
+        // NO KEY UPDATE set `for_update` (they are the strengths that
+        // pull the UPDATE policy group into RLS); SHARE and KEY SHARE
+        // parse but add no policy group (rowsecurity.c). Optional
+        // NOWAIT / SKIP LOCKED suffix accepted (lock waits are
+        // no-ops in this engine's snapshot model).
+        let (for_update, had_lock) = if self.eat_keyword("for") {
+            if self.eat_keyword("update") {
+                (true, true)
+            } else if self.eat_keyword("no") {
+                self.expect_keyword("key")?;
+                self.expect_keyword("update")?;
+                (true, true)
+            } else if self.eat_keyword("share") {
+                (false, true)
+            } else if self.eat_keyword("key") {
+                self.expect_keyword("share")?;
+                (false, true)
+            } else {
+                return Err(err(
+                    "syntax error: expected UPDATE, NO KEY UPDATE, SHARE or KEY SHARE after FOR"
+                        .to_string(),
+                ));
+            }
         } else {
-            false
+            (false, false)
         };
         // v1.14: `FOR UPDATE OF tbl [, ...]` (PG19). The table names are
-        // validated against the FROM items by the executor.
-        let for_update_of = if for_update && self.eat_keyword("of") {
+        // validated against the FROM items by the executor. v1.95: OF
+        // attaches to any locking strength.
+        let for_update_of = if had_lock && self.eat_keyword("of") {
             let mut names = Vec::new();
             loop {
                 names.push(self.expect_ident()?);
@@ -8846,10 +9927,16 @@ impl Parser {
         } else {
             Vec::new()
         };
+        // v1.95: NOWAIT / SKIP LOCKED follow the OF list.
+        if had_lock {
+            let _ = self.eat_keyword("nowait")
+                || (self.eat_keyword("skip") && self.eat_keyword("locked"));
+        }
         sel.order_by = order_by;
         sel.limit = limit;
         sel.offset = offset;
         sel.for_update = for_update;
+        sel.lock_clause = had_lock;
         sel.for_update_of = for_update_of;
         Ok(())
     }
@@ -9213,6 +10300,7 @@ impl Parser {
             carrier.limit = tail.limit;
             carrier.offset = tail.offset;
             carrier.for_update = tail.for_update;
+            carrier.lock_clause = tail.lock_clause;
             carrier.for_update_of = tail.for_update_of;
         }
         Ok(carrier)
@@ -10279,6 +11367,107 @@ impl Parser {
     }
 
     pub(crate) fn parse_drop(&mut self) -> Result<Stmt, SqlError> {
+        // v1.96: DROP CAST [IF EXISTS] (source AS target)
+        // [CASCADE|RESTRICT].
+        if self.eat_keyword("cast") {
+            let if_exists = if self.eat_keyword("if") {
+                self.expect_keyword("exists")?;
+                true
+            } else {
+                false
+            };
+            self.expect(Token::LParen, "'('")?;
+            let src = self.parse_cast_type_name()?;
+            self.expect_keyword("as")?;
+            let dst = self.parse_cast_type_name()?;
+            self.expect(Token::RParen, "')'")?;
+            let cascade = self.parse_cascade_opt()?;
+            return Ok(Stmt::DropCast {
+                src,
+                dst,
+                if_exists,
+                cascade,
+            });
+        }
+        // v1.96: DROP SCHEMA [IF EXISTS] name [, ...] [CASCADE|RESTRICT].
+        if self.eat_keyword("schema") {
+            let if_exists = if self.eat_keyword("if") {
+                self.expect_keyword("exists")?;
+                true
+            } else {
+                false
+            };
+            let mut names = Vec::new();
+            loop {
+                names.push(self.expect_ident()?);
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.next();
+            }
+            let cascade = self.parse_cascade_opt()?;
+            return Ok(Stmt::DropSchema {
+                names,
+                if_exists,
+                cascade,
+            });
+        }
+        // v1.96: DROP OWNED BY role [, ...] [CASCADE|RESTRICT].
+        if self.eat_keyword("owned") {
+            self.expect_keyword("by")?;
+            let mut roles = Vec::new();
+            loop {
+                roles.push(self.expect_ident()?);
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.next();
+            }
+            let cascade = self.parse_cascade_opt()?;
+            return Ok(Stmt::DropOwned { roles, cascade });
+        }
+        // v1.96: DROP AGGREGATE [IF EXISTS] name(args) [CASCADE|RESTRICT].
+        if self.eat_keyword("aggregate") {
+            let if_exists = if self.eat_keyword("if") {
+                self.expect_keyword("exists")?;
+                true
+            } else {
+                false
+            };
+            let name = self.parse_table_name()?;
+            self.expect(Token::LParen, "'('")?;
+            let mut arg_types = Vec::new();
+            if *self.peek() != Token::RParen {
+                loop {
+                    if matches!(self.peek(), Token::Star) {
+                        self.next();
+                        arg_types.push("*".to_string());
+                    } else {
+                        let arg = self.parse_func_arg()?;
+                        arg_types.push(arg.type_name);
+                    }
+                    match self.next() {
+                        Token::Comma => continue,
+                        Token::RParen => break,
+                        other => {
+                            return Err(err(format!(
+                                "syntax error: expected ',' or ')', found {:?}",
+                                other
+                            )));
+                        }
+                    }
+                }
+            } else {
+                self.next();
+            }
+            let cascade = self.parse_cascade_opt()?;
+            return Ok(Stmt::DropAggregate {
+                name,
+                arg_types,
+                if_exists,
+                cascade,
+            });
+        }
         // v0.11: DROP ROLE / USER / GROUP
         if matches!(self.peek(), Token::Ident(s) if s == "role" || s == "user" || s == "group") {
             return self.parse_drop_role();
@@ -10293,13 +11482,37 @@ impl Parser {
             // v0.88: `DROP INDEX a, b, c` (PG allows a name list).
             let mut names = Vec::new();
             loop {
-                names.push(self.expect_ident()?);
+                names.push(self.parse_table_name()?);
                 if !matches!(self.peek(), Token::Comma) {
                     break;
                 }
                 self.next(); // ','
             }
             return Ok(Stmt::DropIndex { names, if_exists });
+        }
+        // v1.96: DROP MATERIALIZED VIEW.
+        if self.eat_keyword("materialized") {
+            self.expect_keyword("view")?;
+            let if_exists = if self.eat_keyword("if") {
+                self.expect_keyword("exists")?;
+                true
+            } else {
+                false
+            };
+            let mut names = Vec::new();
+            loop {
+                names.push(self.parse_table_name()?);
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.next();
+            }
+            let cascade = self.parse_cascade_opt()?;
+            return Ok(Stmt::DropView {
+                names,
+                if_exists,
+                cascade,
+            });
         }
         // v0.9: DROP VIEW [IF EXISTS] name [, ...] [CASCADE | RESTRICT]
         if self.eat_keyword("view") {
@@ -10311,7 +11524,7 @@ impl Parser {
             };
             let mut names = Vec::new();
             loop {
-                names.push(self.expect_ident()?);
+                names.push(self.parse_table_name()?);
                 if !matches!(self.peek(), Token::Comma) {
                     break;
                 }
@@ -10334,7 +11547,7 @@ impl Parser {
             };
             let mut names = Vec::new();
             loop {
-                names.push(self.expect_ident()?);
+                names.push(self.parse_table_name()?);
                 if !matches!(self.peek(), Token::Comma) {
                     break;
                 }
@@ -10357,7 +11570,7 @@ impl Parser {
             };
             let mut names = Vec::new();
             loop {
-                names.push(self.expect_ident()?);
+                names.push(self.parse_table_name()?);
                 if !matches!(self.peek(), Token::Comma) {
                     break;
                 }
@@ -10377,7 +11590,7 @@ impl Parser {
             };
             let mut names = Vec::new();
             loop {
-                names.push(self.expect_ident()?);
+                names.push(self.parse_table_name()?);
                 if !matches!(self.peek(), Token::Comma) {
                     break;
                 }
@@ -10388,7 +11601,8 @@ impl Parser {
         }
         // v0.86: DROP FUNCTION [IF EXISTS] name ([type [, ...]]).
         // Argument names are accepted and ignored (PG allows them).
-        if matches!(self.peek(), Token::Ident(s) if s == "function") {
+        if matches!(self.peek(), Token::Ident(s) if s == "function" || s == "procedure" || s == "routine")
+        {
             return self.parse_drop_function();
         }
         // v0.86: DROP OPERATOR [IF EXISTS] name (lefttype, righttype)
@@ -10400,6 +11614,10 @@ impl Parser {
         if matches!(self.peek(), Token::Ident(s) if s == "trigger") {
             return self.parse_drop_trigger();
         }
+        // v1.95: DROP POLICY [IF EXISTS] name ON table (PG19).
+        if matches!(self.peek(), Token::Ident(s) if s == "policy") {
+            return self.parse_drop_policy();
+        }
         self.expect_keyword("table")?;
         let if_exists = if self.eat_keyword("if") {
             self.expect_keyword("exists")?;
@@ -10410,7 +11628,7 @@ impl Parser {
         // v0.9: DROP TABLE [IF EXISTS] name [, ...] [CASCADE | RESTRICT]
         let mut names = Vec::new();
         loop {
-            names.push(self.expect_ident()?);
+            names.push(self.parse_table_name()?);
             if !matches!(self.peek(), Token::Comma) {
                 break;
             }
@@ -10449,6 +11667,13 @@ impl Parser {
         let name = self.expect_ident()?;
         let mut login = kind == "user";
         let mut superuser = false;
+        let mut bypassrls = false;
+        let mut inherit = true;
+        let mut createrole = false;
+        let mut createdb = false;
+        let mut replication = false;
+        let mut member_of: Vec<(String, bool)> = Vec::new();
+        let mut members: Vec<(String, bool)> = Vec::new();
         let mut password: Option<String> = None;
         let mut connlimit: Option<i32> = None;
         let mut valid_until: Option<String> = None;
@@ -10461,6 +11686,55 @@ impl Parser {
                 superuser = true;
             } else if self.eat_keyword("nosuperuser") {
                 superuser = false;
+            } else if self.eat_keyword("bypassrls") {
+                bypassrls = true;
+            } else if self.eat_keyword("nobypassrls") {
+                bypassrls = false;
+            } else if self.eat_keyword("inherit") {
+                inherit = true;
+            } else if self.eat_keyword("noinherit") {
+                inherit = false;
+            } else if self.eat_keyword("createrole") {
+                createrole = true;
+            } else if self.eat_keyword("nocreaterole") {
+                createrole = false;
+            } else if self.eat_keyword("createdb") {
+                createdb = true;
+            } else if self.eat_keyword("nocreatedb") {
+                createdb = false;
+            } else if self.eat_keyword("replication") {
+                replication = true;
+            } else if self.eat_keyword("noreplication") {
+                replication = false;
+            } else if self.eat_keyword("with") {
+                // WITH is just an introducer; options continue.
+            } else if self.peek_ident() == Some("in") {
+                // IN ROLE list / IN GROUP list: groups the new role joins.
+                self.next();
+                let _ = self.eat_keyword("role") || self.eat_keyword("group");
+                for r in self.parse_grantee_list()? {
+                    member_of.push((r, false));
+                }
+            } else if self.peek_ident() == Some("role") {
+                // ROLE list (gram.y CreateOptRoleElem -> "rolemembers"):
+                // the listed roles are added as members OF the new
+                // role — the reverse of IN ROLE.
+                self.next();
+                for r in self.parse_grantee_list()? {
+                    members.push((r, false));
+                }
+            } else if self.peek_ident() == Some("admin") {
+                // ADMIN list (CREATE GROUP): members with ADMIN OPTION.
+                self.next();
+                for r in self.parse_grantee_list()? {
+                    members.push((r, true));
+                }
+            } else if self.peek_ident() == Some("user") {
+                // USER list (CREATE GROUP): plain members.
+                self.next();
+                for r in self.parse_grantee_list()? {
+                    members.push((r, false));
+                }
             } else if self.eat_keyword("password") {
                 match self.next() {
                     Token::Str(s) => password = Some(s),
@@ -10509,6 +11783,13 @@ impl Parser {
             name,
             login,
             superuser,
+            bypassrls,
+            inherit,
+            createrole,
+            createdb,
+            replication,
+            member_of,
+            members,
             password,
             connlimit,
             valid_until,
@@ -10518,10 +11799,64 @@ impl Parser {
     /// ALTER ROLE name [LOGIN|NOLOGIN] [SUPERUSER|NOSUPERUSER]
     ///   [PASSWORD 'pw' | PASSWORD NULL] [CONNECTION LIMIT n]
     pub(crate) fn parse_alter_role(&mut self) -> Result<Stmt, SqlError> {
-        let _kind = self.parse_role_kind()?;
+        let kind = self.parse_role_kind()?;
         let name = self.expect_ident()?;
+        if kind == "group" {
+            // v1.96: ALTER GROUP name ADD USER list | DROP USER list |
+            // RENAME TO new_name.
+            if self.eat_keyword("add") {
+                self.expect_keyword("user")?;
+                let add = self.parse_grantee_list()?;
+                return Ok(Stmt::AlterGroup {
+                    name,
+                    add,
+                    drop: Vec::new(),
+                    rename_to: None,
+                });
+            }
+            if self.eat_keyword("drop") {
+                self.expect_keyword("user")?;
+                let drop = self.parse_grantee_list()?;
+                return Ok(Stmt::AlterGroup {
+                    name,
+                    add: Vec::new(),
+                    drop,
+                    rename_to: None,
+                });
+            }
+            if self.eat_keyword("rename") {
+                self.expect_keyword("to")?;
+                let rename_to = self.expect_ident()?;
+                return Ok(Stmt::AlterGroup {
+                    name,
+                    add: Vec::new(),
+                    drop: Vec::new(),
+                    rename_to: Some(rename_to),
+                });
+            }
+            return Err(err(
+                "syntax error: expected ADD USER, DROP USER or RENAME in ALTER GROUP".to_string(),
+            ));
+        }
+        // v1.96: ALTER ROLE/USER name RENAME TO new_name (shares the
+        // ALTER GROUP rename machinery at exec).
+        if self.eat_keyword("rename") {
+            self.expect_keyword("to")?;
+            let rename_to = self.expect_ident()?;
+            return Ok(Stmt::AlterGroup {
+                name,
+                add: Vec::new(),
+                drop: Vec::new(),
+                rename_to: Some(rename_to),
+            });
+        }
         let mut login: Option<bool> = None;
         let mut superuser: Option<bool> = None;
+        let mut bypassrls: Option<bool> = None;
+        let mut inherit_o: Option<bool> = None;
+        let mut createrole_o: Option<bool> = None;
+        let mut createdb_o: Option<bool> = None;
+        let mut replication_o: Option<bool> = None;
         let mut password: Option<Option<String>> = None;
         let mut connlimit: Option<i32> = None;
         let mut valid_until: Option<String> = None;
@@ -10534,6 +11869,28 @@ impl Parser {
                 superuser = Some(true);
             } else if self.eat_keyword("nosuperuser") {
                 superuser = Some(false);
+            } else if self.eat_keyword("bypassrls") {
+                bypassrls = Some(true);
+            } else if self.eat_keyword("nobypassrls") {
+                bypassrls = Some(false);
+            } else if self.eat_keyword("inherit") {
+                inherit_o = Some(true);
+            } else if self.eat_keyword("noinherit") {
+                inherit_o = Some(false);
+            } else if self.eat_keyword("createrole") {
+                createrole_o = Some(true);
+            } else if self.eat_keyword("nocreaterole") {
+                createrole_o = Some(false);
+            } else if self.eat_keyword("createdb") {
+                createdb_o = Some(true);
+            } else if self.eat_keyword("nocreatedb") {
+                createdb_o = Some(false);
+            } else if self.eat_keyword("replication") {
+                replication_o = Some(true);
+            } else if self.eat_keyword("noreplication") {
+                replication_o = Some(false);
+            } else if self.eat_keyword("with") {
+                // WITH introducer; options continue.
             } else if self.eat_keyword("password") {
                 match self.next() {
                     Token::Str(s) => password = Some(Some(s)),
@@ -10580,6 +11937,11 @@ impl Parser {
         }
         if login.is_none()
             && superuser.is_none()
+            && bypassrls.is_none()
+            && inherit_o.is_none()
+            && createrole_o.is_none()
+            && createdb_o.is_none()
+            && replication_o.is_none()
             && password.is_none()
             && connlimit.is_none()
             && valid_until.is_none()
@@ -10592,6 +11954,11 @@ impl Parser {
             name,
             login,
             superuser,
+            bypassrls,
+            inherit: inherit_o,
+            createrole: createrole_o,
+            createdb: createdb_o,
+            replication: replication_o,
             password,
             connlimit,
             valid_until,
@@ -10642,6 +12009,20 @@ impl Parser {
                 Privilege::Usage
             } else if self.eat_keyword("connect") {
                 Privilege::Connect
+            } else if self.eat_keyword("execute") {
+                Privilege::Execute
+            } else if self.eat_keyword("create") {
+                Privilege::Create
+            } else if self.eat_keyword("temporary") || self.eat_keyword("temp") {
+                Privilege::Temporary
+            } else if self.eat_keyword("maintain") {
+                Privilege::Maintain
+            } else if self.eat_keyword("set") {
+                Privilege::Set
+            } else if self.peek_ident() == Some("alter") {
+                self.next();
+                self.expect_keyword("system")?;
+                Privilege::AlterSystem
             } else if self.eat_keyword("all") {
                 self.eat_keyword("privileges");
                 Privilege::All
@@ -10655,10 +12036,12 @@ impl Parser {
             let mut columns = Vec::new();
             if matches!(self.peek(), Token::LParen) {
                 match p {
+                    // v1.96: PG19 allows ALL PRIVILEGES (cols) too.
                     Privilege::Select
                     | Privilege::Insert
                     | Privilege::Update
-                    | Privilege::References => {}
+                    | Privilege::References
+                    | Privilege::All => {}
                     _ => {
                         return Err(err(format!(
                             "syntax error: privilege {:?} does not accept a column list",
@@ -10735,60 +12118,317 @@ impl Parser {
 
     pub(crate) fn parse_grant(&mut self) -> Result<Stmt, SqlError> {
         if !self.grant_has_object() {
-            // GRANT role [, ...] TO role [, ...]: role membership.
+            // GRANT role [, ...] TO role [, ...] [WITH options]
+            // [GRANTED BY grantor]: role membership (v1.96 full syntax).
             let roles = self.parse_grantee_list()?;
             self.expect_keyword("to")?;
             let grantees = self.parse_grantee_list()?;
-            // WITH ADMIN OPTION is parsed and ignored (documented).
-            if self.eat_keyword("with") {
-                self.expect_keyword("admin")?;
-                self.expect_keyword("option")?;
+            let (mut admin, mut inherit, mut set) = (None, None, None);
+            let mut granted_by = None;
+            loop {
+                if self.eat_keyword("with") {
+                    // One or more comma/space separated membership options.
+                    loop {
+                        let target = if self.eat_keyword("admin") {
+                            &mut admin
+                        } else if self.eat_keyword("inherit") {
+                            &mut inherit
+                        } else if self.eat_keyword("set") {
+                            &mut set
+                        } else {
+                            break;
+                        };
+                        if self.eat_keyword("option") {
+                            *target = Some(true);
+                        } else if self.eat_keyword("true") {
+                            *target = Some(true);
+                        } else if self.eat_keyword("false") {
+                            *target = Some(false);
+                        } else {
+                            *target = Some(true);
+                        }
+                        if matches!(self.peek(), Token::Comma) {
+                            self.next();
+                            continue;
+                        }
+                        break;
+                    }
+                    continue;
+                }
+                if self.eat_keyword("granted") {
+                    self.expect_keyword("by")?;
+                    granted_by = Some(self.parse_grantor()?);
+                    continue;
+                }
+                break;
             }
-            return Ok(Stmt::GrantRole { roles, grantees });
+            return Ok(Stmt::GrantRole {
+                roles,
+                grantees,
+                admin,
+                inherit,
+                set,
+                granted_by,
+            });
         }
         let privs = self.parse_privilege_list()?;
         self.expect_keyword("on")?;
         let object = self.parse_grant_object()?;
         self.expect_keyword("to")?;
         let grantees = self.parse_grantee_list()?;
-        // GRANT OPTION is parsed and ignored (documented).
-        if self.eat_keyword("with") {
-            self.expect_keyword("grant")?;
-            self.expect_keyword("option")?;
+        // v1.96: [WITH GRANT OPTION] [GRANTED BY grantor], either order.
+        let mut grant_option = false;
+        let mut granted_by = None;
+        loop {
+            if self.eat_keyword("with") {
+                self.expect_keyword("grant")?;
+                self.expect_keyword("option")?;
+                grant_option = true;
+                continue;
+            }
+            if self.eat_keyword("granted") {
+                self.expect_keyword("by")?;
+                granted_by = Some(self.parse_grantor()?);
+                continue;
+            }
+            break;
         }
         Ok(Stmt::Grant {
             privs,
             object,
             grantees,
+            granted_by,
+            grant_option,
         })
     }
 
     /// REVOKE privs ON ... FROM role [, ...], or REVOKE role [, ...]
     /// FROM role [, ...] for membership.
     pub(crate) fn parse_revoke(&mut self) -> Result<Stmt, SqlError> {
+        // v1.96: REVOKE [GRANT|ADMIN|INHERIT|SET] OPTION FOR ... — the
+        // OPTION FOR prefix marks an option-only revoke (role form), or
+        // GRANT OPTION FOR on objects.
+        let mut option_for: Option<char> = None;
+        let mut grant_option_for = false;
+        if self.peek_ident() == Some("grant")
+            || self.peek_ident() == Some("admin")
+            || self.peek_ident() == Some("inherit")
+            || self.peek_ident() == Some("set")
+        {
+            let save = self.pos;
+            let which = self.peek_ident().unwrap().to_string();
+            self.next();
+            if self.eat_keyword("option") && self.eat_keyword("for") {
+                match which.as_str() {
+                    "grant" => {
+                        grant_option_for = true;
+                        option_for = Some('g');
+                    }
+                    "admin" => option_for = Some('a'),
+                    "inherit" => option_for = Some('i'),
+                    _ => option_for = Some('s'),
+                }
+            } else {
+                self.pos = save;
+            }
+        }
         if !self.grant_has_object() {
             let roles = self.parse_grantee_list()?;
             self.expect_keyword("from")?;
             let grantees = self.parse_grantee_list()?;
-            return Ok(Stmt::RevokeRole { roles, grantees });
+            let mut granted_by = None;
+            let mut cascade = false;
+            loop {
+                if self.eat_keyword("granted") {
+                    self.expect_keyword("by")?;
+                    granted_by = Some(self.parse_grantor()?);
+                    continue;
+                }
+                if self.eat_keyword("cascade") {
+                    cascade = true;
+                    continue;
+                }
+                if self.eat_keyword("restrict") {
+                    continue;
+                }
+                break;
+            }
+            return Ok(Stmt::RevokeRole {
+                roles,
+                grantees,
+                option_for: if grant_option_for {
+                    Some('g')
+                } else {
+                    option_for
+                },
+                granted_by,
+                cascade,
+            });
         }
         let privs = self.parse_privilege_list()?;
         self.expect_keyword("on")?;
         let object = self.parse_grant_object()?;
         self.expect_keyword("from")?;
         let grantees = self.parse_grantee_list()?;
+        let mut granted_by = None;
+        let mut cascade = false;
+        loop {
+            if self.eat_keyword("granted") {
+                self.expect_keyword("by")?;
+                granted_by = Some(self.parse_grantor()?);
+                continue;
+            }
+            if self.eat_keyword("cascade") {
+                cascade = true;
+                continue;
+            }
+            if self.eat_keyword("restrict") {
+                continue;
+            }
+            break;
+        }
         Ok(Stmt::Revoke {
             privs,
             object,
             grantees,
+            granted_by,
+            grant_option_for,
+            cascade,
         })
     }
 
     pub(crate) fn parse_grant_object(&mut self) -> Result<GrantObject, SqlError> {
+        // v1.96: FUNCTION/PROCEDURE name [(args)] [, ...] / TYPE / ALL ...
+        let routine_proc = if self.eat_keyword("procedure") {
+            Some(true)
+        } else if self.eat_keyword("function") {
+            Some(false)
+        } else {
+            None
+        };
+        if let Some(is_procedure) = routine_proc {
+            let mut names = Vec::new();
+            loop {
+                let name = self.parse_table_name()?;
+                if matches!(self.peek(), Token::LParen) {
+                    // Consume the balanced argument list.
+                    let mut depth = 0i32;
+                    loop {
+                        match self.next() {
+                            Token::LParen => depth += 1,
+                            Token::RParen => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            Token::EOF => break,
+                            _ => {}
+                        }
+                    }
+                }
+                names.push(name);
+                if matches!(self.peek(), Token::Comma) && !matches!(self.peek2(), Token::Ident(_)) {
+                    unreachable!()
+                }
+                if matches!(self.peek(), Token::Comma) {
+                    // A comma here separates another function only when
+                    // what follows cannot be the TO/FROM keyword.
+                    let save = self.pos;
+                    self.next();
+                    if matches!(self.peek(), Token::Ident(_)) {
+                        continue;
+                    }
+                    self.pos = save;
+                }
+                break;
+            }
+            return Ok(if is_procedure {
+                GrantObject::Procedure(names)
+            } else {
+                GrantObject::Function(names)
+            });
+        }
+        if self.eat_keyword("large") {
+            self.expect_keyword("object")?;
+            let mut oids = Vec::new();
+            loop {
+                match self.next() {
+                    Token::Number(s) => match s.parse::<i64>() {
+                        Ok(n) => oids.push(n),
+                        Err(_) => {
+                            return Err(err(format!("invalid large object OID: {}", s)));
+                        }
+                    },
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected large object OID, found {:?}",
+                            other
+                        )));
+                    }
+                }
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.next();
+            }
+            return Ok(GrantObject::LargeObject(oids));
+        }
+        if self.eat_keyword("language") {
+            let name = self.expect_ident()?;
+            return Ok(GrantObject::Language(name));
+        }
+        if self.eat_keyword("schema") {
+            let name = self.expect_ident()?;
+            return Ok(GrantObject::Schema(name));
+        }
+        if self.eat_keyword("type") {
+            let name = self.parse_table_name()?;
+            return Ok(GrantObject::Type(name));
+        }
+        if self.eat_keyword("domain") {
+            let name = self.parse_table_name()?;
+            return Ok(GrantObject::Domain(name));
+        }
+        if self.eat_keyword("all") {
+            enum AllKind {
+                Tables,
+                Sequences,
+                Functions,
+                Procedures,
+                Routines,
+            }
+            let kind = if self.eat_keyword("tables") {
+                AllKind::Tables
+            } else if self.eat_keyword("sequences") {
+                AllKind::Sequences
+            } else if self.eat_keyword("functions") {
+                AllKind::Functions
+            } else if self.eat_keyword("procedures") {
+                AllKind::Procedures
+            } else if self.eat_keyword("routines") {
+                AllKind::Routines
+            } else {
+                return Err(err(
+                    "syntax error: expected TABLES, SEQUENCES, FUNCTIONS, PROCEDURES or ROUTINES after ALL in GRANT".to_string(),
+                ));
+            };
+            self.expect_keyword("in")?;
+            self.expect_keyword("schema")?;
+            let schemas = self.parse_grantee_list()?;
+            let schema = schemas.into_iter().next().unwrap_or_default();
+            return Ok(match kind {
+                AllKind::Tables => GrantObject::AllTables,
+                AllKind::Sequences => GrantObject::AllSequences,
+                AllKind::Functions => GrantObject::AllFunctionsInSchema(schema),
+                AllKind::Procedures => GrantObject::AllProceduresInSchema(schema),
+                AllKind::Routines => GrantObject::AllRoutinesInSchema(schema),
+            });
+        }
         // Optional TABLE keyword (Postgres allows omitting it).
         let is_table_kw = self.eat_keyword("table");
         if self.eat_keyword("sequence") {
-            return Ok(GrantObject::Sequence(self.expect_ident()?));
+            return Ok(GrantObject::Sequence(self.parse_table_name()?));
         }
         if self.eat_keyword("database") {
             // `GRANT ... ON DATABASE` without a name targets this database.
@@ -10799,27 +12439,23 @@ impl Parser {
         // accepted and applied to each).
         let mut names = Vec::new();
         loop {
-            names.push(self.expect_ident()?);
+            names.push(self.parse_table_name()?);
             if !matches!(self.peek(), Token::Comma) {
                 break;
             }
             self.next();
         }
         let _ = is_table_kw;
-        // Encode multi-name lists by chaining: keep the first as the
-        // object and stash the rest via repeated execution is complex;
-        // instead we only support one name per statement in v0.11.
-        if names.len() > 1 {
-            return Err(err(
-                "only one object name per GRANT/REVOKE is supported".to_string()
-            ));
-        }
-        Ok(GrantObject::Table(names.into_iter().next().unwrap()))
+        // v1.95: multi-name object lists apply the grant to each
+        // named table in turn (PG19 GrantStmt.objects).
+        Ok(GrantObject::Table(names))
     }
 
     pub(crate) fn parse_grantee_list(&mut self) -> Result<Vec<String>, SqlError> {
         let mut out = Vec::new();
         loop {
+            // v1.96: GROUP prefix (GRANT ... TO GROUP x) is a no-op marker.
+            self.eat_keyword("group");
             out.push(self.expect_ident()?);
             if !matches!(self.peek(), Token::Comma) {
                 break;
@@ -10827,6 +12463,262 @@ impl Parser {
             self.next();
         }
         Ok(out)
+    }
+
+    /// v1.96: parse a GRANTED BY specification (the BY keyword is
+    /// already consumed): a role name, CURRENT_USER, CURRENT_ROLE or
+    /// SESSION_USER.
+    pub(crate) fn parse_grantor(&mut self) -> Result<crate::sql::Grantor, SqlError> {
+        match self.next() {
+            Token::Ident(s) if s == "current_user" => Ok(crate::sql::Grantor::CurrentUser),
+            Token::Ident(s) if s == "current_role" => Ok(crate::sql::Grantor::CurrentRole),
+            Token::Ident(s) if s == "session_user" => Ok(crate::sql::Grantor::SessionUser),
+            Token::Ident(s) => Ok(crate::sql::Grantor::Role(s)),
+            other => Err(err(format!(
+                "syntax error: expected role name after GRANTED BY, found {:?}",
+                other
+            ))),
+        }
+    }
+
+    /// v1.96: LOCK [TABLE] name [, ...] IN mode MODE [NOWAIT |
+    /// SKIP LOCKED]. Mode words are collected up to MODE.
+    pub(crate) fn parse_lock(&mut self) -> Result<Stmt, SqlError> {
+        self.eat_keyword("table");
+        let mut names = Vec::new();
+        loop {
+            names.push(self.parse_table_name()?);
+            if !matches!(self.peek(), Token::Comma) {
+                break;
+            }
+            self.next();
+        }
+        // v1.96: the IN ... MODE clause is optional (default ACCESS
+        // EXCLUSIVE, PG19 LockStmt).
+        if !self.eat_keyword("in") {
+            return Ok(Stmt::LockTable {
+                names,
+                mode: "ACCESS EXCLUSIVE".to_string(),
+                nowait: false,
+            });
+        }
+        let mut words = Vec::new();
+        loop {
+            if self.eat_keyword("mode") {
+                break;
+            }
+            match self.next() {
+                Token::Ident(s) => words.push(s.to_uppercase()),
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected lock mode, found {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+        let mut nowait = false;
+        if self.eat_keyword("nowait") {
+            nowait = true;
+        } else if self.eat_keyword("skip") {
+            self.expect_keyword("locked")?;
+        }
+        Ok(Stmt::LockTable {
+            names,
+            mode: words.join(" "),
+            nowait,
+        })
+    }
+
+    /// v1.96: ALTER DEFAULT PRIVILEGES [FOR ROLE name | FOR USER name]
+    /// [IN SCHEMA name [, ...]] {GRANT|REVOKE} ...
+    /// v1.96: REINDEX [ ( CONCURRENTLY ) ] { TABLE | INDEX | SCHEMA |
+    /// DATABASE } [ name ].
+    pub(crate) fn parse_reindex(&mut self) -> Result<Stmt, SqlError> {
+        // (The dispatch already consumed the leading keyword.)
+        let mut concurrently = false;
+        if matches!(self.peek(), Token::LParen) {
+            self.next();
+            if self.eat_keyword("concurrently") {
+                concurrently = true;
+            }
+            self.expect(Token::RParen, "')'")?;
+        }
+        if self.eat_keyword("concurrently") {
+            concurrently = true;
+        }
+        let (kind, name) = if self.eat_keyword("table") {
+            // v1.96: bare CONCURRENTLY may follow the kind keyword
+            // (REINDEX TABLE CONCURRENTLY name).
+            let _ = self.eat_keyword("concurrently");
+            ('t', Some(self.expect_ident()?))
+        } else if self.eat_keyword("index") {
+            let _ = self.eat_keyword("concurrently");
+            ('i', Some(self.expect_ident()?))
+        } else if self.eat_keyword("schema") {
+            let _ = self.eat_keyword("concurrently");
+            ('s', Some(self.expect_ident()?))
+        } else if self.eat_keyword("database") {
+            let n = if matches!(self.peek(), Token::Ident(_)) {
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
+            ('d', n)
+        } else {
+            // Bare REINDEX name is REINDEX TABLE in PG.
+            ('t', Some(self.expect_ident()?))
+        };
+        Ok(Stmt::Reindex {
+            kind,
+            name,
+            concurrently,
+        })
+    }
+
+    /// v1.96: CLUSTER [VERBOSE] [name [USING index]].
+    pub(crate) fn parse_cluster(&mut self) -> Result<Stmt, SqlError> {
+        // (The dispatch already consumed the leading keyword.)
+        let _ = self.eat_keyword("verbose");
+        if !matches!(self.peek(), Token::Ident(_)) || self.peek_ident() == Some("using") {
+            return Ok(Stmt::ClusterStmt {
+                name: None,
+                index: None,
+            });
+        }
+        let name = self.expect_ident()?;
+        // v1.96 finishing pass: `CLUSTER <index> ON <table>` — the
+        // first identifier was the index, not the table.
+        if self.eat_keyword("on") {
+            let table = self.expect_ident()?;
+            return Ok(Stmt::ClusterStmt {
+                name: Some(table),
+                index: Some(name),
+            });
+        }
+        let index = if self.eat_keyword("using") {
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        Ok(Stmt::ClusterStmt {
+            name: Some(name),
+            index,
+        })
+    }
+
+    /// v1.96: REASSIGN OWNED BY role [, ...] TO role.
+    pub(crate) fn parse_reassign_owned(&mut self) -> Result<Stmt, SqlError> {
+        // (The dispatch already consumed the leading keyword.)
+        self.expect_keyword("owned")?;
+        self.expect_keyword("by")?;
+        let mut from = Vec::new();
+        loop {
+            from.push(self.expect_ident()?);
+            if !matches!(self.peek(), Token::Comma) {
+                break;
+            }
+            self.next();
+        }
+        self.expect_keyword("to")?;
+        let to = self.expect_ident()?;
+        Ok(Stmt::ReassignOwned { from, to })
+    }
+
+    /// v1.96: REFRESH MATERIALIZED VIEW [CONCURRENTLY] name.
+    pub(crate) fn parse_refresh(&mut self) -> Result<Stmt, SqlError> {
+        // (The dispatch already consumed the leading keyword.)
+        self.expect_keyword("materialized")?;
+        self.expect_keyword("view")?;
+        let concurrently = self.eat_keyword("concurrently");
+        let name = self.expect_ident()?;
+        // v1.96: WITH [NO] DATA drives the populated flag.
+        let mut with_data = true;
+        if self.eat_keyword("with") {
+            if self.eat_keyword("no") {
+                with_data = false;
+            }
+            self.expect_keyword("data")?;
+        }
+        Ok(Stmt::RefreshMatView {
+            name,
+            concurrently,
+            with_data,
+        })
+    }
+
+    pub(crate) fn parse_alter_default_privileges(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("default")?;
+        self.expect_keyword("privileges")?;
+        let mut target_role = None;
+        if self.eat_keyword("for") {
+            let _ = self.eat_keyword("role") || self.eat_keyword("user");
+            target_role = Some(self.expect_ident()?);
+        }
+        let mut schemas = Vec::new();
+        if self.eat_keyword("in") {
+            self.expect_keyword("schema")?;
+            // Schema list is validated at exec (single-namespace
+            // engine: rules stay global).
+            schemas = self.parse_grantee_list()?;
+        }
+        let (revoke, grant_option_for) = if self.eat_keyword("revoke") {
+            let gof = if self.eat_keyword("grant") {
+                self.expect_keyword("option")?;
+                self.expect_keyword("for")?;
+                true
+            } else {
+                false
+            };
+            (true, gof)
+        } else {
+            self.expect_keyword("grant")?;
+            (false, false)
+        };
+        let privs = self.parse_privilege_list()?;
+        self.expect_keyword("on")?;
+        let kind = if self.eat_keyword("tables") {
+            'r'
+        } else if self.eat_keyword("sequences") {
+            'S'
+        } else if self.eat_keyword("functions") || self.eat_keyword("routines") {
+            'f'
+        } else if self.eat_keyword("types") {
+            'T'
+        } else if self.eat_keyword("schemas") {
+            'n'
+        } else if self.eat_keyword("large") {
+            self.expect_keyword("objects")?;
+            'l'
+        } else {
+            return Err(err(
+                "syntax error: expected TABLES, SEQUENCES, FUNCTIONS, TYPES, SCHEMAS or LARGE OBJECTS in ALTER DEFAULT PRIVILEGES".to_string(),
+            ));
+        };
+        let grantees = if revoke {
+            self.expect_keyword("from")?;
+            let g = self.parse_grantee_list()?;
+            // Trailing CASCADE | RESTRICT accepted.
+            let _ = self.eat_keyword("cascade") || self.eat_keyword("restrict");
+            g
+        } else {
+            self.expect_keyword("to")?;
+            let g = self.parse_grantee_list()?;
+            if self.eat_keyword("with") {
+                self.expect_keyword("grant")?;
+                self.expect_keyword("option")?;
+            }
+            g
+        };
+        Ok(Stmt::AlterDefaultPrivileges {
+            target_role,
+            revoke,
+            privs,
+            kind,
+            grantees,
+            grant_option_for,
+            schemas,
+        })
     }
 }
 
@@ -10981,6 +12873,8 @@ pub fn check_builtin_arity(name: &str, n: usize) -> Result<(), SqlError> {
         "upper" | "lower" | "length" | "char_length" | "character_length" | "abs" | "floor"
         | "ceil" | "ceiling" | "sqrt" => n == 1,
         "current_date" => n == 0,
+        "current_user" | "current_role" | "session_user" | "current_catalog"
+        | "current_database" | "user" => n == 0,
         // v0.76: only CURRENT_TIMESTAMP takes the optional precision
         // (0-6) — PG19's grammar handles it as special syntax
         // (makeSQLValueFunction), while now()/clock_timestamp()/
@@ -11177,6 +13071,12 @@ pub(crate) fn try_split_create_view(text: &str) -> Option<Result<Stmt, SqlError>
     } else if let Some(r) = match_kw(rest, "temp") {
         rest = skip_ws_comments(r);
     }
+    // v1.96: CREATE MATERIALIZED VIEW.
+    let mut matview = false;
+    if let Some(r) = match_kw(rest, "materialized") {
+        matview = true;
+        rest = skip_ws_comments(r);
+    }
     rest = match_kw(rest, "view")?;
     rest = skip_ws_comments(rest);
     // Postgres does not allow IF NOT EXISTS on CREATE VIEW.
@@ -11199,8 +13099,84 @@ pub(crate) fn try_split_create_view(text: &str) -> Option<Result<Stmt, SqlError>
         rest = skip_balanced_parens(rest)?;
         rest = skip_ws_comments(rest);
     }
+    // v1.95: WITH (option [= value] [, ...]) before AS: PG19 view
+    // options security_barrier / security_invoker / check_option.
+    let mut security_invoker = false;
+    let mut check_option = false;
+    if let Some(r) = match_kw(rest, "with") {
+        let r2 = skip_ws_comments(r);
+        if r2.starts_with('(') {
+            let inner_end = match r2.find(')') {
+                Some(i) => i,
+                None => {
+                    return Some(Err(err(
+                        "syntax error: unterminated view option list".to_string()
+                    )));
+                }
+            };
+            // (option list found via a Some(Err) channel: return early)
+            let inner = r2[1..inner_end].to_string();
+            for part in inner.split(',') {
+                let part = part.trim().to_ascii_lowercase();
+                if part.is_empty() {
+                    continue;
+                }
+                let (oname, oval) = match part.split_once('=') {
+                    Some((a, b)) => (a.trim().to_string(), Some(b.trim().to_string())),
+                    None => (part.clone(), None),
+                };
+                let truthy = match oval.as_deref() {
+                    None => true,
+                    Some("true") | Some("on") | Some("yes") | Some("1") => true,
+                    Some("false") | Some("off") | Some("no") | Some("0") => false,
+                    Some(v) => {
+                        return Some(Err(err(format!(
+                            "invalid value for view option \"{}\": \"{}\"",
+                            oname, v
+                        ))));
+                    }
+                };
+                match oname.as_str() {
+                    "security_invoker" => security_invoker = truthy,
+                    "security_barrier" => {}
+                    "check_option" => check_option = true,
+                    _ => {
+                        return Some(Err(err(format!("unrecognized parameter \"{}\"", oname))));
+                    }
+                }
+            }
+            rest = skip_ws_comments(&r2[inner_end + 1..]);
+        }
+    }
     rest = match_kw(rest, "as")?;
-    let query = skip_ws_comments(rest).trim().to_string();
+    let mut query = skip_ws_comments(rest).trim().to_string();
+    // v1.95: a trailing WITH [LOCAL|CASCADED] CHECK OPTION belongs to
+    // the view, not the query (PG19 ViewStmt.check_option).
+    {
+        let lower = query.to_ascii_lowercase();
+        for pat in [
+            "with local check option",
+            "with cascaded check option",
+            "with check option",
+        ] {
+            if lower.ends_with(pat) {
+                query.truncate(query.len() - pat.len());
+                query = query.trim_end().to_string();
+                check_option = true;
+                break;
+            }
+        }
+    }
+    // v1.96: CREATE MATERIALIZED VIEW ... WITH NO DATA.
+    let mut with_data = true;
+    if matview {
+        let lower = query.to_ascii_lowercase();
+        if lower.ends_with("with no data") {
+            query.truncate(query.len() - "with no data".len());
+            query = query.trim_end().to_string();
+            with_data = false;
+        }
+    }
     if query.is_empty() {
         return Some(Err(
             err("syntax error: expected query after AS".to_string()),
@@ -11241,6 +13217,10 @@ pub(crate) fn try_split_create_view(text: &str) -> Option<Result<Stmt, SqlError>
         query,
         col_aliases,
         or_replace,
+        security_invoker,
+        check_option,
+        matview,
+        with_data,
     }))
 }
 
@@ -11287,6 +13267,95 @@ pub(crate) fn parse_statement_inner(text: &str) -> Result<Stmt, SqlError> {
 /// re-analyze stored index-expression / predicate sources (which
 /// were captured with tokens_to_sql at CREATE INDEX time) for the
 /// immutability check.
+/// v1.95: render one token back to SQL text. Used to capture the
+/// source of policy USING / WITH CHECK expressions for the
+/// constraints codec: joining the renderings with spaces always
+/// re-tokenizes to the same token stream for expression fragments.
+pub(crate) fn token_sql(t: &Token) -> String {
+    fn quote_ident(s: &str) -> String {
+        let bare = !s.is_empty()
+            && s.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '$');
+        if bare {
+            s.to_string()
+        } else {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        }
+    }
+    fn quote_str(s: &str) -> String {
+        format!("'{}'", s.replace('\'', "''"))
+    }
+    match t {
+        Token::Ident(s) => quote_ident(s),
+        Token::QIdent(s) | Token::UIdent(s) => quote_ident(s),
+        Token::Number(s) => s.clone(),
+        Token::Str(s) => quote_str(s),
+        Token::UStr(s) => format!("U&{}", quote_str(s)),
+        Token::BitStr(c, s) => format!("{c}'{s}'"),
+        Token::Param(n) => format!("${n}"),
+        Token::LParen => "(".into(),
+        Token::RParen => ")".into(),
+        Token::LBracket => "[".into(),
+        Token::RBracket => "]".into(),
+        Token::Colon => ":".into(),
+        Token::Comma => ",".into(),
+        Token::Semi => ";".into(),
+        Token::Star => "*".into(),
+        Token::Plus => "+".into(),
+        Token::Minus => "-".into(),
+        Token::Slash => "/".into(),
+        Token::Percent => "%".into(),
+        Token::Eq => "=".into(),
+        Token::FatArrow => "=>".into(),
+        Token::Dot => ".".into(),
+        Token::Lt => "<".into(),
+        Token::Gt => ">".into(),
+        Token::LtEq => "<=".into(),
+        Token::GtEq => ">=".into(),
+        Token::Neq => "<>".into(),
+        Token::ColonColon => "::".into(),
+        Token::PipePipe => "||".into(),
+        Token::Pipe => "|".into(),
+        Token::Amp => "&".into(),
+        Token::AmpAmp => "&&".into(),
+        Token::AmpLt => "&<".into(),
+        Token::AmpGt => "&>".into(),
+        Token::DashPipeDash => "-|-".into(),
+        Token::PhraseOp(1) => "<->".into(),
+        Token::PhraseOp(n) => format!("<{n}>"),
+        Token::Bang => "!".into(),
+        Token::BangBang => "!!".into(),
+        Token::Hash => "#".into(),
+        Token::Arrow => "->".into(),
+        Token::ArrowText => "->>".into(),
+        Token::HashArrow => "#>".into(),
+        Token::HashArrowText => "#>>".into(),
+        Token::AtGt => "@>".into(),
+        Token::AtQuestion => "@?".into(),
+        Token::AtAt => "@@".into(),
+        Token::LtAt => "<@".into(),
+        Token::Question => "?".into(),
+        Token::QuestionPipe => "?|".into(),
+        Token::QuestionAmp => "?&".into(),
+        Token::Tilde => "~".into(),
+        Token::TildeStar => "~*".into(),
+        Token::BangTilde => "!~".into(),
+        Token::BangTildeStar => "!~*".into(),
+        Token::Shl => "<<".into(),
+        Token::Shr => ">>".into(),
+        Token::At => "@".into(),
+        Token::PipeSlash => "|/".into(),
+        Token::PipePipeSlash => "||/".into(),
+        Token::Caret => "^".into(),
+        Token::StarEq => "*=".into(),
+        Token::Op(s) => s.clone(),
+        Token::EOF => String::new(),
+    }
+}
+
 pub(crate) fn parse_expr_str(text: &str) -> Result<Expr, SqlError> {
     let tokens = tokenize(text)?;
     let mut p = Parser {
@@ -12488,6 +14557,22 @@ pub(crate) fn parse_fk_action(s: &str) -> Result<FkAction, String> {
 /// v0.9: encode a table's full constraint/default metadata for WAL and
 /// checkpoints. All variable-length lists align with the table's columns
 /// by position (defaults/notnull) or carry their own names.
+/// v1.95: one policy expr slot in the constraints codec: `-` when
+/// absent, `sql <text>` when the source SQL was captured (the only
+/// form that round-trips subqueries), else the s-expr form.
+fn encode_policy_expr(e: &Option<Expr>, sql: &Option<String>, out: &mut String) {
+    match e {
+        None => out.push('-'),
+        Some(e) => match sql {
+            Some(s) => {
+                out.push_str("sql ");
+                sexpr_escape(s, out);
+            }
+            None => encode_expr_inner(e, out),
+        },
+    }
+}
+
 pub fn encode_constraints(t: &crate::storage::Table) -> String {
     let mut out = String::from("(constraints ");
     out.push_str("(notnull");
@@ -12564,6 +14649,31 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
         out.push_str(fk_action_name(f.on_update));
         out.push_str("))");
     }
+    out.push_str(")");
+    // v1.95: RLS flags + policies, trailing sections. Older decoders
+    // are not in play (RGSWAL25 bump); this decoder reads them
+    // optionally so pre-v1.95 encodings still decode.
+    out.push_str(" (rls ");
+    out.push_str(if t.rls_enabled { "1" } else { "0" });
+    out.push(' ');
+    out.push_str(if t.rls_forced { "1" } else { "0" });
+    out.push_str(") (policies");
+    for p in &t.policies {
+        out.push_str(" (");
+        sexpr_escape(&p.name, &mut out);
+        out.push_str(if p.permissive { " p " } else { " r " });
+        out.push(p.cmd.chr());
+        out.push_str(" (roles");
+        for r in &p.roles {
+            out.push(' ');
+            sexpr_escape(r, &mut out);
+        }
+        out.push_str(") (using ");
+        encode_policy_expr(&p.using_expr, &p.using_sql, &mut out);
+        out.push_str(") (check ");
+        encode_policy_expr(&p.check_expr, &p.check_sql, &mut out);
+        out.push_str("))");
+    }
     out.push_str("))");
     out
 }
@@ -12576,6 +14686,10 @@ pub struct DecodedConstraints {
     pub uniques: Vec<UniqueDef>,
     pub pkey: Option<UniqueDef>,
     pub fks: Vec<FkDef>,
+    /// v1.95: RLS flags + policies (absent in pre-v1.95 encodings).
+    pub rls_enabled: bool,
+    pub rls_forced: bool,
+    pub policies: Vec<PolicyDef>,
 }
 
 pub(crate) fn sexpr_is_close(p: &mut SexprParser) -> bool {
@@ -12775,6 +14889,91 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
         });
     }
     p.close()?;
+    // v1.95: optional trailing (rls e f) and (policies ...) sections;
+    // pre-v1.95 encodings end right here.
+    let (mut rls_enabled, mut rls_forced) = (false, false);
+    let mut policies: Vec<PolicyDef> = Vec::new();
+    if !sexpr_is_close(&mut p) {
+        p.open()?;
+        if p.atom()? != "rls" {
+            return Err("bad rls head".into());
+        }
+        rls_enabled = p.atom()? == "1";
+        rls_forced = p.atom()? == "1";
+        p.close()?;
+        p.open()?;
+        if p.atom()? != "policies" {
+            return Err("bad policies head".into());
+        }
+        while !sexpr_is_close(&mut p) {
+            p.open()?;
+            let name = p.atom()?;
+            let permissive = match p.atom()?.as_str() {
+                "p" => true,
+                "r" => false,
+                o => return Err(format!("bad policy kind {}", o)),
+            };
+            let cmd = match p.atom()?.as_str() {
+                "*" => PolicyCmd::All,
+                "r" => PolicyCmd::Select,
+                "a" => PolicyCmd::Insert,
+                "w" => PolicyCmd::Update,
+                "d" => PolicyCmd::Delete,
+                o => return Err(format!("bad policy cmd {}", o)),
+            };
+            p.open()?;
+            if p.atom()? != "roles" {
+                return Err("bad policy roles head".into());
+            }
+            let mut roles = Vec::new();
+            while !sexpr_is_close(&mut p) {
+                roles.push(p.atom()?);
+            }
+            p.close()?;
+            // Returns (expr, source-sql): the sql form re-derives
+            // the AST via parse_expr_str and is kept for re-encoding.
+            let parse_opt_expr = |p: &mut SexprParser,
+                                  head: &str|
+             -> Result<(Option<Expr>, Option<String>), String> {
+                p.open()?;
+                if p.atom()? != head {
+                    return Err(format!("bad policy {} head", head));
+                }
+                p.ws();
+                let v = if p.chars.peek() == Some(&'-') {
+                    p.chars.next();
+                    (None, None)
+                } else if p.chars.peek() == Some(&'(') {
+                    (Some(p.expr()?), None)
+                } else {
+                    // `sql <text>` form.
+                    if p.atom()? != "sql" {
+                        return Err(format!("bad policy {} form", head));
+                    }
+                    let text = p.atom()?;
+                    let e = parse_expr_str(&text)
+                        .map_err(|e| format!("bad policy {} sql: {}", head, e.message))?;
+                    (Some(e), Some(text))
+                };
+                p.close()?;
+                Ok(v)
+            };
+            let (using_expr, using_sql) = parse_opt_expr(&mut p, "using")?;
+            let (check_expr, check_sql) = parse_opt_expr(&mut p, "check")?;
+            p.close()?;
+            policies.push(PolicyDef {
+                name,
+                permissive,
+                cmd,
+                roles,
+                using_expr,
+                check_expr,
+                using_sql,
+                check_sql,
+            });
+        }
+        p.close()?;
+    }
     p.close()?;
     p.ws();
     if p.chars.peek().is_some() {
@@ -12787,6 +14986,9 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
         uniques,
         pkey,
         fks,
+        rls_enabled,
+        rls_forced,
+        policies,
     })
 }
 

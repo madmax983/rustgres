@@ -12,7 +12,7 @@ Covers the v1.02 plpgsql extension, grounded in PostgreSQL REL_19_STABLE
 - %-format rendering: `%%` escape, multiple args, named-arg rewrite.
 - RAISE EXCEPTION: aborts the call with P0001 and the rendered
   message; trappable by WHEN handlers.
-- Unsupported levels (DEBUG/LOG/INFO/WARNING) are honest 0A000.
+- Unsupported levels (DEBUG/LOG/INFO) are honest 0A000; WARNING supported since v1.96.
 - Restart durability: CHECKPOINT + restart; the parsed plpgsql body
   (with RAISE) is rebuilt from stored source on WAL replay /
   checkpoint restore, notices still delivered.
@@ -206,7 +206,18 @@ end$$;""")
         check("trap: notices from body and handler", n == ["about to blow", "caught it"], f"{n}")
 
         # --- Unsupported levels stay honest 0A000 ---
-        for level in ["debug", "log", "info", "warning"]:
+        # v1.96: WARNING is supported now (PG19 supports it; the
+        # privileges suite's plpgsql bodies use it) — it creates
+        # cleanly and delivers its message at call time.
+        r, e, n = c.q(
+            "create function lvl102_warning() returns int as "
+            "'begin raise warning ''x''; return 1; end' language plpgsql;"
+        )
+        check("raise warning: create ok (v1.96)", e is None, e)
+        r, e, n = c.q("select lvl102_warning();")
+        check("raise warning: call returns + message delivered",
+              r == [['1']] and n == ["x"], f"{r} {e} {n}")
+        for level in ["debug", "log", "info"]:
             r, e, n = c.q(
                 f"create function lvl102_{level}() returns int as "
                 f"'begin raise {level} ''x''; return 1; end' language plpgsql;"

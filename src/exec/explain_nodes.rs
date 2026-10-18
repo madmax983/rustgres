@@ -984,6 +984,7 @@ pub(crate) fn pg_anti_scan_stmt(
         limit: None,
         offset: None,
         for_update: false,
+        lock_clause: false,
         for_update_of: vec![],
         set_op: None,
         dead_rtes: 0,

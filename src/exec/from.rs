@@ -15,6 +15,10 @@ pub(crate) fn build_from(
     from: &[FromItem],
     where_: Option<&Expr>,
     need_prov: bool,
+    // v1.96: actual row-locking clause present (see build_source).
+    for_update: bool,
+    // v1.96 finishing pass: any locking clause incl. SHARE.
+    any_lock: bool,
     // v0.8: index-order scan hint for the single-table fast path; always
     // None when `from` has more than one item.
     order_hint: Option<&OrderHint>,
@@ -37,6 +41,8 @@ pub(crate) fn build_from(
             &from[0],
             where_,
             need_prov,
+            for_update,
+            any_lock,
             order_hint,
             early_limit,
             &[],
@@ -55,7 +61,18 @@ pub(crate) fn build_from(
         // one item. Implicit LATERAL for comma joins (`FROM t, f(t.x)`)
         // is handled in the Join arm of `build_source` below, where the
         // left row is in scope when the function is evaluated.
-        let (s2, mut r2) = build_source(q, outer, item, where_, need_prov, None, None, &[])?;
+        let (s2, mut r2) = build_source(
+            q,
+            outer,
+            item,
+            where_,
+            need_prov,
+            for_update,
+            any_lock,
+            None,
+            None,
+            &[],
+        )?;
         // Comma joins are inner joins: a WHERE conjunct that mentions only
         // this item's columns can filter its rows before the cross product.
         // (Qualified refs must name a qualifier from this item and from no

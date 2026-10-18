@@ -164,6 +164,29 @@ pub(crate) fn from_schema_item(
                 out.push(apply_aliases(schema)?);
                 return Ok(());
             }
+            // v1.96: information_schema privilege views.
+            let priv_view_schema = match name.as_str() {
+                "information_schema.table_privileges" => Some(info_table_privileges_schema()),
+                "information_schema.role_table_grants" => {
+                    Some(info_table_privileges_scan_schema_rtg())
+                }
+                "information_schema.column_privileges" => Some(info_column_privileges_schema()),
+                "information_schema.enabled_roles" => Some(info_enabled_roles_schema()),
+                "information_schema.applicable_roles" => Some(info_applicable_roles_schema()),
+                _ => None,
+            };
+            if let Some(s0) = priv_view_schema {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let schema: Vec<QCol> = s0
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                out.push(apply_aliases(schema)?);
+                return Ok(());
+            }
             // v0.9: views describe as their stored SELECT's schema.
             if let Some(view) = eng.db.find_view(name, snap, own) {
                 let stmt = parse_statement(&view.query).map_err(sql_err)?;
@@ -250,6 +273,64 @@ pub(crate) fn from_schema_item(
             if name == "pg_sequences" && eng.db.find_table(name, snap, &[own], session).is_none() {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());
                 let schema: Vec<QCol> = pg_sequences_schema()
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                out.push(apply_aliases(schema)?);
+                return Ok(());
+            }
+            // v1.95: pg_policies / pg_policy are virtual too.
+            if matches!(name.as_str(), "pg_policies" | "pg_policy")
+                && eng.db.find_table(name, snap, &[own], session).is_none()
+            {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let raw = if name == "pg_policies" {
+                    pg_policies_schema()
+                } else {
+                    pg_policy_schema()
+                };
+                let schema: Vec<QCol> = raw
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                out.push(apply_aliases(schema)?);
+                return Ok(());
+            }
+            // v1.96: large-object + namespace + default-ACL +
+            // dependency virtual catalogs.
+            if matches!(
+                name.as_str(),
+                "pg_largeobject"
+                    | "pg_largeobject_metadata"
+                    | "pg_namespace"
+                    | "pg_default_acl"
+                    | "pg_shdepend"
+                    | "pg_aios"
+                    | "pg_backend_memory_contexts"
+                    | "pg_shmem_allocations"
+                    | "pg_stat_activity"
+                    | "pg_database"
+            ) && eng.db.find_table(name, snap, &[own], session).is_none()
+            {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let (raw, _) = match name.as_str() {
+                    "pg_largeobject" | "pg_largeobject_metadata" => {
+                        pg_largeobject_scan(&eng.db, &name)
+                    }
+                    "pg_database" => (pg_database_schema(), Vec::new()),
+                    "pg_namespace" => pg_namespace_scan(&eng.db),
+                    "pg_default_acl" => pg_default_acl_scan(&eng.db),
+                    "pg_shdepend" => pg_shdepend_scan(&eng.db, snap, own, session),
+                    "pg_stat_activity" => (pg_stat_activity_schema(), Vec::new()),
+                    _ => pg_empty_stub_scan(&name),
+                };
+                let schema: Vec<QCol> = raw
                     .into_iter()
                     .map(|mut c| {
                         c.qual = qual.clone();
@@ -887,7 +968,11 @@ pub(crate) fn expr_col_name_strength(e: &Expr) -> (String, u8) {
         Expr::CastNamed { expr, name } => {
             let (inner, s) = expr_col_name_strength(expr);
             if s <= 1 {
-                (name.clone(), 1)
+                // v1.96: an array type's internal name (_int8) names
+                // the column after its element type (PG19
+                // FigureColname for TypeCast): '{1}'::int4[]::int8[]
+                // -> "int8".
+                (name.strip_prefix('_').unwrap_or(name).to_string(), 1)
             } else {
                 (inner, s)
             }
@@ -901,7 +986,10 @@ pub(crate) fn expr_col_name_strength(e: &Expr) -> (String, u8) {
             }
             let (inner, s) = expr_col_name_strength(expr);
             if s <= 1 {
-                (to.pg_typname(), 1)
+                // v1.96: array casts name the column after the
+                // element type (PG19 FigureColname): ::int8[] -> int8.
+                let tn = to.pg_typname();
+                (tn.strip_prefix('_').map(|s| s.to_string()).unwrap_or(tn), 1)
             } else {
                 (inner, s)
             }
@@ -945,9 +1033,27 @@ pub(crate) fn expr_col_name_strength(e: &Expr) -> (String, u8) {
             2,
         ),
         Expr::Func { name, .. } if name == "__is_json" => ("?column?".to_string(), 0),
+        // v1.94: operator desugars (`<->` / `!!`) are not function
+        // calls in PG's FigureColname — the column is ?column?.
+        Expr::Func { name, .. } if name == "__tsquery_phrase" || name == "__tsquery_not" => {
+            ("?column?".to_string(), 0)
+        }
         Expr::Func { name, .. } => (name.clone(), 2),
         // v0.55: PG names an unaliased CASE output column "case".
-        Expr::Case { .. } => ("case".to_string(), 2),
+        // v1.96 (parse_target.c T_CaseExpr): the name comes from the
+        // ELSE result when it carries one (strength > 1), else "case"
+        // at strength 1.
+        Expr::Case { else_, .. } => match else_ {
+            Some(e) => {
+                let (n, s) = expr_col_name_strength(e);
+                if s <= 1 {
+                    ("case".to_string(), 1)
+                } else {
+                    (n, s)
+                }
+            }
+            None => ("case".to_string(), 1),
+        },
         // v1.43: PG19's `FigureColnameInternal` (parse_target.c,
         // `T_RowExpr`): "make ROW() act like a function" — the column
         // name is "row" at strength 2 (so a cast over ROW() keeps
@@ -1149,6 +1255,13 @@ pub(crate) fn expr_type(
         // is the domain's base type.
         Expr::CastNamed { expr, name } => {
             expr_type(eng, snap, own, session, schemas, outer, ctes, expr)?;
+            // v1.96: builtin cast-only types handled inside
+            // eval_cast_named (aclitem rides as text; regrole as oid).
+            match name.as_str() {
+                "aclitem" => return Ok(ColType::Text),
+                "regrole" => return Ok(ColType::Int),
+                _ => {}
+            }
             match eng.db.types.get(name) {
                 Some(st) if st.composite.is_some() => Ok(ColType::Composite),
                 // v1.88: casts to user-defined range types.

@@ -342,6 +342,7 @@ pub(crate) fn exec_explain_analyze(
             wctx: None,
             srf_vals: Vec::new(),
             priv_scopes: Vec::new(),
+            priv_role_override: None,
             hashed_exists: Rc::new(RefCell::new(HashMap::new())),
             immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
             plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
@@ -404,8 +405,10 @@ pub(crate) fn value_coltype(v: &Value) -> ColType {
         Value::Bytea(_) => ColType::Bytea,
         Value::BitString(_) => ColType::Bit, // v1.39
         Value::Uuid(_) => ColType::Uuid,
-        Value::PgLsn(_) => ColType::PgLsn,   // v0.64
-        Value::Record(_) => ColType::Record, // v0.73
+        Value::PgLsn(_) => ColType::PgLsn,       // v0.64
+        Value::Record(_) => ColType::Record,     // v0.73
+        Value::TsVector(_) => ColType::TsVector, // v1.94
+        Value::TsQuery(_) => ColType::TsQuery,   // v1.94
         // v0.79: array values report their array type.
         Value::Array(a) => ColType::Array(a.elem),
         Value::Null => ColType::Text,
@@ -502,12 +505,18 @@ pub(crate) fn exec_analyze_core(
     session: u64,
     role: &str,
     table: &Option<String>,
+    notices: &mut Vec<String>,
 ) -> Result<(), ExecError> {
     // v0.11: ANALYZE requires ownership (or superuser), like PostgreSQL.
     let is_owner = |eng: &Engine, n: &str| {
         eng.db
             .find_table(n, snap, &[own], session)
-            .map(|t| t.owner == role || crate::storage::is_superuser_snap(&eng.db, role, snap, own))
+            .map(|t| {
+                t.owner == role
+                    || crate::storage::is_superuser_snap(&eng.db, role, snap, own)
+                    // v1.96: MAINTAIN privilege permits ANALYZE (PG19).
+                    || crate::storage::table_privs(&eng.db, role, t, snap, own) & 512 != 0
+            })
             .unwrap_or(false)
     };
     let names: Vec<String> = match table {
@@ -519,10 +528,12 @@ pub(crate) fn exec_analyze_core(
                 ));
             }
             if !is_owner(eng, n) {
-                return Err(exec_err(
-                    "42501",
-                    format!("permission denied: must be owner of table \"{}\"", n),
+                // v1.96: PG19 ANALYZE warns and skips (no error).
+                notices.push(format!(
+                    "permission denied to analyze \"{}\", skipping it",
+                    n
                 ));
+                return Ok(());
             }
             vec![n.clone()]
         }
@@ -552,7 +563,15 @@ pub(crate) fn exec_analyze(
     ctx: &mut StmtCtx,
     table: &Option<String>,
 ) -> Result<ExecResult, ExecError> {
-    exec_analyze_core(eng, ctx.snap, ctx.own, ctx.session, ctx.role, table)?;
+    exec_analyze_core(
+        eng,
+        ctx.snap,
+        ctx.own,
+        ctx.session,
+        ctx.role,
+        table,
+        &mut ctx.notices,
+    )?;
     Ok(ExecResult::Command {
         tag: "ANALYZE".to_string(),
     })
