@@ -110,12 +110,18 @@ fn join_kept_when_needed() {
         !lines.iter().any(|l| l.contains("Nested Loop")),
         "{lines:?}"
     );
-    // Ambiguous unqualified reference: conservative keep.
-    let lines = plan_lines(
+    // Ambiguous unqualified reference: PG19 parse analysis rejects it
+    // (42702) before join removal ever runs — and this engine's plain
+    // SELECT errors identically. v1.98: EXPLAIN now runs that analysis,
+    // so the old plan-tolerant expectation is corrected to the error
+    // (the removal pass's conservative-keep rule for ambiguous refs is
+    // unreachable from SQL after analysis, by design in PG too).
+    let err = run(
         &mut eng,
         "EXPLAIN (COSTS OFF) SELECT a.* FROM a LEFT JOIN b ON a.b_id = b.id WHERE id > 0",
-    );
-    assert!(lines.iter().any(|l| l.contains("Nested Loop")), "{lines:?}");
+    )
+    .unwrap_err();
+    assert_eq!(err.code, "42702");
     // SELECT list references the inner range.
     let lines = plan_lines(
         &mut eng,

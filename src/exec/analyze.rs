@@ -285,6 +285,8 @@ pub(crate) fn explain_rows(
     // (planning-only path; ANALYZE instrumentation stays out of scope).
     verbose: bool,
 ) -> Result<Vec<Row>, ExecError> {
+    // v1.98: full analysis before planning (see validate_explain_select).
+    validate_explain_select(q, sel)?;
     // v1.08: COSTS OFF selects the PG-text plan rendering.
     let plan = plan_select(&*q.eng, sel, q.snap, q.own, q.session, &[], !costs, verbose)?;
     let mut lines = Vec::new();

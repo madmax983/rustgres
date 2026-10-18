@@ -270,6 +270,9 @@ mod v195_rls_tests;
 #[path = "test_mods/v197_tests.rs"]
 mod v197_tests;
 #[cfg(test)]
+#[path = "test_mods/v198_explain_analysis_tests.rs"]
+mod v198_explain_analysis_tests;
+#[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;
 

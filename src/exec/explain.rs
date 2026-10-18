@@ -3817,3 +3817,1007 @@ pub(crate) fn pg_hash_clauses(
     }
     out
 }
+
+// ============================================================================
+// v1.98: EXPLAIN full analysis — planning-only EXPLAIN runs the same
+// static analysis the executor's describe/privilege layer performs, so
+// error behavior matches PG19 parse analysis (scope.md in
+// hidden_files/v198). Before this pass, `plan_select` only deparsed:
+// unknown functions/operators/columns, bad cast types and privilege
+// denials all produced a plan where PG19 (and this engine's own SELECT
+// on a non-empty table) raise 42883/42703/42704/42501.
+//
+// The pass mirrors `run_select`'s order: view/column privilege checks
+// first (the exact `check_view_privs` / `check_select_col_privs` the
+// executor runs), then expression resolution over every clause using
+// describe.rs's `expr_type` machinery (function resolution via
+// `func_result_type`, user operators via `resolve_user_operator`,
+// arithmetic operand pairs via `combine_arith_types`). Parameter
+// typing (42P02) is suppressed: bound statements arrive substituted,
+// and free-parameter typing belongs to the extended-protocol describe
+// path, not to EXPLAIN.
+// ============================================================================
+
+/// v1.98: recursion budget for the EXPLAIN analysis pass (subqueries,
+/// derived tables, CTE bodies, view bodies). Beyond it the pass stops
+/// descending (the plan path still runs); it never errors on depth.
+pub(crate) const VX_MAX_DEPTH: usize = 48;
+
+pub(crate) fn validate_explain_select(q: &mut Q, stmt: &SelectStmt) -> Result<(), ExecError> {
+    let mut visiting: Vec<String> = Vec::new();
+    vx_select(q, stmt, &[], &[], 0, &mut visiting)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vx_select(
+    q: &mut Q,
+    stmt: &SelectStmt,
+    outer_defs: &[CteDef],
+    outer_schemas: &[&[QCol]],
+    depth: usize,
+    visiting: &mut Vec<String>,
+) -> Result<(), ExecError> {
+    if depth > VX_MAX_DEPTH {
+        return Ok(());
+    }
+    // Effective CTE definitions visible at this level (outer ++ own,
+    // definition order; later entries shadow on lookup).
+    let mut visible: Vec<CteDef> = outer_defs.to_vec();
+    visible.extend(stmt.with.iter().cloned());
+    // CTE bodies are analyzed at their definition level (PG19
+    // parse_cte.c): each body sees outer CTEs and earlier siblings.
+    for (i, def) in stmt.with.iter().enumerate() {
+        let mut body_outer: Vec<CteDef> = outer_defs.to_vec();
+        body_outer.extend(stmt.with.iter().take(i).cloned());
+        match &def.body {
+            CteBody::Simple(s) => vx_select(q, s, &body_outer, outer_schemas, depth + 1, visiting)?,
+            CteBody::Union { left, right, .. } => {
+                vx_select(q, left, &body_outer, outer_schemas, depth + 1, visiting)?;
+                vx_select(q, right, &body_outer, outer_schemas, depth + 1, visiting)?;
+            }
+            // Data-modifying CTE bodies are validated by their own
+            // execution paths (and EXPLAIN ANALYZE executes them).
+            CteBody::Dml(_) => {}
+        }
+    }
+    // Set-operation carrier: branches are their own query levels (the
+    // executor privilege-checks each branch, not the carrier).
+    if let Some(root) = &stmt.set_op {
+        vx_select(q, &root.left, &visible, outer_schemas, depth + 1, visiting)?;
+        for b in &root.chain {
+            vx_select(q, &b.right, &visible, outer_schemas, depth + 1, visiting)?;
+        }
+        // The root ORDER BY resolves against the combined output
+        // columns (names/types from the leftmost branch).
+        if !stmt.order_by.is_empty() {
+            let cols = describe_select_outer(
+                &*q.eng,
+                q.snap,
+                q.own,
+                q.session,
+                &root.left,
+                &visible,
+                &[],
+                outer_schemas,
+            )?;
+            let schema: Vec<QCol> = cols
+                .into_iter()
+                .enumerate()
+                .map(|(i, (name, ty))| QCol {
+                    qual: String::new(),
+                    name,
+                    ty,
+                    hidden: false,
+                    src_ord: i as u32,
+                })
+                .collect();
+            let refs: Vec<&[QCol]> = vec![schema.as_slice()];
+            for t in &stmt.order_by {
+                vx_expr(
+                    q,
+                    &t.expr,
+                    &refs,
+                    outer_schemas,
+                    &visible,
+                    depth + 1,
+                    visiting,
+                )?;
+            }
+        }
+        return Ok(());
+    }
+    // (1) Privileges, in `run_select`'s exact order and shape.
+    check_view_privs(q, stmt)?;
+    q.priv_scopes.push(priv_scope_for(q, stmt));
+    let chk = check_select_col_privs(q, stmt);
+    q.priv_scopes.pop();
+    chk?;
+    // (2) FROM schemas (view/derived output columns) — the same
+    // builder the describe path uses. If schema construction itself
+    // fails (recursive CTEs and scalar functions in FROM are shapes
+    // it cannot build but the planner handles), the level is left
+    // unvalidated rather than inventing an error: relation existence
+    // and friends remain the plan path's verdict, exactly as before
+    // this pass existed.
+    let schemas = match from_schemas(
+        &*q.eng,
+        q.snap,
+        q.own,
+        q.session,
+        &stmt.from,
+        &visible,
+        &[],
+        outer_schemas,
+        &[],
+    ) {
+        Ok(s) => s,
+        Err(_) => {
+            // Only view bodies are self-contained enough to validate
+            // without this level's schemas (a fresh level with no
+            // correlation scope) — and a schema failure caused by an
+            // invalid view body must not swallow that body's own
+            // analysis error. Derived tables, function arguments and
+            // join conditions all resolve against the very schemas
+            // that failed to build, so they are left to the plan path.
+            for item in &stmt.from {
+                if matches!(item, FromItem::Table { .. }) {
+                    vx_from_item(q, item, &[], outer_schemas, &visible, depth, visiting)?;
+                }
+            }
+            return Ok(());
+        }
+    };
+    let refs: Vec<&[QCol]> = schemas.iter().map(|s| s.as_slice()).collect();
+    // FROM items: nested subqueries, function arguments, join
+    // conditions, and the stored queries of views named in FROM.
+    for item in &stmt.from {
+        vx_from_item(q, item, &refs, outer_schemas, &visible, depth, visiting)?;
+    }
+    // Target list.
+    for item in &stmt.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            vx_expr(q, expr, &refs, outer_schemas, &visible, depth, visiting)?;
+        }
+    }
+    // WHERE (boolean-typed in PG19).
+    if let Some(w) = &stmt.where_ {
+        vx_expr(q, w, &refs, outer_schemas, &visible, depth, visiting)?;
+        vx_bool_clause(q, w, &refs, outer_schemas, &visible, "WHERE")?;
+    }
+    for set in &stmt.group_by {
+        for e in set {
+            let key = vx_alias_subst(stmt, &refs, e).unwrap_or(e);
+            vx_expr(q, key, &refs, outer_schemas, &visible, depth, visiting)?;
+        }
+    }
+    if let Some(h) = &stmt.having {
+        vx_expr(q, h, &refs, outer_schemas, &visible, depth, visiting)?;
+        vx_bool_clause(q, h, &refs, outer_schemas, &visible, "HAVING")?;
+    }
+    for e in &stmt.distinct_on {
+        vx_expr(q, e, &refs, outer_schemas, &visible, depth, visiting)?;
+    }
+    for t in &stmt.order_by {
+        let key = vx_alias_subst(stmt, &refs, &t.expr).unwrap_or(&t.expr);
+        vx_expr(q, key, &refs, outer_schemas, &visible, depth, visiting)?;
+    }
+    // Aggregate/grouping validation (42803), mirroring the executor's
+    // grouped-evaluation rule.
+    vx_grouping(q, stmt, &refs, outer_schemas, &visible)?;
+    Ok(())
+}
+
+/// v1.98: PG19 resolves a bare unqualified name in GROUP BY and
+/// ORDER BY against the query level's output column aliases when no
+/// input column bears the name (parse_clause.c: a GROUP BY name first
+/// seeks an input column, then an unambiguous output name). The
+/// executor does not implement alias group keys, but PG19 analysis
+/// accepts them, so EXPLAIN analysis validates the aliased target
+/// expression in the key's place. Ambiguous aliases (more than one
+/// matching target) fall back to plain key validation.
+fn vx_alias_subst<'s>(stmt: &'s SelectStmt, schemas: &[&[QCol]], e: &Expr) -> Option<&'s Expr> {
+    let Expr::Column { table: None, name } = e else {
+        return None;
+    };
+    if schemas
+        .iter()
+        .flat_map(|s| s.iter())
+        .any(|c| &c.name == name)
+    {
+        return None;
+    }
+    let mut hits = stmt.items.iter().filter_map(|item| match item {
+        SelectItem::Expr { expr, alias } if alias.as_deref() == Some(name.as_str()) => Some(expr),
+        _ => None,
+    });
+    match (hits.next(), hits.next()) {
+        (Some(x), None) => Some(x),
+        _ => None,
+    }
+}
+
+/// v1.98: PG19 parse analysis (parse_agg.c) rejects a bare column in
+/// the target list / HAVING of an aggregate query when it is not
+/// group-bound — the same rule the executor's `grouped_col_value`
+/// enforces per group (42803). Conservative by construction:
+/// grouping-sets queries are exempt (PG evaluates non-set columns as
+/// NULL there), ordinal GROUP BY (`GROUP BY 1`) disables the check
+/// (ordinals denote target expressions), unresolvable columns are
+/// skipped (already reported as 42703), and subqueries are separate
+/// query levels. Functional-dependency (GROUP BY PK) relief is NOT
+/// applied — the executor does not apply it either.
+fn vx_grouping(
+    q: &Q,
+    stmt: &SelectStmt,
+    schemas: &[&[QCol]],
+    outer: &[&[QCol]],
+    ctes: &[CteDef],
+) -> Result<(), ExecError> {
+    if stmt.group_by_sets {
+        return Ok(());
+    }
+    let flat: Vec<&Expr> = stmt.group_by.iter().flatten().collect();
+    if flat
+        .iter()
+        .any(|e| matches!(e, Expr::Literal(Literal::Int(_))))
+    {
+        return Ok(());
+    }
+    fn has_agg(q: &Q, e: &Expr) -> bool {
+        match e {
+            Expr::Agg { .. } | Expr::WithinGroup { .. } => true,
+            Expr::Func { name, args } => {
+                let base = name.rsplit('.').next().unwrap_or(name);
+                q.eng.db.aggregates.contains_key(name)
+                    || q.eng.db.aggregates.contains_key(base)
+                    || args.iter().any(|a| has_agg(q, a))
+            }
+            Expr::ScalarSub(_)
+            | Expr::ArraySubquery(_)
+            | Expr::JsonArraySubq { .. }
+            | Expr::InSub { .. }
+            | Expr::Quantified { .. }
+            | Expr::Exists { .. } => false,
+            _ => expr_children(e).into_iter().any(|c| has_agg(q, c)),
+        }
+    }
+    let is_agg_query = !flat.is_empty()
+        || stmt.items.iter().any(|i| match i {
+            SelectItem::Expr { expr, .. } => has_agg(q, expr),
+            _ => false,
+        })
+        || stmt.having.as_ref().is_some_and(|h| has_agg(q, h));
+    if !is_agg_query {
+        return Ok(());
+    }
+    let scopes: Vec<Scope> = schemas
+        .iter()
+        .map(|s| Scope {
+            schema: s,
+            row: &[],
+            prov: None,
+        })
+        .collect();
+    // (frame, idx) pairs the GROUP BY columns resolve to.
+    let mut bound: Vec<(usize, usize)> = Vec::new();
+    for g in &flat {
+        if let Expr::Column { table, name } = g {
+            if let Ok(rc) = resolve_col(&scopes, table.as_deref(), name) {
+                bound.push(rc);
+            }
+        }
+    }
+    fn walk(
+        q: &Q,
+        e: &Expr,
+        in_agg: bool,
+        scopes: &[Scope],
+        flat: &[&Expr],
+        bound: &[(usize, usize)],
+    ) -> Result<(), ExecError> {
+        match e {
+            Expr::Agg {
+                arg,
+                arg2,
+                agg_order_by,
+                filter,
+                ..
+            } => {
+                if let Some(a) = arg {
+                    walk(q, a, true, scopes, flat, bound)?;
+                }
+                if let Some(a) = arg2 {
+                    walk(q, a, true, scopes, flat, bound)?;
+                }
+                for t in agg_order_by {
+                    walk(q, &t.expr, true, scopes, flat, bound)?;
+                }
+                if let Some(f) = filter {
+                    walk(q, f, true, scopes, flat, bound)?;
+                }
+                Ok(())
+            }
+            Expr::WithinGroup {
+                direct_args,
+                within_order_by,
+                filter,
+                ..
+            } => {
+                for a in direct_args {
+                    walk(q, a, true, scopes, flat, bound)?;
+                }
+                for t in within_order_by {
+                    walk(q, &t.expr, true, scopes, flat, bound)?;
+                }
+                if let Some(f) = filter {
+                    walk(q, f, true, scopes, flat, bound)?;
+                }
+                Ok(())
+            }
+            Expr::Func { name, args } => {
+                let base = name.rsplit('.').next().unwrap_or(name);
+                if base.eq_ignore_ascii_case("grouping") {
+                    return Ok(());
+                }
+                let inner = in_agg
+                    || q.eng.db.aggregates.contains_key(name)
+                    || q.eng.db.aggregates.contains_key(base);
+                for a in args {
+                    walk(q, a, inner, scopes, flat, bound)?;
+                }
+                Ok(())
+            }
+            Expr::Column { table, name } => {
+                if in_agg {
+                    return Ok(());
+                }
+                let Ok(rc) = resolve_col(scopes, table.as_deref(), name) else {
+                    return Ok(());
+                };
+                if bound.contains(&rc) {
+                    return Ok(());
+                }
+                // Structural fallback, mirroring grouped_col_value:
+                // a GROUP BY entry that IS this column expression.
+                let probe = Expr::Column {
+                    table: table.clone(),
+                    name: name.clone(),
+                };
+                if flat.iter().any(|g| **g == probe) {
+                    return Ok(());
+                }
+                Err(exec_err(
+                    "42803",
+                    format!(
+                        "column \"{}\" must appear in the GROUP BY clause or be used in an aggregate function",
+                        name
+                    ),
+                ))
+            }
+            Expr::ScalarSub(_)
+            | Expr::ArraySubquery(_)
+            | Expr::JsonArraySubq { .. }
+            | Expr::InSub { .. }
+            | Expr::Quantified { .. }
+            | Expr::Exists { .. }
+            | Expr::Literal(_)
+            | Expr::Param(_)
+            | Expr::ResolvedCol { .. }
+            | Expr::WholeRow { .. } => Ok(()),
+            _ => {
+                for c in expr_children(e) {
+                    walk(q, c, in_agg, scopes, flat, bound)?;
+                }
+                Ok(())
+            }
+        }
+    }
+    let _ = (outer, ctes);
+    for item in &stmt.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            walk(q, expr, false, &scopes, &flat, &bound)?;
+        }
+    }
+    if let Some(h) = &stmt.having {
+        walk(q, h, false, &scopes, &flat, &bound)?;
+    }
+    Ok(())
+}
+
+/// v1.98: immediate child expressions of `e` (no subquery descent).
+/// Used by the grouping walk; the resolution walk (`vx_expr`) spells
+/// its recursion out per variant instead.
+fn expr_children(e: &Expr) -> Vec<&Expr> {
+    let mut out: Vec<&Expr> = Vec::new();
+    match e {
+        Expr::Arith { left, right, .. }
+        | Expr::Concat(left, right)
+        | Expr::Cmp { left, right, .. }
+        | Expr::IsDistinctFrom { left, right, .. }
+        | Expr::UserOp { left, right, .. }
+        | Expr::JsonOp { left, right, .. } => {
+            out.push(left);
+            out.push(right);
+        }
+        Expr::And(a, b) | Expr::Or(a, b) => {
+            out.push(a);
+            out.push(b);
+        }
+        Expr::Not(x)
+        | Expr::Neg(x)
+        | Expr::BitNot(x)
+        | Expr::IsNull { expr: x, .. }
+        | Expr::IsBool { expr: x, .. }
+        | Expr::Cast { expr: x, .. }
+        | Expr::CastNamed { expr: x, .. }
+        | Expr::FieldAccess { expr: x, .. }
+        | Expr::Extract { from: x, .. }
+        | Expr::NamedArg { expr: x, .. } => out.push(x),
+        Expr::AtTimeZone { expr, zone } => {
+            out.push(expr);
+            if let Some(z) = zone {
+                out.push(z);
+            }
+        }
+        Expr::Row(elems) | Expr::ArrayCtor { elems, .. } => out.extend(elems.iter()),
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            out.push(expr);
+            out.push(pattern);
+            if let Some(x) = escape {
+                out.push(x);
+            }
+        }
+        Expr::Regex { expr, pattern, .. } => {
+            out.push(expr);
+            out.push(pattern);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            out.push(expr);
+            out.push(low);
+            out.push(high);
+        }
+        Expr::Func { args, .. } => out.extend(args.iter()),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                out.push(o);
+            }
+            for (k, v) in whens {
+                out.push(k);
+                out.push(v);
+            }
+            if let Some(x) = else_ {
+                out.push(x);
+            }
+        }
+        Expr::Agg {
+            arg,
+            arg2,
+            agg_order_by,
+            filter,
+            ..
+        } => {
+            if let Some(a) = arg {
+                out.push(a);
+            }
+            if let Some(a) = arg2 {
+                out.push(a);
+            }
+            for t in agg_order_by {
+                out.push(&t.expr);
+            }
+            if let Some(f) = filter {
+                out.push(f);
+            }
+        }
+        Expr::WithinGroup {
+            direct_args,
+            within_order_by,
+            filter,
+            ..
+        } => {
+            out.extend(direct_args.iter());
+            for t in within_order_by {
+                out.push(&t.expr);
+            }
+            if let Some(f) = filter {
+                out.push(f);
+            }
+        }
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            filter,
+            ..
+        } => {
+            out.extend(args.iter());
+            out.extend(partition_by.iter());
+            for t in order_by {
+                out.push(&t.expr);
+            }
+            if let Some(f) = filter {
+                out.push(f);
+            }
+        }
+        Expr::Subscript { array, indices } => {
+            out.push(array);
+            out.extend(indices.iter());
+        }
+        Expr::Slice { array, bounds } => {
+            out.push(array);
+            for (l, u) in bounds {
+                if let Some(x) = l {
+                    out.push(x);
+                }
+                if let Some(x) = u {
+                    out.push(x);
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// v1.98: PG19 requires WHERE/HAVING arguments to be boolean
+/// (parse_expr.c `transformBoolExpr`-family check in parse analysis:
+/// 42804 "argument of WHERE must be type boolean, not type X").
+/// Only a *known* non-boolean type fires; unresolvable shapes were
+/// already reported by `vx_expr`, and parameter-bearing clauses are
+/// exempt (their types live in the describe path).
+fn vx_bool_clause(
+    q: &Q,
+    e: &Expr,
+    schemas: &[&[QCol]],
+    outer: &[&[QCol]],
+    ctes: &[CteDef],
+    clause: &str,
+) -> Result<(), ExecError> {
+    if vx_has_param(e) {
+        return Ok(());
+    }
+    match expr_type(&*q.eng, q.snap, q.own, q.session, schemas, outer, ctes, e) {
+        Ok(ColType::Bool) | Err(_) => Ok(()),
+        Ok(t) => Err(exec_err(
+            "42804",
+            format!(
+                "argument of {} must be type boolean, not type {}",
+                clause,
+                t.sql_name()
+            ),
+        )),
+    }
+}
+
+fn vx_has_param(e: &Expr) -> bool {
+    match e {
+        Expr::Param(_) => true,
+        Expr::Arith { left, right, .. }
+        | Expr::Concat(left, right)
+        | Expr::Cmp { left, right, .. }
+        | Expr::IsDistinctFrom { left, right, .. }
+        | Expr::UserOp { left, right, .. }
+        | Expr::JsonOp { left, right, .. } => vx_has_param(left) || vx_has_param(right),
+        Expr::And(a, b) | Expr::Or(a, b) => vx_has_param(a) || vx_has_param(b),
+        Expr::Not(x) | Expr::Neg(x) | Expr::BitNot(x) | Expr::IsNull { expr: x, .. } => {
+            vx_has_param(x)
+        }
+        Expr::Cast { expr, .. } | Expr::CastNamed { expr, .. } | Expr::FieldAccess { expr, .. } => {
+            vx_has_param(expr)
+        }
+        Expr::Func { args, .. } => args.iter().any(vx_has_param),
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vx_from_item(
+    q: &mut Q,
+    item: &FromItem,
+    schemas: &[&[QCol]],
+    outer_schemas: &[&[QCol]],
+    visible: &[CteDef],
+    depth: usize,
+    visiting: &mut Vec<String>,
+) -> Result<(), ExecError> {
+    match item {
+        FromItem::Table { name, .. } => {
+            // A view named in FROM: PG analysis expands and analyzes
+            // the view's stored query. Tables and CTE names need no
+            // descent (CTE bodies were validated at definition).
+            if q.ctes.iter().any(|b| b.name == *name) {
+                return Ok(());
+            }
+            if q.eng
+                .db
+                .find_table(name, q.snap, &q.all_xids, q.session)
+                .is_some()
+            {
+                return Ok(());
+            }
+            let view = q.eng.db.find_view(name, q.snap, q.own).cloned();
+            if let Some(v) = view {
+                if visiting.iter().any(|n| n == name) {
+                    return Ok(());
+                }
+                if let Ok(Stmt::Select(sel)) = parse_statement(&v.query) {
+                    visiting.push(name.clone());
+                    // The view's internals are analyzed as its owner
+                    // (definer rights), like execution's expansion,
+                    // unless security_invoker.
+                    let saved = q.priv_role_override.clone();
+                    if !v.security_invoker {
+                        q.priv_role_override = Some(v.owner.clone());
+                    }
+                    let r = vx_select(q, &sel, &[], &[], depth + 1, visiting);
+                    q.priv_role_override = saved;
+                    visiting.pop();
+                    r?;
+                }
+            }
+            Ok(())
+        }
+        FromItem::Derived { sub, lateral, .. } => {
+            // A derived table sees enclosing levels; a LATERAL one
+            // also sees this level's ranges.
+            let mut sub_outer: Vec<&[QCol]> = Vec::new();
+            if *lateral {
+                sub_outer.extend_from_slice(schemas);
+            }
+            sub_outer.extend_from_slice(outer_schemas);
+            vx_select(q, sub, visible, &sub_outer, depth + 1, visiting)
+        }
+        FromItem::Values { rows, lateral, .. } => {
+            let refs: &[&[QCol]] = if *lateral { schemas } else { outer_schemas };
+            let out: &[&[QCol]] = if *lateral { outer_schemas } else { &[] };
+            for row in rows {
+                for e in row {
+                    vx_expr(q, e, refs, out, visible, depth, visiting)?;
+                }
+            }
+            Ok(())
+        }
+        FromItem::Function { args, .. } => {
+            // Table-function arguments resolve against enclosing
+            // levels plus this level's ranges (implicit LATERAL).
+            for a in args {
+                vx_expr(q, a, schemas, outer_schemas, visible, depth, visiting)?;
+            }
+            Ok(())
+        }
+        FromItem::Join {
+            left,
+            right,
+            on,
+            using: _,
+            ..
+        } => {
+            vx_from_item(q, left, schemas, outer_schemas, visible, depth, visiting)?;
+            vx_from_item(q, right, schemas, outer_schemas, visible, depth, visiting)?;
+            if let Some(on) = on {
+                vx_expr(q, on, schemas, outer_schemas, visible, depth, visiting)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// v1.98: type one resolution-bearing node via describe's `expr_type`.
+/// 42P02 (parameter typing) is suppressed by design (see header).
+fn vx_node_type(
+    q: &Q,
+    e: &Expr,
+    schemas: &[&[QCol]],
+    outer: &[&[QCol]],
+    ctes: &[CteDef],
+) -> Result<(), ExecError> {
+    match expr_type(&*q.eng, q.snap, q.own, q.session, schemas, outer, ctes, e) {
+        Ok(_) => Ok(()),
+        Err(err) if err.code == "42P02" => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vx_expr(
+    q: &mut Q,
+    e: &Expr,
+    schemas: &[&[QCol]],
+    outer: &[&[QCol]],
+    visible: &[CteDef],
+    depth: usize,
+    visiting: &mut Vec<String>,
+) -> Result<(), ExecError> {
+    // Subqueries first (their own query levels).
+    match e {
+        Expr::ScalarSub(sub) | Expr::ArraySubquery(sub) => {
+            let mut sub_outer: Vec<&[QCol]> = Vec::new();
+            sub_outer.extend_from_slice(schemas);
+            sub_outer.extend_from_slice(outer);
+            return vx_select(q, sub, visible, &sub_outer, depth + 1, visiting);
+        }
+        Expr::JsonArraySubq { query, .. } => {
+            let mut sub_outer: Vec<&[QCol]> = Vec::new();
+            sub_outer.extend_from_slice(schemas);
+            sub_outer.extend_from_slice(outer);
+            return vx_select(q, query, visible, &sub_outer, depth + 1, visiting);
+        }
+        _ => {}
+    }
+    // v1.98: arithmetic pair resolution. `expr_type`'s Arith arm is
+    // only trusted when both operands are arith-typable:
+    // `arith_operand_type` has no arm for several shapes the executor
+    // evaluates fine (EXTRACT, subscripts, ...) and its fallthrough
+    // invents a "boolean <op> integer" error for them. Untypable
+    // operands skip the pair check; their children are still
+    // validated individually below.
+    if let Expr::Arith { op, left, right } = e {
+        let ao = |x: &Expr| -> Option<Option<ColType>> {
+            match arith_operand_type(
+                &*q.eng, q.snap, q.own, q.session, schemas, outer, visible, x, *op,
+            ) {
+                Ok(t) => Some(t),
+                Err(err) if err.code == "42P02" => Some(None),
+                Err(_) => None,
+            }
+        };
+        if let (Some(_), Some(_)) = (ao(left), ao(right)) {
+            vx_node_type(q, e, schemas, outer, visible)?;
+            // PG19 operator resolution for a *typed* text operand:
+            // `combine_arith_types`' unknown-literal arm coerces any
+            // Text operand to the numeric side, but PG only coerces
+            // unknown-type literals — a text column/expression paired
+            // with a numeric operand has no operator (42883).
+            // Literals (unknown type) and parameters are exempt.
+            let ty = |x: &Expr| -> Option<ColType> {
+                if matches!(x, Expr::Literal(_) | Expr::Param(_)) {
+                    None
+                } else {
+                    expr_type(
+                        &*q.eng, q.snap, q.own, q.session, schemas, outer, visible, x,
+                    )
+                    .ok()
+                }
+            };
+            if let (Some(lt), Some(rt)) = (ty(left), ty(right)) {
+                let text_numeric = (matches!(lt, ColType::Text) && numeric_rank(&rt).is_some())
+                    || (matches!(rt, ColType::Text) && numeric_rank(&lt).is_some());
+                if text_numeric {
+                    return Err(exec_err(
+                        "42883",
+                        format!(
+                            "operator does not exist: {} {} {}",
+                            lt.sql_name(),
+                            op.sql(),
+                            rt.sql_name()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    // Node-level resolution for the shapes `expr_type` fully checks.
+    // (Arith is handled by the gated pair check above.)
+    match e {
+        // `::oid` stays a CastNamed (oid values ride as integers, so
+        // oid is not a ColType) and `expr_type`'s CastNamed arm does
+        // not know it — but execution resolves it in eval_cast_named,
+        // so EXPLAIN analysis accepts it too. Other names go through
+        // the full catalog check (42704 for unknown types).
+        Expr::CastNamed { name, .. } => {
+            if name != "oid" {
+                vx_node_type(q, e, schemas, outer, visible)?;
+            }
+        }
+        Expr::Func { .. }
+        | Expr::UserOp { .. }
+        | Expr::Agg { .. }
+        | Expr::WithinGroup { .. }
+        | Expr::Window { .. }
+        | Expr::Column { .. }
+        | Expr::WholeRow { .. }
+        | Expr::Subscript { .. }
+        | Expr::Slice { .. }
+        | Expr::BitNot(_)
+        | Expr::Neg(_) => {
+            vx_node_type(q, e, schemas, outer, visible)?;
+        }
+        _ => {}
+    }
+    // Recurse into every child expression / subquery.
+    match e {
+        Expr::Arith { left, right, .. }
+        | Expr::Concat(left, right)
+        | Expr::Cmp { left, right, .. }
+        | Expr::IsDistinctFrom { left, right, .. }
+        | Expr::UserOp { left, right, .. }
+        | Expr::JsonOp { left, right, .. } => {
+            vx_expr(q, left, schemas, outer, visible, depth, visiting)?;
+            vx_expr(q, right, schemas, outer, visible, depth, visiting)?;
+        }
+        Expr::And(a, b) | Expr::Or(a, b) => {
+            vx_expr(q, a, schemas, outer, visible, depth, visiting)?;
+            vx_expr(q, b, schemas, outer, visible, depth, visiting)?;
+        }
+        Expr::Not(x)
+        | Expr::Neg(x)
+        | Expr::BitNot(x)
+        | Expr::IsNull { expr: x, .. }
+        | Expr::IsBool { expr: x, .. }
+        | Expr::Cast { expr: x, .. }
+        | Expr::CastNamed { expr: x, .. }
+        | Expr::FieldAccess { expr: x, .. }
+        | Expr::Extract { from: x, .. }
+        | Expr::NamedArg { expr: x, .. } => {
+            vx_expr(q, x, schemas, outer, visible, depth, visiting)?;
+        }
+        Expr::AtTimeZone { expr, zone } => {
+            vx_expr(q, expr, schemas, outer, visible, depth, visiting)?;
+            if let Some(z) = zone {
+                vx_expr(q, z, schemas, outer, visible, depth, visiting)?;
+            }
+        }
+        Expr::Row(elems) | Expr::ArrayCtor { elems, .. } => {
+            for x in elems {
+                vx_expr(q, x, schemas, outer, visible, depth, visiting)?;
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            vx_expr(q, expr, schemas, outer, visible, depth, visiting)?;
+            vx_expr(q, pattern, schemas, outer, visible, depth, visiting)?;
+            if let Some(x) = escape {
+                vx_expr(q, x, schemas, outer, visible, depth, visiting)?;
+            }
+        }
+        Expr::Regex { expr, pattern, .. } => {
+            vx_expr(q, expr, schemas, outer, visible, depth, visiting)?;
+            vx_expr(q, pattern, schemas, outer, visible, depth, visiting)?;
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            vx_expr(q, expr, schemas, outer, visible, depth, visiting)?;
+            vx_expr(q, low, schemas, outer, visible, depth, visiting)?;
+            vx_expr(q, high, schemas, outer, visible, depth, visiting)?;
+        }
+        Expr::Func { args, .. } => {
+            for a in args {
+                vx_expr(q, a, schemas, outer, visible, depth, visiting)?;
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                vx_expr(q, o, schemas, outer, visible, depth, visiting)?;
+            }
+            for (k, v) in whens {
+                vx_expr(q, k, schemas, outer, visible, depth, visiting)?;
+                vx_expr(q, v, schemas, outer, visible, depth, visiting)?;
+            }
+            if let Some(x) = else_ {
+                vx_expr(q, x, schemas, outer, visible, depth, visiting)?;
+            }
+        }
+        Expr::Agg {
+            arg,
+            arg2,
+            agg_order_by,
+            filter,
+            ..
+        } => {
+            if let Some(a) = arg {
+                vx_expr(q, a, schemas, outer, visible, depth, visiting)?;
+            }
+            if let Some(a) = arg2 {
+                vx_expr(q, a, schemas, outer, visible, depth, visiting)?;
+            }
+            for t in agg_order_by {
+                vx_expr(q, &t.expr, schemas, outer, visible, depth, visiting)?;
+            }
+            if let Some(f) = filter {
+                vx_expr(q, f, schemas, outer, visible, depth, visiting)?;
+            }
+        }
+        Expr::WithinGroup {
+            direct_args,
+            within_order_by,
+            filter,
+            ..
+        } => {
+            for a in direct_args {
+                vx_expr(q, a, schemas, outer, visible, depth, visiting)?;
+            }
+            for t in within_order_by {
+                vx_expr(q, &t.expr, schemas, outer, visible, depth, visiting)?;
+            }
+            if let Some(f) = filter {
+                vx_expr(q, f, schemas, outer, visible, depth, visiting)?;
+            }
+        }
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            filter,
+            ..
+        } => {
+            for a in args {
+                vx_expr(q, a, schemas, outer, visible, depth, visiting)?;
+            }
+            for a in partition_by {
+                vx_expr(q, a, schemas, outer, visible, depth, visiting)?;
+            }
+            for t in order_by {
+                vx_expr(q, &t.expr, schemas, outer, visible, depth, visiting)?;
+            }
+            if let Some(f) = filter {
+                vx_expr(q, f, schemas, outer, visible, depth, visiting)?;
+            }
+        }
+        Expr::Subscript { array, indices } => {
+            vx_expr(q, array, schemas, outer, visible, depth, visiting)?;
+            for i in indices {
+                vx_expr(q, i, schemas, outer, visible, depth, visiting)?;
+            }
+        }
+        Expr::Slice { array, bounds } => {
+            vx_expr(q, array, schemas, outer, visible, depth, visiting)?;
+            for (l, u) in bounds {
+                if let Some(x) = l {
+                    vx_expr(q, x, schemas, outer, visible, depth, visiting)?;
+                }
+                if let Some(x) = u {
+                    vx_expr(q, x, schemas, outer, visible, depth, visiting)?;
+                }
+            }
+        }
+        Expr::InSub { expr, sub, .. } => {
+            vx_expr(q, expr, schemas, outer, visible, depth, visiting)?;
+            let mut sub_outer: Vec<&[QCol]> = Vec::new();
+            sub_outer.extend_from_slice(schemas);
+            sub_outer.extend_from_slice(outer);
+            vx_select(q, sub, visible, &sub_outer, depth + 1, visiting)?;
+        }
+        Expr::Quantified { left, sub, .. } => {
+            vx_expr(q, left, schemas, outer, visible, depth, visiting)?;
+            let mut sub_outer: Vec<&[QCol]> = Vec::new();
+            sub_outer.extend_from_slice(schemas);
+            sub_outer.extend_from_slice(outer);
+            vx_select(q, sub, visible, &sub_outer, depth + 1, visiting)?;
+        }
+        Expr::Exists { sub, .. } => {
+            let mut sub_outer: Vec<&[QCol]> = Vec::new();
+            sub_outer.extend_from_slice(schemas);
+            sub_outer.extend_from_slice(outer);
+            vx_select(q, sub, visible, &sub_outer, depth + 1, visiting)?;
+        }
+        Expr::Column { .. }
+        | Expr::ResolvedCol { .. }
+        | Expr::Literal(_)
+        | Expr::Param(_)
+        | Expr::WholeRow { .. }
+        | Expr::ScalarSub(_)
+        | Expr::ArraySubquery(_)
+        | Expr::JsonArraySubq { .. } => {}
+    }
+    Ok(())
+}
