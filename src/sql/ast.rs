@@ -2274,6 +2274,11 @@ pub struct CheckDef {
     /// the flag only skips the one-time existing-row scan.
     pub not_valid: bool,
     pub kind: CheckKind,
+    /// v1.97: NO INHERIT not-null constraint (PG19). Only meaningful
+    /// for kind == NotNull: such constraints do not propagate to
+    /// inheritance children, and they block ADD PRIMARY KEY over
+    /// the column like NOT VALID ones do.
+    pub no_inherit: bool,
 }
 
 /// v0.76: a NOT NULL column constraint added via ALTER TABLE
@@ -2283,6 +2288,8 @@ pub struct NotNullDef {
     pub name: String,
     pub col: String,
     pub not_valid: bool,
+    /// v1.97: declared NO INHERIT (PG19).
+    pub no_inherit: bool,
 }
 
 /// v0.9: a PRIMARY KEY or UNIQUE constraint over column names.
@@ -2527,6 +2534,12 @@ pub enum AlterAction {
         name: String,
         cascade: bool,
     },
+    /// v1.97: `ALTER TABLE name VALIDATE CONSTRAINT cname` (PG19) —
+    /// validates existing rows against a NOT VALID constraint and
+    /// marks it valid.
+    ValidateConstraint {
+        name: String,
+    },
     AddConstraint {
         check: Option<CheckDef>,
         unique: Option<UniqueDef>,
@@ -2763,6 +2776,8 @@ pub(crate) struct ParsedColDef {
 
 pub(crate) enum ColCon {
     NotNull,
+    /// v1.97: column-level `NOT NULL NO INHERIT` (PG19).
+    NotNullNoInherit,
     Null,
     Unique(Option<String>),
     PKey(Option<String>),
@@ -2788,6 +2803,8 @@ pub(crate) enum ParsedTableCon {
         name: Option<String>,
         col: String,
         not_valid: bool,
+        /// v1.97: declared NO INHERIT (PG19).
+        no_inherit: bool,
     },
 }
 
@@ -2950,6 +2967,7 @@ pub(crate) fn def_add_check(
         expr: e,
         not_valid: false,
         kind: CheckKind::Check,
+        no_inherit: false,
     });
     Ok(())
 }
@@ -3060,6 +3078,27 @@ pub(crate) fn build_table_def(
                 for con in &c.cons {
                     match con {
                         ColCon::NotNull => def.not_null[i] = true,
+                        ColCon::NotNullNoInherit => {
+                            def.not_null[i] = true;
+                            // v1.97: record the NO INHERIT not-null
+                            // constraint as a first-class CheckDef
+                            // (PG19 names it {table}_{col}_not_null)
+                            // so later ADD PRIMARY KEY / ADD
+                            // CONSTRAINT / SET NOT NULL can see it.
+                            def.checks.push(CheckDef {
+                                name: format!("{}_{}_not_null", table, c.name),
+                                expr: Expr::IsNull {
+                                    expr: Box::new(Expr::Column {
+                                        table: None,
+                                        name: c.name.clone(),
+                                    }),
+                                    neg: true,
+                                },
+                                not_valid: false,
+                                kind: CheckKind::NotNull,
+                                no_inherit: true,
+                            });
+                        }
                         ColCon::Null => {
                             if c.serial.is_some() {
                                 return Err(err(format!(
@@ -3125,8 +3164,72 @@ pub(crate) fn build_table_def(
                 // v0.76: `CONSTRAINT name NOT NULL col` in CREATE TABLE —
                 // PG doesn't allow this syntax here, but we accept it by
                 // marking the column NOT NULL (like a column constraint).
-                ParsedTableCon::NotNull { col, .. } => {
+                ParsedTableCon::NotNull {
+                    name: con_name,
+                    col,
+                    no_inherit,
+                    ..
+                } => {
                     if let Some(i) = def.columns.iter().position(|(n, _)| n == col) {
+                        // v1.97: PG19 — the reverse conflict: a
+                        // column-level NO INHERIT declaration plus an
+                        // inheritable table-level NOT NULL on the
+                        // same column is also a conflict.
+                        if !*no_inherit {
+                            let col_no_inherit = items.iter().any(|it| {
+                                if let TableItem::Col(c) = it {
+                                    c.name == *col
+                                        && c.cons
+                                            .iter()
+                                            .any(|k| matches!(k, ColCon::NotNullNoInherit))
+                                } else {
+                                    false
+                                }
+                            });
+                            if col_no_inherit {
+                                return Err(err(format!(
+                                    "conflicting NO INHERIT declaration for not-null constraint on column \\\"{}\\\"",
+                                    col
+                                )));
+                            }
+                        }
+                        // v1.97: PG19 — a NO INHERIT not-null
+                        // declaration conflicts with an inheritable
+                        // one (plain NOT NULL or PRIMARY KEY) on the
+                        // same column.
+                        if *no_inherit {
+                            let conflict = items.iter().any(|it| {
+                                if let TableItem::Col(c) = it {
+                                    c.name == *col
+                                        && c.cons
+                                            .iter()
+                                            .any(|k| matches!(k, ColCon::NotNull | ColCon::PKey(_)))
+                                } else {
+                                    false
+                                }
+                            });
+                            if conflict {
+                                return Err(err(format!(
+                                    "conflicting NO INHERIT declaration for not-null constraint on column \"{}\"",
+                                    col
+                                )));
+                            }
+                            def.checks.push(CheckDef {
+                                name: con_name
+                                    .clone()
+                                    .unwrap_or_else(|| format!("{}_{}_not_null", table, col)),
+                                expr: Expr::IsNull {
+                                    expr: Box::new(Expr::Column {
+                                        table: None,
+                                        name: col.clone(),
+                                    }),
+                                    neg: true,
+                                },
+                                not_valid: false,
+                                kind: CheckKind::NotNull,
+                                no_inherit: true,
+                            });
+                        }
                         def.not_null[i] = true;
                     } else if inherits.is_empty() {
                         return Err(err(format!(
@@ -3619,12 +3722,56 @@ pub enum FuncLang {
 /// `<domain>_check[N]` like CREATE DOMAIN does.
 #[derive(Clone, Debug)]
 pub enum AlterDomainAction {
-    AddConstraint { name: Option<String>, expr: Expr },
-    DropConstraint { name: String, if_exists: bool },
+    AddConstraint {
+        name: Option<String>,
+        expr: Expr,
+        /// v1.97: `... CHECK (expr) NOT VALID` — skips the PG19
+        /// existing-data validation (validateDomainCheckConstraint).
+        not_valid: bool,
+    },
+    DropConstraint {
+        name: String,
+        if_exists: bool,
+    },
     SetNotNull,
     DropNotNull,
     SetDefault(DefaultExpr),
     DropDefault,
+    /// v1.97: `ALTER DOMAIN name VALIDATE CONSTRAINT cname` — runs
+    /// the existing-data validation for a NOT VALID constraint.
+    ValidateConstraint {
+        name: String,
+    },
+}
+
+/// v1.97: one `ALTER TYPE` attribute action (PG19 AT_AddColumn /
+/// AT_AlterColumnType / AT_DropColumn / RenameAttributeStmt on a
+/// composite type). `cascade` is the CASCADE behavior; false is
+/// RESTRICT (the default).
+#[derive(Clone, Debug)]
+pub enum AlterTypeAction {
+    AddAttribute {
+        attr: String,
+        col_type: ColType,
+        named_type: Option<String>,
+        cascade: bool,
+    },
+    AlterAttribute {
+        attr: String,
+        col_type: ColType,
+        named_type: Option<String>,
+        cascade: bool,
+    },
+    DropAttribute {
+        attr: String,
+        if_exists: bool,
+        cascade: bool,
+    },
+    RenameAttribute {
+        old: String,
+        new: String,
+        cascade: bool,
+    },
 }
 
 /// v0.97: desugar a bounded-plpgsql function body to a SQL SELECT body.
@@ -5648,6 +5795,12 @@ pub enum Stmt {
         /// v0.72: PG19 allows a comma-separated list of actions in one
         /// ALTER TABLE; they run left to right in a single statement.
         actions: Vec<AlterAction>,
+        /// v1.97: `ALTER TABLE IF EXISTS ...` — a missing relation is
+        /// a NOTICE-level no-op instead of 42P01.
+        if_exists: bool,
+        /// v1.97: `ALTER TABLE ONLY ...` — no recursion into
+        /// inheritance children (PG19 RenameStmt/AlterTableStmt).
+        only: bool,
     },
     // --- v0.9: views ---
     CreateView {
@@ -5705,6 +5858,9 @@ pub enum Stmt {
     DropType {
         names: Vec<String>,
         if_exists: bool,
+        /// v1.97: CASCADE drops dependent types (domains over the
+        /// type, composites containing it) like PG19.
+        cascade: bool,
     },
     // --- v1.38: CREATE CAST (bounded): only the WITHOUT FUNCTION
     // (binary) method is executed; WITH FUNCTION / WITH INOUT parse
@@ -6064,19 +6220,19 @@ pub enum Stmt {
     DoBlock {
         body: String,
     },
-    /// v1.96: ALTER TYPE name ADD ATTRIBUTE attr type.
-    AlterTypeAddAttribute {
+    /// v1.96: ALTER TYPE name <attribute actions>. v1.97: full
+    /// attribute grammar (ADD / ALTER [SET DATA] TYPE / DROP /
+    /// RENAME ATTRIBUTE, comma-separated, CASCADE/RESTRICT each).
+    AlterType {
         name: String,
-        attr: String,
-        col_type: ColType,
-        named_type: Option<String>,
+        actions: Vec<AlterTypeAction>,
     },
-    /// v1.96: ALTER TYPE name ALTER ATTRIBUTE attr TYPE type.
-    AlterTypeAlterAttribute {
+    /// v1.97: ALTER VIEW / ALTER MATERIALIZED VIEW name
+    /// RENAME COLUMN old TO new (PG19 RenameStmt on a view).
+    AlterViewRenameColumn {
         name: String,
-        attr: String,
-        col_type: ColType,
-        named_type: Option<String>,
+        old: String,
+        new: String,
     },
     /// v1.96: CREATE AGGREGATE name(args) (sfunc, stype, ...).
     CreateAggregate {

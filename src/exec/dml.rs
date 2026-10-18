@@ -1306,6 +1306,50 @@ pub(crate) fn apply_row_inserts(
 /// discards the rows (Postgres skips execution); observable only via
 /// volatile functions in the query.
 #[allow(clippy::too_many_arguments)]
+/// v1.97: the named composite type a CTAS select item produces,
+/// when it is statically known (see exec_create_table_as).
+fn ctas_item_composite(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    select: &SelectStmt,
+    expr: &Expr,
+) -> Option<String> {
+    match expr {
+        Expr::CastNamed { name: ty_name, .. } => eng
+            .db
+            .types
+            .get(ty_name)
+            .filter(|st| st.composite.is_some())
+            .map(|_| ty_name.clone()),
+        Expr::Column { table, name } => {
+            for item in &select.from {
+                let crate::sql::FromItem::Table {
+                    name: tname, alias, ..
+                } = item
+                else {
+                    continue;
+                };
+                if let Some(q) = table {
+                    if q != tname && alias.as_deref() != Some(q.as_str()) {
+                        continue;
+                    }
+                }
+                let Some(t) = eng
+                    .db
+                    .find_table(tname, ctx.snap, &ctx.all_xids, ctx.session)
+                else {
+                    continue;
+                };
+                if let Some(ci) = t.column_index(name) {
+                    return t.composite_types.get(ci).cloned().flatten();
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn exec_create_table_as(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -1403,9 +1447,28 @@ pub(crate) fn exec_create_table_as(
         }
     }
     let ncols = columns.len();
+    // v1.97: CTAS output columns keep their named composite type
+    // (PG19 records the column type of the query output; a bare
+    // Composite ColType without a name failed create validation
+    // with a bogus 42704 "<unknown>"). Infer per select item: an
+    // explicit cast to a composite type, or a plain column
+    // reference to a composite-typed source column.
+    let mut composite_types: Vec<Option<String>> = vec![None; ncols];
+    if select.items.len() == ncols
+        && !select
+            .items
+            .iter()
+            .any(|i| !matches!(i, crate::sql::SelectItem::Expr { .. }))
+    {
+        for (idx, item) in select.items.iter().enumerate() {
+            if let crate::sql::SelectItem::Expr { expr, .. } = item {
+                composite_types[idx] = ctas_item_composite(eng, ctx, select, expr);
+            }
+        }
+    }
     let def = crate::sql::TableDef {
         columns,
-        composite_types: vec![None; ncols],
+        composite_types,
         domain_types: vec![None; ncols],
         bit_typmods: vec![None; ncols],
         domain_elem: vec![false; ncols],

@@ -673,6 +673,31 @@ pub(crate) fn attach_partition(
         }
         (child.columns.clone(), child.partition.clone())
     };
+    // v1.97: PG19 rejects circular partition attachment
+    // ("circular inheritance not allowed", 42P16): the table being
+    // attached must not be an ancestor of the parent in the
+    // partition tree. (Such cycles previously formed silently and
+    // recursive ALTER propagation over them overflowed the stack.)
+    {
+        let mut cur = Some(parent_name.to_string());
+        let mut hops = 0usize;
+        while let Some(c) = cur {
+            if c == child_name {
+                return Err(exec_err(
+                    "42P16",
+                    "circular inheritance not allowed".to_string(),
+                ));
+            }
+            hops += 1;
+            if hops > 100_000 {
+                break;
+            }
+            cur = eng
+                .db
+                .find_table(&c, ctx.snap, &ctx.all_xids, ctx.session)
+                .and_then(|t| t.partition.as_ref().and_then(|p| p.parent.clone()));
+        }
+    }
     // Validate column compatibility by name (PG: same names, binary-
     // coercible types; we require exact type equality for simplicity,
     // which covers the corpus).
@@ -701,6 +726,51 @@ pub(crate) fn attach_partition(
                     col_type_name(ptype)
                 ),
             ));
+        }
+    }
+    // v1.97: PG19 MergeCheckConstraint on ATTACH — a parent's
+    // validated NOT NULL constraint conflicts with a child's
+    // NOT VALID not-null constraint on the same column (42P17).
+    {
+        let parent_t = eng
+            .db
+            .find_table(parent_name, ctx.snap, &ctx.all_xids, ctx.session)
+            .expect("parent resolved above");
+        let child_t = eng
+            .db
+            .find_table(child_name, ctx.snap, &ctx.all_xids, ctx.session)
+            .expect("child resolved above");
+        for (pi, (pname, _)) in parent_t.columns.iter().enumerate() {
+            if parent_t.not_null.get(pi) != Some(&true) {
+                continue;
+            }
+            for cc in &child_t.checks {
+                if cc.kind == crate::sql::CheckKind::NotNull && cc.not_valid {
+                    let mut refs: Vec<(Option<String>, String)> = Vec::new();
+                    crate::sql::collect_col_refs(&cc.expr, &mut refs);
+                    if refs.iter().any(|(_, r)| r == pname) {
+                        let pname_con = parent_t
+                            .checks
+                            .iter()
+                            .find(|pc| {
+                                pc.kind == crate::sql::CheckKind::NotNull && {
+                                    let mut pr: Vec<(Option<String>, String)> = Vec::new();
+                                    crate::sql::collect_col_refs(&pc.expr, &mut pr);
+                                    pr.iter().any(|(_, r)| r == pname)
+                                }
+                            })
+                            .map(|pc| pc.name.clone())
+                            .unwrap_or_else(|| cc.name.clone());
+                        return Err(exec_err(
+                            "42P17",
+                            format!(
+                                "constraint \"{}\" conflicts with NOT VALID constraint on child table \"{}\"",
+                                pname_con, child_name
+                            ),
+                        ));
+                    }
+                }
+            }
         }
     }
     // Convert and validate the bound.
@@ -938,13 +1008,44 @@ pub(crate) fn alter_inherit(
                     ),
                 ));
             }
-            if parent.not_null.get(pi) == Some(&true) && child.not_null.get(ci) != Some(&true) {
+            // v1.97: a parent NOT NULL backed by a NO INHERIT
+            // constraint does not merge into the child (PG19), so
+            // it does not force the child column NOT NULL.
+            let parent_nn_no_inherit = parent.checks.iter().any(|c| {
+                c.kind == crate::sql::CheckKind::NotNull && c.no_inherit && {
+                    let mut refs: Vec<(Option<String>, String)> = Vec::new();
+                    crate::sql::collect_col_refs(&c.expr, &mut refs);
+                    refs.iter().any(|(_, r)| r == pname)
+                }
+            });
+            if !parent_nn_no_inherit
+                && parent.not_null.get(pi) == Some(&true)
+                && child.not_null.get(ci) != Some(&true)
+            {
                 return Err(exec_err(
                     "42804",
                     format!(
                         "column \"{}\" in child table \"{}\" must be marked NOT NULL",
                         pname, child_name
                     ),
+                ));
+            }
+        }
+        // v1.97: PG19 MergeCheckConstraint — every parent CHECK
+        // constraint must already exist in the child (matched by
+        // definition), else INHERIT fails (42804).
+        for pc in &parent.checks {
+            if pc.kind != crate::sql::CheckKind::Check {
+                continue;
+            }
+            let pexpr = format!("{:?}", pc.expr);
+            let found = child.checks.iter().any(|cc| {
+                cc.kind == crate::sql::CheckKind::Check && format!("{:?}", cc.expr) == pexpr
+            });
+            if !found {
+                return Err(exec_err(
+                    "42804",
+                    format!("child table is missing constraint \"{}\"", pc.name),
                 ));
             }
         }
@@ -1817,6 +1918,7 @@ pub(crate) fn expand_like_clauses(
                     expr: ck.expr.clone(),
                     not_valid: ck.not_valid,
                     kind: ck.kind,
+                    no_inherit: ck.no_inherit,
                 });
             }
         }
@@ -1963,6 +2065,40 @@ pub(crate) fn create_table_from_def(
     // NOT NULL flags, defaults, and CHECK constraints. Parent scans
     // including children's rows are implemented in scan_table_from.
     if !like_def.inherits.is_empty() {
+        // v1.97: PG19 — a column that is both locally defined (with
+        // a NO INHERIT not-null constraint) and inherited cannot be
+        // defined: the NO INHERIT declaration would be overridden
+        // by the inherited definition.
+        {
+            let mut parent_cols: Vec<String> = Vec::new();
+            for pname in &like_def.inherits {
+                if let Some(pt) = eng
+                    .db
+                    .find_table(pname, ctx.snap, &ctx.all_xids, ctx.session)
+                {
+                    parent_cols.extend(pt.columns.iter().map(|(n, _)| n.clone()));
+                }
+            }
+            for c in &like_def.checks {
+                if c.kind == crate::sql::CheckKind::NotNull && c.no_inherit {
+                    let mut refs: Vec<(Option<String>, String)> = Vec::new();
+                    crate::sql::collect_col_refs(&c.expr, &mut refs);
+                    for (_, col) in &refs {
+                        if parent_cols.contains(col)
+                            && like_def.columns.iter().any(|(n, _)| n == col)
+                        {
+                            return Err(exec_err(
+                                "42P16",
+                                format!(
+                                    "cannot define not-null constraint with NO INHERIT on column \"{}\"",
+                                    col
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         let mut merged = TableDef::empty();
         merged.inherits = like_def.inherits.clone();
         let mut seen_parents: Vec<String> = Vec::new();

@@ -610,6 +610,8 @@ impl Parser {
             // --- v0.9: ALTER TABLE / ALTER SEQUENCE
             "alter" => match self.peek() {
                 Token::Ident(s) if s == "table" => self.parse_alter(),
+                Token::Ident(s) if s == "view" => self.parse_alter_view(false),
+                Token::Ident(s) if s == "materialized" => self.parse_alter_view(true),
                 Token::Ident(s) if s == "sequence" => self.parse_alter_sequence(),
                 Token::Ident(s) if s == "domain" => self.parse_alter_domain(),
                 Token::Ident(s) if s == "type" => self.parse_alter_type(),
@@ -1569,6 +1571,13 @@ impl Parser {
                 parent: None,
                 bound: None,
             });
+            // v1.97: PG19 — not-null constraints on partitioned
+            // tables cannot be NO INHERIT.
+            if def.checks.iter().any(|c| c.no_inherit) {
+                return Err(err(
+                    "not-null constraints on partitioned tables cannot be NO INHERIT".to_string(),
+                ));
+            }
         }
         Ok(Stmt::CreateTable { name, def, temp })
     }
@@ -1736,7 +1745,7 @@ impl Parser {
     pub(crate) fn is_table_constraint_start(&mut self) -> bool {
         matches!(self.peek(), Token::Ident(s)
             if s == "constraint" || s == "primary" || s == "unique"
-                || s == "check" || s == "foreign")
+                || s == "check" || s == "foreign" || s == "not")
     }
 
     /// v0.72: `LIKE source_table [INCLUDING|EXCLUDING kind ...]`
@@ -1836,7 +1845,13 @@ impl Parser {
             };
             if self.eat_keyword("not") {
                 self.expect_keyword("null")?;
-                cons.push(ColCon::NotNull);
+                // v1.97: optional NO INHERIT (PG19).
+                if self.eat_keyword("no") {
+                    self.expect_keyword("inherit")?;
+                    cons.push(ColCon::NotNullNoInherit);
+                } else {
+                    cons.push(ColCon::NotNull);
+                }
             } else if self.eat_keyword("null") {
                 cons.push(ColCon::Null);
             } else if self.eat_keyword("unique") {
@@ -1912,9 +1927,16 @@ impl Parser {
             // v0.76: `NOT NULL col [NOT VALID]`.
             self.expect_keyword("null")?;
             let col = self.expect_ident()?;
+            let mut no_inherit = false;
             let not_valid = if self.eat_keyword("not") {
                 self.expect_keyword("valid")?;
                 true
+            } else if self.eat_keyword("no") {
+                // v1.97: NO INHERIT (PG19) — tracked separately via
+                // the variant's no_inherit flag below.
+                self.expect_keyword("inherit")?;
+                no_inherit = true;
+                false
             } else {
                 // Plain `NOT VALID` without NOT is not valid syntax here,
                 // but accept a bare `VALID` as a no-op for robustness.
@@ -1925,6 +1947,7 @@ impl Parser {
                 name: cname,
                 col,
                 not_valid,
+                no_inherit,
             })
         } else {
             Err(err(
@@ -2020,7 +2043,22 @@ impl Parser {
     /// lists are unaffected).
     pub(crate) fn parse_alter(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("table")?;
+        // v1.97: ALTER TABLE [IF EXISTS] [ONLY] name [*] ... (PG19
+        // AlterTableStmt). The `*` suffix (relation + descendants) is
+        // the default recursion behavior here, so it is consumed and
+        // not recorded.
+        let if_exists = if matches!(self.peek(), Token::Ident(s) if s == "if") {
+            self.next();
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        let only = self.eat_keyword("only");
         let name = self.parse_table_name()?;
+        if *self.peek() == Token::Star {
+            self.next();
+        }
         let mut actions = Vec::new();
         loop {
             actions.push(self.parse_alter_action()?);
@@ -2030,7 +2068,34 @@ impl Parser {
                 break;
             }
         }
-        Ok(Stmt::AlterTable { name, actions })
+        Ok(Stmt::AlterTable {
+            name,
+            actions,
+            if_exists,
+            only,
+        })
+    }
+
+    /// v1.97: ALTER VIEW / ALTER MATERIALIZED VIEW name
+    /// RENAME [COLUMN] old TO new (PG19 RenameStmt). Other ALTER
+    /// VIEW actions stay unsupported (42601).
+    pub(crate) fn parse_alter_view(&mut self, materialized: bool) -> Result<Stmt, SqlError> {
+        if materialized {
+            self.expect_keyword("materialized")?;
+        }
+        self.expect_keyword("view")?;
+        let tname = self.parse_table_name()?;
+        let name = tname.rsplit('.').next().unwrap_or(&tname).to_string();
+        if self.eat_keyword("rename") {
+            self.eat_keyword("column");
+            let old = self.expect_ident()?;
+            self.expect_keyword("to")?;
+            let new = self.expect_ident()?;
+            return Ok(Stmt::AlterViewRenameColumn { name, old, new });
+        }
+        Err(err(
+            "syntax error: expected RENAME COLUMN in ALTER VIEW".to_string()
+        ))
     }
 
     // ------------------------------------------------------------------
@@ -2264,6 +2329,13 @@ impl Parser {
             let options = self.parse_reloptions()?;
             return Ok(AlterAction::SetRelOptions { options });
         }
+        // v1.97: ALTER TABLE name VALIDATE CONSTRAINT cname (PG19).
+        if self.eat_keyword("validate") {
+            self.expect_keyword("constraint")?;
+            return Ok(AlterAction::ValidateConstraint {
+                name: self.expect_ident()?,
+            });
+        }
         if self.eat_keyword("add") {
             if self.is_table_constraint_start() {
                 return self.parse_alter_add_constraint();
@@ -2284,6 +2356,7 @@ impl Parser {
             for con in col.cons {
                 match con {
                     ColCon::NotNull => not_null = true,
+                    ColCon::NotNullNoInherit => not_null = true,
                     ColCon::Null => {
                         if col.serial.is_some() {
                             return Err(err(format!(
@@ -2311,6 +2384,7 @@ impl Parser {
                         expr: e,
                         not_valid: false,
                         kind: CheckKind::Check,
+                        no_inherit: false,
                     }),
                     ColCon::References { name: n, tail } => fks.push(FkDef {
                         name: n.unwrap_or_else(|| format!("{}_fkey", col.name)),
@@ -2413,9 +2487,19 @@ impl Parser {
                 let new = self.expect_ident()?;
                 return Ok(AlterAction::RenameColumn { old, new });
             }
+            // v1.97: RENAME old TO new with the COLUMN keyword
+            // omitted (PG19 gram.y RenameStmt) vs RENAME TO new_name
+            // for the relation itself: TO immediately after RENAME
+            // means the relation form.
+            if matches!(self.peek(), Token::Ident(s) if s == "to") {
+                self.next();
+                let new_name = self.expect_ident()?;
+                return Ok(AlterAction::RenameTo { new_name });
+            }
+            let old = self.expect_ident()?;
             self.expect_keyword("to")?;
-            let new_name = self.expect_ident()?;
-            return Ok(AlterAction::RenameTo { new_name });
+            let new = self.expect_ident()?;
+            return Ok(AlterAction::RenameColumn { old, new });
         }
         // v0.96: `ALTER TABLE child INHERIT parent` /
         // `ALTER TABLE child NO INHERIT parent` (PG19).
@@ -2470,6 +2554,7 @@ impl Parser {
                     expr: e,
                     not_valid: false,
                     kind: CheckKind::Check,
+                    no_inherit: false,
                 }),
                 unique: None,
                 pkey: None,
@@ -2494,11 +2579,13 @@ impl Parser {
                 name,
                 col,
                 not_valid,
+                no_inherit,
             } => Ok(AlterAction::AddConstraint {
                 notnull: Some(NotNullDef {
                     name: name.unwrap_or_default(),
                     col,
                     not_valid,
+                    no_inherit,
                 }),
                 check: None,
                 unique: None,
@@ -3981,6 +4068,7 @@ impl Parser {
                     expr: e,
                     not_valid: false,
                     kind: CheckKind::Check,
+                    no_inherit: false,
                 });
             } else if self.eat_keyword("not") {
                 self.expect_keyword("null")?;
@@ -4052,43 +4140,101 @@ impl Parser {
     /// supported (honest 0A000 via the fallthrough).
     /// v1.96: ALTER TYPE name ADD ATTRIBUTE a type |
     /// ALTER TYPE name ALTER ATTRIBUTE a TYPE type [CASCADE|RESTRICT].
+    /// v1.97: full attribute grammar (PG19 gram.y
+    /// AlterCompositeTypeStmt + RenameAttributeStmt): a
+    /// comma-separated list of ADD ATTRIBUTE / ALTER ATTRIBUTE
+    /// [SET DATA] TYPE / DROP ATTRIBUTE [IF EXISTS], each with an
+    /// optional trailing CASCADE|RESTRICT; plus the standalone
+    /// RENAME ATTRIBUTE a TO b [CASCADE|RESTRICT] form.
     pub(crate) fn parse_alter_type(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("type")?;
         let tname = self.parse_table_name()?;
         let name = tname.rsplit('.').next().unwrap_or(&tname).to_string();
-        if self.eat_keyword("add") {
+        if self.eat_keyword("rename") {
             self.expect_keyword("attribute")?;
-            let attr = self.expect_ident()?;
-            let (col_type, named_type) = self.parse_col_type()?;
-            return Ok(Stmt::AlterTypeAddAttribute {
+            let old = self.expect_ident()?;
+            self.expect_keyword("to")?;
+            let new = self.expect_ident()?;
+            let cascade = self.parse_cascade_opt()?;
+            return Ok(Stmt::AlterType {
                 name,
-                attr,
-                col_type,
-                named_type,
+                actions: vec![AlterTypeAction::RenameAttribute { old, new, cascade }],
             });
         }
-        if self.eat_keyword("alter") {
-            self.expect_keyword("attribute")?;
-            let attr = self.expect_ident()?;
-            self.expect_keyword("type")?;
-            let (col_type, named_type) = self.parse_col_type()?;
-            let _ = self.eat_keyword("cascade") || self.eat_keyword("restrict");
-            return Ok(Stmt::AlterTypeAlterAttribute {
-                name,
-                attr,
-                col_type,
-                named_type,
-            });
+        let mut actions = Vec::new();
+        loop {
+            if self.eat_keyword("add") {
+                self.expect_keyword("attribute")?;
+                let attr = self.expect_ident()?;
+                let (col_type, named_type) = self.parse_col_type()?;
+                // Optional COLLATE clause (accepted, not modeled).
+                if self.eat_keyword("collate") {
+                    let _ = self.expect_ident()?;
+                }
+                let cascade = self.parse_cascade_opt()?;
+                actions.push(AlterTypeAction::AddAttribute {
+                    attr,
+                    col_type,
+                    named_type,
+                    cascade,
+                });
+            } else if self.eat_keyword("alter") {
+                self.expect_keyword("attribute")?;
+                let attr = self.expect_ident()?;
+                // TYPE t | SET DATA TYPE t (PG19 both spellings).
+                if self.eat_keyword("set") {
+                    self.expect_keyword("data")?;
+                }
+                self.expect_keyword("type")?;
+                let (col_type, named_type) = self.parse_col_type()?;
+                if self.eat_keyword("collate") {
+                    let _ = self.expect_ident()?;
+                }
+                let cascade = self.parse_cascade_opt()?;
+                actions.push(AlterTypeAction::AlterAttribute {
+                    attr,
+                    col_type,
+                    named_type,
+                    cascade,
+                });
+            } else if self.eat_keyword("drop") {
+                self.expect_keyword("attribute")?;
+                let if_exists = if self.eat_keyword("if") {
+                    self.expect_keyword("exists")?;
+                    true
+                } else {
+                    false
+                };
+                let attr = self.expect_ident()?;
+                let cascade = self.parse_cascade_opt()?;
+                actions.push(AlterTypeAction::DropAttribute {
+                    attr,
+                    if_exists,
+                    cascade,
+                });
+            } else {
+                return Err(err(
+                    "syntax error: expected ADD ATTRIBUTE, ALTER ATTRIBUTE, DROP ATTRIBUTE or RENAME ATTRIBUTE in ALTER TYPE"
+                        .to_string(),
+                ));
+            }
+            if *self.peek() == Token::Comma {
+                self.next();
+            } else {
+                break;
+            }
         }
-        Err(err(
-            "syntax error: expected ADD ATTRIBUTE or ALTER ATTRIBUTE in ALTER TYPE".to_string(),
-        ))
+        Ok(Stmt::AlterType { name, actions })
     }
 
     pub(crate) fn parse_alter_domain(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("domain")?;
         let name = self.expect_ident()?;
-        let action = if self.eat_keyword("add") {
+        let action = if self.eat_keyword("validate") {
+            self.expect_keyword("constraint")?;
+            let cname = self.expect_ident()?;
+            AlterDomainAction::ValidateConstraint { name: cname }
+        } else if self.eat_keyword("add") {
             let cname = if self.eat_keyword("constraint") {
                 Some(self.expect_ident()?)
             } else {
@@ -4099,9 +4245,17 @@ impl Parser {
             let e = self.parse_or()?;
             self.expect(Token::RParen, "')'")?;
             validate_constraint_expr(&e, "CHECK")?;
+            // v1.97: trailing NOT VALID (PG19 AlterDomainStmt).
+            let not_valid = if self.eat_keyword("not") {
+                self.expect_keyword("valid")?;
+                true
+            } else {
+                false
+            };
             AlterDomainAction::AddConstraint {
                 name: cname,
                 expr: e,
+                not_valid,
             }
         } else if self.eat_keyword("drop") {
             if self.eat_keyword("constraint") {
@@ -4143,7 +4297,8 @@ impl Parser {
             }
         } else {
             return Err(err(
-                "syntax error: expected ADD, DROP or SET after ALTER DOMAIN name".to_string(),
+                "syntax error: expected ADD, DROP, SET or VALIDATE after ALTER DOMAIN name"
+                    .to_string(),
             ));
         };
         Ok(Stmt::AlterDomain { name, action })
@@ -11576,8 +11731,12 @@ impl Parser {
                 }
                 self.next();
             }
-            self.parse_cascade_opt()?;
-            return Ok(Stmt::DropType { names, if_exists });
+            let cascade = self.parse_cascade_opt()?;
+            return Ok(Stmt::DropType {
+                names,
+                if_exists,
+                cascade,
+            });
         }
         // v0.85: DROP DOMAIN [IF EXISTS] name [, ...] [CASCADE | RESTRICT]
         // — mirrors DROP TYPE (dependents are not tracked).
@@ -14602,6 +14761,9 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
             CheckKind::Check => " c",
             CheckKind::NotNull => " n",
         });
+        // v1.97: NO INHERIT flag (older checkpoints omit it; the
+        // decoder defaults a missing flag to false).
+        out.push_str(if c.no_inherit { " 1" } else { " 0" });
         out.push(')');
     }
     out.push_str(") (uniques");
@@ -14786,12 +14948,23 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
                 o => return Err(format!("bad check kind {}", o)),
             }
         };
+        // v1.97: optional NO INHERIT flag (older checkpoints omit it).
+        let no_inherit = if sexpr_is_close(&mut p) {
+            false
+        } else {
+            match p.atom()?.as_str() {
+                "1" => true,
+                "0" => false,
+                o => return Err(format!("bad check no-inherit flag {}", o)),
+            }
+        };
         p.close()?;
         checks.push(CheckDef {
             name,
             expr,
             not_valid,
             kind,
+            no_inherit,
         });
     }
     p.close()?;
@@ -15032,6 +15205,7 @@ pub fn decode_domain_checks(s: &str) -> Result<Vec<CheckDef>, String> {
             expr,
             not_valid: false,
             kind: CheckKind::Check,
+            no_inherit: false,
         });
     }
     p.ws();

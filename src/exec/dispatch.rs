@@ -131,7 +131,15 @@ pub(crate) fn execute_inner(
             cascade,
         } => exec_drop(eng, ctx, names, *if_exists, *cascade),
         // --- v0.9: constraints / ALTER / views / sequences
-        Stmt::AlterTable { name, actions } => exec_alter(eng, ctx, name, actions),
+        Stmt::AlterTable {
+            name,
+            actions,
+            if_exists,
+            only,
+        } => exec_alter_stmt(eng, ctx, name, actions, *if_exists, *only),
+        Stmt::AlterViewRenameColumn { name, old, new } => {
+            exec_alter_view_rename_column(eng, ctx, name, old, new)
+        }
         Stmt::CreateView {
             name,
             query,
@@ -260,7 +268,11 @@ pub(crate) fn execute_inner(
                 exec_create_type(eng, ctx, name, like_base.as_deref(), composite.as_deref())
             }
         }
-        Stmt::DropType { names, if_exists } => exec_drop_type(eng, ctx, names, *if_exists),
+        Stmt::DropType {
+            names,
+            if_exists,
+            cascade,
+        } => exec_drop_type(eng, ctx, names, *if_exists, *cascade),
         // --- v1.38: CREATE CAST (binary method only) ---
         Stmt::CreateCast {
             src,
@@ -274,18 +286,7 @@ pub(crate) fn execute_inner(
             if_exists,
             ..
         } => exec_drop_cast(eng, ctx, src, dst, *if_exists),
-        Stmt::AlterTypeAddAttribute {
-            name,
-            attr,
-            col_type,
-            named_type,
-        } => exec_alter_type_add_attribute(eng, ctx, name, attr, col_type, named_type.as_deref()),
-        Stmt::AlterTypeAlterAttribute {
-            name,
-            attr,
-            col_type,
-            named_type,
-        } => exec_alter_type_alter_attribute(eng, ctx, name, attr, col_type, named_type.as_deref()),
+        Stmt::AlterType { name, actions } => exec_alter_type(eng, ctx, name, actions),
         // --- v0.85: CREATE/DROP DOMAIN ---
         Stmt::CreateDomain {
             name,
