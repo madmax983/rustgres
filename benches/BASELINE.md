@@ -2,6 +2,81 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: UPDATE/DELETE RLS target-visibility re-derives role/policy state per row — fix — 2026-10-18
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec/rls.rs`: replaces `rls_visible_q` with two functions that
+split the statement-invariant work from the per-row work, mirroring
+the pattern `rls_filter_qrows` already uses for the SELECT/JOIN path:
+
+- `rls_visibility_groups(q, t, table_name, cmds)` — calls `rls_applies`
+  once and builds the per-cmd `applicable_policies` groups once;
+  returns `None` when RLS doesn't apply (every row visible) or
+  `Some(groups)`.
+- `rls_row_visible(q, schema, cells, groups)` — the per-row-only part:
+  evaluates each precomputed group's USING expression against one row.
+
+`src/exec/dml.rs`: both call sites (UPDATE's and DELETE's
+target-visibility filtering loops) now call `rls_visibility_groups`
+once before the loop and `rls_row_visible` inside it, instead of
+calling the old `rls_visible_q` (which repeated `rls_applies` +
+`applicable_policies`) on every row. Behavior is unchanged: same
+RLS-applies check, same per-cmd policy groups, same
+permissive-OR/restrictive-AND evaluation — just computed once per
+statement instead of once per row.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_rls.py --rows 3000 --iters 40`), same
+workload, same machine, same session.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes`,
+`--inclusive=yes` so callee cost is folded into each function):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total `Ir` | 4,598,295,452 | 3,200,423,169 | **-30.39%** |
+| `applicable_policies` inclusive `Ir` | 906,072,596 (19.70%) | 9,449,244 (0.30%) | **-98.96%** |
+| `rls_applies` inclusive `Ir` | 455,817,600 (9.91%) | 9,086,560 (0.28%) | **-98.01%** |
+| `role_closure` inclusive `Ir` | 678,611,462 (14.76%) | 7,546,288 (0.24%) | **-98.89%** |
+
+DHAT (same workload):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total bytes allocated | 190,123,093 | 168,109,333 | **-11.58%** |
+| Total blocks allocated | 2,595,896 | 1,617,416 | **-37.70%** |
+| Blocks under `role_closure`/`applicable_policies`/`rls_applies`/`role_bypassrls_snap` | 989,301 | 10,741 | **-98.91%** |
+
+The total-`Ir` reduction (-30.39%) clears the ≥5%-of-profile floor by
+6x; the allocation-block reduction (-37.70%) clears the ≥10% floor by
+nearly 4x. Both the `Ir` drop and the allocation-block drop land almost
+entirely inside the four role/policy-lookup functions identified in
+the baseline, confirming the hypothesis rather than just moving cost
+around.
+
+`cargo test --all-features`: 1055/1055 passed, unchanged (same count
+as the pre-change tree). `cargo fmt --all -- --check`: clean. `cargo
+clippy --all-targets --all-features -- -D warnings`: 913 errors on
+both trees (the same pre-existing toolchain/lint-version mismatch
+noted throughout this file), none in `rls.rs` and none on the changed
+lines in `dml.rs`; zero net new. `tests/conformance/schedule_runner.py
+--tests rowsecurity`: identical PASS=1035/REAL-FAIL=341 on both trees —
+zero behavior change.
+
+Before/after profiles committed:
+`benches/profiles/{callgrind,dhat}.out.rls-{base,after}-2026-10-18`.
+
+**Reproduce**: check out the parent (baseline) commit, `cargo build`,
+repeat the Callgrind command in the baseline entry's "Reproduce"
+section for the before numbers (swap `--tool=callgrind ...` for
+`--tool=dhat --dhat-out-file=/tmp/dhat.out` for the DHAT numbers);
+check out this commit, `cargo build`, repeat for the after numbers.
+
 ## Bolt: UPDATE/DELETE RLS target-visibility re-derives role/policy state per row — baseline — 2026-10-18
 
 **Why this workload**: v1.95 (2026-10-14/17, row-level security) added

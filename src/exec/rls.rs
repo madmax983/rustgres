@@ -208,23 +208,41 @@ pub(crate) fn rls_filter_qrows(
     Ok(out)
 }
 
-/// Row-visibility test for one row against the USING groups of
-/// `cmds` (used by UPDATE/DELETE target collection in dml.rs, which
-/// builds its own Q). Returns true when RLS does not apply.
-pub(crate) fn rls_visible_q(
+/// Precomputes the statement-invariant part of the UPDATE/DELETE
+/// target-visibility check: whether RLS applies at all, and (if so)
+/// the applicable-policy groups for each of `cmds`. `q.role`/`q.snap`/
+/// `q.own`/`t` do not change across the rows of one statement, so
+/// callers compute this once before their per-row loop instead of
+/// repeating `rls_applies` (a role lookup) and `applicable_policies`
+/// (a role-membership closure walk) on every candidate row.  `None`
+/// means RLS does not apply: every row is visible.
+pub(crate) fn rls_visibility_groups<'t>(
     q: &mut Q,
-    t: &Table,
+    t: &'t Table,
     table_name: &str,
     cmds: &[PolicyCmd],
+) -> Result<Option<Vec<Vec<&'t PolicyDef>>>, ExecError> {
+    if !rls_applies(q.eng, q.snap, q.own, t, table_name, q.role)? {
+        return Ok(None);
+    }
+    Ok(Some(
+        cmds.iter()
+            .map(|c| applicable_policies(q.eng, q.snap, q.own, t, *c, q.role))
+            .collect(),
+    ))
+}
+
+/// Row-visibility test for one row against pre-computed USING groups
+/// from [`rls_visibility_groups`] (used by UPDATE/DELETE target
+/// collection in dml.rs, which builds its own Q).
+pub(crate) fn rls_row_visible(
+    q: &mut Q,
     schema: &[QCol],
     cells: &[Value],
+    groups: &[Vec<&PolicyDef>],
 ) -> Result<bool, ExecError> {
-    if !rls_applies(q.eng, q.snap, q.own, t, table_name, q.role)? {
-        return Ok(true);
-    }
-    for c in cmds {
-        let group = applicable_policies(q.eng, q.snap, q.own, t, *c, q.role);
-        if !eval_group(q, schema, cells, &group, |p| p.using_expr.as_ref())? {
+    for g in groups {
+        if !eval_group(q, schema, cells, g, |p| p.using_expr.as_ref())? {
             return Ok(false);
         }
     }

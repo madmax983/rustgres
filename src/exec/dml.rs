@@ -3533,13 +3533,15 @@ pub(crate) fn exec_update(
                         ctx.default_toast_compression,
                     )),
                 };
-                let mut kept = Vec::with_capacity(vis.len());
-                for entry in vis {
-                    if rls_visible_q(&mut q, &tdef, table, &cmds, &schema, &entry.4)? {
-                        kept.push(entry);
+                if let Some(groups) = rls_visibility_groups(&mut q, &tdef, table, &cmds)? {
+                    let mut kept = Vec::with_capacity(vis.len());
+                    for entry in vis {
+                        if rls_row_visible(&mut q, &schema, &entry.4, &groups)? {
+                            kept.push(entry);
+                        }
                     }
+                    vis = kept;
                 }
-                vis = kept;
             }
         }
         let mut plan: Vec<(String, u64, u64, Row)> = Vec::new();
@@ -4359,13 +4361,18 @@ pub(crate) fn exec_delete(
                         ctx.default_toast_compression,
                     )),
                 };
-                let mut kept = Vec::with_capacity(vis.len());
-                for entry in vis {
-                    if rls_visible_q(&mut q, &tdef, table, &cmds, &schema, &entry.3)? {
-                        kept.push(entry);
+                match rls_visibility_groups(&mut q, &tdef, table, &cmds)? {
+                    None => vis,
+                    Some(groups) => {
+                        let mut kept = Vec::with_capacity(vis.len());
+                        for entry in vis {
+                            if rls_row_visible(&mut q, &schema, &entry.3, &groups)? {
+                                kept.push(entry);
+                            }
+                        }
+                        kept
                     }
                 }
-                kept
             }
         };
         let mut plan = Vec::new();
