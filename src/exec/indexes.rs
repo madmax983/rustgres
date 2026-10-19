@@ -846,15 +846,16 @@ pub(crate) fn est_heap_pages(t: &Table) -> u64 {
     // A page holds at most 291 minimum-size tuples
     // (`MAX_HEAP_TUPLES_PER_PAGE` inside `pg_heap_page_count`); past
     // that the table provably exceeds one page without measuring
-    // every tuple.
+    // every tuple. Checked against `t.rows.len()` up front (not
+    // discovered 291 `pg_heap_tuple_len` calls into the loop below):
+    // the result past the cap is the constant `2` regardless of what
+    // those lengths are, so computing them first and discarding them
+    // was pure waste for every table at or above the cap.
     const MAX_TUPLES_PER_PAGE: usize = 291;
-    let mut lens: Vec<usize> = Vec::new();
-    for rv in &t.rows {
-        if lens.len() >= MAX_TUPLES_PER_PAGE {
-            return 2;
-        }
-        lens.push(pg_heap_tuple_len(t, rv));
+    if t.rows.len() >= MAX_TUPLES_PER_PAGE {
+        return 2;
     }
+    let lens: Vec<usize> = t.rows.iter().map(|rv| pg_heap_tuple_len(t, rv)).collect();
     // `pg_heap_page_count` returns bytes; one heap page is 8192.
     pg_heap_page_count(t, &lens) / 8192
 }

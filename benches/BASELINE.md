@@ -2,6 +2,77 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `est_heap_pages` computes 291 real tuple lengths it then discards — fix — 2026-10-19
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec/indexes.rs`'s `est_heap_pages`: check `t.rows.len() >=
+MAX_TUPLES_PER_PAGE` once, up front, before computing anything. For a
+table at or above the cap this returns the same constant `2` the old
+code eventually returned — but without first calling
+`pg_heap_tuple_len` for 291 rows whose lengths the early-return branch
+never read. For a table under the cap, the per-row lengths are still
+computed for every row (via `t.rows.iter().map(pg_heap_tuple_len).collect()`,
+behaviorally identical to the old manual push loop, just without the
+now-redundant length check inside it) and fed to `pg_heap_page_count`
+exactly as before. No change to any computed value in either branch —
+only to how many `pg_heap_tuple_len` calls it takes to reach the
+at-or-above-cap branch's already-fixed answer.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_explain.py --count 300`), same workload,
+same machine, same session.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes`):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total `Ir` | 2,845,091,717 | 2,526,580,210 | **-11.19%** |
+| `pg_nestloop_swap` inclusive `Ir` (600 calls) | 548,196,074 (19.27% of total) | 229,489,851 (9.08% of new total) | **-318,706,223** |
+| `pg_heap_tuple_len` total calls | 294,600 | 120,000 | **-174,600 (-59.3%)** |
+| `pg_heap_tuple_len` self `Ir` | 149,385,600 (5.25%) | 55,800,000 (2.21%) | -62.65% |
+
+The eliminated 174,600 calls match exactly: `291 × 600` — the
+`bench_orders` (2000-row, at-the-cap) side of every `pg_nestloop_swap`
+invocation, previously computed and always discarded. The remaining
+120,000 calls are exactly `200 × 600` — the `bench_customers` (200-row,
+under-the-cap) side, whose result is genuinely used and is completely
+unaffected by this change (its own `est_heap_pages` call site's
+inclusive cost moved from 8.14% to 8.97% of total — consistent with an
+unchanged absolute cost against a smaller total). The total-`Ir`
+reduction (318,511,507) matches `pg_nestloop_swap`'s own inclusive-`Ir`
+reduction (318,706,223) within rounding — the savings are exactly
+where the hypothesis said they'd be, and nowhere else moved.
+
+The -11.19% total-`Ir` delta clears the ≥5%-of-profile floor by more
+than 2x.
+
+**Direct behavior check** (beyond the counter-preservation argument):
+built both the pre-change and post-change trees to separate binaries
+and ran four `EXPLAIN` shapes (the three from the harness, plus an
+explicit `EXPLAIN (COSTS ON)` two-table join) against the same
+200-customer/2000-order dataset on each — byte-for-byte identical
+output on all four, including plan shape (nestloop side order) and
+every `rows=`/cost annotation.
+
+`cargo test --all-features`: 1082/1082 passed, unchanged (same count
+as the pre-change tree). `cargo fmt --all -- --check`: clean. `cargo
+clippy --all-targets --all-features -- -D warnings`: 941 errors on
+both trees (confirmed via `git stash`), none in the changed lines of
+`indexes.rs`; zero net new errors/warnings from this diff.
+
+Before/after profiles committed:
+`benches/profiles/callgrind.out.heappages-{base,after}-2026-10-19`.
+
+**Reproduce**: check out the parent (baseline) commit, `cargo build`,
+repeat the Callgrind command in the baseline entry's "Reproduce"
+section for the before numbers; check out this commit, `cargo build`,
+repeat for the after numbers.
+
 ## Bolt: `est_heap_pages` computes 291 real tuple lengths it then discards — baseline — 2026-10-19
 
 **Why this workload**: v1.98 (2026-10-17/19) added `validate_explain_select`,
