@@ -2,6 +2,115 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `est_heap_pages` computes 291 real tuple lengths it then discards — baseline — 2026-10-19
+
+**Why this workload**: v1.98 (2026-10-17/19) added `validate_explain_select`,
+a full static-analysis pass that plan-only `EXPLAIN` now runs before
+planning. That pass has never been profiled, so this round targets it.
+`benches/profile_explain.py` (new) loads a realistic two-table schema
+(`bench_customers`: 200 rows, `bench_orders`: 2000 rows — an
+orders/customers shape, not a toy table) and sends an exact count of
+plan-only `EXPLAIN` (no `ANALYZE` — nothing executes, isolating plan-time
+cost) over three representative query shapes a client that inspects
+query plans before running them would send: an inner-equi-join with
+`GROUP BY`/`HAVING`/`ORDER BY` (bench.py's `join` shape), a correlated
+`EXISTS` subquery, and a CTE feeding a join — the FROM/subquery/CTE
+shapes `validate_explain_select` recurses into. 300 iterations of each
+(900 EXPLAIN round-trips total) over the real wire protocol, debug
+build, fresh data dir.
+
+Reproduce:
+```bash
+cargo build
+RUSTGRES_DATA_DIR=$(mktemp -d) valgrind --tool=callgrind \
+  --callgrind-out-file=/tmp/cg.out --collect-jumps=yes --cache-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_explain.py --count 300 --timeout 1800
+# SIGTERM the real valgrind-wrapped server pid (not the shell job) to
+# flush, then:
+callgrind_annotate --auto=yes /tmp/cg.out | head -80
+```
+
+📈 **Profile** (Callgrind, valgrind 3.22.0, current HEAD v1.98):
+**2,845,091,717** total `Ir`. `validate_explain_select`'s own machinery
+(`vx_select`/`vx_expr`/`expr_type`/`check_select_col_privs`/...) sums to
+well under 1% of total `Ir` — the originally-hypothesized "EXPLAIN
+re-validates what planning already resolves" redundancy does not hold;
+that pass is cheap. The real cost is in planning's cost *estimation*:
+
+| call | inclusive `Ir` | % of total | calls |
+|---|---|---|---|
+| `src/exec/explain.rs::pg_nestloop_swap` | 548,196,074 | **19.27%** | 600 |
+| ⤷ `src/exec/indexes.rs::est_heap_pages` (side A) | 231,522,824 | 8.14% | 600 |
+| ⤷ `src/exec/indexes.rs::est_heap_pages` (side B) | 313,705,022 | 11.03% | 600 |
+| `src/exec/funcs.rs::pg_heap_tuple_len` (self) | 149,385,600 | 5.25% | 294,600 |
+
+`pg_nestloop_swap` (the cost-based nestloop side-selection check PG19's
+planner performs for every inner join) is called once per `EXPLAIN` of
+the 600/900 iterations whose query shape is a top-level join
+(the join-group-aggregate and CTE-join shapes; the `EXISTS` shape has no
+top-level join). It calls `est_heap_pages` once per side to get each
+table's `(cost=... rows=...)` page-count term — and that one call per
+side accounts for essentially its entire cost.
+
+💡 **Hypothesis investigated and falsified**: I suspected `est_heap_pages`
+was being called *redundantly* — once per candidate join-order/strategy
+(nestloop-swap, hash-join L/R, nestloop L/R) for the same pair of tables
+within one planning pass, via the richer hash-vs-nestloop cost
+comparison in `src/exec/sje.rs` (`hash_win`, lines ~2170-2330) — which
+would make a per-planning-call memoization cache a clean win. Verified
+with temporary instrumentation (not committed): for this query shape
+(`JOIN ... ON a.x = b.y`), the ON clause's equality is absorbed into an
+equivalence class (`join_ec`) before `pg_hash_clauses` scans the
+join-filter conjunct list, so `hash_clauses` is always empty and
+`pg_hashjoin_cost_order`/`pg_nestloop_cost_order` are never called for
+this (extremely common) shape — confirmed via callgrind: both have
+**zero** calls in this profile. No redundant-call pattern exists here to
+cache away.
+
+**The real mechanism, found while reading `est_heap_pages` instead**
+(`src/exec/indexes.rs:845`):
+
+```rust
+pub(crate) fn est_heap_pages(t: &Table) -> u64 {
+    const MAX_TUPLES_PER_PAGE: usize = 291;
+    let mut lens: Vec<usize> = Vec::new();
+    for rv in &t.rows {
+        if lens.len() >= MAX_TUPLES_PER_PAGE {
+            return 2;
+        }
+        lens.push(pg_heap_tuple_len(t, rv));
+    }
+    pg_heap_page_count(t, &lens) / 8192
+}
+```
+
+For any table at or above the 291-tuple cap (`bench_orders`, 2000 rows),
+this computes `pg_heap_tuple_len` — a real per-row PG19 heap-tuple byte-
+layout calculation — for the first 291 rows, **then discards every one
+of those 291 lengths** and returns the hardcoded constant `2`: the
+early-return value does not depend on `lens` at all. The check
+`lens.len() >= MAX_TUPLES_PER_PAGE` is also only reachable *after*
+pushing 291 real lengths (the check runs at the top of each loop
+iteration, so the 292nd row's check is what triggers it, but rows
+1..=291 are all computed first). The cap is already a function purely
+of `t.rows.len()` — not of any row's contents — so the result for every
+table with `t.rows.len() >= 291` is independent of the 291 computed
+lengths and can be known before computing any of them.
+
+Confirmed by exact call-count arithmetic: `pg_heap_tuple_len` is called
+294,600 times total in this profile = `200 × 600` (`bench_customers`,
+under the cap — legitimate, its result is used) + `291 × 600`
+(`bench_orders`, at the cap — **every one of these 174,600 calls is
+discarded**). 59.3% of all `pg_heap_tuple_len` calls in this workload
+compute a value nothing ever reads.
+
+`cargo test --all-features`: 1082/1082 passed (pre-change tree,
+unmodified).
+
+Before profile committed:
+`benches/profiles/callgrind.out.heappages-base-2026-10-19`.
+
 ## Bolt: the Snowball English stemmer re-decodes ASCII suffix tables as UTF-8 on every candidate — fix — 2026-10-17
 
 Fixes the target identified in the baseline entry immediately below
