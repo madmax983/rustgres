@@ -78,6 +78,7 @@ mod dispatch;
 mod dml;
 mod eval;
 mod explain;
+mod explain_dml;
 mod explain_nodes;
 mod from;
 mod funcs;
@@ -273,6 +274,9 @@ mod v197_tests;
 #[path = "test_mods/v198_explain_analysis_tests.rs"]
 mod v198_explain_analysis_tests;
 #[cfg(test)]
+#[path = "test_mods/v199_explain_dml_tests.rs"]
+mod v199_explain_dml_tests;
+#[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;
 
@@ -295,6 +299,7 @@ pub(crate) use dispatch::*;
 pub(crate) use dml::*;
 pub(crate) use eval::*;
 pub(crate) use explain::*;
+pub(crate) use explain_dml::*;
 pub(crate) use explain_nodes::*;
 pub(crate) use from::*;
 pub(crate) use funcs::*;

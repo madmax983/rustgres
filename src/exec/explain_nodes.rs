@@ -3441,14 +3441,14 @@ pub(crate) fn exec_explain(
     // v1.46: EXPLAIN VERBOSE — render the `Output:` targetlist lines.
     verbose: bool,
 ) -> Result<ExecResult, ExecError> {
+    // v1.99: EXPLAIN of DML (Insert/Update/Delete/CTAS/Declare/...)
+    // lives in explain_dml.rs.
+    if !matches!(stmt, Stmt::Select(_)) {
+        return exec_explain_dml(eng, ctx, stmt, costs, verbose);
+    }
     let sel = match stmt {
         Stmt::Select(s) => s,
-        _ => {
-            return Err(exec_err(
-                "0A000",
-                "EXPLAIN only supports SELECT statements".to_string(),
-            ));
-        }
+        _ => unreachable!("non-SELECT routed to exec_explain_dml above"),
     };
     // v1.98: full analysis — planning-only EXPLAIN validates the query
     // like PG19 parse analysis (privileges, operator/function/type

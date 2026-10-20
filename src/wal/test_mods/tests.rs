@@ -684,6 +684,9 @@ fn v088_create_index_metadata_roundtrip() {
         nulls_first: vec![false, true],
         exprs: vec![None, Some("a + b".into())],
         predicate: Some("b > 0".into()),
+        // v1.99: per-key collation / operator class.
+        collates: vec![None, Some("C".into())],
+        opclasses: vec![Some("text_pattern_ops".into()), None],
         xmin: 42,
     };
     let mut e = Enc::new();
@@ -700,8 +703,12 @@ fn v088_create_index_metadata_roundtrip() {
             nulls_first,
             exprs,
             predicate,
+            collates,
+            opclasses,
             xmin,
         } => {
+            assert_eq!(collates, vec![None, Some("C".to_string())]);
+            assert_eq!(opclasses, vec![Some("text_pattern_ops".to_string()), None]);
             assert_eq!(name, "ix");
             assert_eq!(table, "t");
             assert_eq!(columns, vec!["a".to_string(), "(a + b)".to_string()]);

@@ -669,6 +669,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             nulls_first,
             exprs,
             predicate,
+            collates,
+            opclasses,
             xmin,
         } => {
             // Rebuild the index from the table's current rows: at recovery
@@ -697,6 +699,10 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 };
                 let mut ex = exprs.clone();
                 ex.resize(n, None);
+                let mut co = collates.clone();
+                co.resize(n, None);
+                let mut op = opclasses.clone();
+                op.resize(n, None);
                 let planner_usable = !any_expr && predicate.is_none();
                 let mut ix = Index::new(IndexDef {
                     name: name.clone(),
@@ -710,6 +716,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     desc: pad_bool(desc),
                     nulls_first: pad_bool(nulls_first),
                     exprs: ex,
+                    collates: co,
+                    opclasses: op,
                     predicate: predicate.clone(),
                     planner_usable,
                 });
@@ -1735,6 +1743,8 @@ pub fn records_for_commit(
                     nulls_first: ix.def.nulls_first.clone(),
                     exprs: ix.def.exprs.clone(),
                     predicate: ix.def.predicate.clone(),
+                    collates: ix.def.collates.clone(),
+                    opclasses: ix.def.opclasses.clone(),
                     xmin: own,
                 });
             }

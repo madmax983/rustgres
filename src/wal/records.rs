@@ -118,6 +118,12 @@ pub enum WalRecord {
         exprs: Vec<Option<String>>,
         /// v0.88: partial-index predicate source, if any.
         predicate: Option<String>,
+        /// v1.99: per-key-column collation names (`COLLATE name`);
+        /// parallel to `columns`.
+        collates: Vec<Option<String>>,
+        /// v1.99: per-key-column operator classes; parallel to
+        /// `columns`.
+        opclasses: Vec<Option<String>>,
         xmin: u64,
     },
     DropIndex {

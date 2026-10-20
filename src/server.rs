@@ -3880,6 +3880,53 @@ fn resolve_sql_execute(
     Ok(stmt)
 }
 
+/// v1.99: `CREATE TABLE ... AS EXECUTE name [(args)]` — resolve the
+/// prepared statement (which must be a SELECT, PG19 CreateAsStmt) and
+/// substitute it as the CTAS query, like the EXPLAIN EXECUTE arm below.
+fn resolve_ctas_execute(
+    engine: &Arc<Mutex<Engine>>,
+    session: &mut Session,
+    stmt: &Stmt,
+) -> Result<Stmt, ExecError> {
+    let (name, col_aliases, temp, if_not_exists, with_data, pname, args) = match stmt {
+        Stmt::CreateTableAs {
+            name,
+            col_aliases,
+            temp,
+            if_not_exists,
+            with_data,
+            execute: Some((pname, args)),
+            ..
+        } => (
+            name.clone(),
+            col_aliases.clone(),
+            *temp,
+            *if_not_exists,
+            *with_data,
+            pname.clone(),
+            args.clone(),
+        ),
+        _ => unreachable!("guarded by the caller"),
+    };
+    let resolved = resolve_sql_execute(engine, session, &pname, &args)?;
+    match resolved {
+        Stmt::Select(sel) => Ok(Stmt::CreateTableAs {
+            name,
+            col_aliases,
+            select: Box::new(sel),
+            temp,
+            if_not_exists,
+            with_data,
+            execute: None,
+        }),
+        _ => Err(ExecError {
+            detail: None,
+            code: "42601",
+            message: "prepared statement is not a SELECT".to_string(),
+        }),
+    }
+}
+
 fn run_statement(
     engine: &Arc<Mutex<Engine>>,
     wal: &Arc<Mutex<Wal>>,
@@ -3985,6 +4032,36 @@ fn run_statement(
                 _ => unreachable!("guarded by matches! above"),
             };
             let resolved = resolve_sql_execute(engine, session, &name, &args)?;
+            owned = Stmt::Explain {
+                stmt: Box::new(resolved),
+                analyze: *analyze,
+                costs: *costs,
+                opts: opts.clone(),
+            };
+            &owned
+        }
+        // v1.99: CREATE TABLE AS EXECUTE — resolve the prepared SELECT
+        // before dispatch (bare and under EXPLAIN).
+        Stmt::CreateTableAs {
+            execute: Some(_), ..
+        } => {
+            owned = resolve_ctas_execute(engine, session, stmt)?;
+            &owned
+        }
+        Stmt::Explain {
+            stmt: inner,
+            analyze,
+            costs,
+            opts,
+        } if matches!(
+            inner.as_ref(),
+            Stmt::CreateTableAs {
+                execute: Some(_),
+                ..
+            }
+        ) =>
+        {
+            let resolved = resolve_ctas_execute(engine, session, inner)?;
             owned = Stmt::Explain {
                 stmt: Box::new(resolved),
                 analyze: *analyze,

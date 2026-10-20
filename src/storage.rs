@@ -7700,8 +7700,32 @@ pub fn table_privs_in(
     snap: &Snapshot,
     own: u64,
 ) -> u32 {
-    if is_superuser_snap(db, role, snap, own) || t.owner == role {
+    if is_superuser_snap(db, role, snap, own) {
         return PRIV_ALL_TABLE;
+    }
+    if t.owner == role {
+        // v1.99: the owner's own ACL item is authoritative once
+        // materialized — the same rule sequence_privs has applied
+        // since v1.96. GRANT/REVOKE (roles.rs) and CREATE-time
+        // default-privilege application materialize the item from
+        // acldefault (all table privileges), so a present item IS
+        // the owner's full effective set: REVOKE INSERT ON t FROM
+        // <owner>, or an ALTER DEFAULT PRIVILEGES rule revoking it,
+        // must actually deny the owner. Absent item = acldefault.
+        // (PG19 aclchk.c: owners hold privileges only through their
+        // ACL item; there is no owner bypass. This was exposed when
+        // v1.99 taught CTAS to materialize default-privilege ACLs —
+        // select_into's owner-INSERT after a default-privileges
+        // REVOKE had been passing only because the CTAS itself
+        // failed first in the baseline trajectory.)
+        let owner_item = t
+            .acl
+            .iter()
+            .find(|e| e.role == t.owner && (e.grantor.is_empty() || e.grantor == t.owner));
+        return match owner_item {
+            Some(e) => e.privs,
+            None => PRIV_ALL_TABLE,
+        };
     }
     let mut privs = 0u32;
     // v1.96: a role that inherits the OWNING role holds the owner's

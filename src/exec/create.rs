@@ -118,35 +118,7 @@ pub(crate) fn exec_create(
     }
     // v1.96: ALTER DEFAULT PRIVILEGES for the creating role.
     if !temp {
-        let defaults = default_acl_entries_for(&eng.db, ctx.role, 'r', name);
-        if !defaults.is_empty() {
-            if let Some(t) = eng
-                .db
-                .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
-                .cloned()
-            {
-                let mut next = t;
-                for e in defaults {
-                    let g = if e.grantor.is_empty() {
-                        ctx.role.to_string()
-                    } else {
-                        e.grantor.clone()
-                    };
-                    let _ = apply_acl_delta(
-                        &mut next.acl,
-                        &[e.role.clone()],
-                        &[(g, e.privs)],
-                        false,
-                        false,
-                        e.grant_option != 0,
-                        false,
-                        false,
-                        &ctx.role.to_string(),
-                    );
-                }
-                alter_swap(eng, ctx, name, None, next, None)?;
-            }
-        }
+        apply_default_acl_for_new_table(eng, ctx, name)?;
     }
     // Backing unique indexes for PRIMARY KEY / UNIQUE constraints. The
     // table is empty, so no duplicate check is needed. (v0.22: temp
@@ -178,6 +150,50 @@ pub(crate) fn exec_create(
 /// injects): smallserial -> 32767, serial -> 2147483647,
 /// bigserial -> 9223372036854775807. The create is a transactional
 /// write op, so ROLLBACK drops the sequence with the table.
+/// v1.99: ALTER DEFAULT PRIVILEGES for the creating role,
+/// materialized into a freshly created table's ACL (PG19 applies
+/// the default ACL at relation creation). Shared by CREATE TABLE
+/// (v1.96) and CREATE TABLE AS — the CTAS path skipped it, so a
+/// default-privileges REVOKE (e.g. of the owner's INSERT) was not
+/// honored for CTAS-created tables.
+pub(crate) fn apply_default_acl_for_new_table(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+) -> Result<(), ExecError> {
+    let defaults = default_acl_entries_for(&eng.db, ctx.role, 'r', name);
+    if defaults.is_empty() {
+        return Ok(());
+    }
+    if let Some(t) = eng
+        .db
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+        .cloned()
+    {
+        let mut next = t;
+        for e in defaults {
+            let g = if e.grantor.is_empty() {
+                ctx.role.to_string()
+            } else {
+                e.grantor.clone()
+            };
+            let _ = apply_acl_delta(
+                &mut next.acl,
+                &[e.role.clone()],
+                &[(g, e.privs)],
+                false,
+                false,
+                e.grant_option != 0,
+                false,
+                false,
+                &ctx.role.to_string(),
+            );
+        }
+        alter_swap(eng, ctx, name, None, next, None)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn create_serial_sequence(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
