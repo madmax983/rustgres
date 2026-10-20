@@ -2,6 +2,63 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: row-level security INSERT-path overhead — negative result — 2026-10-20
+
+No prior Bolt round in this repo had profiled the row-level-security
+path (`src/exec/rls.rs`, added in v1.95). RLS runs on every row of
+every INSERT/UPDATE/DELETE/SELECT once `ENABLE ROW LEVEL SECURITY` +
+a policy are in place, so `benches/profile_rls.py` (new, this round)
+drives a realistic multi-tenant shape: `bench_rls(id, tenant_id,
+body)` with `FORCE ROW LEVEL SECURITY` and one `tenant_id = 1`
+USING/WITH CHECK policy, loaded via 20 autocommit 500-row multi-VALUES
+`INSERT`s (10,000 rows total) over the real wire protocol.
+
+**Hypothesis investigated and falsified**: `rls_check_new_row_ctx`
+builds a fresh `Q` per row (4 `Rc::new(RefCell::new(...))` heap
+allocations) and `applicable_policies` recomputes `role_closure` (a
+`Vec<String>` role-membership BFS, allocating a `String` + `Vec` per
+call) on every row even though the role is constant for the whole
+statement; `rls_check_new_row_ctx` also calls `rls_applies` itself and
+then calls `rls_check_new_row`, which calls `rls_applies` again with
+the same arguments — a genuine redundant call, once per row.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes`),
+current HEAD (v1.98): **1,172,565,027** total `Ir` for the 10,000-row
+workload.
+
+| symbol (inclusive `Ir`) | Ir | % of total |
+|---|---|---|
+| `exec::dml::exec_insert` (non-RLS insert machinery) | 528,631,211 | 45.08% |
+| `exec::rls::rls_check_new_row_ctx` (whole per-row RLS WITH CHECK path) | 16,600,000 | **1.42%** |
+| ⤷ `exec::rls::rls_applies` (called 2x/row) | 15,570,000 | 1.33% |
+| ⤷ `storage::role_closure` | 51,212 | 0.004% |
+
+The whole RLS path, including the redundant double `rls_applies()`
+call and the per-row `role_closure` recomputation, is **1.42%** of
+total `Ir` — below the 5%-of-profile floor. Even eliminating all of it
+(impossible; the check is semantically required) would not clear the
+floor; removing just the redundant call would save at most ~1.33%
+(likely less), still below floor. The other 98.6% of total `Ir` is
+inherent, non-RLS `exec_insert` cost already targeted by prior Bolt
+rounds (`WriteOp` log, `compress_pglz`, `tokenize` buffer growth,
+WAL CRC32, etc.).
+
+No fix shipped. Recording this so a future round doesn't re-spend a
+profiling cycle on the same hypothesis against a similar RLS shape.
+Full writeup: https://github.com/madmax983/rustgres/issues/56
+
+**Reproduce**:
+```bash
+cargo build
+RUSTGRES_DATA_DIR=$(mktemp -d) valgrind --tool=callgrind \
+  --callgrind-out-file=/tmp/cg_rls.out --collect-jumps=yes --cache-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_rls.py --count 20 --rows 500 --timeout 600
+# SIGTERM the real valgrind.bin PID (not a wrapper/shell pid) to flush:
+kill -TERM "$(pgrep -f 'valgrind --tool=callgrind')"
+callgrind_annotate --auto=no --inclusive=yes /tmp/cg_rls.out | grep -i rls
+```
+
 ## Bolt: `est_heap_pages` computes 291 real tuple lengths it then discards — fix — 2026-10-19
 
 Fixes the target identified in the baseline entry immediately below
