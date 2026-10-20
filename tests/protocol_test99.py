@@ -28,7 +28,7 @@ Sections:
   F. partition-moving UPDATE moves chunks with the row
   G. UPDATE chunks survive a restart (WAL-logged)
   H. repeated updates: no chunk/metadata accumulation
-  I. WAL magic is RGSWAL27 (v1.96: WAL 27 adds the rolreplication trailing byte to role records (decode gated >= 27; magic bumped in lockstep -- recovery derives the decode version from the magic); WAL 26: membership option bytes + rolinherit in role records; v1.94: tsvector/tsquery ColType+Value tags;
+  I. WAL magic is RGSWAL28 (v1.99: WAL 28 adds per-key collation/opclass lists to CreateIndex records (trailing, decode gated >= 28; magic bumped in lockstep -- recovery derives the decode version from the magic); v1.96: WAL 27 adds the rolreplication trailing byte to role records (decode gated >= 27); WAL 26: membership option bytes + rolinherit in role records; v1.94: tsvector/tsquery ColType+Value tags;
      v1.41: attnums/next_attnum/fillfactor in
      CreateTable/AlterTable; v1.80: partition fields in CreateTable/AlterTable)
 """
@@ -321,7 +321,7 @@ def main():
         stop_server(proc)
     with open(os.path.join(data_dir, "wal.log"), "rb") as f:
         magic = f.read(8)
-    check("I1 WAL magic is RGSWAL27", magic == b"RGSWAL27")
+    check("I1 WAL magic is RGSWAL28", magic == b"RGSWAL28")
     shutil.rmtree(data_dir, ignore_errors=True)
 
     print(f"protocol_test99: {passed} passed, {failed} failed")

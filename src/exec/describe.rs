@@ -2099,9 +2099,14 @@ pub(crate) fn agg_result_type(
         AggFunc::StringAgg => {
             // Delimiter should be text-ish; be permissive here (the
             // executor coerces via casts) and just require an argument.
+            // v1.98: the whole string family resolves to PG's
+            // string_agg(text, text) via implicit cast — varchar and
+            // bpchar arguments are accepted by the executor (agg
+            // evaluation coerces bpchar inputs to text), so describe
+            // must accept them too.
             let a = arg.expect("string_agg always takes arguments");
             let t = expr_type(eng, snap, own, session, schemas, outer, ctes, a)?;
-            if !matches!(t, ColType::Text) {
+            if !matches!(t, ColType::Text | ColType::Varchar(_) | ColType::Char(_)) {
                 return Err(exec_err(
                     "42883",
                     format!("function string_agg({}) does not exist", t.sql_name()),

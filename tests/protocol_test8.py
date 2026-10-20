@@ -575,8 +575,17 @@ def t_explain():
         _, _, codes = c.q("EXPLAIN ANALYZE SELECT 1")
         check("explain analyze -> 0A000", codes == ["0A000"], f"{codes}")
 
-        _, _, codes = c.q("EXPLAIN INSERT INTO a VALUES (3,30)")
-        check("explain non-select -> error", codes != [], f"{codes}")
+        # v1.99: EXPLAIN of DML is supported (PG19 ExplainableStmt);
+        # it plans without writing.
+        _, rows, codes = c.q("EXPLAIN INSERT INTO a VALUES (31337,30)")
+        flat = " ".join(str(r) for r in rows)
+        check(
+            "explain non-select -> ModifyTable plan",
+            codes == [] and "Insert on a" in flat,
+            f"{codes} {flat}",
+        )
+        _, rows, codes = c.q("SELECT count(*) FROM a WHERE id = 31337")
+        check("explain insert wrote nothing", rows == [["0"]], f"{rows}")
 
         # extended protocol: EXPLAIN completes with the EXPLAIN tag
         xc = XConn(srv.port)

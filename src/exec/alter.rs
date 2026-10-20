@@ -680,8 +680,60 @@ pub(crate) fn exec_alter(
     name: &str,
     actions: &[AlterAction],
 ) -> Result<ExecResult, ExecError> {
+    exec_alter_flags(eng, ctx, name, actions, false)
+}
+
+/// v1.97: ALTER TABLE statement entry (dispatch): honors
+/// IF EXISTS (missing relation -> quiet success) and routes
+/// RENAME COLUMN addressed at a view/matview to the view rename
+/// path (PG19 accepts ALTER TABLE on views).
+pub(crate) fn exec_alter_stmt(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    actions: &[AlterAction],
+    if_exists: bool,
+    only: bool,
+) -> Result<ExecResult, ExecError> {
+    let is_table = eng
+        .db
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+        .is_some();
+    if !is_table {
+        let is_view = eng.db.find_view(name, ctx.snap, ctx.own).is_some();
+        if is_view
+            && !actions.is_empty()
+            && actions
+                .iter()
+                .all(|a| matches!(a, AlterAction::RenameColumn { .. }))
+        {
+            for action in actions {
+                if let AlterAction::RenameColumn { old, new } = action {
+                    exec_alter_view_rename_column_tag(eng, ctx, name, old, new, "ALTER TABLE")?;
+                }
+            }
+            return Ok(ExecResult::Command {
+                tag: "ALTER TABLE".to_string(),
+            });
+        }
+        if if_exists {
+            return Ok(ExecResult::Command {
+                tag: "ALTER TABLE".to_string(),
+            });
+        }
+    }
+    exec_alter_flags(eng, ctx, name, actions, only)
+}
+
+pub(crate) fn exec_alter_flags(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    actions: &[AlterAction],
+    only: bool,
+) -> Result<ExecResult, ExecError> {
     for action in actions {
-        exec_alter_one(eng, ctx, name, action)?;
+        exec_alter_one(eng, ctx, name, action, only)?;
     }
     Ok(ExecResult::Command {
         tag: "ALTER TABLE".to_string(),
@@ -693,6 +745,7 @@ pub(crate) fn exec_alter_one(
     ctx: &mut StmtCtx,
     name: &str,
     action: &AlterAction,
+    only: bool,
 ) -> Result<ExecResult, ExecError> {
     // v0.11: every ALTER TABLE needs owner-or-superuser.
     // v1.96: OWNER TO has its own PG19 rule (inheritance-aware
@@ -730,6 +783,14 @@ pub(crate) fn exec_alter_one(
             pkey,
             fks,
         } => {
+            // v1.97: PG19 ATExecAddColumn — ONLY with inheritance /
+            // partition children would put them out of step.
+            if only && !rename_descendants(eng, ctx, name).is_empty() {
+                return Err(exec_err(
+                    "42P16",
+                    "column must be added to child tables too".to_string(),
+                ));
+            }
             // v1.96: PG19 type-USAGE check for the new column's type
             // (and cast targets in its CHECK/DEFAULT clauses).
             if let Some(n) = named_type {
@@ -825,13 +886,18 @@ pub(crate) fn exec_alter_one(
                     if eng.db.is_temp_table(ctx.session, child) {
                         continue;
                     }
-                    let child_action = AlterAction::AlterColumnType {
-                        name: col.clone(),
-                        col_type: *col_type,
-                        named_type: named_type.clone(),
-                        using_expr: using_expr.clone(),
-                    };
-                    exec_alter(eng, ctx, child, std::slice::from_ref(&child_action))?;
+                    // v1.97: parent-driven propagation bypasses the
+                    // inherited-column guard via the tree entry
+                    // (which recurses the partition tree itself).
+                    alter_column_type_tree(
+                        eng,
+                        ctx,
+                        child,
+                        col,
+                        col_type,
+                        named_type.as_deref(),
+                        using_expr.as_ref(),
+                    )?;
                 }
             }
             res
@@ -853,11 +919,11 @@ pub(crate) fn exec_alter_one(
                     if eng.db.is_temp_table(ctx.session, child) {
                         continue;
                     }
-                    let child_action = AlterAction::DropColumn {
-                        name: col.clone(),
-                        cascade: *cascade,
-                    };
-                    exec_alter(eng, ctx, child, std::slice::from_ref(&child_action))?;
+                    // v1.97: propagation uses the bypass entry —
+                    // the drop was authorized at the parent, so the
+                    // child's inherited-column guard (PG's recursing
+                    // case) must not fire.
+                    drop_column_partition_tree(eng, ctx, child, col, *cascade)?;
                 }
             }
             res
@@ -869,6 +935,48 @@ pub(crate) fn exec_alter_one(
             fk,
             notnull,
         } => {
+            // v1.97: PG19 ATExecAddConstraint (FK) — ONLY cannot
+            // create a foreign key on a partitioned table, since
+            // the constraint must exist on every partition.
+            if only {
+                if let Some(f) = fk {
+                    let is_partitioned = eng
+                        .db
+                        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                        .and_then(|t| t.partition.as_ref())
+                        .is_some_and(|p| p.is_partitioned);
+                    if is_partitioned {
+                        return Err(exec_err(
+                            "42809",
+                            format!(
+                                "cannot use ONLY for foreign key on partitioned table \"{}\" referencing relation \"{}\"",
+                                name, f.ref_table
+                            ),
+                        ));
+                    }
+                }
+                // v1.97: PG19 — a CHECK or NOT NULL constraint cannot
+                // be added to ONLY a partitioned parent that has
+                // partitions (42P16 "constraint must be added to
+                // child tables too"). For plain inheritance parents
+                // PG treats ONLY as NO INHERIT (allowed).
+                if check.is_some() || notnull.is_some() {
+                    let t = eng
+                        .db
+                        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session);
+                    let partitioned_with_children = t.is_some_and(|t| {
+                        t.partition
+                            .as_ref()
+                            .is_some_and(|p| p.is_partitioned && !p.children.is_empty())
+                    });
+                    if partitioned_with_children {
+                        return Err(exec_err(
+                            "42P16",
+                            "constraint must be added to child tables too".to_string(),
+                        ));
+                    }
+                }
+            }
             let res = alter_add_constraint(eng, ctx, name, check, unique, pkey, fk, notnull);
             // v0.70: propagate ADD CONSTRAINT to partitions (PG does
             // this). Per-child backing indexes get per-table names via
@@ -915,6 +1023,115 @@ pub(crate) fn exec_alter_one(
             }
             res
         }
+        AlterAction::ValidateConstraint { name: con } => {
+            // v1.97: PG19 ATExecValidateConstraint — validate the
+            // existing rows against a NOT VALID constraint, then
+            // mark it valid.
+            let t = eng
+                .db
+                .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
+                .clone();
+            let Some(cd) = t.checks.iter().find(|c| &c.name == con).cloned() else {
+                return Err(exec_err(
+                    "42704",
+                    format!(
+                        "constraint \"{}\" for relation \"{}\" does not exist",
+                        con, name
+                    ),
+                ));
+            };
+            if cd.not_valid {
+                let rows: Vec<Row> = t
+                    .rows
+                    .iter()
+                    .filter(|rv| row_visible(rv, ctx.snap, &ctx.all_xids))
+                    .map(|rv| rv.values.clone())
+                    .collect();
+                let qcols: Vec<QCol> = t
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (cn, ct))| QCol {
+                        qual: name.to_string(),
+                        name: cn.clone(),
+                        ty: ct.clone(),
+                        hidden: false,
+                        src_ord: i as u32,
+                    })
+                    .collect();
+                let mut lock_ids = Vec::new();
+                let mut q = Q {
+                    eng: &mut *eng,
+                    snap: ctx.snap,
+                    own: ctx.own,
+                    all_xids: ctx.all_xids.clone(),
+                    session: ctx.session,
+                    role: ctx.role,
+                    read_only: true,
+                    depth: 0,
+                    lock_ids: &mut lock_ids,
+                    ctes: Vec::new(),
+                    wctx: None,
+                    srf_vals: Vec::new(),
+                    priv_scopes: Vec::new(),
+                    priv_role_override: None,
+                    hashed_exists: std::rc::Rc::new(std::cell::RefCell::new(
+                        std::collections::HashMap::new(),
+                    )),
+                    immutable_fn_cache: std::rc::Rc::new(std::cell::RefCell::new(
+                        std::collections::HashMap::new(),
+                    )),
+                    plan_fold_memo: std::rc::Rc::new(std::cell::RefCell::new(
+                        std::collections::HashMap::new(),
+                    )),
+                    hashed_in: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+                    pending_updates: None,
+                    write: None,
+                };
+                for values in &rows {
+                    let frame = Scope {
+                        schema: &qcols,
+                        row: values,
+                        prov: None,
+                    };
+                    let v = eval_expr(&mut q, &[frame], &cd.expr)?;
+                    if matches!(v, Value::Bool(false)) {
+                        return Err(match cd.kind {
+                            crate::sql::CheckKind::NotNull => {
+                                let mut refs: Vec<(Option<String>, String)> = Vec::new();
+                                crate::sql::collect_col_refs(&cd.expr, &mut refs);
+                                let col = refs.first().map(|(_, c)| c.clone()).unwrap_or_default();
+                                exec_err(
+                                    "23502",
+                                    format!(
+                                        "column \"{}\" of relation \"{}\" contains null values",
+                                        col, name
+                                    ),
+                                )
+                            }
+                            crate::sql::CheckKind::Check => exec_err(
+                                "23514",
+                                format!(
+                                    "check constraint \"{}\" of relation \"{}\" is violated by some row",
+                                    con, name
+                                ),
+                            ),
+                        });
+                    }
+                }
+                let mut next = t.clone();
+                for c in next.checks.iter_mut() {
+                    if &c.name == con {
+                        c.not_valid = false;
+                    }
+                }
+                alter_swap(eng, ctx, name, None, next, None)?;
+            }
+            Ok(ExecResult::Command {
+                tag: "ALTER TABLE".to_string(),
+            })
+        }
         AlterAction::DropConstraint { name: con, cascade } => {
             let res = alter_drop_constraint(eng, ctx, name, con, *cascade);
             // v0.70: propagate DROP CONSTRAINT to partitions.
@@ -949,7 +1166,9 @@ pub(crate) fn exec_alter_one(
         AlterAction::AlterColumnDropDefault { name: col } => {
             alter_set_default(eng, ctx, name, col, None)
         }
-        AlterAction::RenameColumn { old, new } => alter_rename_column(eng, ctx, name, old, new),
+        AlterAction::RenameColumn { old, new } => {
+            alter_rename_column_ext(eng, ctx, name, old, new, only, true)
+        }
         AlterAction::RenameTo { new_name } => alter_rename_to(eng, ctx, name, new_name),
         // v0.11
         AlterAction::OwnerTo { new_owner } => alter_owner_to(eng, ctx, name, new_owner),
@@ -1028,6 +1247,37 @@ pub(crate) fn alter_of_type(
 /// in place for the int family, other values ride the dynamic
 /// value representation unchanged.
 #[allow(clippy::too_many_arguments)]
+/// v1.97: ALTER COLUMN TYPE partition-tree propagation entry —
+/// the child change is parent-driven, so the inherited-column
+/// guard is bypassed (PG19 recursion into partitions).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn alter_column_type_tree(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    col: &str,
+    col_type: &ColType,
+    named_type: Option<&str>,
+    using_expr: Option<&crate::sql::Expr>,
+) -> Result<ExecResult, ExecError> {
+    let res = alter_column_type_ext(
+        eng, ctx, name, col, col_type, named_type, using_expr, false, true,
+    )?;
+    let children: Vec<String> = eng
+        .db
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+        .and_then(|t| t.partition.as_ref())
+        .map(|p| p.children.clone())
+        .unwrap_or_default();
+    for child in &children {
+        if eng.db.is_temp_table(ctx.session, child) {
+            continue;
+        }
+        alter_column_type_tree(eng, ctx, child, col, col_type, named_type, using_expr)?;
+    }
+    Ok(res)
+}
+
 pub(crate) fn alter_column_type(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -1036,6 +1286,25 @@ pub(crate) fn alter_column_type(
     col_type: &ColType,
     named_type: Option<&str>,
     using_expr: Option<&crate::sql::Expr>,
+) -> Result<ExecResult, ExecError> {
+    alter_column_type_ext(
+        eng, ctx, name, col, col_type, named_type, using_expr, false, false,
+    )
+}
+
+/// v1.97: `bypass_typed` serves ALTER TYPE ... CASCADE propagation
+/// into typed tables (the OF type itself ordered the change).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn alter_column_type_ext(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    col: &str,
+    col_type: &ColType,
+    named_type: Option<&str>,
+    using_expr: Option<&crate::sql::Expr>,
+    bypass_typed: bool,
+    bypass_inherited: bool,
 ) -> Result<ExecResult, ExecError> {
     if let Some(n) = named_type {
         check_type_usage(eng, ctx, n)?;
@@ -1057,10 +1326,20 @@ pub(crate) fn alter_column_type(
         })?;
     // v1.96 finishing pass: typed tables cannot change column
     // types (the OF type owns the column definitions).
-    if eng.db.typed_tables.contains_key(name) {
+    if !bypass_typed && eng.db.typed_tables.contains_key(name) {
         return Err(exec_err(
             "42P16",
             "cannot alter column type of typed table".to_string(),
+        ));
+    }
+    // v1.97: PG19 ATExecAlterColumnType — a column inherited from
+    // a parent (inheritance or partition tree) cannot be altered
+    // directly in the child (42P16). Parent-driven propagation
+    // passes bypass_inherited.
+    if !bypass_inherited && ancestor_has_column(eng, ctx, &t, col) {
+        return Err(exec_err(
+            "42P16",
+            format!("cannot alter inherited column \"{}\"", col),
         ));
     }
     // v1.96 finishing pass: PG19 ATExecAlterColumnType guards.
@@ -1080,6 +1359,49 @@ pub(crate) fn alter_column_type(
                         col, name
                     ),
                 ));
+            }
+        }
+    }
+    // v1.97: PG19 — the column may not be a partition-key column
+    // of any descendant partitioned table either (e.g. altering
+    // list_parted2.b fails because part_5 is partitioned on b).
+    {
+        for dname in partition_descendants(eng, ctx, name) {
+            if let Some(dt) = eng
+                .db
+                .find_table(&dname, ctx.snap, &ctx.all_xids, ctx.session)
+            {
+                if let Some(p) = &dt.partition {
+                    // Key column indexes are in the coordinates of
+                    // the table that DEFINES the key: the descendant
+                    // itself when it is partitioned, otherwise its
+                    // partition parent (whose column order may
+                    // differ — at_part_2 stores (b, a)).
+                    let is_key = p.key.iter().any(|k| {
+                        if k.expr.is_some() {
+                            return false;
+                        }
+                        let key_col_name = if p.is_partitioned {
+                            dt.columns.get(k.col).map(|(cn, _)| cn.clone())
+                        } else if let Some(pname) = &p.parent {
+                            eng.db
+                                .find_table(pname, ctx.snap, &ctx.all_xids, ctx.session)
+                                .and_then(|pt| pt.columns.get(k.col).map(|(cn, _)| cn.clone()))
+                        } else {
+                            dt.columns.get(k.col).map(|(cn, _)| cn.clone())
+                        };
+                        key_col_name.as_deref() == Some(col)
+                    });
+                    if is_key {
+                        return Err(exec_err(
+                            "42P16",
+                            format!(
+                                "cannot alter column \"{}\" because it is part of the partition key of relation \"{}\"",
+                                col, dname
+                            ),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -1263,8 +1585,15 @@ pub(crate) fn alter_column_type(
             *cell = converted;
         }
         live_new.push(cells.clone());
+        // v1.97: stamp the rewritten live version with the current
+        // write xid (like ADD/DROP COLUMN's RowVersion::plain) — the
+        // commit-time WAL conversion (own_row) only logs row versions
+        // whose xmin is the committing transaction, so a plain clone
+        // (old xmin) silently lost the row on WAL replay.
         new_rows.push(crate::storage::RowVersion {
             values: crate::storage::Row::new(cells),
+            xmin: ctx.write_xid,
+            xmax: 0,
             ..rv.clone()
         });
     }
@@ -1320,6 +1649,7 @@ pub(crate) fn alter_column_type(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn alter_add_column(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -1337,13 +1667,51 @@ pub(crate) fn alter_add_column(
     pkey: &Option<UniqueDef>,
     fks: &[FkDef],
 ) -> Result<ExecResult, ExecError> {
+    alter_add_column_ext(
+        eng,
+        ctx,
+        name,
+        col,
+        col_type,
+        bit_typmod,
+        not_null,
+        default,
+        serial,
+        compression,
+        checks,
+        uniques,
+        pkey,
+        fks,
+        false,
+    )
+}
+
+/// v1.97: `bypass_typed` serves ALTER TYPE ... CASCADE propagation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn alter_add_column_ext(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    col: &str,
+    col_type: &ColType,
+    bit_typmod: Option<(i32, bool)>,
+    not_null: bool,
+    default: &Option<DefaultExpr>,
+    serial: Option<SerialKind>,
+    compression: &Option<String>,
+    checks: &[CheckDef],
+    uniques: &[UniqueDef],
+    pkey: &Option<UniqueDef>,
+    fks: &[FkDef],
+    bypass_typed: bool,
+) -> Result<ExecResult, ExecError> {
     let t = eng
         .db
         .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
     // v1.96 finishing pass: PG19 forbids this on typed tables
     // (the column set is owned by the OF type).
-    if eng.db.typed_tables.contains_key(name) {
+    if !bypass_typed && eng.db.typed_tables.contains_key(name) {
         return Err(exec_err(
             "42P16",
             "cannot add column to typed table".to_string(),
@@ -1553,16 +1921,75 @@ pub(crate) fn alter_drop_column(
     col: &str,
     cascade: bool,
 ) -> Result<ExecResult, ExecError> {
+    alter_drop_column_ext(eng, ctx, name, col, cascade, false, false)
+}
+
+/// v1.97: partition-child propagation entry for DROP COLUMN: the
+/// drop was already authorized at the partitioned parent, so the
+/// inherited-column guard (PG's `recursing` case) is bypassed.
+/// v1.97: DROP COLUMN propagation into a partition subtree (see
+/// alter_drop_column_propagate).
+fn drop_column_partition_tree(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    col: &str,
+    cascade: bool,
+) -> Result<(), ExecError> {
+    alter_drop_column_propagate(eng, ctx, name, col, cascade)?;
+    let children: Vec<String> = eng
+        .db
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+        .and_then(|t| t.partition.as_ref())
+        .map(|p| p.children.clone())
+        .unwrap_or_default();
+    for child in &children {
+        if eng.db.is_temp_table(ctx.session, child) {
+            continue;
+        }
+        drop_column_partition_tree(eng, ctx, child, col, cascade)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn alter_drop_column_propagate(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    col: &str,
+    cascade: bool,
+) -> Result<ExecResult, ExecError> {
+    alter_drop_column_ext(eng, ctx, name, col, cascade, false, true)
+}
+
+/// v1.97: `bypass_typed` serves ALTER TYPE ... CASCADE propagation.
+pub(crate) fn alter_drop_column_ext(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    col: &str,
+    cascade: bool,
+    bypass_typed: bool,
+    bypass_inherited: bool,
+) -> Result<ExecResult, ExecError> {
     let t = eng
         .db
         .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
     // v1.96 finishing pass: PG19 forbids this on typed tables
     // (the column set is owned by the OF type).
-    if eng.db.typed_tables.contains_key(name) {
+    if !bypass_typed && eng.db.typed_tables.contains_key(name) {
         return Err(exec_err(
             "42P16",
             "cannot drop column from typed table".to_string(),
+        ));
+    }
+    // v1.97: PG19 ATExecDropColumn — an inherited column cannot be
+    // dropped in the child (attinhcount > 0, not recursing).
+    if !bypass_inherited && ancestor_has_column(eng, ctx, t, col) {
+        return Err(exec_err(
+            "42P16",
+            format!("cannot drop inherited column \"{}\"", col),
         ));
     }
     let ci = t.column_index(col).ok_or_else(|| {
@@ -2025,6 +2452,35 @@ pub(crate) fn alter_add_constraint(
         .db
         .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
+    // v1.97: PG19 verifyNotNullPKCompatible — a NOT VALID
+    // not-null constraint on a primary-key column, on the table
+    // or any of its partitions, blocks ADD PRIMARY KEY (55000).
+    if let Some(pk) = pkey {
+        let mut candidates = vec![name.to_string()];
+        candidates.extend(partition_descendants(eng, ctx, name));
+        for cand in &candidates {
+            let Some(ct) = eng
+                .db
+                .find_table(cand, ctx.snap, &ctx.all_xids, ctx.session)
+            else {
+                continue;
+            };
+            for col in &pk.cols {
+                for c in &ct.checks {
+                    if c.kind == crate::sql::CheckKind::NotNull && (c.not_valid || c.no_inherit) {
+                        let mut refs = Vec::new();
+                        crate::sql::collect_col_refs(&c.expr, &mut refs);
+                        if refs.iter().any(|(_, r)| r == col) {
+                            return Err(exec_err(
+                                "55000",
+                                format!("cannot create primary key on column \"{}\"", col),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
     // v1.96 finishing pass: PG19 ChooseConstraintName for unnamed
     // constraints ({table}_{col}_key / _fkey / _check, suffixed
     // until free on this table). Previously unnamed constraints
@@ -2176,6 +2632,34 @@ pub(crate) fn alter_add_constraint(
                 format!("constraint \"{}\" already exists", n.name),
             ));
         }
+        // v1.97: PG19 — NO INHERIT not-null constraints are not
+        // allowed on partitioned tables.
+        if n.no_inherit && t.partition.as_ref().is_some_and(|p| p.is_partitioned) {
+            return Err(exec_err(
+                "42P16",
+                "not-null constraints on partitioned tables cannot be NO INHERIT".to_string(),
+            ));
+        }
+        // v1.97: PG19 — adding an inheritable not-null constraint
+        // over a column that already has a NO INHERIT one fails
+        // ("cannot change NO INHERIT status ...").
+        if !n.no_inherit {
+            for c in &t.checks {
+                if c.kind == crate::sql::CheckKind::NotNull && c.no_inherit {
+                    let mut refs: Vec<(Option<String>, String)> = Vec::new();
+                    crate::sql::collect_col_refs(&c.expr, &mut refs);
+                    if refs.iter().any(|(_, r)| r == &n.col) {
+                        return Err(exec_err(
+                            "42P16",
+                            format!(
+                                "cannot change NO INHERIT status of NOT NULL constraint \"{}\" on relation \"{}\"",
+                                c.name, name
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
         let col_idx = meta.column_index(&n.col).ok_or_else(|| {
             exec_err(
                 "42703",
@@ -2214,6 +2698,7 @@ pub(crate) fn alter_add_constraint(
             },
             not_valid: n.not_valid,
             kind: crate::sql::CheckKind::NotNull,
+            no_inherit: n.no_inherit,
         })
     } else {
         None
@@ -2493,61 +2978,110 @@ pub(crate) fn alter_set_default(
     })
 }
 
-pub(crate) fn alter_rename_column(
+/// v1.97: all tables that inherit from (or are partitions of)
+/// `name`, transitively — PG19 renameatt recurses to every
+/// inheritor. Names are catalog keys of permanent tables.
+/// v1.97: all partition descendants (recursive partition
+/// children, not inheritance children) of a table.
+pub(crate) fn partition_descendants(eng: &Engine, ctx: &StmtCtx, name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut stack: Vec<String> = vec![name.to_string()];
+    while let Some(cur) = stack.pop() {
+        if let Some(t) = eng
+            .db
+            .find_table(&cur, ctx.snap, &ctx.all_xids, ctx.session)
+        {
+            if let Some(p) = &t.partition {
+                for c in &p.children {
+                    if !out.contains(c) {
+                        out.push(c.clone());
+                        stack.push(c.clone());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn rename_descendants(eng: &Engine, ctx: &StmtCtx, name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut frontier: Vec<String> = vec![name.to_string()];
+    while let Some(cur) = frontier.pop() {
+        let keys: Vec<String> = eng.db.tables.keys().cloned().collect();
+        for k in keys {
+            if k == name || out.contains(&k) {
+                continue;
+            }
+            let is_child = eng
+                .db
+                .find_table(&k, ctx.snap, &ctx.all_xids, ctx.session)
+                .is_some_and(|t| {
+                    t.inherits.iter().any(|p| p == &cur)
+                        || t.partition.as_ref().and_then(|p| p.parent.as_deref())
+                            == Some(cur.as_str())
+                });
+            if is_child {
+                out.push(k.clone());
+                frontier.push(k);
+            }
+        }
+    }
+    out
+}
+
+/// Whether any ancestor (inherits / partition parent, transitively)
+/// of table `t0` has a column named `col`.
+fn ancestor_has_column(eng: &Engine, ctx: &StmtCtx, t0: &Table, col: &str) -> bool {
+    let mut stack: Vec<String> = t0.inherits.clone();
+    if let Some(p) = t0.partition.as_ref().and_then(|p| p.parent.clone()) {
+        stack.push(p);
+    }
+    let mut seen: Vec<String> = Vec::new();
+    while let Some(p) = stack.pop() {
+        if seen.contains(&p) {
+            continue;
+        }
+        seen.push(p.clone());
+        if let Some(pt) = eng.db.find_table(&p, ctx.snap, &ctx.all_xids, ctx.session) {
+            if pt.columns.iter().any(|(cn, _)| cn == col) {
+                return true;
+            }
+            stack.extend(pt.inherits.iter().cloned());
+            if let Some(pp) = pt.partition.as_ref().and_then(|x| x.parent.clone()) {
+                stack.push(pp);
+            }
+        }
+    }
+    false
+}
+
+/// v1.97: rename a column in ONE table (no guards, no recursion):
+/// dependent views are rewritten first (their stored query text
+/// follows the new name, PG19 ruleutils semantics), then the
+/// table's own checks/defaults/unique/pkey/fk lists, other tables'
+/// FK reference lists, and index column names follow.
+pub(crate) fn rename_column_one_table(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     name: &str,
     old: &str,
     new: &str,
-) -> Result<ExecResult, ExecError> {
+) -> Result<(), ExecError> {
     let t = eng
         .db
         .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
-        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
-    // v1.96 finishing pass: PG19 forbids this on typed tables
-    // (the column set is owned by the OF type).
-    if eng.db.typed_tables.contains_key(name) {
-        return Err(exec_err(
-            "42P16",
-            "cannot rename column of typed table".to_string(),
-        ));
-    }
-    if t.column_index(old).is_none() {
-        return Err(exec_err(
-            "42703",
-            format!("column \"{}\" of relation \"{}\" does not exist", old, name),
-        ));
-    }
-    if t.column_index(new).is_some() {
-        return Err(exec_err(
-            "42701",
-            format!("column \"{}\" of relation \"{}\" already exists", new, name),
-        ));
-    }
-    // v0.77: temp tables are session-local — no global view can depend
-    // on one, and a same-named permanent table's views/indexes must not
-    // be touched.
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
+        .clone();
     let is_temp = eng.db.is_temp_table(ctx.session, name);
-    // Views reference columns by name in stored SQL; refuse rather than
-    // silently breaking them.
+    // v1.97: dependent views/matviews follow the rename by having
+    // their stored query text rewritten (was: blanket 2BP01 refusal
+    // since v0.77). Temp tables have no global views (v0.77 note).
     if !is_temp {
-        for (vname, vs) in &eng.db.views {
-            if vs.iter().any(|v| {
-                crate::storage::view_visible(v, ctx.snap, ctx.own)
-                    && v.deps.iter().any(|d| d == name)
-            }) {
-                return Err(exec_err(
-                    "2BP01",
-                    format!(
-                        "cannot rename column {} because view {} depends on table {}",
-                        old, vname, name
-                    ),
-                ));
-            }
-        }
+        rewrite_views_for_rename(eng, ctx, name, old, new)?;
     }
-    let mut next = t.clone();
-    let ci = next.column_index(old).expect("checked");
+    let mut next = t;
+    let ci = next.column_index(old).expect("checked by caller");
     next.columns[ci].0 = new.to_string();
     // Rename inside CHECK/DEFAULT expressions.
     for c in &mut next.checks {
@@ -2581,10 +3115,46 @@ pub(crate) fn alter_rename_column(
         }
     }
     alter_swap(eng, ctx, name, None, next, None)?;
-    // Update index col_names. v0.77: temp tables have no global
-    // indexes — skip so a shadowed permanent table's indexes are
-    // never touched.
     if !is_temp {
+        // Other tables' FKs that REFERENCE this column follow too
+        // (PG19 renameatt updates the constraint's referenced side).
+        let referrers: Vec<String> = eng
+            .db
+            .tables
+            .keys()
+            .filter(|k| k.as_str() != name)
+            .cloned()
+            .collect();
+        for rname in referrers {
+            let needs = eng
+                .db
+                .find_table(&rname, ctx.snap, &ctx.all_xids, ctx.session)
+                .is_some_and(|ot| {
+                    ot.fks
+                        .iter()
+                        .any(|fk| fk.ref_table == name && fk.ref_cols.iter().any(|c| c == old))
+                });
+            if !needs {
+                continue;
+            }
+            let mut ot = eng
+                .db
+                .find_table(&rname, ctx.snap, &ctx.all_xids, ctx.session)
+                .expect("checked")
+                .clone();
+            for fk in &mut ot.fks {
+                if fk.ref_table == name {
+                    for c in &mut fk.ref_cols {
+                        if c == old {
+                            *c = new.to_string();
+                        }
+                    }
+                }
+            }
+            alter_swap(eng, ctx, &rname, None, ot, None)?;
+        }
+        // Update index col_names. v0.77: temp tables have no global
+        // indexes — skipped above via is_temp.
         let ix_names: Vec<String> = eng
             .db
             .indexes
@@ -2602,6 +3172,113 @@ pub(crate) fn alter_rename_column(
             }
         }
     }
+    Ok(())
+}
+
+pub(crate) fn alter_rename_column_ext(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    old: &str,
+    new: &str,
+    only: bool,
+    top: bool,
+) -> Result<ExecResult, ExecError> {
+    let t = eng
+        .db
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
+        .clone();
+    // v1.96 finishing pass: PG19 forbids this on typed tables
+    // (the column set is owned by the OF type).
+    if eng.db.typed_tables.contains_key(name) {
+        return Err(exec_err(
+            "42P16",
+            "cannot rename column of typed table".to_string(),
+        ));
+    }
+    if t.column_index(old).is_none() {
+        return Err(exec_err(
+            "42703",
+            format!("column \"{}\" of relation \"{}\" does not exist", old, name),
+        ));
+    }
+    if t.column_index(new).is_some() {
+        return Err(exec_err(
+            "42701",
+            format!("column \"{}\" of relation \"{}\" already exists", new, name),
+        ));
+    }
+    if top {
+        // v1.97: PG19 renameatt_internal guards. ONLY with any
+        // inheritance children fails first (the recurse=false
+        // branch); a non-ONLY rename of a column the table itself
+        // inherited fails as an inherited-column rename.
+        let descendants = rename_descendants(eng, ctx, name);
+        if only && !descendants.is_empty() {
+            return Err(exec_err(
+                "42P16",
+                format!(
+                    "inherited column \"{}\" must be renamed in child tables too",
+                    old
+                ),
+            ));
+        }
+        if ancestor_has_column(eng, ctx, &t, old) {
+            return Err(exec_err(
+                "42P16",
+                format!("cannot rename inherited column \"{}\"", old),
+            ));
+        }
+        // v1.97 (PG19 renameatt_internal): a descendant that
+        // inherits the column from MORE THAN ONE parent cannot
+        // have it renamed through just this parent (inherit.sql
+        // inht1/inhts: b arrives via both inht1 and inhs1).
+        if !only {
+            for child in &descendants {
+                let Some(ct) = eng
+                    .db
+                    .find_table(child, ctx.snap, &ctx.all_xids, ctx.session)
+                else {
+                    continue;
+                };
+                let parents_with_col = ct
+                    .inherits
+                    .iter()
+                    .filter(|p| {
+                        eng.db
+                            .find_table(p, ctx.snap, &ctx.all_xids, ctx.session)
+                            .is_some_and(|pt| pt.column_index(old).is_some())
+                    })
+                    .count();
+                if parents_with_col > 1 {
+                    return Err(exec_err(
+                        "42P16",
+                        format!("cannot rename inherited column \"{}\"", old),
+                    ));
+                }
+            }
+        }
+        rename_column_one_table(eng, ctx, name, old, new)?;
+        if !only {
+            for child in descendants {
+                // A descendant reached through several paths may
+                // already carry the new name; skip those without
+                // the old column.
+                let has_old = eng
+                    .db
+                    .find_table(&child, ctx.snap, &ctx.all_xids, ctx.session)
+                    .is_some_and(|ct| ct.column_index(old).is_some());
+                if has_old {
+                    rename_column_one_table(eng, ctx, &child, old, new)?;
+                }
+            }
+        }
+        return Ok(ExecResult::Command {
+            tag: "ALTER TABLE".to_string(),
+        });
+    }
+    rename_column_one_table(eng, ctx, name, old, new)?;
     Ok(ExecResult::Command {
         tag: "ALTER TABLE".to_string(),
     })

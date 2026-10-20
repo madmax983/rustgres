@@ -285,6 +285,8 @@ pub(crate) fn explain_rows(
     // (planning-only path; ANALYZE instrumentation stays out of scope).
     verbose: bool,
 ) -> Result<Vec<Row>, ExecError> {
+    // v1.98: full analysis before planning (see validate_explain_select).
+    validate_explain_select(q, sel)?;
     // v1.08: COSTS OFF selects the PG-text plan rendering.
     let plan = plan_select(&*q.eng, sel, q.snap, q.own, q.session, &[], !costs, verbose)?;
     let mut lines = Vec::new();
@@ -317,14 +319,14 @@ pub(crate) fn exec_explain_analyze(
     stmt: &Stmt,
     costs: bool,
 ) -> Result<ExecResult, ExecError> {
+    // v1.99: EXPLAIN ANALYZE of DML lives in explain_dml.rs (it
+    // executes through the DML executors, not run_select).
+    if !matches!(stmt, Stmt::Select(_)) {
+        return exec_explain_dml_analyze(eng, ctx, stmt, costs);
+    }
     let sel = match stmt {
         Stmt::Select(s) => s,
-        _ => {
-            return Err(exec_err(
-                "0A000",
-                "EXPLAIN only supports SELECT statements".to_string(),
-            ));
-        }
+        _ => unreachable!("non-SELECT routed to exec_explain_dml_analyze above"),
     };
     let mut lock_ids: Vec<(String, u64)> = Vec::new();
     let rows = {

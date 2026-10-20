@@ -291,6 +291,7 @@ pub(crate) fn exec_drop_type(
     ctx: &mut StmtCtx,
     names: &[String],
     if_exists: bool,
+    cascade: bool,
 ) -> Result<ExecResult, ExecError> {
     for name in names {
         let prev = eng.db.types.remove(name);
@@ -302,6 +303,58 @@ pub(crate) fn exec_drop_type(
         }
         if prev.is_some() {
             clean_type_owner_acl(eng, ctx, name);
+        }
+        // v1.97: PG19 DROP TYPE CASCADE drops dependent types:
+        // domains based (transitively) on the dropped type and
+        // composites containing it as an attribute. (Tables with
+        // columns of the type are NOT dropped — that deeper
+        // cascade remains a documented narrowing, as before.)
+        if cascade && prev.is_some() {
+            let mut removed: Vec<String> = vec![name.clone()];
+            loop {
+                let mut victims: Vec<String> = Vec::new();
+                let mut tnames: Vec<String> = eng.db.types.keys().cloned().collect();
+                tnames.sort();
+                for tn in tnames {
+                    if removed.contains(&tn) {
+                        continue;
+                    }
+                    let st = eng.db.types.get(&tn).expect("key");
+                    let depends = match &st.domain {
+                        Some(dom) => {
+                            dom.base_named.as_ref().is_some_and(|b| removed.contains(b))
+                                || dom
+                                    .base_domain
+                                    .as_ref()
+                                    .is_some_and(|b| removed.contains(b))
+                                || domain_base_composite(&eng.db, &tn)
+                                    .is_some_and(|b| removed.contains(&b))
+                        }
+                        None => match &st.composite {
+                            Some(fields) => fields.iter().any(|(_, _, named)| {
+                                named.as_ref().is_some_and(|n| removed.contains(n))
+                            }),
+                            None => false,
+                        },
+                    };
+                    if depends {
+                        victims.push(tn);
+                    }
+                }
+                if victims.is_empty() {
+                    break;
+                }
+                for v in victims {
+                    if let Some(prev_v) = eng.db.types.remove(&v) {
+                        clean_type_owner_acl(eng, ctx, &v);
+                        ctx.writes.push(WriteOp::DropType {
+                            name: v.clone(),
+                            prev: Some(prev_v),
+                        });
+                        removed.push(v);
+                    }
+                }
+            }
         }
         // v1.88: dropping a range type also drops its multirange
         // companion (PG dependency semantics).
@@ -645,37 +698,88 @@ pub(crate) fn composite_type_contains(
     false
 }
 
-/// v1.96 finishing pass: shared guards for ALTER TYPE ... ADD /
-/// ALTER ATTRIBUTE (PG19 typecmds.c): a type used by a table column
-/// cannot have its attributes changed; the incoming attribute type
-/// must exist; and a composite type cannot (transitively) become a
-/// member of itself — including through a range/multirange
-/// companion named after it, whose subtype is the type itself.
-pub(crate) fn alter_type_attr_guards(
-    eng: &mut Engine,
-    ctx: &mut StmtCtx,
-    type_name: &str,
-    new_named: Option<&str>,
-) -> Result<(), ExecError> {
-    let names: Vec<String> = eng.db.tables.keys().cloned().collect();
-    for tname in &names {
-        if let Some(t) = eng
-            .db
-            .find_table(tname, ctx.snap, &ctx.all_xids, ctx.session)
-        {
-            for (i, (cn, _)) in t.columns.iter().enumerate() {
-                if t.composite_types.get(i).and_then(|o| o.as_deref()) == Some(type_name) {
-                    return Err(exec_err(
-                        "2BP01",
-                        format!(
-                            "cannot alter type \"{}\" because column \"{}.{}\" uses it",
-                            type_name, tname, cn
-                        ),
-                    ));
-                }
+/// v1.97: resolve a domain (through domain-over-domain chains) to
+/// the composite type at its base, if any.
+pub(crate) fn domain_base_composite(db: &crate::storage::Database, dname: &str) -> Option<String> {
+    let mut cur = dname.to_string();
+    for _ in 0..16 {
+        let st = db.types.get(&cur)?;
+        let dom = st.domain.as_ref()?;
+        if let Some(inner) = &dom.base_domain {
+            cur = inner.clone();
+            continue;
+        }
+        return match &dom.base_named {
+            Some(n) if db.types.get(n).is_some_and(|t| t.composite.is_some()) => Some(n.clone()),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// v1.97: the composite type a table column effectively stores:
+/// the column's own named composite, or the composite at the base
+/// of its domain. None for non-composite columns.
+pub(crate) fn column_effective_composite(
+    db: &crate::storage::Database,
+    t: &Table,
+    i: usize,
+) -> Option<String> {
+    if let Some(Some(n)) = t.composite_types.get(i) {
+        if db.types.get(n).is_some_and(|st| st.composite.is_some()) {
+            return Some(n.clone());
+        }
+        if db.types.get(n).is_some_and(|st| st.domain.is_some()) {
+            return domain_base_composite(db, n);
+        }
+    }
+    if let Some(Some(d)) = t.domain_types.get(i) {
+        return domain_base_composite(db, d);
+    }
+    None
+}
+
+/// v1.97: snapshot of every visible table (permanent catalog plus
+/// this session's temp tables) as (name, table) pairs, sorted by
+/// name for deterministic error reporting.
+pub(crate) fn all_tables_snapshot(eng: &Engine, ctx: &StmtCtx) -> Vec<(String, Table)> {
+    let mut out: Vec<(String, Table)> = Vec::new();
+    let mut names: Vec<String> = eng.db.tables.keys().cloned().collect();
+    names.sort();
+    for n in names {
+        if let Some(t) = eng.db.find_table(&n, ctx.snap, &ctx.all_xids, ctx.session) {
+            out.push((n, t.clone()));
+        }
+    }
+    if let Some(tmps) = eng.db.temp_tables.get(&ctx.session) {
+        let mut tnames: Vec<String> = tmps.keys().cloned().collect();
+        tnames.sort();
+        for n in tnames {
+            if out.iter().any(|(x, _)| x == &n) {
+                continue;
+            }
+            if let Some(t) = eng.db.find_table(&n, ctx.snap, &ctx.all_xids, ctx.session) {
+                out.push((n, t.clone()));
             }
         }
     }
+    out
+}
+
+/// v1.96 finishing pass: guards on the INCOMING attribute type for
+/// ALTER TYPE attribute actions (PG19 typecmds.c): the type must
+/// exist, and a composite type cannot (transitively) become a
+/// member of itself — including through a range/multirange
+/// companion named after it, whose subtype is the type itself.
+/// (The v1.96 column-use block that also lived here moved into the
+/// per-action semantics in v1.97: PG blocks ALTER ATTRIBUTE with
+/// 0A000, allows ADD, and handles DROP via attribute dependency
+/// checks — see exec_alter_type.)
+pub(crate) fn alter_type_named_guards(
+    eng: &Engine,
+    type_name: &str,
+    new_named: Option<&str>,
+) -> Result<(), ExecError> {
     if let Some(n) = new_named {
         const BUILTIN_RANGES: [&str; 12] = [
             "int4range",
@@ -718,15 +822,390 @@ pub(crate) fn alter_type_attr_guards(
     Ok(())
 }
 
-pub(crate) fn exec_alter_type_add_attribute(
+/// v1.97: does expression `e` contain a FieldAccess on `field`
+/// whose access chain roots at one of `root_cols` (or at any root
+/// when `root_cols` is None — domain CHECKs, whose only root is
+/// VALUE)?
+fn expr_field_ref(e: &Expr, field: &str, root_cols: Option<&[String]>) -> bool {
+    fn root_column(e: &Expr) -> Option<String> {
+        match e {
+            Expr::FieldAccess { expr, .. }
+            | Expr::Cast { expr, .. }
+            | Expr::CastNamed { expr, .. } => root_column(expr),
+            Expr::Column { name, .. } => Some(name.clone()),
+            _ => None,
+        }
+    }
+    let mut found = false;
+    walk_expr(e, &mut |node| {
+        if let Expr::FieldAccess { expr, field: f } = node {
+            if f == field {
+                match root_cols {
+                    None => found = true,
+                    Some(cols) => {
+                        if root_column(expr).is_some_and(|r| cols.iter().any(|c| c == &r)) {
+                            found = true;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    found
+}
+
+/// v1.97: rename FieldAccess(field) occurrences in a stored
+/// expression (domain CHECKs and CHECK/DEFAULT expressions over
+/// composite-typed columns) for ALTER TYPE ... RENAME ATTRIBUTE.
+/// Bounded walker over the expression families constraint
+/// expressions may contain (validate_constraint_expr already
+/// restricts them); unknown shapes are left untouched.
+fn rename_field_in_expr(e: &mut Expr, old: &str, new: &str, root_cols: Option<&[String]>) {
+    fn root_column(e: &Expr) -> Option<String> {
+        match e {
+            Expr::FieldAccess { expr, .. }
+            | Expr::Cast { expr, .. }
+            | Expr::CastNamed { expr, .. } => root_column(expr),
+            Expr::Column { name, .. } => Some(name.clone()),
+            _ => None,
+        }
+    }
+    match e {
+        Expr::FieldAccess { expr, field } => {
+            let hit = *field == old
+                && match root_cols {
+                    None => true,
+                    Some(cols) => root_column(expr).is_some_and(|r| cols.iter().any(|c| c == &r)),
+                };
+            if hit {
+                *field = new.to_string();
+            }
+            rename_field_in_expr(expr, old, new, root_cols);
+        }
+        Expr::NamedArg { expr, .. } => rename_field_in_expr(expr, old, new, root_cols),
+        Expr::Arith { left, right, .. } => {
+            rename_field_in_expr(left, old, new, root_cols);
+            rename_field_in_expr(right, old, new, root_cols);
+        }
+        Expr::Cast { expr, .. } | Expr::CastNamed { expr, .. } => {
+            rename_field_in_expr(expr, old, new, root_cols)
+        }
+        Expr::AtTimeZone { expr, zone } => {
+            rename_field_in_expr(expr, old, new, root_cols);
+            if let Some(z) = zone {
+                rename_field_in_expr(z, old, new, root_cols);
+            }
+        }
+        Expr::Row(elems) => {
+            for e in elems {
+                rename_field_in_expr(e, old, new, root_cols);
+            }
+        }
+        Expr::Concat(a, b)
+        | Expr::JsonOp {
+            left: a, right: b, ..
+        }
+        | Expr::And(a, b)
+        | Expr::Or(a, b) => {
+            rename_field_in_expr(a, old, new, root_cols);
+            rename_field_in_expr(b, old, new, root_cols);
+        }
+        Expr::Not(a) | Expr::BitNot(a) | Expr::Neg(a) => {
+            rename_field_in_expr(a, old, new, root_cols)
+        }
+        Expr::Func { args, .. } => {
+            for a in args {
+                rename_field_in_expr(a, old, new, root_cols);
+            }
+        }
+        Expr::Cmp { left, right, .. }
+        | Expr::IsDistinctFrom { left, right, .. }
+        | Expr::UserOp { left, right, .. } => {
+            rename_field_in_expr(left, old, new, root_cols);
+            rename_field_in_expr(right, old, new, root_cols);
+        }
+        Expr::Extract { from, .. } => rename_field_in_expr(from, old, new, root_cols),
+        Expr::Slice { array, bounds } => {
+            rename_field_in_expr(array, old, new, root_cols);
+            for (lo, hi) in bounds {
+                if let Some(e) = lo {
+                    rename_field_in_expr(e, old, new, root_cols);
+                }
+                if let Some(e) = hi {
+                    rename_field_in_expr(e, old, new, root_cols);
+                }
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                rename_field_in_expr(o, old, new, root_cols);
+            }
+            for (k, r) in whens {
+                rename_field_in_expr(k, old, new, root_cols);
+                rename_field_in_expr(r, old, new, root_cols);
+            }
+            if let Some(el) = else_ {
+                rename_field_in_expr(el, old, new, root_cols);
+            }
+        }
+        Expr::Like { expr, pattern, .. } | Expr::Regex { expr, pattern, .. } => {
+            rename_field_in_expr(expr, old, new, root_cols);
+            rename_field_in_expr(pattern, old, new, root_cols);
+        }
+        Expr::IsNull { expr, .. } | Expr::IsBool { expr, .. } => {
+            rename_field_in_expr(expr, old, new, root_cols)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            rename_field_in_expr(expr, old, new, root_cols);
+            rename_field_in_expr(low, old, new, root_cols);
+            rename_field_in_expr(high, old, new, root_cols);
+        }
+        Expr::ArrayCtor { elems, .. } => {
+            for e in elems {
+                rename_field_in_expr(e, old, new, root_cols);
+            }
+        }
+        Expr::Subscript { array, indices } => {
+            rename_field_in_expr(array, old, new, root_cols);
+            for i in indices {
+                rename_field_in_expr(i, old, new, root_cols);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// v1.97: an attribute-level operation on stored composite values.
+/// Composite values are name-keyed Records (possibly nested inside
+/// arrays or other composites), so ADD appends a NULL field, DROP
+/// removes it, and RENAME renames the key — in every stored value
+/// whose type is (or contains) the altered composite.
+#[derive(Clone)]
+enum AttrValueOp {
+    Add(String),
+    Drop(String),
+    Rename(String, String),
+}
+
+fn transform_typed_value(
+    db: &crate::storage::Database,
+    target: &str,
+    target_fields: &[(String, ColType, Option<String>)],
+    v: &mut Value,
+    tyname: &str,
+    op: &AttrValueOp,
+    depth: usize,
+) {
+    if depth > 24 {
+        return;
+    }
+    match v {
+        Value::Array(a) => {
+            for e in &mut a.elems {
+                transform_typed_value(db, target, target_fields, e, tyname, op, depth + 1);
+            }
+        }
+        Value::Record(fields) => {
+            if tyname == target {
+                match op {
+                    AttrValueOp::Add(f) => {
+                        if !fields.iter().any(|(n, _)| n == f) {
+                            fields.push((f.clone(), Value::Null));
+                        }
+                    }
+                    AttrValueOp::Drop(f) => fields.retain(|(n, _)| n != f),
+                    AttrValueOp::Rename(o, n) => {
+                        for (fn_, _) in fields.iter_mut() {
+                            if fn_ == o {
+                                *fn_ = n.clone();
+                            }
+                        }
+                    }
+                }
+            }
+            // Recurse into nested composite fields.
+            let defs: Vec<(String, Option<String>)> = if tyname == target {
+                target_fields
+                    .iter()
+                    .map(|(n, _, named)| (n.clone(), named.clone()))
+                    .collect()
+            } else {
+                db.types
+                    .get(tyname)
+                    .and_then(|st| st.composite.clone())
+                    .map(|fs| {
+                        fs.iter()
+                            .map(|(n, _, named)| (n.clone(), named.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            for (fname, fval) in fields.iter_mut() {
+                if let Some((_, Some(nested))) = defs.iter().find(|(n, _)| n == fname) {
+                    let nested = nested.clone();
+                    transform_typed_value(db, target, target_fields, fval, &nested, op, depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// v1.97: apply an AttrValueOp to every stored row of every table
+/// holding a column whose effective composite is `target`.
+fn transform_stored_records(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    target: &str,
+    target_fields: &[(String, ColType, Option<String>)],
+    op: &AttrValueOp,
+) -> Result<(), ExecError> {
+    let tables = all_tables_snapshot(eng, ctx);
+    for (tname, t) in tables {
+        let cols: Vec<usize> = (0..t.columns.len())
+            .filter(|&i| column_effective_composite(&eng.db, &t, i).as_deref() == Some(target))
+            .collect();
+        if cols.is_empty() {
+            continue;
+        }
+        let next = t.clone();
+        let mut new_rows: Vec<RowVersion> = Vec::new();
+        for rv in t
+            .rows
+            .iter()
+            .filter(|r| row_visible(r, ctx.snap, &ctx.all_xids))
+        {
+            let mut cells: Vec<Value> = rv.values.iter().cloned().collect();
+            for &ci in &cols {
+                if let Some(cell) = cells.get_mut(ci) {
+                    let mut v = std::mem::replace(cell, Value::Null);
+                    transform_typed_value(&eng.db, target, target_fields, &mut v, target, op, 0);
+                    *cell = v;
+                }
+            }
+            let mut rv2 = rv.clone();
+            rv2.values = Row::new(cells);
+            // v1.97: stamp with the current write xid (see the
+            // ALTER COLUMN TYPE rewrite) so the commit-time WAL
+            // conversion logs the transformed row; a plain clone
+            // (old xmin) was silently dropped from the WAL batch.
+            rv2.xmin = ctx.write_xid;
+            rv2.xmax = 0;
+            new_rows.push(rv2);
+        }
+        alter_swap(eng, ctx, &tname, None, next, Some(new_rows))?;
+    }
+    Ok(())
+}
+
+/// v1.97: typed tables of `type_name` plus all their inheritance /
+/// partition descendants (the CASCADE propagation targets).
+fn typed_propagation_targets(eng: &Engine, ctx: &StmtCtx, type_name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut typed: Vec<String> = eng
+        .db
+        .typed_tables
+        .iter()
+        .filter(|(_, v)| v.as_str() == type_name)
+        .map(|(k, _)| k.clone())
+        .collect();
+    typed.sort();
+    for t in typed {
+        if !out.contains(&t) {
+            out.push(t.clone());
+        }
+        for d in rename_descendants(eng, ctx, &t) {
+            if !out.contains(&d) {
+                out.push(d);
+            }
+        }
+    }
+    out
+}
+
+fn typed_table_error(type_name: &str) -> ExecError {
+    exec_err(
+        "2BP01",
+        format!(
+            "cannot alter type \"{}\" because it is the type of a typed table",
+            type_name
+        ),
+    )
+}
+
+/// v1.97: sample (non-NULL, correctly typed) value for revalidating
+/// domain CHECK expressions against a prospective attribute type.
+fn sample_value_for(
+    db: &crate::storage::Database,
+    ty: &ColType,
+    named: Option<&str>,
+    depth: usize,
+) -> Value {
+    if depth > 8 {
+        return Value::Null;
+    }
+    match ty {
+        ColType::SmallInt => Value::SmallInt(1),
+        ColType::Int => Value::Int(1),
+        ColType::BigInt => Value::BigInt(1),
+        ColType::Float4 => Value::Float4(1.0),
+        ColType::Float => Value::Float(1.0),
+        ColType::Numeric(_) => Value::Float(1.0),
+        ColType::Text | ColType::Varchar(_) => Value::Text("x".into()),
+        ColType::Char(_) => Value::BpChar("x".into()),
+        ColType::Bool => Value::Bool(true),
+        ColType::Date => Value::Date(0),
+        ColType::Composite => match named.and_then(|n| db.types.get(n)) {
+            Some(st) => match &st.composite {
+                Some(fields) => Value::Record(
+                    fields
+                        .iter()
+                        .map(|(n, t, named)| {
+                            (
+                                n.clone(),
+                                sample_value_for(db, t, named.as_deref(), depth + 1),
+                            )
+                        })
+                        .collect(),
+                ),
+                None => Value::Null,
+            },
+            None => Value::Null,
+        },
+        ColType::Array(elem) => {
+            let inner = sample_value_for(db, &array_elem_coltype(*elem), named, depth + 1);
+            Value::Array(Box::new(crate::storage::ArrayVal {
+                elem: *elem,
+                dims: vec![1],
+                lower: vec![1],
+                elems: vec![inner],
+            }))
+        }
+        _ => Value::Null,
+    }
+}
+
+/// v1.97: PG19 ALTER TYPE over composite attribute actions
+/// (typecmds.c / tablecmds.c ATExec* on the type's relation):
+/// attribute changes propagate into dependent stored definitions —
+/// typed tables (RESTRICT refuses, CASCADE alters them too),
+/// stored composite values, dependent domain CHECKs (revalidated
+/// on ALTER ATTRIBUTE; field references block DROP ATTRIBUTE), and
+/// stored CHECK/DEFAULT expressions (rewritten on RENAME).
+pub(crate) fn exec_alter_type(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     name: &str,
-    attr: &str,
-    col_type: &ColType,
-    named_type: Option<&str>,
+    actions: &[crate::sql::AlterTypeAction],
 ) -> Result<ExecResult, ExecError> {
-    let prev = match eng.db.types.get(name) {
+    use crate::sql::AlterTypeAction;
+    let orig = match eng.db.types.get(name) {
         Some(st) => st.clone(),
         None => {
             return Err(exec_err(
@@ -735,89 +1214,646 @@ pub(crate) fn exec_alter_type_add_attribute(
             ));
         }
     };
-    if prev.composite.is_none() {
+    if orig.composite.is_none() {
         return Err(exec_err(
             "42809",
             format!("type \"{}\" is not a composite type", name),
         ));
     }
-    if let Some(n) = named_type {
-        check_type_usage(eng, ctx, n)?;
+    let mut next = orig.clone();
+    for action in actions {
+        let fields = next.composite.clone().expect("composite checked");
+        match action {
+            AlterTypeAction::AddAttribute {
+                attr,
+                col_type,
+                named_type,
+                cascade,
+            } => {
+                if let Some(n) = named_type {
+                    check_type_usage(eng, ctx, n)?;
+                }
+                alter_type_named_guards(eng, name, named_type.as_deref())?;
+                if fields.iter().any(|(f, _, _)| f == attr) {
+                    return Err(exec_err(
+                        "42701",
+                        format!("attribute \"{}\" of type \"{}\" already exists", attr, name),
+                    ));
+                }
+                let typed = typed_propagation_targets(eng, ctx, name);
+                let has_typed = eng.db.typed_tables.values().any(|v| v.as_str() == name);
+                if has_typed && !cascade {
+                    return Err(typed_table_error(name));
+                }
+                // Stored composite values gain a NULL field.
+                transform_stored_records(eng, ctx, name, &fields, &AttrValueOp::Add(attr.clone()))?;
+                if *cascade {
+                    for tname in &typed {
+                        alter_add_column_ext(
+                            eng,
+                            ctx,
+                            tname,
+                            attr,
+                            col_type,
+                            None,
+                            false,
+                            &None,
+                            None,
+                            &None,
+                            &[],
+                            &[],
+                            &None,
+                            &[],
+                            true,
+                        )?;
+                    }
+                }
+                next.composite.as_mut().expect("composite").push((
+                    attr.clone(),
+                    *col_type,
+                    named_type.clone(),
+                ));
+            }
+            AlterTypeAction::AlterAttribute {
+                attr,
+                col_type,
+                named_type,
+                cascade,
+            } => {
+                if let Some(n) = named_type {
+                    check_type_usage(eng, ctx, n)?;
+                }
+                alter_type_named_guards(eng, name, named_type.as_deref())?;
+                let pos = fields
+                    .iter()
+                    .position(|(f, _, _)| f == attr)
+                    .ok_or_else(|| {
+                        exec_err(
+                            "42703",
+                            format!("attribute \"{}\" of type \"{}\" does not exist", attr, name),
+                        )
+                    })?;
+                let has_typed = eng.db.typed_tables.values().any(|v| v.as_str() == name);
+                if has_typed && !cascade {
+                    return Err(typed_table_error(name));
+                }
+                // PG19 find_composite_type_dependencies: a stored
+                // column using the type (directly or through a
+                // domain) blocks with 0A000.
+                let tables = all_tables_snapshot(eng, ctx);
+                for (tname, t) in &tables {
+                    for i in 0..t.columns.len() {
+                        if column_effective_composite(&eng.db, t, i).as_deref() == Some(name) {
+                            return Err(exec_err(
+                                "0A000",
+                                format!(
+                                    "cannot alter type \"{}\" because column \"{}.{}\" uses it",
+                                    name, tname, t.columns[i].0
+                                ),
+                            ));
+                        }
+                    }
+                }
+                // Index expressions using the type block too; PG
+                // names the offender "<index>.row".
+                let mut idx_names: Vec<String> = eng.db.indexes.keys().cloned().collect();
+                idx_names.sort();
+                for ix_name in idx_names {
+                    let ix = eng.db.indexes.get(&ix_name).expect("key");
+                    let mut uses = false;
+                    for src in ix.def.exprs.iter().flatten() {
+                        let Ok(e) = crate::sql::parse_expr_str(src) else {
+                            continue;
+                        };
+                        let mut names = Vec::new();
+                        crate::sql::collect_cast_type_names(&e, &mut names);
+                        if names.iter().any(|n| n == name) {
+                            uses = true;
+                        }
+                    }
+                    if uses {
+                        return Err(exec_err(
+                            "0A000",
+                            format!(
+                                "cannot alter type \"{}\" because column \"{}.row\" uses it",
+                                name, ix_name
+                            ),
+                        ));
+                    }
+                }
+                // Revalidate dependent domain CHECKs against the
+                // new attribute type (PG19 re-analyzes them; an
+                // operator-resolution failure aborts the ALTER).
+                revalidate_domains_for_alter(eng, ctx, name, &fields, pos, col_type, named_type)?;
+                if *cascade && has_typed {
+                    let typed = typed_propagation_targets(eng, ctx, name);
+                    for tname in &typed {
+                        alter_column_type_ext(
+                            eng,
+                            ctx,
+                            tname,
+                            attr,
+                            col_type,
+                            named_type.as_deref(),
+                            None,
+                            true,
+                            true,
+                        )?;
+                    }
+                }
+                let slot = &mut next.composite.as_mut().expect("composite")[pos];
+                slot.1 = *col_type;
+                slot.2 = named_type.clone();
+            }
+            AlterTypeAction::DropAttribute {
+                attr,
+                if_exists,
+                cascade,
+            } => {
+                let pos = fields.iter().position(|(f, _, _)| f == attr);
+                let pos = match pos {
+                    Some(p) => p,
+                    None => {
+                        if *if_exists {
+                            continue;
+                        }
+                        return Err(exec_err(
+                            "42703",
+                            format!("attribute \"{}\" of type \"{}\" does not exist", attr, name),
+                        ));
+                    }
+                };
+                let has_typed = eng.db.typed_tables.values().any(|v| v.as_str() == name);
+                if has_typed && !cascade {
+                    return Err(typed_table_error(name));
+                }
+                // Field references from dependent stored
+                // definitions: domain CHECKs over this type, and
+                // CHECK / DEFAULT / index expressions of tables
+                // holding the composite.
+                let mut dom_refs: Vec<String> = Vec::new();
+                let mut type_names: Vec<String> = eng.db.types.keys().cloned().collect();
+                type_names.sort();
+                for dname in &type_names {
+                    if domain_base_composite(&eng.db, dname).as_deref() != Some(name) {
+                        continue;
+                    }
+                    if let Some(dom) = eng.db.types.get(dname).and_then(|st| st.domain.clone()) {
+                        if dom
+                            .checks
+                            .iter()
+                            .any(|c| expr_field_ref(&c.expr, attr, None))
+                        {
+                            dom_refs.push(dname.clone());
+                        }
+                    }
+                }
+                // (table, kind, key): kind 0 = table CHECK by name,
+                // 1 = column DEFAULT by index, 2 = index by name.
+                let mut tbl_refs: Vec<(String, u8, String)> = Vec::new();
+                let tables = all_tables_snapshot(eng, ctx);
+                for (tname, t) in &tables {
+                    let comp_cols: Vec<String> = (0..t.columns.len())
+                        .filter(|&i| {
+                            column_effective_composite(&eng.db, t, i).as_deref() == Some(name)
+                        })
+                        .map(|i| t.columns[i].0.clone())
+                        .collect();
+                    if comp_cols.is_empty() {
+                        continue;
+                    }
+                    for c in &t.checks {
+                        if expr_field_ref(&c.expr, attr, Some(&comp_cols)) {
+                            tbl_refs.push((tname.clone(), 0, c.name.clone()));
+                        }
+                    }
+                    for (i, d) in t.defaults.iter().enumerate() {
+                        if comp_cols.iter().any(|c| c == &t.columns[i].0) {
+                            if let Some(crate::sql::DefaultExpr::Expr(e)) = d {
+                                if expr_field_ref(e, attr, None) {
+                                    tbl_refs.push((tname.clone(), 1, i.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+                let mut idx_refs: Vec<String> = Vec::new();
+                let mut idx_names: Vec<String> = eng.db.indexes.keys().cloned().collect();
+                idx_names.sort();
+                for ix_name in idx_names {
+                    let ix = eng.db.indexes.get(&ix_name).expect("key");
+                    let Some(t) = tables.iter().find(|(n, _)| n == &ix.def.table) else {
+                        continue;
+                    };
+                    let comp_cols: Vec<String> = (0..t.1.columns.len())
+                        .filter(|&i| {
+                            column_effective_composite(&eng.db, &t.1, i).as_deref() == Some(name)
+                        })
+                        .map(|i| t.1.columns[i].0.clone())
+                        .collect();
+                    if comp_cols.is_empty() {
+                        continue;
+                    }
+                    for src in ix.def.exprs.iter().flatten() {
+                        let Ok(e) = crate::sql::parse_expr_str(src) else {
+                            continue;
+                        };
+                        if expr_field_ref(&e, attr, Some(&comp_cols)) {
+                            idx_refs.push(ix_name.clone());
+                            break;
+                        }
+                    }
+                }
+                if !dom_refs.is_empty() || !tbl_refs.is_empty() || !idx_refs.is_empty() {
+                    if !*cascade {
+                        return Err(exec_err(
+                            "2BP01",
+                            format!(
+                                "cannot drop column {} of composite type {} because other objects depend on it",
+                                attr, name
+                            ),
+                        ));
+                    }
+                    // CASCADE: drop the dependent definitions.
+                    for dname in &dom_refs {
+                        let prev = eng.db.types.get(dname).expect("domain").clone();
+                        let mut dom = prev.domain.clone().expect("domain");
+                        dom.checks.retain(|c| !expr_field_ref(&c.expr, attr, None));
+                        eng.db.types.insert(
+                            dname.clone(),
+                            crate::storage::ShellType {
+                                like_base: prev.like_base.clone(),
+                                composite: prev.composite.clone(),
+                                domain: Some(dom),
+                                range: prev.range.clone(),
+                            },
+                        );
+                        ctx.writes.push(WriteOp::CreateType {
+                            name: dname.clone(),
+                            prev: Some(prev),
+                        });
+                    }
+                    for (tname, kind, key) in &tbl_refs {
+                        let t = eng
+                            .db
+                            .find_table(tname, ctx.snap, &ctx.all_xids, ctx.session)
+                            .expect("snapshot")
+                            .clone();
+                        let mut nt = t;
+                        match kind {
+                            0 => nt.checks.retain(|c| &c.name != key),
+                            1 => {
+                                let i: usize = key.parse().expect("index");
+                                nt.defaults[i] = None;
+                            }
+                            _ => {}
+                        }
+                        alter_swap(eng, ctx, tname, None, nt, None)?;
+                    }
+                    for ix_name in &idx_refs {
+                        drop_index_internal(eng, ctx, ix_name)?;
+                    }
+                }
+                // Stored composite values lose the field.
+                transform_stored_records(
+                    eng,
+                    ctx,
+                    name,
+                    &fields,
+                    &AttrValueOp::Drop(attr.clone()),
+                )?;
+                if *cascade && has_typed {
+                    let typed = typed_propagation_targets(eng, ctx, name);
+                    for tname in &typed {
+                        alter_drop_column_ext(eng, ctx, tname, attr, true, true, true)?;
+                    }
+                }
+                next.composite.as_mut().expect("composite").remove(pos);
+            }
+            AlterTypeAction::RenameAttribute { old, new, cascade } => {
+                let pos = fields
+                    .iter()
+                    .position(|(f, _, _)| f == old)
+                    .ok_or_else(|| {
+                        exec_err(
+                            "42703",
+                            format!("attribute \"{}\" of type \"{}\" does not exist", old, name),
+                        )
+                    })?;
+                if fields.iter().any(|(f, _, _)| f == new) {
+                    return Err(exec_err(
+                        "42701",
+                        format!("attribute \"{}\" of type \"{}\" already exists", new, name),
+                    ));
+                }
+                let has_typed = eng.db.typed_tables.values().any(|v| v.as_str() == name);
+                if has_typed && !cascade {
+                    return Err(typed_table_error(name));
+                }
+                // Stored composite values rename the key.
+                transform_stored_records(
+                    eng,
+                    ctx,
+                    name,
+                    &fields,
+                    &AttrValueOp::Rename(old.clone(), new.clone()),
+                )?;
+                // Stored expressions referencing the field follow:
+                // domain CHECKs over this type (root VALUE) and
+                // CHECK/DEFAULT expressions over composite columns.
+                let mut type_names: Vec<String> = eng.db.types.keys().cloned().collect();
+                type_names.sort();
+                for dname in &type_names {
+                    if domain_base_composite(&eng.db, dname).as_deref() != Some(name) {
+                        continue;
+                    }
+                    let prev = eng.db.types.get(dname).expect("type").clone();
+                    if let Some(mut dom) = prev.domain.clone() {
+                        let mut changed = false;
+                        for c in &mut dom.checks {
+                            let before = format!("{:?}", c.expr);
+                            rename_field_in_expr(&mut c.expr, old, new, None);
+                            if format!("{:?}", c.expr) != before {
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            eng.db.types.insert(
+                                dname.clone(),
+                                crate::storage::ShellType {
+                                    like_base: prev.like_base.clone(),
+                                    composite: prev.composite.clone(),
+                                    domain: Some(dom),
+                                    range: prev.range.clone(),
+                                },
+                            );
+                            ctx.writes.push(WriteOp::CreateType {
+                                name: dname.clone(),
+                                prev: Some(prev),
+                            });
+                        }
+                    }
+                }
+                let tables = all_tables_snapshot(eng, ctx);
+                for (tname, t) in &tables {
+                    let comp_cols: Vec<String> = (0..t.columns.len())
+                        .filter(|&i| {
+                            column_effective_composite(&eng.db, t, i).as_deref() == Some(name)
+                        })
+                        .map(|i| t.columns[i].0.clone())
+                        .collect();
+                    if comp_cols.is_empty() {
+                        continue;
+                    }
+                    let mut nt = t.clone();
+                    let mut changed = false;
+                    for c in &mut nt.checks {
+                        let before = format!("{:?}", c.expr);
+                        rename_field_in_expr(&mut c.expr, old, new, Some(&comp_cols));
+                        if format!("{:?}", c.expr) != before {
+                            changed = true;
+                        }
+                    }
+                    for d in &mut nt.defaults {
+                        if let Some(crate::sql::DefaultExpr::Expr(e)) = d {
+                            let before = format!("{:?}", *e);
+                            rename_field_in_expr(e, old, new, Some(&comp_cols));
+                            if format!("{:?}", *e) != before {
+                                changed = true;
+                            }
+                        }
+                    }
+                    if changed {
+                        alter_swap(eng, ctx, tname, None, nt, None)?;
+                    }
+                }
+                if *cascade && has_typed {
+                    let typed = typed_propagation_targets(eng, ctx, name);
+                    for tname in &typed {
+                        rename_column_one_table(eng, ctx, tname, old, new)?;
+                    }
+                }
+                next.composite.as_mut().expect("composite")[pos].0 = new.clone();
+            }
+        }
     }
-    alter_type_attr_guards(eng, ctx, name, named_type)?;
-    let mut next = prev.clone();
-    let fields = next.composite.as_mut().expect("composite checked");
-    if fields.iter().any(|(f, _, _)| f == attr) {
-        return Err(exec_err(
-            "42701",
-            format!("attribute \"{}\" of type \"{}\" already exists", attr, name),
-        ));
-    }
-    fields.push((
-        attr.to_string(),
-        *col_type,
-        named_type.map(|s| s.to_string()),
-    ));
     eng.db.types.insert(name.to_string(), next);
     ctx.writes.push(WriteOp::CreateType {
         name: name.to_string(),
-        prev: Some(prev),
+        prev: Some(orig),
     });
     Ok(ExecResult::Command {
         tag: "ALTER TYPE".to_string(),
     })
 }
 
-/// v1.96: ALTER TYPE name ALTER ATTRIBUTE attr TYPE type.
-pub(crate) fn exec_alter_type_alter_attribute(
+/// v1.97: PG display name of a column type (for 42883 messages).
+fn pg_type_display(t: &ColType) -> String {
+    match t {
+        ColType::Int => "integer".to_string(),
+        ColType::BigInt => "bigint".to_string(),
+        ColType::SmallInt => "smallint".to_string(),
+        ColType::Float => "double precision".to_string(),
+        ColType::Float4 => "real".to_string(),
+        ColType::Numeric(_) => "numeric".to_string(),
+        ColType::Text => "text".to_string(),
+        ColType::Varchar(_) => "character varying".to_string(),
+        ColType::Char(_) => "character".to_string(),
+        ColType::Bool => "boolean".to_string(),
+        _ => format!("{:?}", t).to_lowercase(),
+    }
+}
+
+/// v1.97: does `e` contain an explicit cast whose subtree
+/// field-accesses `attr`? (PG19 analysis accepts those: the cast
+/// exists, only runtime values could fail.)
+fn expr_has_cast_on_field(e: &Expr, attr: &str) -> bool {
+    fn subtree_has_field(e: &Expr, attr: &str) -> bool {
+        let mut found = false;
+        walk_expr(e, &mut |n| {
+            if matches!(n, Expr::FieldAccess { field, .. } if field == attr) {
+                found = true;
+            }
+        });
+        found
+    }
+    let mut found = false;
+    walk_expr(e, &mut |n| match n {
+        Expr::Cast { expr, .. } | Expr::CastNamed { expr, .. } => {
+            if subtree_has_field(expr, attr) {
+                found = true;
+            }
+        }
+        _ => {}
+    });
+    found
+}
+
+/// v1.97: symbol of the first comparison whose subtree
+/// field-accesses `attr` (for the 42883 message).
+fn first_cmp_op_on_field(e: &Expr, attr: &str) -> Option<String> {
+    fn subtree_has_field(e: &Expr, attr: &str) -> bool {
+        let mut found = false;
+        walk_expr(e, &mut |n| {
+            if matches!(n, Expr::FieldAccess { field, .. } if field == attr) {
+                found = true;
+            }
+        });
+        found
+    }
+    let mut out: Option<String> = None;
+    walk_expr(e, &mut |n| {
+        if out.is_none() {
+            if let Expr::Cmp { op, left, right } = n {
+                if subtree_has_field(left, attr) || subtree_has_field(right, attr) {
+                    out = Some(op.sql().to_string());
+                }
+            }
+        }
+    });
+    out
+}
+
+/// v1.97: revalidate the CHECK expressions of domains based on
+/// composite `name` after attribute `pos` changes to a new type.
+/// PG19 re-analyzes the constraint expressions; the observable
+/// failure is operator resolution (42883). We evaluate each check
+/// against a sample composite whose altered field carries a
+/// sample of the NEW type and propagate only 42883 failures —
+/// value-dependent outcomes are not analysis failures.
+fn revalidate_domains_for_alter(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     name: &str,
-    attr: &str,
-    col_type: &ColType,
-    named_type: Option<&str>,
-) -> Result<ExecResult, ExecError> {
-    let prev = match eng.db.types.get(name) {
-        Some(st) => st.clone(),
-        None => {
-            return Err(exec_err(
-                "42704",
-                format!("type \"{}\" does not exist", name),
-            ));
-        }
-    };
-    if prev.composite.is_none() {
-        return Err(exec_err(
-            "42809",
-            format!("type \"{}\" is not a composite type", name),
-        ));
-    }
-    if let Some(n) = named_type {
-        check_type_usage(eng, ctx, n)?;
-    }
-    alter_type_attr_guards(eng, ctx, name, named_type)?;
-    let mut next = prev.clone();
-    let fields = next.composite.as_mut().expect("composite checked");
-    match fields.iter_mut().find(|(f, _, _)| f == attr) {
-        Some(slot) => {
-            slot.1 = *col_type;
-            slot.2 = named_type.map(|s| s.to_string());
-        }
-        None => {
-            return Err(exec_err(
-                "42703",
-                format!("attribute \"{}\" of type \"{}\" does not exist", attr, name),
-            ));
+    fields: &[(String, ColType, Option<String>)],
+    pos: usize,
+    new_type: &ColType,
+    new_named: &Option<String>,
+) -> Result<(), ExecError> {
+    let mut type_names: Vec<String> = eng.db.types.keys().cloned().collect();
+    type_names.sort();
+    let mut domains: Vec<String> = Vec::new();
+    for dname in &type_names {
+        if domain_base_composite(&eng.db, dname).as_deref() == Some(name) {
+            domains.push(dname.clone());
         }
     }
-    eng.db.types.insert(name.to_string(), next);
-    ctx.writes.push(WriteOp::CreateType {
-        name: name.to_string(),
-        prev: Some(prev),
-    });
-    Ok(ExecResult::Command {
-        tag: "ALTER TYPE".to_string(),
-    })
+    if domains.is_empty() {
+        return Ok(());
+    }
+    // Sample composite as typed BEFORE the change (the domain
+    // check was valid against it by construction).
+    let old_sample = Value::Record(
+        fields
+            .iter()
+            .map(|(n, t, named)| (n.clone(), sample_value_for(&eng.db, t, named.as_deref(), 0)))
+            .collect(),
+    );
+    // Sample composite with the altered field re-typed.
+    let sample_fields: Vec<Value> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, (_, t, named))| {
+            if i == pos {
+                sample_value_for(&eng.db, new_type, new_named.as_deref(), 0)
+            } else {
+                sample_value_for(&eng.db, t, named.as_deref(), 0)
+            }
+        })
+        .collect();
+    let sample = Value::Record(
+        fields
+            .iter()
+            .map(|(n, _, _)| n.clone())
+            .zip(sample_fields)
+            .collect(),
+    );
+    for dname in &domains {
+        let dom = eng
+            .db
+            .types
+            .get(dname)
+            .and_then(|st| st.domain.clone())
+            .expect("domain");
+        for c in &dom.checks {
+            // Evaluate against BOTH the old-typed and new-typed
+            // samples. PG19 fails the ALTER at analysis time when
+            // the expression no longer resolves (42883). This
+            // engine resolves some cross-type comparisons by
+            // coercion at value time, surfacing PG's analysis
+            // failure as 22P02 on the synthetic sample instead —
+            // a NEW 22P02 (absent under the old type) with no
+            // explicit cast around the field is that analysis
+            // failure, and is reported as PG's 42883.
+            let eval_with = |eng2: &mut Engine, sample2: &Value| -> Result<Value, ExecError> {
+                let mut lock_ids2: Vec<(String, u64)> = Vec::new();
+                let mut q2 = Q {
+                    eng: eng2,
+                    snap: ctx.snap,
+                    own: ctx.own,
+                    all_xids: ctx.all_xids.clone(),
+                    session: ctx.session,
+                    role: ctx.role,
+                    read_only: true,
+                    depth: 0,
+                    lock_ids: &mut lock_ids2,
+                    ctes: Vec::new(),
+                    wctx: None,
+                    srf_vals: Vec::new(),
+                    priv_scopes: Vec::new(),
+                    priv_role_override: None,
+                    hashed_exists: std::rc::Rc::new(std::cell::RefCell::new(
+                        std::collections::HashMap::new(),
+                    )),
+                    immutable_fn_cache: std::rc::Rc::new(std::cell::RefCell::new(
+                        std::collections::HashMap::new(),
+                    )),
+                    plan_fold_memo: std::rc::Rc::new(std::cell::RefCell::new(
+                        std::collections::HashMap::new(),
+                    )),
+                    hashed_in: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+                    pending_updates: None,
+                    write: None,
+                };
+                let schema2 = vec![QCol {
+                    qual: String::new(),
+                    name: "value".to_string(),
+                    ty: ColType::Composite,
+                    hidden: false,
+                    src_ord: 0,
+                }];
+                let frame2 = Scope {
+                    schema: &schema2,
+                    row: std::slice::from_ref(sample2),
+                    prov: None,
+                };
+                eval_expr(&mut q2, &[frame2], &c.expr)
+            };
+            if let Err(e) = eval_with(&mut *eng, &sample) {
+                if e.code == "42883" {
+                    return Err(e);
+                }
+                if e.code == "22P02" {
+                    let attr = &fields[pos].0;
+                    let old_err = eval_with(&mut *eng, &old_sample).err();
+                    let old_also = old_err.is_some_and(|oe| oe.code == "22P02");
+                    if !old_also && !expr_has_cast_on_field(&c.expr, attr) {
+                        return Err(exec_err(
+                            "42883",
+                            format!(
+                                "operator does not exist: {} {} {}",
+                                pg_type_display(new_type),
+                                first_cmp_op_on_field(&c.expr, attr)
+                                    .unwrap_or_else(|| ">".to_string()),
+                                pg_type_display(&fields[pos].1),
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// v0.85: CREATE DOMAIN — a named type over a base type with CHECK
@@ -993,6 +2029,198 @@ pub(crate) fn exec_drop_domain(
 /// kinds. PG19 does not validate existing stored data when a domain
 /// constraint is added (constraints apply to future writes), and
 /// neither do we.
+/// v1.97: does domain `start`'s base_domain chain include
+/// `target` (or is `start` == `target`)?
+fn domain_chain_includes(db: &crate::storage::Database, start: &str, target: &str) -> bool {
+    let mut cur = start.to_string();
+    for _ in 0..16 {
+        if cur == target {
+            return true;
+        }
+        match db
+            .types
+            .get(&cur)
+            .and_then(|st| st.domain.as_ref())
+            .and_then(|d| d.base_domain.clone())
+        {
+            Some(inner) => cur = inner,
+            None => return false,
+        }
+    }
+    false
+}
+
+/// v1.97: composite types that (transitively) contain an attribute
+/// whose type resolves to domain `dname` — the "container" set for
+/// PG19's find_composite_type_dependencies rule: ALTER DOMAIN ADD
+/// CONSTRAINT over such a domain cannot be validated against
+/// stored rows (the domain value is buried inside composite
+/// values), so PG refuses with 0A000 when a stored column uses
+/// one of these composites.
+fn composites_containing_domain(db: &crate::storage::Database, dname: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    loop {
+        let mut grew = false;
+        let mut names: Vec<String> = db.types.keys().cloned().collect();
+        names.sort();
+        for n in names {
+            if out.contains(&n) {
+                continue;
+            }
+            let Some(fields) = db.types.get(&n).and_then(|st| st.composite.clone()) else {
+                continue;
+            };
+            let hit = fields.iter().any(|(_, _, named)| match named {
+                Some(a) => {
+                    a == dname || domain_chain_includes(db, a, dname) || out.iter().any(|c| c == a)
+                }
+                None => false,
+            });
+            if hit {
+                out.push(n);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    out
+}
+
+/// v1.97: evaluate ONE prospective domain check against one stored
+/// value (PG19 validateDomainCheckConstraint). FALSE violates;
+/// NULL passes (checks only run on non-null domain values).
+fn domain_check_holds(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    base: &ColType,
+    check: &crate::sql::CheckDef,
+    value: &Value,
+) -> Result<bool, ExecError> {
+    let mut lock_ids: Vec<(String, u64)> = Vec::new();
+    let mut q = Q {
+        eng: &mut *eng,
+        snap: ctx.snap,
+        own: ctx.own,
+        all_xids: ctx.all_xids.clone(),
+        session: ctx.session,
+        role: ctx.role,
+        read_only: true,
+        depth: 0,
+        lock_ids: &mut lock_ids,
+        ctes: Vec::new(),
+        wctx: None,
+        srf_vals: Vec::new(),
+        priv_scopes: Vec::new(),
+        priv_role_override: None,
+        hashed_exists: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
+        immutable_fn_cache: std::rc::Rc::new(std::cell::RefCell::new(
+            std::collections::HashMap::new(),
+        )),
+        plan_fold_memo: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
+        hashed_in: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        pending_updates: None,
+        write: None,
+    };
+    let schema = vec![QCol {
+        qual: String::new(),
+        name: "value".to_string(),
+        ty: *base,
+        hidden: false,
+        src_ord: 0,
+    }];
+    let frame = Scope {
+        schema: &schema,
+        row: std::slice::from_ref(value),
+        prov: None,
+    };
+    match eval_expr(&mut q, &[frame], &check.expr)? {
+        Value::Bool(false) => Ok(false),
+        _ => Ok(true),
+    }
+}
+
+/// v1.97: PG19 AlterDomainAddConstraint validation
+/// (typecmds.c validateDomainCheckConstraint): existing stored
+/// values in columns of this domain (or of domains derived from
+/// it) must satisfy the new check — 23514 naming the first
+/// violating column. When the domain reaches a stored column only
+/// through a composite container, PG refuses outright (0A000,
+/// find_composite_type_dependencies).
+fn validate_domain_new_check(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    dname: &str,
+    base: &ColType,
+    check: &crate::sql::CheckDef,
+) -> Result<(), ExecError> {
+    let containers = composites_containing_domain(&eng.db, dname);
+    let tables = all_tables_snapshot(eng, ctx);
+    // Container refusal first (PG checks dependencies before
+    // scanning data).
+    if !containers.is_empty() {
+        for (tname, t) in &tables {
+            for i in 0..t.columns.len() {
+                if let Some(ec) = column_effective_composite(&eng.db, t, i) {
+                    if containers.iter().any(|c| c == &ec) {
+                        return Err(exec_err(
+                            "0A000",
+                            format!(
+                                "cannot alter type \"{}\" because column \"{}.{}\" uses it",
+                                dname, tname, t.columns[i].0
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    for (tname, t) in &tables {
+        for i in 0..t.columns.len() {
+            let Some(Some(cd)) = t.domain_types.get(i) else {
+                continue;
+            };
+            if !domain_chain_includes(&eng.db, cd, dname) {
+                continue;
+            }
+            let is_elem = t.domain_elem.get(i).copied().unwrap_or(false);
+            let mut values: Vec<Value> = Vec::new();
+            for rv in t
+                .rows
+                .iter()
+                .filter(|r| row_visible(r, ctx.snap, &ctx.all_xids))
+            {
+                let Some(cell) = rv.values.get(i) else {
+                    continue;
+                };
+                if is_elem {
+                    if let Value::Array(a) = cell {
+                        values.extend(a.elems.iter().cloned());
+                    }
+                } else {
+                    values.push(cell.clone());
+                }
+            }
+            for v in &values {
+                if matches!(v, Value::Null) {
+                    continue;
+                }
+                if !domain_check_holds(eng, ctx, base, check, v)? {
+                    return Err(exec_err(
+                        "23514",
+                        format!(
+                            "column \"{}\" of table \"{}\" contains values that violate the new constraint",
+                            t.columns[i].0, tname
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn exec_alter_domain(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -1011,7 +2239,11 @@ pub(crate) fn exec_alter_domain(
         .clone()
         .ok_or_else(|| exec_err("42809", format!("\"{}\" is not a domain", name)))?;
     match action {
-        AlterDomainAction::AddConstraint { name: cname, expr } => {
+        AlterDomainAction::AddConstraint {
+            name: cname,
+            expr,
+            not_valid,
+        } => {
             // PG19: domain CHECK expressions may only reference VALUE
             // (same rule as CREATE DOMAIN).
             let mut refs = Vec::new();
@@ -1047,12 +2279,40 @@ pub(crate) fn exec_alter_domain(
                     ),
                 ));
             }
-            dom.checks.push(crate::sql::CheckDef {
+            let new_check = crate::sql::CheckDef {
                 name: cname,
                 expr: expr.clone(),
-                not_valid: false,
+                not_valid: *not_valid,
                 kind: crate::sql::CheckKind::Check,
-            });
+                no_inherit: false,
+            };
+            // v1.97: PG19 validates existing stored data against a
+            // new domain constraint (validateDomainCheckConstraint)
+            // unless it is added NOT VALID.
+            if !*not_valid {
+                validate_domain_new_check(eng, ctx, name, &dom.base, &new_check)?;
+            }
+            dom.checks.push(new_check);
+        }
+        AlterDomainAction::ValidateConstraint { name: cname } => {
+            // v1.97: VALIDATE CONSTRAINT scans the stored data like
+            // the ADD-time validation, then clears not_valid.
+            let pos = dom
+                .checks
+                .iter()
+                .position(|c| &c.name == cname)
+                .ok_or_else(|| {
+                    exec_err(
+                        "42704",
+                        format!(
+                            "constraint \"{}\" of domain \"{}\" does not exist",
+                            cname, name
+                        ),
+                    )
+                })?;
+            let check = dom.checks[pos].clone();
+            validate_domain_new_check(eng, ctx, name, &dom.base, &check)?;
+            dom.checks[pos].not_valid = false;
         }
         AlterDomainAction::DropConstraint {
             name: cname,

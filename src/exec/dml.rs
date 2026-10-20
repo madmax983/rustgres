@@ -472,6 +472,55 @@ pub(crate) struct UpsertPlan {
     pub(crate) explicit_arbiter: bool,
 }
 
+/// v1.99: the column name when an ON CONFLICT inference element is a
+/// bare (possibly quoted) identifier, else None (an expression
+/// element, matched against index expression keys instead).
+pub(crate) fn arbiter_elem_bare_name(key: &str) -> Option<&str> {
+    let inner = key
+        .strip_prefix('"')
+        .and_then(|k| k.strip_suffix('"'))
+        .unwrap_or(key);
+    if !inner.is_empty()
+        && inner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        && !inner.chars().next().is_some_and(|c| c.is_ascii_digit())
+    {
+        Some(inner)
+    } else {
+        None
+    }
+}
+
+/// v1.99: PG19's arbiter inference satisfaction rule
+/// (indxpath.c infer_arbiter_indexes): an index matches an inference
+/// specification when every index key is named by some element AND
+/// every element is satisfied by some index key — an element
+/// attribute (collation / operator class) left unspecified is a
+/// wildcard, and a specified one must equal the key's.
+pub(crate) fn arbiter_elems_match(
+    key_texts: &[String],
+    key_collates: &[Option<String>],
+    key_opclasses: &[Option<String>],
+    elems: &[crate::sql::ArbiterElem],
+) -> bool {
+    let attr = |v: &[Option<String>], i: usize| v.get(i).cloned().flatten();
+    if key_texts.iter().any(|k| !elems.iter().any(|e| &e.key == k)) {
+        return false;
+    }
+    elems.iter().all(|e| {
+        key_texts.iter().enumerate().any(|(i, k)| {
+            k == &e.key
+                && e.collate
+                    .as_ref()
+                    .map_or(true, |c| attr(key_collates, i).as_ref() == Some(c))
+                && e.opclass
+                    .as_ref()
+                    .map_or(true, |o| attr(key_opclasses, i).as_ref() == Some(o))
+        })
+    })
+}
+
 pub(crate) fn plan_upsert(
     eng: &Engine,
     ctx: &StmtCtx,
@@ -493,52 +542,68 @@ pub(crate) fn plan_upsert(
     // the index name with that prefix stripped. Parents and plain
     // tables keep the historical `{constraint}` name.
     let is_child = t.partition.as_ref().is_some_and(|p| p.parent.is_some());
-    let mut unique: Vec<(String, Vec<usize>, Vec<String>, Option<String>)> =
-        if eng.db.is_temp_table(ctx.session, table) {
-            let mut out = Vec::new();
-            let mut push = |u: &UniqueDef| {
-                let cols: Vec<usize> = u.cols.iter().filter_map(|c| t.column_index(c)).collect();
-                if cols.len() == u.cols.len() {
-                    out.push((u.name.clone(), cols, u.cols.clone(), Some(u.name.clone())));
-                }
-            };
-            if let Some(pk) = &t.pkey {
-                push(pk);
+    let mut unique: Vec<(
+        String,
+        Vec<usize>,
+        Vec<String>,
+        Option<String>,
+        Vec<Option<String>>,
+        Vec<Option<String>>,
+    )> = if eng.db.is_temp_table(ctx.session, table) {
+        let mut out = Vec::new();
+        let mut push = |u: &UniqueDef| {
+            let cols: Vec<usize> = u.cols.iter().filter_map(|c| t.column_index(c)).collect();
+            if cols.len() == u.cols.len() {
+                let n = cols.len();
+                out.push((
+                    u.name.clone(),
+                    cols,
+                    u.cols.clone(),
+                    Some(u.name.clone()),
+                    vec![None; n],
+                    vec![None; n],
+                ));
             }
-            for u in &t.uniques {
-                push(u);
-            }
-            out
-        } else {
-            eng.db
-                .visible_indexes_for(table, ctx.snap, &ctx.all_xids, ctx.session)
-                .into_iter()
-                .filter(|ix| ix.def.unique && ix.def.planner_usable)
-                .map(|ix| {
-                    // v0.71: only constraint-backed indexes (internal)
-                    // carry a constraint name for ON CONFLICT ON
-                    // CONSTRAINT and partitioned leaf mapping. A
-                    // standalone CREATE UNIQUE INDEX has no constraint
-                    // and no per-leaf backing index.
-                    let con = if !ix.def.internal {
-                        None
-                    } else if is_child {
-                        ix.def
-                            .name
-                            .strip_prefix(&format!("{table}_"))
-                            .map(|s| s.to_string())
-                    } else {
-                        Some(ix.def.name.clone())
-                    };
-                    (
-                        ix.def.name.clone(),
-                        ix.def.cols.clone(),
-                        ix.def.col_names.clone(),
-                        con,
-                    )
-                })
-                .collect()
         };
+        if let Some(pk) = &t.pkey {
+            push(pk);
+        }
+        for u in &t.uniques {
+            push(u);
+        }
+        out
+    } else {
+        eng.db
+            .visible_indexes_for(table, ctx.snap, &ctx.all_xids, ctx.session)
+            .into_iter()
+            .filter(|ix| ix.def.unique && ix.def.planner_usable)
+            .map(|ix| {
+                // v0.71: only constraint-backed indexes (internal)
+                // carry a constraint name for ON CONFLICT ON
+                // CONSTRAINT and partitioned leaf mapping. A
+                // standalone CREATE UNIQUE INDEX has no constraint
+                // and no per-leaf backing index.
+                let con = if !ix.def.internal {
+                    None
+                } else if is_child {
+                    ix.def
+                        .name
+                        .strip_prefix(&format!("{table}_"))
+                        .map(|s| s.to_string())
+                } else {
+                    Some(ix.def.name.clone())
+                };
+                (
+                    ix.def.name.clone(),
+                    ix.def.cols.clone(),
+                    ix.def.col_names.clone(),
+                    con,
+                    ix.def.collates.clone(),
+                    ix.def.opclasses.clone(),
+                )
+            })
+            .collect()
+    };
     unique.sort_by(|a, b| a.0.cmp(&b.0));
     let no_arbiter = || {
         exec_err(
@@ -558,29 +623,64 @@ pub(crate) fn plan_upsert(
             // DO NOTHING without an arbiter: every unique index arbitrates.
             unique
                 .iter()
-                .map(|(n, cols, _, con)| (n.clone(), cols.clone(), con.clone()))
+                .map(|(n, cols, _, con, _, _)| (n.clone(), cols.clone(), con.clone()))
                 .collect()
         }
         ConflictArbiter::Columns(cols) => {
-            for c in cols {
-                if meta.column_index(c).is_none() {
-                    return Err(exec_err(
-                        "42703",
-                        format!("column \"{}\" of relation \"{}\" does not exist", c, table),
-                    ));
+            // v1.99: bare-name elements must name target columns
+            // (42703, PG19); expression elements are matched against
+            // index expression keys instead.
+            for e in cols {
+                let bare = arbiter_elem_bare_name(&e.key);
+                if let Some(name) = bare {
+                    if meta.column_index(name).is_none() {
+                        return Err(exec_err(
+                            "42703",
+                            format!(
+                                "column \"{}\" of relation \"{}\" does not exist",
+                                name, table
+                            ),
+                        ));
+                    }
                 }
             }
-            let mut want: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
-            want.sort_unstable();
-            unique
+            let found = unique
                 .iter()
-                .find(|(_, _, cn, _)| {
-                    let mut have: Vec<&str> = cn.iter().map(|s| s.as_str()).collect();
-                    have.sort_unstable();
-                    have == want
-                })
-                .map(|(n, cols, _, con)| vec![(n.clone(), cols.clone(), con.clone())])
-                .ok_or_else(no_arbiter)?
+                .find(|(_, _, cn, _, co, op)| arbiter_elems_match(cn, co, op, cols));
+            match found {
+                Some((n, pcols, _, con, _, _)) => {
+                    vec![(n.clone(), pcols.clone(), con.clone())]
+                }
+                None => {
+                    // v1.99: the inference may still be satisfied by
+                    // a catalog-only unique index (expression /
+                    // partial — never built in this engine). PG19
+                    // accepts the statement; execution degrades to
+                    // the no-arbiter path (DO NOTHING inserts plain;
+                    // DO UPDATE still 42P10s below, since it cannot
+                    // arbitrate without index entries). EXPLAIN only
+                    // needs the validation, which now succeeds.
+                    let catalog_match = !eng.db.is_temp_table(ctx.session, table)
+                        && eng
+                            .db
+                            .visible_indexes_for(table, ctx.snap, &ctx.all_xids, ctx.session)
+                            .iter()
+                            .any(|ix| {
+                                ix.def.unique
+                                    && arbiter_elems_match(
+                                        &ix.def.col_names,
+                                        &ix.def.collates,
+                                        &ix.def.opclasses,
+                                        cols,
+                                    )
+                            });
+                    if catalog_match && !matches!(oc.action, ConflictAction::DoUpdate { .. }) {
+                        Vec::new()
+                    } else {
+                        return Err(no_arbiter());
+                    }
+                }
+            }
         }
         // v0.71: match the constraint name as well as the index name, so
         // ON CONFLICT ON CONSTRAINT works against sub-partitioned
@@ -589,8 +689,8 @@ pub(crate) fn plan_upsert(
         // standalone CREATE UNIQUE INDEX is not a constraint (42P10).
         ConflictArbiter::Constraint(name) => unique
             .iter()
-            .find(|(_, _, _, con)| con.as_deref() == Some(name.as_str()))
-            .map(|(n, cols, _, con)| vec![(n.clone(), cols.clone(), con.clone())])
+            .find(|(_, _, _, con, _, _)| con.as_deref() == Some(name.as_str()))
+            .map(|(n, cols, _, con, _, _)| vec![(n.clone(), cols.clone(), con.clone())])
             .ok_or_else(no_arbiter)?,
     };
     let indexes: Vec<(String, Vec<usize>)> = resolved
@@ -1306,6 +1406,50 @@ pub(crate) fn apply_row_inserts(
 /// discards the rows (Postgres skips execution); observable only via
 /// volatile functions in the query.
 #[allow(clippy::too_many_arguments)]
+/// v1.97: the named composite type a CTAS select item produces,
+/// when it is statically known (see exec_create_table_as).
+fn ctas_item_composite(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    select: &SelectStmt,
+    expr: &Expr,
+) -> Option<String> {
+    match expr {
+        Expr::CastNamed { name: ty_name, .. } => eng
+            .db
+            .types
+            .get(ty_name)
+            .filter(|st| st.composite.is_some())
+            .map(|_| ty_name.clone()),
+        Expr::Column { table, name } => {
+            for item in &select.from {
+                let crate::sql::FromItem::Table {
+                    name: tname, alias, ..
+                } = item
+                else {
+                    continue;
+                };
+                if let Some(q) = table {
+                    if q != tname && alias.as_deref() != Some(q.as_str()) {
+                        continue;
+                    }
+                }
+                let Some(t) = eng
+                    .db
+                    .find_table(tname, ctx.snap, &ctx.all_xids, ctx.session)
+                else {
+                    continue;
+                };
+                if let Some(ci) = t.column_index(name) {
+                    return t.composite_types.get(ci).cloned().flatten();
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn exec_create_table_as(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -1403,9 +1547,28 @@ pub(crate) fn exec_create_table_as(
         }
     }
     let ncols = columns.len();
+    // v1.97: CTAS output columns keep their named composite type
+    // (PG19 records the column type of the query output; a bare
+    // Composite ColType without a name failed create validation
+    // with a bogus 42704 "<unknown>"). Infer per select item: an
+    // explicit cast to a composite type, or a plain column
+    // reference to a composite-typed source column.
+    let mut composite_types: Vec<Option<String>> = vec![None; ncols];
+    if select.items.len() == ncols
+        && !select
+            .items
+            .iter()
+            .any(|i| !matches!(i, crate::sql::SelectItem::Expr { .. }))
+    {
+        for (idx, item) in select.items.iter().enumerate() {
+            if let crate::sql::SelectItem::Expr { expr, .. } = item {
+                composite_types[idx] = ctas_item_composite(eng, ctx, select, expr);
+            }
+        }
+    }
     let def = crate::sql::TableDef {
         columns,
-        composite_types: vec![None; ncols],
+        composite_types,
         domain_types: vec![None; ncols],
         bit_typmods: vec![None; ncols],
         domain_elem: vec![false; ncols],
@@ -1427,6 +1590,11 @@ pub(crate) fn exec_create_table_as(
     };
     // CTAS definitions never carry constraints; the effective def is discarded.
     let _ = create_table_from_def(eng, ctx, name, &def, temp)?;
+    // v1.99: default privileges materialize at creation, as for
+    // plain CREATE TABLE (PG19).
+    if !temp {
+        apply_default_acl_for_new_table(eng, ctx, name)?;
+    }
     let n = if with_data { out.rows.len() } else { 0 };
     if with_data {
         let mut inserts: Vec<(u64, Row)> = Vec::with_capacity(out.rows.len());
@@ -1816,7 +1984,9 @@ pub(crate) fn exec_insert(
                 }
                 exprs.extend(returning_exprs.iter().copied());
             }
-            crate::sql::ConflictAction::DoSelect { where_, for_update } => {
+            crate::sql::ConflictAction::DoSelect {
+                where_, for_update, ..
+            } => {
                 // v1.96 finishing pass: PG19 analyze.c — DO SELECT
                 // requires a RETURNING clause (42601), unconditionally.
                 if returning.is_empty() {
@@ -1870,7 +2040,10 @@ pub(crate) fn exec_insert(
         let mut arbiter_refs: Vec<Expr> = Vec::new();
         if matches!(oc.action, crate::sql::ConflictAction::DoUpdate { .. }) {
             let arbiter_cols: Vec<String> = match &oc.arbiter {
-                crate::sql::ConflictArbiter::Columns(cols) => cols.clone(),
+                crate::sql::ConflictArbiter::Columns(cols) => cols
+                    .iter()
+                    .filter_map(|e| arbiter_elem_bare_name(&e.key).map(str::to_string))
+                    .collect(),
                 crate::sql::ConflictArbiter::Constraint(cname) => eng
                     .db
                     .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
@@ -2653,7 +2826,9 @@ pub(crate) fn exec_insert(
                 ConflictAction::DoNothing => {
                     // Skipped: contributes no row and no RETURNING output.
                 }
-                ConflictAction::DoSelect { where_, for_update } => {
+                ConflictAction::DoSelect {
+                    where_, for_update, ..
+                } => {
                     // v1.96: PG19 ON CONFLICT DO SELECT — the
                     // conflicting (existing) row is returned as if
                     // selected: it feeds RETURNING, and without

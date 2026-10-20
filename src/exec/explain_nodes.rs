@@ -3441,15 +3441,46 @@ pub(crate) fn exec_explain(
     // v1.46: EXPLAIN VERBOSE — render the `Output:` targetlist lines.
     verbose: bool,
 ) -> Result<ExecResult, ExecError> {
+    // v1.99: EXPLAIN of DML (Insert/Update/Delete/CTAS/Declare/...)
+    // lives in explain_dml.rs.
+    if !matches!(stmt, Stmt::Select(_)) {
+        return exec_explain_dml(eng, ctx, stmt, costs, verbose);
+    }
     let sel = match stmt {
         Stmt::Select(s) => s,
-        _ => {
-            return Err(exec_err(
-                "0A000",
-                "EXPLAIN only supports SELECT statements".to_string(),
-            ));
-        }
+        _ => unreachable!("non-SELECT routed to exec_explain_dml above"),
     };
+    // v1.98: full analysis — planning-only EXPLAIN validates the query
+    // like PG19 parse analysis (privileges, operator/function/type
+    // resolution) before rendering a plan. See `validate_explain_select`.
+    {
+        let mut lock_ids: Vec<(String, u64)> = Vec::new();
+        let mut q = Q {
+            eng,
+            snap: ctx.snap,
+            own: ctx.own,
+            all_xids: ctx.all_xids.clone(),
+            session: ctx.session,
+            role: ctx.role,
+            read_only: ctx.read_only,
+            depth: 0,
+            lock_ids: &mut lock_ids,
+            ctes: Vec::new(),
+            wctx: None,
+            srf_vals: Vec::new(),
+            priv_scopes: Vec::new(),
+            priv_role_override: None,
+            hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+            immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+            plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
+            hashed_in: Rc::new(RefCell::new(Vec::new())),
+            pending_updates: None,
+            write: None,
+        };
+        validate_explain_select(&mut q, sel)?;
+        // `q` reborrowed `eng` mutably; rebind for `plan_select` below.
+        drop(q);
+    }
     // Planning only inspects definitions and statistics — nothing runs.
     // v1.08: COSTS OFF selects the PG-text plan rendering.
     let plan = plan_select(

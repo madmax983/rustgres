@@ -155,6 +155,186 @@ Before profiles committed:
 `benches/profiles/callgrind.out.rls-base-2026-10-18`,
 `benches/profiles/dhat.out.rls-base-2026-10-18`.
 
+## Bolt: `est_heap_pages` computes 291 real tuple lengths it then discards — fix — 2026-10-19
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec/indexes.rs`'s `est_heap_pages`: check `t.rows.len() >=
+MAX_TUPLES_PER_PAGE` once, up front, before computing anything. For a
+table at or above the cap this returns the same constant `2` the old
+code eventually returned — but without first calling
+`pg_heap_tuple_len` for 291 rows whose lengths the early-return branch
+never read. For a table under the cap, the per-row lengths are still
+computed for every row (via `t.rows.iter().map(pg_heap_tuple_len).collect()`,
+behaviorally identical to the old manual push loop, just without the
+now-redundant length check inside it) and fed to `pg_heap_page_count`
+exactly as before. No change to any computed value in either branch —
+only to how many `pg_heap_tuple_len` calls it takes to reach the
+at-or-above-cap branch's already-fixed answer.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_explain.py --count 300`), same workload,
+same machine, same session.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes`):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total `Ir` | 2,845,091,717 | 2,526,580,210 | **-11.19%** |
+| `pg_nestloop_swap` inclusive `Ir` (600 calls) | 548,196,074 (19.27% of total) | 229,489,851 (9.08% of new total) | **-318,706,223** |
+| `pg_heap_tuple_len` total calls | 294,600 | 120,000 | **-174,600 (-59.3%)** |
+| `pg_heap_tuple_len` self `Ir` | 149,385,600 (5.25%) | 55,800,000 (2.21%) | -62.65% |
+
+The eliminated 174,600 calls match exactly: `291 × 600` — the
+`bench_orders` (2000-row, at-the-cap) side of every `pg_nestloop_swap`
+invocation, previously computed and always discarded. The remaining
+120,000 calls are exactly `200 × 600` — the `bench_customers` (200-row,
+under-the-cap) side, whose result is genuinely used and is completely
+unaffected by this change (its own `est_heap_pages` call site's
+inclusive cost moved from 8.14% to 8.97% of total — consistent with an
+unchanged absolute cost against a smaller total). The total-`Ir`
+reduction (318,511,507) matches `pg_nestloop_swap`'s own inclusive-`Ir`
+reduction (318,706,223) within rounding — the savings are exactly
+where the hypothesis said they'd be, and nowhere else moved.
+
+The -11.19% total-`Ir` delta clears the ≥5%-of-profile floor by more
+than 2x.
+
+**Direct behavior check** (beyond the counter-preservation argument):
+built both the pre-change and post-change trees to separate binaries
+and ran four `EXPLAIN` shapes (the three from the harness, plus an
+explicit `EXPLAIN (COSTS ON)` two-table join) against the same
+200-customer/2000-order dataset on each — byte-for-byte identical
+output on all four, including plan shape (nestloop side order) and
+every `rows=`/cost annotation.
+
+`cargo test --all-features`: 1082/1082 passed, unchanged (same count
+as the pre-change tree). `cargo fmt --all -- --check`: clean. `cargo
+clippy --all-targets --all-features -- -D warnings`: 941 errors on
+both trees (confirmed via `git stash`), none in the changed lines of
+`indexes.rs`; zero net new errors/warnings from this diff.
+
+Before/after profiles committed:
+`benches/profiles/callgrind.out.heappages-{base,after}-2026-10-19`.
+
+**Reproduce**: check out the parent (baseline) commit, `cargo build`,
+repeat the Callgrind command in the baseline entry's "Reproduce"
+section for the before numbers; check out this commit, `cargo build`,
+repeat for the after numbers.
+
+## Bolt: `est_heap_pages` computes 291 real tuple lengths it then discards — baseline — 2026-10-19
+
+**Why this workload**: v1.98 (2026-10-17/19) added `validate_explain_select`,
+a full static-analysis pass that plan-only `EXPLAIN` now runs before
+planning. That pass has never been profiled, so this round targets it.
+`benches/profile_explain.py` (new) loads a realistic two-table schema
+(`bench_customers`: 200 rows, `bench_orders`: 2000 rows — an
+orders/customers shape, not a toy table) and sends an exact count of
+plan-only `EXPLAIN` (no `ANALYZE` — nothing executes, isolating plan-time
+cost) over three representative query shapes a client that inspects
+query plans before running them would send: an inner-equi-join with
+`GROUP BY`/`HAVING`/`ORDER BY` (bench.py's `join` shape), a correlated
+`EXISTS` subquery, and a CTE feeding a join — the FROM/subquery/CTE
+shapes `validate_explain_select` recurses into. 300 iterations of each
+(900 EXPLAIN round-trips total) over the real wire protocol, debug
+build, fresh data dir.
+
+Reproduce:
+```bash
+cargo build
+RUSTGRES_DATA_DIR=$(mktemp -d) valgrind --tool=callgrind \
+  --callgrind-out-file=/tmp/cg.out --collect-jumps=yes --cache-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_explain.py --count 300 --timeout 1800
+# SIGTERM the real valgrind-wrapped server pid (not the shell job) to
+# flush, then:
+callgrind_annotate --auto=yes /tmp/cg.out | head -80
+```
+
+📈 **Profile** (Callgrind, valgrind 3.22.0, current HEAD v1.98):
+**2,845,091,717** total `Ir`. `validate_explain_select`'s own machinery
+(`vx_select`/`vx_expr`/`expr_type`/`check_select_col_privs`/...) sums to
+well under 1% of total `Ir` — the originally-hypothesized "EXPLAIN
+re-validates what planning already resolves" redundancy does not hold;
+that pass is cheap. The real cost is in planning's cost *estimation*:
+
+| call | inclusive `Ir` | % of total | calls |
+|---|---|---|---|
+| `src/exec/explain.rs::pg_nestloop_swap` | 548,196,074 | **19.27%** | 600 |
+| ⤷ `src/exec/indexes.rs::est_heap_pages` (side A) | 231,522,824 | 8.14% | 600 |
+| ⤷ `src/exec/indexes.rs::est_heap_pages` (side B) | 313,705,022 | 11.03% | 600 |
+| `src/exec/funcs.rs::pg_heap_tuple_len` (self) | 149,385,600 | 5.25% | 294,600 |
+
+`pg_nestloop_swap` (the cost-based nestloop side-selection check PG19's
+planner performs for every inner join) is called once per `EXPLAIN` of
+the 600/900 iterations whose query shape is a top-level join
+(the join-group-aggregate and CTE-join shapes; the `EXISTS` shape has no
+top-level join). It calls `est_heap_pages` once per side to get each
+table's `(cost=... rows=...)` page-count term — and that one call per
+side accounts for essentially its entire cost.
+
+💡 **Hypothesis investigated and falsified**: I suspected `est_heap_pages`
+was being called *redundantly* — once per candidate join-order/strategy
+(nestloop-swap, hash-join L/R, nestloop L/R) for the same pair of tables
+within one planning pass, via the richer hash-vs-nestloop cost
+comparison in `src/exec/sje.rs` (`hash_win`, lines ~2170-2330) — which
+would make a per-planning-call memoization cache a clean win. Verified
+with temporary instrumentation (not committed): for this query shape
+(`JOIN ... ON a.x = b.y`), the ON clause's equality is absorbed into an
+equivalence class (`join_ec`) before `pg_hash_clauses` scans the
+join-filter conjunct list, so `hash_clauses` is always empty and
+`pg_hashjoin_cost_order`/`pg_nestloop_cost_order` are never called for
+this (extremely common) shape — confirmed via callgrind: both have
+**zero** calls in this profile. No redundant-call pattern exists here to
+cache away.
+
+**The real mechanism, found while reading `est_heap_pages` instead**
+(`src/exec/indexes.rs:845`):
+
+```rust
+pub(crate) fn est_heap_pages(t: &Table) -> u64 {
+    const MAX_TUPLES_PER_PAGE: usize = 291;
+    let mut lens: Vec<usize> = Vec::new();
+    for rv in &t.rows {
+        if lens.len() >= MAX_TUPLES_PER_PAGE {
+            return 2;
+        }
+        lens.push(pg_heap_tuple_len(t, rv));
+    }
+    pg_heap_page_count(t, &lens) / 8192
+}
+```
+
+For any table at or above the 291-tuple cap (`bench_orders`, 2000 rows),
+this computes `pg_heap_tuple_len` — a real per-row PG19 heap-tuple byte-
+layout calculation — for the first 291 rows, **then discards every one
+of those 291 lengths** and returns the hardcoded constant `2`: the
+early-return value does not depend on `lens` at all. The check
+`lens.len() >= MAX_TUPLES_PER_PAGE` is also only reachable *after*
+pushing 291 real lengths (the check runs at the top of each loop
+iteration, so the 292nd row's check is what triggers it, but rows
+1..=291 are all computed first). The cap is already a function purely
+of `t.rows.len()` — not of any row's contents — so the result for every
+table with `t.rows.len() >= 291` is independent of the 291 computed
+lengths and can be known before computing any of them.
+
+Confirmed by exact call-count arithmetic: `pg_heap_tuple_len` is called
+294,600 times total in this profile = `200 × 600` (`bench_customers`,
+under the cap — legitimate, its result is used) + `291 × 600`
+(`bench_orders`, at the cap — **every one of these 174,600 calls is
+discarded**). 59.3% of all `pg_heap_tuple_len` calls in this workload
+compute a value nothing ever reads.
+
+`cargo test --all-features`: 1082/1082 passed (pre-change tree,
+unmodified).
+
+Before profile committed:
+`benches/profiles/callgrind.out.heappages-base-2026-10-19`.
+
 ## Bolt: the Snowball English stemmer re-decodes ASCII suffix tables as UTF-8 on every candidate — fix — 2026-10-17
 
 Fixes the target identified in the baseline entry immediately below
@@ -285,6 +465,169 @@ unmodified). `tests/conformance/schedule_runner.py --tests tsearch`:
 PASS=326/REAL-FAIL=119 (of 326+119 scored tsearch cases).
 
 Before profile committed: `benches/profiles/callgrind.out.tsearch-base-2026-10-17`.
+
+## Bolt: `JSON_QUERY`/`JSON_EXISTS`/`JSON_VALUE` re-parse their jsonpath literal from scratch on every row — fix — 2026-10-16
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec/jsonpath.rs`: `parse_jsonpath` now checks a thread-local
+cache, keyed by the input path text, before tokenizing/parsing
+anything. A hit clones the cached `JpPath` (an `Rc` deref + one
+`Clone`, no tokenizer, no recursive-descent parse, no per-node `Box`
+allocation) instead of re-running `tokenize_jsonpath` +
+`JpParser::parse_path`; a miss parses exactly as before and caches a
+clone of the result. Bounded at 64 entries (`JSONPATH_PARSE_CACHE_CAP`),
+matching this repo's existing `REGEX_CACHE_CAP`/`JSONB_PARSE_CACHE_CAP`
+caches, and clears itself outright on overflow rather than evicting
+LRU-style. Only successful parses are cached; a parse error re-reports
+the identical error on every call, exactly as before. The function's
+signature and all 5 call sites are unchanged.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_sqljson_queryfuncs.py --rows 1500
+--count 20`), same workload, same machine, same session.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total `Ir` | 18,556,724,153 | 16,406,519,485 | **-11.59%** |
+
+DHAT (same workload, one run each before/after):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total allocation bytes | 862,466,772 | 779,460,864 | -9.62% |
+| Total allocation blocks | 13,164,200 | 12,114,261 | -7.98% |
+| Target-attributable bytes (tokenize/parse call stacks) | 106,770,000 | 18,244,084 | **-82.91%** |
+| Target-attributable blocks (tokenize/parse call stacks) | 1,560,000 | 450,060 | **-71.15%** |
+
+The `Ir` delta (-11.59%) clears the ≥5%-of-profile floor by more than
+2x on its own. The target-attributable DHAT deltas (-82.91% bytes,
+-71.15% blocks — the allocations whose call stack passes through
+`tokenize_jsonpath`/`JpLexer`/`JpParser`/`JpTok::clone`) clear the
+≥10%-of-allocations floor independently and confirm the fix hits
+exactly the call stacks the baseline named; the residual (the cache
+still misses on a path's first appearance, and occasionally reallocates
+the cache `HashMap` itself) is inherent. Program-wide DHAT totals also
+drop (-9.62% bytes, -7.98% blocks), smaller than the target-specific
+numbers because most of this workload's remaining allocation churn is
+unrelated document/numeric parsing, not jsonpath parsing.
+
+`cargo test --all-features`: 1017/1017 passed, unchanged. `cargo fmt
+--all -- --check`: clean. `cargo clippy --all-targets --all-features
+-- -D warnings`: 808 errors on both the pre-change and post-change
+tree (compared by count via `git stash`) — the same pre-existing
+toolchain/lint-version mismatch noted throughout this file, zero new.
+`tests/conformance/schedule_runner.py --tests
+json,jsonb,json_encoding,jsonpath,jsonpath_encoding,jsonb_jsonpath,
+sqljson,sqljson_queryfuncs,sqljson_jsontable`: identical PASS=2844
+EF=1 REAL-FAIL=836 of 3681 scored on both trees — zero behavior
+change.
+
+Before/after profiles committed:
+`benches/profiles/{callgrind,dhat}.out.sqljsonpathcache-{base,after}-2026-10-16`.
+
+**Reproduce**: check out the parent (baseline) commit, `cargo build`,
+repeat the Callgrind/DHAT commands in the baseline entry's
+"Reproduce" section for the before numbers; check out this commit,
+`cargo build`, repeat for the after numbers.
+
+## Bolt: `JSON_QUERY`/`JSON_EXISTS`/`JSON_VALUE` re-parse their jsonpath literal from scratch on every row — baseline — 2026-10-16
+
+**Why this workload**: v1.92 added the SQL-standard query functions
+(`JSON_VALUE`/`JSON_QUERY`/`JSON_EXISTS`, `json.rs`'s
+`eval_sqljson_func`/`eval_sqljson_query_q`) on top of the jsonpath
+engine. This is a different call path from the older scalar
+`jsonb_path_*` functions profiled 2026-10-14
+(`eval_jsonpath_scalar`) — that round's fix cached the *document*
+text's parsed tree (`parse_jsonb`'s `JSONB_PARSE_CACHE`), not the
+jsonpath *pattern* text's parsed tree, and left `jsonpath.rs`'s
+`parse_jsonpath` (tokenize + recursive-descent parse) uncached at
+every one of its 5 call sites. No prior Bolt round has profiled the
+SQL-standard query functions or the jsonpath-pattern-parse cost in
+isolation from the then-dominant document-parse cost.
+
+`benches/profile_sqljson_queryfuncs.py` (new): 20 exact iterations of
+a 3-function SELECT (`JSON_EXISTS`/`JSON_VALUE`/`JSON_QUERY`, each
+with a literal jsonpath argument) over 1500 rows of nested order-event
+jsonb documents, over the real wire protocol, debug build, fresh data
+dir — the textbook SQL/JSON report-query shape (`JSON_EXISTS(doc,
+'$.a.b')` with a constant path), not a synthetic microbenchmark of the
+jsonpath parser alone.
+
+Reproduce:
+```bash
+cargo build
+RUSTGRES_DATA_DIR=$(mktemp -d) valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out --collect-jumps=yes --cache-sim=yes --branch-sim=yes ./target/debug/rustgres &
+python3 benches/profile_sqljson_queryfuncs.py --rows 1500 --count 20 --timeout 2400
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | head -40
+# swap --tool=dhat --dhat-out-file=/tmp/dhat.out for the allocation profile
+```
+
+**Profile** (callgrind, valgrind 3.22.0, `--collect-jumps=yes
+--cache-sim=yes --branch-sim=yes`): **18,556,724,153** total `Ir`.
+Summing the self-cost of every `jsonpath.rs` function that participates
+in tokenizing/parsing a path (`tokenize_jsonpath`, every `JpLexer::*`
+and `JpParser::*` method, `JpTok`'s `Clone`/`PartialEq`, `parse_jsonpath`
+itself) — i.e. excluding the data-dependent *evaluation* functions
+(`eval`, `eval_pred`, `jp_query_seq`, `jp_exists`, `key_access`,
+`compare_seqs`/`compare_pair`, `operand_seq`, `jp_context`) that
+genuinely differ per row and can't be cached away — gives **575,310,000
+Ir (3.10% of total)** in named-function self-cost alone. That undercounts
+the real cost: the allocator calls those parsing functions make (growing
+the token `Vec`, boxing each `JpExpr` AST node) are attributed to libc/
+`alloc::raw_vec` symbols, not to `jsonpath.rs`, so DHAT is the more
+honest measure here — same pattern as the 2026-10-14 jsonpath-cache
+baseline, which also undercounted on raw `Ir` self-cost alone.
+
+DHAT (same workload, one run): **862,466,772** total bytes,
+**13,164,200** total allocation blocks. Attributing every allocation
+whose call stack passes through `tokenize_jsonpath`, any `JpLexer`/
+`JpParser` method, or `JpTok`'s `Clone` impl (i.e. everything that
+exists only to turn the literal path *text* into a `JpPath` tree, run
+fresh on every row despite the text being byte-identical across all
+1500 rows × 20 iterations × 3 call sites):
+
+| metric | value | % of total |
+|---|---|---|
+| allocation blocks | 1,560,000 | **11.85%** |
+| allocation bytes | 106,770,000 | **12.38%** |
+
+Both clear the ≥10%-of-allocations floor independently. Top sites by
+block count: `RawVec<JpTok>::grow_one` (the token vector growing
+without a capacity hint — `tokenize_jsonpath` pushes one `JpTok` at a
+time starting from `Vec::new()`), `JpParser::parse_accessor_op`
+(boxing each parsed `JpExpr` AST node), and `JpTok::clone`.
+
+**Hypothesis**: `parse_jsonpath` (jsonpath.rs:1453) has no cache at
+any of its 5 call sites (json.rs:1402, 2543, 2544, 2704, 3767, 3881),
+unlike its sibling `parse_jsonb` (cached since 52ee619). In the
+overwhelming common case — `JSON_EXISTS(doc, '$.a.b')`,
+`JSON_VALUE`/`JSON_QUERY` with a literal path argument — the path text
+is a SQL constant, identical across every row of a SELECT and across
+every iteration of a prepared/repeated query, yet it is tokenized and
+recursive-descent-parsed into a fresh `JpPath`/`JpExpr` tree from
+scratch on every single row. `JpPath` already derives `Clone`
+(jsonpath.rs:18), so a thread-local cache keyed by the input text —
+exactly `JSONB_PARSE_CACHE`'s shape in `json.rs`, bounded the same way
+(64 entries, `src/regex.rs`'s existing `REGEX_CACHE_CAP`) — can serve a
+cached `Rc<JpPath>`'s clone instead of re-tokenizing and re-parsing.
+
+`cargo test --all-features`: 1017/1017 passed (pre-change tree,
+unmodified). `tests/conformance/schedule_runner.py --tests
+json,jsonb,json_encoding,jsonpath,jsonpath_encoding,jsonb_jsonpath,
+sqljson,sqljson_queryfuncs,sqljson_jsontable`: PASS=2844 EF=1
+REAL-FAIL=836 of 3681 scored (pre-change tree).
+
+Before profiles committed:
+`benches/profiles/{callgrind,dhat}.out.sqljsonpathcache-base-2026-10-16`.
 
 ## Bolt: default-RETURNING `JSON_OBJECT`/`JSON_ARRAY` builds a full jsonb tree it never reads — fix — 2026-10-15
 
@@ -600,6 +943,159 @@ unmodified).
 
 Before profiles committed:
 `benches/profiles/{callgrind,dhat}.out.jsonpathcache-base-2026-10-14`.
+
+## Bolt: `json.rs`'s `parse_string` re-validates the entire remaining document as UTF-8 on every character copied — fix — 2026-10-13
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec/json.rs`: `parse_string`'s regular-character arm no longer
+calls `std::str::from_utf8(&self.chars[self.pos..])` (an unbounded
+slice running to the end of the whole document) to decode the next
+character:
+
+```diff
+-                    // Copy the full UTF-8 sequence for this char.
+-                    let s = std::str::from_utf8(&self.chars[self.pos..])
+-                        .map_err(|_| "invalid utf-8".to_string())?;
+-                    let ch = s.chars().next().unwrap();
++                    // Decode just the one leading char (see doc comment).
++                    let ch = text[self.pos..].chars().next().unwrap();
+                     out.push(ch);
+                     self.pos += ch.len_utf8();
+```
+
+`parse_string` now takes the document's `text: &str` (the same
+`&str` `parse_value`/`parse_value_inner` already thread through
+every recursive call, previously unused past a no-op boundary check)
+and decodes through it instead of re-deriving a `&str` from the raw
+byte buffer each call. Indexing an already-valid `&str` by
+`self.pos..` is O(1) -- `str`'s `Index` impl only checks the
+boundary lands on a char (it always does here: `self.pos` only ever
+advances by whole-char lengths) -- and `Chars::next()` decodes just
+the one leading code point, bounded by at most 4 bytes, never
+touching the rest of the buffer. Both call sites (`parse_value_inner`
+for string values, the object-field loop for keys) now pass `text`
+through, the same parameter they already receive.
+
+The removed `.map_err(|_| "invalid utf-8"...)` branch was dead code:
+the parser's input is always a `&str`, already guaranteed valid
+UTF-8 by Rust's type system, so that branch could never be taken.
+No test exercised it (confirmed: no reference to `"invalid utf-8"`
+outside this line before the fix).
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_json.py --rows 1500 --count 15
+--timeout 1800`), same machine, same session.
+
+Callgrind `Ir` (`--collect-jumps=yes --cache-sim=yes`):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total `Ir` | 17,660,693,562 | 15,406,345,198 | **-12.76%** |
+| `core::str::converts::from_utf8` (self) | 2,306,780,740 (13.06%) | 322 (0.00%) | **-99.99999%** |
+| `json::Parser::parse_string` (self) | 1,754,213,460 (9.93%) | 1,405,786,620 (9.12%) | -19.86% |
+
+`from_utf8` drops out of the profile entirely (not in the
+`--threshold=100` top-cost listing at all; the 322 Ir that remain are
+calls elsewhere in the binary, e.g. protocol/UTF-8-validation code
+unrelated to this fix). The -12.76% total-Ir drop is more than 2x
+the 5% impact floor on its own, before counting the asymptotic
+improvement: parsing all the strings/keys in one document is no
+longer O(n^2) in document size, it is O(n).
+
+`cargo test --all-features`: 935/935 passed, unchanged. `cargo fmt
+--all -- --check`: clean. `cargo clippy --all-targets --all-features
+-- -D warnings`: 635 errors on both the pre-change and post-change
+tree (confirmed via `git stash`, compared by count) -- the same
+pre-existing toolchain/lint-version mismatch noted in every prior
+Bolt round in this file; zero new errors from this diff.
+
+Reproduce: `git show HEAD~1:src/exec/json.rs` (or check out the
+parent baseline commit) for the pre-fix tree, `cargo build`, then
+repeat the Callgrind command from the baseline entry's "Reproduce"
+section on both trees.
+
+## Bolt: `json.rs`'s `parse_string` re-validates the entire remaining document as UTF-8 on every character copied — baseline — 2026-10-13
+
+`benches/profile_json.py` (new, this commit) loads a table of 1500
+nested JSON order-event documents (object with a nested `customer`
+object, a nested `items` array of objects, and several scalar
+fields — ~250-350 bytes each, shaped like a real request/event-log
+JSON payload, not a toy `{"a":1}`) and runs 15 iterations of a
+5-extraction report query (`doc->>'status'`,
+`doc->'customer'->>'region'`, `doc#>>ARRAY['customer','name']`,
+`doc#>ARRAY['items','0','sku']`, `doc->'items'->0->>'price'`) over
+the real wire protocol — the v1.82 JSON extraction operators
+(`->`/`->>`/`#>`/`#>>`), never profiled by a prior Bolt round.
+
+Callgrind (`--collect-jumps=yes --cache-sim=yes`, debug build),
+`benches/profiles/callgrind.out.jsonstr-base-2026-10-13`, total `Ir`
+**17,660,693,562**:
+
+| symbol (self cost) | Ir | % of total |
+|---|---|---|
+| `core::str::converts::from_utf8` | 2,306,780,740 | **13.06%** |
+| `json::Parser::parse_string` (self) | 1,754,213,460 | **9.93%** |
+| **combined** | **4,060,994,200** | **23.00%** |
+
+`callgrind_annotate --tree=caller` shows `from_utf8`'s only two call
+edges both route through `parse_string` (via `parse_value_inner` /
+`parse_value_inner'2`, its inlined/non-inlined variants); grepping
+`src/exec/json.rs` confirms there is exactly one call site for
+`std::str::from_utf8` in the whole module — `parse_string`'s
+regular-character arm (line 366-368):
+
+```rust
+let s = std::str::from_utf8(&self.chars[self.pos..])
+    .map_err(|_| "invalid utf-8".to_string())?;
+let ch = s.chars().next().unwrap();
+```
+
+**Bug**: `self.chars` is the whole document's byte buffer, and the
+slice `&self.chars[self.pos..]` has no *upper* bound — it runs from
+the current character to the *end of the entire document*, not just
+to the end of the current string value. `std::str::from_utf8`
+validates every byte of whatever slice it is given, so this call
+re-validates the UTF-8 well-formedness of the entire rest of the
+document, from scratch, once per character copied into every string
+(and every object key — keys are parsed with the same `parse_string`)
+in the document. That is O(remaining-document-length) work per
+character, i.e. O(n²) in document size for parsing all the strings in
+one document, not O(n).
+
+**Mechanism for the fix**: the parser's input is always a `&str`
+(guaranteed-valid UTF-8 by Rust's type system), and `self.pos` is
+always at a char boundary (the loop only ever advances by whole-char
+lengths). `parse_value`/`parse_value_inner` already thread the
+original `text: &str` through recursive calls (currently unused
+inside them beyond a no-op boundary check); threading it one level
+further into `parse_string` and decoding via `text[self.pos..]
+.chars().next()` gets the same character with zero re-validation:
+indexing an already-valid `&str` by a byte range is O(1) (pointer
+arithmetic only, `str`'s `Index` impl does not re-check UTF-8
+validity), and `Chars::next()` decodes only the one leading code
+point (bounded by at most 4 bytes), never touching the rest of the
+buffer. The `.map_err(|_| "invalid utf-8"...)` branch this removes is
+already dead code — the input can never fail that check, since it
+comes from a `&str`.
+
+Reproduce:
+```bash
+cargo build
+RUSTGRES_DATA_DIR=$(mktemp -d) \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes ./target/debug/rustgres &
+python3 benches/profile_json.py --rows 1500 --count 15 --timeout 1800
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | head -40
+callgrind_annotate --auto=no --tree=caller /tmp/cg.out | grep -A5 'converts::from_utf8$'
+```
+
+Fix follows in the next commit.
 
 ## Bolt: `value_key_numeric`'s decimal-digit encoding allocates a heap `String` per exact-numeric value hashed into a GROUP BY/DISTINCT/ORDER BY/hash-join key — fix — 2026-10-12
 

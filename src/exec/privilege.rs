@@ -355,6 +355,36 @@ pub(crate) fn exec_alter_default_privileges(
                     privs: bits,
                     schema: sk.clone(),
                 });
+            } else if revoke && *g == target {
+                // v1.99: REVOKE FROM the creator with no prior rule:
+                // PG19 computes the new pg_default_acl entry from
+                // acldefault, where the creator's own item holds ALL
+                // rights for the kind — so the revoke must record
+                // (all & !bits) or it is silently lost and every
+                // later CREATE resurrects the revoked privilege.
+                // (Exposed by select_into: ALTER DEFAULT PRIVILEGES
+                // FOR ROLE u REVOKE INSERT ON TABLES FROM u, then a
+                // CTAS by u must deny u INSERT.) Kinds 'r'/'S' have
+                // unambiguous acldefault bit sets here; other kinds
+                // keep the historical drop (no in-scope consumer).
+                let all = match kind {
+                    'r' => crate::storage::PRIV_ALL_TABLE | 512,
+                    'S' => {
+                        crate::storage::PRIV_USAGE
+                            | crate::storage::PRIV_SELECT
+                            | crate::storage::PRIV_UPDATE
+                    }
+                    _ => 0,
+                };
+                if all != 0 {
+                    eng.db.default_acls.push(crate::storage::DefaultAcl {
+                        creator: target.clone(),
+                        kind,
+                        grantee: g.clone(),
+                        privs: all & !bits,
+                        schema: sk.clone(),
+                    });
+                }
             } else if g == "public" {
                 // v1.96: REVOKE FROM public with no prior rule still
                 // records a rule: PG computes the new default ACL

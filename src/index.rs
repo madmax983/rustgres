@@ -255,6 +255,17 @@ pub struct IndexDef {
     /// column (`None`), parallel to `cols` / `col_names`. Expression
     /// columns carry `cols[i] == usize::MAX` (no single column position).
     pub exprs: Vec<Option<String>>,
+    /// v1.99: per-key-column collation name from `COLLATE name`
+    /// (PG19 IndexElem.collation), parallel to `cols` / `col_names`;
+    /// `None` = the column's default collation. Catalog fidelity:
+    /// consulted by ON CONFLICT arbiter inference (an inference
+    /// element without COLLATE matches any key collation, and vice
+    /// versa per PG19's liberal satisfaction rule).
+    pub collates: Vec<Option<String>>,
+    /// v1.99: per-key-column operator class, last name component
+    /// (PG19 IndexElem.opclass), parallel to `cols` / `col_names`;
+    /// `None` = the type's default operator class.
+    pub opclasses: Vec<Option<String>>,
     /// v0.88: partial-index predicate source (`WHERE ...`), if any.
     pub predicate: Option<String>,
     /// v0.88: false for expression / partial indexes: accepted by DDL
@@ -291,6 +302,8 @@ impl IndexDef {
             desc: vec![false; n],
             nulls_first: vec![false; n],
             exprs: vec![None; n],
+            collates: vec![None; n],
+            opclasses: vec![None; n],
             predicate: None,
             planner_usable: true,
         }

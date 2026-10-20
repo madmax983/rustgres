@@ -544,6 +544,11 @@ pub(crate) fn exec_create_index(
         }
         (cols, col_names, descs, nulls_firsts, exprs)
     };
+    // v1.99: per-key collation / operator class from the specs.
+    let (collates, opclasses): (Vec<Option<String>>, Vec<Option<String>>) = columns
+        .iter()
+        .map(|c| (c.collate.clone(), c.opclass.clone()))
+        .unzip();
     let mut ix = Index::new(IndexDef {
         name: name.to_string(),
         table: table.to_string(),
@@ -556,6 +561,8 @@ pub(crate) fn exec_create_index(
         desc: descs,
         nulls_first: nulls_firsts,
         exprs,
+        collates,
+        opclasses,
         predicate: predicate.map(|s| s.to_string()),
         planner_usable,
     });
@@ -846,15 +853,16 @@ pub(crate) fn est_heap_pages(t: &Table) -> u64 {
     // A page holds at most 291 minimum-size tuples
     // (`MAX_HEAP_TUPLES_PER_PAGE` inside `pg_heap_page_count`); past
     // that the table provably exceeds one page without measuring
-    // every tuple.
+    // every tuple. Checked against `t.rows.len()` up front (not
+    // discovered 291 `pg_heap_tuple_len` calls into the loop below):
+    // the result past the cap is the constant `2` regardless of what
+    // those lengths are, so computing them first and discarding them
+    // was pure waste for every table at or above the cap.
     const MAX_TUPLES_PER_PAGE: usize = 291;
-    let mut lens: Vec<usize> = Vec::new();
-    for rv in &t.rows {
-        if lens.len() >= MAX_TUPLES_PER_PAGE {
-            return 2;
-        }
-        lens.push(pg_heap_tuple_len(t, rv));
+    if t.rows.len() >= MAX_TUPLES_PER_PAGE {
+        return 2;
     }
+    let lens: Vec<usize> = t.rows.iter().map(|rv| pg_heap_tuple_len(t, rv)).collect();
     // `pg_heap_page_count` returns bytes; one heap page is 8192.
     pg_heap_page_count(t, &lens) / 8192
 }
@@ -1086,6 +1094,23 @@ pub(crate) fn index_scan_ids(
             }
         }
         out.extend(ids.iter().copied());
+    }
+    // v1.99: a range-driven scan returns rows in heap order, not key
+    // order. PG19 has no plain index scan for mid-size ranges: it
+    // uses a Bitmap Heap Scan, whose result order is heap (ctid)
+    // order — observable through order-sensitive consumers (window
+    // ROWS frames and LIMIT without ORDER BY over an unordered
+    // query). A plain index scan in PG is chosen for point lookups
+    // (full equality prefix, kept in key order above) and for
+    // order-providing scans (a separate path here, `index_order_rows`,
+    // which never reaches this function with a filter). Row-version
+    // ids increase in insertion order, so sorting them reproduces
+    // heap order for the append-mostly tables this affects. This
+    // became observable when CREATE INDEX learned to accept
+    // opclass suffixes (v1.99): tenk1's indexes now exist during the
+    // window suite, exactly as in PG.
+    if has_range {
+        out.sort_unstable();
     }
     out
 }

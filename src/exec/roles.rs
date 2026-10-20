@@ -3705,7 +3705,7 @@ pub(crate) fn exec_drop_owned(
             .map(|(n, _)| n.clone())
             .collect();
         if !owned_types.is_empty() {
-            super::ddl_types::exec_drop_type(eng, ctx, &owned_types, true)?;
+            super::ddl_types::exec_drop_type(eng, ctx, &owned_types, true, false)?;
         }
         let owned_los: Vec<i64> = eng
             .db

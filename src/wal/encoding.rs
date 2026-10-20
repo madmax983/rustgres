@@ -957,6 +957,8 @@ impl Enc {
                 nulls_first,
                 exprs,
                 predicate,
+                collates,
+                opclasses,
                 xmin,
             } => {
                 self.u8(5);
@@ -981,6 +983,11 @@ impl Enc {
                     None => self.u8(0),
                 }
                 self.u64(*xmin);
+                // v1.99 (RGSWAL28): per-column collation / operator
+                // class, trailing so an RGSWAL27 record is an exact
+                // prefix of this layout.
+                self.opt_str_list(collates);
+                self.opt_str_list(opclasses);
             }
             WalRecord::DropIndex { name, xmax } => {
                 self.u8(6);
@@ -2180,6 +2187,13 @@ impl<'a> Dec<'a> {
                     None
                 };
                 let xmin = self.u64()?;
+                // v1.99: per-column collation / operator class ride
+                // RGSWAL28+ only (trailing).
+                let (collates, opclasses) = if self.wal_version >= 28 {
+                    (self.opt_str_list_d()?, self.opt_str_list_d()?)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
                 Ok(WalRecord::CreateIndex {
                     name,
                     table,
@@ -2190,6 +2204,8 @@ impl<'a> Dec<'a> {
                     nulls_first,
                     exprs,
                     predicate,
+                    collates,
+                    opclasses,
                     xmin,
                 })
             }
