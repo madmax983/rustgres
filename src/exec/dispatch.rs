@@ -701,6 +701,15 @@ pub(crate) fn execute_inner(
             with,
             returning,
         } => exec_delete(eng, ctx, table, alias, using, where_, with, returning),
+        Stmt::Merge {
+            table,
+            alias,
+            source,
+            on,
+            whens,
+            returning,
+            with,
+        } => exec_merge(eng, ctx, table, alias, source, on, whens, returning, with),
         // v0.16: TRUNCATE is executor-level (transactional row removal).
         Stmt::Truncate {
             tables,

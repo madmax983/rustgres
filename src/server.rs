@@ -2240,6 +2240,8 @@ fn read_only_violation(
         Stmt::Update { .. } => Some("UPDATE"),
         Stmt::Delete { table, .. } if all_temp(db, session, std::slice::from_ref(table)) => None,
         Stmt::Delete { .. } => Some("DELETE"),
+        Stmt::Merge { table, .. } if all_temp(db, session, std::slice::from_ref(table)) => None,
+        Stmt::Merge { .. } => Some("MERGE"),
         // COPY FROM STDIN writes; COPY TO STDOUT is a read.
         Stmt::Copy { to_stdout, .. } => {
             if *to_stdout {

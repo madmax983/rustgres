@@ -311,6 +311,8 @@ impl Parser {
             // --- v0.5: UPDATE / DELETE
             "update" => self.parse_update(),
             "delete" => self.parse_delete(),
+            // --- v2.01: MERGE
+            "merge" => self.parse_merge(),
             // --- v0.74: PREPARE / EXECUTE / DEALLOCATE
             "prepare" => self.parse_prepare(),
             "execute" => self.parse_execute(),
@@ -614,10 +616,8 @@ impl Parser {
                 // the planner sees it.
                 match inner {
                     // v1.99: PG19 gram.y ExplainableStmt — Select | Insert |
-                    // Update | Delete | DeclareCursor | CreateAs |
-                    // CreateMatView | RefreshMatView | Execute. (MERGE is
-                    // not in the list: the engine has no MERGE statement
-                    // at all, so parse_top_kw rejects it upstream.) A
+                    // Update | Delete | Merge | DeclareCursor | CreateAs |
+                    // CreateMatView | RefreshMatView | Execute. A
                     // plain CREATE VIEW is NOT explainable in PG19 (only
                     // the MATERIALIZED form is).
                     Stmt::Select(_)
@@ -625,6 +625,7 @@ impl Parser {
                     | Stmt::Insert { .. }
                     | Stmt::Update { .. }
                     | Stmt::Delete { .. }
+                    | Stmt::Merge { .. }
                     | Stmt::Declare { .. }
                     | Stmt::CreateTableAs { .. }
                     | Stmt::RefreshMatView { .. } => Ok(Stmt::Explain {
@@ -5176,7 +5177,7 @@ impl Parser {
     /// v0.10: `WITH [RECURSIVE] name [(cols)] AS (select) [, ...]` followed
     /// by SELECT / INSERT / UPDATE / DELETE.
     pub(crate) fn parse_with(&mut self) -> Result<Stmt, SqlError> {
-        let (ctes, _recursive) = self.parse_cte_defs()?;
+        let (ctes, recursive) = self.parse_cte_defs()?;
         let kw = match self.next() {
             Token::Ident(kw) => kw,
             other => {
@@ -5216,6 +5217,22 @@ impl Parser {
                 }
                 Ok(stmt)
             }
+            "merge" => {
+                // PG19 parse_merge.c: WITH RECURSIVE over a MERGE
+                // main statement is a syntax error (42601), even when
+                // no CTE is actually recursive.
+                if recursive {
+                    return Err(err(
+                        "WITH RECURSIVE is not supported for MERGE statement".to_string()
+                    ));
+                }
+                let mut stmt = self.parse_merge()?;
+                match &mut stmt {
+                    Stmt::Merge { with, .. } => *with = ctes,
+                    _ => unreachable!(),
+                }
+                Ok(stmt)
+            }
             _ => Err(err(format!(
                 "syntax error: expected SELECT, INSERT, UPDATE or DELETE after WITH, found \"{}\"",
                 kw
@@ -5237,7 +5254,7 @@ impl Parser {
         // CTE, v0.59: `WITH v(x) AS (VALUES (1),(2)) SELECT ...`).
         // v1.39: or with a data-modifying statement — `WITH x AS
         // (INSERT/UPDATE/DELETE ... [RETURNING ...])` (PG19 parse_cte.c).
-        if matches!(self.peek(), Token::Ident(kw) if kw == "insert" || kw == "update" || kw == "delete")
+        if matches!(self.peek(), Token::Ident(kw) if kw == "insert" || kw == "update" || kw == "delete" || kw == "merge")
         {
             let kw = match self.next() {
                 Token::Ident(kw) => kw,
@@ -5247,6 +5264,7 @@ impl Parser {
                 "insert" => self.parse_insert()?,
                 "update" => self.parse_update()?,
                 "delete" => self.parse_delete()?,
+                "merge" => self.parse_merge()?,
                 _ => unreachable!("peeked DML keyword above"),
             };
             return Ok(CteBody::Dml(Box::new(stmt)));
@@ -9640,6 +9658,179 @@ impl Parser {
             sets,
             from,
             where_,
+            returning,
+            with: Vec::new(),
+        })
+    }
+
+    // --- v2.01: MERGE (PG19 gram.y MergeStmt) ----------------------------
+    // `MERGE INTO relation [AS] alias USING table_ref ON expr
+    //   { WHEN MATCHED [AND cond] THEN UPDATE SET ... | DELETE | DO NOTHING
+    //   | WHEN NOT MATCHED BY SOURCE [AND cond] THEN UPDATE/DELETE/DO NOTHING
+    //   | WHEN NOT MATCHED [BY TARGET] [AND cond] THEN INSERT ... | DO NOTHING }
+    //   [RETURNING ...]`. The leading MERGE keyword is already consumed.
+    // Kind/action pairing is enforced here, like gram.y: a mismatched
+    // action keyword is a 42601 at that keyword.
+    pub(crate) fn parse_merge(&mut self) -> Result<Stmt, SqlError> {
+        use crate::sql::{MergeAction, MergeMatchKind, MergeWhen};
+        self.expect_keyword("into")?;
+        let table = self.parse_table_name()?;
+        let alias = self.parse_alias_opt()?;
+        self.expect_keyword("using")?;
+        let source = self.parse_from()?;
+        self.expect_keyword("on")?;
+        let on = self.parse_or()?;
+        let mut whens: Vec<MergeWhen> = Vec::new();
+        while self.eat_keyword("when") {
+            let kind = if self.eat_keyword("not") {
+                self.expect_keyword("matched")?;
+                if self.eat_keyword("by") {
+                    if self.eat_keyword("source") {
+                        MergeMatchKind::NotMatchedBySource
+                    } else {
+                        self.expect_keyword("target")?;
+                        MergeMatchKind::NotMatchedByTarget
+                    }
+                } else {
+                    MergeMatchKind::NotMatchedByTarget
+                }
+            } else {
+                self.expect_keyword("matched")?;
+                MergeMatchKind::Matched
+            };
+            let condition = if self.eat_keyword("and") {
+                Some(self.parse_or()?)
+            } else {
+                None
+            };
+            self.expect_keyword("then")?;
+            let kw = self.peek_ident().unwrap_or("").to_string();
+            let action = match (kind, kw.as_str()) {
+                (_, "do") => {
+                    self.next();
+                    self.expect_keyword("nothing")?;
+                    MergeAction::DoNothing
+                }
+                (MergeMatchKind::NotMatchedByTarget, "insert") => {
+                    self.next();
+                    // PG19: `INSERT INTO ...` inside MERGE is a syntax
+                    // error at INTO.
+                    if self.peek_ident() == Some("into") {
+                        return Err(err("syntax error at or near \"into\"".to_string()));
+                    }
+                    let columns = if *self.peek() == Token::LParen {
+                        self.next();
+                        let mut cols = Vec::new();
+                        loop {
+                            cols.push(self.expect_ident()?);
+                            match self.next() {
+                                Token::Comma => continue,
+                                Token::RParen => break,
+                                other => {
+                                    return Err(err(format!(
+                                        "syntax error: expected ',' or ')', found {:?}",
+                                        other
+                                    )));
+                                }
+                            }
+                        }
+                        Some(cols)
+                    } else {
+                        None
+                    };
+                    if self.eat_keyword("overriding") {
+                        let _ = self.expect_ident()?; // SYSTEM | USER
+                        self.expect_keyword("value")?;
+                    }
+                    let values = if columns.is_none() && self.eat_keyword("default") {
+                        self.expect_keyword("values")?;
+                        None
+                    } else {
+                        self.expect_keyword("values")?;
+                        self.expect(Token::LParen, "'('")?;
+                        let mut vs = Vec::new();
+                        if *self.peek() != Token::RParen {
+                            loop {
+                                vs.push(self.parse_or()?);
+                                match self.next() {
+                                    Token::Comma => continue,
+                                    Token::RParen => break,
+                                    other => {
+                                        return Err(err(format!(
+                                            "syntax error: expected ',' or ')', found {:?}",
+                                            other
+                                        )));
+                                    }
+                                }
+                            }
+                        } else {
+                            self.next();
+                        }
+                        Some(vs)
+                    };
+                    MergeAction::Insert { columns, values }
+                }
+                (MergeMatchKind::Matched, "update")
+                | (MergeMatchKind::NotMatchedBySource, "update") => {
+                    self.next();
+                    self.expect_keyword("set")?;
+                    let mut sets = Vec::new();
+                    loop {
+                        let col = self.expect_ident()?;
+                        self.expect(Token::Eq, "'='")?;
+                        let expr = self.parse_or()?;
+                        sets.push((col, expr));
+                        if *self.peek() == Token::Comma {
+                            self.next();
+                            continue;
+                        }
+                        break;
+                    }
+                    MergeAction::Update { sets }
+                }
+                (MergeMatchKind::Matched, "delete")
+                | (MergeMatchKind::NotMatchedBySource, "delete") => {
+                    self.next();
+                    MergeAction::Delete
+                }
+                _ => {
+                    return Err(err(format!("syntax error at or near \"{}\"", kw)));
+                }
+            };
+            whens.push(MergeWhen {
+                kind,
+                condition,
+                action,
+            });
+        }
+        if whens.is_empty() {
+            return Err(err(
+                "syntax error: MERGE requires at least one WHEN clause".to_string()
+            ));
+        }
+        // PG19 parse analysis: a WHEN clause of a kind that follows an
+        // unconditional WHEN clause of the same kind can never fire.
+        {
+            let mut seen_uncond: Vec<MergeMatchKind> = Vec::new();
+            for w in &whens {
+                if seen_uncond.contains(&w.kind) {
+                    return Err(err(
+                        "unreachable WHEN clause specified after unconditional WHEN clause"
+                            .to_string(),
+                    ));
+                }
+                if w.condition.is_none() {
+                    seen_uncond.push(w.kind);
+                }
+            }
+        }
+        let returning = self.parse_returning()?;
+        Ok(Stmt::Merge {
+            table,
+            alias,
+            source,
+            on,
+            whens,
             returning,
             with: Vec::new(),
         })

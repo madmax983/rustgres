@@ -1080,6 +1080,44 @@ pub fn subst_params(stmt: &mut Stmt, params: &[Option<Value>]) -> Result<(), Exe
             }
             subst_returning(returning, params)
         }
+        // v2.01: parameters inside MERGE (prepared statements and
+        // function bodies): source items, ON, WHEN conditions, SET
+        // exprs, INSERT values, RETURNING.
+        Stmt::Merge {
+            source,
+            on,
+            whens,
+            with,
+            returning,
+            ..
+        } => {
+            subst_ctes(with, params)?;
+            for f in source {
+                subst_from(f, params)?;
+            }
+            subst_expr(on, params)?;
+            for w in whens {
+                if let Some(c) = &mut w.condition {
+                    subst_expr(c, params)?;
+                }
+                match &mut w.action {
+                    crate::sql::MergeAction::Update { sets } => {
+                        for (_, e) in sets {
+                            subst_expr(e, params)?;
+                        }
+                    }
+                    crate::sql::MergeAction::Insert { values, .. } => {
+                        if let Some(vs) = values {
+                            for e in vs {
+                                subst_expr(e, params)?;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            subst_returning(returning, params)
+        }
         _ => Ok(()),
     }
 }
@@ -1563,6 +1601,35 @@ pub fn describe_columns(
                         table,
                         alias.as_deref().unwrap_or(table),
                         &extra,
+                        returning,
+                    )?
+                    .0,
+                ))
+            }
+        }
+        // v2.01: MERGE with RETURNING describes the RETURNING list
+        // against target + source + old/new ranges.
+        Stmt::Merge {
+            table,
+            alias,
+            source,
+            returning,
+            with,
+            ..
+        } => {
+            if returning.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(
+                    describe_merge_returning(
+                        eng,
+                        snap,
+                        own,
+                        session,
+                        table,
+                        alias.as_deref(),
+                        source,
+                        with,
                         returning,
                     )?
                     .0,

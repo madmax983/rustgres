@@ -237,6 +237,7 @@ pub(crate) fn sql_func_body_kind(stmt: &Stmt) -> &'static str {
         Stmt::Insert { .. } => "INSERT",
         Stmt::Update { .. } => "UPDATE",
         Stmt::Delete { .. } => "DELETE",
+        Stmt::Merge { .. } => "MERGE",
         _ => "utility statement",
     }
 }
@@ -414,7 +415,11 @@ pub(crate) fn parse_sql_func_body(
         let is_void = ret_type.eq_ignore_ascii_case("void");
         if !matches!(
             stmt,
-            Stmt::Select(_) | Stmt::Insert { .. } | Stmt::Update { .. } | Stmt::Delete { .. }
+            Stmt::Select(_)
+                | Stmt::Insert { .. }
+                | Stmt::Update { .. }
+                | Stmt::Delete { .. }
+                | Stmt::Merge { .. }
         ) && !(is_void
             && matches!(
                 stmt,
@@ -453,7 +458,8 @@ pub(crate) fn parse_sql_func_body(
         Stmt::Select(_) => true,
         Stmt::Insert { returning, .. }
         | Stmt::Update { returning, .. }
-        | Stmt::Delete { returning, .. } => !returning.is_empty(),
+        | Stmt::Delete { returning, .. }
+        | Stmt::Merge { returning, .. } => !returning.is_empty(),
         // Unreachable: non-SELECT/DML statements are rejected above.
         _ => false,
     };
@@ -479,7 +485,8 @@ pub(crate) fn parse_sql_func_body(
             }
             Stmt::Insert { returning, .. }
             | Stmt::Update { returning, .. }
-            | Stmt::Delete { returning, .. } => {
+            | Stmt::Delete { returning, .. }
+            | Stmt::Merge { returning, .. } => {
                 let unambiguous = !returning.iter().any(|i| {
                     matches!(
                         i,
@@ -2031,6 +2038,39 @@ pub(crate) fn rewrite_func_arg_refs(stmt: &mut Stmt, arg_names: &[Option<String>
             rewrite_from_fn_refs(using, arg_names);
             if let Some(w) = where_ {
                 rewrite_func_arg_expr(w, arg_names);
+            }
+            rewrite_returning_refs(returning, arg_names);
+        }
+        // v2.01: MERGE bodies — ON, WHEN conditions, SET exprs, INSERT
+        // values, source FROM items, RETURNING.
+        Stmt::Merge {
+            source,
+            on,
+            whens,
+            returning,
+            ..
+        } => {
+            rewrite_from_fn_refs(source, arg_names);
+            rewrite_func_arg_expr(on, arg_names);
+            for w in whens.iter_mut() {
+                if let Some(c) = &mut w.condition {
+                    rewrite_func_arg_expr(c, arg_names);
+                }
+                match &mut w.action {
+                    crate::sql::MergeAction::Update { sets } => {
+                        for (_, e) in sets.iter_mut() {
+                            rewrite_func_arg_expr(e, arg_names);
+                        }
+                    }
+                    crate::sql::MergeAction::Insert { values, .. } => {
+                        if let Some(vs) = values {
+                            for e in vs.iter_mut() {
+                                rewrite_func_arg_expr(e, arg_names);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
             rewrite_returning_refs(returning, arg_names);
         }

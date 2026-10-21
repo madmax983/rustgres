@@ -6333,6 +6333,24 @@ pub enum Stmt {
         /// v0.10: `WITH ...` CTEs visible to the statement.
         with: Vec<CteDef>,
     },
+    // --- v2.01: MERGE (PG19 MergeStmt) -------------------------------------
+    Merge {
+        table: String,
+        /// Optional target alias (`MERGE INTO t AS x`); the alias is the
+        /// visible qualifier for target columns, like UPDATE/DELETE.
+        alias: Option<String>,
+        /// The USING source: one table_ref as a FROM list (joins fold to
+        /// a single item, like SELECT's FROM).
+        source: Vec<FromItem>,
+        /// The ON join condition.
+        on: Expr,
+        whens: Vec<MergeWhen>,
+        /// `RETURNING ...` (PG17 shape: target/source columns,
+        /// merge_action(), old/new).
+        returning: Vec<SelectItem>,
+        /// `WITH ...` CTEs visible to the statement.
+        with: Vec<CteDef>,
+    },
     // --- v0.16: TRUNCATE ----------------------------------------------------
     Truncate {
         tables: Vec<String>,
@@ -6495,6 +6513,45 @@ pub enum Stmt {
         /// None = ALL.
         name: Option<String>,
     },
+}
+
+/// v2.01: which rows a MERGE WHEN clause applies to (PG19
+/// MergeMatchKind).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeMatchKind {
+    /// `WHEN MATCHED` — a target row joined to a source row.
+    Matched,
+    /// `WHEN NOT MATCHED [BY TARGET]` — a source row with no target match.
+    NotMatchedByTarget,
+    /// `WHEN NOT MATCHED BY SOURCE` — a target row with no source match.
+    NotMatchedBySource,
+}
+
+/// v2.01: the action of one MERGE WHEN clause (PG19 MergeWhenClause
+/// commandType). The parser enforces PG's kind/action pairing:
+/// Matched/NotMatchedBySource take Update/Delete/DoNothing;
+/// NotMatchedByTarget takes Insert/DoNothing.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MergeAction {
+    Update {
+        sets: Vec<(String, Expr)>,
+    },
+    Delete,
+    Insert {
+        /// Explicit `INSERT (col, ...)` list; None = positional.
+        columns: Option<Vec<String>>,
+        /// The single VALUES row's expressions; None = DEFAULT VALUES.
+        values: Option<Vec<Expr>>,
+    },
+    DoNothing,
+}
+
+/// v2.01: one `WHEN ... [AND cond] THEN <action>` clause of a MERGE.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MergeWhen {
+    pub kind: MergeMatchKind,
+    pub condition: Option<Expr>,
+    pub action: MergeAction,
 }
 
 /// v0.10: `INSERT ... ON CONFLICT ...`.
@@ -6703,6 +6760,42 @@ impl Stmt {
                 }
                 if let Some(w) = where_ {
                     m = m.max(max_param_expr(w));
+                }
+                m = m.max(max_param_returning(returning));
+                m = m.max(max_param_ctes(with));
+                m
+            }
+            Stmt::Merge {
+                source,
+                on,
+                whens,
+                returning,
+                with,
+                ..
+            } => {
+                let mut m = max_param_expr(on);
+                for f in source {
+                    m = m.max(max_param_from(f));
+                }
+                for w in whens {
+                    if let Some(c) = &w.condition {
+                        m = m.max(max_param_expr(c));
+                    }
+                    match &w.action {
+                        MergeAction::Update { sets } => {
+                            for (_, e) in sets {
+                                m = m.max(max_param_expr(e));
+                            }
+                        }
+                        MergeAction::Insert { values, .. } => {
+                            if let Some(vs) = values {
+                                for e in vs {
+                                    m = m.max(max_param_expr(e));
+                                }
+                            }
+                        }
+                        MergeAction::Delete | MergeAction::DoNothing => {}
+                    }
                 }
                 m = m.max(max_param_returning(returning));
                 m = m.max(max_param_ctes(with));
