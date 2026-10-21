@@ -8,9 +8,15 @@ use super::*;
 // is zero runtime init cost. (Callgrind on the v0.4 commit path showed
 // the old bitwise loop at ~1.2% of instructions; this is ~8x faster for
 // the same checksum.)
+//
+// `static`, not `const`: a `const` has no fixed address, so an
+// unoptimized build rematerializes the whole 1024-byte array by
+// `memcpy` at every use site -- here, once per byte hashed (see
+// benches/BASELINE.md, 2026-10-21). `static` gives it one address, so
+// `CRC32_TABLE[idx]` is a plain indexed load.
 // ---------------------------------------------------------------------------
 
-pub(crate) const CRC32_TABLE: [u32; 256] = build_crc32_table();
+pub(crate) static CRC32_TABLE: [u32; 256] = build_crc32_table();
 
 pub(crate) const fn build_crc32_table() -> [u32; 256] {
     let mut table = [0u32; 256];

@@ -775,6 +775,13 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             if let Some(prev) = versions.iter_mut().find(|v| v.dropped_xmax == 0) {
                 prev.dropped_xmax = *xmin;
             }
+            // v2.00: the previous live version's column layout, for the
+            // rename-following pass after the push below.
+            let prev_cols: Vec<String> = versions
+                .iter()
+                .find(|v| v.dropped_xmax == *xmin)
+                .map(|v| v.columns.iter().map(|(n, _)| n.clone()).collect())
+                .unwrap_or_default();
             let mut t = Table::new(columns.clone(), *xmin);
             // v1.80: partition metadata (ATTACH, PARTITION OF, DROP COLUMN
             // key shifts). RGSWAL20 records never carried it; open() fills
@@ -810,6 +817,15 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             if *copy_rows {
                 if let Some(prev) = versions.iter().find(|v| v.dropped_xmax == *xmin) {
                     t.rows = prev.rows.clone();
+                    // v2.00: the bulk assignment bypasses push_version,
+                    // the only maintainer of row_index; without a rebuild
+                    // the new version's row_pos misses every copied id,
+                    // so index scans over it silently return 0 rows while
+                    // seq scans see the full heap (and replayed
+                    // DELETE/UPDATEs of copied rows are skipped as
+                    // "missing"). Every live bulk-rows site rebuilds;
+                    // this was the only one that did not.
+                    t.rebuild_row_index();
                 }
             }
             // v0.11
@@ -861,6 +877,56 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 })
                 .collect::<Result<_, _>>()?;
             versions.push(t);
+            // v2.00: follow position-preserving column renames into the
+            // table's live index definitions, mirroring live RENAME
+            // COLUMN (which rewrites ix.def.col_names in memory; the WAL
+            // carries a rename only as this AlterTable record, so replay
+            // is the only place it can be followed). Without it a
+            // replayed state keeps the old name in the def — scans keep
+            // working by position, but the next checkpoint writes the
+            // stale name and load_checkpoint resolves index columns by
+            // name against the live version, refusing to start
+            // ("unknown column"). A key follows only when its stored
+            // name equals the previous version's name at the key's own
+            // position, so non-rename alters are untouched (DROP COLUMN
+            // never reaches here with live indexes: live execution drops
+            // and re-creates them, and those records replay separately).
+            if !prev_cols.is_empty() {
+                let mut renames: Vec<(usize, &str, &str)> = Vec::new();
+                for (pos, old) in prev_cols.iter().enumerate() {
+                    if let Some(new) = columns.get(pos).map(|(n, _)| n) {
+                        if old != new {
+                            renames.push((pos, old.as_str(), new.as_str()));
+                        }
+                    }
+                }
+                if !renames.is_empty() {
+                    for ix in eng.db.indexes.values_mut() {
+                        if ix.def.table != *name || ix.def.dropped_xmax != 0 {
+                            continue;
+                        }
+                        for (i, cn) in ix.def.col_names.iter_mut().enumerate() {
+                            let is_expr = ix
+                                .def
+                                .exprs
+                                .get(i)
+                                .and_then(|e| e.as_ref())
+                                .is_some();
+                            if is_expr {
+                                continue;
+                            }
+                            let Some(&pos) = ix.def.cols.get(i) else {
+                                continue;
+                            };
+                            for (p, old, new) in &renames {
+                                if pos == *p && cn == old {
+                                    *cn = new.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         WalRecord::CreateView {
             name,
