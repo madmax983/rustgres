@@ -2,6 +2,81 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `wal::encoding::CRC32_TABLE` is a `const`, so every byte of every WAL commit frame re-copies the whole 1024-byte table before indexing it — baseline — 2026-10-21
+
+**Why this workload**: no prior Bolt round has profiled `COPY ...
+FROM STDIN` (see rounds above) — a different code path from the
+`insert` workload's multi-VALUES `INSERT`, since it's the one place
+`src/copy.rs`'s parser runs. `benches/profile_copy.py` (new, this
+round) sends 15 separate `COPY ... FROM STDIN (FORMAT csv)` batches of
+2000 rows each (a support-ticket-shaped table: short/long text
+columns, ~15% of rows needing CSV quoting, ~5% NULL) over the real
+wire protocol — each batch commits as its own autocommit transaction,
+so the workload exercises 15 real WAL commit-frame writes (CRC
+included) on top of CSV parsing and row insertion, not just parsing in
+isolation.
+
+Reproduce:
+```bash
+cargo build
+RUSTGRES_DATA_DIR=$(mktemp -d) valgrind --tool=callgrind \
+  --callgrind-out-file=/tmp/cg.out --collect-jumps=yes --cache-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_copy.py --count 15 --rows 2000 --timeout 600
+# SIGTERM the valgrind-wrapped server pid to flush, then:
+callgrind_annotate --auto=no /tmp/cg.out | head -40
+```
+
+📈 **Profile** (Callgrind, valgrind 3.22.0, current HEAD v2.00):
+**4,761,984,713** total `Ir`.
+
+| symbol (inclusive `Ir`) | Ir | % of total | calls |
+|---|---|---|---|
+| `src/wal/encoding.rs::crc32` | 1,670,707,547 | **35.08%** | 16 |
+| ⤷ `__memcpy_avx_unaligned_erms` (called from inside `crc32`'s per-byte loop) | 1,135,342,465 | 23.84% | 9,230,417 |
+| ⤷ `crc32` self (loop control + table lookup, excluding the `memcpy` it calls) | 323,064,931 | 6.78% | — |
+| `src/copy.rs::parse_csv_rows` (self) | 328,514,955 | 6.90% | — |
+
+Comfortably past the 5%-of-profile floor by a wide margin: one
+16-call function (`crc32`, called once per committed WAL frame) is
+over a third of total program instructions for this workload.
+
+💡 **Hypothesis**: `crc32` (`src/wal/encoding.rs:35`) is a standard
+table-driven CRC-32 (IEEE 802.3), one `CRC32_TABLE[(crc^byte)&0xFF]`
+lookup per byte — normal and cheap. But `CRC32_TABLE` is declared
+```rust
+pub(crate) const CRC32_TABLE: [u32; 256] = build_crc32_table();
+```
+A Rust `const` has no fixed storage address: unlike a `static`, each
+reference to it is a value the compiler is free to (and, at
+`opt-level=0`, does) rematerialize at its use site. For a 1024-byte
+array referenced from inside a loop, rustc's unoptimized codegen
+rematerializes it by `memcpy`-ing the whole table from its `.rodata`
+copy into a fresh stack slot *every time the expression is
+evaluated* — i.e. once per loop iteration, once per byte hashed. The
+call count confirms this exactly: `__memcpy_avx_unaligned_erms` is
+called 9,230,417 times from inside `crc32`, and summed across all 16
+`crc32` calls in this workload the total bytes CRC'd (sum of all 16
+WAL commit frame bodies) is 9,230,417 — a 1:1 match between "bytes
+hashed" and "table-copy memcpy calls". The debug-mode preconditions
+`memcpy` runs before every call (`is_aligned_to`,
+`copy_nonoverlapping::precondition_check`) show up as their own
+multi-percent line items in the profile for the same reason.
+`CRC32_TABLE[idx]` should instead compile to a single load from one
+fixed address — the fix is to change `const` to `static` (the
+initializer stays a `const fn` call, which is allowed for `static`
+items), giving the table one address and turning every lookup into a
+plain indexed load with no copy.
+
+`cargo test --all-features`: 1096/1096 passed. `cargo fmt --all --
+--check`: clean.
+
+Before profile committed:
+`benches/profiles/callgrind.out.crc32table-base-2026-10-21`.
+
+**Reproduce the exact number**: check out this commit, `cargo build`,
+repeat the Reproduce command above.
+
 ## Bolt: `est_heap_pages` computes 291 real tuple lengths it then discards — fix — 2026-10-19
 
 Fixes the target identified in the baseline entry immediately below
