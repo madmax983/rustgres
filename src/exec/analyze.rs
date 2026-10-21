@@ -319,14 +319,14 @@ pub(crate) fn exec_explain_analyze(
     stmt: &Stmt,
     costs: bool,
 ) -> Result<ExecResult, ExecError> {
+    // v1.99: EXPLAIN ANALYZE of DML lives in explain_dml.rs (it
+    // executes through the DML executors, not run_select).
+    if !matches!(stmt, Stmt::Select(_)) {
+        return exec_explain_dml_analyze(eng, ctx, stmt, costs);
+    }
     let sel = match stmt {
         Stmt::Select(s) => s,
-        _ => {
-            return Err(exec_err(
-                "0A000",
-                "EXPLAIN only supports SELECT statements".to_string(),
-            ));
-        }
+        _ => unreachable!("non-SELECT routed to exec_explain_dml_analyze above"),
     };
     let mut lock_ids: Vec<(String, u64)> = Vec::new();
     let rows = {

@@ -33,7 +33,7 @@ pub(crate) const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK16";
 /// v1.94: version 20 adds the tsvector / tsquery column types and
 /// value tags to table and row images. v19 checkpoints are refused;
 /// remove the data directory to start fresh.
-pub(crate) const CHKPT_VERSION: u32 = 23;
+pub(crate) const CHKPT_VERSION: u32 = 24;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -92,9 +92,12 @@ pub(crate) const CHKPT_VERSION: u32 = 23;
 /// (trailing byte). WAL_MAGIC and WAL_VERSION must move together:
 /// recovery derives the decode version from the magic, so a stale
 /// magic makes new records decode one version short (trailing bytes).
-pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL27";
+/// v1.99: `RGSWAL28` — CreateIndex records carry per-key collation /
+/// operator class lists (trailing). CHKPT 24: checkpoint index
+/// definitions carry the same two lists.
+pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL28";
 /// v1.80: the format version number in [`WAL_MAGIC`].
-pub(crate) const WAL_VERSION: u32 = 27;
+pub(crate) const WAL_VERSION: u32 = 28;
 /// v1.80: oldest WAL format this build can replay.
 pub(crate) const MIN_READABLE_WAL_VERSION: u32 = 20;
 pub(crate) const WAL_HEADER_LEN: u64 = 16;
@@ -553,6 +556,9 @@ impl Wal {
                 }
                 None => ix_body.u8(0),
             }
+            // v1.99: per-column collation / operator class.
+            ix_body.opt_str_list(&ix.def.collates);
+            ix_body.opt_str_list(&ix.def.opclasses);
             ix_body.u64(ix.def.created_xmin);
             ix_body.u64(0); // live index: no committed drop
             n_indexes += 1;
@@ -1289,9 +1295,14 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         } else {
             None
         };
+        // v1.99: per-column collation / operator class.
+        let mut collates = d.opt_str_list_d().map_err(|e| bad(&e))?;
+        let mut opclasses = d.opt_str_list_d().map_err(|e| bad(&e))?;
         desc.resize(n_cols, false);
         nulls_first.resize(n_cols, false);
         exprs.resize(n_cols, None);
+        collates.resize(n_cols, None);
+        opclasses.resize(n_cols, None);
         let created_xmin = d.u64().map_err(|e| bad(&e))?;
         let dropped_xmax = d.u64().map_err(|e| bad(&e))?;
         let bad_idx = |why: String| {
@@ -1339,6 +1350,8 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 desc,
                 nulls_first,
                 exprs,
+                collates,
+                opclasses,
                 predicate,
                 planner_usable,
             });

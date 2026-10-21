@@ -3849,7 +3849,7 @@ pub(crate) fn validate_explain_select(q: &mut Q, stmt: &SelectStmt) -> Result<()
 }
 
 #[allow(clippy::too_many_arguments)]
-fn vx_select(
+pub(crate) fn vx_select(
     q: &mut Q,
     stmt: &SelectStmt,
     outer_defs: &[CteDef],
@@ -3875,9 +3875,27 @@ fn vx_select(
                 vx_select(q, left, &body_outer, outer_schemas, depth + 1, visiting)?;
                 vx_select(q, right, &body_outer, outer_schemas, depth + 1, visiting)?;
             }
-            // Data-modifying CTE bodies are validated by their own
-            // execution paths (and EXPLAIN ANALYZE executes them).
-            CteBody::Dml(_) => {}
+            // v1.99: data-modifying CTE bodies get the same static
+            // analysis as a top-level DML EXPLAIN (PG19 analyzes
+            // them at parse time). A throwaway read-only StmtCtx
+            // suffices — the DML validators only read through it.
+            CteBody::Dml(d) => {
+                let mut writes = Vec::new();
+                let ctx = StmtCtx {
+                    snap: q.snap,
+                    own: q.own,
+                    write_xid: q.own,
+                    all_xids: q.all_xids.clone(),
+                    level: IsolationLevel::ReadCommitted,
+                    writes: &mut writes,
+                    session: q.session,
+                    role: q.role,
+                    read_only: true,
+                    default_toast_compression: crate::storage::ToastCompression::Pglz,
+                    notices: Vec::new(),
+                };
+                validate_explain_stmt(q, &ctx, d)?;
+            }
         }
     }
     // Set-operation carrier: branches are their own query levels (the
@@ -4376,7 +4394,7 @@ fn expr_children(e: &Expr) -> Vec<&Expr> {
 /// Only a *known* non-boolean type fires; unresolvable shapes were
 /// already reported by `vx_expr`, and parameter-bearing clauses are
 /// exempt (their types live in the describe path).
-fn vx_bool_clause(
+pub(crate) fn vx_bool_clause(
     q: &Q,
     e: &Expr,
     schemas: &[&[QCol]],
@@ -4422,7 +4440,7 @@ fn vx_has_param(e: &Expr) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn vx_from_item(
+pub(crate) fn vx_from_item(
     q: &mut Q,
     item: &FromItem,
     schemas: &[&[QCol]],
@@ -4530,7 +4548,7 @@ fn vx_node_type(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn vx_expr(
+pub(crate) fn vx_expr(
     q: &mut Q,
     e: &Expr,
     schemas: &[&[QCol]],

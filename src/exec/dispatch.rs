@@ -44,16 +44,27 @@ pub(crate) fn execute_inner(
             temp,
             if_not_exists,
             with_data,
-        } => exec_create_table_as(
-            eng,
-            ctx,
-            name,
-            col_aliases,
-            select,
-            *temp,
-            *if_not_exists,
-            *with_data,
-        ),
+            execute,
+        } => {
+            // v1.99: server.rs resolves AS EXECUTE before dispatch; an
+            // unresolved spec reaching here means a non-session caller.
+            if execute.is_some() {
+                return Err(exec_err(
+                    "26000",
+                    "prepared statement for CREATE TABLE AS EXECUTE was not resolved".to_string(),
+                ));
+            }
+            exec_create_table_as(
+                eng,
+                ctx,
+                name,
+                col_aliases,
+                select,
+                *temp,
+                *if_not_exists,
+                *with_data,
+            )
+        }
         Stmt::Insert {
             table,
             columns,

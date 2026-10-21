@@ -684,6 +684,9 @@ fn v088_create_index_metadata_roundtrip() {
         nulls_first: vec![false, true],
         exprs: vec![None, Some("a + b".into())],
         predicate: Some("b > 0".into()),
+        // v1.99: per-key collation / operator class.
+        collates: vec![None, Some("C".into())],
+        opclasses: vec![Some("text_pattern_ops".into()), None],
         xmin: 42,
     };
     let mut e = Enc::new();
@@ -700,8 +703,12 @@ fn v088_create_index_metadata_roundtrip() {
             nulls_first,
             exprs,
             predicate,
+            collates,
+            opclasses,
             xmin,
         } => {
+            assert_eq!(collates, vec![None, Some("C".to_string())]);
+            assert_eq!(opclasses, vec![Some("text_pattern_ops".to_string()), None]);
             assert_eq!(name, "ix");
             assert_eq!(table, "t");
             assert_eq!(columns, vec!["a".to_string(), "(a + b)".to_string()]);
@@ -1060,5 +1067,193 @@ fn v180_checkpoint_load_tolerates_bad_rows_in_superseded_versions() {
         Wal::open(&dir).is_err(),
         "a live mismatch must still be rejected"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// v2.00: AlterTable replay must produce a version indistinguishable from
+// the one live execution built — its row_index covers the copied rows,
+// and column renames are followed into index definitions.
+// ---------------------------------------------------------------------------
+
+fn v200_engine() -> Engine {
+    let mut eng = Engine::new();
+    let mut t = Table::new(
+        vec![("a".into(), ColType::Int), ("f".into(), ColType::Int)],
+        1,
+    );
+    for id in 1..=3u64 {
+        t.push_version(RowVersion::plain(
+            id,
+            Row::new(vec![Value::Int(id as i64), Value::Int(id as i64 * 10)]),
+            1,
+        ));
+    }
+    eng.db.tables.insert("t".into(), vec![t]);
+    eng.txns.next_xid = 10;
+    eng.txns.next_row_id = 4;
+    eng
+}
+
+fn v200_alter(cols: &[&str], copy_rows: bool, xmin: u64) -> WalRecord {
+    let n = cols.len();
+    WalRecord::AlterTable {
+        name: "t".into(),
+        columns: cols
+            .iter()
+            .map(|c| ((*c).to_string(), ColType::Int))
+            .collect(),
+        constraints: "(constraints (notnull) (defaults) (checks) (uniques) (pkey -) (fks))"
+            .to_string(),
+        copy_rows,
+        owner: "postgres".into(),
+        acl: vec![],
+        col_acl: vec![],
+        oid: 16384,
+        toast_relid: 0,
+        toast_target: 0,
+        col_storage: vec![0; n],
+        col_compression: vec![0; n],
+        composite_types: vec![None; n],
+        domain_types: vec![None; n],
+        domain_elem: vec![false; n],
+        inherits: vec![],
+        attnums: (1..=n as i16).collect(),
+        next_attnum: n as i16 + 1,
+        fillfactor: 100,
+        partition: None,
+        bit_typmods: Vec::new(),
+        next_value_id: 1,
+        toast_info: vec![],
+        xmin,
+    }
+}
+
+#[test]
+fn v200_alter_replay_copy_rows_rebuilds_row_index() {
+    // A metadata ALTER (reloption SET, RENAME, ...) replays with
+    // copy_rows=true: the new version inherits the previous version's
+    // rows by bulk assignment. Every id must resolve through the new
+    // version's row_index afterwards — index scans look rows up with
+    // row_pos and silently return 0 rows when it misses, and replayed
+    // DELETE/UPDATE records target rows the same way.
+    let mut eng = v200_engine();
+    apply_record(&mut eng, &v200_alter(&["a", "f"], true, 5)).unwrap();
+    let live = eng.db.tables["t"]
+        .iter()
+        .find(|t| t.dropped_xmax == 0)
+        .expect("live version");
+    assert_eq!(live.rows.len(), 3);
+    for id in 1..=3u64 {
+        assert!(
+            live.row_pos(id).is_some(),
+            "copied row id {} must resolve in the replayed version",
+            id
+        );
+    }
+    // A replayed DELETE of a copied row must find its target.
+    apply_record(
+        &mut eng,
+        &WalRecord::DeleteRows {
+            table: "t".into(),
+            ids: vec![2],
+            old_rows: vec![],
+            xmax: 6,
+        },
+    )
+    .unwrap();
+    let live = eng.db.tables["t"]
+        .iter()
+        .find(|t| t.dropped_xmax == 0)
+        .expect("live version");
+    let pos = live.row_pos(2).expect("row 2 still resolves");
+    assert_eq!(live.rows[pos].xmax, 6, "delete must land on the copied row");
+}
+
+#[test]
+fn v200_alter_replay_create_index_entries_resolve() {
+    // A CreateIndex replayed after an AlterTable replay builds its
+    // entries from the new version's rows; every entry id must resolve
+    // through that version (the scan-side lookup) afterwards.
+    let mut eng = v200_engine();
+    apply_record(&mut eng, &v200_alter(&["a", "f"], true, 5)).unwrap();
+    apply_record(
+        &mut eng,
+        &WalRecord::CreateIndex {
+            name: "ix".into(),
+            table: "t".into(),
+            columns: vec!["a".into()],
+            unique: false,
+            internal: false,
+            desc: vec![false],
+            nulls_first: vec![false],
+            exprs: vec![None],
+            predicate: None,
+            collates: vec![None],
+            opclasses: vec![None],
+            xmin: 6,
+        },
+    )
+    .unwrap();
+    let ix = &eng.db.indexes["ix"];
+    let entries: usize = ix.tree.values().map(|v| v.len()).sum();
+    assert_eq!(entries, 3);
+    let live = eng.db.tables["t"]
+        .iter()
+        .find(|t| t.dropped_xmax == 0)
+        .expect("live version");
+    for ids in ix.tree.values() {
+        for id in ids {
+            assert!(live.row_pos(*id).is_some(), "entry id {} resolves", id);
+        }
+    }
+}
+
+#[test]
+fn v200_alter_replay_rename_follows_index_names_and_checkpoint_loads() {
+    // RENAME COLUMN arrives in the WAL only as an AlterTable record
+    // with the new column list. Replay must follow the rename into
+    // index definitions like live execution does; otherwise the next
+    // checkpoint emits the stale name and load_checkpoint refuses to
+    // start ("unknown column").
+    let mut eng = v200_engine();
+    eng.db.indexes.insert(
+        "xxx".into(),
+        Index::new(IndexDef::plain(
+            "xxx".into(),
+            "t".into(),
+            vec![1],
+            vec!["f".into()],
+            false,
+            false,
+            2,
+        )),
+    );
+    apply_record(&mut eng, &v200_alter(&["a", "f1"], true, 5)).unwrap();
+    assert_eq!(eng.db.indexes["xxx"].def.col_names, vec!["f1".to_string()]);
+    assert_eq!(eng.db.indexes["xxx"].def.cols, vec![1]);
+
+    // A checkpoint written from this replayed state must load back,
+    // with the index rebuilt against the renamed live version.
+    let dir = std::env::temp_dir().join("rg200-rename-ckpt");
+    let _ = std::fs::remove_dir_all(&dir);
+    {
+        let (_e, mut wal) = Wal::open(&dir).expect("open");
+        wal.checkpoint(&eng).expect("checkpoint");
+    }
+    let (loaded, _wal) = Wal::open(&dir).expect("checkpoint from replayed state must load");
+    let ix = &loaded.db.indexes["xxx"];
+    assert_eq!(ix.def.col_names, vec!["f1".to_string()]);
+    let entries: usize = ix.tree.values().map(|v| v.len()).sum();
+    assert_eq!(entries, 3);
+    let live = loaded.db.tables["t"]
+        .iter()
+        .find(|t| t.dropped_xmax == 0)
+        .expect("live version");
+    for ids in ix.tree.values() {
+        for id in ids {
+            assert!(live.row_pos(*id).is_some(), "entry id {} resolves", id);
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

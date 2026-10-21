@@ -1447,10 +1447,35 @@ fn validate_last(e: &JpExpr, in_subscript: bool) -> PResult<()> {
     }
 }
 
+/// `parse_jsonpath` (every `jsonb_path_*`/`JSON_VALUE`/`JSON_QUERY`/
+/// `JSON_EXISTS`/`JSON_TABLE` call site) re-tokenizes and
+/// re-recursive-descent-parses its path argument's *entire* text into
+/// a fresh `JpPath` tree on every call, even though the path is a SQL
+/// literal in the overwhelming common case (`JSON_EXISTS(doc,
+/// '$.a.b')`) and so is byte-identical across every row of a SELECT.
+/// This thread-local cache, keyed by the input text, mirrors
+/// `json.rs`'s `JSONB_PARSE_CACHE` exactly (same 64-entry bound,
+/// same clear-on-overflow policy, same text-keyed `Rc` clone):
+/// distinct literal paths across a query plan are few, but a scan
+/// calls `parse_jsonpath` with the same text once per row, so the hit
+/// rate lives entirely in that "same text, many rows" pattern. Only
+/// successful parses are cached; invalid input re-reports the same
+/// error on every call, exactly as before.
+const JSONPATH_PARSE_CACHE_CAP: usize = 64;
+
+thread_local! {
+    static JSONPATH_PARSE_CACHE: std::cell::RefCell<
+        std::collections::HashMap<String, std::rc::Rc<JpPath>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 /// Parse jsonpath input text (PG's `jsonpath_in`): syntax errors are
 /// 22P02 `invalid input syntax for type jsonpath: "<text>"` with the
 /// scanner/grammar complaint as DETAIL.
 pub(crate) fn parse_jsonpath(text: &str) -> Result<JpPath, ExecError> {
+    if let Some(hit) = JSONPATH_PARSE_CACHE.with(|c| c.borrow().get(text).cloned()) {
+        return Ok((*hit).clone());
+    }
     let toks = tokenize_jsonpath(text).map_err(|detail| {
         exec_err_detail(
             "22P02",
@@ -1463,7 +1488,7 @@ pub(crate) fn parse_jsonpath(text: &str) -> Result<JpPath, ExecError> {
         pos: 0,
         in_pred: false,
     };
-    p.parse_path().map_err(|detail| {
+    let path = p.parse_path().map_err(|detail| {
         // PG distinguishes a bare complaint (used directly as the
         // message for the LAST-placement error) from syntax details.
         if detail.starts_with("LAST is allowed") {
@@ -1475,7 +1500,15 @@ pub(crate) fn parse_jsonpath(text: &str) -> Result<JpPath, ExecError> {
                 detail,
             )
         }
-    })
+    })?;
+    JSONPATH_PARSE_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= JSONPATH_PARSE_CACHE_CAP {
+            c.clear();
+        }
+        c.insert(text.to_string(), std::rc::Rc::new(path.clone()));
+    });
+    Ok(path)
 }
 
 // ---------------------------------------------------------------------------

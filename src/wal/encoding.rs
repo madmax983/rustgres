@@ -8,9 +8,15 @@ use super::*;
 // is zero runtime init cost. (Callgrind on the v0.4 commit path showed
 // the old bitwise loop at ~1.2% of instructions; this is ~8x faster for
 // the same checksum.)
+//
+// `static`, not `const`: a `const` has no fixed address, so an
+// unoptimized build rematerializes the whole 1024-byte array by
+// `memcpy` at every use site -- here, once per byte hashed (see
+// benches/BASELINE.md, 2026-10-21). `static` gives it one address, so
+// `CRC32_TABLE[idx]` is a plain indexed load.
 // ---------------------------------------------------------------------------
 
-pub(crate) const CRC32_TABLE: [u32; 256] = build_crc32_table();
+pub(crate) static CRC32_TABLE: [u32; 256] = build_crc32_table();
 
 pub(crate) const fn build_crc32_table() -> [u32; 256] {
     let mut table = [0u32; 256];
@@ -957,6 +963,8 @@ impl Enc {
                 nulls_first,
                 exprs,
                 predicate,
+                collates,
+                opclasses,
                 xmin,
             } => {
                 self.u8(5);
@@ -981,6 +989,11 @@ impl Enc {
                     None => self.u8(0),
                 }
                 self.u64(*xmin);
+                // v1.99 (RGSWAL28): per-column collation / operator
+                // class, trailing so an RGSWAL27 record is an exact
+                // prefix of this layout.
+                self.opt_str_list(collates);
+                self.opt_str_list(opclasses);
             }
             WalRecord::DropIndex { name, xmax } => {
                 self.u8(6);
@@ -2180,6 +2193,13 @@ impl<'a> Dec<'a> {
                     None
                 };
                 let xmin = self.u64()?;
+                // v1.99: per-column collation / operator class ride
+                // RGSWAL28+ only (trailing).
+                let (collates, opclasses) = if self.wal_version >= 28 {
+                    (self.opt_str_list_d()?, self.opt_str_list_d()?)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
                 Ok(WalRecord::CreateIndex {
                     name,
                     table,
@@ -2190,6 +2210,8 @@ impl<'a> Dec<'a> {
                     nulls_first,
                     exprs,
                     predicate,
+                    collates,
+                    opclasses,
                     xmin,
                 })
             }

@@ -572,20 +572,68 @@ impl Parser {
                         ));
                     }
                 }
-                let inner_kw = match self.next() {
-                    Token::Ident(s) => s,
-                    other => {
-                        return Err(err(format!("syntax error: unexpected {:?}", other)));
+                // v1.99: EXPLAIN CREATE MATERIALIZED VIEW — CREATE
+                // VIEW forms are parsed from raw text
+                // (try_split_create_view) because the query is stored
+                // verbatim, and parse_create has no view arm. Rebuild
+                // the inner statement's text from the remaining
+                // tokens and reuse that path.
+                let inner = if matches!(self.peek(), Token::Ident(s) if s == "create")
+                    && matches!(self.peek2(), Token::Ident(s) if s == "materialized")
+                    && matches!(self.peek3(), Token::Ident(s) if s == "view")
+                {
+                    let mut end = self.tokens.len();
+                    while end > self.pos && matches!(self.tokens[end - 1], Token::Semi | Token::EOF)
+                    {
+                        end -= 1;
                     }
+                    let text = tokens_to_sql(&self.tokens[self.pos..end]);
+                    self.pos = self.tokens.len();
+                    match try_split_create_view(&text) {
+                        Some(Ok(stmt)) => stmt,
+                        Some(Err(e)) => return Err(e),
+                        None => {
+                            return Err(err(
+                                "syntax error: expected CREATE MATERIALIZED VIEW".to_string()
+                            ));
+                        }
+                    }
+                } else {
+                    let inner_kw = match self.next() {
+                        Token::Ident(s) => s,
+                        other => {
+                            return Err(err(format!("syntax error: unexpected {:?}", other)));
+                        }
+                    };
+                    self.parse_top_kw(inner_kw)?
                 };
-                let inner = self.parse_top_kw(inner_kw)?;
                 // v1.58: EXPLAIN EXECUTE — PG19 (explain.c ExplainExecuteQuery)
                 // plans the named prepared statement with the EXECUTE
                 // arguments bound (custom plan). The inner Execute is
                 // resolved to its bound statement in run_statement before
                 // the planner sees it.
                 match inner {
-                    Stmt::Select(_) | Stmt::Execute { .. } => Ok(Stmt::Explain {
+                    // v1.99: PG19 gram.y ExplainableStmt — Select | Insert |
+                    // Update | Delete | DeclareCursor | CreateAs |
+                    // CreateMatView | RefreshMatView | Execute. (MERGE is
+                    // not in the list: the engine has no MERGE statement
+                    // at all, so parse_top_kw rejects it upstream.) A
+                    // plain CREATE VIEW is NOT explainable in PG19 (only
+                    // the MATERIALIZED form is).
+                    Stmt::Select(_)
+                    | Stmt::Execute { .. }
+                    | Stmt::Insert { .. }
+                    | Stmt::Update { .. }
+                    | Stmt::Delete { .. }
+                    | Stmt::Declare { .. }
+                    | Stmt::CreateTableAs { .. }
+                    | Stmt::RefreshMatView { .. } => Ok(Stmt::Explain {
+                        stmt: Box::new(inner),
+                        analyze,
+                        costs,
+                        opts,
+                    }),
+                    Stmt::CreateView { matview: true, .. } => Ok(Stmt::Explain {
                         stmt: Box::new(inner),
                         analyze,
                         costs,
@@ -1257,6 +1305,13 @@ impl Parser {
                 // v0.14: the index name may be omitted
                 // (`CREATE INDEX ON t (a, b)`); PostgreSQL auto-names it
                 // <table>_<columns>_idx. Filled in after parsing columns.
+                // v1.99: but not with IF NOT EXISTS — PG19's grammar
+                // requires a name there (`syntax error at or near
+                // "ON"`); the unnamed form silently succeeding also
+                // flipped a create_index statement that PG errors on.
+                if if_not_exists {
+                    return Err(err("syntax error at or near \"ON\"".to_string()));
+                }
                 String::new()
             } else {
                 self.expect_ident()?
@@ -1304,6 +1359,12 @@ impl Parser {
                         (Some(name), None)
                     }
                 };
+                // v1.99: PG19 index_elem — `opt_collate opt_opclass`
+                // sit between the column/expression and ASC/DESC.
+                // Stored on the spec (and the cataloged index) for
+                // ON CONFLICT arbiter inference; the btree itself
+                // compares bytewise regardless.
+                let (collate, opclass) = self.parse_opt_collate_opclass()?;
                 let desc = if self.eat_keyword("desc") {
                     true
                 } else {
@@ -1326,6 +1387,8 @@ impl Parser {
                     expr: expr_opt,
                     desc,
                     nulls_first,
+                    collate,
+                    opclass,
                 });
                 match self.next() {
                     Token::Comma => continue,
@@ -1699,6 +1762,53 @@ impl Parser {
         } else {
             Vec::new()
         };
+        // v1.99: `AS EXECUTE name [(args)]` (PG19 CreateAsStmt) — the
+        // prepared statement is resolved in server.rs (session state);
+        // here we only record the spec.
+        if matches!(self.peek(), Token::Ident(s) if s == "execute") {
+            self.next(); // 'execute'
+            let pname = self.expect_ident()?;
+            let args = if *self.peek() == Token::LParen {
+                self.next();
+                let mut es = Vec::new();
+                if *self.peek() == Token::RParen {
+                    self.next();
+                } else {
+                    loop {
+                        es.push(self.parse_or()?);
+                        match self.next() {
+                            Token::Comma => continue,
+                            Token::RParen => break,
+                            other => {
+                                return Err(err(format!(
+                                    "syntax error: expected ',' or ')', found {:?}",
+                                    other
+                                )));
+                            }
+                        }
+                    }
+                }
+                es
+            } else {
+                Vec::new()
+            };
+            let with_data = if self.eat_keyword("with") {
+                let no_data = self.eat_keyword("no");
+                self.expect_keyword("data")?;
+                !no_data
+            } else {
+                true
+            };
+            return Ok(Stmt::CreateTableAs {
+                name,
+                col_aliases,
+                select: Box::new(crate::sql::empty_select()),
+                temp,
+                if_not_exists,
+                with_data,
+                execute: Some((pname, args)),
+            });
+        }
         // The query: SELECT, WITH...SELECT, or a parenthesized query.
         // (TABLE / VALUES query forms are not supported in this version.)
         // Note: when `as_consumed` is false the only leading paren group
@@ -1737,6 +1847,7 @@ impl Parser {
             temp,
             if_not_exists,
             with_data,
+            execute: None,
         })
     }
 
@@ -4756,6 +4867,51 @@ impl Parser {
 
     /// v0.10: `ON CONFLICT [ ( cols ) | ON CONSTRAINT name ] DO NOTHING |
     /// DO UPDATE SET ... [WHERE ...]`. Returns None when absent.
+    /// v1.99: `opt_collate opt_opclass` after an index element or an
+    /// ON CONFLICT inference element (PG19 index_elem). The collation
+    /// name may be quoted; the operator class may be schema-qualified
+    /// and may carry a parenthesized parameter list (skipped). Only
+    /// the last name component is kept.
+    pub(crate) fn parse_opt_collate_opclass(
+        &mut self,
+    ) -> Result<(Option<String>, Option<String>), SqlError> {
+        let mut collate = None;
+        if self.eat_keyword("collate") {
+            collate = Some(match self.next() {
+                Token::Ident(s) | Token::QIdent(s) | Token::Str(s) => s,
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected collation name, found {:?}",
+                        other
+                    )));
+                }
+            });
+        }
+        let mut opclass = None;
+        if matches!(self.peek(), Token::Ident(s) if s != "asc" && s != "desc" && s != "nulls" && s != "where" && s != "do")
+        {
+            let mut name = match self.next() {
+                Token::Ident(s) => s,
+                _ => unreachable!(),
+            };
+            if matches!(self.peek(), Token::Dot) {
+                self.next();
+                name = self.expect_ident()?;
+            }
+            if matches!(self.peek(), Token::LParen) {
+                // Operator-class parameters: no operator class in
+                // this engine defines an options procedure, so PG19's
+                // verdict applies universally (indexam.c): 22023.
+                return Err(SqlError {
+                    message: format!("operator class {} has no options", name),
+                    code: "22023",
+                });
+            }
+            opclass = Some(name);
+        }
+        Ok((collate, opclass))
+    }
+
     pub(crate) fn parse_on_conflict(&mut self) -> Result<Option<OnConflict>, SqlError> {
         if !self.eat_keyword("on") {
             return Ok(None);
@@ -4766,9 +4922,78 @@ impl Parser {
             ConflictArbiter::Constraint(self.expect_ident()?)
         } else if *self.peek() == Token::LParen {
             self.next();
-            let mut cols = Vec::new();
+            let mut cols: Vec<ArbiterElem> = Vec::new();
             loop {
-                cols.push(self.expect_ident()?);
+                // v1.99: an inference element is an index_elem
+                // (PG19): a column name or an arbitrary expression,
+                // each with optional COLLATE / operator class.
+                // Expressions are captured as source text, exactly
+                // like CREATE INDEX expression keys, so plan-time
+                // matching compares renderer-identical strings.
+                let start = self.pos;
+                // Bare single name iff what follows it can only be
+                // the element suffix (COLLATE / opclass) or the list
+                // punctuation — anything else (an operator, a cast, a
+                // call paren) makes it a general expression.
+                let bare = match (self.peek(), self.tokens.get(self.pos + 1)) {
+                    (Token::QIdent(_), _) => true,
+                    (Token::Ident(s), Some(Token::Comma))
+                    | (Token::Ident(s), Some(Token::RParen)) => {
+                        let _ = s;
+                        true
+                    }
+                    (Token::Ident(_), Some(Token::Ident(n))) if n == "collate" || n == "on" => true,
+                    (Token::Ident(_), Some(Token::Ident(_))) => matches!(
+                        self.tokens.get(self.pos + 2),
+                        Some(Token::Comma)
+                            | Some(Token::RParen)
+                            | Some(Token::Dot)
+                            | Some(Token::LParen)
+                    ),
+                    _ => false,
+                };
+                if bare {
+                    self.next();
+                } else {
+                    let _ = self.parse_or()?;
+                }
+                // A parenthesized element captures without its outer
+                // parens, mirroring CREATE INDEX's expression keys
+                // (index on `(fruit)` stores the key text `fruit`).
+                let span = if matches!(self.tokens.get(start), Some(Token::LParen))
+                    && matches!(self.tokens.get(self.pos - 1), Some(Token::RParen))
+                {
+                    // Verify the first '(' matches the final ')'.
+                    let mut depth = 0i32;
+                    let mut outer = true;
+                    for (i, t) in self.tokens[start..self.pos].iter().enumerate() {
+                        match t {
+                            Token::LParen => depth += 1,
+                            Token::RParen => {
+                                depth -= 1;
+                                if depth == 0 && i + 1 < self.pos - start {
+                                    outer = false;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if outer {
+                        &self.tokens[start + 1..self.pos - 1]
+                    } else {
+                        &self.tokens[start..self.pos]
+                    }
+                } else {
+                    &self.tokens[start..self.pos]
+                };
+                let key = tokens_to_sql(span);
+                let (collate, opclass) = self.parse_opt_collate_opclass()?;
+                cols.push(ArbiterElem {
+                    key,
+                    collate,
+                    opclass,
+                });
                 if *self.peek() == Token::Comma {
                     self.next();
                     continue;
@@ -4802,12 +5027,23 @@ impl Parser {
                 // [WHERE ...] — no update; the conflicting row is
                 // locked (strength ignored) and filtered by WHERE.
                 let mut for_update = false;
+                // v1.99: keep the exact strength for EXPLAIN
+                // (0 none, 1 key share, 2 share, 3 no key update,
+                // 4 update).
+                let mut strength: u8 = 0;
                 if self.eat_keyword("for") {
-                    let _ = self.eat_keyword("no") || self.eat_keyword("key");
+                    let no = self.eat_keyword("no");
+                    let key = if no {
+                        self.eat_keyword("key")
+                    } else {
+                        self.eat_keyword("key")
+                    };
                     if self.eat_keyword("update") {
                         for_update = true;
+                        strength = if no { 3 } else { 4 };
                     } else {
                         let _ = self.eat_keyword("share");
+                        strength = if key { 1 } else { 2 };
                     }
                 }
                 let where_ = if self.eat_keyword("where") {
@@ -4815,7 +5051,11 @@ impl Parser {
                 } else {
                     None
                 };
-                ConflictAction::DoSelect { where_, for_update }
+                ConflictAction::DoSelect {
+                    where_,
+                    for_update,
+                    strength,
+                }
             } else if self.eat_keyword("update") {
                 self.expect_keyword("set")?;
                 let mut sets = Vec::new();

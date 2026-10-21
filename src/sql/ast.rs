@@ -5610,6 +5610,11 @@ pub struct IndexColSpec {
     pub expr: Option<String>,
     pub desc: bool,
     pub nulls_first: bool,
+    /// v1.99: `COLLATE name` on the key (PG19 IndexElem.collation).
+    pub collate: Option<String>,
+    /// v1.99: operator class on the key, last name component
+    /// (PG19 IndexElem.opclass).
+    pub opclass: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -5788,6 +5793,13 @@ pub enum Stmt {
         if_not_exists: bool,
         /// `WITH NO DATA` creates the table without populating it.
         with_data: bool,
+        /// v1.99: `CREATE TABLE ... AS EXECUTE name [(args)]` (PG19
+        /// CreateAsStmt with an ExecuteStmt query). The parser cannot
+        /// resolve the prepared statement (session state), so the spec
+        /// rides here and server.rs substitutes the bound SELECT into
+        /// `select` before dispatch (the v1.58 EXPLAIN EXECUTE pattern);
+        /// `select` holds an empty shell while this is `Some`.
+        execute: Option<(String, Vec<Expr>)>,
     },
     // --- v0.9: ALTER TABLE ---
     AlterTable {
@@ -6526,12 +6538,24 @@ impl Stmt {
     }
 }
 
+/// v1.99: one ON CONFLICT inference element (PG19 IndexElem in the
+/// inference specification): a column name or an expression's source
+/// text, with optional COLLATE / operator class. An unspecified
+/// collation/opclass is a wildcard when matching cataloged indexes
+/// (PG19 indxpath.c infer_arbiter_indexes).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArbiterElem {
+    pub key: String,
+    pub collate: Option<String>,
+    pub opclass: Option<String>,
+}
+
 /// v0.10: conflict arbiter. `None` = no arbiter (`ON CONFLICT DO NOTHING`
 /// catches any unique violation).
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConflictArbiter {
     None,
-    Columns(Vec<String>),
+    Columns(Vec<ArbiterElem>),
     Constraint(String),
 }
 
@@ -6546,6 +6570,12 @@ pub enum ConflictAction {
     DoSelect {
         where_: Option<Expr>,
         for_update: bool,
+        /// v1.99: the exact lock strength for EXPLAIN's
+        /// `Conflict Resolution:` line (PG19 LockClauseStrength):
+        /// 0 = none, 1 = FOR KEY SHARE, 2 = FOR SHARE,
+        /// 3 = FOR NO KEY UPDATE, 4 = FOR UPDATE. `for_update` stays
+        /// the (strength >= 3) summary the executor checks.
+        strength: u8,
     },
     DoUpdate {
         sets: Vec<(String, Expr)>,
@@ -7012,6 +7042,10 @@ pub(crate) fn is_reserved(word: &str) -> bool {
             | "where"
             | "using" // v0.20: JOIN ... USING
             | "natural" // v0.20: NATURAL JOIN
+            | "with" // v1.99: fully reserved in PG19 — as a bare alias it
+                     // swallowed the trailing WITH [NO] DATA of CREATE
+                     // TABLE AS / CREATE MATERIALIZED VIEW, making the
+                     // explicit WITH DATA form a 42601
     )
 }
 
