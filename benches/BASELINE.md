@@ -2,6 +2,74 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `wal::encoding::CRC32_TABLE` is a `const`, so every byte of every WAL commit frame re-copies the whole 1024-byte table before indexing it — fix — 2026-10-21
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/wal/encoding.rs`: `CRC32_TABLE` changes from `const` to `static`.
+The initializer (`build_crc32_table()`, a `const fn`) is unchanged and
+still runs at compile time — `static` items accept any
+const-evaluable initializer, so this costs nothing at runtime to set
+up. The table's 256 `u32` values are bit-for-bit identical; only its
+storage class changes, from "a value rematerialized at each use site"
+to "one fixed address every use site loads from". `crc32`'s body
+(`src/wal/encoding.rs:42-47`) is untouched.
+
+### Measurement
+
+Same harness (`benches/profile_copy.py --count 15 --rows 2000`), same
+workload, same machine, same session.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes`):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total `Ir` | 4,761,984,713 | 3,571,131,273 | **-25.01%** |
+| `crc32` inclusive `Ir` (16 calls) | 1,670,707,547 (35.08% of total) | 479,982,580 (13.44% of new total) | **-71.27%** |
+| `__memcpy_avx_unaligned_erms` calls from inside `crc32` | 9,230,417 | **0** | -100% |
+
+The total-`Ir` reduction (1,190,853,440) matches `crc32`'s own
+inclusive-`Ir` reduction (1,190,724,967) within 0.01% — the entire
+program-wide saving is exactly where the hypothesis said it would be,
+and nowhere else moved. The caller-tree confirms the mechanism
+directly: in the before profile, `crc32`'s loop body calls
+`__memcpy_avx_unaligned_erms` 9,230,417 times (once per byte hashed);
+in the after profile, that call is gone entirely — `crc32` now only
+calls `Iter<u8>::next` (9,230,433 times, the byte iteration itself,
+unavoidable). `crc32`'s self cost (excluding callees) goes from
+323,064,931 (6.78% of the old total) to 267,682,429 (7.50% of the new,
+smaller total) — a modest self-cost drop (fewer redundant bounds/
+alignment checks the old `memcpy` path forced nearby) on top of the
+`memcpy` call itself vanishing completely.
+
+The -25.01% total-`Ir` delta clears the ≥5%-of-profile floor by 5x,
+and the -71.27% delta on the target function itself is nowhere close
+to the floor's lower bound.
+
+`cargo test --all-features`: 1096/1096 passed (same count as the
+pre-fix tree — no behavior change). `cargo fmt --all -- --check`:
+clean. `cargo clippy --all-targets --all-features -- -D warnings`: 946
+errors on both trees (confirmed via `git stash`), zero net new.
+
+**Direct behavior check**: the existing `wal::tests::crc32_known_answers`
+and `wal::tests::crc32_detects_single_bit_flip` unit tests (unchanged)
+pass against the known CRC-32 test vectors (`crc32(b"") ==
+0x0000_0000`, `crc32(b"123456789") == 0xCBF4_3926`, `crc32(b"rustgres")
+== 0x94E1_4388`) — the checksum algorithm's output is unaffected, as
+expected since only the table's storage class changed, not its
+contents or the lookup formula.
+
+Before/after profiles committed:
+`benches/profiles/callgrind.out.crc32table-{base,after}-2026-10-21`.
+
+**Reproduce**: check out the parent (baseline) commit, `cargo build`,
+repeat the baseline entry's "Reproduce" command for the before
+numbers; check out this commit, `cargo build`, repeat for the after
+numbers.
+
 ## Bolt: `wal::encoding::CRC32_TABLE` is a `const`, so every byte of every WAL commit frame re-copies the whole 1024-byte table before indexing it — baseline — 2026-10-21
 
 **Why this workload**: no prior Bolt round has profiled `COPY ...
