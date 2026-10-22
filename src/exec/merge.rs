@@ -576,20 +576,17 @@ pub(crate) fn exec_merge(
                 ctx.default_toast_compression,
             )),
         };
-        let mut kept = Vec::with_capacity(vis.len());
-        for entry in vis {
-            if rls_visible_q(
-                &mut q,
-                &tdef,
-                table,
-                &[crate::sql::PolicyCmd::Select],
-                &tgt_schema,
-                &entry.4,
-            )? {
-                kept.push(entry);
+        if let Some(groups) =
+            rls_visibility_groups(&mut q, &tdef, table, &[crate::sql::PolicyCmd::Select])?
+        {
+            let mut kept = Vec::with_capacity(vis.len());
+            for entry in vis {
+                if rls_row_visible(&mut q, &tgt_schema, &entry.4, &groups)? {
+                    kept.push(entry);
+                }
             }
+            vis = kept;
         }
-        vis = kept;
     }
     // Static scope checks (PG19 parse analysis for MERGE): NOT MATCHED
     // clauses see only the source, NOT MATCHED BY SOURCE only the
