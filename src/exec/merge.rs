@@ -121,7 +121,7 @@ pub(crate) fn exec_merge(
 ) -> Result<ExecResult, ExecError> {
     let qual = alias.as_deref().unwrap_or(table).to_string();
     // --- static validation: target, clause shapes ----------------------
-    let (meta, partitioned, pinfo, unique_defs, target_oid) = {
+    let (meta, partitioned, pinfo, unique_defs, target_oid, tdef) = {
         let t = merge_target_table(eng, ctx, table)?;
         let mut defs: Vec<UniqueDef> = t.uniques.clone();
         if let Some(pk) = &t.pkey {
@@ -133,6 +133,7 @@ pub(crate) fn exec_merge(
             t.partition.clone(),
             defs,
             t.oid,
+            t.clone(),
         )
     };
     let columns = meta.columns.clone();
@@ -441,6 +442,21 @@ pub(crate) fn exec_merge(
             require_table_priv(eng, ctx, table, crate::storage::PRIV_SELECT, "SELECT")?;
         }
     }
+    // v2.02: replica-identity guard, per action in written order
+    // (PG19 CheckValidResultRel iterates mergeActions; INSERT and DO
+    // NOTHING are unrestricted). Partitioned roots are skipped inside
+    // the guard; their touched leaves are checked after planning.
+    for w in whens {
+        match &w.action {
+            MergeAction::Update { .. } => {
+                check_replica_identity_for(eng, ctx, table, true)?;
+            }
+            MergeAction::Delete => {
+                check_replica_identity_for(eng, ctx, table, false)?;
+            }
+            _ => {}
+        }
+    }
     let ctes = materialize_dml_ctes(eng, &mut *ctx, with)?;
     // --- source rows -----------------------------------------------------
     let (src_schema, src_rows): (Vec<QCol>, Vec<Row>) = {
@@ -525,6 +541,55 @@ pub(crate) fn exec_merge(
                 ));
             }
         }
+    }
+    // v2.02: row-level security — the target's SELECT policy group
+    // filters the target rows before any matching (PG19: SELECT
+    // security quals on the target RTE). Rows the SELECT group cannot
+    // see are simply not there for ON/MATCHED/BY SOURCE evaluation;
+    // a source row that would have matched one falls to NOT MATCHED.
+    if tdef.rls_enabled {
+        let mut lock_ids = Vec::new();
+        let mut q = Q {
+            eng: &mut *eng,
+            snap: ctx.snap,
+            own: ctx.own,
+            all_xids: ctx.all_xids.clone(),
+            session: ctx.session,
+            role: ctx.role,
+            read_only: ctx.read_only,
+            depth: 0,
+            lock_ids: &mut lock_ids,
+            ctes: ctes.clone(),
+            wctx: None,
+            srf_vals: Vec::new(),
+            priv_scopes: Vec::new(),
+            priv_role_override: None,
+            hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+            immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+            plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
+            hashed_in: Rc::new(RefCell::new(Vec::new())),
+            pending_updates: None,
+            write: Some(qwrite_from_ctx(
+                &mut *ctx.writes,
+                ctx.write_xid,
+                ctx.level,
+                ctx.default_toast_compression,
+            )),
+        };
+        let mut kept = Vec::with_capacity(vis.len());
+        for entry in vis {
+            if rls_visible_q(
+                &mut q,
+                &tdef,
+                table,
+                &[crate::sql::PolicyCmd::Select],
+                &tgt_schema,
+                &entry.4,
+            )? {
+                kept.push(entry);
+            }
+        }
+        vis = kept;
     }
     // Static scope checks (PG19 parse analysis for MERGE): NOT MATCHED
     // clauses see only the source, NOT MATCHED BY SOURCE only the
@@ -718,6 +783,19 @@ pub(crate) fn exec_merge(
                                 "MERGE command cannot affect row a second time".to_string(),
                             ));
                         }
+                        // v2.02: DELETE USING policies are a check,
+                        // not a filter, for MERGE (42501 on failure).
+                        if tdef.rls_enabled {
+                            rls_check_merge_using_ctx(
+                                eng,
+                                ctx,
+                                &tdef,
+                                table,
+                                crate::sql::PolicyCmd::Delete,
+                                &tgt_schema,
+                                tvals,
+                            )?;
+                        }
                         check_row_lock(eng, leaf, *id, ctx.own)?;
                         acted[vi] = true;
                         acts.push(MAct::Delete {
@@ -735,6 +813,19 @@ pub(crate) fn exec_merge(
                                 "MERGE command cannot affect row a second time".to_string(),
                             ));
                         }
+                        // v2.02: UPDATE USING policies are a check,
+                        // not a filter, for MERGE (42501 on failure).
+                        if tdef.rls_enabled {
+                            rls_check_merge_using_ctx(
+                                eng,
+                                ctx,
+                                &tdef,
+                                table,
+                                crate::sql::PolicyCmd::Update,
+                                &tgt_schema,
+                                tvals,
+                            )?;
+                        }
                         check_row_lock(eng, leaf, *id, ctx.own)?;
                         let mut new_values = tvals.to_vec();
                         for (name, expr) in sets {
@@ -745,6 +836,23 @@ pub(crate) fn exec_merge(
                             let comp = meta.composite_types.get(ci).and_then(|o| o.as_deref());
                             nv = coerce_assign_composite(eng, nv, comp)?;
                             new_values[ci] = nv;
+                        }
+                        // v2.02: WITH CHECK on the new row; the
+                        // SELECT group joins as a check because MERGE
+                        // always requires SELECT perms on the target
+                        // (rowsecurity.c CMD_MERGE branch).
+                        if tdef.rls_enabled {
+                            rls_check_new_row_ctx(
+                                eng,
+                                ctx,
+                                &tdef,
+                                table,
+                                crate::sql::PolicyCmd::Update,
+                                true,
+                                false,
+                                &tgt_schema,
+                                &new_values,
+                            )?;
                         }
                         acted[vi] = true;
                         acts.push(MAct::Update {
@@ -791,6 +899,22 @@ pub(crate) fn exec_merge(
                         srow,
                         &ctes,
                     )?;
+                    // v2.02: INSERT WITH CHECK on the new row; the
+                    // SELECT group joins only when RETURNING is
+                    // present (rowsecurity.c CMD_MERGE branch).
+                    if tdef.rls_enabled {
+                        rls_check_new_row_ctx(
+                            eng,
+                            ctx,
+                            &tdef,
+                            table,
+                            crate::sql::PolicyCmd::Insert,
+                            !returning.is_empty(),
+                            false,
+                            &tgt_schema,
+                            &row[..],
+                        )?;
+                    }
                     acts.push(MAct::Insert {
                         dst: table.to_string(),
                         new: row,
@@ -821,6 +945,19 @@ pub(crate) fn exec_merge(
             match &w.action {
                 MergeAction::DoNothing => {}
                 MergeAction::Delete => {
+                    // v2.02: DELETE USING check (BY SOURCE rows are
+                    // target rows too; same WCO as MATCHED deletes).
+                    if tdef.rls_enabled {
+                        rls_check_merge_using_ctx(
+                            eng,
+                            ctx,
+                            &tdef,
+                            table,
+                            crate::sql::PolicyCmd::Delete,
+                            &tgt_schema,
+                            tvals,
+                        )?;
+                    }
                     check_row_lock(eng, leaf, *id, ctx.own)?;
                     acts.push(MAct::Delete {
                         leaf: leaf.clone(),
@@ -831,6 +968,19 @@ pub(crate) fn exec_merge(
                     });
                 }
                 MergeAction::Update { sets } => {
+                    // v2.02: UPDATE USING check on the existing row,
+                    // then WITH CHECK (+ SELECT visibility) on the new.
+                    if tdef.rls_enabled {
+                        rls_check_merge_using_ctx(
+                            eng,
+                            ctx,
+                            &tdef,
+                            table,
+                            crate::sql::PolicyCmd::Update,
+                            &tgt_schema,
+                            tvals,
+                        )?;
+                    }
                     check_row_lock(eng, leaf, *id, ctx.own)?;
                     let mut new_values = tvals.to_vec();
                     for (name, expr) in sets {
@@ -841,6 +991,19 @@ pub(crate) fn exec_merge(
                         let comp = meta.composite_types.get(ci).and_then(|o| o.as_deref());
                         nv = coerce_assign_composite(eng, nv, comp)?;
                         new_values[ci] = nv;
+                    }
+                    if tdef.rls_enabled {
+                        rls_check_new_row_ctx(
+                            eng,
+                            ctx,
+                            &tdef,
+                            table,
+                            crate::sql::PolicyCmd::Update,
+                            true,
+                            false,
+                            &tgt_schema,
+                            &new_values,
+                        )?;
                     }
                     acts.push(MAct::Update {
                         leaf: leaf.clone(),
@@ -856,6 +1019,21 @@ pub(crate) fn exec_merge(
                 }
             }
             break;
+        }
+    }
+    // v2.02: replica-identity guard for partitioned targets — check
+    // each leaf an UPDATE/DELETE action actually touches.
+    {
+        let mut seen: HashSet<(String, bool)> = HashSet::new();
+        for a in &acts {
+            let (leaf, is_update) = match a {
+                MAct::Update { leaf, .. } => (leaf, true),
+                MAct::Delete { leaf, .. } => (leaf, false),
+                _ => continue,
+            };
+            if seen.insert((leaf.clone(), is_update)) {
+                check_replica_identity_for(eng, ctx, leaf, is_update)?;
+            }
         }
     }
     // --- route inserts / partition-key moves, fire INSERT triggers ------

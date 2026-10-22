@@ -6175,6 +6175,44 @@ pub enum Stmt {
         if_not_exists: bool,
         authorization: Option<String>,
     },
+    /// v2.02: CREATE PUBLICATION name [FOR ALL TABLES [EXCEPT (...)] |
+    /// FOR TABLE t [(cols)] [, ...] | FOR TABLES IN SCHEMA s [, ...]]
+    /// [WITH (publish = '...' | publish_via_partition_root = bool |
+    /// publish_generated_columns = ...)]; an empty spec is a bare
+    /// publication publishing nothing. `publish` is None when the WITH
+    /// clause does not name it (PG default: all actions).
+    CreatePublication {
+        name: String,
+        all_tables: bool,
+        all_sequences: bool,
+        except_tables: Vec<String>,
+        tables: Vec<String>,
+        schemas: Vec<String>,
+        publish: Option<(bool, bool, bool, bool)>,
+        via_partition_root: Option<bool>,
+    },
+    /// v2.02: DROP PUBLICATION [IF EXISTS] name [, ...] [CASCADE|RESTRICT].
+    DropPublication {
+        names: Vec<String>,
+        if_exists: bool,
+    },
+    /// v2.02: ALTER PUBLICATION name {ADD|DROP|SET} {TABLE ... |
+    /// TABLES IN SCHEMA ... | ALL TABLES [EXCEPT (...)] | ALL
+    /// SEQUENCES} | SET (publish = ...) | OWNER TO r | RENAME TO n.
+    /// `action` is 'a' add, 'd' drop, 's' set-tables, 'p'
+    /// set-publish-options, 'o' owner, 'r' rename.
+    AlterPublication {
+        name: String,
+        action: char,
+        all_tables: bool,
+        all_sequences: bool,
+        except_tables: Vec<String>,
+        tables: Vec<String>,
+        schemas: Vec<String>,
+        publish: Option<(bool, bool, bool, bool)>,
+        via_partition_root: Option<bool>,
+        new_value: Option<String>,
+    },
     /// v1.96: DROP SCHEMA [IF EXISTS] name [, ...] [CASCADE|RESTRICT].
     DropSchema {
         names: Vec<String>,

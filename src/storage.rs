@@ -6024,6 +6024,15 @@ pub struct Database {
     /// forgets them, which only narrows DDL acceptance).
     pub cluster_marks: std::collections::HashMap<String, String>,
     pub typed_tables: std::collections::HashMap<String, String>,
+    /// v2.02: publications by name (CREATE PUBLICATION), consulted by
+    /// the replica-identity guard (CheckCmdReplicaIdentity).
+    /// Transactional via the statement undo log
+    /// (`WriteOp::CreatePublication` & friends — object_address.sql
+    /// relies on a rolled-back FOR ALL TABLES publication never
+    /// becoming visible), but deliberately not WAL-logged or
+    /// checkpointed: a restart forgets publications, which only
+    /// narrows the guard (documented hold-back).
+    pub publications: HashMap<String, Publication, FxBuildHasher>,
     /// v1.96: large object contents (oid -> bytes) and owners.
     /// v1.96: user-defined aggregates by name.
     pub aggregates: std::collections::HashMap<String, AggDef>,
@@ -6035,6 +6044,32 @@ pub struct Database {
     /// v0.37: next table OID to assign (`pg_class.oid`). Starts at
     /// `FIRST_USER_OID` (16384), like PG's `FirstNormalObjectId`.
     pub next_oid: u32,
+}
+
+/// v2.02: a logical-replication publication (pg_publication row,
+/// reduced to what the replica-identity guard and the publication DDL
+/// surface need). Table and schema names are stored as written
+/// (schema-qualified when given); membership tests compare the
+/// unqualified base name, matching the engine's single-namespace
+/// storage keys, plus the schema attribution in `Database::obj_schema`
+/// for TABLES IN SCHEMA entries.
+#[derive(Clone, Debug)]
+pub struct Publication {
+    pub name: String,
+    pub owner: String,
+    pub all_tables: bool,
+    pub all_sequences: bool,
+    /// FOR ALL TABLES EXCEPT (TABLE ...) exclusions (base names).
+    pub except_tables: Vec<String>,
+    /// Explicit FOR TABLE entries (names as written).
+    pub tables: Vec<String>,
+    /// FOR TABLES IN SCHEMA entries (schema names).
+    pub schemas: Vec<String>,
+    pub pubinsert: bool,
+    pub pubupdate: bool,
+    pub pubdelete: bool,
+    pub pubtruncate: bool,
+    pub via_partition_root: bool,
 }
 
 /// v0.13: a replication slot. Cluster-global (not per-database), and
@@ -6197,6 +6232,7 @@ impl Database {
             obj_schema: std::collections::HashMap::default(),
             cluster_marks: std::collections::HashMap::default(),
             typed_tables: std::collections::HashMap::default(),
+            publications: HashMap::default(),
             schema_acls: HashMap::default(),
             aggregates: std::collections::HashMap::default(),
             large_objects: std::collections::HashMap::default(),
@@ -8014,6 +8050,26 @@ pub enum WriteOp {
         dst: String,
         prev: Option<CastDef>,
     },
+    // --- v2.02: publication DDL. Publications live in
+    // `Database::publications` (not the versioned catalog and not
+    // WAL-logged — see the field docs); the op carries the previous
+    // entry so statement-undo / ROLLBACK restores it exactly. This
+    // matters observably: object_address.sql creates a FOR ALL TABLES
+    // publication inside a rolled-back transaction precisely so it
+    // never becomes visible, and the replica-identity guard reads the
+    // live catalog.
+    CreatePublication {
+        name: String,
+        prev: Option<Publication>,
+    },
+    DropPublication {
+        name: String,
+        prev: Option<Publication>,
+    },
+    AlterPublication {
+        name: String,
+        prev: Option<Publication>,
+    },
     // --- v0.8: index DDL. DropIndex carries the whole index so undo can
     // restore the definition and its entries exactly.
     CreateIndex {
@@ -8393,6 +8449,18 @@ pub fn undo_write_op(eng: &mut Engine, owns: &[u64], op: &WriteOp) {
                 }
             }
         }
+        // --- v2.02: publication DDL undo. Restore the previous entry,
+        // or remove the publication when there was none.
+        WriteOp::CreatePublication { name, prev }
+        | WriteOp::DropPublication { name, prev }
+        | WriteOp::AlterPublication { name, prev } => match prev {
+            Some(p) => {
+                eng.db.publications.insert(name.clone(), p.clone());
+            }
+            None => {
+                eng.db.publications.remove(name);
+            }
+        },
         WriteOp::CreateIndex { name } => {
             // Undo a CREATE INDEX: drop the definition (and its entries)
             // iff it is still ours — a concurrent DROP INDEX of the same

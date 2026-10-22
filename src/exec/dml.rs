@@ -1953,6 +1953,15 @@ pub(crate) fn exec_insert(
     } else {
         require_table_priv(eng, ctx, table, crate::storage::PRIV_INSERT, "INSERT")?;
     }
+    // v2.02: ON CONFLICT DO UPDATE also runs the replica-identity
+    // guard as an UPDATE (PG19 CheckValidResultRel). Partitioned
+    // targets are skipped inside the guard (leaf conflict checks are
+    // held back; see hidden_files/v202/scope.md).
+    if let Some(oc) = on_conflict {
+        if matches!(oc.action, crate::sql::ConflictAction::DoUpdate { .. }) {
+            check_replica_identity_for(eng, ctx, table, true)?;
+        }
+    }
     // v1.96: ON CONFLICT privilege checks (PG19 aclchk for
     // ModifyTable): DO UPDATE needs UPDATE on its SET columns;
     // the inference (arbiter) columns, SET/WHERE expression reads,
@@ -3505,6 +3514,11 @@ pub(crate) fn exec_update(
         crate::storage::PRIV_UPDATE,
         "UPDATE",
     )?;
+    // v2.02: replica-identity guard for unpartitioned targets (PG19
+    // CheckCmdReplicaIdentity at ModifyTable init — it fires even
+    // when no row matches). Partitioned targets check their touched
+    // leaves after planning, below.
+    check_replica_identity_for(eng, ctx, table, true)?;
     // v1.96: columns READ by SET expressions / WHERE need SELECT
     // (PG19 ExecCheckRTEPerms selectedCols on the target relation).
     {
@@ -4104,6 +4118,23 @@ pub(crate) fn exec_update(
         let from_schema = from_data.map(|(s, _)| s);
         (plan, moves, ret_new, ret_from, ret_prov_ids, from_schema)
     };
+    // v2.02: replica-identity guard for partitioned targets — PG
+    // checks each leaf result relation the statement actually touches
+    // (a WHERE-false UPDATE over a published partitioned table with
+    // no replica identity passes, because no leaf is ever opened).
+    {
+        let touched: Vec<&str> = plan
+            .iter()
+            .map(|(dst, _, _, _)| dst.as_str())
+            .chain(moves.iter().map(|(src, _, _, _, _)| src.as_str()))
+            .collect();
+        let mut seen = HashSet::new();
+        for leaf in touched {
+            if seen.insert(leaf.to_string()) {
+                check_replica_identity_for(eng, ctx, leaf, true)?;
+            }
+        }
+    }
     // v1.95: row-level security WITH CHECK on every updated row's new
     // version (WCO_RLS_UPDATE_CHECK; SELECT policies join as checks
     // when RETURNING is present). ret_new is in target (parent)
@@ -4404,6 +4435,9 @@ pub(crate) fn exec_delete(
 ) -> Result<ExecResult, ExecError> {
     // v0.11: DELETE needs DELETE privilege on the table.
     require_table_priv(eng, ctx, table, crate::storage::PRIV_DELETE, "DELETE")?;
+    // v2.02: replica-identity guard (see exec_update; partitioned
+    // targets check their touched leaves after planning).
+    check_replica_identity_for(eng, ctx, table, false)?;
     // v1.96: columns READ by the WHERE clause need SELECT.
     if let Some(w) = where_ {
         check_dml_read_cols(eng, ctx, table, alias.as_deref(), &[w], &[])?;
@@ -4712,6 +4746,16 @@ pub(crate) fn exec_delete(
         let using_schema = using_data.map(|(s, _)| s);
         (plan, plan_using, using_schema)
     };
+    // v2.02: replica-identity guard for partitioned targets — check
+    // each leaf the plan actually deletes from (see exec_update).
+    {
+        let mut seen = HashSet::new();
+        for (leaf, _, _, _, _, _) in &plan {
+            if seen.insert(leaf.clone()) {
+                check_replica_identity_for(eng, ctx, leaf, false)?;
+            }
+        }
+    }
     let n = plan.len();
     // v0.10: DELETE RETURNING evaluates against the OLD row values —
     // collect them before the plan is consumed by the apply loop.

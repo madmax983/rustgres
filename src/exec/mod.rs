@@ -97,6 +97,7 @@ mod pg_input;
 mod privfuncs;
 mod privilege;
 mod project;
+mod publication;
 pub(crate) mod ranges;
 mod reorder;
 mod rls;
@@ -282,6 +283,9 @@ mod v199_explain_dml_tests;
 #[path = "test_mods/v201_merge_tests.rs"]
 mod v201_merge_tests;
 #[cfg(test)]
+#[path = "test_mods/v202_guard_tests.rs"]
+mod v202_guard_tests;
+#[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;
 
@@ -320,6 +324,7 @@ pub(crate) use pg_input::*;
 pub(crate) use privfuncs::*;
 pub(crate) use privilege::*;
 pub(crate) use project::*;
+pub(crate) use publication::*;
 pub(crate) use reorder::*;
 pub(crate) use rls::*;
 pub(crate) use roles::*;
