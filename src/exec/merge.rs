@@ -1069,7 +1069,26 @@ pub(crate) fn exec_merge(
             }
         }
     }
-    // FK child checks for inserted/updated rows.
+    // FK child checks for inserted/updated rows. `self_new` (every new
+    // row headed to the same destination, reordered into leaf column
+    // order) depends only on `dst`, not on which action is being
+    // checked — reorder each destination's rows once here rather than
+    // once per action that happens to share the destination (was
+    // O(actions^2) reorder_row calls for a destination with many
+    // planned actions; a plain upsert MERGE sends every row to the
+    // same destination).
+    let self_new_by_dst: HashMap<&str, Vec<Row>> = new_by_dst
+        .iter()
+        .map(|(dst, rows)| {
+            let lc = leaf_cols(eng, ctx, dst);
+            let reordered: Vec<Row> = rows
+                .iter()
+                .map(|r| Row::new(reorder_row(&columns, &lc, &r.to_vec())))
+                .collect();
+            (dst.as_str(), reordered)
+        })
+        .collect();
+    let no_self_new: Vec<Row> = Vec::new();
     for a in &acts {
         let (dst, nv, excl): (&str, &Row, Option<u64>) = match a {
             MAct::Insert { dst, new, .. } => (dst, new, None),
@@ -1085,13 +1104,7 @@ pub(crate) fn exec_merge(
             TableMeta::of(t)
         };
         let leaf_row = Row::new(reorder_row(&columns, &lc, &nv.to_vec()));
-        let self_new: Vec<Row> = new_by_dst
-            .get(dst)
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .map(|r| Row::new(reorder_row(&columns, &lc, &r.to_vec())))
-            .collect();
+        let self_new = self_new_by_dst.get(dst).unwrap_or(&no_self_new);
         check_fk_child_row(
             eng,
             ctx.snap,
@@ -1100,7 +1113,7 @@ pub(crate) fn exec_merge(
             &dst_meta,
             dst,
             &leaf_row,
-            &self_new,
+            self_new,
             excl,
         )?;
     }
