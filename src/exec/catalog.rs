@@ -3052,6 +3052,11 @@ pub(crate) struct CteBinding {
     pub(crate) name: String,
     pub(crate) schema: Vec<QCol>,
     pub(crate) rows: Vec<QRow>,
+    /// v2.01: the body was a data-modifying CTE without RETURNING.
+    /// PG19 executes such a CTE but raises 0A000 if it is REFERENCED
+    /// (parse_relation.c addRangeTableEntryForCTE); the check lives
+    /// at the FROM reference site, not at materialization.
+    pub(crate) dml_no_returning: bool,
 }
 
 /// v0.10: window-function evaluation state for one query level.

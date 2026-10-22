@@ -492,6 +492,121 @@ pub(crate) fn rls_check_new_row_ctx(
     )
 }
 
+/// v2.02: MERGE per-action USING check (PG19 WCO_RLS_MERGE_UPDATE_CHECK
+/// / WCO_RLS_MERGE_DELETE_CHECK, rowsecurity.c + nodeModifyTable.c):
+/// once a WHEN clause for an UPDATE or DELETE action fires on a target
+/// row, the action command's USING group is checked against the
+/// EXISTING row as a WithCheckOption — a failure is an error 42501
+/// "target row violates row-level security policy ... (USING
+/// expression)", never a silent skip (unlike plain UPDATE/DELETE,
+/// where the same group filters). Permissive policies combine (no
+/// policy name in the message, per execMain.c); a failing restrictive
+/// policy is named.
+pub(crate) fn rls_check_merge_using(
+    q: &mut Q,
+    t: &Table,
+    table_name: &str,
+    cmd: PolicyCmd,
+    schema: &[QCol],
+    cells: &[Value],
+) -> Result<(), ExecError> {
+    if !rls_applies(q.eng, q.snap, q.own, t, table_name, q.role)? {
+        return Ok(());
+    }
+    let group = applicable_policies(q.eng, q.snap, q.own, t, cmd, q.role);
+    let fail = |name: Option<&str>| -> ExecError {
+        let msg = match name {
+            Some(n) => format!(
+                "target row violates row-level security policy \"{}\" (USING expression) for table \"{}\"",
+                n, table_name
+            ),
+            None => format!(
+                "target row violates row-level security policy (USING expression) for table \"{}\"",
+                table_name
+            ),
+        };
+        exec_err("42501", msg)
+    };
+    let frame = Scope {
+        schema,
+        row: cells,
+        prov: None,
+    };
+    let scopes = [frame];
+    let permissives: Vec<&&PolicyDef> = group.iter().filter(|p| p.permissive).collect();
+    if permissives.is_empty() {
+        return Err(fail(None));
+    }
+    let mut ok = false;
+    for p in &permissives {
+        let v = match p.using_expr.as_ref() {
+            Some(e) => check_bool(eval_expr(q, &scopes, e)?, "policy")?,
+            None => true,
+        };
+        if v {
+            ok = true;
+            break;
+        }
+    }
+    if !ok {
+        return Err(fail(None));
+    }
+    for p in group.iter().filter(|p| !p.permissive) {
+        let v = match p.using_expr.as_ref() {
+            Some(e) => check_bool(eval_expr(q, &scopes, e)?, "policy")?,
+            None => true,
+        };
+        if !v {
+            return Err(fail(Some(p.name.as_str())));
+        }
+    }
+    Ok(())
+}
+
+/// rls_check_merge_using for callers holding a StmtCtx (MERGE).
+pub(crate) fn rls_check_merge_using_ctx(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    t: &Table,
+    table_name: &str,
+    cmd: PolicyCmd,
+    schema: &[QCol],
+    cells: &[Value],
+) -> Result<(), ExecError> {
+    if !rls_applies(eng, ctx.snap, ctx.own, t, table_name, ctx.role)? {
+        return Ok(());
+    }
+    let mut lock_ids = Vec::new();
+    let mut q = Q {
+        eng,
+        snap: ctx.snap,
+        own: ctx.own,
+        all_xids: ctx.all_xids.clone(),
+        session: ctx.session,
+        role: ctx.role,
+        read_only: ctx.read_only,
+        depth: 0,
+        lock_ids: &mut lock_ids,
+        ctes: Vec::new(),
+        wctx: None,
+        srf_vals: Vec::new(),
+        priv_scopes: Vec::new(),
+        priv_role_override: None,
+        hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+        immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+        plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
+        hashed_in: Rc::new(RefCell::new(Vec::new())),
+        pending_updates: None,
+        write: Some(qwrite_from_ctx(
+            &mut *ctx.writes,
+            ctx.write_xid,
+            ctx.level,
+            ctx.default_toast_compression,
+        )),
+    };
+    rls_check_merge_using(&mut q, t, table_name, cmd, schema, cells)
+}
+
 // ---------------------------------------------------------------------------
 // Policy DDL (commands/policy.c). Mutations stage through
 // commit_table_version, exactly like CREATE/DROP TRIGGER.

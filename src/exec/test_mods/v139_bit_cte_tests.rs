@@ -202,18 +202,21 @@ fn cte_dml_recursive_rejected() {
 fn cte_dml_empty_returning() {
     let mut eng = engine();
     mk(&mut eng);
-    // No RETURNING list: zero columns, but the insert still happens.
-    match run(
-        &mut eng,
-        "with ins as (insert into t139 values (5, 'v')) select * from ins;",
-    )
-    .unwrap()
-    {
-        ExecResult::Select { columns, rows, .. } => {
-            assert_eq!(columns.len(), 0);
-            assert_eq!(rows.len(), 0);
-        }
-        other => panic!("expected SELECT, got {other:?}"),
-    }
+    // v2.01 correction (PG19 parse_relation.c): a data-modifying CTE
+    // that is referenced without a RETURNING clause is 0A000
+    // `WITH query "ins" does not have a RETURNING clause` — the v1.39
+    // zero-column success behavior contradicted PG19.
+    assert_eq!(
+        err_code(
+            &mut eng,
+            "with ins as (insert into t139 values (5, 'v')) select * from ins;"
+        ),
+        "0A000"
+    );
+    // The CTE body still EXECUTED during materialization (PG likewise
+    // always executes data-modifying CTEs); rolling its writes back
+    // on the reference error is the server statement-atomicity
+    // layer's job, which this in-process harness bypasses — so the
+    // row is visible here. Wire-level atomicity is probe-verified.
     assert_eq!(col0(&mut eng, "select count(*) from t139;"), vec!["1"]);
 }

@@ -453,10 +453,11 @@ fn v199_explain_declare_and_parser_gates() {
         "EXPLAIN (COSTS OFF) DECLARE cur CURSOR FOR SELECT * FROM t1 WHERE a = 1",
     );
     assert!(p.iter().any(|l| l.contains("Seq Scan on t1")), "{p:?}");
-    // MERGE has no engine statement at all yet: parse-level 42601.
+    // v2.01: MERGE exists and PG19's ExplainableStmt includes
+    // MergeStmt, so EXPLAIN MERGE parses (and plans, per v201 tests).
     assert!(
         parse_statement("EXPLAIN MERGE INTO t1 USING t2 ON t1.a = t2.a WHEN MATCHED THEN DELETE")
-            .is_err()
+            .is_ok()
     );
     // The EXPLAIN arm accepts exactly the PG19 ExplainableStmt set.
     for sql in [

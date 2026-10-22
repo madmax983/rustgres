@@ -691,7 +691,10 @@ pub(crate) fn run_func_body(
             Stmt::Select(bound) => {
                 last_out = Some(run_select(&mut call_q, &bound, scopes)?);
             }
-            Stmt::Insert { .. } | Stmt::Update { .. } | Stmt::Delete { .. } => {
+            Stmt::Insert { .. }
+            | Stmt::Update { .. }
+            | Stmt::Delete { .. }
+            | Stmt::Merge { .. } => {
                 last_out = Some(run_func_dml(&mut call_q, &stmt, &fdef.name)?);
             }
             // v1.96: GRANT/REVOKE (object and role) body statements

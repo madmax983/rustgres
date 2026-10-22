@@ -311,6 +311,8 @@ impl Parser {
             // --- v0.5: UPDATE / DELETE
             "update" => self.parse_update(),
             "delete" => self.parse_delete(),
+            // --- v2.01: MERGE
+            "merge" => self.parse_merge(),
             // --- v0.74: PREPARE / EXECUTE / DEALLOCATE
             "prepare" => self.parse_prepare(),
             "execute" => self.parse_execute(),
@@ -614,10 +616,8 @@ impl Parser {
                 // the planner sees it.
                 match inner {
                     // v1.99: PG19 gram.y ExplainableStmt — Select | Insert |
-                    // Update | Delete | DeclareCursor | CreateAs |
-                    // CreateMatView | RefreshMatView | Execute. (MERGE is
-                    // not in the list: the engine has no MERGE statement
-                    // at all, so parse_top_kw rejects it upstream.) A
+                    // Update | Delete | Merge | DeclareCursor | CreateAs |
+                    // CreateMatView | RefreshMatView | Execute. A
                     // plain CREATE VIEW is NOT explainable in PG19 (only
                     // the MATERIALIZED form is).
                     Stmt::Select(_)
@@ -625,6 +625,7 @@ impl Parser {
                     | Stmt::Insert { .. }
                     | Stmt::Update { .. }
                     | Stmt::Delete { .. }
+                    | Stmt::Merge { .. }
                     | Stmt::Declare { .. }
                     | Stmt::CreateTableAs { .. }
                     | Stmt::RefreshMatView { .. } => Ok(Stmt::Explain {
@@ -665,6 +666,7 @@ impl Parser {
                 Token::Ident(s) if s == "type" => self.parse_alter_type(),
                 Token::Ident(s) if s == "function" => self.parse_alter_function(),
                 Token::Ident(s) if s == "policy" => self.parse_alter_policy(),
+                Token::Ident(s) if s == "publication" => self.parse_alter_publication(),
                 Token::Ident(s) if s == "default" => self.parse_alter_default_privileges(),
                 Token::Ident(s) if s == "schema" => {
                     self.next(); // 'schema'
@@ -1290,6 +1292,10 @@ impl Parser {
         // v1.95: CREATE POLICY name ON table ... (PG19).
         if matches!(self.peek(), Token::Ident(s) if s == "policy") {
             return self.parse_create_policy();
+        }
+        // v2.02: CREATE PUBLICATION name [FOR ...] [WITH (...)].
+        if matches!(self.peek(), Token::Ident(s) if s == "publication") {
+            return self.parse_create_publication();
         }
         // CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (col [, ...])
         let unique = self.eat_keyword("unique");
@@ -3732,6 +3738,450 @@ impl Parser {
         })
     }
 
+    /// v2.02: one publication table-list entry list: `TABLE name
+    /// [(col, ...)] [, ...]` / `TABLES IN SCHEMA name [, ...]` /
+    /// `ALL TABLES [EXCEPT (...)]` / `ALL SEQUENCES` (ignored — the
+    /// engine has no sequence publications) in any comma combination.
+    /// Returns (all_tables, except, tables, schemas). Column lists are
+    /// parsed and discarded (column-list validity is held back).
+    pub(crate) fn parse_publication_spec(
+        &mut self,
+    ) -> Result<(bool, bool, Vec<String>, Vec<String>, Vec<String>), SqlError> {
+        let mut all_tables = false;
+        let mut all_sequences = false;
+        let mut except_tables: Vec<String> = Vec::new();
+        let mut tables: Vec<String> = Vec::new();
+        let mut schemas: Vec<String> = Vec::new();
+        loop {
+            if self.eat_keyword("all") {
+                if self.eat_keyword("tables") {
+                    if all_tables {
+                        return Err(err(
+                            "syntax error: ALL TABLES specified more than once".to_string()
+                        ));
+                    }
+                    all_tables = true;
+                    if self.eat_keyword("except") {
+                        self.expect(Token::LParen, "'('")?;
+                        // PG19 gram.y: EXCEPT '(' TABLE ... — the TABLE
+                        // keyword is mandatory before the list.
+                        self.expect_keyword("table")?;
+                        loop {
+                            let _ = self.eat_keyword("table");
+                            let _ = self.eat_keyword("only");
+                            let n = self.parse_table_name()?;
+                            // A trailing `*` (include descendants) is
+                            // accepted and ignored.
+                            if matches!(self.peek(), Token::Star) {
+                                self.next();
+                            }
+                            except_tables.push(n);
+                            if !matches!(self.peek(), Token::Comma) {
+                                break;
+                            }
+                            self.next();
+                        }
+                        self.expect(Token::RParen, "')'")?;
+                    }
+                } else if self.eat_keyword("sequences") {
+                    if all_sequences {
+                        return Err(err(
+                            "syntax error: ALL SEQUENCES specified more than once".to_string()
+                        ));
+                    }
+                    all_sequences = true;
+                } else {
+                    return Err(err(
+                        "syntax error: expected TABLES or SEQUENCES after ALL".to_string()
+                    ));
+                }
+            } else if self.eat_keyword("tables") {
+                self.expect_keyword("in")?;
+                self.expect_keyword("schema")?;
+                loop {
+                    schemas.push(self.expect_ident()?);
+                    // CURRENT_SCHEMA is a valid schema entry in PG.
+                    if !matches!(self.peek(), Token::Comma) {
+                        break;
+                    }
+                    // A comma may also start the next spec item; only
+                    // consume it as a separator when another ident
+                    // follows that is not a spec keyword.
+                    let save = self.pos;
+                    self.next();
+                    match self.peek() {
+                        Token::Ident(s) if s != "table" && s != "tables" && s != "all" => {
+                            continue;
+                        }
+                        _ => {
+                            self.pos = save;
+                            break;
+                        }
+                    }
+                }
+            } else if self.eat_keyword("table") {
+                loop {
+                    let _ = self.eat_keyword("only");
+                    let n = self.parse_table_name()?;
+                    // Optional column list: (col [, ...]) — parsed and
+                    // discarded; a `WHERE (expr)` row filter likewise.
+                    if matches!(self.peek(), Token::LParen) {
+                        self.next();
+                        let mut depth = 1;
+                        while depth > 0 {
+                            match self.next() {
+                                Token::LParen => depth += 1,
+                                Token::RParen => depth -= 1,
+                                Token::EOF => {
+                                    return Err(err(
+                                        "syntax error: unterminated column list".to_string()
+                                    ));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    if self.eat_keyword("where") {
+                        self.expect(Token::LParen, "'('")?;
+                        let mut depth = 1;
+                        while depth > 0 {
+                            match self.next() {
+                                Token::LParen => depth += 1,
+                                Token::RParen => depth -= 1,
+                                Token::EOF => {
+                                    return Err(err(
+                                        "syntax error: unterminated row filter".to_string()
+                                    ));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    tables.push(n);
+                    if !matches!(self.peek(), Token::Comma) {
+                        break;
+                    }
+                    let save = self.pos;
+                    self.next();
+                    match self.peek() {
+                        Token::Ident(s) if s == "tables" || s == "all" => {
+                            self.pos = save;
+                            break;
+                        }
+                        _ => continue,
+                    }
+                }
+            } else {
+                break;
+            }
+            if !matches!(self.peek(), Token::Comma) {
+                break;
+            }
+            self.next();
+        }
+        Ok((all_tables, all_sequences, except_tables, tables, schemas))
+    }
+
+    /// v2.02: publication WITH options `(name = value [, ...])` where
+    /// values are strings, idents, or numbers. Returns (publish tuple
+    /// (insert, update, delete, truncate) when `publish` was named,
+    /// via_partition_root when named). Unknown options are parsed and
+    /// ignored (PG validates them; the guard only needs these two).
+    pub(crate) fn parse_publication_options(
+        &mut self,
+    ) -> Result<(Option<(bool, bool, bool, bool)>, Option<bool>), SqlError> {
+        let mut publish = None;
+        let mut via_root = None;
+        if !self.eat_keyword("with") {
+            return Ok((publish, via_root));
+        }
+        self.expect(Token::LParen, "'('")?;
+        let mut seen_opts: std::collections::HashSet<String> = std::collections::HashSet::new();
+        loop {
+            let opt = self.expect_ident()?;
+            let mut val = String::new();
+            let mut has_value = false;
+            if matches!(self.peek(), Token::Eq) {
+                has_value = true;
+                self.next();
+                match self.next() {
+                    Token::Str(s) => val = s.to_string(),
+                    Token::Ident(s) => {
+                        val = s.to_string();
+                        // Unquoted comma list: publish = insert, update
+                        while opt == "publish"
+                            && matches!(self.peek(), Token::Comma)
+                            && matches!(self.peek2(), Token::Ident(s2) if matches!(s2.as_str(), "insert" | "update" | "delete" | "truncate"))
+                        {
+                            self.next();
+                            match self.next() {
+                                Token::Ident(s) => {
+                                    val.push_str(", ");
+                                    val.push_str(&s);
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
+                    Token::Number(n) => val = n.to_string(),
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: unexpected {:?} in publication options",
+                            other
+                        )));
+                    }
+                }
+            }
+            let (p, v) = Self::pub_option_checked(&opt, &val, has_value, &mut seen_opts)?;
+            if p.is_some() {
+                publish = p;
+            }
+            if v.is_some() {
+                via_root = v;
+            }
+            if !matches!(self.peek(), Token::Comma) {
+                break;
+            }
+            self.next();
+        }
+        self.expect(Token::RParen, "')'")?;
+        Ok((publish, via_root))
+    }
+
+    /// v2.02: validate one publication option (PG19 publicationcmds.c
+    /// parse_publication_options): unknown or duplicate parameters and
+    /// bad values are errors. Returns (publish tuple, via_root).
+    pub(crate) fn pub_option_checked(
+        opt: &str,
+        val: &str,
+        has_value: bool,
+        seen: &mut std::collections::HashSet<String>,
+    ) -> Result<(Option<(bool, bool, bool, bool)>, Option<bool>), SqlError> {
+        if !seen.insert(opt.to_string()) {
+            return Err(err(format!(
+                "publication parameter \"{}\" specified more than once",
+                opt
+            )));
+        }
+        match opt {
+            "publish" => {
+                if !has_value {
+                    return Err(err(
+                        "publication parameter \"publish\" requires a value".to_string()
+                    ));
+                }
+                let mut t = (false, false, false, false);
+                for part in val.split(',') {
+                    match part.trim() {
+                        "insert" => t.0 = true,
+                        "update" => t.1 = true,
+                        "delete" => t.2 = true,
+                        "truncate" => t.3 = true,
+                        "" => {}
+                        other => {
+                            return Err(err(format!(
+                                "invalid value for publication parameter \"publish\": \"{}\"",
+                                other
+                            )));
+                        }
+                    }
+                }
+                Ok((Some(t), None))
+            }
+            "publish_via_partition_root" => {
+                if !matches!(
+                    val,
+                    "true" | "false" | "1" | "0" | "on" | "off" | "yes" | "no"
+                ) {
+                    return Err(err(format!(
+                        "invalid value for publication parameter \"publish_via_partition_root\": \"{}\"",
+                        val
+                    )));
+                }
+                Ok((None, Some(matches!(val, "true" | "1" | "on" | "yes"))))
+            }
+            "publish_generated_columns" => {
+                if !matches!(val, "none" | "stored") {
+                    return Err(err(format!(
+                        "invalid value for publication parameter \"publish_generated_columns\": \"{}\"",
+                        val
+                    )));
+                }
+                Ok((None, None))
+            }
+            _ => Err(err(format!(
+                "unrecognized publication parameter: \"{}\"",
+                opt
+            ))),
+        }
+    }
+
+    /// v2.02: `CREATE PUBLICATION name [FOR spec] [WITH (...)]`.
+    pub(crate) fn parse_create_publication(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("publication")?;
+        let name = self.expect_ident()?;
+        let (mut all_tables, mut all_sequences, mut except_tables, mut tables, mut schemas) =
+            (false, false, Vec::new(), Vec::new(), Vec::new());
+        if self.eat_keyword("for") {
+            let (a, seq, e, t, s) = self.parse_publication_spec()?;
+            all_tables = a;
+            all_sequences = seq;
+            except_tables = e;
+            tables = t;
+            schemas = s;
+        }
+        let (publish, via_partition_root) = self.parse_publication_options()?;
+        Ok(Stmt::CreatePublication {
+            name,
+            all_tables,
+            all_sequences,
+            except_tables,
+            tables,
+            schemas,
+            publish,
+            via_partition_root,
+        })
+    }
+
+    /// v2.02: `ALTER PUBLICATION name ...`.
+    pub(crate) fn parse_alter_publication(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("publication")?;
+        let name = self.expect_ident()?;
+        if self.eat_keyword("rename") {
+            self.expect_keyword("to")?;
+            let new_name = self.expect_ident()?;
+            return Ok(Stmt::AlterPublication {
+                name,
+                action: 'r',
+                all_tables: false,
+                all_sequences: false,
+                except_tables: Vec::new(),
+                tables: Vec::new(),
+                schemas: Vec::new(),
+                publish: None,
+                via_partition_root: None,
+                new_value: Some(new_name),
+            });
+        }
+        if self.eat_keyword("owner") {
+            self.expect_keyword("to")?;
+            let new_owner = self.expect_ident()?;
+            return Ok(Stmt::AlterPublication {
+                name,
+                action: 'o',
+                all_tables: false,
+                all_sequences: false,
+                except_tables: Vec::new(),
+                tables: Vec::new(),
+                schemas: Vec::new(),
+                publish: None,
+                via_partition_root: None,
+                new_value: Some(new_owner),
+            });
+        }
+        if self.eat_keyword("set") {
+            if matches!(self.peek(), Token::LParen) {
+                // SET (publish = ...) — no WITH keyword in this form.
+                let (publish, via_partition_root) = self.parse_publication_options_body()?;
+                return Ok(Stmt::AlterPublication {
+                    name,
+                    action: 'p',
+                    all_tables: false,
+                    all_sequences: false,
+                    except_tables: Vec::new(),
+                    tables: Vec::new(),
+                    schemas: Vec::new(),
+                    publish,
+                    via_partition_root,
+                    new_value: None,
+                });
+            }
+            let (at, aseq, exc, tables, schemas) = self.parse_publication_spec()?;
+            return Ok(Stmt::AlterPublication {
+                name,
+                action: 's',
+                all_tables: at,
+                all_sequences: aseq,
+                except_tables: exc,
+                tables,
+                schemas,
+                publish: None,
+                via_partition_root: None,
+                new_value: None,
+            });
+        }
+        let action = if self.eat_keyword("add") {
+            'a'
+        } else if self.eat_keyword("drop") {
+            'd'
+        } else {
+            return Err(err(
+                "syntax error: expected ADD, DROP, SET, OWNER or RENAME after ALTER PUBLICATION"
+                    .to_string(),
+            ));
+        };
+        let (at, aseq, exc, tables, schemas) = self.parse_publication_spec()?;
+        Ok(Stmt::AlterPublication {
+            name,
+            action,
+            all_tables: at,
+            all_sequences: aseq,
+            except_tables: exc,
+            tables,
+            schemas,
+            publish: None,
+            via_partition_root: None,
+            new_value: None,
+        })
+    }
+
+    /// v2.02: the `(...)` body of publication options without the WITH
+    /// keyword (ALTER PUBLICATION ... SET (...)).
+    pub(crate) fn parse_publication_options_body(
+        &mut self,
+    ) -> Result<(Option<(bool, bool, bool, bool)>, Option<bool>), SqlError> {
+        // Reuse the WITH parser by stepping back over the '(' — the
+        // WITH parser expects to consume `with` first, so parse the
+        // parenthesised list directly here.
+        self.expect(Token::LParen, "'('")?;
+        let mut publish = None;
+        let mut via_root = None;
+        let mut seen_opts: std::collections::HashSet<String> = std::collections::HashSet::new();
+        loop {
+            let opt = self.expect_ident()?;
+            let mut val = String::new();
+            let mut has_value = false;
+            if matches!(self.peek(), Token::Eq) {
+                has_value = true;
+                self.next();
+                match self.next() {
+                    Token::Str(s) => val = s.to_string(),
+                    Token::Ident(s) => val = s.to_string(),
+                    Token::Number(n) => val = n.to_string(),
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: unexpected {:?} in publication options",
+                            other
+                        )));
+                    }
+                }
+            }
+            let (p, v) = Self::pub_option_checked(&opt, &val, has_value, &mut seen_opts)?;
+            if p.is_some() {
+                publish = p;
+            }
+            if v.is_some() {
+                via_root = v;
+            }
+            if !matches!(self.peek(), Token::Comma) {
+                break;
+            }
+            self.next();
+        }
+        self.expect(Token::RParen, "')'")?;
+        Ok((publish, via_root))
+    }
+
     /// v1.00: parse the statement list of a trigger-function body (see
     /// [`parse_trigger_body`]). The parser is positioned at the first
     /// token of the body; it must start with `BEGIN` and end with `END`.
@@ -5176,7 +5626,7 @@ impl Parser {
     /// v0.10: `WITH [RECURSIVE] name [(cols)] AS (select) [, ...]` followed
     /// by SELECT / INSERT / UPDATE / DELETE.
     pub(crate) fn parse_with(&mut self) -> Result<Stmt, SqlError> {
-        let (ctes, _recursive) = self.parse_cte_defs()?;
+        let (ctes, recursive) = self.parse_cte_defs()?;
         let kw = match self.next() {
             Token::Ident(kw) => kw,
             other => {
@@ -5216,6 +5666,22 @@ impl Parser {
                 }
                 Ok(stmt)
             }
+            "merge" => {
+                // PG19 parse_merge.c: WITH RECURSIVE over a MERGE
+                // main statement is a syntax error (42601), even when
+                // no CTE is actually recursive.
+                if recursive {
+                    return Err(err(
+                        "WITH RECURSIVE is not supported for MERGE statement".to_string()
+                    ));
+                }
+                let mut stmt = self.parse_merge()?;
+                match &mut stmt {
+                    Stmt::Merge { with, .. } => *with = ctes,
+                    _ => unreachable!(),
+                }
+                Ok(stmt)
+            }
             _ => Err(err(format!(
                 "syntax error: expected SELECT, INSERT, UPDATE or DELETE after WITH, found \"{}\"",
                 kw
@@ -5237,7 +5703,7 @@ impl Parser {
         // CTE, v0.59: `WITH v(x) AS (VALUES (1),(2)) SELECT ...`).
         // v1.39: or with a data-modifying statement — `WITH x AS
         // (INSERT/UPDATE/DELETE ... [RETURNING ...])` (PG19 parse_cte.c).
-        if matches!(self.peek(), Token::Ident(kw) if kw == "insert" || kw == "update" || kw == "delete")
+        if matches!(self.peek(), Token::Ident(kw) if kw == "insert" || kw == "update" || kw == "delete" || kw == "merge")
         {
             let kw = match self.next() {
                 Token::Ident(kw) => kw,
@@ -5247,6 +5713,7 @@ impl Parser {
                 "insert" => self.parse_insert()?,
                 "update" => self.parse_update()?,
                 "delete" => self.parse_delete()?,
+                "merge" => self.parse_merge()?,
                 _ => unreachable!("peeked DML keyword above"),
             };
             return Ok(CteBody::Dml(Box::new(stmt)));
@@ -9645,6 +10112,179 @@ impl Parser {
         })
     }
 
+    // --- v2.01: MERGE (PG19 gram.y MergeStmt) ----------------------------
+    // `MERGE INTO relation [AS] alias USING table_ref ON expr
+    //   { WHEN MATCHED [AND cond] THEN UPDATE SET ... | DELETE | DO NOTHING
+    //   | WHEN NOT MATCHED BY SOURCE [AND cond] THEN UPDATE/DELETE/DO NOTHING
+    //   | WHEN NOT MATCHED [BY TARGET] [AND cond] THEN INSERT ... | DO NOTHING }
+    //   [RETURNING ...]`. The leading MERGE keyword is already consumed.
+    // Kind/action pairing is enforced here, like gram.y: a mismatched
+    // action keyword is a 42601 at that keyword.
+    pub(crate) fn parse_merge(&mut self) -> Result<Stmt, SqlError> {
+        use crate::sql::{MergeAction, MergeMatchKind, MergeWhen};
+        self.expect_keyword("into")?;
+        let table = self.parse_table_name()?;
+        let alias = self.parse_alias_opt()?;
+        self.expect_keyword("using")?;
+        let source = self.parse_from()?;
+        self.expect_keyword("on")?;
+        let on = self.parse_or()?;
+        let mut whens: Vec<MergeWhen> = Vec::new();
+        while self.eat_keyword("when") {
+            let kind = if self.eat_keyword("not") {
+                self.expect_keyword("matched")?;
+                if self.eat_keyword("by") {
+                    if self.eat_keyword("source") {
+                        MergeMatchKind::NotMatchedBySource
+                    } else {
+                        self.expect_keyword("target")?;
+                        MergeMatchKind::NotMatchedByTarget
+                    }
+                } else {
+                    MergeMatchKind::NotMatchedByTarget
+                }
+            } else {
+                self.expect_keyword("matched")?;
+                MergeMatchKind::Matched
+            };
+            let condition = if self.eat_keyword("and") {
+                Some(self.parse_or()?)
+            } else {
+                None
+            };
+            self.expect_keyword("then")?;
+            let kw = self.peek_ident().unwrap_or("").to_string();
+            let action = match (kind, kw.as_str()) {
+                (_, "do") => {
+                    self.next();
+                    self.expect_keyword("nothing")?;
+                    MergeAction::DoNothing
+                }
+                (MergeMatchKind::NotMatchedByTarget, "insert") => {
+                    self.next();
+                    // PG19: `INSERT INTO ...` inside MERGE is a syntax
+                    // error at INTO.
+                    if self.peek_ident() == Some("into") {
+                        return Err(err("syntax error at or near \"into\"".to_string()));
+                    }
+                    let columns = if *self.peek() == Token::LParen {
+                        self.next();
+                        let mut cols = Vec::new();
+                        loop {
+                            cols.push(self.expect_ident()?);
+                            match self.next() {
+                                Token::Comma => continue,
+                                Token::RParen => break,
+                                other => {
+                                    return Err(err(format!(
+                                        "syntax error: expected ',' or ')', found {:?}",
+                                        other
+                                    )));
+                                }
+                            }
+                        }
+                        Some(cols)
+                    } else {
+                        None
+                    };
+                    if self.eat_keyword("overriding") {
+                        let _ = self.expect_ident()?; // SYSTEM | USER
+                        self.expect_keyword("value")?;
+                    }
+                    let values = if columns.is_none() && self.eat_keyword("default") {
+                        self.expect_keyword("values")?;
+                        None
+                    } else {
+                        self.expect_keyword("values")?;
+                        self.expect(Token::LParen, "'('")?;
+                        let mut vs = Vec::new();
+                        if *self.peek() != Token::RParen {
+                            loop {
+                                vs.push(self.parse_or()?);
+                                match self.next() {
+                                    Token::Comma => continue,
+                                    Token::RParen => break,
+                                    other => {
+                                        return Err(err(format!(
+                                            "syntax error: expected ',' or ')', found {:?}",
+                                            other
+                                        )));
+                                    }
+                                }
+                            }
+                        } else {
+                            self.next();
+                        }
+                        Some(vs)
+                    };
+                    MergeAction::Insert { columns, values }
+                }
+                (MergeMatchKind::Matched, "update")
+                | (MergeMatchKind::NotMatchedBySource, "update") => {
+                    self.next();
+                    self.expect_keyword("set")?;
+                    let mut sets = Vec::new();
+                    loop {
+                        let col = self.expect_ident()?;
+                        self.expect(Token::Eq, "'='")?;
+                        let expr = self.parse_or()?;
+                        sets.push((col, expr));
+                        if *self.peek() == Token::Comma {
+                            self.next();
+                            continue;
+                        }
+                        break;
+                    }
+                    MergeAction::Update { sets }
+                }
+                (MergeMatchKind::Matched, "delete")
+                | (MergeMatchKind::NotMatchedBySource, "delete") => {
+                    self.next();
+                    MergeAction::Delete
+                }
+                _ => {
+                    return Err(err(format!("syntax error at or near \"{}\"", kw)));
+                }
+            };
+            whens.push(MergeWhen {
+                kind,
+                condition,
+                action,
+            });
+        }
+        if whens.is_empty() {
+            return Err(err(
+                "syntax error: MERGE requires at least one WHEN clause".to_string()
+            ));
+        }
+        // PG19 parse analysis: a WHEN clause of a kind that follows an
+        // unconditional WHEN clause of the same kind can never fire.
+        {
+            let mut seen_uncond: Vec<MergeMatchKind> = Vec::new();
+            for w in &whens {
+                if seen_uncond.contains(&w.kind) {
+                    return Err(err(
+                        "unreachable WHEN clause specified after unconditional WHEN clause"
+                            .to_string(),
+                    ));
+                }
+                if w.condition.is_none() {
+                    seen_uncond.push(w.kind);
+                }
+            }
+        }
+        let returning = self.parse_returning()?;
+        Ok(Stmt::Merge {
+            table,
+            alias,
+            source,
+            on,
+            whens,
+            returning,
+            with: Vec::new(),
+        })
+    }
+
     pub(crate) fn parse_delete(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("from")?;
         let table = self.expect_ident()?;
@@ -11783,6 +12423,25 @@ impl Parser {
                 if_exists,
                 cascade,
             });
+        }
+        // v2.02: DROP PUBLICATION [IF EXISTS] name [, ...] [CASCADE|RESTRICT].
+        if self.eat_keyword("publication") {
+            let if_exists = if self.eat_keyword("if") {
+                self.expect_keyword("exists")?;
+                true
+            } else {
+                false
+            };
+            let mut names = Vec::new();
+            loop {
+                names.push(self.expect_ident()?);
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.next();
+            }
+            let _ = self.parse_cascade_opt()?;
+            return Ok(Stmt::DropPublication { names, if_exists });
         }
         // v1.96: DROP SCHEMA [IF EXISTS] name [, ...] [CASCADE|RESTRICT].
         if self.eat_keyword("schema") {

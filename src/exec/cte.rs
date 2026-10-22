@@ -30,8 +30,21 @@ pub(crate) fn eval_cte(q: &mut Q, cte: &CteDef) -> Result<CteBinding, ExecError>
         // inside the DML body fails closed (42P01) via the existing
         // name resolution, which only sees the outer query's bindings.
         CteBody::Dml(stmt) => {
+            // PG19: a data-modifying CTE executes even when never
+            // referenced, but REFERENCING one that has no RETURNING
+            // clause is 0A000 (parse_relation.c). Record the fact on
+            // the binding; the FROM reference site raises the error.
+            let has_returning = match &**stmt {
+                Stmt::Insert { returning, .. }
+                | Stmt::Update { returning, .. }
+                | Stmt::Delete { returning, .. }
+                | Stmt::Merge { returning, .. } => !returning.is_empty(),
+                _ => true,
+            };
             let out = run_nested_dml(q, stmt, &format!("CTE \"{}\"", cte.name))?;
-            cte_binding(cte, out.columns, out.rows)
+            let mut binding = cte_binding(cte, out.columns, out.rows)?;
+            binding.dml_no_returning = !has_returning;
+            Ok(binding)
         }
     }
 }
@@ -65,6 +78,7 @@ pub(crate) fn cte_binding(
         name: cte.name.clone(),
         schema,
         rows,
+        dml_no_returning: false,
     })
 }
 
@@ -156,6 +170,7 @@ pub(crate) fn eval_recursive_cte(
             name: cte.name.clone(),
             schema: binding.schema.clone(),
             rows: working,
+            dml_no_returning: false,
         }));
         let delta = run_select(q, right, &[]);
         q.ctes.pop();

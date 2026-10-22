@@ -731,6 +731,31 @@ pub(crate) fn describe_cte_dml(
                 .0)
             }
         }
+        Stmt::Merge {
+            table,
+            alias,
+            source,
+            returning,
+            with,
+            ..
+        } => {
+            if returning.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(describe_merge_returning(
+                    eng,
+                    snap,
+                    own,
+                    session,
+                    table,
+                    alias.as_deref(),
+                    source,
+                    with,
+                    returning,
+                )?
+                .0)
+            }
+        }
         _ => Err(exec_err(
             "0A000",
             "data-modifying CTE body must be INSERT, UPDATE, or DELETE",

@@ -1,8 +1,8 @@
 // v1.99: EXPLAIN of DML — generalize the v1.98 EXPLAIN analysis pass
 // beyond SELECT (scope: hidden_files/v199/scope.md; PG19 gram.y
 // ExplainableStmt = Select | Insert | Update | Delete | DeclareCursor |
-// CreateAs | CreateMatView | RefreshMatView | Execute; MERGE is absent
-// because the engine has no MERGE statement at all).
+// CreateAs | CreateMatView | RefreshMatView | Execute).
+// v2.01: MergeStmt joins the set (vx_merge + Merge ModifyTable plans).
 //
 // Three layers, mirroring the SELECT path:
 //  1. `validate_explain_stmt` — static analysis in PG19's shape: target
@@ -122,6 +122,25 @@ pub(crate) fn validate_explain_stmt(
             where_.as_ref(),
             with,
             returning,
+        ),
+        Stmt::Merge {
+            table,
+            alias,
+            source,
+            on,
+            whens,
+            returning,
+            with,
+        } => vx_merge(
+            q,
+            ctx,
+            table,
+            alias.as_deref(),
+            source,
+            on,
+            whens,
+            returning,
+            with,
         ),
         Stmt::CreateTableAs { select, .. } => validate_explain_select(q, select),
         Stmt::Declare { query, .. } => validate_explain_select(q, query),
@@ -589,6 +608,180 @@ fn vx_delete(
     Ok(())
 }
 
+/// v2.01: EXPLAIN analysis for MERGE — mirrors exec_merge's own checks
+/// (privileges in executor order, SET/INSERT column existence and
+/// duplicates, target-in-source), then resolves every expression
+/// position over a synthesized SELECT level (target + source ranges,
+/// ON as the level's WHERE). RETURNING items that use the PG17-only
+/// merge_action()/old/new forms are skipped here (their resolution is
+/// the executor's describe path, which EXPLAIN ANALYZE exercises by
+/// executing).
+#[allow(clippy::too_many_arguments)]
+fn vx_merge(
+    q: &mut Q,
+    ctx: &StmtCtx,
+    table: &str,
+    alias: Option<&str>,
+    source: &[FromItem],
+    on: &Expr,
+    whens: &[MergeWhen],
+    returning: &[SelectItem],
+    with: &[CteDef],
+) -> Result<(), ExecError> {
+    let meta = TableMeta::of(dml_target(q, table)?);
+    if whens
+        .iter()
+        .any(|w| matches!(w.action, MergeAction::Delete))
+    {
+        require_table_priv(&*q.eng, ctx, table, crate::storage::PRIV_DELETE, "DELETE")?;
+    }
+    for w in whens {
+        match &w.action {
+            MergeAction::Update { sets } => {
+                require_column_privs(
+                    &*q.eng,
+                    ctx,
+                    table,
+                    &sets.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                    crate::storage::PRIV_UPDATE,
+                    "UPDATE",
+                )?;
+                let mut seen = std::collections::HashSet::new();
+                for (name, _) in sets {
+                    if !seen.insert(name) {
+                        return Err(exec_err(
+                            "42701",
+                            format!("multiple assignments to same column \"{}\"", name),
+                        ));
+                    }
+                    if meta.column_index(name).is_none() {
+                        return Err(exec_err(
+                            "42703",
+                            format!(
+                                "column \"{}\" of relation \"{}\" does not exist",
+                                name, table
+                            ),
+                        ));
+                    }
+                }
+            }
+            MergeAction::Insert { columns, .. } => {
+                if let Some(cols) = columns {
+                    require_column_privs(
+                        &*q.eng,
+                        ctx,
+                        table,
+                        cols,
+                        crate::storage::PRIV_INSERT,
+                        "INSERT",
+                    )?;
+                    for c in cols {
+                        if meta.column_index(c).is_none() {
+                            return Err(exec_err(
+                                "42703",
+                                format!(
+                                    "column \"{}\" of relation \"{}\" does not exist",
+                                    c, table
+                                ),
+                            ));
+                        }
+                    }
+                } else {
+                    require_table_priv(&*q.eng, ctx, table, crate::storage::PRIV_INSERT, "INSERT")?;
+                }
+            }
+            _ => {}
+        }
+    }
+    {
+        let mut exprs: Vec<&Expr> = vec![on];
+        for w in whens {
+            if let Some(c) = &w.condition {
+                exprs.push(c);
+            }
+            if let MergeAction::Update { sets } = &w.action {
+                exprs.extend(sets.iter().map(|(_, e)| e));
+            }
+        }
+        exprs.extend(returning.iter().filter_map(|i| match i {
+            SelectItem::Expr { expr, .. } => Some(expr),
+            _ => None,
+        }));
+        check_dml_read_cols(&*q.eng, ctx, table, alias, &exprs, &[])?;
+    }
+    // Target in source (mirrors exec_merge).
+    {
+        fn collect_table_names(item: &FromItem, out: &mut Vec<String>) {
+            match item {
+                FromItem::Table { name, .. } => {
+                    out.push(name.rsplit('.').next().unwrap_or(name).to_string());
+                }
+                FromItem::Join { left, right, .. } => {
+                    collect_table_names(left, out);
+                    collect_table_names(right, out);
+                }
+                _ => {}
+            }
+        }
+        let target = table.rsplit('.').next().unwrap_or(table);
+        let mut names = Vec::new();
+        for item in source {
+            collect_table_names(item, &mut names);
+        }
+        for n in names {
+            if n.eq_ignore_ascii_case(target) {
+                return Err(exec_err(
+                    "42712",
+                    format!("name \"{}\" specified more than once", target),
+                ));
+            }
+        }
+    }
+    vx_cte_defs(q, ctx, with)?;
+    let mut synth = scan_select(table, alias, source, Some(on), with);
+    let mut items: Vec<SelectItem> = Vec::new();
+    for w in whens {
+        if let MergeAction::Update { sets } = &w.action {
+            items.extend(sets.iter().map(|(_, e)| SelectItem::Expr {
+                expr: e.clone(),
+                alias: None,
+            }));
+        }
+        if let Some(c) = &w.condition {
+            items.push(SelectItem::Expr {
+                expr: c.clone(),
+                alias: None,
+            });
+        }
+        if let MergeAction::Insert { values, .. } = &w.action {
+            if let Some(vs) = values {
+                items.extend(vs.iter().map(|e| SelectItem::Expr {
+                    expr: e.clone(),
+                    alias: None,
+                }));
+            }
+        }
+    }
+    for item in returning {
+        if let SelectItem::Expr { expr, .. } = item {
+            // Skip PG17 RETURNING-only forms (merge_action / old / new).
+            let mut refs: Vec<(Option<String>, String)> = Vec::new();
+            crate::sql::collect_col_refs(expr, &mut refs);
+            let special = refs.iter().any(|(q, n)| {
+                q.as_deref() == Some("old")
+                    || q.as_deref() == Some("new")
+                    || (q.is_none() && (n == "old" || n == "new"))
+            }) || matches!(expr, Expr::Func { name, .. } if name.eq_ignore_ascii_case("merge_action"));
+            if !special {
+                items.push(item.clone());
+            }
+        }
+    }
+    synth.items = items;
+    validate_explain_select(q, &synth)?;
+    Ok(())
+}
+
 /// The scan shape of an UPDATE/DELETE as a SELECT level: the target
 /// relation (under its alias) followed by the FROM/USING items, with
 /// the statement's WHERE and WITH. Used both for validation scopes
@@ -962,6 +1155,26 @@ pub(crate) fn explain_dml_plan(
             verbose,
             &mut out,
         )?,
+        Stmt::Merge {
+            table,
+            alias,
+            source,
+            on,
+            with,
+            ..
+        } => scan_dml_plan(
+            eng,
+            ctx,
+            "Merge",
+            table,
+            alias.as_deref(),
+            source,
+            Some(on),
+            with,
+            costs,
+            verbose,
+            &mut out,
+        )?,
         Stmt::CreateTableAs {
             name,
             select,
@@ -1300,6 +1513,36 @@ pub(crate) fn exec_explain_dml_analyze(
             let affected = affected_of(&res);
             out.push(format!(
                 "Delete on {table} (actual rows={:.2} loops=1)",
+                affected as f64
+            ));
+            let ax = dml_ax(eng, ctx, affected);
+            render_analyze(&plan, &ax, 1, None, true, &mut out);
+        }
+        Stmt::Merge {
+            table,
+            alias,
+            source,
+            on,
+            whens,
+            returning,
+            with,
+        } => {
+            let mut synth = scan_select(table, alias.as_deref(), source, Some(on), with);
+            synth.items = vec![SelectItem::All];
+            let plan = plan_select(
+                eng,
+                &synth,
+                ctx.snap,
+                ctx.own,
+                ctx.session,
+                &[],
+                !costs,
+                false,
+            )?;
+            let res = exec_merge(eng, ctx, table, alias, source, on, whens, returning, with)?;
+            let affected = affected_of(&res);
+            out.push(format!(
+                "Merge on {table} (actual rows={:.2} loops=1)",
                 affected as f64
             ));
             let ax = dml_ax(eng, ctx, affected);

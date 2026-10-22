@@ -31,7 +31,7 @@ statement instead of once per row.
 
 ### Measurement (after fix)
 
-Same harness (`benches/profile_rls.py --rows 3000 --iters 40`), same
+Same harness (`benches/profile_rls_update.py --rows 3000 --iters 40`), same
 workload, same machine, same session.
 
 Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes`,
@@ -87,7 +87,7 @@ per-statement-invariant "does RLS apply" and "which policies apply"
 computation out of its row loop — but `rls_visible_q`, the UPDATE/
 DELETE target-visibility check in dml.rs (used at two call sites, the
 UPDATE and DELETE target-collection loops), calls it fresh on every
-candidate row. `benches/profile_rls.py` (new) seeds a 3,000-row
+candidate row. `benches/profile_rls_update.py` (new) seeds a 3,000-row
 multi-tenant `orders`-shaped table, enables RLS with the textbook
 `USING (tenant_id = $N) WITH CHECK (tenant_id = $N)` tenant-isolation
 policy, switches to a non-owner, non-superuser role (`SET SESSION
@@ -101,7 +101,7 @@ Reproduce:
 ```bash
 cargo build
 RUSTGRES_DATA_DIR=$(mktemp -d) valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out --collect-jumps=yes --cache-sim=yes ./target/debug/rustgres &
-python3 benches/profile_rls.py --rows 3000 --iters 40 --timeout 1800
+python3 benches/profile_rls_update.py --rows 3000 --iters 40 --timeout 1800
 # SIGTERM the server to flush, then:
 callgrind_annotate --auto=no --inclusive=yes --threshold=100 /tmp/cg.out | head -60
 ```
@@ -154,6 +154,157 @@ rowsecurity+test_setup cases).
 Before profiles committed:
 `benches/profiles/callgrind.out.rls-base-2026-10-18`,
 `benches/profiles/dhat.out.rls-base-2026-10-18`.
+
+## Bolt: MERGE's FK self-reference check reorders every new row once per action sharing its destination (O(actions^2)) — fix — 2026-10-22
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec/merge.rs`'s FK-child-check loop (the one right after
+`new_by_dst` is built) used to call, for *every* planned action `a`:
+
+```rust
+let self_new: Vec<Row> = new_by_dst.get(dst).cloned().unwrap_or_default()
+    .iter().map(|r| Row::new(reorder_row(&columns, &lc, &r.to_vec()))).collect();
+```
+
+`new_by_dst[dst]` is the full list of every other new row headed to
+the same destination table — it does not depend on which action `a`
+is being checked, only on `dst`. But this line recomputed it (via
+`reorder_row`, which builds a fresh `HashMap<&str, usize>` from
+scratch to do the column reorder) inside the per-action loop, so a
+MERGE with N planned actions against one destination paid N calls to
+reorder N rows each — O(N²) `reorder_row` calls — even though every
+one of those N×N reorders produces exactly the same per-destination
+answer. A plain upsert MERGE (`WHEN MATCHED THEN UPDATE ... WHEN NOT
+MATCHED THEN INSERT`) sends every action to the same destination, so
+this is the common case, not an edge case — and it fires whether or
+not the destination table has any foreign keys at all, since the
+reorder happens before `check_fk_child_row` gets a chance to see its
+FK list is empty.
+
+The fix hoists the reorder to run once per distinct destination
+(there is usually exactly one), building `self_new_by_dst: HashMap<&str,
+Vec<Row>>` before the per-action loop, then having each action borrow
+its destination's already-reordered list instead of rebuilding it.
+`check_fk_child_row` already takes `self_new: &[Row]`, so this is a
+borrow, not a clone — no behavior changes, only how many times the
+identical reorder work happens. `src/exec/dml.rs::reorder_row` itself
+is untouched.
+
+### Verification
+
+`cargo test --all-features`: 1106/1106 passed, unchanged (same count
+as the pre-fix tree, includes `src/exec/test_mods/v201_merge_tests.rs`).
+`cargo fmt --all -- --check`: clean. `cargo clippy --all-targets
+--all-features -- -D warnings`: 974 pre-existing errors on both trees
+(confirmed via `git stash`; documented toolchain/lint-version
+mismatch), none in the changed lines of `merge.rs` — zero net new.
+
+Direct behavior check beyond the counter-preservation argument: ran a
+MERGE that inserts two rows in the same statement where one's FK
+column references the other's primary key (`stg(id=2, mgr_id=3)` and
+`stg(id=3, mgr_id=1)` merged into `emp` in one statement) — succeeds
+on both the pre-fix and post-fix tree, proving `self_new`'s
+same-statement cross-reference semantics survived the refactor
+unchanged. A MERGE inserting a row whose FK column references neither
+a committed row nor another new row in the same statement still fails
+with `23503` on both trees.
+
+### Measurement
+
+Same harness (`benches/profile_merge.py --count 10 --rows 300`), same
+workload, same machine, same session.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes`):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total `Ir` | 34,675,477,617 | 13,340,042,392 | **-61.53%** |
+| `reorder_row` inclusive `Ir` | 18,816,732,060 (54.27% of total) | 302,362,414 (2.27% of new total) | **-98.39%** |
+| `reorder_row` self `Ir` | 53,790,300 | 867,300 | -98.39% |
+
+The total-`Ir` reduction (21,335,435,225) is dominated by
+`reorder_row`'s own inclusive-`Ir` reduction (18,514,369,646) — over
+86% of the whole program's saving is exactly where the hypothesis said
+it would be. The remainder comes from the smaller, same-shaped
+per-action `lc`/`dst_meta`/`leaf_row` recomputation this change did
+not touch, now running against a program with a much smaller total to
+be a percentage of.
+
+The -61.53% total-`Ir` delta clears the ≥5%-of-profile floor by more
+than 12x.
+
+Before/after profiles committed:
+`benches/profiles/callgrind.out.mergefkselfnew-{base,after}-2026-10-22`.
+
+**Reproduce**: check out the parent (baseline) commit, `cargo build`,
+repeat the baseline entry's "Reproduce" command for the before
+numbers; check out this commit, `cargo build`, repeat for the after
+numbers.
+
+## Bolt: MERGE's FK self-reference check reorders every new row once per action sharing its destination (O(actions^2)) — baseline — 2026-10-22
+
+**Why this workload**: v2.01 added MERGE (`src/exec/merge.rs`, 1939
+lines) and no prior Bolt round has profiled it. `benches/profile_merge.py`
+(new, this round) drives a textbook CDC/ETL upsert over the real wire
+protocol: a 300-row staging table is repeatedly `MERGE INTO`'d into a
+target table on an equality join (`t.id = s.id`) with `WHEN MATCHED
+THEN UPDATE` / `WHEN NOT MATCHED THEN INSERT` — the first of 10
+iterations is a cold all-INSERT pass, the other 9 are steady-state
+all-UPDATE passes, both phases a real sync job hits.
+
+Reproduce:
+```bash
+cargo build
+RUSTGRES_DATA_DIR=$(mktemp -d) valgrind --tool=callgrind \
+  --callgrind-out-file=/tmp/cg.out --collect-jumps=yes --cache-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_merge.py --count 10 --rows 300 --timeout 600
+# SIGTERM the valgrind-wrapped server pid to flush, then:
+callgrind_annotate --auto=no --inclusive=yes --threshold=100 /tmp/cg.out | head -40
+```
+
+📈 **Profile** (Callgrind, valgrind 3.22.0, current HEAD v2.01):
+**34,675,477,617** total `Ir`.
+
+| symbol (inclusive `Ir`) | Ir | % of total |
+|---|---|---|
+| `src/exec/merge.rs::exec_merge` | 34,499,843,331 | **99.49%** |
+| ⤷ `src/exec/dml.rs::reorder_row` (called from inside `exec_merge`'s FK-check loop) | 18,816,732,060 | **54.27%** |
+| ⤷⤷ `core::hash::sip::Sip13Rounds` family (siphashing the `HashMap<&str, usize>` `reorder_row` builds fresh every call) | ~3,000,000,000 | ~8.6% |
+| `src/exec/eval.rs::eval_dml_expr`/`eval_update_expr` (the ON/SET/condition evaluation itself) | 8,956,106,107 | 25.83% |
+
+Comfortably past the 5%-of-profile floor: a single helper
+(`reorder_row`, meant to remap a handful of column values between
+parent and leaf column order) accounts for over half of total program
+instructions for this workload.
+
+💡 **Hypothesis**: `reorder_row` (`src/exec/dml.rs:3466`) builds a
+fresh `HashMap<&str, usize>` from the destination's column names on
+every call just to look up a handful of positions — expensive on its
+own (hence the siphashing), but tolerable if called O(rows) times.
+Grepping `exec_merge`'s FK-child-check loop shows it being called
+*inside* a `for a in &acts` loop, on a list (`new_by_dst[dst]`) that
+every action sharing a destination gets the identical answer for —
+i.e. it is being recomputed from scratch by every one of the N actions
+touching that destination, for a destination with N actions, which is
+O(N²) `reorder_row` calls total. A plain MERGE upsert sends every
+row to one destination table, so N here is "rows touched by the
+statement" — exactly what this workload's 300-row MERGE drives.
+Hoisting the reorder to run once per destination (there is normally
+only one) turns this into O(N).
+
+`cargo test --all-features`: 1106/1106 passed. `cargo fmt --all --
+--check`: clean.
+
+Before profile committed:
+`benches/profiles/callgrind.out.mergefkselfnew-base-2026-10-22`.
+
+**Reproduce the exact number**: check out this commit, `cargo build`,
+repeat the Reproduce command above.
 
 ## Bolt: `wal::encoding::CRC32_TABLE` is a `const`, so every byte of every WAL commit frame re-copies the whole 1024-byte table before indexing it — fix — 2026-10-21
 
@@ -297,6 +448,63 @@ Before profile committed:
 
 **Reproduce the exact number**: check out this commit, `cargo build`,
 repeat the Reproduce command above.
+
+## Bolt: row-level security INSERT-path overhead — negative result — 2026-10-20
+
+No prior Bolt round in this repo had profiled the row-level-security
+path (`src/exec/rls.rs`, added in v1.95). RLS runs on every row of
+every INSERT/UPDATE/DELETE/SELECT once `ENABLE ROW LEVEL SECURITY` +
+a policy are in place, so `benches/profile_rls.py` (new, this round)
+drives a realistic multi-tenant shape: `bench_rls(id, tenant_id,
+body)` with `FORCE ROW LEVEL SECURITY` and one `tenant_id = 1`
+USING/WITH CHECK policy, loaded via 20 autocommit 500-row multi-VALUES
+`INSERT`s (10,000 rows total) over the real wire protocol.
+
+**Hypothesis investigated and falsified**: `rls_check_new_row_ctx`
+builds a fresh `Q` per row (4 `Rc::new(RefCell::new(...))` heap
+allocations) and `applicable_policies` recomputes `role_closure` (a
+`Vec<String>` role-membership BFS, allocating a `String` + `Vec` per
+call) on every row even though the role is constant for the whole
+statement; `rls_check_new_row_ctx` also calls `rls_applies` itself and
+then calls `rls_check_new_row`, which calls `rls_applies` again with
+the same arguments — a genuine redundant call, once per row.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes`),
+current HEAD (v1.98): **1,172,565,027** total `Ir` for the 10,000-row
+workload.
+
+| symbol (inclusive `Ir`) | Ir | % of total |
+|---|---|---|
+| `exec::dml::exec_insert` (non-RLS insert machinery) | 528,631,211 | 45.08% |
+| `exec::rls::rls_check_new_row_ctx` (whole per-row RLS WITH CHECK path) | 16,600,000 | **1.42%** |
+| ⤷ `exec::rls::rls_applies` (called 2x/row) | 15,570,000 | 1.33% |
+| ⤷ `storage::role_closure` | 51,212 | 0.004% |
+
+The whole RLS path, including the redundant double `rls_applies()`
+call and the per-row `role_closure` recomputation, is **1.42%** of
+total `Ir` — below the 5%-of-profile floor. Even eliminating all of it
+(impossible; the check is semantically required) would not clear the
+floor; removing just the redundant call would save at most ~1.33%
+(likely less), still below floor. The other 98.6% of total `Ir` is
+inherent, non-RLS `exec_insert` cost already targeted by prior Bolt
+rounds (`WriteOp` log, `compress_pglz`, `tokenize` buffer growth,
+WAL CRC32, etc.).
+
+No fix shipped. Recording this so a future round doesn't re-spend a
+profiling cycle on the same hypothesis against a similar RLS shape.
+Full writeup: https://github.com/madmax983/rustgres/issues/56
+
+**Reproduce**:
+```bash
+cargo build
+RUSTGRES_DATA_DIR=$(mktemp -d) valgrind --tool=callgrind \
+  --callgrind-out-file=/tmp/cg_rls.out --collect-jumps=yes --cache-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_rls.py --count 20 --rows 500 --timeout 600
+# SIGTERM the real valgrind.bin PID (not a wrapper/shell pid) to flush:
+kill -TERM "$(pgrep -f 'valgrind --tool=callgrind')"
+callgrind_annotate --auto=no --inclusive=yes /tmp/cg_rls.out | grep -i rls
+```
 
 ## Bolt: `est_heap_pages` computes 291 real tuple lengths it then discards — fix — 2026-10-19
 

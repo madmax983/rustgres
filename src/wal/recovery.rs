@@ -1779,6 +1779,12 @@ pub fn records_for_commit(
             WriteOp::CreateCast { .. } => {
                 // v1.91: no local increment (see CreateType arm note).
             }
+            // v2.02: publication DDL is likewise NOT WAL-logged:
+            // publications are an in-memory catalog and do not survive
+            // restart (documented hold-back on the v2.02 guard).
+            WriteOp::CreatePublication { .. }
+            | WriteOp::DropPublication { .. }
+            | WriteOp::AlterPublication { .. } => {}
             WriteOp::CreateIndex { name } => {
                 let Some(ix) = eng.db.indexes.get(name) else {
                     i += 1;

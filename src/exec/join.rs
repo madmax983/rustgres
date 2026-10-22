@@ -2335,6 +2335,14 @@ pub(crate) fn build_source(
             };
             // v0.10: CTEs shadow everything (like Postgres).
             if let Some(b) = q.ctes.iter().rev().find(|b| b.name == *name) {
+                // v2.01 (PG19 parse_relation.c): referencing a
+                // data-modifying CTE that has no RETURNING clause.
+                if b.dml_no_returning {
+                    return Err(exec_err(
+                        "0A000",
+                        format!("WITH query \"{}\" does not have a RETURNING clause", b.name),
+                    ));
+                }
                 let schema: Vec<QCol> = b
                     .schema
                     .iter()

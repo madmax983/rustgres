@@ -181,6 +181,56 @@ pub(crate) fn execute_inner(
         Stmt::AlterDatabaseOwner { name, new_owner } => {
             exec_alter_database_owner(eng, ctx, name, new_owner)
         }
+        // v2.02: publication DDL (runtime catalog; see publication.rs).
+        Stmt::CreatePublication {
+            name,
+            all_tables,
+            all_sequences,
+            except_tables,
+            tables,
+            schemas,
+            publish,
+            via_partition_root,
+        } => exec_create_publication(
+            eng,
+            ctx,
+            name,
+            *all_tables,
+            *all_sequences,
+            except_tables,
+            tables,
+            schemas,
+            publish,
+            via_partition_root,
+        ),
+        Stmt::DropPublication { names, if_exists } => {
+            exec_drop_publication(eng, ctx, names, *if_exists)
+        }
+        Stmt::AlterPublication {
+            name,
+            action,
+            all_tables,
+            all_sequences,
+            except_tables,
+            tables,
+            schemas,
+            publish,
+            via_partition_root,
+            new_value,
+        } => exec_alter_publication(
+            eng,
+            ctx,
+            name,
+            *action,
+            *all_tables,
+            *all_sequences,
+            except_tables,
+            tables,
+            schemas,
+            publish,
+            via_partition_root,
+            new_value,
+        ),
         // v1.96: schema / maintenance / aggregate statement surface.
         Stmt::CreateSchema {
             name,
@@ -701,6 +751,15 @@ pub(crate) fn execute_inner(
             with,
             returning,
         } => exec_delete(eng, ctx, table, alias, using, where_, with, returning),
+        Stmt::Merge {
+            table,
+            alias,
+            source,
+            on,
+            whens,
+            returning,
+            with,
+        } => exec_merge(eng, ctx, table, alias, source, on, whens, returning, with),
         // v0.16: TRUNCATE is executor-level (transactional row removal).
         Stmt::Truncate {
             tables,
