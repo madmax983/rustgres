@@ -245,6 +245,17 @@ fn parse_csv_rows(
     // Whether the current field was quoted (for NULL detection).
     let mut field_quoted = false;
 
+    // Plain (untransformed) bytes between `run_start` and `i` belong to the
+    // current field but have not yet been copied into `field`: most bytes
+    // (ordinary field text) never need special handling, so they are left
+    // in place in `data` and copied into `field` with one `extend_from_slice`
+    // per run instead of one `push` per byte. `field_start` marks where the
+    // current field began, for the "is this the first byte of the field"
+    // check a leading quote needs (equivalent to the old `field.is_empty()`,
+    // which no longer reflects unflushed run bytes).
+    let mut run_start = 0;
+    let mut field_start = 0;
+
     macro_rules! end_field {
         () => {{
             // `replace` both reads the flag and resets it for the next
@@ -278,30 +289,48 @@ fn parse_csv_rows(
     let skip_header = options.header;
     let mut rows_skipped = 0;
 
+    macro_rules! flush_run {
+        () => {
+            if run_start < i {
+                field.extend_from_slice(&data[run_start..i]);
+            }
+        };
+    }
+
     while i < data.len() {
         let b = data[i];
         if in_quotes {
             if b == options.escape && i + 1 < data.len() && data[i + 1] == options.quote {
                 // Escaped quote ("").
+                flush_run!();
                 field.push(options.quote);
                 i += 2;
+                run_start = i;
                 continue;
             }
             if b == options.quote {
+                flush_run!();
                 in_quotes = false;
                 i += 1;
+                run_start = i;
                 continue;
             }
-            field.push(b);
+            // Plain byte inside quotes: part of the current run, copied in
+            // bulk at the next flush point instead of pushed individually.
             i += 1;
-        } else if b == options.quote && field.is_empty() {
+        } else if b == options.quote && i == field_start {
             in_quotes = true;
             field_quoted = true;
             i += 1;
+            run_start = i;
         } else if b == options.delimiter {
+            flush_run!();
             end_field!();
             i += 1;
+            field_start = i;
+            run_start = i;
         } else if b == b'\n' {
+            flush_run!();
             end_row!();
             if skip_header && rows_skipped == 0 && !rows.is_empty() {
                 rows.pop();
@@ -309,16 +338,19 @@ fn parse_csv_rows(
             }
             lineno += 1;
             i += 1;
+            field_start = i;
+            run_start = i;
         } else if b == b'\r' {
             // Allow \r\n; a bare \r is data.
             if i + 1 < data.len() && data[i + 1] == b'\n' {
+                flush_run!();
                 i += 1; // the \n arm handles it
+                run_start = i;
             } else {
-                field.push(b);
                 i += 1;
             }
         } else {
-            field.push(b);
+            // Plain byte: part of the current run.
             i += 1;
         }
     }
@@ -326,6 +358,7 @@ fn parse_csv_rows(
         return Err(CopyParseError::at(lineno, "unterminated quoted field"));
     }
     // Trailing field/row without a newline.
+    flush_run!();
     if !field.is_empty() || !row.is_empty() || field_quoted {
         end_row!();
         if skip_header && rows_skipped == 0 {

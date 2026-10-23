@@ -2,6 +2,150 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `parse_csv_rows` copies every unescaped field byte with its own `Vec::push` call — fix — 2026-10-23
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/copy.rs::parse_csv_rows` built each field's bytes into a `Vec<u8>`
+one byte at a time: the "plain data byte" arm (`else { field.push(b);
+i += 1; }`, hit on almost every byte of almost every unquoted field —
+CSV only needs to special-case the quote/delimiter/newline/escape
+bytes, not every character) and the matching arm inside `in_quotes`
+each called `Vec::push` per byte. Each `push` pays its own capacity
+check, and the field buffer starts at 0 capacity after every
+`std::mem::take` in `end_field!`, so it also re-grows from scratch for
+every field.
+
+The fix tracks a `run_start` index into `data` for the span of bytes
+since the last transformation point (entering/leaving quotes, an
+escaped `""`, or the end of the field) and copies that whole span into
+`field` with one `extend_from_slice` at each transformation point,
+instead of pushing every byte individually. The `field.is_empty()`
+check that used to gate "does a leading quote start a quoted field"
+no longer reflects unflushed run bytes, so it is replaced by `i ==
+field_start` (`field_start` marks where the current field began) —
+exactly equivalent, since both are true iff zero bytes of the current
+field have been consumed yet, quoted or not. No other behavior
+changes: the same bytes end up in `field` in the same order, through
+the same quote/escape/NULL/row-count logic.
+
+### Verification
+
+`cargo test --all-features`: 1110/1110 passed, unchanged. `cargo fmt
+--all -- --check`: clean. `cargo clippy --all-targets --all-features
+-- -D warnings`: 979 pre-existing errors on both trees (confirmed via
+`git stash`), none in the changed lines of `copy.rs` — zero net new.
+
+Direct behavior check beyond the counter-preservation argument: the
+vendored PG19 `copy`/`copy2` regression suites (DOS/Unix/Mac line
+endings, backslash-vs-quote escaping interactions, NULL markers,
+header skip, column-count mismatches) score identically before and
+after — `copy PASS=110 RF=79`, `copy2 PASS=185 RF=108` on both trees
+(`python3 tests/conformance/schedule_runner.py --tests copy,copy2`).
+`tests/protocol_test10.py` (18 COPY-specific wire-protocol cases,
+including `copy-from-csv`, `copy-from-csv-rows`, NULL handling, and
+bad-data rollback) and the full `protocol_test17.py` suite pass
+unchanged.
+
+### Measurement
+
+Same harness (`benches/profile_copy.py --count 20 --rows 2000`), same
+workload, same machine, same session.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes`):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total `Ir` | 4,747,039,891 | 4,378,197,516 | **-7.77%** |
+| `parse_csv_rows` inclusive `Ir` | 1,093,562,203 (23.04% of total) | 705,736,704 (16.12% of new total) | **-35.46%** |
+| per-byte `field.push(b)` call sites (plain + in-quotes) | 528,907,493 (11.15% of total) | *(no longer a separately-attributed symbol — below the `--threshold=100` display floor)* | gone |
+
+`parse_csv_rows`'s own instruction count dropped more than a third,
+and the two call sites that used to drive a quarter of its cost
+(individual `Vec<u8>::push` calls, 466,939,092 Ir at 7,916,680 calls
+for the plain-byte arm alone) no longer show up as a cost at all —
+their work is now folded into a handful of `extend_from_slice` calls
+per field. The remaining `parse_csv_rows` cost is UTF-8 validation
+(`String::from_utf8`) and the per-row/per-field `Vec` bookkeeping,
+both inherent to the format.
+
+The -35.46% delta on a target that was 23.04% of the profile clears
+the impact floor (≥5% reduction on a ≥5%-of-profile target) by a wide
+margin.
+
+Before/after profiles committed:
+`benches/profiles/callgrind.out.copycsv-{base,after}-2026-10-23`.
+
+**Reproduce**: check out the parent (baseline) commit, `cargo build`,
+repeat the baseline entry's "Reproduce" command for the before
+numbers; check out this commit, `cargo build`, repeat for the after
+numbers.
+
+## Bolt: `parse_csv_rows` copies every unescaped field byte with its own `Vec::push` call — baseline — 2026-10-23
+
+**Why this workload**: `benches/profile_copy.py` (committed earlier,
+unused by any prior Bolt round per `benches/BASELINE.md`) drives `COPY
+... FROM STDIN WITH (FORMAT csv)` over the real wire protocol — one of
+the most common ways data enters a Postgres-wire-compatible server
+(CSV exports, ETL dumps, `pg_dump` restores), and a code path (`src/
+copy.rs`) no prior round had profiled. The payload is a
+support-ticket-shaped table (mixed short/long text fields, ~15% of
+bodies forcing CSV quoting via an embedded comma/quote, ~5% NULL
+subjects) sent as 20 fixed iterations of a 2000-row, ~462 KiB bulk
+load.
+
+Reproduce:
+```bash
+cargo build
+RUSTGRES_DATA_DIR=$(mktemp -d) valgrind --tool=callgrind \
+  --callgrind-out-file=/tmp/cg.out --collect-jumps=yes --cache-sim=yes \
+  ./target/debug/rustgres &
+python3 benches/profile_copy.py --count 20 --rows 2000 --timeout 450
+# SIGTERM the valgrind-wrapped server pid to flush, then:
+callgrind_annotate --auto=no --inclusive=yes --threshold=100 /tmp/cg.out | head -40
+```
+
+📈 **Profile** (Callgrind, valgrind 3.22.0, current HEAD): **4,747,039,891**
+total `Ir`.
+
+| symbol (inclusive `Ir`) | Ir | % of total |
+|---|---|---|
+| `src/server.rs::handle_copy_from` | 4,736,417,431 | 99.78% |
+| ⤷ `src/exec/copy_stmt.rs::copy_from_rows` | 2,202,310,902 | 46.39% |
+| ⤷ `src/copy.rs::parse_rows` / `parse_csv_rows` | 1,093,562,723 | **23.04%** |
+| ⤷⤷ `Vec<u8>::push` called from the plain-byte arm (7,916,680 calls) | 466,939,092 | 9.84% |
+| ⤷⤷ `Vec<u8>::push` called from the in-quotes plain-byte arm (1,230,560 calls) | 61,968,401 | 1.31% |
+| `src/exec/dml.rs::exec_insert` (downstream row insertion) | 1,838,805,856 | 38.74% |
+
+Comfortably past the 5%-of-profile floor: `parse_csv_rows` alone is
+nearly a quarter of total program instructions for this workload, and
+two call sites that do nothing but copy bytes one at a time account
+for 11.15% of the entire program by themselves.
+
+💡 **Hypothesis**: `parse_csv_rows` (`src/copy.rs:233`) accumulates
+every field's bytes into a `Vec<u8>` via `field.push(b)` inside its
+per-byte state machine. CSV format only needs special handling for
+the quote, delimiter, newline, and escape bytes — an ordinary
+character inside or outside quotes needs no transformation at all, so
+pushing it one byte at a time (capacity check + bounds check per call,
+plus repeated reallocation since `field` restarts at 0 capacity after
+every `std::mem::take`) is pure overhead for the common case. Batching
+contiguous untransformed spans into a single `extend_from_slice` per
+transformation point should collapse per-byte call overhead into
+per-run `memcpy`s, with no change to which bytes end up in each field.
+
+`cargo test --all-features`: 1110/1110 passed. `cargo fmt --all --
+--check`: clean.
+
+Before profile committed:
+`benches/profiles/callgrind.out.copycsv-base-2026-10-23`.
+
+**Reproduce the exact number**: check out this commit, `cargo build`,
+repeat the Reproduce command above.
+
 ## Bolt: MERGE's FK self-reference check reorders every new row once per action sharing its destination (O(actions^2)) — fix — 2026-10-22
 
 Fixes the target identified in the baseline entry immediately below
