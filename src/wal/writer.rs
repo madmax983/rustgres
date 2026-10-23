@@ -1253,6 +1253,12 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 __t.rls_enabled = dc.rls_enabled;
                 __t.rls_forced = dc.rls_forced;
                 __t.policies = dc.policies;
+                __t.replica_identity = dc.replica_identity.clone();
+                __t.gen_cols = if dc.gen_cols.len() == __t.columns.len() {
+                    dc.gen_cols.clone()
+                } else {
+                    vec![None; __t.columns.len()]
+                };
             }
             Err(e) => {
                 return Err(bad(&format!(

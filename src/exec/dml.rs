@@ -1587,6 +1587,7 @@ pub(crate) fn exec_create_table_as(
         inherits: Vec::new(),
         deferred_not_null: Vec::new(),
         of_type: None,
+        gen_cols: vec![None; ncols],
     };
     // CTAS definitions never carry constraints; the effective def is discarded.
     let _ = create_table_from_def(eng, ctx, name, &def, temp)?;
@@ -2371,6 +2372,16 @@ pub(crate) fn exec_insert(
                         values[ci] = coerce_assign_composite(eng, v, Some(tname))?;
                     }
                 }
+                // v2.03: generated columns materialize on write.
+                compute_generated_columns(
+                    eng,
+                    ctx.snap,
+                    ctx.own,
+                    ctx.session,
+                    ctx.role,
+                    &meta,
+                    &mut values,
+                )?;
                 check_row_constraints(
                     eng,
                     ctx.snap,
@@ -2441,6 +2452,21 @@ pub(crate) fn exec_insert(
                 let mut explicit = vec![false; ncols];
                 for (v, &(ci, indir)) in row.iter().zip(targets.iter()) {
                     let (cname, ctype) = &meta.columns[ci];
+                    // v2.03: a non-DEFAULT value into a generated
+                    // column is 428C9 (PG19 "cannot insert a
+                    // non-DEFAULT value into column"); DEFAULT is the
+                    // one accepted spelling.
+                    if meta.gen_cols.get(ci).is_some_and(|g| g.is_some())
+                        && !matches!(v, InsertValue::Default)
+                    {
+                        return Err(exec_err(
+                            "428C9",
+                            format!(
+                                "cannot insert a non-DEFAULT value into column \"{}\"",
+                                cname
+                            ),
+                        ));
+                    }
                     // v0.84: indirection targets (`f2[1]`, `f3.if2`).
                     // PG19 rejects DEFAULT into an indirection path
                     // with 0A000 before evaluating any default, coerces
@@ -2543,6 +2569,16 @@ pub(crate) fn exec_insert(
                         }
                     }
                 }
+                // v2.03: generated columns materialize on write.
+                compute_generated_columns(
+                    q.eng,
+                    ctx.snap,
+                    ctx.own,
+                    ctx.session,
+                    ctx.role,
+                    &meta,
+                    &mut values,
+                )?;
                 // v0.9: NOT NULL + CHECK.
                 check_row_constraints(
                     q.eng,
@@ -3100,6 +3136,16 @@ pub(crate) fn exec_insert(
                             ),
                         ));
                     }
+                    let mut new_values = new_values;
+                    compute_generated_columns(
+                        eng,
+                        ctx.snap,
+                        ctx.own,
+                        ctx.session,
+                        ctx.role,
+                        &meta_for_upsert,
+                        &mut new_values,
+                    )?;
                     check_row_constraints(
                         eng,
                         ctx.snap,
@@ -3623,6 +3669,16 @@ pub(crate) fn exec_update(
                 })
             })
             .collect::<Result<_, _>>()?;
+        // v2.03: PG19 — a generated column can only be updated to
+        // DEFAULT (428C9); the value is always computed.
+        for ((name, _), &ci) in sets.iter().zip(set_cols.iter()) {
+            if meta.gen_cols.get(ci).is_some_and(|g| g.is_some()) {
+                return Err(exec_err(
+                    "428C9",
+                    format!("column \"{}\" can only be updated to DEFAULT", name),
+                ));
+            }
+        }
         let columns = meta.columns.clone();
         // v0.85: composite type names for positional record coercion on
         // UPDATE assignment.
@@ -3976,6 +4032,17 @@ pub(crate) fn exec_update(
                     ),
                 ));
             }
+            // v2.03: generated columns re-materialize on update.
+            let mut new_dst = new_dst;
+            compute_generated_columns(
+                eng,
+                ctx.snap,
+                ctx.own,
+                ctx.session,
+                ctx.role,
+                &dst_meta,
+                &mut new_dst,
+            )?;
             // v0.9: NOT NULL + CHECK on the new row (destination metadata).
             check_row_constraints(
                 eng,

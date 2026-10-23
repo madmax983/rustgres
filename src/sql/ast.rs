@@ -2362,6 +2362,9 @@ pub struct TableDef {
     pub uniques: Vec<UniqueDef>,
     pub pkey: Option<UniqueDef>,
     pub fks: Vec<FkDef>,
+    /// v2.03: generated columns, parallel to `columns`
+    /// (`Some((expr, stored))`).
+    pub gen_cols: Vec<Option<(Expr, bool)>>,
     /// v0.69: declarative partitioning (`None` = ordinary table).
     pub partition: Option<PartitionDef>,
     /// v0.72: `LIKE` clauses, expanded at exec. PG19 option defaults
@@ -2575,6 +2578,14 @@ pub enum AlterAction {
     AlterColumnDropDefault {
         name: String,
     },
+    /// v2.03: ALTER COLUMN c SET NOT NULL / DROP NOT NULL (PG19
+    /// AT_SetNotNull / AT_DropNotNull).
+    AlterColumnSetNotNull {
+        name: String,
+    },
+    AlterColumnDropNotNull {
+        name: String,
+    },
     RenameColumn {
         old: String,
         new: String,
@@ -2633,6 +2644,21 @@ pub enum AlterAction {
     ForceRowSecurity,
     /// v1.95: `ALTER TABLE t NO FORCE ROW LEVEL SECURITY` (PG19).
     NoForceRowSecurity,
+    /// v2.03: `ALTER TABLE t REPLICA IDENTITY {DEFAULT|FULL|NOTHING|
+    /// USING INDEX name}` (PG19 ReplicaIdentityStmt).
+    ReplicaIdentity {
+        kind: ReplicaKind,
+        index: Option<String>,
+    },
+}
+
+/// v2.03: replica identity kind in ALTER TABLE (PG19).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplicaKind {
+    Default,
+    Full,
+    Nothing,
+    Index,
 }
 
 /// v0.9: CREATE / ALTER SEQUENCE options. `None` = keep current value
@@ -2787,6 +2813,11 @@ pub(crate) enum ColCon {
         name: Option<String>,
         tail: ParsedFkTail,
     },
+    /// v2.03: `GENERATED ALWAYS AS (expr) STORED|VIRTUAL`.
+    Generated {
+        expr: Expr,
+        stored: bool,
+    },
 }
 
 pub(crate) enum ParsedTableCon {
@@ -2854,6 +2885,7 @@ impl TableDef {
             inherits: Vec::new(),
             deferred_not_null: Vec::new(),
             of_type: None,
+            gen_cols: Vec::new(),
         }
     }
 }
@@ -3045,6 +3077,8 @@ pub(crate) fn build_table_def(
             // v0.72: no column-level STORAGE syntax yet; LIKE ...
             // INCLUDING STORAGE fills this at exec.
             def.storage.push(None);
+            // v2.03: generated-column slot (filled in pass 2).
+            def.gen_cols.push(None);
         }
     }
     // v0.72: a bare `(LIKE src)` list contributes its columns at exec;
@@ -3140,6 +3174,10 @@ pub(crate) fn build_table_def(
                             },
                             false,
                         )?,
+                        // v2.03: generated column definition.
+                        ColCon::Generated { expr, stored } => {
+                            def.gen_cols[i] = Some((expr.clone(), *stored))
+                        }
                     }
                 }
             }
@@ -6190,6 +6228,11 @@ pub enum Stmt {
         schemas: Vec<String>,
         publish: Option<(bool, bool, bool, bool)>,
         via_partition_root: Option<bool>,
+        /// v2.03: per-table (name, column list, row filter), parallel
+        /// to `tables`.
+        table_specs: Vec<(String, Option<Vec<String>>, Option<Expr>)>,
+        /// v2.03: publish_generated_columns option value.
+        publish_generated_columns: Option<String>,
     },
     /// v2.02: DROP PUBLICATION [IF EXISTS] name [, ...] [CASCADE|RESTRICT].
     DropPublication {
@@ -6212,6 +6255,10 @@ pub enum Stmt {
         publish: Option<(bool, bool, bool, bool)>,
         via_partition_root: Option<bool>,
         new_value: Option<String>,
+        /// v2.03: per-table specs, parallel to `tables`.
+        table_specs: Vec<(String, Option<Vec<String>>, Option<Expr>)>,
+        /// v2.03: publish_generated_columns option value.
+        publish_generated_columns: Option<String>,
     },
     /// v1.96: DROP SCHEMA [IF EXISTS] name [, ...] [CASCADE|RESTRICT].
     DropSchema {

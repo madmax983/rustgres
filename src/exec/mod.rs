@@ -286,6 +286,9 @@ mod v201_merge_tests;
 #[path = "test_mods/v202_guard_tests.rs"]
 mod v202_guard_tests;
 #[cfg(test)]
+#[path = "test_mods/v203_tests.rs"]
+mod v203_tests;
+#[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;
 

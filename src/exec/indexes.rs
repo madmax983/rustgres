@@ -1177,6 +1177,15 @@ pub(crate) fn plan_order_scan(
         | FromItem::Function { .. } => return None,
     };
     let t = eng.db.find_table(table_name, snap, &[own], session)?;
+    // v2.03: RLS-enabled tables never take the index-order fast path.
+    // The scan layer drops the hint for RLS tables (policy quals must
+    // filter before any ordering/LIMIT shortcut); if the planner still
+    // handed out a hint, run_select would skip the ORDER BY sort while
+    // the scan returned heap order — the v2.02-found defect where
+    // SELECT ... ORDER BY over an RLS table came back unsorted.
+    if t.rls_enabled {
+        return None;
+    }
     // ORDER BY alias safety: an unqualified ORDER BY column that matches a
     // select-list output name resolves to the *output* value (which may be
     // an expression), not the raw column — unless the select item is the

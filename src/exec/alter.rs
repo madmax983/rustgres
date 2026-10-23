@@ -1166,6 +1166,12 @@ pub(crate) fn exec_alter_one(
         AlterAction::AlterColumnDropDefault { name: col } => {
             alter_set_default(eng, ctx, name, col, None)
         }
+        AlterAction::AlterColumnSetNotNull { name: col } => {
+            alter_set_not_null(eng, ctx, name, col, true)
+        }
+        AlterAction::AlterColumnDropNotNull { name: col } => {
+            alter_set_not_null(eng, ctx, name, col, false)
+        }
         AlterAction::RenameColumn { old, new } => {
             alter_rename_column_ext(eng, ctx, name, old, new, only, true)
         }
@@ -1178,6 +1184,10 @@ pub(crate) fn exec_alter_one(
         AlterAction::DisableRowSecurity => alter_set_rls(eng, ctx, name, Some(false), None),
         AlterAction::ForceRowSecurity => alter_set_rls(eng, ctx, name, None, Some(true)),
         AlterAction::NoForceRowSecurity => alter_set_rls(eng, ctx, name, None, Some(false)),
+        // v2.03: REPLICA IDENTITY (PG19 ATExecReplicaIdentity).
+        AlterAction::ReplicaIdentity { kind, index } => {
+            alter_replica_identity(eng, ctx, name, *kind, index.as_deref())
+        }
         // v0.37
         AlterAction::SetStorage { column, mode } => alter_set_storage(eng, ctx, name, column, mode),
         AlterAction::SetCompression { column, mode } => {
@@ -1749,6 +1759,10 @@ pub(crate) fn alter_add_column_ext(
     }
     let mut next = t.clone();
     next.columns.push((col.to_string(), col_type.clone()));
+    // v2.03: keep generated-column metadata parallel to `columns`.
+    if next.gen_cols.len() < next.columns.len() {
+        next.gen_cols.push(None);
+    }
     // v1.93: keep the declared bit typmods parallel to `columns`
     // (padding a short vec like col_compression below).
     if next.bit_typmods.len() < next.columns.len() - 1 {
@@ -2242,6 +2256,12 @@ pub(crate) fn alter_drop_column_ext(
     }
     // v0.37: keep the per-column TOAST storage parallel to `columns`.
     next.col_storage.remove(ci);
+    // v2.03: keep generated-column metadata parallel too — leaving
+    // it long made later writes index columns[] out of bounds (the
+    // testpub_tbl5 crash in the v2.03 schedule run).
+    if next.gen_cols.len() > ci {
+        next.gen_cols.remove(ci);
+    }
     // v0.41: keep the per-column COMPRESSION metadata parallel too.
     if next.col_compression.len() > ci {
         next.col_compression.remove(ci);
@@ -2941,6 +2961,67 @@ pub(crate) fn alter_drop_constraint(
         }
     }
     alter_drop_constraint_internal(eng, ctx, name, con)?;
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
+/// v2.03: ALTER COLUMN SET/DROP NOT NULL (PG19 ATExecSetNotNull /
+/// ATExecDropNotNull). SET validates existing visible rows (23502
+/// when a NULL is present); a primary-key column cannot DROP its
+/// NOT NULL (PG keeps PK columns not-null).
+pub(crate) fn alter_set_not_null(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    col: &str,
+    set: bool,
+) -> Result<ExecResult, ExecError> {
+    let t = eng
+        .db
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
+    let ci = t.column_index(col).ok_or_else(|| {
+        exec_err(
+            "42703",
+            format!("column \"{}\" of relation \"{}\" does not exist", col, name),
+        )
+    })?;
+    if set {
+        for r in t
+            .rows
+            .iter()
+            .filter(|r| row_visible(r, ctx.snap, &ctx.all_xids))
+        {
+            if r.values.get(ci) == Some(&crate::storage::Value::Null) {
+                return Err(exec_err(
+                    "23502",
+                    format!(
+                        "column \"{}\" of relation \"{}\" contains null values",
+                        col, name
+                    ),
+                ));
+            }
+        }
+    } else if t
+        .pkey
+        .as_ref()
+        .is_some_and(|p| p.cols.iter().any(|c| c == col))
+    {
+        return Err(exec_err(
+            "0A000",
+            format!(
+                "column \"{}\" is in a primary key and cannot be dropped NOT NULL",
+                col
+            ),
+        ));
+    }
+    let mut next = t.clone();
+    if next.not_null.len() <= ci {
+        next.not_null.resize(next.columns.len(), false);
+    }
+    next.not_null[ci] = set;
+    alter_swap(eng, ctx, name, None, next, None)?;
     Ok(ExecResult::Command {
         tag: "ALTER TABLE".to_string(),
     })

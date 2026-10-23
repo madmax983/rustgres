@@ -493,6 +493,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     t.rls_enabled = dc.rls_enabled;
                     t.rls_forced = dc.rls_forced;
                     t.policies = dc.policies;
+                    t.replica_identity = dc.replica_identity.clone();
+                    t.gen_cols = if dc.gen_cols.len() == t.columns.len() { dc.gen_cols.clone() } else { vec![None; t.columns.len()] };
                 }
                 Err(e) => {
                     return Err(format!(
@@ -804,6 +806,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     t.rls_enabled = dc.rls_enabled;
                     t.rls_forced = dc.rls_forced;
                     t.policies = dc.policies;
+                    t.replica_identity = dc.replica_identity.clone();
+                    t.gen_cols = if dc.gen_cols.len() == t.columns.len() { dc.gen_cols.clone() } else { vec![None; t.columns.len()] };
                 }
                 Err(e) => {
                     return Err(format!(

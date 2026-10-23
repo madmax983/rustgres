@@ -191,6 +191,8 @@ pub(crate) fn execute_inner(
             schemas,
             publish,
             via_partition_root,
+            table_specs,
+            publish_generated_columns,
         } => exec_create_publication(
             eng,
             ctx,
@@ -202,6 +204,8 @@ pub(crate) fn execute_inner(
             schemas,
             publish,
             via_partition_root,
+            table_specs,
+            publish_generated_columns,
         ),
         Stmt::DropPublication { names, if_exists } => {
             exec_drop_publication(eng, ctx, names, *if_exists)
@@ -217,6 +221,8 @@ pub(crate) fn execute_inner(
             publish,
             via_partition_root,
             new_value,
+            table_specs,
+            publish_generated_columns,
         } => exec_alter_publication(
             eng,
             ctx,
@@ -230,6 +236,8 @@ pub(crate) fn execute_inner(
             publish,
             via_partition_root,
             new_value,
+            table_specs,
+            publish_generated_columns,
         ),
         // v1.96: schema / maintenance / aggregate statement surface.
         Stmt::CreateSchema {

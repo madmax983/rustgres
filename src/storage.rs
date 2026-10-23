@@ -5642,6 +5642,26 @@ pub struct Table {
     /// creation order. Versions, WAL-replays, and checkpoints with the
     /// table via the s-expr constraints codec.
     pub policies: Vec<crate::sql::PolicyDef>,
+    /// v2.03: `pg_class.relreplident` — the table's replica identity
+    /// (PG19 `ALTER TABLE ... REPLICA IDENTITY`). Versions and
+    /// persists with the table via the constraints codec.
+    pub replica_identity: ReplicaIdentity,
+    /// v2.03: generated columns, parallel to `columns`:
+    /// `Some((expr, stored))` for `GENERATED ALWAYS AS (expr)
+    /// STORED|VIRTUAL`. Values are materialized on write for both
+    /// kinds in this engine. Persists via the constraints codec.
+    pub gen_cols: Vec<Option<(crate::sql::Expr, bool)>>,
+}
+
+/// v2.03: replica identity kind (PG19 `relreplident`).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum ReplicaIdentity {
+    #[default]
+    Default,
+    Full,
+    Nothing,
+    /// REPLICA IDENTITY USING INDEX <name>.
+    Index(String),
 }
 
 impl Table {
@@ -5700,6 +5720,9 @@ impl Table {
             rls_enabled: false,
             rls_forced: false,
             policies: Vec::new(),
+            // v2.03: DEFAULT replica identity, no generated columns.
+            replica_identity: ReplicaIdentity::Default,
+            gen_cols: vec![None; n],
         }
     }
 
@@ -5717,6 +5740,10 @@ impl Table {
         }
         t.not_null = def.not_null.clone();
         t.defaults = def.defaults.clone();
+        // v2.03: generated columns (LIKE-expanded defs may be shorter).
+        if def.gen_cols.len() == t.columns.len() {
+            t.gen_cols = def.gen_cols.clone();
+        }
         t.checks = def.checks.clone();
         t.uniques = def.uniques.clone();
         t.pkey = def.pkey.clone();
@@ -6070,6 +6097,20 @@ pub struct Publication {
     pub pubdelete: bool,
     pub pubtruncate: bool,
     pub via_partition_root: bool,
+    /// v2.03: publish_generated_columns ('none' | 'stored').
+    pub publish_generated_columns: String,
+    /// v2.03: per-table specs keyed by lowercased unqualified table
+    /// name: column list (None = all columns) and row filter.
+    pub table_specs: std::collections::HashMap<String, PubTableSpec, FxBuildHasher>,
+}
+
+/// v2.03: one FOR TABLE entry's column list + row filter
+/// (pg_publication_rel.prattrs / prqual).
+#[derive(Clone, Debug, Default)]
+pub struct PubTableSpec {
+    /// None = no column list (all columns published).
+    pub cols: Option<Vec<String>>,
+    pub filter: Option<crate::sql::Expr>,
 }
 
 /// v0.13: a replication slot. Cluster-global (not per-database), and
