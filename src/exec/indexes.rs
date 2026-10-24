@@ -39,13 +39,23 @@ pub(crate) fn check_insert_unique(
             .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
             .collect()
     };
-    for (i, values) in rows.iter().enumerate() {
-        for (cname, cols) in &uniques {
+    // v2.05: `seen` tracks, per unique constraint, the keys of rows
+    // already scanned in this statement's batch — a `BTreeSet<IndexKey>`
+    // (ordered by the same `index_key_cmp` the real index trees use, so
+    // cross-type equality like NUMERIC 1 == INT 1 still matches) gives
+    // an O(log batch_len) membership check + insert per row. The
+    // previous `rows[..i].iter().any(...)` rescanned every earlier row
+    // of the batch for every row, making one multi-row INSERT's
+    // in-batch duplicate check O(batch_len^2) — quadratic in the size
+    // of a single INSERT statement, not just the table.
+    let mut seen: Vec<BTreeSet<IndexKey>> = vec![BTreeSet::new(); uniques.len()];
+    for values in rows {
+        for ((cname, cols), seen_keys) in uniques.iter().zip(seen.iter_mut()) {
             let key = temp_key(cols, values);
             if key.0.iter().any(|v| matches!(v, Value::Null)) {
                 continue; // NULLs never conflict
             }
-            if rows[..i].iter().any(|prev| temp_key(cols, prev) == key) {
+            if !seen_keys.insert(key) {
                 return Err(unique_violation_err(cname));
             }
         }

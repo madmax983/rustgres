@@ -56,7 +56,7 @@ pub(crate) use crate::storage::{
 };
 pub(crate) use std::cell::RefCell;
 pub(crate) use std::cmp::Ordering;
-pub(crate) use std::collections::{HashMap, HashSet};
+pub(crate) use std::collections::{BTreeSet, HashMap, HashSet};
 pub(crate) use std::ops::Bound;
 pub(crate) use std::rc::Rc;
 
