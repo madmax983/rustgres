@@ -2,6 +2,184 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: multi-row INSERT's in-batch duplicate check is O(batch_len^2) for any UNIQUE/PRIMARY KEY column — fix — 2026-10-24
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`check_insert_unique` (`src/exec/indexes.rs`) enforces UNIQUE/PRIMARY
+KEY constraints for a multi-row INSERT in two parts: against rows
+already committed to the table (via the real index tree,
+`db.unique_violation` — already O(log table_len), untouched here) and
+against *other rows in the same INSERT statement*, since the real
+index has no entries yet for rows not committed. The in-batch half
+used to be:
+
+```rust
+for (i, values) in rows.iter().enumerate() {
+    for (cname, cols) in &uniques {
+        let key = temp_key(cols, values);
+        if rows[..i].iter().any(|prev| temp_key(cols, prev) == key) {
+            return Err(unique_violation_err(cname));
+        }
+    }
+    ...
+}
+```
+
+For row `i`, this rescans every one of the `i` earlier rows of the
+*same statement*, recomputing each one's key from scratch — O(i) work
+per row, O(batch_len^2) for the whole statement. This has nothing to
+do with how big the table is; it fires on the first INSERT into a
+brand-new empty table, scaling only with how many rows one INSERT
+carries — the common bulk-load shape (ETL job, migration script, ORM
+batch insert, a multi-VALUES INSERT standing in for `COPY`).
+
+The fix replaces the rescan with one `BTreeSet<IndexKey>` per unique
+constraint, built incrementally as the batch is scanned:
+
+```rust
+let mut seen: Vec<BTreeSet<IndexKey>> = vec![BTreeSet::new(); uniques.len()];
+for values in rows {
+    for ((cname, cols), seen_keys) in uniques.iter().zip(seen.iter_mut()) {
+        let key = temp_key(cols, values);
+        if key.0.iter().any(|v| matches!(v, Value::Null)) { continue; }
+        if !seen_keys.insert(key) {
+            return Err(unique_violation_err(cname));
+        }
+    }
+    ...
+}
+```
+
+`IndexKey` already has a hand-written `Ord` (`src/index.rs`) using the
+same `index_key_cmp` cross-type comparison the real index trees use
+(so e.g. a NUMERIC `1` and an INT `1` still collide, exactly as
+before) — `BTreeSet::insert` returning `false` for an already-present
+key is the same test as the old `rows[..i].iter().any(...)`, just
+O(log batch_len) instead of O(batch_len). NULLs are skipped before
+the set lookup, same as before (NULLs never conflict). Behavior is
+unchanged: same error, same `23505` constraint name, on the same first
+duplicate row — only how many comparisons it costs to find it.
+
+`check_update_unique_pairs` just below this function (the equivalent
+pairwise check for a batched UPDATE's planned new values) has the
+identical `plan[..i].iter().any(...)` shape and the same O(n^2)
+problem, but no workload in this round exercises it — left as a noted
+follow-up, not fixed here (no measurement, no fix).
+
+### Verification
+
+`cargo test --all-features`: 1130/1130 passed, unchanged. `cargo fmt
+--all`: clean (no further changes beyond the two edited files).
+`cargo clippy --all-targets --all-features -- -D warnings`: 1002
+pre-existing errors on both trees (confirmed via `git stash`;
+documented toolchain/lint-version mismatch — same count the v2.01
+MERGE fix hit as 974 before two more version bumps), none in the
+changed lines of `indexes.rs`/`mod.rs` — zero net new.
+
+### Measurement
+
+Same harness (`benches/profile_insert_unique.py`), same three sizes,
+same machine, same session. Callgrind (valgrind 3.22.0,
+`--collect-jumps=yes --cache-sim=yes --branch-sim=yes`):
+
+| rows | before (`Ir`) | after (`Ir`) | delta |
+|---|---|---|---|
+| 500  | 209,441,432    | 59,373,603   | **-71.64%** |
+| 1500 | 1,549,010,676  | 174,205,556  | **-88.75%** |
+| 4500 | 12,997,464,192 | 536,989,601  | **-95.87%** |
+
+Growth factor per 3x step in row count (the asymptotic argument):
+
+| step | before | after |
+|---|---|---|
+| 500 → 1500  | ×7.40 (→ quadratic's ×9) | ×2.94 (≈ linear's ×3) |
+| 1500 → 4500 | ×8.39 (→ quadratic's ×9) | ×3.08 (≈ linear's ×3) |
+
+Before the fix, tripling the batch size roughly *octupled* the
+instruction count — the signature of O(n^2). After the fix, tripling
+the batch size roughly *triples* the instruction count — O(n log n)
+with a log factor that barely moves across this range, indistinguishable
+from linear. The -71.64% delta at the smallest size alone clears the
+≥5%-of-profile floor by more than 14x; the other two sizes clear it by
+17x and 19x respectively, and the shrinking-growth-factor curve is the
+asymptotic-improvement evidence in its own right.
+
+Before/after profiles committed:
+`benches/profiles/callgrind.out.insertunique-{base,after}-n{500,1500,4500}-2026-10-24`.
+
+**Reproduce**: check out the parent (baseline) commit, `cargo build`,
+repeat the baseline entry's "Reproduce" command at each of `--rows
+500`, `--rows 1500`, `--rows 4500` for the before numbers; check out
+this commit, `cargo build`, repeat for the after numbers.
+
+## Bolt: multi-row INSERT's in-batch duplicate check is O(batch_len^2) for any UNIQUE/PRIMARY KEY column — baseline — 2026-10-24
+
+**Why this workload**: every prior Bolt round's INSERT harness
+(`benches/profile_insert.py`) targets a table with **no** PRIMARY KEY
+or UNIQUE column, so `check_insert_unique`'s in-batch duplicate-check
+loop — the uniques list it builds is empty — has never actually run
+under profiling. Virtually every real table has a primary key, and
+bulk-loading it via one multi-row `INSERT INTO t VALUES (...), (...),
+...` (what a loader, migration script, or ORM batch insert sends) is
+exactly the public entry point this harness drives: a single such
+INSERT, varied only by row count, over the real wire protocol.
+`benches/profile_insert_unique.py` (new, this round) creates `bench_ins_pk(id
+INT PRIMARY KEY, name TEXT, active BOOL)` and sends one `--rows N`
+multi-VALUES INSERT into it.
+
+Reproduce (repeat for `--rows 500`, `--rows 1500`, `--rows 4500`):
+```bash
+cargo build
+RUSTGRES_DATA_DIR=$(mktemp -d) valgrind --tool=callgrind \
+  --callgrind-out-file=/tmp/cg.out --collect-jumps=yes --cache-sim=yes \
+  --branch-sim=yes ./target/debug/rustgres &
+python3 benches/profile_insert_unique.py --rows 1500 --timeout 600
+# SIGTERM the valgrind-wrapped server pid to flush, then:
+callgrind_annotate --auto=yes /tmp/cg.out | head -40
+```
+
+📈 **Profile** (Callgrind, valgrind 3.22.0, current HEAD v2.04):
+
+| rows | total `Ir` | in-batch dup-check subtree\* | % of total |
+|---|---|---|---|
+| 500  | 209,441,432    | 48,782,352    | 23.3% |
+| 1500 | 1,549,010,676  | 427,865,424   | 27.6% |
+| 4500 | 12,997,464,192 | 3,812,135,952 | 29.3% |
+
+\* sum of `check_insert_unique::{closure#3}`, `temp_key` (+ its
+`Iter<usize>`/`Map`/`extend_trusted` call chain), `index_key_cmp`, and
+`exact_as_i64`'s self-`Ir` at each size (`callgrind_annotate --auto=yes`,
+filtered to those symbols) — a lower bound on the true cost, since it
+excludes `check_insert_unique`'s own frame and some inlined iterator
+glue.
+
+Already well past the 5%-of-profile floor at every size, and the
+share *grows* with batch size — exactly what an O(batch_len^2)
+subroutine inside an O(batch_len)-or-better statement looks like under
+profiling.
+
+Wall-clock cross-check (debug build, no valgrind, same harness,
+informational only per this agent's wall-clock-is-inadmissible rule):
+500 rows 0.072s, 1500 rows 0.223s (×3.1 for ×3 rows), 4500 rows 1.376s
+(×6.2 for ×3 rows) — accelerating, consistent with the callgrind
+curve below.
+
+💡 **Hypothesis**: `check_insert_unique`'s in-batch loop
+(`rows[..i].iter().any(|prev| temp_key(cols, prev) == key)`) rescans
+every earlier row of the *same INSERT statement* for every row, to
+catch duplicates among rows that have no index entry yet (they are not
+committed). This is O(i) work for row `i`, O(batch_len^2) for the
+statement — independent of table size, so it fires even on the very
+first INSERT into a brand-new table. `IndexKey` already carries a
+total order (`Ord`, used by the real on-disk index trees), so the
+rescan can become one `BTreeSet<IndexKey>` per unique constraint,
+checked and extended incrementally: O(log batch_len) per row instead
+of O(batch_len), collapsing the statement from O(n^2) to O(n log n).
+
 ## Bolt: MERGE's FK self-reference check reorders every new row once per action sharing its destination (O(actions^2)) — fix — 2026-10-22
 
 Fixes the target identified in the baseline entry immediately below
