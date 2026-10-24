@@ -571,7 +571,19 @@ pub(crate) fn coerce_to_type_name(
     type_name: &str,
 ) -> Result<Value, ExecError> {
     if let Ok(ct) = crate::sql::coltype_by_name(type_name) {
+        // v2.04: coercing an array value to an array type is the
+        // identity (eval_cast renders it to its text form, which
+        // broke array-typed function arguments in bodies).
+        if matches!(ct, ColType::Array(_)) && matches!(v, Value::Array(_)) {
+            return Ok(v.clone());
+        }
         return eval_cast(v, ct);
+    }
+    // v2.04: an array value coerced to an array type name passes
+    // through (element-wise coercion is not modeled for declared
+    // function argument types; literals arrive already typed).
+    if type_name.ends_with("[]") && matches!(v, Value::Array(_)) {
+        return Ok(v.clone());
     }
     eval_cast_named(q, v, type_name)
 }
@@ -1384,6 +1396,17 @@ pub(crate) fn call_table_function(
         return Ok((vec![colname], vec![coltype], out.rows));
     }
     // SETOF: rows as produced; column names from the SELECT output.
+    // v2.04: a RETURNS TABLE declaration overrides names/types
+    // positionally (PG names the output from the declaration).
+    if !fdef.table_cols.is_empty() && fdef.table_cols.len() == out.columns.len() {
+        let names: Vec<String> = fdef.table_cols.iter().map(|(n, _)| n.clone()).collect();
+        let types: Vec<ColType> = fdef
+            .table_cols
+            .iter()
+            .map(|(_, t)| crate::sql::coltype_by_name(t).unwrap_or(ColType::Text))
+            .collect();
+        return Ok((names, types, out.rows));
+    }
     let names: Vec<String> = out.columns.iter().map(|(n, _)| n.clone()).collect();
     let types: Vec<ColType> = out.columns.iter().map(|(_, t)| t.clone()).collect();
     Ok((names, types, out.rows))
@@ -2208,6 +2231,89 @@ pub(crate) fn eval_func(
     // v1.96: privilege/ACL function family (needs the live catalog).
     if let Some(r) = eval_priv_func(q, scopes, name, args) {
         return r;
+    }
+    // v2.04: publication catalog description helpers (need the live
+    // catalog). pg_get_expr returns our stored pg_get_expr text form
+    // unchanged; pg_describe_object / obj_description resolve
+    // publication objects by OID.
+    if name == "pg_get_expr" && !args.is_empty() {
+        let v = eval_expr(q, scopes, &args[0])?;
+        return Ok(v);
+    }
+    if name == "pg_describe_object" && args.len() == 3 {
+        let classid = eval_expr(q, scopes, &args[0])?;
+        let objid = eval_expr(q, scopes, &args[1])?;
+        // The class argument is usually a regclass cast, whose value
+        // is the display TEXT (e.g. "pg_publication_rel"); resolve
+        // text and numeric forms to the catalog oid.
+        let cls_resolved: Option<i64> = match &classid {
+            Value::Int(i) => Some(*i),
+            Value::Text(s) => {
+                if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+                    s.parse::<i64>().ok()
+                } else {
+                    crate::exec::cast::catalog_name_oid(s).map(|o| o as i64)
+                }
+            }
+            _ => None,
+        };
+        let (Some(cls), Value::Int(oid)) = (cls_resolved, &objid) else {
+            return Ok(Value::Null);
+        };
+        let cls = &cls;
+        match *cls {
+            // pg_publication_rel (6106)
+            6106 => {
+                for (eoid, pubname, table, except, _, _) in publication_rel_entries(&q.eng.db) {
+                    if eoid as i64 == *oid {
+                        let base = table.rsplit('.').next().unwrap_or(&table);
+                        return Ok(Value::text(if except {
+                            format!("exclusion of table {} from publication {}", base, pubname)
+                        } else {
+                            format!("publication of table {} in publication {}", base, pubname)
+                        }));
+                    }
+                }
+                return Err(exec_err(
+                    "22023",
+                    format!("could not find object with OID {}", oid),
+                ));
+            }
+            // pg_publication (6104)
+            6104 => {
+                for p in q.eng.db.publications.values() {
+                    if p.oid as i64 == *oid {
+                        return Ok(Value::text(format!("publication {}", p.name)));
+                    }
+                }
+                return Err(exec_err(
+                    "22023",
+                    format!("could not find object with OID {}", oid),
+                ));
+            }
+            _ => {}
+        }
+    }
+    if name == "obj_description" && args.len() == 2 {
+        let v0 = eval_expr(q, scopes, &args[0])?;
+        let v1 = eval_expr(q, scopes, &args[1])?;
+        if let Value::Text(cat) = &v1 {
+            if cat.as_ref() == "pg_publication" {
+                return Ok(match &v0 {
+                    Value::Int(oid) => q
+                        .eng
+                        .db
+                        .publications
+                        .values()
+                        .find(|p| p.oid as i64 == *oid)
+                        .and_then(|p| p.comment.clone())
+                        .map(|c| Value::text(c))
+                        .unwrap_or(Value::Null),
+                    _ => Value::Null,
+                });
+            }
+        }
+        // Other catalogs keep the pre-v2.04 behavior (fall through).
     }
     // v0.97: pg_typeof is statically typed (PG19 resolves it at parse
     // analysis): a cast to a domain, or a reference to a domain-typed
@@ -11552,6 +11658,11 @@ pub(crate) fn func_result_type(
         | "has_type_privilege" | "has_parameter_privilege" | "has_any_column_privilege"
         | "has_largeobject_privilege" | "pg_has_role" | "aclcontains" => Ok(ColType::Bool),
         "current_setting" | "makeaclitem" | "pg_get_userbyid" => Ok(ColType::Text),
+        // v2.04: catalog description helpers used by the publication
+        // suite (pg_get_expr deparses our stored filter text form).
+        "pg_get_expr" | "pg_describe_object" | "obj_description" | "shobj_description" => {
+            Ok(ColType::Text)
+        }
         // v1.96: large-object family result types.
         "lo_create" | "lo_creat" | "lo_open" | "lo_close" | "lowrite" | "lo_truncate"
         | "lo_unlink" | "lo_from_bytea" | "lo_put" => Ok(ColType::Int),

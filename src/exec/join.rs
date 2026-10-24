@@ -958,6 +958,21 @@ pub(crate) fn eval_function_item(
             col_aliases,
         );
     }
+    // v2.04: pg_get_publication_tables reads the publication
+    // catalog directly (its rows depend on catalog state, not on a
+    // generic table-function evaluation).
+    if name == "pg_get_publication_tables" {
+        let rows = pg_get_publication_tables_rows(&q.eng.db, q.snap, q.own, q.session, &arg_vals)?;
+        let nargs = arg_vals.len();
+        return finish_function_item(
+            name,
+            alias,
+            col_aliases,
+            &gpt_col_names(nargs),
+            &gpt_col_types(nargs),
+            rows,
+        );
+    }
     // v1.84: record-returning json functions resolve their row type
     // from the call site (base argument shape or column definitions),
     // before generic table-function dispatch.
@@ -2143,7 +2158,46 @@ pub(crate) fn lateral_function_schema(
             if let Ok(ct) = crate::sql::coltype_by_name(&fdef.ret_type) {
                 return function_item_schema(name, &[name.to_string()], &[ct], alias, col_aliases);
             }
+            // v2.04: RETURNS TABLE (record + setof) — PG names the
+            // output from the DECLARED column list when present.
+            if fdef.ret_type == "record" && !fdef.table_cols.is_empty() {
+                let names: Vec<String> = fdef.table_cols.iter().map(|(n, _)| n.clone()).collect();
+                let tys: Vec<ColType> = fdef
+                    .table_cols
+                    .iter()
+                    .map(|(_, t)| crate::sql::coltype_by_name(t).unwrap_or(ColType::Text))
+                    .collect();
+                return function_item_schema(name, &names, &tys, alias, col_aliases);
+            }
+            if fdef.ret_type == "record" {
+                if let Some(parsed) = &fdef.parsed {
+                    if let Some(crate::sql::Stmt::Select(sel)) = parsed.last() {
+                        let cols = crate::exec::describe::describe_select(
+                            eng,
+                            snap,
+                            own,
+                            session,
+                            sel,
+                            &[],
+                            &[left],
+                        )?;
+                        let names: Vec<String> = cols.iter().map(|(n, _)| n.clone()).collect();
+                        let tys: Vec<ColType> = cols.iter().map(|(_, t)| t.clone()).collect();
+                        return function_item_schema(name, &names, &tys, alias, col_aliases);
+                    }
+                }
+            }
         }
+    }
+    // v2.04: pg_get_publication_tables (static schema by arity).
+    if name == "pg_get_publication_tables" {
+        return function_item_schema(
+            name,
+            &gpt_col_names(args.len()),
+            &gpt_col_types(args.len()),
+            alias,
+            col_aliases,
+        );
     }
     let out_names = table_function_col_names(name)?;
     let col_types: Vec<ColType> = if name == "generate_series" {
@@ -2606,6 +2660,40 @@ pub(crate) fn build_source(
                     })
                     .collect();
                 let (_, rows) = pg_sequences_scan(&q.eng.db, q.snap, q.own);
+                return Ok((apply_aliases(schema)?, rows));
+            }
+            // v2.04: publication catalog views are virtual too.
+            if matches!(
+                name.as_str(),
+                "pg_publication"
+                    | "pg_publication_rel"
+                    | "pg_publication_namespace"
+                    | "pg_publication_tables"
+                    | "pg_publication_sequences"
+            ) && q
+                .eng
+                .db
+                .find_table(name, q.snap, &q.all_xids, q.session)
+                .is_none()
+            {
+                let (schema, rows) = match name.as_str() {
+                    "pg_publication" => pg_publication_scan(&q.eng.db),
+                    "pg_publication_rel" => {
+                        pg_publication_rel_scan(&q.eng.db, q.snap, q.own, q.session)
+                    }
+                    "pg_publication_namespace" => pg_publication_namespace_scan(&q.eng.db),
+                    "pg_publication_tables" => {
+                        pg_publication_tables_scan(&q.eng.db, q.snap, q.own, q.session)
+                    }
+                    _ => pg_publication_sequences_scan(&q.eng.db, q.snap, q.own),
+                };
+                let schema: Vec<QCol> = schema
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
                 return Ok((apply_aliases(schema)?, rows));
             }
             // v1.95: pg_policies / pg_policy are virtual too.

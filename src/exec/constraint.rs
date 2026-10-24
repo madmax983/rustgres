@@ -27,6 +27,8 @@ pub(crate) struct TableMeta {
     pub(crate) checks: Vec<CheckDef>,
     pub(crate) pkey: Option<UniqueDef>,
     pub(crate) fks: Vec<FkDef>,
+    /// v2.03: generated columns, parallel to `columns`.
+    pub(crate) gen_cols: Vec<Option<(crate::sql::Expr, bool)>>,
 }
 
 impl TableMeta {
@@ -42,6 +44,7 @@ impl TableMeta {
             checks: t.checks.clone(),
             pkey: t.pkey.clone(),
             fks: t.fks.clone(),
+            gen_cols: t.gen_cols.clone(),
         }
     }
 
@@ -292,6 +295,277 @@ pub(crate) fn domain_default<'e>(
 /// v0.85: domain CHECKs are enforced here too, on the finished row
 /// (PG19 checks domain constraints during value coercion, before the
 /// table's own CHECK constraints).
+
+/// v2.03: materialize generated columns into `values` (PG19
+/// ExecComputeStoredGenerated; virtual columns are materialized the
+/// same way in this engine). Each generated expression evaluates
+/// against the row's other columns; generated columns may reference
+/// earlier generated columns, so evaluate in column order and write
+/// back as we go.
+#[allow(clippy::too_many_arguments)]
+
+/// v2.03: PG19 generation-expression validity (heap.c cookDefault +
+/// parse_agg/parse_expr EXPR_KIND_GENERATED_COLUMN), enforced at
+/// CREATE TABLE: only immutable expressions over the table's own
+/// non-generated columns. Without this, an expression the s-expr
+/// codec cannot represent (e.g. an aggregate) would be stored and
+/// then fail WAL replay on every restart.
+pub(crate) fn validate_generated_columns(
+    eng: &Engine,
+    def: &crate::sql::TableDef,
+) -> Result<(), ExecError> {
+    for g in def.gen_cols.iter() {
+        let Some((expr, _)) = g else { continue };
+        gen_expr_walk(eng, def, expr)?;
+    }
+    Ok(())
+}
+
+const GEN_SYSTEM_COLS: [&str; 6] = ["ctid", "xmin", "xmax", "cmin", "cmax", "tableoid"];
+
+fn gen_expr_walk(eng: &Engine, def: &crate::sql::TableDef, e: &Expr) -> Result<(), ExecError> {
+    match e {
+        Expr::Column { table: qual, name } => {
+            let lname = name.to_lowercase();
+            if GEN_SYSTEM_COLS.contains(&lname.as_str()) {
+                return Err(exec_err(
+                    "0A000",
+                    format!(
+                        "cannot use system column \"{}\" in column generation expression",
+                        name
+                    ),
+                ));
+            }
+            if qual.is_some() {
+                return Err(exec_err(
+                    "42703",
+                    format!("column \"{}\" does not exist", name),
+                ));
+            }
+            match def
+                .columns
+                .iter()
+                .position(|(cn, _)| cn.eq_ignore_ascii_case(name))
+            {
+                None => Err(exec_err(
+                    "42703",
+                    format!("column \"{}\" does not exist", name),
+                )),
+                Some(p) if def.gen_cols.get(p).is_some_and(|g| g.is_some()) => Err(exec_err(
+                    "42P10",
+                    format!(
+                        "cannot use generated column \"{}\" in column generation expression",
+                        name
+                    ),
+                )),
+                _ => Ok(()),
+            }
+        }
+        Expr::WholeRow { .. } => Err(exec_err(
+            "0A000",
+            "cannot use whole-row variable in column generation expression".to_string(),
+        )),
+        Expr::Agg { .. } | Expr::WithinGroup { .. } => Err(exec_err(
+            "42803",
+            "aggregate functions are not allowed in column generation expressions".to_string(),
+        )),
+        Expr::Window { .. } => Err(exec_err(
+            "42P20",
+            "window functions are not allowed in column generation expressions".to_string(),
+        )),
+        Expr::ScalarSub(_) | Expr::InSub { .. } | Expr::Exists { .. } | Expr::Quantified { .. } => {
+            Err(exec_err(
+                "0A000",
+                "cannot use subquery in column generation expression".to_string(),
+            ))
+        }
+        Expr::Func { name, args, .. } => {
+            let lname = name.to_lowercase();
+            if lname == "generate_series"
+                || lname == "generate_subscripts"
+                || eng.db.functions.contains_key(&lname)
+                || !super::publication::IMMUTABLE_FUNCS.contains(&lname.as_str())
+            {
+                return Err(exec_err(
+                    "42P17",
+                    "generation expression is not immutable".to_string(),
+                ));
+            }
+            for a in args {
+                gen_expr_walk(eng, def, a)?;
+            }
+            Ok(())
+        }
+        Expr::UserOp { .. } => Err(exec_err(
+            "42P17",
+            "generation expression is not immutable".to_string(),
+        )),
+        Expr::Arith { left, right, .. } | Expr::Cmp { left, right, .. } => {
+            gen_expr_walk(eng, def, left)?;
+            gen_expr_walk(eng, def, right)
+        }
+        Expr::Concat(a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
+            gen_expr_walk(eng, def, a)?;
+            gen_expr_walk(eng, def, b)
+        }
+        Expr::JsonOp { left, right, .. } | Expr::IsDistinctFrom { left, right, .. } => {
+            gen_expr_walk(eng, def, left)?;
+            gen_expr_walk(eng, def, right)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            gen_expr_walk(eng, def, expr)?;
+            gen_expr_walk(eng, def, pattern)?;
+            if let Some(x) = escape {
+                gen_expr_walk(eng, def, x)?;
+            }
+            Ok(())
+        }
+        Expr::Regex { expr, pattern, .. } => {
+            gen_expr_walk(eng, def, expr)?;
+            gen_expr_walk(eng, def, pattern)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            gen_expr_walk(eng, def, expr)?;
+            gen_expr_walk(eng, def, low)?;
+            gen_expr_walk(eng, def, high)
+        }
+        Expr::IsBool { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Not(expr)
+        | Expr::BitNot(expr)
+        | Expr::Neg(expr)
+        | Expr::Cast { expr, .. }
+        | Expr::CastNamed { expr, .. }
+        | Expr::NamedArg { expr, .. }
+        | Expr::FieldAccess { expr, .. }
+        | Expr::Extract { from: expr, .. } => gen_expr_walk(eng, def, expr),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                gen_expr_walk(eng, def, o)?;
+            }
+            for (k, r) in whens {
+                gen_expr_walk(eng, def, k)?;
+                gen_expr_walk(eng, def, r)?;
+            }
+            if let Some(x) = else_ {
+                gen_expr_walk(eng, def, x)?;
+            }
+            Ok(())
+        }
+        Expr::Row(elems) | Expr::ArrayCtor { elems, .. } => {
+            for x in elems {
+                gen_expr_walk(eng, def, x)?;
+            }
+            Ok(())
+        }
+        Expr::AtTimeZone { expr, zone } => {
+            gen_expr_walk(eng, def, expr)?;
+            if let Some(z) = zone {
+                gen_expr_walk(eng, def, z)?;
+            }
+            Ok(())
+        }
+        Expr::Subscript { array, indices } => {
+            gen_expr_walk(eng, def, array)?;
+            for x in indices {
+                gen_expr_walk(eng, def, x)?;
+            }
+            Ok(())
+        }
+        Expr::Slice { array, bounds } => {
+            gen_expr_walk(eng, def, array)?;
+            for (l, u) in bounds {
+                if let Some(l) = l {
+                    gen_expr_walk(eng, def, l)?;
+                }
+                if let Some(u) = u {
+                    gen_expr_walk(eng, def, u)?;
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn compute_generated_columns(
+    eng: &mut Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    role: &str,
+    meta: &TableMeta,
+    values: &mut [Value],
+) -> Result<(), ExecError> {
+    if meta.gen_cols.iter().all(|g| g.is_none()) {
+        return Ok(());
+    }
+    let schema: Vec<QCol> = meta
+        .columns
+        .iter()
+        .map(|(n, ty)| QCol {
+            qual: String::new(),
+            name: n.clone(),
+            ty: ty.clone(),
+            hidden: false,
+            src_ord: 0,
+        })
+        .collect();
+    let n = meta
+        .gen_cols
+        .len()
+        .min(meta.columns.len())
+        .min(values.len());
+    for i in 0..n {
+        let Some((expr, _stored)) = meta.gen_cols.get(i).cloned().flatten() else {
+            continue;
+        };
+        let mut lock_ids = Vec::new();
+        let mut q = Q {
+            eng,
+            snap,
+            own,
+            all_xids: vec![own],
+            session,
+            role,
+            read_only: false,
+            depth: 0,
+            lock_ids: &mut lock_ids,
+            ctes: Vec::new(),
+            wctx: None,
+            srf_vals: Vec::new(),
+            priv_scopes: Vec::new(),
+            priv_role_override: None,
+            hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+            immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+            plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
+            hashed_in: Rc::new(RefCell::new(Vec::new())),
+            pending_updates: None,
+            write: None,
+        };
+        let frame = Scope {
+            schema: &schema,
+            row: values,
+            prov: None,
+        };
+        let v = eval_expr(&mut q, &[frame], &expr)?;
+        let (_, ctype) = &meta.columns[i];
+        values[i] = coerce_value(v, ctype, &meta.columns[i].0)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn check_row_constraints(
     eng: &mut Engine,
     snap: &Snapshot,

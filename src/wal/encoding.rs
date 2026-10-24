@@ -1283,6 +1283,7 @@ impl Enc {
                 strict,
                 security_definer,
                 is_procedure,
+                table_cols,
                 xmin,
             } => {
                 self.u8(24);
@@ -1310,6 +1311,12 @@ impl Enc {
                 // v1.96 (RGSWAL26): SECURITY DEFINER, then procedure.
                 self.u8(if *security_definer { 1 } else { 0 });
                 self.u8(if *is_procedure { 1 } else { 0 });
+                // v2.04 (RGSWAL29): RETURNS TABLE declared columns.
+                self.u32(table_cols.len() as u32);
+                for (cn, ct) in table_cols {
+                    self.str(cn);
+                    self.str(ct);
+                }
                 self.u64(*xmin);
             }
             WalRecord::DropFunction {
@@ -1379,6 +1386,24 @@ impl Enc {
                 self.str(name);
                 self.u32(*toast_relid);
                 self.u64(*xmin);
+            }
+            // v2.04 (RGSWAL29): publication DDL, full image.
+            WalRecord::CreatePublication { name, pub_, xmin } => {
+                self.u8(31);
+                self.str(name);
+                self.publication(pub_);
+                self.u64(*xmin);
+            }
+            WalRecord::AlterPublication { name, pub_, xmin } => {
+                self.u8(33);
+                self.str(name);
+                self.publication(pub_);
+                self.u64(*xmin);
+            }
+            WalRecord::DropPublication { name, xmax } => {
+                self.u8(32);
+                self.str(name);
+                self.u64(*xmax);
             }
         }
     }
@@ -1608,6 +1633,52 @@ impl Enc {
                         self.u64(*v);
                     }
                 }
+            }
+        }
+    }
+}
+
+impl Enc {
+    /// v2.04: encode a `WalPublication` (WAL records + checkpoint
+    /// section share this codec). The publication name rides in the
+    /// enclosing record/section, not here.
+    pub(crate) fn publication(&mut self, p: &WalPublication) {
+        self.u32(p.oid);
+        match &p.comment {
+            Some(c) => {
+                self.u8(1);
+                self.str(c);
+            }
+            None => self.u8(0),
+        }
+        self.str(&p.owner);
+        self.u8(p.all_tables as u8);
+        self.u8(p.all_sequences as u8);
+        self.str_list(&p.except_tables);
+        self.str_list(&p.tables);
+        self.str_list(&p.schemas);
+        self.u8(p.pubinsert as u8);
+        self.u8(p.pubupdate as u8);
+        self.u8(p.pubdelete as u8);
+        self.u8(p.pubtruncate as u8);
+        self.u8(p.via_partition_root as u8);
+        self.str(&p.publish_generated_columns);
+        self.u32(p.specs.len() as u32);
+        for (k, cols, filter) in &p.specs {
+            self.str(k);
+            match cols {
+                Some(cs) => {
+                    self.u8(1);
+                    self.str_list(cs);
+                }
+                None => self.u8(0),
+            }
+            match filter {
+                Some(f) => {
+                    self.u8(1);
+                    self.str(f);
+                }
+                None => self.u8(0),
             }
         }
     }
@@ -2555,6 +2626,19 @@ impl<'a> Dec<'a> {
                 } else {
                     false
                 };
+                // v2.04: RETURNS TABLE columns ride RGSWAL29+.
+                let table_cols = if self.wal_version >= 29 {
+                    let n = self.u32()? as usize;
+                    let mut v = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let cn = self.str()?;
+                        let ct = self.str()?;
+                        v.push((cn, ct));
+                    }
+                    v
+                } else {
+                    Vec::new()
+                };
                 let xmin = self.u64()?;
                 Ok(WalRecord::CreateFunction {
                     name,
@@ -2568,6 +2652,7 @@ impl<'a> Dec<'a> {
                     strict,
                     security_definer,
                     is_procedure,
+                    table_cols,
                     xmin,
                 })
             }
@@ -2642,6 +2727,24 @@ impl<'a> Dec<'a> {
                     xmin,
                 })
             }
+            // v2.04 (RGSWAL29): publication DDL, full image.
+            31 => {
+                let name = self.str()?;
+                let pub_ = self.publication()?;
+                let xmin = self.u64()?;
+                Ok(WalRecord::CreatePublication { name, pub_, xmin })
+            }
+            33 => {
+                let name = self.str()?;
+                let pub_ = self.publication()?;
+                let xmin = self.u64()?;
+                Ok(WalRecord::AlterPublication { name, pub_, xmin })
+            }
+            32 => {
+                let name = self.str()?;
+                let xmax = self.u64()?;
+                Ok(WalRecord::DropPublication { name, xmax })
+            }
             t => Err(self.err(&format!("unknown record tag {}", t))),
         }
     }
@@ -2691,6 +2794,61 @@ impl<'a> Dec<'a> {
             owner,
             acl,
             owned_by,
+        })
+    }
+
+    /// v2.04: decode a `WalPublication` (see Enc::publication).
+    pub(crate) fn publication(&mut self) -> Result<WalPublication, String> {
+        let oid = self.u32()?;
+        let comment = if self.u8()? != 0 {
+            Some(self.str()?)
+        } else {
+            None
+        };
+        let owner = self.str()?;
+        let all_tables = self.u8()? != 0;
+        let all_sequences = self.u8()? != 0;
+        let except_tables = self.str_list_d()?;
+        let tables = self.str_list_d()?;
+        let schemas = self.str_list_d()?;
+        let pubinsert = self.u8()? != 0;
+        let pubupdate = self.u8()? != 0;
+        let pubdelete = self.u8()? != 0;
+        let pubtruncate = self.u8()? != 0;
+        let via_partition_root = self.u8()? != 0;
+        let publish_generated_columns = self.str()?;
+        let n = self.u32()? as usize;
+        let mut specs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let k = self.str()?;
+            let cols = if self.u8()? != 0 {
+                Some(self.str_list_d()?)
+            } else {
+                None
+            };
+            let filter = if self.u8()? != 0 {
+                Some(self.str()?)
+            } else {
+                None
+            };
+            specs.push((k, cols, filter));
+        }
+        Ok(WalPublication {
+            oid,
+            comment,
+            owner,
+            all_tables,
+            all_sequences,
+            except_tables,
+            tables,
+            schemas,
+            pubinsert,
+            pubupdate,
+            pubdelete,
+            pubtruncate,
+            via_partition_root,
+            publish_generated_columns,
+            specs,
         })
     }
 

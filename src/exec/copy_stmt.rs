@@ -23,11 +23,20 @@ pub fn copy_ncols(
             .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?;
         let meta = TableMeta::of(t);
         for n in cols {
-            if !meta.columns.iter().any(|(c, _)| c == n) {
+            let Some(pos) = meta.columns.iter().position(|(c, _)| c == n) else {
                 return Err(exec_err(
                     "42703",
                     format!("column \"{}\" of relation \"{}\" does not exist", n, table),
                 ));
+            };
+            // v2.03: PG19 copy.c — a generated column named in a
+            // COPY column list is 42P10 (both directions).
+            if meta.gen_cols.get(pos).is_some_and(|g| g.is_some()) {
+                return Err(ExecError {
+                    code: "42P10",
+                    message: format!("column \"{}\" is a generated column", n),
+                    detail: Some("Generated columns cannot be used in COPY.".to_string()),
+                });
             }
         }
         Ok(cols.len())

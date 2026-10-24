@@ -39,13 +39,23 @@ pub(crate) fn check_insert_unique(
             .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
             .collect()
     };
-    for (i, values) in rows.iter().enumerate() {
-        for (cname, cols) in &uniques {
+    // v2.05: `seen` tracks, per unique constraint, the keys of rows
+    // already scanned in this statement's batch — a `BTreeSet<IndexKey>`
+    // (ordered by the same `index_key_cmp` the real index trees use, so
+    // cross-type equality like NUMERIC 1 == INT 1 still matches) gives
+    // an O(log batch_len) membership check + insert per row. The
+    // previous `rows[..i].iter().any(...)` rescanned every earlier row
+    // of the batch for every row, making one multi-row INSERT's
+    // in-batch duplicate check O(batch_len^2) — quadratic in the size
+    // of a single INSERT statement, not just the table.
+    let mut seen: Vec<BTreeSet<IndexKey>> = vec![BTreeSet::new(); uniques.len()];
+    for values in rows {
+        for ((cname, cols), seen_keys) in uniques.iter().zip(seen.iter_mut()) {
             let key = temp_key(cols, values);
             if key.0.iter().any(|v| matches!(v, Value::Null)) {
                 continue; // NULLs never conflict
             }
-            if rows[..i].iter().any(|prev| temp_key(cols, prev) == key) {
+            if !seen_keys.insert(key) {
                 return Err(unique_violation_err(cname));
             }
         }
@@ -1177,6 +1187,15 @@ pub(crate) fn plan_order_scan(
         | FromItem::Function { .. } => return None,
     };
     let t = eng.db.find_table(table_name, snap, &[own], session)?;
+    // v2.03: RLS-enabled tables never take the index-order fast path.
+    // The scan layer drops the hint for RLS tables (policy quals must
+    // filter before any ordering/LIMIT shortcut); if the planner still
+    // handed out a hint, run_select would skip the ORDER BY sort while
+    // the scan returned heap order — the v2.02-found defect where
+    // SELECT ... ORDER BY over an RLS table came back unsorted.
+    if t.rls_enabled {
+        return None;
+    }
     // ORDER BY alias safety: an unqualified ORDER BY column that matches a
     // select-list output name resolves to the *output* value (which may be
     // an expression), not the raw column — unless the select item is the

@@ -1229,6 +1229,10 @@ pub(crate) fn catalog_name_oid(name: &str) -> Option<u32> {
         "pg_policy" => 3256,
         "pg_collation" => 3456,
         "pg_default_acl" => 826,
+        // v2.04: publication catalogs (PG19 pg_publication*.h).
+        "pg_publication" => 6104,
+        "pg_publication_rel" => 6106,
+        "pg_publication_namespace" => 6237,
         _ => return None,
     })
 }
@@ -1243,6 +1247,12 @@ pub(crate) fn regclass_display(q: &Q, oid: u32) -> String {
             .any(|t| t.oid == oid && crate::storage::table_visible(t, q.snap, &q.all_xids))
         {
             return name.clone();
+        }
+    }
+    // v2.04: view stand-in oids (name hash) render as the view name.
+    for (vname, v) in &q.eng.db.views {
+        if v.iter().any(|vd| vd.dropped_xmax == 0) && crate::exec::catalog::name_oid(vname) == oid {
+            return vname.clone();
         }
     }
     // v1.96: catalog OIDs render as their catalog name.
@@ -1304,16 +1314,26 @@ pub(crate) fn eval_regclass_cast(q: &mut Q, v: &Value) -> Result<Value, ExecErro
             } else if let Some(oid) = catalog_name_oid(s) {
                 // v1.96: catalog names resolve to their fixed OIDs.
                 oid
+            } else if let Some(t) = q.eng.db.find_table(s, q.snap, &q.all_xids, q.session) {
+                t.oid
+            } else if q
+                .eng
+                .db
+                .views
+                .get(s.as_ref())
+                .is_some_and(|vs| vs.iter().any(|v| v.dropped_xmax == 0))
+            {
+                // v2.04: views resolve as regclass too (PG gives
+                // every relation an oid); views carry no allocated
+                // oid in this engine, so the deterministic name
+                // hash stands in (regclass_display mirrors it).
+                crate::exec::catalog::name_oid(s)
             } else {
                 // A relation name: must resolve, like PG (42P01).
-                let t = q
-                    .eng
-                    .db
-                    .find_table(s, q.snap, &q.all_xids, q.session)
-                    .ok_or_else(|| {
-                        exec_err("42P01", format!("relation \"{}\" does not exist", s))
-                    })?;
-                t.oid
+                return Err(exec_err(
+                    "42P01",
+                    format!("relation \"{}\" does not exist", s),
+                ));
             }
         }
         other => {
@@ -1514,6 +1534,17 @@ pub(crate) fn eval_cast_named(q: &mut Q, v: &Value, name: &str) -> Result<Value,
                 }
                 match q.eng.db.find_table(&raw, q.snap, &q.all_xids, q.session) {
                     Some(t) => Ok(Value::Int(t.oid as i64)),
+                    // v2.04: a view's regclass display resolves back
+                    // to its stand-in oid, mirroring eval_regclass_cast.
+                    None if q
+                        .eng
+                        .db
+                        .views
+                        .get(&raw)
+                        .is_some_and(|vs| vs.iter().any(|v| v.dropped_xmax == 0)) =>
+                    {
+                        Ok(Value::Int(crate::exec::catalog::name_oid(&raw) as i64))
+                    }
                     None => Err(exec_err(
                         "22P02",
                         format!("invalid input syntax for type oid: \"{}\"", raw),

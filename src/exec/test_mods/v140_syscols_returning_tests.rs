@@ -332,7 +332,9 @@ fn v142_pg_class_relkind_toast_is_t() {
     run(&mut eng, "CREATE TABLE t142toast (f1 text);").unwrap();
     match run(
         &mut eng,
-        "SELECT relkind FROM pg_class WHERE relname LIKE 'pg_toast.%';",
+        // v2.04: relname is never schema-qualified (PG shape), so
+        // toast tables match 'pg_toast_%', not 'pg_toast.%'.
+        "SELECT relkind FROM pg_class WHERE relname LIKE 'pg_toast_%';",
     )
     .unwrap()
     {

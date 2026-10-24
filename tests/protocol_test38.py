@@ -138,15 +138,15 @@ do_sql("ALTER TABLE t38toast SET (toast_tuple_target = 128)")
 do_sql("INSERT INTO t38toast VALUES (repeat('1', 4000), repeat('2', 120))")
 toastrel = val("SELECT relname FROM pg_class WHERE oid = "
                "(SELECT reltoastrelid FROM pg_class WHERE relname = 't38toast')")
-check("E1 toast rel exists", toastrel.startswith("pg_toast."))
+check("E1 toast rel exists", toastrel.startswith("pg_toast_"))
 check("E2 two chunk_seq=0 rows",
-      val(f"SELECT count(*) FROM {toastrel} WHERE chunk_seq = 0") == "2")
+      val(f"SELECT count(*) FROM pg_toast.{toastrel} WHERE chunk_seq = 0") == "2")
 # PG chunks large values (TOAST_MAX_CHUNK_SIZE): the 4000-byte value spans
 # 2 chunks, the 120-byte value is a single chunk.
 check("E3 big value chunked",
-      val(f"SELECT count(*) FROM {toastrel} WHERE chunk_seq = 1") == "1")
+      val(f"SELECT count(*) FROM pg_toast.{toastrel} WHERE chunk_seq = 1") == "1")
 check("E3b three rows total",
-      val(f"SELECT count(*) FROM {toastrel}") == "3")
+      val(f"SELECT count(*) FROM pg_toast.{toastrel}") == "3")
 check("E4 external not compressed",
       val("SELECT pg_column_compression(a) FROM t38toast") is None)
 check("E5 roundtrip",
@@ -162,7 +162,7 @@ do_sql("INSERT INTO t38main VALUES (repeat('3', 4000), repeat('4', 4000))")
 mrel = val("SELECT relname FROM pg_class WHERE oid = "
            "(SELECT reltoastrelid FROM pg_class WHERE relname = 't38main')")
 check("F1 main inline zero toast rows",
-      val(f"SELECT count(*) FROM {mrel}") == "0")
+      val(f"SELECT count(*) FROM pg_toast.{mrel}") == "0")
 check("F2 main compressed a",
       val("SELECT pg_column_compression(a) FROM t38main") == "pglz")
 check("F3 main compressed b",
@@ -178,7 +178,7 @@ do_sql("INSERT INTO t38ext VALUES (repeat('5', 100000))")
 erel = val("SELECT relname FROM pg_class WHERE oid = "
            "(SELECT reltoastrelid FROM pg_class WHERE relname = 't38ext')")
 check("G1 one chunk_seq=0 row",
-      val(f"SELECT count(*) FROM {erel} WHERE chunk_seq = 0") == "1")
+      val(f"SELECT count(*) FROM pg_toast.{erel} WHERE chunk_seq = 0") == "1")
 check("G2 extended compressed",
       val("SELECT pg_column_compression(a) FROM t38ext") == "pglz")
 check("G3 extended roundtrip", val("SELECT length(a) FROM t38ext") == "100000")

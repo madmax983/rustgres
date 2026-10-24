@@ -33,7 +33,10 @@ pub(crate) const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK16";
 /// v1.94: version 20 adds the tsvector / tsquery column types and
 /// value tags to table and row images. v19 checkpoints are refused;
 /// remove the data directory to start fresh.
-pub(crate) const CHKPT_VERSION: u32 = 24;
+/// v2.04: version 25 adds the publications section (the whole
+/// `Database::publications` catalog). v24 checkpoints are refused;
+/// remove the data directory to start fresh.
+pub(crate) const CHKPT_VERSION: u32 = 26;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -95,9 +98,12 @@ pub(crate) const CHKPT_VERSION: u32 = 24;
 /// v1.99: `RGSWAL28` — CreateIndex records carry per-key collation /
 /// operator class lists (trailing). CHKPT 24: checkpoint index
 /// definitions carry the same two lists.
-pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL28";
+/// v2.04: `RGSWAL29` — new publication records (tags 31-33) carrying
+/// the full publication image. Older logs (down to MIN_READABLE)
+/// still read; they simply contain no publication records.
+pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL29";
 /// v1.80: the format version number in [`WAL_MAGIC`].
-pub(crate) const WAL_VERSION: u32 = 28;
+pub(crate) const WAL_VERSION: u32 = 29;
 /// v1.80: oldest WAL format this build can replay.
 pub(crate) const MIN_READABLE_WAL_VERSION: u32 = 20;
 pub(crate) const WAL_HEADER_LEN: u64 = 16;
@@ -886,6 +892,12 @@ impl Wal {
                 // v1.96 (checkpoint v22): SECURITY DEFINER + procedure.
                 img.u8(if f.security_definer { 1 } else { 0 });
                 img.u8(if f.is_procedure { 1 } else { 0 });
+                // v2.04 (checkpoint v26): RETURNS TABLE columns.
+                img.u32(f.table_cols.len() as u32);
+                for (cn, ct) in &f.table_cols {
+                    img.str(cn);
+                    img.str(ct);
+                }
             }
         }
 
@@ -962,6 +974,21 @@ impl Wal {
                     img.str(t);
                 }
                 img.str(&a.owner);
+            }
+        }
+
+        // v2.04 (checkpoint v25): publications. Like types/functions,
+        // publications carry no xid versioning (transactionality is
+        // the undo log's job); snapshotting the live map is strictly
+        // better than the pre-v2.04 behavior (a checkpoint+restart
+        // forgot every publication).
+        {
+            let mut p_names: Vec<&String> = eng.db.publications.keys().collect();
+            p_names.sort();
+            img.u32(p_names.len() as u32);
+            for name in p_names {
+                img.str(name);
+                img.publication(&WalPublication::of(&eng.db.publications[name]));
             }
         }
 
@@ -1253,6 +1280,12 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 __t.rls_enabled = dc.rls_enabled;
                 __t.rls_forced = dc.rls_forced;
                 __t.policies = dc.policies;
+                __t.replica_identity = dc.replica_identity.clone();
+                __t.gen_cols = if dc.gen_cols.len() == __t.columns.len() {
+                    dc.gen_cols.clone()
+                } else {
+                    vec![None; __t.columns.len()]
+                };
             }
             Err(e) => {
                 return Err(bad(&format!(
@@ -1704,6 +1737,14 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
             // v1.96 (checkpoint v22): SECURITY DEFINER + procedure.
             let security_definer = d.u8().map_err(|e| bad(&e))? != 0;
             let is_procedure = d.u8().map_err(|e| bad(&e))? != 0;
+            // v2.04 (checkpoint v26): RETURNS TABLE columns.
+            let n_tc = d.u32().map_err(|e| bad(&e))? as usize;
+            let mut table_cols = Vec::with_capacity(n_tc);
+            for _ in 0..n_tc {
+                let cn = d.str().map_err(|e| bad(&e))?;
+                let ct = d.str().map_err(|e| bad(&e))?;
+                table_cols.push((cn, ct));
+            }
             let (parsed, plpgsql) =
                 crate::exec::rebuild_function_bodies(lang, &arg_names, &body, returns_set);
             overloads.push(crate::storage::FuncDef {
@@ -1721,6 +1762,7 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 strict,
                 security_definer,
                 is_procedure,
+                table_cols,
             });
         }
         eng.db.functions.insert(name, overloads);
@@ -1801,6 +1843,17 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 owner,
             },
         );
+    }
+    // v2.04 (checkpoint v25): publications (see the writer side).
+    let n_pubs = d.u32().map_err(|e| bad(&e))? as usize;
+    for _ in 0..n_pubs {
+        let name = d.str().map_err(|e| bad(&e))?;
+        let wp = d.publication().map_err(|e| bad(&e))?;
+        if wp.oid >= eng.db.next_oid {
+            eng.db.next_oid = wp.oid + 1;
+        }
+        let p = wp.into_publication(name.clone());
+        eng.db.publications.insert(name, p);
     }
     d.end().map_err(|e| bad(&e))?;
     Ok((eng, wal_end))
