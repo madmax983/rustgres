@@ -5990,6 +5990,8 @@ pub enum Stmt {
         /// v1.96: CREATE PROCEDURE (stored as a void function flagged
         /// as a procedure; PG keeps a separate namespace).
         procedure: bool,
+        /// v2.04: RETURNS TABLE declared columns (name, type name).
+        table_cols: Vec<(String, String)>,
     },
     DropFunction {
         name: String,
@@ -6259,6 +6261,13 @@ pub enum Stmt {
         table_specs: Vec<(String, Option<Vec<String>>, Option<Expr>)>,
         /// v2.03: publish_generated_columns option value.
         publish_generated_columns: Option<String>,
+    },
+    /// v2.04: COMMENT ON PUBLICATION name IS 'text' | NULL — the
+    /// only COMMENT ON arm this engine models (it backs
+    /// obj_description over pg_publication in publication.sql).
+    CommentPublication {
+        name: String,
+        comment: Option<String>,
     },
     /// v1.96: DROP SCHEMA [IF EXISTS] name [, ...] [CASCADE|RESTRICT].
     DropSchema {

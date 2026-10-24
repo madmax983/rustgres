@@ -239,6 +239,10 @@ pub(crate) fn execute_inner(
             table_specs,
             publish_generated_columns,
         ),
+        // v2.04: COMMENT ON PUBLICATION.
+        Stmt::CommentPublication { name, comment } => {
+            exec_comment_publication(eng, ctx, name, comment)
+        }
         // v1.96: schema / maintenance / aggregate statement surface.
         Stmt::CreateSchema {
             name,
@@ -399,6 +403,7 @@ pub(crate) fn execute_inner(
             strict,
             security_definer,
             procedure,
+            table_cols,
         } => exec_create_function(
             eng,
             ctx,
@@ -413,6 +418,7 @@ pub(crate) fn execute_inner(
             *strict,
             *security_definer,
             *procedure,
+            table_cols,
         ),
         Stmt::DropFunction {
             name,

@@ -3,12 +3,17 @@
 // CheckCmdReplicaIdentity, called from execMain.c
 // CheckValidResultRel).
 //
-// The catalog lives on `Database::publications` — not WAL-logged
-// and not checkpointed (definitions do not survive restart), but
-// transactional via the statement undo log (`WriteOp::*Publication`),
-// which object_address.sql observably relies on. Its only consumer
-// in this milestone is the guard below (plus the DDL surface
-// itself); pg_publication catalog views are not implemented.
+// The catalog lives on `Database::publications` — transactional
+// via the statement undo log (`WriteOp::*Publication`), which
+// object_address.sql observably relies on.
+// v2.04: publications are WAL-logged (CreatePublication /
+// DropPublication / AlterPublication records, RGSWAL29) and written
+// in CHECKPOINT (v25+), so they survive restart; and the
+// pg_publication / pg_publication_rel / pg_publication_tables /
+// pg_publication_namespace / pg_publication_sequences catalog views
+// plus the pg_get_publication_tables SRF are implemented below and
+// in catalog.rs (PG19 catalog/pg_publication.h,
+// catalog/pg_publication_rel.h, catalog/system_views.sql).
 //
 // Guard semantics (DEFAULT replica identity only): a table publishes
 // updates/deletes when some publication covers it — FOR ALL TABLES
@@ -21,7 +26,7 @@
 // Partitioned parents are skipped (PG skips partitioned relkind);
 // leaves are checked individually by the callers.
 use super::*;
-use crate::storage::Publication;
+use crate::storage::{PubTableSpec, Publication};
 
 fn base_name(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
@@ -1237,10 +1242,15 @@ pub(crate) fn exec_create_publication(
     }
     let (pubinsert, pubupdate, pubdelete, pubtruncate) =
         publish.unwrap_or((true, true, true, true));
+    // v2.04: allocate the publication's OID (pg_publication.oid).
+    let oid = eng.db.next_oid;
+    eng.db.next_oid += 1;
     eng.db.publications.insert(
         name.to_string(),
         Publication {
             name: name.to_string(),
+            oid,
+            comment: None,
             owner: ctx.role.to_string(),
             all_tables,
             all_sequences,
@@ -1579,5 +1589,663 @@ pub(crate) fn exec_alter_publication(
     }
     Ok(ExecResult::Command {
         tag: "ALTER PUBLICATION".to_string(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// v2.04: catalog-view support — the effective published-relation list
+// of a publication (PG19 pg_publication.c GetPublicationRelations /
+// GetAllPublicationRelations + the pg_get_publication_tables worker),
+// shared by the pg_publication_tables view and the
+// pg_get_publication_tables set-returning function.
+// ---------------------------------------------------------------------------
+
+/// One effective published relation: the relation a subscriber sees.
+pub(crate) struct PubRelRow {
+    /// Storage key of the effective relation (root when published via
+    /// partition root, the partition itself otherwise).
+    pub rel_key: String,
+    pub schemaname: String,
+    pub tablename: String,
+    /// Published column names, in relation column order.
+    pub attnames: Vec<String>,
+    /// Attnums parallel to `attnames` (pg_get_publication_tables'
+    /// int2vector payload).
+    pub attnums: Vec<i16>,
+    /// Row filter of the defining entry, if any.
+    pub filter: Option<Expr>,
+}
+
+fn pub_table_of<'e>(
+    db: &'e Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    key: &str,
+) -> Option<&'e crate::storage::Table> {
+    db.find_table(key, snap, &[own], session)
+}
+
+fn pub_schema_of(db: &Database, key: &str) -> String {
+    if let Some((s, _)) = key.rsplit_once('.') {
+        return s.to_string();
+    }
+    db.obj_schema
+        .get(key)
+        .cloned()
+        .unwrap_or_else(|| "public".to_string())
+}
+
+/// All descendant partition keys of `key` (recursive, cycle-safe).
+fn pub_descendants(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    key: &str,
+    out: &mut Vec<String>,
+) {
+    let Some(t) = pub_table_of(db, snap, own, session, key) else {
+        return;
+    };
+    let children = t
+        .partition
+        .as_ref()
+        .map(|p| p.children.clone())
+        .unwrap_or_default();
+    for c in children {
+        if !out.contains(&c) {
+            out.push(c.clone());
+            pub_descendants(db, snap, own, session, &c, out);
+        }
+    }
+}
+
+/// Partition ancestors of `key`, nearest first (storage keys).
+fn pub_ancestors(db: &Database, snap: &Snapshot, own: u64, session: u64, key: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = key.to_string();
+    for _ in 0..32 {
+        let Some(t) = pub_table_of(db, snap, own, session, &cur) else {
+            break;
+        };
+        let Some(parent) = t.partition.as_ref().and_then(|p| p.parent.clone()) else {
+            break;
+        };
+        // Parent names are stored as written; resolve to the storage
+        // key by base-name match against the tables map.
+        let pkey = db
+            .tables
+            .keys()
+            .find(|k| base_name(k).eq_ignore_ascii_case(base_name(&parent)))
+            .cloned()
+            .unwrap_or(parent);
+        if out.contains(&pkey) {
+            break;
+        }
+        out.push(pkey.clone());
+        cur = pkey;
+    }
+    out
+}
+
+fn pub_is_partitioned(db: &Database, snap: &Snapshot, own: u64, session: u64, key: &str) -> bool {
+    pub_table_of(db, snap, own, session, key)
+        .and_then(|t| t.partition.as_ref())
+        .is_some_and(|p| p.is_partitioned)
+}
+
+/// The effective published relations of `p` (see the section header).
+pub(crate) fn publication_rel_rows(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    p: &Publication,
+) -> Vec<PubRelRow> {
+    // 1. Candidate entry keys (storage keys), in deterministic order.
+    let mut entries: Vec<String> = Vec::new();
+    let push_entry = |entries: &mut Vec<String>, key: String| {
+        if !entries.contains(&key) {
+            entries.push(key);
+        }
+    };
+    if p.all_tables {
+        let mut keys: Vec<&String> = db.tables.keys().collect();
+        keys.sort();
+        for k in keys {
+            let base = base_name(k);
+            if base.starts_with("pg_toast") || k.starts_with("pg_toast.") {
+                continue;
+            }
+            if pub_schema_of(db, k).eq_ignore_ascii_case("pg_catalog") {
+                continue;
+            }
+            if pub_table_of(db, snap, own, session, k).is_none() {
+                continue;
+            }
+            push_entry(&mut entries, k.clone());
+        }
+    } else {
+        for t in &p.tables {
+            if let Some(k) = db
+                .tables
+                .keys()
+                .find(|k| base_name(k).eq_ignore_ascii_case(base_name(t)))
+            {
+                push_entry(&mut entries, k.clone());
+            }
+        }
+        if !p.schemas.is_empty() {
+            let mut keys: Vec<&String> = db.tables.keys().collect();
+            keys.sort();
+            for k in keys {
+                let base = base_name(k);
+                if base.starts_with("pg_toast") || k.starts_with("pg_toast.") {
+                    continue;
+                }
+                if p.schemas
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(&pub_schema_of(db, k)))
+                    && pub_table_of(db, snap, own, session, k).is_some()
+                {
+                    push_entry(&mut entries, k.clone());
+                }
+            }
+        }
+    }
+    // EXCEPT removes the named relations.
+    if !p.except_tables.is_empty() {
+        entries.retain(|k| {
+            !p.except_tables
+                .iter()
+                .any(|e| base_name(e).eq_ignore_ascii_case(base_name(k)))
+        });
+    }
+    // 2. Partition resolution.
+    let mut effective: Vec<String> = Vec::new();
+    if p.via_partition_root {
+        for e in &entries {
+            // Published via the topmost published ancestor, if any.
+            let anc = pub_ancestors(db, snap, own, session, e);
+            let top = anc.iter().rev().find(|a| entries.contains(a)).cloned();
+            match top {
+                Some(root) => {
+                    if !effective.contains(&root) {
+                        effective.push(root);
+                    }
+                }
+                None => {
+                    // An unpublished ancestor chain: if any ancestor
+                    // is an entry the loop above found it; a partition
+                    // whose root is not published stands alone unless
+                    // a nearer ancestor is an entry (handled by top).
+                    let nearer = anc.iter().find(|a| entries.contains(a)).cloned();
+                    match nearer {
+                        Some(root) => {
+                            if !effective.contains(&root) {
+                                effective.push(root);
+                            }
+                        }
+                        None => {
+                            if !effective.contains(e) {
+                                effective.push(e.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        for e in &entries {
+            if pub_is_partitioned(db, snap, own, session, e) {
+                // Expand to descendant leaves: descendants that are
+                // not themselves partitioned-with-children.
+                let mut desc = Vec::new();
+                pub_descendants(db, snap, own, session, e, &mut desc);
+                let mut leaves: Vec<String> = desc
+                    .into_iter()
+                    .filter(|d| {
+                        let has_children = pub_table_of(db, snap, own, session, d)
+                            .and_then(|t| t.partition.as_ref())
+                            .is_some_and(|pi| !pi.children.is_empty());
+                        !has_children
+                    })
+                    .collect();
+                if leaves.is_empty() {
+                    // Childless partitioned table: it is its own row.
+                    leaves.push(e.clone());
+                }
+                for l in leaves {
+                    if !effective.contains(&l) {
+                        effective.push(l);
+                    }
+                }
+            } else if !effective.contains(e) {
+                effective.push(e.clone());
+            }
+        }
+        // A partition explicitly entered whose partitioned ancestor
+        // was also entered and expanded already includes it; an
+        // excepted ancestor's partitions stay excluded (entries were
+        // filtered before expansion only for exact names, so re-check:
+        // partitions of an EXCEPTed root are not published).
+        if !p.except_tables.is_empty() {
+            let excepted: Vec<String> = p
+                .except_tables
+                .iter()
+                .filter_map(|e| {
+                    db.tables
+                        .keys()
+                        .find(|k| base_name(k).eq_ignore_ascii_case(base_name(e)))
+                        .cloned()
+                })
+                .collect();
+            effective.retain(|k| {
+                !excepted.contains(k)
+                    && !pub_ancestors(db, snap, own, session, k)
+                        .iter()
+                        .any(|a| excepted.contains(a))
+            });
+        }
+    }
+    // EXCEPT under via-root: partitions of an excepted root are out
+    // (their effective root was the excepted entry, already removed,
+    // so they may have leaked in as standalone rows).
+    if p.via_partition_root && !p.except_tables.is_empty() {
+        let excepted: Vec<String> = p
+            .except_tables
+            .iter()
+            .filter_map(|e| {
+                db.tables
+                    .keys()
+                    .find(|k| base_name(k).eq_ignore_ascii_case(base_name(e)))
+                    .cloned()
+            })
+            .collect();
+        effective.retain(|k| {
+            !excepted.contains(k)
+                && !pub_ancestors(db, snap, own, session, k)
+                    .iter()
+                    .any(|a| excepted.contains(a))
+        });
+    }
+    effective.sort();
+    // 3. Specs + column sets.
+    let mut rows = Vec::new();
+    for key in effective {
+        let Some(t) = pub_table_of(db, snap, own, session, &key) else {
+            continue;
+        };
+        // The defining spec: own entry first, then partition
+        // ancestors (PG: a parent entry's column list / row filter
+        // governs partitions published through it).
+        let mut spec: Option<&PubTableSpec> = None;
+        let mut chain = vec![key.clone()];
+        chain.extend(pub_ancestors(db, snap, own, session, &key));
+        for cand in &chain {
+            if let Some(s) = p.table_specs.get(&base_name(cand).to_lowercase()) {
+                // Only explicit FOR TABLE entries carry specs.
+                if p.tables
+                    .iter()
+                    .any(|e| base_name(e).eq_ignore_ascii_case(base_name(cand)))
+                {
+                    spec = Some(s);
+                    break;
+                }
+            }
+        }
+        let (attnames, attnums): (Vec<String>, Vec<i16>) = match spec.and_then(|s| s.cols.as_ref())
+        {
+            Some(cols) => {
+                let mut names = Vec::new();
+                let mut nums = Vec::new();
+                for c in cols {
+                    if let Some(pos) = t
+                        .columns
+                        .iter()
+                        .position(|(n, _)| n.eq_ignore_ascii_case(c))
+                    {
+                        names.push(t.columns[pos].0.clone());
+                        nums.push(t.attnums.get(pos).copied().unwrap_or(pos as i16 + 1));
+                    }
+                }
+                (names, nums)
+            }
+            None => (
+                t.columns.iter().map(|(n, _)| n.clone()).collect(),
+                t.columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| t.attnums.get(i).copied().unwrap_or(i as i16 + 1))
+                    .collect(),
+            ),
+        };
+        rows.push(PubRelRow {
+            schemaname: pub_schema_of(db, &key),
+            tablename: base_name(&key).to_string(),
+            rel_key: key,
+            attnames,
+            attnums,
+            filter: spec.and_then(|s| s.filter.clone()),
+        });
+    }
+    rows
+}
+
+/// v2.04: enumerate pg_publication_rel rows (explicit + EXCEPT
+/// entries only, as PG) with deterministic synthetic OIDs. The OID
+/// is a pure function of catalog position, so pg_describe_object can
+/// resolve it by re-enumerating within the same statement.
+pub(crate) fn publication_rel_entries(
+    db: &Database,
+) -> Vec<(u32, String, String, bool, Option<Expr>, Option<Vec<String>>)> {
+    // (oid, pubname, table-as-written, prexcept, filter, cols)
+    let mut pubs: Vec<&Publication> = db.publications.values().collect();
+    pubs.sort_by_key(|p| p.oid);
+    let mut out = Vec::new();
+    let mut idx: u32 = 0;
+    for p in pubs {
+        let mut ents: Vec<(String, bool)> = p.tables.iter().map(|t| (t.clone(), false)).collect();
+        ents.extend(p.except_tables.iter().map(|t| (t.clone(), true)));
+        for (t, except) in ents {
+            idx += 1;
+            let spec = p.table_specs.get(&base_name(&t).to_lowercase());
+            out.push((
+                610_600 + idx,
+                p.name.clone(),
+                t,
+                except,
+                if except {
+                    None
+                } else {
+                    spec.and_then(|s| s.filter.clone())
+                },
+                if except {
+                    None
+                } else {
+                    spec.and_then(|s| s.cols.clone())
+                },
+            ));
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// v2.04: Expr -> SQL text deparsing for row filters, in PG's
+// pg_get_expr style (the whole qual parenthesized, precedence-driven
+// inner parens). Covers the expression shapes publication row
+// filters use in practice; exotic shapes fall back to a bare
+// rendering of their head form.
+// ---------------------------------------------------------------------------
+
+fn deparse_prec(e: &Expr) -> u8 {
+    match e {
+        Expr::Or(..) => 1,
+        Expr::And(..) => 2,
+        Expr::Not(_) => 3,
+        Expr::Cmp { .. }
+        | Expr::IsNull { .. }
+        | Expr::IsBool { .. }
+        | Expr::Between { .. }
+        | Expr::Like { .. }
+        | Expr::IsDistinctFrom { .. } => 4,
+        Expr::Arith { op, .. } => match op {
+            ArithOp::Add | ArithOp::Sub => 5,
+            ArithOp::Mul | ArithOp::Div | ArithOp::Mod => 6,
+            _ => 7,
+        },
+        _ => 9,
+    }
+}
+
+fn deparse_child(e: &Expr, parent_prec: u8) -> String {
+    let s = deparse_inner(e);
+    if deparse_prec(e) < parent_prec {
+        format!("({})", s)
+    } else {
+        s
+    }
+}
+
+fn deparse_lit(l: &Literal) -> String {
+    match l {
+        Literal::Int(v) => v.to_string(),
+        Literal::BigInt(v) => v.to_string(),
+        Literal::SmallInt(v) => v.to_string(),
+        Literal::Float(v) => format!("{}", v),
+        Literal::Decimal(s) => s.clone(),
+        Literal::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        Literal::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+        Literal::Null => "NULL".to_string(),
+        _ => "NULL".to_string(),
+    }
+}
+
+fn deparse_inner(e: &Expr) -> String {
+    match e {
+        Expr::Column { name, .. } => name.clone(),
+        Expr::ResolvedCol { .. } => "?".to_string(),
+        Expr::Literal(l) => deparse_lit(l),
+        Expr::Arith { op, left, right } => {
+            let p = deparse_prec(e);
+            format!(
+                "{} {} {}",
+                deparse_child(left, p),
+                op.sql(),
+                deparse_child(right, p)
+            )
+        }
+        Expr::Cmp { op, left, right } => {
+            let os = match op {
+                CmpOp::Eq => "=",
+                CmpOp::Ne => "<>",
+                CmpOp::Lt => "<",
+                CmpOp::Le => "<=",
+                CmpOp::Gt => ">",
+                CmpOp::Ge => ">=",
+                CmpOp::ImageEq => "*=",
+            };
+            format!(
+                "{} {} {}",
+                deparse_child(left, 4),
+                os,
+                deparse_child(right, 4)
+            )
+        }
+        Expr::And(l, r) => format!("{} AND {}", deparse_child(l, 2), deparse_child(r, 2)),
+        Expr::Or(l, r) => format!("{} OR {}", deparse_child(l, 1), deparse_child(r, 1)),
+        Expr::Not(inner) => format!("NOT {}", deparse_child(inner, 3)),
+        Expr::IsNull { expr, neg } => format!(
+            "{} IS {}NULL",
+            deparse_child(expr, 4),
+            if *neg { "NOT " } else { "" }
+        ),
+        Expr::Func { name, args } => {
+            let parts: Vec<String> = args.iter().map(deparse_inner).collect();
+            format!("{}({})", name, parts.join(", "))
+        }
+        Expr::Cast { expr, to, .. } => {
+            format!("{}::{}", deparse_child(expr, 9), to.sql_name())
+        }
+        Expr::ArrayCtor { elems, .. } => {
+            let parts: Vec<String> = elems.iter().map(deparse_inner).collect();
+            format!("ARRAY[{}]", parts.join(", "))
+        }
+        Expr::UserOp { op, left, right } => format!(
+            "{} {} {}",
+            deparse_child(left, 4),
+            op,
+            deparse_child(right, 4)
+        ),
+        Expr::JsonOp { op, left, right } => format!(
+            "{} {} {}",
+            deparse_child(left, 4),
+            op.sql(),
+            deparse_child(right, 4)
+        ),
+        _ => "true".to_string(),
+    }
+}
+
+/// PG pg_get_expr form of a publication row filter: parenthesized.
+pub(crate) fn deparse_filter(e: &Expr) -> String {
+    format!("({})", deparse_inner(e))
+}
+
+// ---------------------------------------------------------------------------
+// v2.04: pg_get_publication_tables (PG19 pg_publication.c) — the
+// set-returning function behind pg_publication_tables and the
+// publication suite's test_gpt helper. One-argument form returns
+// (relid, attrs, qual) for every effective relation of every named
+// publication; the two-argument form additionally filters to one
+// relation and reports (pubid, relid, attrs, qual). attrs is the
+// int2vector payload rendered as text ("1 2 3"); qual is the row
+// filter in pg_get_expr text form.
+// ---------------------------------------------------------------------------
+
+pub(crate) fn gpt_col_names(nargs: usize) -> Vec<String> {
+    let names: &[&str] = if nargs >= 2 {
+        &["pubid", "relid", "attrs", "qual"]
+    } else {
+        &["relid", "attrs", "qual"]
+    };
+    names.iter().map(|s| s.to_string()).collect()
+}
+
+pub(crate) fn gpt_col_types(nargs: usize) -> Vec<ColType> {
+    if nargs >= 2 {
+        vec![ColType::Int, ColType::Int, ColType::Text, ColType::Text]
+    } else {
+        vec![ColType::Int, ColType::Text, ColType::Text]
+    }
+}
+
+pub(crate) fn pg_get_publication_tables_rows(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    arg_vals: &[Value],
+) -> Result<Vec<Row>, ExecError> {
+    let Some(first) = arg_vals.first() else {
+        return Err(exec_err(
+            "42883",
+            "function pg_get_publication_tables() does not exist".to_string(),
+        ));
+    };
+    let pubnames: Vec<String> = match first {
+        Value::Array(a) => a
+            .elems
+            .iter()
+            .filter_map(|v| match v {
+                Value::Text(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect(),
+        // Array parameters substitute as `{...}` text literals in
+        // function bodies (params.rs value_to_literal); parse the
+        // literal back, like downstream coercion would.
+        Value::Text(s) => {
+            match super::eval::parse_array_literal(s, crate::storage::ArrayElem::Text) {
+                Ok(a) => a
+                    .elems
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Text(s2) => Some(s2.to_string()),
+                        _ => None,
+                    })
+                    .collect(),
+                Err(_) => {
+                    return Err(exec_err(
+                        "42883",
+                        "function pg_get_publication_tables() does not exist".to_string(),
+                    ));
+                }
+            }
+        }
+        Value::Null => Vec::new(),
+        _ => {
+            return Err(exec_err(
+                "42883",
+                "function pg_get_publication_tables() does not exist".to_string(),
+            ));
+        }
+    };
+    let want_relid: Option<i64> = if arg_vals.len() >= 2 {
+        match arg_vals[1] {
+            Value::Int(v) => Some(v),
+            Value::Null => None,
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let mut out = Vec::new();
+    for name in &pubnames {
+        let Some(p) = db.publications.get(name) else {
+            continue; // PG: unknown publications contribute no rows.
+        };
+        for r in publication_rel_rows(db, snap, own, session, p) {
+            let Some(t) = pub_table_of(db, snap, own, session, &r.rel_key) else {
+                continue;
+            };
+            let relid = t.oid as i64;
+            if let Some(w) = want_relid {
+                if w != relid {
+                    continue;
+                }
+            }
+            let attrs = r
+                .attnums
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let qual = match &r.filter {
+                Some(f) => Value::text(deparse_filter(f)),
+                None => Value::Null,
+            };
+            if arg_vals.len() >= 2 {
+                out.push(Row::new(vec![
+                    Value::Int(p.oid as i64),
+                    Value::Int(relid),
+                    Value::text(attrs),
+                    qual,
+                ]));
+            } else {
+                out.push(Row::new(vec![Value::Int(relid), Value::text(attrs), qual]));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// v2.04: COMMENT ON PUBLICATION — stores the comment on the
+/// publication record (PG keeps it in pg_description; here
+/// obj_description reads it back from the record). Transactional
+/// via the AlterPublication undo entry, WAL-logged and checkpointed
+/// with the rest of the record.
+pub(crate) fn exec_comment_publication(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    comment: &Option<String>,
+) -> Result<ExecResult, ExecError> {
+    let Some(p) = eng.db.publications.get_mut(name) else {
+        return Err(exec_err(
+            "42P01",
+            format!("publication \"{}\" does not exist", name),
+        ));
+    };
+    let prev = p.clone();
+    p.comment = comment.clone();
+    ctx.writes.push(crate::storage::WriteOp::AlterPublication {
+        name: name.to_string(),
+        prev: Some(prev),
+    });
+    Ok(ExecResult::Command {
+        tag: "COMMENT".to_string(),
     })
 }

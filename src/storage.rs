@@ -5903,6 +5903,10 @@ pub struct FuncDef {
     pub security_definer: bool,
     /// v1.96: CREATE PROCEDURE (separate PG namespace from functions).
     pub is_procedure: bool,
+    /// v2.04: RETURNS TABLE declared columns (name, type name);
+    /// empty for other return shapes. PG names a table function's
+    /// output columns from this list, not from the body's aliases.
+    pub table_cols: Vec<(String, String)>,
 }
 
 /// v1.38: a user-defined cast definition, keyed by (source, target)
@@ -6056,9 +6060,9 @@ pub struct Database {
     /// Transactional via the statement undo log
     /// (`WriteOp::CreatePublication` & friends — object_address.sql
     /// relies on a rolled-back FOR ALL TABLES publication never
-    /// becoming visible), but deliberately not WAL-logged or
-    /// checkpointed: a restart forgets publications, which only
-    /// narrows the guard (documented hold-back).
+    /// becoming visible).
+    /// v2.04: WAL-logged (full-image records, RGSWAL29) and
+    /// checkpointed (CHKPT 25), so publications survive restart.
     pub publications: HashMap<String, Publication, FxBuildHasher>,
     /// v1.96: large object contents (oid -> bytes) and owners.
     /// v1.96: user-defined aggregates by name.
@@ -6083,6 +6087,15 @@ pub struct Database {
 #[derive(Clone, Debug)]
 pub struct Publication {
     pub name: String,
+    /// v2.04: pg_publication.oid, allocated from `Database::next_oid`
+    /// at CREATE and preserved by ALTER/RENAME; carried by WAL and
+    /// checkpoint so catalog views and obj_description are stable
+    /// across restarts. 0 for records decoded from pre-v2.04 images
+    /// (none can exist: the checkpoint version bump refuses them).
+    pub oid: u32,
+    /// v2.04: COMMENT ON PUBLICATION text (pg_description), read back
+    /// via obj_description(oid, 'pg_publication').
+    pub comment: Option<String>,
     pub owner: String,
     pub all_tables: bool,
     pub all_sequences: bool,

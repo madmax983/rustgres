@@ -313,6 +313,8 @@ impl Parser {
             "delete" => self.parse_delete(),
             // --- v2.01: MERGE
             "merge" => self.parse_merge(),
+            // --- v2.04: COMMENT ON PUBLICATION
+            "comment" => self.parse_comment(),
             // --- v0.74: PREPARE / EXECUTE / DEALLOCATE
             "prepare" => self.parse_prepare(),
             "execute" => self.parse_execute(),
@@ -2434,7 +2436,9 @@ impl Parser {
     > {
         self.expect_keyword("partition")?;
         self.expect_keyword("of")?;
-        let parent = self.expect_ident()?;
+        // v2.04: the parent may be schema-qualified
+        // (`PARTITION OF sch1.tbl1`, publication.sql's sch section).
+        let parent = self.expect_qualified_ident()?;
         let bound = self.parse_partition_bound()?;
         // Optional sub-partitioning: `PARTITION BY ...`.
         let sub = if matches!(self.peek(), Token::Ident(s) if s == "partition") {
@@ -2506,7 +2510,8 @@ impl Parser {
         // v0.69: ALTER TABLE parent ATTACH PARTITION child FOR VALUES ...
         if self.eat_keyword("attach") {
             self.expect_keyword("partition")?;
-            let child = self.expect_ident()?;
+            // v2.04: the child may be schema-qualified.
+            let child = self.expect_qualified_ident()?;
             let bound = self.parse_partition_bound()?;
             return Ok(AlterAction::AttachPartition { child, bound });
         }
@@ -3119,8 +3124,39 @@ impl Parser {
             self.next(); // ')'
         }
         self.expect_keyword("returns")?;
-        let returns_set = self.eat_keyword("setof");
-        let ret_type = self.parse_func_type_name()?;
+        let mut returns_set = self.eat_keyword("setof");
+        // v2.04: RETURNS TABLE (col type, ...) — PG models this as a
+        // record-returning function whose OUT columns are the list.
+        // The executor drives the call schema from the body's final
+        // SELECT (whose columns PG requires to match this list), so
+        // the list is parsed and type-checked, then folded to
+        // record + setof.
+        let mut table_cols: Vec<(String, String)> = Vec::new();
+        let ret_type = if matches!(self.peek(), Token::Ident(w) if w == "table")
+            && matches!(self.peek2(), Token::LParen)
+        {
+            self.next(); // TABLE
+            self.next(); // (
+            loop {
+                let col = self.expect_ident()?;
+                let ty = self.parse_func_type_name()?;
+                table_cols.push((col, ty));
+                match self.next() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')' in RETURNS TABLE, found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+            returns_set = true;
+            "record".to_string()
+        } else {
+            self.parse_func_type_name()?
+        };
         let mut lang_name: Option<String> = None;
         let mut body: Option<String> = None;
         let mut volatility = FuncVolatility::Volatile;
@@ -3281,6 +3317,45 @@ impl Parser {
                         }
                     }
                 }
+            } else if self.eat_keyword("begin") {
+                // v2.04: SQL-standard body `BEGIN ATOMIC ... END`
+                // (PG19 gram.y opt_atomic). The body is the raw
+                // token span up to the matching END (CASE/BEGIN
+                // nesting tracked); it is stored like an AS '...'
+                // SQL body and implies LANGUAGE SQL.
+                self.expect_keyword("atomic")?;
+                let start = self.pos;
+                let mut depth = 0i32;
+                let mut j = start;
+                let mut end_at: Option<usize> = None;
+                while j < self.tokens.len() {
+                    if let Token::Ident(w) = &self.tokens[j] {
+                        match w.as_str() {
+                            "case" | "begin" => depth += 1,
+                            "end" => {
+                                if depth == 0 {
+                                    end_at = Some(j);
+                                    break;
+                                }
+                                depth -= 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                    j += 1;
+                }
+                // No closing END in this statement chunk: the
+                // pg_regress-style statement splitter cuts BEGIN
+                // ATOMIC bodies at the body's internal `;`, so the
+                // END arrives as a separate fragment. Accept the
+                // body running to the end of the token stream.
+                let end_at = end_at.unwrap_or(self.tokens.len());
+                body = Some(tokens_to_sql(&self.tokens[start..end_at]));
+                self.pos = if end_at < self.tokens.len() {
+                    end_at + 1 // consume END
+                } else {
+                    end_at
+                };
             } else {
                 break;
             }
@@ -3302,6 +3377,7 @@ impl Parser {
             strict,
             security_definer,
             procedure: false,
+            table_cols,
         })
     }
 
@@ -3374,6 +3450,7 @@ impl Parser {
             strict: false,
             security_definer,
             procedure: true,
+            table_cols: Vec::new(),
         })
     }
 
@@ -3384,15 +3461,28 @@ impl Parser {
     /// `double precision` itself which is special-cased.)
     pub(crate) fn parse_func_arg(&mut self) -> Result<FuncArg, SqlError> {
         let w1 = self.expect_ident()?;
+        // v2.04: a bare array type (`text[]` with no arg name, as in
+        // DROP FUNCTION f(text[], text)) — the `[` suffix belongs to
+        // the type word, so this is a bare type, not a named arg.
+        let bare_array = *self.peek() == Token::LBracket;
         let bare_type = matches!(self.peek(), Token::Comma | Token::RParen)
-            || (w1 == "double" && matches!(self.peek(), Token::Ident(s) if s == "precision"));
+            || (w1 == "double" && matches!(self.peek(), Token::Ident(s) if s == "precision"))
+            || bare_array;
         let mut arg = if bare_type {
-            let type_name = if w1 == "double" {
+            let mut type_name = if w1 == "double" {
                 self.next(); // 'precision'
                 "double precision".to_string()
             } else {
                 w1
             };
+            while *self.peek() == Token::LBracket {
+                self.next(); // '['
+                if *self.peek() != Token::RBracket {
+                    return Err(err("expected ] in array type name".to_string()));
+                }
+                self.next(); // ']'
+                type_name.push_str("[]");
+            }
             FuncArg {
                 name: None,
                 type_name,
@@ -3420,17 +3510,25 @@ impl Parser {
 
     /// v0.86: a type name as written for function signatures: an
     /// optionally schema-qualified identifier (`pg_catalog.int4`
-    /// keeps `int4`). Array `[]` suffixes are rejected (bounded).
+    /// keeps `int4`).
+    /// v2.04: array `[]` suffixes are accepted and folded into the
+    /// type name (`text[]`), which `coltype_by_name` and the call
+    /// path already understand — publication.sql's test_gpt helper
+    /// takes a `text[]` argument, and PG19 accepts array-typed
+    /// function arguments generally.
     pub(crate) fn parse_func_type_name(&mut self) -> Result<String, SqlError> {
         let mut name = self.expect_ident()?;
         if *self.peek() == Token::Dot && matches!(self.peek2(), Token::Ident(_)) {
             self.next(); // '.'
             name = self.expect_ident()?;
         }
-        if *self.peek() == Token::LBracket {
-            return Err(err(
-                "array argument/return types are not supported".to_string()
-            ));
+        while *self.peek() == Token::LBracket {
+            self.next(); // '['
+            if *self.peek() != Token::RBracket {
+                return Err(err("expected ] in array type name".to_string()));
+            }
+            self.next(); // ']'
+            name.push_str("[]");
         }
         Ok(name)
     }
@@ -3944,6 +4042,11 @@ impl Parser {
                 }
             } else if self.eat_keyword("table") {
                 loop {
+                    // v2.04: PG19's grammar repeats the TABLE keyword
+                    // per entry (`FOR TABLE t1, TABLE t2`); consume it
+                    // when present (the first iteration already ate
+                    // one, a bare name is unaffected).
+                    let _ = self.eat_keyword("table");
                     let _ = self.eat_keyword("only");
                     let n = self.parse_table_name()?;
                     // v2.03: column list and row filter are parsed for
@@ -4254,6 +4357,31 @@ impl Parser {
             table_specs,
             publish_generated_columns,
         })
+    }
+
+    /// v2.04: `COMMENT ON PUBLICATION name IS 'text' | NULL`.
+    /// Other COMMENT ON targets stay 42601 (pre-v2.04 behavior).
+    pub(crate) fn parse_comment(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("on")?;
+        self.expect_keyword("publication")?;
+        let name = self.expect_ident()?;
+        self.expect_keyword("is")?;
+        let comment = match self.peek().clone() {
+            Token::Str(v) => {
+                self.next();
+                Some(v)
+            }
+            Token::Ident(s) if s == "null" => {
+                self.next();
+                None
+            }
+            _ => {
+                return Err(err(
+                    "syntax error: expected string literal or NULL".to_string()
+                ));
+            }
+        };
+        Ok(Stmt::CommentPublication { name, comment })
     }
 
     /// v2.02: `ALTER PUBLICATION name ...`.
@@ -14019,6 +14147,69 @@ impl Parser {
 /// top-level `;`, ignoring semicolons inside string literals, quoted
 /// identifiers, and comments. Empty segments are dropped (a Query that is
 /// entirely empty is handled by the caller as EmptyQueryResponse).
+/// v2.04: is `seg` (a statement prefix ending at a `;`) inside a
+/// `BEGIN ATOMIC ... END` function body? Word scan with CASE/BEGIN
+/// nesting; single-quoted spans are skipped.
+fn segment_in_atomic_block(seg: &str) -> bool {
+    if !seg.to_ascii_lowercase().contains("atomic") {
+        return false;
+    }
+    let chars: Vec<char> = seg.chars().collect();
+    let mut words: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' {
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\'' {
+                    if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                        i += 2;
+                    } else {
+                        i += 1;
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if c.is_alphabetic() || c == '_' {
+            let st = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            words.push(chars[st..i].iter().collect::<String>().to_ascii_lowercase());
+            continue;
+        }
+        i += 1;
+    }
+    let mut k = 0;
+    while k + 1 < words.len() {
+        if words[k] == "begin" && words[k + 1] == "atomic" {
+            let mut depth = 1i32;
+            let mut m = k + 2;
+            while m < words.len() {
+                match words[m].as_str() {
+                    "case" | "begin" => depth += 1,
+                    "end" => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return false;
+                        }
+                    }
+                    _ => {}
+                }
+                m += 1;
+            }
+            return depth > 0;
+        }
+        k += 1;
+    }
+    false
+}
+
 pub fn split_statements(input: &str) -> Vec<String> {
     let chars: Vec<char> = input.chars().collect();
     let mut out = Vec::new();
@@ -14106,10 +14297,14 @@ pub fn split_statements(input: &str) -> Vec<String> {
         }
         if c == ';' {
             let seg: String = chars[start..i].iter().collect();
-            if !seg.trim().is_empty() {
-                out.push(seg);
+            // v2.04: a `;` inside a BEGIN ATOMIC function body does
+            // not terminate the statement.
+            if !segment_in_atomic_block(&seg) {
+                if !seg.trim().is_empty() {
+                    out.push(seg);
+                }
+                start = i + 1;
             }
-            start = i + 1;
         }
         i += 1;
     }
@@ -14892,6 +15087,21 @@ pub(crate) fn encode_literal(lit: &Literal, out: &mut String) {
         Literal::Null => out.push_str("null"),
     }
     out.push(')');
+}
+
+/// v2.04: standalone Expr <-> s-expr string, for WAL/checkpoint
+/// payloads that carry a bare expression (publication row filters).
+/// Same encoding `encode_constraints` uses for CHECK expressions.
+pub fn encode_expr(e: &Expr) -> String {
+    let mut out = String::new();
+    encode_expr_inner(e, &mut out);
+    out
+}
+
+/// v2.04: inverse of [`encode_expr`].
+pub fn decode_expr(s: &str) -> Result<Expr, String> {
+    let mut p = SexprParser::new(s);
+    p.expr()
 }
 
 pub(crate) fn encode_expr_inner(e: &Expr, out: &mut String) {

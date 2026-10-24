@@ -837,6 +837,18 @@ pub(crate) fn exec_merge(
                             nv = coerce_assign_composite(eng, nv, comp)?;
                             new_values[ci] = nv;
                         }
+                        // v2.04: generated columns materialize on
+                        // the MERGE apply path too (mirrors the
+                        // v2.03 DML wiring in dml.rs).
+                        compute_generated_columns(
+                            eng,
+                            ctx.snap,
+                            ctx.own,
+                            ctx.session,
+                            ctx.role,
+                            &meta,
+                            &mut new_values,
+                        )?;
                         // v2.02: WITH CHECK on the new row; the
                         // SELECT group joins as a check because MERGE
                         // always requires SELECT perms on the target
@@ -1630,6 +1642,16 @@ fn build_merge_insert(
             vals[ci] = coerce_assign_composite(eng, v, Some(tname))?;
         }
     }
+    // v2.04: generated columns materialize on the MERGE insert path.
+    compute_generated_columns(
+        eng,
+        ctx.snap,
+        ctx.own,
+        ctx.session,
+        ctx.role,
+        meta,
+        &mut vals,
+    )?;
     Ok(Row::new(vals))
 }
 
