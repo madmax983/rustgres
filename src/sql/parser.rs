@@ -2168,6 +2168,71 @@ impl Parser {
                 break;
             }
         }
+        // v2.05: ConstraintAttributeSpec — [NOT] DEFERRABLE /
+        // INITIALLY DEFERRED|IMMEDIATE / [NOT] ENFORCED (PG19
+        // gram.y). Parsed and discarded: the engine checks FKs
+        // immediately and has no NOT ENFORCED mode, but the syntax
+        // must parse (foreign_key.sql's inline
+        // `REFERENCES pktable2 DEFERRABLE INITIALLY DEFERRED`).
+        // PG19 gram.y ConstraintAttributeSpec: each attribute may
+        // appear at most once and ENFORCED / NOT ENFORCED (likewise
+        // DEFERRABLE pairs and INITIALLY pairs) conflict — "multiple
+        // ... clauses not allowed" (42601).
+        let mut seen_deferrable = false;
+        let mut seen_initially = false;
+        let mut seen_enforced = false;
+        loop {
+            if self.eat_keyword("not") {
+                if self.eat_keyword("deferrable") {
+                    if seen_deferrable {
+                        return Err(err(
+                            "multiple DEFERRABLE/NOT DEFERRABLE clauses not allowed".to_string(),
+                        ));
+                    }
+                    seen_deferrable = true;
+                } else if self.eat_keyword("enforced") {
+                    if seen_enforced {
+                        return Err(err(
+                            "multiple ENFORCED/NOT ENFORCED clauses not allowed".to_string()
+                        ));
+                    }
+                    seen_enforced = true;
+                } else {
+                    return Err(err(
+                        "syntax error: expected DEFERRABLE or ENFORCED after NOT".to_string(),
+                    ));
+                }
+            } else if self.eat_keyword("deferrable") {
+                if seen_deferrable {
+                    return Err(err(
+                        "multiple DEFERRABLE/NOT DEFERRABLE clauses not allowed".to_string(),
+                    ));
+                }
+                seen_deferrable = true;
+            } else if self.eat_keyword("enforced") {
+                if seen_enforced {
+                    return Err(err(
+                        "multiple ENFORCED/NOT ENFORCED clauses not allowed".to_string()
+                    ));
+                }
+                seen_enforced = true;
+            } else if self.eat_keyword("initially") {
+                if seen_initially {
+                    return Err(err(
+                        "multiple INITIALLY DEFERRED/INITIALLY IMMEDIATE clauses not allowed"
+                            .to_string(),
+                    ));
+                }
+                seen_initially = true;
+                if !(self.eat_keyword("deferred") || self.eat_keyword("immediate")) {
+                    return Err(err(
+                        "syntax error: expected DEFERRED or IMMEDIATE".to_string()
+                    ));
+                }
+            } else {
+                break;
+            }
+        }
         Ok(ParsedFkTail {
             ref_table,
             ref_cols,
@@ -2674,6 +2739,18 @@ impl Parser {
                         mode,
                     });
                 }
+                // v2.05: ALTER COLUMN c SET EXPRESSION AS (expr)
+                // (PG19 AT_SetExpression).
+                if self.eat_keyword("expression") {
+                    self.expect_keyword("as")?;
+                    self.expect(Token::LParen, "'('")?;
+                    let e = self.parse_or()?;
+                    self.expect(Token::RParen, "')'")?;
+                    return Ok(AlterAction::AlterColumnSetExpression {
+                        name: cname,
+                        expr: e,
+                    });
+                }
                 self.expect_keyword("default")?;
                 let e = self.parse_or()?;
                 validate_constraint_expr(&e, "DEFAULT")?;
@@ -2687,6 +2764,20 @@ impl Parser {
                 if self.eat_keyword("not") {
                     self.expect_keyword("null")?;
                     return Ok(AlterAction::AlterColumnDropNotNull { name: cname });
+                }
+                // v2.05: ALTER COLUMN c DROP EXPRESSION [IF EXISTS]
+                // (PG19 AT_DropExpression).
+                if self.eat_keyword("expression") {
+                    let if_exists = if self.eat_keyword("if") {
+                        self.expect_keyword("exists")?;
+                        true
+                    } else {
+                        false
+                    };
+                    return Ok(AlterAction::AlterColumnDropExpression {
+                        name: cname,
+                        if_exists,
+                    });
                 }
                 self.expect_keyword("default")?;
                 return Ok(AlterAction::AlterColumnDropDefault { name: cname });
@@ -13852,7 +13943,21 @@ impl Parser {
             return Ok(GrantObject::Sequence(self.parse_table_name()?));
         }
         if self.eat_keyword("database") {
-            // `GRANT ... ON DATABASE` without a name targets this database.
+            // v2.05: `GRANT ... ON DATABASE <name>` — PG19 takes an
+            // optional database name here. The engine is
+            // single-database, so the name is consumed and not
+            // validated; bare `ON DATABASE` (no name) still targets
+            // this database. The following TO/FROM keyword must not
+            // be mistaken for the name (protocol_test11's nameless
+            // REVOKE CONNECT ON DATABASE FROM ... shape).
+            let is_name = match self.peek() {
+                Token::QIdent(_) => true,
+                Token::Ident(w) => !w.eq_ignore_ascii_case("to") && !w.eq_ignore_ascii_case("from"),
+                _ => false,
+            };
+            if is_name {
+                let _db_name = self.expect_ident()?;
+            }
             return Ok(GrantObject::Database);
         }
         // TABLE name [, ...]: only the first name is used (v0.11 has a

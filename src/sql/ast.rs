@@ -2586,6 +2586,19 @@ pub enum AlterAction {
     AlterColumnDropNotNull {
         name: String,
     },
+    /// v2.05: ALTER COLUMN c SET EXPRESSION AS (expr) (PG19
+    /// AT_SetExpression) — replaces a generated column's expression.
+    AlterColumnSetExpression {
+        name: String,
+        expr: Expr,
+    },
+    /// v2.05: ALTER COLUMN c DROP EXPRESSION [IF EXISTS] (PG19
+    /// AT_DropExpression) — the column becomes a regular column,
+    /// keeping its current values.
+    AlterColumnDropExpression {
+        name: String,
+        if_exists: bool,
+    },
     RenameColumn {
         old: String,
         new: String,
@@ -2897,6 +2910,83 @@ pub(crate) fn def_col_exists(def: &TableDef, n: &str) -> bool {
     def.columns.iter().any(|(c, _)| c == n)
 }
 
+/// v2.05: PG19 makeObjectName / ChooseConstraintName for an
+/// auto-generated constraint name: truncate the base to 63 bytes
+/// (NAMEDATALEN-1); on collision within the table, append 1, 2, ...
+/// re-truncating the stem so the result stays within 63 bytes
+/// (foreign_key.out: fktable2_..._charact_fkey then
+/// fktable2_..._charac_fkey1). Explicit names keep the caller's
+/// duplicate error.
+pub(crate) fn choose_auto_name(def: &TableDef, base: &str) -> String {
+    fn trunc(s: &str, n: usize) -> String {
+        let mut out = String::new();
+        for ch in s.chars() {
+            if out.len() + ch.len_utf8() > n {
+                break;
+            }
+            out.push(ch);
+        }
+        out
+    }
+    let cand = trunc(base, 63);
+    if !def_constraint_name_exists(def, &cand) {
+        return cand;
+    }
+    let mut k = 1;
+    loop {
+        let suffix = k.to_string();
+        let cand = format!("{}{}", trunc(base, 63 - suffix.len()), suffix);
+        if !def_constraint_name_exists(def, &cand) {
+            return cand;
+        }
+        k += 1;
+    }
+}
+
+/// v2.05: PG19 ChooseConstraintName for FOREIGN KEY constraints
+/// (tablecmds.c ChooseForeignKeyConstraintNameAddition +
+/// catalog.c makeObjectName): the name is
+/// `{table}_{col1_col2_...}_fkey`; when it exceeds 63 bytes the
+/// column addition is truncated (table and suffix stay intact);
+/// on collision the retry appends 1, 2, ... to the "fkey" suffix
+/// and re-truncates the addition (foreign_key.out:
+/// fktable2_..._charact_fkey, then fktable2_..._charac_fkey1).
+pub(crate) fn pg_fk_auto_name(
+    table: &str,
+    cols: &[String],
+    taken: impl Fn(&str) -> bool,
+) -> String {
+    fn trunc(s: &str, n: usize) -> String {
+        let mut out = String::new();
+        for ch in s.chars() {
+            if out.len() + ch.len_utf8() > n {
+                break;
+            }
+            out.push(ch);
+        }
+        out
+    }
+    // The addition itself is capped at 63 chars by PG.
+    let addition = trunc(&cols.join("_"), 63);
+    let make = |suffix: &str| -> String {
+        let name3 = format!("fkey{}", suffix);
+        let budget = 63usize.saturating_sub(table.len() + 1 + name3.len() + 1);
+        format!("{}_{}_{}", table, trunc(&addition, budget), name3)
+    };
+    let cand = make("");
+    if !taken(&cand) {
+        return cand;
+    }
+    let mut k = 1;
+    loop {
+        let cand = make(&k.to_string());
+        if !taken(&cand) {
+            return cand;
+        }
+        k += 1;
+    }
+}
+
 pub(crate) fn def_constraint_name_exists(def: &TableDef, cname: &str) -> bool {
     def.uniques.iter().any(|u| u.name == cname)
         || def.checks.iter().any(|c| c.name == cname)
@@ -2924,10 +3014,15 @@ pub(crate) fn def_add_pkey(
     if def.pkey.is_some() {
         return Err(err("multiple primary keys for table".to_string()));
     }
-    let cname = name.unwrap_or_else(|| format!("{}_pkey", table));
-    if def_constraint_name_exists(def, &cname) {
-        return Err(err(format!("constraint \"{}\" already exists", cname)));
-    }
+    let cname = match &name {
+        Some(n) => {
+            if def_constraint_name_exists(def, n) {
+                return Err(err(format!("constraint \"{}\" already exists", n)));
+            }
+            n.clone()
+        }
+        None => choose_auto_name(def, &format!("{}_pkey", table)),
+    };
     if !defer_col_check {
         for c in cols {
             let i = def.columns.iter().position(|(n, _)| n == c).unwrap();
@@ -2958,10 +3053,15 @@ pub(crate) fn def_add_unique(
             }
         }
     }
-    let cname = name.unwrap_or_else(|| format!("{}_{}_key", table, col));
-    if def_constraint_name_exists(def, &cname) {
-        return Err(err(format!("constraint \"{}\" already exists", cname)));
-    }
+    let cname = match &name {
+        Some(n) => {
+            if def_constraint_name_exists(def, n) {
+                return Err(err(format!("constraint \"{}\" already exists", n)));
+            }
+            n.clone()
+        }
+        None => choose_auto_name(def, &format!("{}_{}_key", table, col)),
+    };
     def.uniques.push(UniqueDef {
         name: cname,
         cols: cols.to_vec(),
@@ -2976,10 +3076,15 @@ pub(crate) fn def_add_check(
     e: Expr,
     col: &str,
 ) -> Result<(), SqlError> {
-    let cname = name.unwrap_or_else(|| format!("{}_{}_check", table, col));
-    if def_constraint_name_exists(def, &cname) {
-        return Err(err(format!("constraint \"{}\" already exists", cname)));
-    }
+    let cname = match &name {
+        Some(n) => {
+            if def_constraint_name_exists(def, n) {
+                return Err(err(format!("constraint \"{}\" already exists", n)));
+            }
+            n.clone()
+        }
+        None => choose_auto_name(def, &format!("{}_{}_check", table, col)),
+    };
     // CHECK expressions may only reference this table's columns.
     let mut refs = Vec::new();
     collect_col_refs(&e, &mut refs);
@@ -3021,10 +3126,15 @@ pub(crate) fn def_add_fk(
             }
         }
     }
-    let cname = name.unwrap_or_else(|| format!("{}_{}_fkey", table, cols[0]));
-    if def_constraint_name_exists(def, &cname) {
-        return Err(err(format!("constraint \"{}\" already exists", cname)));
-    }
+    let cname = match &name {
+        Some(n) => {
+            if def_constraint_name_exists(def, n) {
+                return Err(err(format!("constraint \"{}\" already exists", n)));
+            }
+            n.clone()
+        }
+        None => pg_fk_auto_name(table, cols, |n| def_constraint_name_exists(def, n)),
+    };
     def.fks.push(FkDef {
         name: cname,
         cols: cols.to_vec(),

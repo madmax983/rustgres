@@ -28,7 +28,7 @@
 use super::*;
 use crate::storage::{PubTableSpec, Publication};
 
-fn base_name(name: &str) -> &str {
+pub(crate) fn base_name(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
 }
 
@@ -965,6 +965,36 @@ pub(crate) fn check_replica_identity(
             }
             any_pub_action = true;
             let spec = p.table_specs.get(&lvl_base);
+            // v2.05 (PG19 CheckCmdReplicaIdentity): a column list or
+            // row filter stored on a partitioned ANCESTOR cannot be
+            // applied to this leaf when the publication does not
+            // publish via the partition root — reachable when
+            // publish_via_partition_root is flipped to false after
+            // the spec was added (DDL-time checks catch the rest).
+            if lvl_base != base.to_lowercase() && !p.via_partition_root {
+                if let Some(sp) = spec {
+                    if sp.filter.is_some() {
+                        return Err(ri_validity_err(
+                            is_update,
+                            base,
+                            &format!(
+                                "The publication contains a WHERE clause for partitioned table \"{}\", which is not allowed when \"publish_via_partition_root\" is false.",
+                                base_name(&name)
+                            ),
+                        ));
+                    }
+                    if sp.cols.is_some() {
+                        return Err(ri_validity_err(
+                            is_update,
+                            base,
+                            &format!(
+                                "The publication contains a column list for partitioned table \"{}\", which is not allowed when \"publish_via_partition_root\" is false.",
+                                base_name(&name)
+                            ),
+                        ));
+                    }
+                }
+            }
             // 1. Row filter columns must be in the replica identity.
             if let Some(f) = spec.and_then(|s| s.filter.as_ref()) {
                 let mut fcols = Vec::new();
@@ -1140,6 +1170,18 @@ pub(crate) fn build_table_specs(
         if let Some(t) = t {
             if let Some(cols) = cols {
                 validate_column_list(&t, name, cols)?;
+                // v2.05 (PG19 CheckPubRelationColumnList): a column
+                // list on a partitioned table requires
+                // publish_via_partition_root.
+                if !via_root && t.partition.as_ref().is_some_and(|pi| pi.is_partitioned) {
+                    return Err(exec_err(
+                        "22023",
+                        format!(
+                            "cannot use column list for relation \"{}\" in publication",
+                            name
+                        ),
+                    ));
+                }
             }
             if let Some(f) = filter {
                 validate_row_filter(eng, &t, name, f)?;
@@ -1170,6 +1212,76 @@ pub(crate) fn build_table_specs(
 // they take effect immediately, like replication-slot DDL.
 // ---------------------------------------------------------------------------
 
+// v2.05: PG19 publicationcmds.c permission model.
+// CREATE privilege on the database rides the db_acl REFERENCES bit
+// (see roles.rs GrantObject::Database mapping); the database owner
+// and superusers hold it implicitly. PUBLIC holds no CREATE by
+// default (a fresh PG database grants PUBLIC only CONNECT+TEMP).
+pub(crate) fn pub_is_super(eng: &Engine, ctx: &StmtCtx) -> bool {
+    crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own)
+}
+
+pub(crate) fn pub_has_db_create(eng: &Engine, ctx: &StmtCtx, role: &str) -> bool {
+    if crate::storage::is_superuser_snap(&eng.db, role, ctx.snap, ctx.own) {
+        return true;
+    }
+    if role == eng.db.db_owner {
+        return true;
+    }
+    let closure = crate::storage::role_closure(&eng.db, role, ctx.snap, ctx.own);
+    eng.db.db_acl.iter().any(|e| {
+        (e.role == "public" || closure.iter().any(|n| n == &e.role))
+            && e.privs & crate::storage::PRIV_REFERENCES != 0
+    })
+}
+
+/// PG19 object_ownercheck: the actor owns the object when they are
+/// the owner or a member of the owning role; superusers pass.
+pub(crate) fn pub_ownercheck(eng: &Engine, ctx: &StmtCtx, owner: &str) -> bool {
+    if pub_is_super(eng, ctx) {
+        return true;
+    }
+    crate::storage::membership_closure(&eng.db, ctx.role, ctx.snap, ctx.own)
+        .iter()
+        .any(|n| n == owner)
+}
+
+pub(crate) fn pub_require_owner(eng: &Engine, ctx: &StmtCtx, name: &str) -> Result<(), ExecError> {
+    let owner = eng
+        .db
+        .publications
+        .get(name)
+        .map(|p| p.owner.clone())
+        .unwrap_or_default();
+    if !pub_ownercheck(eng, ctx, &owner) {
+        return Err(exec_err(
+            "42501",
+            format!("must be owner of publication {}", name),
+        ));
+    }
+    Ok(())
+}
+
+/// PublicationAddTables' table-ownership rule (also used at CREATE).
+pub(crate) fn pub_require_table_owner(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    table: &str,
+) -> Result<(), ExecError> {
+    if let Some(t) = eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+    {
+        if !pub_ownercheck(eng, ctx, &t.owner.clone()) {
+            return Err(exec_err(
+                "42501",
+                format!("must be owner of table {}", base_name(table)),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_create_publication(
     eng: &mut Engine,
@@ -1185,11 +1297,46 @@ pub(crate) fn exec_create_publication(
     table_specs: &[(String, Option<Vec<String>>, Option<Expr>)],
     publish_generated_columns: &Option<String>,
 ) -> Result<ExecResult, ExecError> {
+    // v2.05 (PG19 CreatePublication): CREATE privilege on the
+    // database first, then the superuser-only shapes.
+    if !pub_has_db_create(eng, ctx, ctx.role) {
+        return Err(exec_err(
+            "42501",
+            "permission denied for database postgres".to_string(),
+        ));
+    }
+    if !pub_is_super(eng, ctx) {
+        if all_tables || all_sequences {
+            return Err(exec_err(
+                "42501",
+                "must be superuser to create a FOR ALL TABLES or ALL SEQUENCES publication"
+                    .to_string(),
+            ));
+        }
+        if !schemas.is_empty() {
+            return Err(exec_err(
+                "42501",
+                "must be superuser to create FOR TABLES IN SCHEMA publication".to_string(),
+            ));
+        }
+    }
     if eng.db.publications.contains_key(name) {
         return Err(exec_err(
             "42710",
             format!("publication \"{}\" already exists", name),
         ));
+    }
+    // v2.05: PublicationAddTables ownership applies at CREATE too.
+    for t in tables.iter().chain(except_tables.iter()) {
+        // Missing tables keep their existing 42P01 path below;
+        // ownership is only checked for tables that exist.
+        if eng
+            .db
+            .find_table(t, ctx.snap, &ctx.all_xids, ctx.session)
+            .is_some()
+        {
+            pub_require_table_owner(eng, ctx, t)?;
+        }
     }
     // Validate named tables and schemas (publicationcmds.c).
     // v2.03: a duplicate table is only an error when neither entry
@@ -1283,6 +1430,13 @@ pub(crate) fn exec_drop_publication(
     names: &[String],
     if_exists: bool,
 ) -> Result<ExecResult, ExecError> {
+    // v2.05: DROP PUBLICATION requires ownership (PG19 RemoveObjects
+    // owner check), per existing publication in the list.
+    for name in names {
+        if eng.db.publications.contains_key(name) {
+            pub_require_owner(eng, ctx, name)?;
+        }
+    }
     for name in names {
         match eng.db.publications.remove(name) {
             Some(p) => {
@@ -1335,6 +1489,60 @@ pub(crate) fn exec_alter_publication(
     // Captured for the statement undo log (v2.02): every successful
     // mutation below records the pre-statement entry.
     let prev_pub = eng.db.publications.get(name).cloned();
+    // v2.05 (PG19 AlterPublication / CheckAlterPublication /
+    // AlterPublicationOwner_internal): ownership + superuser gates.
+    pub_require_owner(eng, ctx, name)?;
+    if !pub_is_super(eng, ctx) {
+        if (action == 'a' || action == 's') && !schemas.is_empty() {
+            return Err(exec_err(
+                "42501",
+                "must be superuser to add or set schemas".to_string(),
+            ));
+        }
+        if action == 's' && spec_all_tables {
+            return Err(exec_err(
+                "42501",
+                "must be superuser to set ALL TABLES".to_string(),
+            ));
+        }
+        if action == 's' && spec_all_sequences {
+            return Err(exec_err(
+                "42501",
+                "must be superuser to set ALL SEQUENCES".to_string(),
+            ));
+        }
+        if action == 'o' {
+            let new_owner = new_value.clone().unwrap_or_default();
+            let can_set = crate::storage::membership_closure(&eng.db, ctx.role, ctx.snap, ctx.own)
+                .iter()
+                .any(|n| n == &new_owner);
+            let new_has_create = pub_has_db_create(eng, ctx, &new_owner);
+            let new_is_super =
+                crate::storage::is_superuser_snap(&eng.db, &new_owner, ctx.snap, ctx.own);
+            let p = eng.db.publications.get(name).expect("checked above");
+            let needs_super_owner = p.all_tables || p.all_sequences || !p.schemas.is_empty();
+            if !can_set || !new_has_create || (needs_super_owner && !new_is_super) {
+                return Err(exec_err(
+                    "42501",
+                    format!(
+                        "permission denied to change owner of publication \"{}\"",
+                        name
+                    ),
+                ));
+            }
+        }
+    }
+    if action == 'a' || action == 's' {
+        for t in tables {
+            if eng
+                .db
+                .find_table(t, ctx.snap, &ctx.all_xids, ctx.session)
+                .is_some()
+            {
+                pub_require_table_owner(eng, ctx, t)?;
+            }
+        }
+    }
     match action {
         'r' => {
             let new_name = new_value.clone().unwrap_or_default();

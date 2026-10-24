@@ -1172,6 +1172,14 @@ pub(crate) fn exec_alter_one(
         AlterAction::AlterColumnDropNotNull { name: col } => {
             alter_set_not_null(eng, ctx, name, col, false)
         }
+        // v2.05: SET EXPRESSION / DROP EXPRESSION (PG19).
+        AlterAction::AlterColumnSetExpression { name: col, expr } => {
+            alter_column_expression(eng, ctx, name, col, Some(expr.clone()), false)
+        }
+        AlterAction::AlterColumnDropExpression {
+            name: col,
+            if_exists,
+        } => alter_column_expression(eng, ctx, name, col, None, *if_exists),
         AlterAction::RenameColumn { old, new } => {
             alter_rename_column_ext(eng, ctx, name, old, new, only, true)
         }
@@ -2100,6 +2108,14 @@ pub(crate) fn alter_drop_column_ext(
             if ix.def.table != name {
                 continue;
             }
+            // v2.05: skip already-dropped index versions — the map
+            // retains them for MVCC, and a same-named index dropped
+            // with an earlier incarnation of this table otherwise
+            // gets "dropped" again here and fails 42P01 in
+            // drop_index_internal (indexing.sql idxpart_col1_idx).
+            if !crate::storage::index_visible(&ix.def, ctx.snap, &ctx.all_xids) {
+                continue;
+            }
             if ix.def.col_names.iter().any(|c| c == col) {
                 dep_indexes.push(ix_name.clone());
             }
@@ -2117,18 +2133,90 @@ pub(crate) fn alter_drop_column_ext(
             }
         }
     }
+    // v2.05: capture the RI index name now — `t`'s borrow must end
+    // before the CASCADE mutations below.
+    let ri_index_name: Option<String> = match &t.replica_identity {
+        crate::storage::ReplicaIdentity::Index(n) => Some(n.clone()),
+        _ => None,
+    };
+    // v2.05: generated columns whose generation expression references
+    // the dropped column are NORMAL dependents (PG19 generated_*.out
+    // gtest10: 2BP01). The dropped column's own generation expression
+    // is not a dependent.
+    let mut dep_gen: Vec<String> = Vec::new();
+    for (i, g) in t.gen_cols.iter().enumerate() {
+        if i == ci {
+            continue;
+        }
+        if let Some((expr, _stored)) = g {
+            let mut refs = Vec::new();
+            collect_col_refs(expr, &mut refs);
+            if refs.iter().any(|(_, r)| r == col) {
+                dep_gen.push(t.columns[i].0.clone());
+            }
+        }
+    }
+    // v2.05: publications whose column list or row filter for this
+    // table references the column are NORMAL dependents (PG19
+    // publication.out testpub_tbl5: 2BP01 with DETAIL naming the
+    // publication). (pub_name, in_column_list, in_row_filter)
+    let tbl_key = crate::exec::publication::base_name(name).to_lowercase();
+    let mut dep_pubs: Vec<(String, bool, bool)> = Vec::new();
+    if !is_temp {
+        for (pname, p) in &eng.db.publications {
+            if let Some(spec) = p.table_specs.get(&tbl_key) {
+                let in_cols = spec
+                    .cols
+                    .as_ref()
+                    .is_some_and(|cs| cs.iter().any(|c| c.eq_ignore_ascii_case(col)));
+                let in_filter = spec.filter.as_ref().is_some_and(|f| {
+                    let mut refs = Vec::new();
+                    collect_col_refs(f, &mut refs);
+                    refs.iter().any(|(_, r)| r.eq_ignore_ascii_case(col))
+                });
+                if in_cols || in_filter {
+                    dep_pubs.push((pname.clone(), in_cols, in_filter));
+                }
+            }
+        }
+    }
+    // v2.05: PG19 dependency classes — this table's own CHECK /
+    // UNIQUE / PK constraints and plain indexes on the column are
+    // AUTO/INTERNAL dependents: they are dropped WITH the column
+    // even under RESTRICT (alter_table.out atacc1 value / old_system
+    // _table othercol), so dep_constraints / dep_indexes no longer
+    // block; the unconditional drop code below removes them either
+    // way. Only NORMAL dependents block: other tables' FKs, views,
+    // generated expressions, publications.
     if !cascade
-        && (!dep_constraints.is_empty()
-            || !dep_fks.is_empty()
-            || !dep_indexes.is_empty()
-            || !dep_views.is_empty())
+        && (!dep_fks.is_empty()
+            || !dep_views.is_empty()
+            || !dep_gen.is_empty()
+            || !dep_pubs.is_empty())
     {
-        let first = dep_constraints
+        if let Some((pname, _, _)) = dep_pubs.first() {
+            let mut e = exec_err(
+                "2BP01",
+                format!(
+                    "cannot drop column {} of table {} because other objects depend on it",
+                    col,
+                    crate::exec::publication::base_name(name)
+                ),
+            );
+            e.detail = Some(format!(
+                "publication of table {} in publication {} depends on column {} of table {}",
+                crate::exec::publication::base_name(name),
+                pname,
+                col,
+                crate::exec::publication::base_name(name)
+            ));
+            return Err(e);
+        }
+        let first = dep_fks
             .first()
-            .map(|s| s.as_str())
-            .or(dep_fks.first().map(|(_, f)| f.as_str()))
-            .or(dep_indexes.first().map(|s| s.as_str()))
+            .map(|(_, f)| f.as_str())
             .or(dep_views.first().map(|s| s.as_str()))
+            .or(dep_gen.first().map(|s| s.as_str()))
             .unwrap_or("?");
         return Err(exec_err(
             "2BP01",
@@ -2170,6 +2258,63 @@ pub(crate) fn alter_drop_column_ext(
         .collect();
     for sname in &owned_here {
         drop_serial_sequence(eng, ctx, sname)?;
+    }
+    // v2.05 CASCADE: publication dependents — strip the column from
+    // the publication's column list; a row filter referencing the
+    // column (or a list that becomes empty) removes the table entry
+    // from the publication entirely (the pg_publication_rel row is
+    // the dependent object). Under RESTRICT we already returned.
+    if cascade {
+        for (pname, _in_cols, in_filter) in &dep_pubs {
+            let prev = eng.db.publications.get(pname).cloned();
+            if let Some(p) = eng.db.publications.get_mut(pname) {
+                if *in_filter {
+                    p.tables.retain(|tn| {
+                        crate::exec::publication::base_name(tn).to_lowercase() != tbl_key
+                    });
+                    p.table_specs.remove(&tbl_key);
+                } else if let Some(spec) = p.table_specs.get_mut(&tbl_key) {
+                    if let Some(cs) = spec.cols.as_mut() {
+                        cs.retain(|c| !c.eq_ignore_ascii_case(col));
+                        if cs.is_empty() {
+                            // handled below via removal flag
+                        }
+                    }
+                }
+                let emptied = p
+                    .table_specs
+                    .get(&tbl_key)
+                    .is_some_and(|s| s.cols.as_ref().is_some_and(|cs| cs.is_empty()));
+                if emptied {
+                    p.tables.retain(|tn| {
+                        crate::exec::publication::base_name(tn).to_lowercase() != tbl_key
+                    });
+                    p.table_specs.remove(&tbl_key);
+                }
+            }
+            ctx.writes.push(crate::storage::WriteOp::AlterPublication {
+                name: pname.clone(),
+                prev,
+            });
+        }
+        // CASCADE: dependent generated columns lose their generation
+        // expression (they keep their stored values and become plain
+        // columns; PG drops the dependent — named divergence).
+        for gname in &dep_gen {
+            if let Some(pos) = next.columns.iter().position(|(n, _)| n == gname) {
+                if let Some(slot) = next.gen_cols.get_mut(pos) {
+                    *slot = None;
+                }
+            }
+        }
+    }
+    // v2.05: when the column's AUTO drop removes the replica
+    // identity index, the table's replica identity reverts to
+    // DEFAULT (PG19: dropping the RI index resets relreplident).
+    if let Some(ixname) = &ri_index_name {
+        if dep_indexes.iter().any(|n| n == ixname) {
+            next.replica_identity = crate::storage::ReplicaIdentity::Default;
+        }
     }
     // Views first (they only read).
     for v in &dep_views {
@@ -2234,6 +2379,14 @@ pub(crate) fn alter_drop_column_ext(
     if !is_temp {
         for (ix_name, ix) in &eng.db.indexes {
             if ix.def.table != name {
+                continue;
+            }
+            // v2.05: indexes already dropped above as dependents of
+            // the column (marked dropped_xmax by this statement)
+            // must not enter the shift/re-create pass — re-dropping
+            // them failed 42P01 (a latent bug the old RESTRICT block
+            // masked: it errored before reaching this code).
+            if !crate::storage::index_visible(&ix.def, ctx.snap, &ctx.all_xids) {
                 continue;
             }
             index_defs.push((
@@ -2542,18 +2695,9 @@ pub(crate) fn alter_add_constraint(
         }
         if let Some(f) = fk.as_mut() {
             if f.name.is_empty() {
-                let base = format!(
-                    "{}_{}_fkey",
-                    name,
-                    f.cols.first().cloned().unwrap_or_default()
-                );
-                let mut cand = base.clone();
-                let mut k = 1;
-                while taken(&cand) {
-                    cand = format!("{}{}", base, k);
-                    k += 1;
-                }
-                f.name = cand;
+                // v2.05: PG19 FK naming (all columns, suffix on
+                // "fkey", 63-byte truncation) — shared with CREATE.
+                f.name = crate::sql::pg_fk_auto_name(name, &f.cols, taken);
             }
         }
         if let Some(c) = check.as_mut() {
@@ -2818,6 +2962,31 @@ pub(crate) fn alter_add_constraint(
                 ));
             }
         }
+        // v2.05: PG19 — ADD PRIMARY KEY implies NOT NULL on the key
+        // columns (and fails 23502 when existing rows hold NULL).
+        // Without this, REPLICA IDENTITY USING INDEX on an
+        // ALTER-added PK always failed 42809 "column is nullable".
+        for c in &pk.cols {
+            let ci = next.column_index(c).expect("checked above");
+            for r in next
+                .rows
+                .iter()
+                .filter(|r| row_visible(r, ctx.snap, &ctx.all_xids))
+            {
+                if r.values.get(ci) == Some(&crate::storage::Value::Null) {
+                    return Err(exec_err(
+                        "23502",
+                        format!(
+                            "column \"{}\" of relation \"{}\" contains null values",
+                            c, name
+                        ),
+                    ));
+                }
+            }
+            if let Some(nn) = next.not_null.get_mut(ci) {
+                *nn = true;
+            }
+        }
         next.pkey = Some(pk.clone());
         alter_swap(eng, ctx, name, None, next, None)?;
         if eng.db.is_temp_table(ctx.session, name) {
@@ -3022,6 +3191,204 @@ pub(crate) fn alter_set_not_null(
     }
     next.not_null[ci] = set;
     alter_swap(eng, ctx, name, None, next, None)?;
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
+/// v2.05: ALTER COLUMN c SET EXPRESSION AS (expr) / DROP EXPRESSION
+/// [IF EXISTS] (PG19 tablecmds.c AT_SetExpression /
+/// AT_DropExpression). A non-generated column is 55000
+/// (ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE, "is not a generated
+/// column"); DROP EXPRESSION IF EXISTS on one is a no-op success
+/// (PG emits a NOTICE). SET on a STORED column rewrites live rows
+/// with the new expression; DROP on a VIRTUAL column materializes
+/// the computed values into the rows before clearing the marker.
+pub(crate) fn alter_column_expression(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    col: &str,
+    new_expr: Option<crate::sql::Expr>,
+    if_exists: bool,
+) -> Result<ExecResult, ExecError> {
+    let t = eng
+        .db
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
+        .clone();
+    let ci = t
+        .columns
+        .iter()
+        .position(|(n, _)| n == col)
+        .ok_or_else(|| {
+            exec_err(
+                "42703",
+                format!("column \"{}\" of relation \"{}\" does not exist", col, name),
+            )
+        })?;
+    let cur = t.gen_cols.get(ci).cloned().flatten();
+    let Some((_, stored)) = cur else {
+        if new_expr.is_none() && if_exists {
+            return Ok(ExecResult::Command {
+                tag: "ALTER TABLE".to_string(),
+            });
+        }
+        return Err(exec_err(
+            "55000",
+            format!(
+                "column \"{}\" of relation \"{}\" is not a generated column",
+                col, name
+            ),
+        ));
+    };
+    let mut next = t.clone();
+    while next.gen_cols.len() < next.columns.len() {
+        next.gen_cols.push(None);
+    }
+    match &new_expr {
+        Some(e) => next.gen_cols[ci] = Some((e.clone(), stored)),
+        None => next.gen_cols[ci] = None,
+    }
+    // Partition descendants: the leaves hold the rows. Their defs
+    // do not carry gen_cols in this engine (the root's meta drives
+    // generated computation for routed rows), so leaf row work
+    // borrows the root's gen list and leaf catalogs stay untouched.
+    let mut descendants: Vec<(String, crate::storage::Table)> = Vec::new();
+    {
+        let mut stack: Vec<String> = t
+            .partition
+            .as_ref()
+            .map(|p| p.children.clone())
+            .unwrap_or_default();
+        while let Some(cname) = stack.pop() {
+            if let Some(ct) = eng
+                .db
+                .find_table(&cname, ctx.snap, &ctx.all_xids, ctx.session)
+                .cloned()
+            {
+                if let Some(p) = &ct.partition {
+                    stack.extend(p.children.iter().cloned());
+                }
+                descendants.push((cname, ct));
+            }
+        }
+    }
+    // The rewrite revalidates each row: a SET EXPRESSION that
+    // would produce NULL in a NOT NULL generated column fails
+    // 23502 (generated_stored gtestnn_parent), as does a DROP
+    // EXPRESSION materializing NULLs into a NOT NULL column.
+    fn rewrite_rows(
+        eng: &mut Engine,
+        ctx: &mut StmtCtx,
+        tname: &str,
+        tdef: &crate::storage::Table,
+        compute_meta: &TableMeta,
+        validate_meta: &TableMeta,
+        swap_def: crate::storage::Table,
+    ) -> Result<(), ExecError> {
+        let mut new_rows: Vec<crate::storage::RowVersion> = Vec::with_capacity(tdef.rows.len());
+        for rv in &tdef.rows {
+            if row_visible(rv, ctx.snap, &ctx.all_xids) {
+                let mut cells = rv.values.to_vec();
+                compute_generated_columns(
+                    eng,
+                    ctx.snap,
+                    ctx.own,
+                    ctx.session,
+                    ctx.role,
+                    compute_meta,
+                    &mut cells,
+                )?;
+                check_row_constraints(
+                    eng,
+                    ctx.snap,
+                    ctx.own,
+                    ctx.session,
+                    ctx.role,
+                    validate_meta,
+                    tname,
+                    &cells,
+                )?;
+                new_rows.push(crate::storage::RowVersion {
+                    values: crate::storage::Row::new(cells),
+                    xmin: ctx.write_xid,
+                    xmax: 0,
+                    ..rv.clone()
+                });
+            } else {
+                new_rows.push(rv.clone());
+            }
+        }
+        alter_swap(eng, ctx, tname, None, swap_def, Some(new_rows))
+    }
+    if new_expr.is_some() && stored {
+        // SET on STORED: recompute with the NEW expression.
+        let meta = TableMeta::of(&next);
+        rewrite_rows(eng, ctx, name, &t, &meta, &meta, next.clone())?;
+        for (lname, ldef) in &descendants {
+            let mut cdef = ldef.clone();
+            cdef.gen_cols = next.gen_cols.clone();
+            let meta = TableMeta::of(&cdef);
+            rewrite_rows(eng, ctx, lname, ldef, &meta, &meta, ldef.clone())?;
+        }
+    } else if new_expr.is_none() && !stored {
+        // DROP on VIRTUAL: materialize with the OLD expression.
+        let meta_old = TableMeta::of(&t);
+        let meta_new = TableMeta::of(&next);
+        rewrite_rows(eng, ctx, name, &t, &meta_old, &meta_new, next.clone())?;
+        for (lname, ldef) in &descendants {
+            let mut cdef = ldef.clone();
+            cdef.gen_cols = t.gen_cols.clone();
+            let meta_old = TableMeta::of(&cdef);
+            let meta_new = TableMeta::of(ldef);
+            rewrite_rows(eng, ctx, lname, ldef, &meta_old, &meta_new, ldef.clone())?;
+        }
+    } else if new_expr.is_some() {
+        // SET on VIRTUAL stores no values, but PG19 still
+        // verifies the new expression against existing rows when
+        // the column is NOT NULL (verify_new_notnull) — over the
+        // named table and every partition leaf.
+        if next.not_null.get(ci).copied().unwrap_or(false) {
+            let mut cdef_owned: Vec<crate::storage::Table> = vec![next.clone()];
+            for (_, ldef) in &descendants {
+                let mut cdef = ldef.clone();
+                cdef.gen_cols = next.gen_cols.clone();
+                cdef_owned.push(cdef);
+            }
+            let mut defs: Vec<&crate::storage::Table> = vec![&t];
+            defs.extend(descendants.iter().map(|(_, ldef)| ldef));
+            for (tdef, cdef) in defs.iter().zip(cdef_owned.iter()) {
+                let meta_new = TableMeta::of(cdef);
+                for rv in &tdef.rows {
+                    if row_visible(rv, ctx.snap, &ctx.all_xids) {
+                        let mut cells = rv.values.to_vec();
+                        compute_generated_columns(
+                            eng,
+                            ctx.snap,
+                            ctx.own,
+                            ctx.session,
+                            ctx.role,
+                            &meta_new,
+                            &mut cells,
+                        )?;
+                        if matches!(cells.get(ci), Some(Value::Null)) {
+                            return Err(exec_err(
+                                "23502",
+                                format!(
+                                    "column \"{}\" of relation \"{}\" contains null values",
+                                    col, name
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        alter_swap(eng, ctx, name, None, next, None)?;
+    } else {
+        alter_swap(eng, ctx, name, None, next, None)?;
+    }
     Ok(ExecResult::Command {
         tag: "ALTER TABLE".to_string(),
     })

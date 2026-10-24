@@ -2769,7 +2769,14 @@ pub(crate) fn validate_fk_def(
 /// namespace can't hold one `{constraint}` index per sibling); every
 /// other table keeps the historical `{constraint}` name.
 pub(crate) fn constraint_index_name(table: &str, con: &str, is_partition_child: bool) -> String {
-    if is_partition_child {
+    // v2.05: a constraint created directly on the child already
+    // carries the child's name (`{table}_pkey` from
+    // ChooseConstraintName), so prefixing again produced
+    // `{table}_{table}_pkey` and REPLICA IDENTITY USING INDEX
+    // could never find the backing index (42704). PG names the
+    // backing index after the constraint verbatim; the prefix is
+    // only needed when a parent-named constraint propagates.
+    if is_partition_child && !con.starts_with(&format!("{table}_")) {
         format!("{table}_{con}")
     } else {
         con.to_string()

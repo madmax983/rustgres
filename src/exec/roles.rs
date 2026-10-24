@@ -1217,17 +1217,25 @@ pub(crate) fn exec_drop_role(
         // of a membership all block DROP ROLE (2BP01).
         let mut blockers: Vec<String> = owned.clone();
         if blockers.is_empty() {
+            // v2.05: an entry with no privilege bits and no
+            // grant-option bits conveys nothing (PG removes such
+            // aclitems on REVOKE; the engine keeps zero entries in
+            // the database ACL as explicit-deny markers for its
+            // default-allow connect rule) — it is not a dependency.
             let acl_has = |acl: &[crate::storage::AclEntry]| {
-                acl.iter()
-                    .any(|e| e.role == role.name || e.grantor == role.name)
+                acl.iter().any(|e| {
+                    (e.role == role.name || e.grantor == role.name)
+                        && (e.privs != 0 || e.grant_option != 0)
+                })
             };
             for (tn, vs) in &eng.db.tables {
                 if vs.iter().any(|t| {
                     crate::storage::table_visible(t, ctx.snap, &ctx.all_xids)
                         && (acl_has(&t.acl)
-                            || t.col_acl
-                                .iter()
-                                .any(|e| e.role == role.name || e.grantor == role.name))
+                            || t.col_acl.iter().any(|e| {
+                                (e.role == role.name || e.grantor == role.name)
+                                    && (e.privs != 0 || e.grant_option != 0)
+                            }))
                 }) {
                     blockers.push(format!("privileges on table {}", tn));
                 }
@@ -2604,7 +2612,13 @@ pub(crate) fn exec_grant_revoke(
             unreachable!("expanded above")
         }
         GrantObject::Database => {
-            require_superuser(eng, ctx)?;
+            // v2.05: PG19 aclchk — the database owner, a superuser,
+            // or a role holding the privilege WITH GRANT OPTION may
+            // grant/revoke it (create_role.sql: regress_role_admin
+            // passes on the CREATE it was granted WITH GRANT
+            // OPTION). The blanket superuser gate here predated the
+            // grantor-group machinery; use it like every other
+            // object kind.
             let prev = eng.db.db_acl.clone();
             let groups = select_grantor_groups(
                 eng,
@@ -2615,6 +2629,13 @@ pub(crate) fn exec_grant_revoke(
                 granted_by,
                 revoke,
             )?;
+            let actor_any = crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own)
+                || eng
+                    .db
+                    .db_acl
+                    .iter()
+                    .any(|e| (e.role == ctx.role || e.role == "public") && e.privs != 0);
+            check_stranger_grantor(&groups, actor_any, "database", "postgres")?;
             apply_acl_delta(
                 &mut eng.db.db_acl,
                 grantees,
