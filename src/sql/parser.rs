@@ -1994,7 +1994,8 @@ impl Parser {
                 let e = self.parse_or()?;
                 self.expect(Token::RParen, "')'")?;
                 validate_constraint_expr(&e, "CHECK")?;
-                cons.push(ColCon::Check(cname, e));
+                let (nv, enf) = self.parse_check_attrs()?;
+                cons.push(ColCon::Check(cname, e, nv, enf));
             } else if self.eat_keyword("references") {
                 let tail = self.parse_fk_tail()?;
                 cons.push(ColCon::References { name: cname, tail });
@@ -2067,6 +2068,12 @@ impl Parser {
         };
         if self.eat_keyword("primary") {
             self.expect_keyword("key")?;
+            // v2.06: PRIMARY KEY USING INDEX name (ALTER TABLE ADD).
+            if self.eat_keyword("using") {
+                self.expect_keyword("index")?;
+                let idx = self.expect_ident()?;
+                return Ok(ParsedTableCon::PKeyUsingIndex(cname, idx));
+            }
             let cols = self.parse_col_name_list()?;
             Ok(ParsedTableCon::PKey(cname, cols))
         } else if self.eat_keyword("unique") {
@@ -2077,7 +2084,8 @@ impl Parser {
             let e = self.parse_or()?;
             self.expect(Token::RParen, "')'")?;
             validate_constraint_expr(&e, "CHECK")?;
-            Ok(ParsedTableCon::Check(cname, e))
+            let (nv, enf) = self.parse_check_attrs()?;
+            Ok(ParsedTableCon::Check(cname, e, nv, enf))
         } else if self.eat_keyword("foreign") {
             self.expect_keyword("key")?;
             let cols = self.parse_col_name_list()?;
@@ -2153,6 +2161,18 @@ impl Parser {
         }
         let mut on_delete = FkAction::Restrict;
         let mut on_update = FkAction::Restrict;
+        // v2.06: opt_foreign_key_match_clause (gram.y): MATCH FULL |
+        // PARTIAL | SIMPLE, before the ON actions.
+        let mut match_full = false;
+        if self.eat_keyword("match") {
+            if self.eat_keyword("full") {
+                match_full = true;
+            } else if !(self.eat_keyword("partial") || self.eat_keyword("simple")) {
+                return Err(err(
+                    "syntax error: expected FULL, PARTIAL or SIMPLE after MATCH".to_string(),
+                ));
+            }
+        }
         loop {
             if self.eat_keyword("on") {
                 if self.eat_keyword("delete") {
@@ -2168,12 +2188,12 @@ impl Parser {
                 break;
             }
         }
-        // v2.05: ConstraintAttributeSpec — [NOT] DEFERRABLE /
+        // v2.05/v2.06: ConstraintAttributeSpec — [NOT] DEFERRABLE /
         // INITIALLY DEFERRED|IMMEDIATE / [NOT] ENFORCED (PG19
-        // gram.y). Parsed and discarded: the engine checks FKs
-        // immediately and has no NOT ENFORCED mode, but the syntax
-        // must parse (foreign_key.sql's inline
-        // `REFERENCES pktable2 DEFERRABLE INITIALLY DEFERRED`).
+        // gram.y), now RECORDED on the tail: v2.06 implements
+        // deferred checking and NOT ENFORCED semantics. FK NOT VALID
+        // may appear in the same tail (ALTER ... ADD CONSTRAINT ...
+        // REFERENCES ... NOT VALID NOT ENFORCED, foreign_key.sql).
         // PG19 gram.y ConstraintAttributeSpec: each attribute may
         // appear at most once and ENFORCED / NOT ENFORCED (likewise
         // DEFERRABLE pairs and INITIALLY pairs) conflict — "multiple
@@ -2181,6 +2201,10 @@ impl Parser {
         let mut seen_deferrable = false;
         let mut seen_initially = false;
         let mut seen_enforced = false;
+        let mut deferrable = false;
+        let mut initially_deferred = false;
+        let mut enforced = true;
+        let mut not_valid = false;
         loop {
             if self.eat_keyword("not") {
                 if self.eat_keyword("deferrable") {
@@ -2190,6 +2214,7 @@ impl Parser {
                         ));
                     }
                     seen_deferrable = true;
+                    deferrable = false;
                 } else if self.eat_keyword("enforced") {
                     if seen_enforced {
                         return Err(err(
@@ -2197,9 +2222,13 @@ impl Parser {
                         ));
                     }
                     seen_enforced = true;
+                    enforced = false;
+                } else if self.eat_keyword("valid") {
+                    not_valid = true;
                 } else {
                     return Err(err(
-                        "syntax error: expected DEFERRABLE or ENFORCED after NOT".to_string(),
+                        "syntax error: expected DEFERRABLE, ENFORCED or VALID after NOT"
+                            .to_string(),
                     ));
                 }
             } else if self.eat_keyword("deferrable") {
@@ -2209,6 +2238,7 @@ impl Parser {
                     ));
                 }
                 seen_deferrable = true;
+                deferrable = true;
             } else if self.eat_keyword("enforced") {
                 if seen_enforced {
                     return Err(err(
@@ -2224,7 +2254,9 @@ impl Parser {
                     ));
                 }
                 seen_initially = true;
-                if !(self.eat_keyword("deferred") || self.eat_keyword("immediate")) {
+                if self.eat_keyword("deferred") {
+                    initially_deferred = true;
+                } else if !self.eat_keyword("immediate") {
                     return Err(err(
                         "syntax error: expected DEFERRED or IMMEDIATE".to_string()
                     ));
@@ -2233,12 +2265,57 @@ impl Parser {
                 break;
             }
         }
+        // PG19 parse_utilcmd.c (CONSTR_ATTR_DEFERRED): INITIALLY
+        // DEFERRED with an explicit NOT DEFERRABLE is a 42601, but
+        // INITIALLY DEFERRED alone implies DEFERRABLE ("If only
+        // INITIALLY DEFERRED appears, assume DEFERRABLE").
+        if initially_deferred && !deferrable {
+            if seen_deferrable {
+                return Err(SqlError {
+                    code: "42601",
+                    message: "constraint declared INITIALLY DEFERRED must be DEFERRABLE"
+                        .to_string(),
+                });
+            }
+            deferrable = true;
+        }
         Ok(ParsedFkTail {
             ref_table,
             ref_cols,
             on_delete,
             on_update,
+            match_full,
+            deferrable,
+            initially_deferred,
+            enforced,
+            not_valid,
         })
+    }
+
+    /// v2.06: trailing CHECK-constraint attributes (PG19
+    /// ConstraintAttributeSpec subset): NOT VALID and [NOT] ENFORCED,
+    /// in any order. Returns (not_valid, enforced).
+    pub(crate) fn parse_check_attrs(&mut self) -> Result<(bool, bool), SqlError> {
+        let mut not_valid = false;
+        let mut enforced = true;
+        loop {
+            if self.eat_keyword("not") {
+                if self.eat_keyword("valid") {
+                    not_valid = true;
+                } else if self.eat_keyword("enforced") {
+                    enforced = false;
+                } else {
+                    return Err(err(
+                        "syntax error: expected VALID or ENFORCED after NOT".to_string()
+                    ));
+                }
+            } else if self.eat_keyword("enforced") {
+                enforced = true;
+            } else {
+                break;
+            }
+        }
+        Ok((not_valid, enforced))
     }
 
     pub(crate) fn parse_fk_action(&mut self) -> Result<FkAction, SqlError> {
@@ -2580,6 +2657,20 @@ impl Parser {
             let bound = self.parse_partition_bound()?;
             return Ok(AlterAction::AttachPartition { child, bound });
         }
+        // v2.06: ALTER TABLE parent DETACH PARTITION child
+        // [CONCURRENTLY|FINALIZE] (PG19).
+        if self.eat_keyword("detach") {
+            self.expect_keyword("partition")?;
+            let child = self.expect_qualified_ident()?;
+            let mode = if self.eat_keyword("concurrently") {
+                1
+            } else if self.eat_keyword("finalize") {
+                2
+            } else {
+                0
+            };
+            return Ok(AlterAction::DetachPartition { child, mode });
+        }
         // v0.11: ALTER TABLE name OWNER TO role
         if self.eat_keyword("owner") {
             self.expect_keyword("to")?;
@@ -2648,22 +2739,19 @@ impl Parser {
                             code: "0A000",
                         });
                     }
-                    ColCon::Check(n, e) => checks.push(CheckDef {
+                    ColCon::Check(n, e, nv, enf) => checks.push(CheckDef {
                         name: n
                             .unwrap_or_else(|| format!("{}_check_{}", col.name, checks.len() + 1)),
                         expr: e,
-                        not_valid: false,
+                        not_valid: nv,
                         kind: CheckKind::Check,
                         no_inherit: false,
+                        enforced: enf,
                     }),
-                    ColCon::References { name: n, tail } => fks.push(FkDef {
-                        name: n.unwrap_or_else(|| format!("{}_fkey", col.name)),
-                        cols: vec![col.name.clone()],
-                        ref_table: tail.ref_table,
-                        ref_cols: tail.ref_cols,
-                        on_delete: tail.on_delete,
-                        on_update: tail.on_update,
-                    }),
+                    ColCon::References { name: n, tail } => fks.push(tail.into_fk(
+                        n.unwrap_or_else(|| format!("{}_fkey", col.name)),
+                        vec![col.name.clone()],
+                    )),
                 }
             }
             return Ok(AlterAction::AddColumn {
@@ -2699,8 +2787,85 @@ impl Parser {
             });
         }
         if self.eat_keyword("alter") {
+            // v2.06: ALTER TABLE t ALTER CONSTRAINT c [NOT] DEFERRABLE
+            // / INITIALLY DEFERRED|IMMEDIATE / [NOT] ENFORCED (PG19
+            // AT_AlterConstraint; the attribute clauses may appear in
+            // any order, at most once each per pair).
+            if self.eat_keyword("constraint") {
+                let cname = self.expect_ident()?;
+                let mut deferrable: Option<bool> = None;
+                let mut initially: Option<bool> = None;
+                let mut enforced: Option<bool> = None;
+                loop {
+                    if self.eat_keyword("not") {
+                        if self.eat_keyword("deferrable") {
+                            deferrable = Some(false);
+                        } else if self.eat_keyword("enforced") {
+                            enforced = Some(false);
+                        } else {
+                            return Err(err(
+                                "syntax error: expected DEFERRABLE or ENFORCED after NOT"
+                                    .to_string(),
+                            ));
+                        }
+                    } else if self.eat_keyword("deferrable") {
+                        deferrable = Some(true);
+                    } else if self.eat_keyword("enforced") {
+                        enforced = Some(true);
+                    } else if self.eat_keyword("initially") {
+                        if self.eat_keyword("deferred") {
+                            initially = Some(true);
+                        } else if self.eat_keyword("immediate") {
+                            initially = Some(false);
+                        } else {
+                            return Err(err(
+                                "syntax error: expected DEFERRED or IMMEDIATE".to_string()
+                            ));
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                // PG19 gram.y: INITIALLY DEFERRED requires
+                // DEFERRABLE within the same attribute spec.
+                if initially == Some(true) && deferrable == Some(false) {
+                    return Err(SqlError {
+                        code: "42601",
+                        message: "constraint declared INITIALLY DEFERRED must be DEFERRABLE"
+                            .to_string(),
+                    });
+                }
+                return Ok(AlterAction::AlterConstraint {
+                    name: cname,
+                    deferrable,
+                    initially_deferred: initially,
+                    enforced,
+                });
+            }
             self.eat_keyword("column");
             let cname = self.expect_ident()?;
+            // v2.06: ALTER COLUMN c SET DATA TYPE t — the spelled-out
+            // form of TYPE (PG19 gram.y accepts both). Lookahead so
+            // SET NOT NULL / SET STORAGE etc. keep their own branch.
+            if matches!(self.peek(), Token::Ident(s) if s == "set")
+                && matches!(self.peek2(), Token::Ident(s) if s == "data")
+            {
+                self.next();
+                self.next();
+                self.expect_keyword("type")?;
+                let (col_type, named_type) = self.parse_col_type()?;
+                let using_expr = if self.eat_keyword("using") {
+                    Some(self.parse_or()?)
+                } else {
+                    None
+                };
+                return Ok(AlterAction::AlterColumnType {
+                    name: cname,
+                    col_type,
+                    named_type,
+                    using_expr,
+                });
+            }
             // v1.96: ALTER COLUMN c TYPE t [USING expr].
             if self.eat_keyword("type") {
                 let (col_type, named_type) = self.parse_col_type()?;
@@ -2834,6 +2999,9 @@ impl Parser {
     /// FOREIGN KEY ...` (table-constraint form).
     pub(crate) fn parse_alter_add_constraint(&mut self) -> Result<AlterAction, SqlError> {
         match self.parse_table_constraint()? {
+            ParsedTableCon::PKeyUsingIndex(_name, idx) => {
+                Ok(AlterAction::AddPrimaryKeyUsingIndex { index: idx })
+            }
             ParsedTableCon::PKey(name, cols) => Ok(AlterAction::AddConstraint {
                 pkey: Some(UniqueDef {
                     name: name.unwrap_or_default(),
@@ -2854,13 +3022,14 @@ impl Parser {
                 fk: None,
                 notnull: None,
             }),
-            ParsedTableCon::Check(name, e) => Ok(AlterAction::AddConstraint {
+            ParsedTableCon::Check(name, e, nv, enf) => Ok(AlterAction::AddConstraint {
                 check: Some(CheckDef {
                     name: name.unwrap_or_default(),
                     expr: e,
-                    not_valid: false,
+                    not_valid: nv,
                     kind: CheckKind::Check,
                     no_inherit: false,
+                    enforced: enf,
                 }),
                 unique: None,
                 pkey: None,
@@ -2868,14 +3037,7 @@ impl Parser {
                 notnull: None,
             }),
             ParsedTableCon::Fk { name, cols, tail } => Ok(AlterAction::AddConstraint {
-                fk: Some(FkDef {
-                    name: name.unwrap_or_default(),
-                    cols,
-                    ref_table: tail.ref_table,
-                    ref_cols: tail.ref_cols,
-                    on_delete: tail.on_delete,
-                    on_update: tail.on_update,
-                }),
+                fk: Some(tail.into_fk(name.unwrap_or_default(), cols)),
                 check: None,
                 unique: None,
                 pkey: None,
@@ -5084,6 +5246,7 @@ impl Parser {
                     not_valid: false,
                     kind: CheckKind::Check,
                     no_inherit: false,
+                    enforced: true,
                 });
             } else if self.eat_keyword("not") {
                 self.expect_keyword("null")?;
@@ -10205,24 +10368,30 @@ impl Parser {
     }
 
     pub(crate) fn parse_set(&mut self) -> Result<Stmt, SqlError> {
-        // v1.96: SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED |
-        // IMMEDIATE } — accepted no-op.
+        // v1.96/v2.06: SET CONSTRAINTS { ALL | name [, ...] }
+        // { DEFERRED | IMMEDIATE } — names may be schema-qualified
+        // (fkpart3.fkey in foreign_key.sql).
         if self.eat_keyword("constraints") {
-            if self.eat_keyword("all") {
-                // done
+            let names = if self.eat_keyword("all") {
+                None
             } else {
+                let mut v = Vec::new();
                 loop {
-                    let _ = self.expect_ident()?;
+                    v.push(self.expect_qualified_ident()?);
                     if !matches!(self.peek(), Token::Comma) {
                         break;
                     }
                     self.next();
                 }
-            }
-            if !self.eat_keyword("deferred") {
+                Some(v)
+            };
+            let deferred = if self.eat_keyword("deferred") {
+                true
+            } else {
                 self.expect_keyword("immediate")?;
-            }
-            return Ok(Stmt::SetConstraints);
+                false
+            };
+            return Ok(Stmt::SetConstraints { names, deferred });
         }
         if self.eat_keyword("transaction") {
             // v1.07: SET TRANSACTION SNAPSHOT 'snapshot-id' (PG19 special
@@ -16213,6 +16382,9 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
         // v1.97: NO INHERIT flag (older checkpoints omit it; the
         // decoder defaults a missing flag to false).
         out.push_str(if c.no_inherit { " 1" } else { " 0" });
+        // v2.06: ENFORCED flag (older checkpoints omit it; the
+        // decoder defaults a missing flag to true).
+        out.push_str(if c.enforced { " 1" } else { " 0" });
         out.push(')');
     }
     out.push_str(") (uniques");
@@ -16258,6 +16430,19 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
         out.push_str(fk_action_name(f.on_delete));
         out.push_str(") (onupd ");
         out.push_str(fk_action_name(f.on_update));
+        // v2.06: FK attribute section (match_full, deferrable,
+        // initially_deferred, enforced, not_valid). The decoder
+        // defaults a missing section to (0 0 0 1 0).
+        out.push_str(") (attrs ");
+        out.push_str(if f.match_full { "1" } else { "0" });
+        out.push(' ');
+        out.push_str(if f.deferrable { "1" } else { "0" });
+        out.push(' ');
+        out.push_str(if f.initially_deferred { "1" } else { "0" });
+        out.push(' ');
+        out.push_str(if f.enforced { "1" } else { "0" });
+        out.push(' ');
+        out.push_str(if f.not_valid { "1" } else { "0" });
         out.push_str("))");
     }
     out.push_str(")");
@@ -16436,6 +16621,16 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
                 o => return Err(format!("bad check no-inherit flag {}", o)),
             }
         };
+        // v2.06: optional ENFORCED flag (older checkpoints omit it).
+        let enforced = if sexpr_is_close(&mut p) {
+            true
+        } else {
+            match p.atom()?.as_str() {
+                "1" => true,
+                "0" => false,
+                o => return Err(format!("bad check enforced flag {}", o)),
+            }
+        };
         p.close()?;
         checks.push(CheckDef {
             name,
@@ -16443,6 +16638,7 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
             not_valid,
             kind,
             no_inherit,
+            enforced,
         });
     }
     p.close()?;
@@ -16529,6 +16725,29 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
         }
         let on_update = parse_fk_action(&p.atom()?)?;
         p.close()?;
+        // v2.06: optional (attrs mf def initdef enf nv) section;
+        // pre-v2.06 encodings omit it.
+        let (mut match_full, mut deferrable, mut initially_deferred) = (false, false, false);
+        let (mut fk_enforced, mut fk_not_valid) = (true, false);
+        if !sexpr_is_close(&mut p) {
+            p.open()?;
+            if p.atom()? != "attrs" {
+                return Err("bad fk attrs head".into());
+            }
+            let bit = |p: &mut SexprParser| -> Result<bool, String> {
+                match p.atom()?.as_str() {
+                    "1" => Ok(true),
+                    "0" => Ok(false),
+                    o => Err(format!("bad fk attrs bit {}", o)),
+                }
+            };
+            match_full = bit(&mut p)?;
+            deferrable = bit(&mut p)?;
+            initially_deferred = bit(&mut p)?;
+            fk_enforced = bit(&mut p)?;
+            fk_not_valid = bit(&mut p)?;
+            p.close()?;
+        }
         p.close()?;
         fks.push(FkDef {
             name,
@@ -16537,6 +16756,11 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
             ref_cols,
             on_delete,
             on_update,
+            match_full,
+            deferrable,
+            initially_deferred,
+            enforced: fk_enforced,
+            not_valid: fk_not_valid,
         });
     }
     p.close()?;
@@ -16735,6 +16959,7 @@ pub fn decode_domain_checks(s: &str) -> Result<Vec<CheckDef>, String> {
             not_valid: false,
             kind: CheckKind::Check,
             no_inherit: false,
+            enforced: true,
         });
     }
     p.ws();

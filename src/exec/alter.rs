@@ -1206,6 +1206,61 @@ pub(crate) fn exec_alter_one(
         AlterAction::AttachPartition { child, bound } => {
             attach_partition(eng, ctx, name, child, bound)
         }
+        // v2.06: DETACH PARTITION (PG19 ATExecDetachPartition).
+        AlterAction::DetachPartition { child, mode } => {
+            detach_partition(eng, ctx, name, child, *mode)
+        }
+        // v2.06: ALTER CONSTRAINT (PG19 ATExecAlterConstraint). On a
+        // partitioned table the constraint also lives on every
+        // partition (PG alters the children too), so propagate like
+        // ADD CONSTRAINT does.
+        AlterAction::AlterConstraint {
+            name: con,
+            deferrable,
+            initially_deferred,
+            enforced,
+        } => {
+            let res = alter_alter_constraint(
+                eng,
+                ctx,
+                name,
+                con,
+                *deferrable,
+                *initially_deferred,
+                *enforced,
+            );
+            if res.is_ok() {
+                let children: Vec<String> = eng
+                    .db
+                    .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                    .and_then(|t| t.partition.as_ref())
+                    .map(|p| p.children.clone())
+                    .unwrap_or_default();
+                for child in &children {
+                    if eng.db.is_temp_table(ctx.session, child) {
+                        continue;
+                    }
+                    let has = eng
+                        .db
+                        .find_table(child, ctx.snap, &ctx.all_xids, ctx.session)
+                        .is_some_and(|t| table_has_constraint(t, con));
+                    if has {
+                        let child_action = AlterAction::AlterConstraint {
+                            name: con.clone(),
+                            deferrable: *deferrable,
+                            initially_deferred: *initially_deferred,
+                            enforced: *enforced,
+                        };
+                        exec_alter(eng, ctx, child, std::slice::from_ref(&child_action))?;
+                    }
+                }
+            }
+            res
+        }
+        // v2.06: ADD PRIMARY KEY USING INDEX.
+        AlterAction::AddPrimaryKeyUsingIndex { index } => {
+            alter_add_primary_key_using_index(eng, ctx, name, index)
+        }
         // v0.96: table inheritance (PG19).
         AlterAction::Inherit { parent } => alter_inherit(eng, ctx, name, parent, true),
         AlterAction::NoInherit { parent } => alter_inherit(eng, ctx, name, parent, false),
@@ -2863,6 +2918,7 @@ pub(crate) fn alter_add_constraint(
             not_valid: n.not_valid,
             kind: crate::sql::CheckKind::NotNull,
             no_inherit: n.no_inherit,
+            enforced: true,
         })
     } else {
         None
@@ -3827,6 +3883,300 @@ pub(crate) fn alter_rename_to(
             }
         }
     }
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// v2.06: ALTER TABLE ... ALTER CONSTRAINT (PG19 ATExecAlterConstraint)
+// ---------------------------------------------------------------------------
+
+/// Validate every visible row of `t` against FK `fk` (used when a
+/// constraint becomes ENFORCED: PG19 validates existing rows and the
+/// alter fails 23503 on the first violation).
+fn validate_fk_rows(
+    eng: &mut Engine,
+    ctx: &StmtCtx,
+    t: &Table,
+    table: &str,
+    fk: &FkDef,
+) -> Result<(), ExecError> {
+    let meta = TableMeta::of(t);
+    let rows: Vec<Row> = t
+        .rows
+        .iter()
+        .filter(|rv| row_visible(rv, ctx.snap, &ctx.all_xids))
+        .map(|rv| rv.values.clone())
+        .collect();
+    for values in &rows {
+        // Single-FK check with the flag forced on: build a one-FK
+        // meta so check_fk_child_row judges only this constraint.
+        let mut one = meta.clone();
+        one.fks = vec![fk.clone()];
+        check_fk_child_row(
+            eng,
+            ctx.snap,
+            ctx.own,
+            ctx.session,
+            &one,
+            table,
+            values,
+            &[],
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+/// Validate every visible row of `t` against CHECK constraint `cd`
+/// (PG19: 23514 "check constraint ... is violated by some row").
+fn validate_check_rows(
+    eng: &mut Engine,
+    ctx: &StmtCtx,
+    t: &Table,
+    table: &str,
+    cd: &CheckDef,
+) -> Result<(), ExecError> {
+    let rows: Vec<Row> = t
+        .rows
+        .iter()
+        .filter(|rv| row_visible(rv, ctx.snap, &ctx.all_xids))
+        .map(|rv| rv.values.clone())
+        .collect();
+    let qcols: Vec<QCol> = t
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, (cn, ct))| QCol {
+            qual: table.to_string(),
+            name: cn.clone(),
+            ty: ct.clone(),
+            hidden: false,
+            src_ord: i as u32,
+        })
+        .collect();
+    let mut lock_ids = Vec::new();
+    let mut q = Q {
+        eng,
+        snap: ctx.snap,
+        own: ctx.own,
+        all_xids: ctx.all_xids.clone(),
+        session: ctx.session,
+        role: ctx.role,
+        read_only: true,
+        depth: 0,
+        lock_ids: &mut lock_ids,
+        ctes: Vec::new(),
+        wctx: None,
+        srf_vals: Vec::new(),
+        priv_scopes: Vec::new(),
+        priv_role_override: None,
+        hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+        immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+        plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
+        hashed_in: Rc::new(RefCell::new(Vec::new())),
+        pending_updates: None,
+        write: None,
+    };
+    for values in &rows {
+        let frame = Scope {
+            schema: &qcols,
+            row: values,
+            prov: None,
+        };
+        let v = eval_expr(&mut q, &[frame], &cd.expr)?;
+        if matches!(v, Value::Bool(false)) {
+            return Err(exec_err(
+                "23514",
+                format!(
+                    "check constraint \"{}\" of relation \"{}\" is violated by some row",
+                    cd.name, table
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn alter_alter_constraint(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    con: &str,
+    deferrable: Option<bool>,
+    initially: Option<bool>,
+    enforced: Option<bool>,
+) -> Result<ExecResult, ExecError> {
+    let t = eng
+        .db
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
+        .clone();
+    let mut next = t.clone();
+    if let Some(fk) = next.fks.iter_mut().find(|f| f.name == con) {
+        if let Some(d) = deferrable {
+            fk.deferrable = d;
+            if !d {
+                fk.initially_deferred = false;
+            }
+        }
+        if let Some(i) = initially {
+            fk.initially_deferred = i;
+            if i {
+                fk.deferrable = true;
+            }
+        }
+        if let Some(e) = enforced {
+            if e && !fk.enforced {
+                // PG19: becoming ENFORCED validates existing rows.
+                let mut fk_now = fk.clone();
+                fk_now.enforced = true;
+                validate_fk_rows(eng, ctx, &t, name, &fk_now)?;
+                fk.not_valid = false;
+            }
+            fk.enforced = e;
+        }
+    } else if let Some(cd) = next.checks.iter_mut().find(|c| c.name == con) {
+        if deferrable.is_some() || initially.is_some() {
+            return Err(exec_err(
+                "42809",
+                format!(
+                    "constraint \"{}\" of relation \"{}\" is not a foreign key constraint",
+                    con, name
+                ),
+            ));
+        }
+        if let Some(e) = enforced {
+            if e && (!cd.enforced || cd.not_valid) {
+                let cd_now = cd.clone();
+                if cd_now.kind == crate::sql::CheckKind::Check {
+                    validate_check_rows(eng, ctx, &t, name, &cd_now)?;
+                }
+                cd.not_valid = false;
+            }
+            cd.enforced = e;
+        }
+    } else if t.uniques.iter().any(|u| u.name == con)
+        || t.pkey.as_ref().is_some_and(|p| p.name == con)
+    {
+        // PG19 lets UNIQUE/PK constraints be (re)marked deferrable;
+        // this engine does not defer unique checks (named hold-back),
+        // so the catalog-only change is accepted. Enforceability is
+        // FK/CHECK-only in PG19.
+        if enforced.is_some() {
+            return Err(exec_err(
+                "42809",
+                format!(
+                    "cannot alter enforceability of constraint \"{}\" of relation \"{}\"",
+                    con, name
+                ),
+            ));
+        }
+    } else {
+        return Err(exec_err(
+            "42704",
+            format!(
+                "constraint \"{}\" of relation \"{}\" does not exist",
+                con, name
+            ),
+        ));
+    }
+    alter_swap(eng, ctx, name, None, next, None)?;
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// v2.06: ALTER TABLE ... ADD PRIMARY KEY USING INDEX (PG19
+// transformIndexConstraints / ATExecAddConstraint over an index)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn alter_add_primary_key_using_index(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    index_name: &str,
+) -> Result<ExecResult, ExecError> {
+    let t = eng
+        .db
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
+        .clone();
+    if t.pkey.is_some() {
+        return Err(exec_err(
+            "42P16",
+            format!(
+                "multiple primary keys for table \"{}\" are not allowed",
+                name
+            ),
+        ));
+    }
+    let def = eng
+        .db
+        .visible_indexes_for(name, ctx.snap, &ctx.all_xids, ctx.session)
+        .into_iter()
+        .find(|ix| ix.def.name.eq_ignore_ascii_case(index_name))
+        .map(|ix| ix.def.clone());
+    let def = match def {
+        Some(d) => d,
+        None => {
+            // PG19: an index by that name on ANOTHER table is a
+            // different error than no such index at all.
+            let elsewhere = eng
+                .db
+                .tables
+                .keys()
+                .filter(|tn| tn.as_str() != name)
+                .any(|tn| {
+                    eng.db
+                        .visible_indexes_for(tn, ctx.snap, &ctx.all_xids, ctx.session)
+                        .iter()
+                        .any(|ix| ix.def.name.eq_ignore_ascii_case(index_name))
+                });
+            if elsewhere {
+                return Err(exec_err(
+                    "42809",
+                    format!(
+                        "index \"{}\" does not belong to table \"{}\"",
+                        index_name, name
+                    ),
+                ));
+            }
+            return Err(exec_err(
+                "42704",
+                format!("index \"{}\" does not exist", index_name),
+            ));
+        }
+    };
+    if !def.unique {
+        return Err(exec_err(
+            "42809",
+            format!("index \"{}\" is not unique", index_name),
+        ));
+    }
+    if def
+        .cols
+        .iter()
+        .any(|&ci| !t.not_null.get(ci).copied().unwrap_or(false))
+    {
+        // PG19: USING INDEX requires the columns to be NOT NULL
+        // (it does not set them, unlike ADD PRIMARY KEY (cols)).
+        return Err(exec_err(
+            "42809",
+            format!(
+                "columns of index \"{}\" are not marked NOT NULL",
+                index_name
+            ),
+        ));
+    }
+    let mut next = t.clone();
+    next.pkey = Some(UniqueDef {
+        name: format!("{}_pkey", base_name(name)),
+        cols: def.col_names.clone(),
+    });
+    alter_swap(eng, ctx, name, None, next, None)?;
     Ok(ExecResult::Command {
         tag: "ALTER TABLE".to_string(),
     })

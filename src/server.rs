@@ -242,6 +242,10 @@ struct Txn {
     /// PG19 restores the parent's characteristics on both ROLLBACK TO
     /// and RELEASE SAVEPOINT.
     txn_char_marks: Vec<(Option<bool>, IsolationLevel, Option<bool>)>,
+    /// v2.06: deferred-FK (queue length, SET CONSTRAINTS modes)
+    /// snapshots in lockstep with `savepoints` — ROLLBACK TO
+    /// truncates the queue and restores the modes, like PG19.
+    deferred_marks: Vec<(usize, std::collections::HashMap<(String, String), bool>)>,
 }
 
 impl Txn {
@@ -1704,6 +1708,32 @@ fn copy_from_ingest(
         // success.
         match r {
             Ok(n) => {
+                // v2.06: COPY is a whole autocommit transaction —
+                // fire deferred FK checks before the WAL commit.
+                {
+                    let mut ctx = StmtCtx {
+                        snap: &snap,
+                        own: xid,
+                        write_xid: xid,
+                        all_xids: vec![xid],
+                        level: IsolationLevel::ReadCommitted,
+                        session: session.sid,
+                        role: &session.role,
+                        read_only: session.default_txn_read_only == Some(true),
+                        default_toast_compression: session.default_toast_compression,
+                        notices: Vec::new(),
+                        writes: &mut writes,
+                    };
+                    if let Err(e) = exec::flush_deferred_fk(&mut guard, &mut ctx, None) {
+                        drop(ctx);
+                        undo_all(&mut guard, &[xid], &writes);
+                        exec::deferred_clear(&mut guard, session.sid);
+                        retire_txn(&mut guard, xid);
+                        auto_vacuum(&mut guard, &writes);
+                        return Err(e);
+                    }
+                }
+                exec::deferred_clear(&mut guard, session.sid);
                 let records = match wal::records_for_commit(&guard, xid, &writes, session.sid) {
                     Ok(r) => r,
                     Err(msg) => {
@@ -4484,10 +4514,36 @@ fn autocommit_execute(
         Ok(r) => r,
         Err(e) => {
             undo_all(&mut guard, &[xid], &writes);
+            exec::deferred_clear(&mut guard, sid);
             retire_txn(&mut guard, xid);
             return Err(e);
         }
     };
+    // v2.06: an autocommit statement is a whole transaction — fire
+    // its deferred FK checks now (cascades append to `writes`).
+    {
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: xid,
+            write_xid: xid,
+            all_xids: vec![xid],
+            level: IsolationLevel::ReadCommitted,
+            session: sid,
+            role,
+            read_only,
+            default_toast_compression,
+            notices: Vec::new(),
+            writes: &mut writes,
+        };
+        if let Err(e) = exec::flush_deferred_fk(&mut guard, &mut ctx, None) {
+            drop(ctx);
+            undo_all(&mut guard, &[xid], &writes);
+            exec::deferred_clear(&mut guard, sid);
+            retire_txn(&mut guard, xid);
+            return Err(e);
+        }
+    }
+    exec::deferred_clear(&mut guard, sid);
     // Derive the WAL records, then fsync BEFORE the commit can become
     // visible: we still hold the engine lock, so no other session can
     // observe the in-memory mutation until the frame is durable.
@@ -4544,6 +4600,14 @@ fn retire_txn_family(engine: &mut Engine, t: &Txn) {
         engine.end_txn(sub);
     }
     retire_txn(engine, t.xid);
+}
+
+/// v2.06: retire + drop the session's deferred FK queue/modes (every
+/// transaction end — commit, rollback, or commit-of-failed — clears
+/// them, like PG19's after-trigger queue).
+fn retire_txn_family_sid(engine: &mut Engine, t: &Txn, sid: u64) {
+    retire_txn_family(engine, t);
+    exec::deferred_clear(engine, sid);
 }
 
 /// Best-effort cleanup after a commit or abort: reclaim versions that are
@@ -4658,6 +4722,7 @@ fn begin_implicit_txn(engine: &Arc<Mutex<Engine>>, session: &mut Session) {
         guc_stack: Vec::new(),
         guc_marks: Vec::new(),
         txn_char_marks: Vec::new(),
+        deferred_marks: Vec::new(),
     });
 }
 
@@ -4671,7 +4736,7 @@ fn abort_implicit_txn(engine: &Arc<Mutex<Engine>>, session: &mut Session) {
         debug_assert!(t.implicit, "abort_implicit_txn on explicit txn");
         let mut guard = lock_engine(engine);
         undo_all(&mut guard, &t.all_xids(), &t.writes);
-        retire_txn_family(&mut guard, &t);
+        retire_txn_family_sid(&mut guard, &t, session.sid);
         auto_vacuum(&mut guard, &t.writes);
         drop(guard);
         // v0.16: every cursor dies with the aborted transaction.
@@ -4714,7 +4779,7 @@ fn commit_taken_txn(
     if t.failed {
         // COMMIT of an aborted transaction rolls back (v0.3 behavior).
         undo_all(&mut guard, &t.all_xids(), &t.writes);
-        retire_txn_family(&mut guard, &t);
+        retire_txn_family_sid(&mut guard, &t, session.sid);
         auto_vacuum(&mut guard, &t.writes);
         drop(guard);
         // v0.16: every cursor dies with the aborted transaction
@@ -4724,6 +4789,38 @@ fn commit_taken_txn(
         // GUC change (SET and SET LOCAL), like PG19.
         revert_guc_stack(session, t.guc_stack, false);
         return Ok(cmd("ROLLBACK"));
+    }
+    // v2.06: fire deferred FK checks BEFORE the WAL records are
+    // derived — a fired cascade appends its writes to the log. A
+    // failure aborts the transaction (PG19: an error in a deferred
+    // trigger at COMMIT rolls the transaction back).
+    let mut t = t;
+    {
+        let (snap, xid, level) = stmt_snapshot(&mut guard, Some(&mut t));
+        let write_xid = t.write_xid();
+        let mut ctx = StmtCtx {
+            snap: &snap,
+            own: xid,
+            write_xid,
+            all_xids: t.all_xids(),
+            level,
+            session: session.sid,
+            role: &session.role,
+            read_only: t.read_only == Some(true),
+            default_toast_compression: session.default_toast_compression,
+            notices: Vec::new(),
+            writes: &mut t.writes,
+        };
+        if let Err(e) = exec::flush_deferred_fk(&mut guard, &mut ctx, None) {
+            drop(ctx);
+            undo_all(&mut guard, &t.all_xids(), &t.writes);
+            retire_txn_family_sid(&mut guard, &t, session.sid);
+            auto_vacuum(&mut guard, &t.writes);
+            drop(guard);
+            session.cursors.clear();
+            revert_guc_stack(session, t.guc_stack, false);
+            return Err(e);
+        }
     }
     // Derive the records from the write log and make them durable BEFORE
     // the commit returns. The in-memory versions are already stamped with
@@ -4756,7 +4853,7 @@ fn commit_taken_txn(
         session.txn = Some(t);
         return Err(wal_err(e));
     }
-    retire_txn_family(&mut guard, &t);
+    retire_txn_family_sid(&mut guard, &t, session.sid);
     auto_vacuum(&mut guard, &t.writes);
     drop(guard);
     // v0.16: plain cursors die at COMMIT; WITH HOLD cursors survive.
@@ -4809,6 +4906,7 @@ fn txn_begin(
         guc_stack: Vec::new(),
         guc_marks: Vec::new(),
         txn_char_marks: Vec::new(),
+        deferred_marks: Vec::new(),
     });
     Ok(cmd("BEGIN"))
 }
@@ -5030,7 +5128,7 @@ fn txn_rollback(
             .expect("implicit transaction checked above");
         let mut guard = lock_engine(engine);
         undo_all(&mut guard, &t.all_xids(), &t.writes);
-        retire_txn_family(&mut guard, &t);
+        retire_txn_family_sid(&mut guard, &t, session.sid);
         auto_vacuum(&mut guard, &t.writes);
         drop(guard);
         // v0.16: ROLLBACK closes every cursor, including WITH HOLD ones.
@@ -5046,7 +5144,7 @@ fn txn_rollback(
         let chained = (t.level, t.read_only, t.deferrable);
         let mut guard = lock_engine(engine);
         undo_all(&mut guard, &t.all_xids(), &t.writes);
-        retire_txn_family(&mut guard, &t);
+        retire_txn_family_sid(&mut guard, &t, session.sid);
         auto_vacuum(&mut guard, &t.writes);
         // v0.16: ROLLBACK closes every cursor, including WITH HOLD ones.
         session.cursors.clear();
@@ -5090,6 +5188,10 @@ fn txn_savepoint(
             // row-lock count — no copies.
             let xid = t.xid;
             let mut guard = lock_engine(engine);
+            // v2.06: snapshot the deferred-FK queue/modes for a
+            // possible ROLLBACK TO (PG19 discards after-trigger
+            // events queued inside the subtransaction).
+            let dmark = exec::deferred_mark(&guard, session.sid);
             let locks = guard.txn_lock_count(xid);
             // v1.21: the new savepoint scope gets its own sub-xid (PG19
             // AssignTransactionId, eager — the burn is unobservable).
@@ -5098,6 +5200,7 @@ fn txn_savepoint(
             let sub = guard.begin_txn();
             drop(guard);
             t.savepoints.push((name.to_string(), t.writes.len(), locks));
+            t.deferred_marks.push(dmark);
             t.sub_xids.push(sub);
             t.owned_xids.push(sub);
             // v0.66: a ROLLBACK TO SAVEPOINT also cancels SET/SET LOCAL
@@ -5161,6 +5264,13 @@ fn txn_rollback_to(
         }
     }
     t.writes.extend(kept_seq.into_iter().rev());
+    // v2.06: deferred FK events queued after the savepoint are
+    // discarded and SET CONSTRAINTS modes restored (PG19).
+    {
+        let dmark = t.deferred_marks[idx].clone();
+        exec::deferred_restore(&mut guard, session.sid, &dmark);
+    }
+    t.deferred_marks.truncate(idx + 1);
     // Row locks taken after the savepoint are released, like Postgres;
     // locks from before it stay held.
     guard.release_locks_after(xid, keep_locks);
@@ -5241,6 +5351,9 @@ fn txn_release(session: &mut Session, name: &str) -> Result<ExecResult, ExecErro
         })?;
     // Destroys the named savepoint and all established after it.
     t.savepoints.truncate(idx);
+    // v2.06: deferred-FK marks die with their savepoints; the queued
+    // events themselves survive RELEASE, like PG19.
+    t.deferred_marks.truncate(idx);
     // v1.21: the sub-xid scopes die with their savepoints. The rows keep
     // their stamped xmins (PG19: released subtransactions keep their xids).
     t.sub_xids.truncate(idx);
@@ -5955,6 +6068,7 @@ mod tests {
                 guc_stack: Vec::new(),
                 guc_marks: Vec::new(),
                 txn_char_marks: Vec::new(),
+                deferred_marks: Vec::new(),
             }),
         };
         (engine, session)

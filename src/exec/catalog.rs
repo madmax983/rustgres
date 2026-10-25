@@ -4854,3 +4854,171 @@ pub(crate) fn pg_publication_sequences_scan(
     }
     (schema, rows)
 }
+
+// ---------------------------------------------------------------------------
+// v2.06: pg_constraint (virtual, bounded subset). Synthesized from the
+// stored constraint records (checks / uniques / pkey / fks / not-null)
+// so catalog introspection — condeferrable, condeferred, conenforced,
+// convalidated — resolves. Constraint OIDs are synthetic: assigned
+// sequentially in (table, name) scan order from 20000; they are stable
+// within a scan but are not a durable identity. confupdtype /
+// confdeltype report 'r' for RESTRICT and for NO ACTION alike (the
+// engine's FkAction does not distinguish them).
+// ---------------------------------------------------------------------------
+
+pub(crate) fn pg_constraint_schema() -> Vec<QCol> {
+    [
+        ("oid", ColType::Int),
+        ("conname", ColType::Text),
+        ("connamespace", ColType::Int),
+        ("contype", ColType::SingleChar),
+        ("condeferrable", ColType::Bool),
+        ("condeferred", ColType::Bool),
+        ("conenforced", ColType::Bool),
+        ("convalidated", ColType::Bool),
+        ("conrelid", ColType::Int),
+        ("contypid", ColType::Int),
+        ("confrelid", ColType::Int),
+        ("conindid", ColType::Int),
+        ("conparentid", ColType::Int),
+        ("confupdtype", ColType::SingleChar),
+        ("confdeltype", ColType::SingleChar),
+        ("confmatchtype", ColType::SingleChar),
+        ("conkey", ColType::Array(ArrayElem::Int)),
+        ("confkey", ColType::Array(ArrayElem::Int)),
+    ]
+    .into_iter()
+    .map(|(n, ty)| QCol {
+        qual: "pg_constraint".to_string(),
+        name: n.to_string(),
+        ty,
+        hidden: false,
+        src_ord: 0,
+    })
+    .collect()
+}
+
+fn fk_action_char(a: FkAction) -> u8 {
+    match a {
+        FkAction::Restrict => b'r',
+        FkAction::Cascade => b'c',
+        FkAction::SetNull => b'n',
+        FkAction::SetDefault => b'd',
+    }
+}
+
+pub(crate) fn pg_constraint_scan(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = pg_constraint_schema();
+    let mut rows = Vec::new();
+    let mut names: Vec<&String> = db.tables.keys().collect();
+    names.sort();
+    if let Some(tmps) = db.temp_tables.get(&session) {
+        let mut tnames: Vec<&String> = tmps.keys().collect();
+        tnames.sort();
+        names.extend(tnames);
+    }
+    let mut next_oid: i64 = 20000;
+    let mut mk = |cells: Vec<Value>| {
+        let mut full = vec![Value::Int(next_oid)];
+        next_oid += 1;
+        full.extend(cells);
+        QRow {
+            cells: Row::new(full),
+            prov: Vec::new(),
+        }
+    };
+    let attnums = |t: &Table, cols: &[String]| -> Vec<i64> {
+        cols.iter()
+            .map(|c| t.column_index(c).map(|i| (i + 1) as i64).unwrap_or(0))
+            .collect()
+    };
+    for name in names {
+        let Some(t) = db.find_table(name, snap, &[own], session) else {
+            continue;
+        };
+        let relid = Value::Int(t.oid as i64);
+        let plain = |contype: u8,
+                     cname: &str,
+                     enforced: bool,
+                     validated: bool,
+                     conkey: Vec<i64>|
+         -> Vec<Value> {
+            vec![
+                Value::text(cname),
+                Value::Int(2200),
+                Value::SingleChar(contype),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Bool(enforced),
+                Value::Bool(validated),
+                relid.clone(),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::SingleChar(b'a'),
+                Value::SingleChar(b'a'),
+                Value::SingleChar(b's'),
+                int_array(conkey),
+                Value::Null,
+            ]
+        };
+        if let Some(pk) = &t.pkey {
+            rows.push(mk(plain(b'p', &pk.name, true, true, attnums(t, &pk.cols))));
+        }
+        for u in &t.uniques {
+            rows.push(mk(plain(b'u', &u.name, true, true, attnums(t, &u.cols))));
+        }
+        for c in &t.checks {
+            let contype = match c.kind {
+                crate::sql::CheckKind::Check => b'c',
+                crate::sql::CheckKind::NotNull => b'n',
+            };
+            rows.push(mk(plain(
+                contype,
+                &c.name,
+                c.enforced,
+                !c.not_valid,
+                Vec::new(),
+            )));
+        }
+        for f in &t.fks {
+            let (confrelid, confkey) = match db.find_table(&f.ref_table, snap, &[own], session) {
+                Some(pt) => {
+                    let ref_cols = if f.ref_cols.is_empty() {
+                        pt.pkey.as_ref().map(|p| p.cols.clone()).unwrap_or_default()
+                    } else {
+                        f.ref_cols.clone()
+                    };
+                    (pt.oid as i64, int_array(attnums(pt, &ref_cols)))
+                }
+                None => (0, Value::Null),
+            };
+            rows.push(mk(vec![
+                Value::text(f.name.clone()),
+                Value::Int(2200),
+                Value::SingleChar(b'f'),
+                Value::Bool(f.deferrable),
+                Value::Bool(f.initially_deferred),
+                Value::Bool(f.enforced),
+                Value::Bool(!f.not_valid),
+                relid.clone(),
+                Value::Int(0),
+                Value::Int(confrelid),
+                Value::Int(0),
+                Value::Int(0),
+                Value::SingleChar(fk_action_char(f.on_update)),
+                Value::SingleChar(fk_action_char(f.on_delete)),
+                Value::SingleChar(if f.match_full { b'f' } else { b's' }),
+                int_array(attnums(t, &f.cols)),
+                confkey,
+            ]));
+        }
+    }
+    (schema, rows)
+}

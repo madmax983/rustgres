@@ -7043,9 +7043,49 @@ pub struct TxnManager {
 /// for the whole engine keeps the locking discipline trivial (engine ->
 /// wal) at the cost of serializing statements — acceptable for v0.5.
 #[derive(Debug)]
+/// v2.06: one queued deferred FK check (PG19's after-trigger queue).
+/// Child entries re-validate by KEY: at fire time, any visible child
+/// row still carrying the key must find it in the parent (a row that
+/// was updated away or deleted inside the transaction no longer
+/// matches, mirroring PG's final-image semantics). Parent entries
+/// carry the referenced row's id and its full pre-change image; at
+/// fire time the row's current image decides the action.
+#[derive(Clone)]
+pub enum PendingFk {
+    Child {
+        child: String,
+        fk_name: String,
+        key: Vec<Value>,
+    },
+    Parent {
+        parent: String,
+        child: String,
+        fk_name: String,
+        row_id: u64,
+        old_values: Row,
+    },
+}
+
+/// v2.06: per-session deferred-FK state: the pending-trigger queue
+/// plus SET CONSTRAINTS mode overrides, keyed by (child table,
+/// constraint name). Lives for one transaction; the server clears it
+/// at transaction end and truncates it at savepoint rollback.
+#[derive(Clone, Debug, Default)]
+pub struct DeferredFkState {
+    pub queue: Vec<PendingFk>,
+    pub modes: HashMap<(String, String), bool>,
+    /// (child table, constraint) pairs currently being fired: their
+    /// own cascade planning must run immediate, not re-queue.
+    pub firing: HashSet<(String, String)>,
+}
+
 pub struct Engine {
     pub db: Database,
     pub txns: TxnManager,
+    /// v2.06: deferred FK queues by session id (interior-mutable:
+    /// FK checks run under `&Engine` in several DML paths; every
+    /// borrow is short and never held across a recursive call).
+    pub deferred_fk: std::cell::RefCell<HashMap<u64, DeferredFkState>>,
     /// v0.9: session-local `currval` state: (session id, sequence name) ->
     /// last `nextval` result in that session. Cleared when... never
     /// automatically (Postgres keeps it for the session); keyed by the
@@ -7086,6 +7126,7 @@ impl Engine {
                 lock_order: HashMap::new(),
             },
             seq_currval: HashMap::new(),
+            deferred_fk: std::cell::RefCell::new(HashMap::new()),
             seq_advanced: Vec::new(),
             seq_lastval: HashMap::new(),
             // v0.13: replication slots.

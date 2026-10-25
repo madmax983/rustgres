@@ -2611,6 +2611,23 @@ pub(crate) fn build_source(
                 let (_, rows) = pg_class_scan(&q.eng.db, q.snap, q.own, q.session);
                 return Ok((apply_aliases(schema)?, rows));
             }
+            // v2.06: pg_constraint is virtual too (bounded catalog subset).
+            if name == "pg_constraint"
+                && q.eng
+                    .db
+                    .find_table(name, q.snap, &q.all_xids, q.session)
+                    .is_none()
+            {
+                let schema: Vec<QCol> = pg_constraint_schema()
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                let (_, rows) = pg_constraint_scan(&q.eng.db, q.snap, q.own, q.session);
+                return Ok((apply_aliases(schema)?, rows));
+            }
             // v0.88: pg_attribute is virtual too (bounded catalog subset).
             if name == "pg_attribute"
                 && q.eng

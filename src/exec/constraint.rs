@@ -648,6 +648,11 @@ pub(crate) fn check_row_constraints(
         })
         .collect();
     for check in &meta.checks {
+        // v2.06: a NOT ENFORCED constraint is catalogued, not
+        // evaluated (PG19 conenforced).
+        if !check.enforced {
+            continue;
+        }
         let mut lock_ids = Vec::new();
         let mut q = Q {
             eng,
@@ -730,6 +735,64 @@ pub(crate) fn fk_ref_cols(parent_meta: &TableMeta, fk: &FkDef) -> Result<Vec<Str
     }
 }
 
+/// v2.06: does a visible row carrying `key` in the FK's referenced
+/// columns exist in the referenced table — OR IN ANY OF ITS PARTITION
+/// DESCENDANTS? A partitioned parent's own row store is always empty
+/// (rows live in the leaves), so the pre-v2.06 root-only scan
+/// reported every key missing for partitioned parents; the deferred
+/// flush shared the same blindness via its own copy. `ignore` skips
+/// one row id on one named table (self-referencing UPDATE).
+pub(crate) fn fk_parent_key_exists(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    fk: &FkDef,
+    key: &[Value],
+    ignore: Option<(&str, u64)>,
+) -> Result<bool, ExecError> {
+    // Collect the referenced table plus its partition tree.
+    let mut tables: Vec<(String, Table)> = Vec::new();
+    let mut stack = vec![fk.ref_table.clone()];
+    let mut seen: HashSet<String> = HashSet::new();
+    while let Some(name) = stack.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let Some(t) = eng.db.find_table(&name, snap, &[own], session) else {
+            continue;
+        };
+        if let Some(p) = &t.partition {
+            for c in &p.children {
+                stack.push(c.clone());
+            }
+        }
+        tables.push((name, t.clone()));
+    }
+    for (name, t) in &tables {
+        let meta = TableMeta::of(t);
+        let ref_cols = fk_ref_cols(&meta, fk)?;
+        let pos: Vec<usize> = ref_cols
+            .iter()
+            .map(|c| t.column_index(c).expect("fk ref cols validated at DDL"))
+            .collect();
+        let hit = t
+            .rows
+            .iter()
+            .filter(|r| row_visible(r, snap, &[own]))
+            .filter(|r| !matches!(ignore, Some((tn, id)) if tn == name && r.id == id))
+            .any(|r| {
+                pos.iter()
+                    .zip(key.iter())
+                    .all(|(&pi, kv)| fk_key_eq(&r.values[pi], kv))
+            });
+        if hit {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Child-side foreign-key check for one new row (INSERT / UPDATE /
 /// cascaded SET NULL / SET DEFAULT). `self_new` holds the statement's own
 /// new rows on the child table (self-references); `ignore_id` excludes the
@@ -764,7 +827,47 @@ pub(crate) fn check_fk_child_row(
     self_new: &[Row],
     ignore_id: Option<u64>,
 ) -> Result<(), ExecError> {
+    check_fk_child_row_pv(
+        eng,
+        snap,
+        own,
+        session,
+        child_meta,
+        child_table,
+        values,
+        self_new,
+        ignore_id,
+        None,
+    )
+}
+
+/// As `check_fk_child_row`, plus a prevalidated (referenced table,
+/// key) pair: a key the caller guarantees exists in that table's
+/// FINAL image. The ON UPDATE CASCADE planner uses this — the
+/// cascaded child row's new key is carried by the parent row being
+/// updated, whose new version is not visible in the table yet at
+/// plan time (the pre-fix planner therefore reported every cascaded
+/// key missing and failed plain ON UPDATE CASCADE 23503). Matching
+/// by referenced table (not constraint name) also covers several
+/// FKs from one child to the same parent acting on the same row.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_fk_child_row_pv(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    child_meta: &TableMeta,
+    child_table: &str,
+    values: &[Value],
+    self_new: &[Row],
+    ignore_id: Option<u64>,
+    prevalidated: Option<(&str, &[Value])>,
+) -> Result<(), ExecError> {
     for fk in &child_meta.fks {
+        // v2.06: NOT ENFORCED FKs are never checked.
+        if !fk.enforced {
+            continue;
+        }
         let child_pos: Vec<usize> = fk
             .cols
             .iter()
@@ -776,6 +879,38 @@ pub(crate) fn check_fk_child_row(
             .collect();
         let key: Vec<Value> = child_pos.iter().map(|&i| values[i].clone()).collect();
         if key.iter().any(|v| matches!(v, Value::Null)) {
+            // v2.06: MATCH SIMPLE/PARTIAL skip on any NULL; MATCH
+            // FULL fails on a partially-NULL key (deferred FKs queue
+            // the key and fail at fire time instead).
+            if fk.match_full && !key.iter().all(|v| matches!(v, Value::Null)) {
+                if fk_mode_deferred(eng, session, child_table, fk) {
+                    queue_child_fk(eng, session, child_table, &fk.name, key);
+                    continue;
+                }
+                return Err(exec_err(
+                    "23503",
+                    format!(
+                        "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
+                        child_table, fk.name
+                    ),
+                ));
+            }
+            continue;
+        }
+        // v2.06: a currently-deferred FK queues its check for
+        // COMMIT / SET CONSTRAINTS IMMEDIATE instead of running it.
+        if fk_mode_deferred(eng, session, child_table, fk) {
+            queue_child_fk(eng, session, child_table, &fk.name, key);
+            continue;
+        }
+        // Prevalidated key (ON UPDATE CASCADE plan): the parent's
+        // pending row carries exactly this key, so it exists in the
+        // final image by construction.
+        if let Some((href, hkey)) = prevalidated
+            && href == fk.ref_table
+            && hkey.len() == key.len()
+            && hkey.iter().zip(key.iter()).all(|(a, b)| fk_key_eq(a, b))
+        {
             continue;
         }
         let parent = eng
@@ -799,13 +934,21 @@ pub(crate) fn check_fk_child_row(
                 .all(|(&pi, kv)| fk_key_eq(&vals[pi], kv))
         };
         let self_ref = fk.ref_table == child_table;
-        let found = parent
-            .rows
-            .iter()
-            .filter(|r| row_visible(r, snap, &[own]))
-            .filter(|r| !(self_ref && Some(r.id) == ignore_id))
-            .any(|r| matches_key(&r.values))
-            || (self_ref && self_new.iter().any(|v| matches_key(v)));
+        // v2.06: the key may live in any partition leaf of the
+        // referenced table, not only in its (always empty) root.
+        let found = fk_parent_key_exists(
+            eng,
+            snap,
+            own,
+            session,
+            fk,
+            &key,
+            if self_ref {
+                ignore_id.map(|id| (child_table, id))
+            } else {
+                None
+            },
+        )? || (self_ref && self_new.iter().any(|v| matches_key(v)));
         if !found {
             return Err(exec_err(
                 "23503",
@@ -864,12 +1007,42 @@ pub(crate) struct FkCascade {
 }
 
 impl FkCascade {
-    pub(crate) fn contains(&self, table: &str, id: u64) -> bool {
+    pub(crate) fn is_planned_delete(&self, table: &str, id: u64) -> bool {
         self.deletes.iter().any(|(t, i, _)| t == table && *i == id)
-            || self
-                .updates
-                .iter()
-                .any(|(t, i, _, _)| t == table && *i == id)
+    }
+
+    /// The values a previously planned action will leave in this
+    /// row, if any (v2.06 composition: several FKs between the same
+    /// parent/child pair can act on one row — PG applies each RI
+    /// action to the row's current image, so later actions must
+    /// start from the planned image, not the table image).
+    pub(crate) fn planned_values(&self, table: &str, id: u64) -> Option<Row> {
+        self.updates
+            .iter()
+            .find(|(t, i, _, _)| t == table && *i == id)
+            .map(|(_, _, _, v)| v.clone())
+    }
+
+    /// Insert or replace the planned update for a row.
+    pub(crate) fn upsert_update(&mut self, table: &str, id: u64, xmax: u64, values: Row) {
+        if let Some(e) = self
+            .updates
+            .iter_mut()
+            .find(|(t, i, _, _)| t == table && *i == id)
+        {
+            e.3 = values;
+        } else {
+            self.updates.push((table.to_string(), id, xmax, values));
+        }
+    }
+
+    /// A planned delete subsumes any planned update of the row.
+    pub(crate) fn supersede_with_delete(&mut self, table: &str, id: u64, xmax: u64) {
+        self.updates
+            .retain(|(t, i, _, _)| !(t == table && *i == id));
+        if !self.is_planned_delete(table, id) {
+            self.deletes.push((table.to_string(), id, xmax));
+        }
     }
 }
 
@@ -898,6 +1071,26 @@ pub(crate) fn plan_fk_cascade(
         ));
     }
     for (child_table, fk) in fks_referencing(eng, snap, own, session, parent_table) {
+        // v2.06: NOT ENFORCED FKs never act. A currently-deferred FK
+        // queues one parent entry per changed row; the action is
+        // planned at fire time against the row's final image.
+        if !fk.enforced {
+            continue;
+        }
+        if fk_mode_deferred(eng, session, &child_table, &fk) {
+            for (pid, old_values, _) in changed {
+                queue_parent_fk(
+                    eng,
+                    session,
+                    parent_table,
+                    &child_table,
+                    &fk.name,
+                    *pid,
+                    old_values.clone(),
+                );
+            }
+            continue;
+        }
         let ref_cols = fk_ref_cols(parent_meta, &fk)?;
         let parent_pos: Vec<usize> = ref_cols
             .iter()
@@ -961,11 +1154,32 @@ pub(crate) fn plan_fk_cascade(
                     .collect()
             };
             for (cid, cxmax, cvalues) in refs {
-                if out.contains(&child_table, cid) {
-                    continue; // already handled by this cascade
+                if out.is_planned_delete(&child_table, cid) {
+                    continue; // a planned delete subsumes later actions
                 }
+                // v2.06 composition: an earlier FK action on this
+                // row (several FKs can join the same parent/child
+                // pair — e.g. tasks.owner/worker/checked_by) leaves
+                // a planned image; this action applies to THAT
+                // image, not the table image. The pre-fix blanket
+                // `contains` skip applied only the first FK's action
+                // and left the row referencing the dead key.
+                let base: Vec<Value> = out
+                    .planned_values(&child_table, cid)
+                    .map(|r| r.to_vec())
+                    .unwrap_or_else(|| cvalues.to_vec());
+                let base_row = Row::new(base.clone());
                 match act {
                     FkAction::Restrict => {
+                        // If a planned action already moved this
+                        // row off the old key, it no longer restricts.
+                        let still_refs = child_pos
+                            .iter()
+                            .zip(old_key.iter())
+                            .all(|(&ci, kv)| fk_key_eq(&base[ci], kv));
+                        if !still_refs {
+                            continue;
+                        }
                         return Err(exec_err(
                             "23503",
                             format!(
@@ -986,7 +1200,7 @@ pub(crate) fn plan_fk_cascade(
                         check_row_lock(eng, &child_table, cid, own)?;
                         if let Some(nk) = &new_key {
                             // ON UPDATE CASCADE: move the child key.
-                            let mut nv = cvalues.to_vec();
+                            let mut nv = base.to_vec();
                             for (&ci, kv) in child_pos.iter().zip(nk.iter()) {
                                 nv[ci] = kv.clone();
                             }
@@ -1017,7 +1231,9 @@ pub(crate) fn plan_fk_cascade(
                                 ));
                             }
                             // The child's own FKs must still hold.
-                            check_fk_child_row(
+                            // This FK is prevalidated: the parent's
+                            // pending row carries the new key.
+                            check_fk_child_row_pv(
                                 eng,
                                 snap,
                                 own,
@@ -1027,10 +1243,10 @@ pub(crate) fn plan_fk_cascade(
                                 &nv,
                                 &[],
                                 Some(cid),
+                                Some((parent_table, nk.as_slice())),
                             )?;
                             let nv = Row::new(nv);
-                            out.updates
-                                .push((child_table.clone(), cid, cxmax, nv.clone()));
+                            out.upsert_update(&child_table, cid, cxmax, nv.clone());
                             let child_meta2 = child_meta.clone();
                             plan_fk_cascade(
                                 eng,
@@ -1041,13 +1257,13 @@ pub(crate) fn plan_fk_cascade(
                                 level,
                                 &child_table,
                                 &child_meta2,
-                                &[(cid, cvalues.clone(), Some(nv))],
+                                &[(cid, base_row.clone(), Some(nv))],
                                 depth + 1,
                                 out,
                             )?;
                         } else {
                             // ON DELETE CASCADE.
-                            out.deletes.push((child_table.clone(), cid, cxmax));
+                            out.supersede_with_delete(&child_table, cid, cxmax);
                             let child_meta2 = child_meta.clone();
                             plan_fk_cascade(
                                 eng,
@@ -1058,7 +1274,7 @@ pub(crate) fn plan_fk_cascade(
                                 level,
                                 &child_table,
                                 &child_meta2,
-                                &[(cid, cvalues.clone(), None)],
+                                &[(cid, base_row.clone(), None)],
                                 depth + 1,
                                 out,
                             )?;
@@ -1067,7 +1283,7 @@ pub(crate) fn plan_fk_cascade(
                     FkAction::SetNull | FkAction::SetDefault => {
                         check_write_conflict(eng, cxmax, level)?;
                         check_row_lock(eng, &child_table, cid, own)?;
-                        let mut nv = cvalues.to_vec();
+                        let mut nv = base.to_vec();
                         for &ci in &child_pos {
                             nv[ci] = match act {
                                 FkAction::SetNull => Value::Null,
@@ -1120,8 +1336,7 @@ pub(crate) fn plan_fk_cascade(
                             Some(cid),
                         )?;
                         let nv = Row::new(nv);
-                        out.updates
-                            .push((child_table.clone(), cid, cxmax, nv.clone()));
+                        out.upsert_update(&child_table, cid, cxmax, nv.clone());
                         let child_meta2 = child_meta.clone();
                         plan_fk_cascade(
                             eng,
@@ -1132,7 +1347,7 @@ pub(crate) fn plan_fk_cascade(
                             level,
                             &child_table,
                             &child_meta2,
-                            &[(cid, cvalues.clone(), Some(nv))],
+                            &[(cid, base_row.clone(), Some(nv))],
                             depth + 1,
                             out,
                         )?;

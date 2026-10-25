@@ -267,9 +267,9 @@ pub(crate) fn execute_inner(
             with_data,
             concurrently,
         } => exec_refresh_matview(eng, ctx, name, *with_data, *concurrently),
-        Stmt::SetConstraints { .. } => Ok(ExecResult::Command {
-            tag: "SET CONSTRAINTS".to_string(),
-        }),
+        Stmt::SetConstraints { names, deferred } => {
+            exec_set_constraints(eng, ctx, names, *deferred)
+        }
         Stmt::CreateAggregate {
             name,
             arg_types,
