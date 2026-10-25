@@ -243,6 +243,19 @@ pub(crate) fn from_schema_item(
                 out.push(apply_aliases(schema)?);
                 return Ok(());
             }
+            // v2.06: pg_constraint is virtual too (bounded catalog subset).
+            if name == "pg_constraint" && eng.db.find_table(name, snap, &[own], session).is_none() {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let schema: Vec<QCol> = pg_constraint_schema()
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                out.push(apply_aliases(schema)?);
+                return Ok(());
+            }
             // v0.88: pg_attribute is virtual too (bounded catalog subset).
             if name == "pg_attribute" && eng.db.find_table(name, snap, &[own], session).is_none() {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());
@@ -273,6 +286,34 @@ pub(crate) fn from_schema_item(
             if name == "pg_sequences" && eng.db.find_table(name, snap, &[own], session).is_none() {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());
                 let schema: Vec<QCol> = pg_sequences_schema()
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                out.push(apply_aliases(schema)?);
+                return Ok(());
+            }
+            // v2.04: publication catalog views are virtual too.
+            if matches!(
+                name.as_str(),
+                "pg_publication"
+                    | "pg_publication_rel"
+                    | "pg_publication_namespace"
+                    | "pg_publication_tables"
+                    | "pg_publication_sequences"
+            ) && eng.db.find_table(name, snap, &[own], session).is_none()
+            {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let raw = match name.as_str() {
+                    "pg_publication" => pg_publication_schema(),
+                    "pg_publication_rel" => pg_publication_rel_schema(),
+                    "pg_publication_namespace" => pg_publication_namespace_schema(),
+                    "pg_publication_tables" => pg_publication_tables_schema(),
+                    _ => pg_publication_sequences_schema(),
+                };
+                let schema: Vec<QCol> = raw
                     .into_iter()
                     .map(|mut c| {
                         c.qual = qual.clone();

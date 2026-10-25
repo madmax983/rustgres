@@ -3894,6 +3894,7 @@ fn v76_check_not_valid_encode_decode_roundtrip() {
         not_valid: false,
         kind: crate::sql::CheckKind::Check,
         no_inherit: false,
+        enforced: true,
     });
     t.checks.push(CheckDef {
         name: "c_nv".to_string(),
@@ -3901,6 +3902,7 @@ fn v76_check_not_valid_encode_decode_roundtrip() {
         not_valid: true,
         kind: crate::sql::CheckKind::Check,
         no_inherit: false,
+        enforced: true,
     });
     // v0.77: a NOT NULL-kind check round-trips its kind.
     t.checks.push(CheckDef {
@@ -3915,6 +3917,7 @@ fn v76_check_not_valid_encode_decode_roundtrip() {
         not_valid: true,
         kind: crate::sql::CheckKind::NotNull,
         no_inherit: false,
+        enforced: true,
     });
     let encoded = encode_constraints(&t);
     let dec = decode_constraints(&encoded).unwrap();
@@ -3943,7 +3946,7 @@ fn v76_check_not_valid_encode_decode_roundtrip() {
     // Backward compatibility: strip the new flag and kind (as a
     // pre-v0.76 checkpoint would) and confirm they decode as false
     // / CHECK.
-    let legacy = encoded.replace("(\"c_nv\" (lit int 1) 1 c 0)", "(\"c_nv\" (lit int 1))");
+    let legacy = encoded.replace("(\"c_nv\" (lit int 1) 1 c 0 1)", "(\"c_nv\" (lit int 1))");
     assert_ne!(legacy, encoded);
     let dec = decode_constraints(&legacy).unwrap();
     let nv = dec.checks.iter().find(|c| c.name == "c_nv").unwrap();

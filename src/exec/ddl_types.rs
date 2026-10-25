@@ -2285,6 +2285,7 @@ pub(crate) fn exec_alter_domain(
                 not_valid: *not_valid,
                 kind: crate::sql::CheckKind::Check,
                 no_inherit: false,
+                enforced: true,
             };
             // v1.97: PG19 validates existing stored data against a
             // new domain constraint (validateDomainCheckConstraint)

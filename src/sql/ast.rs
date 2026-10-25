@@ -2279,6 +2279,9 @@ pub struct CheckDef {
     /// inheritance children, and they block ADD PRIMARY KEY over
     /// the column like NOT VALID ones do.
     pub no_inherit: bool,
+    /// v2.06: [NOT] ENFORCED (PG19 conenforced). Only meaningful for
+    /// kind == Check: a non-enforced CHECK is catalogued, not evaluated.
+    pub enforced: bool,
 }
 
 /// v0.76: a NOT NULL column constraint added via ALTER TABLE
@@ -2319,6 +2322,19 @@ pub struct FkDef {
     pub ref_cols: Vec<String>,
     pub on_delete: FkAction,
     pub on_update: FkAction,
+    /// v2.06: MATCH FULL (any NULL in the key fails unless ALL are NULL).
+    /// MATCH PARTIAL is parsed and treated as SIMPLE (see scope.md).
+    pub match_full: bool,
+    /// v2.06: DEFERRABLE / INITIALLY DEFERRED (PG19 pg_constraint
+    /// condeferrable / condeferred).
+    pub deferrable: bool,
+    pub initially_deferred: bool,
+    /// v2.06: [NOT] ENFORCED (PG19 conenforced). A non-enforced FK is
+    /// recorded in the catalog but never checked.
+    pub enforced: bool,
+    /// v2.06: added NOT VALID (PG19 convalidated == !not_valid):
+    /// existing rows were not validated at ADD time.
+    pub not_valid: bool,
 }
 
 /// v0.9: the full schema of a CREATE TABLE: columns plus constraints.
@@ -2362,6 +2378,9 @@ pub struct TableDef {
     pub uniques: Vec<UniqueDef>,
     pub pkey: Option<UniqueDef>,
     pub fks: Vec<FkDef>,
+    /// v2.03: generated columns, parallel to `columns`
+    /// (`Some((expr, stored))`).
+    pub gen_cols: Vec<Option<(Expr, bool)>>,
     /// v0.69: declarative partitioning (`None` = ordinary table).
     pub partition: Option<PartitionDef>,
     /// v0.72: `LIKE` clauses, expanded at exec. PG19 option defaults
@@ -2575,6 +2594,27 @@ pub enum AlterAction {
     AlterColumnDropDefault {
         name: String,
     },
+    /// v2.03: ALTER COLUMN c SET NOT NULL / DROP NOT NULL (PG19
+    /// AT_SetNotNull / AT_DropNotNull).
+    AlterColumnSetNotNull {
+        name: String,
+    },
+    AlterColumnDropNotNull {
+        name: String,
+    },
+    /// v2.05: ALTER COLUMN c SET EXPRESSION AS (expr) (PG19
+    /// AT_SetExpression) — replaces a generated column's expression.
+    AlterColumnSetExpression {
+        name: String,
+        expr: Expr,
+    },
+    /// v2.05: ALTER COLUMN c DROP EXPRESSION [IF EXISTS] (PG19
+    /// AT_DropExpression) — the column becomes a regular column,
+    /// keeping its current values.
+    AlterColumnDropExpression {
+        name: String,
+        if_exists: bool,
+    },
     RenameColumn {
         old: String,
         new: String,
@@ -2611,6 +2651,27 @@ pub enum AlterAction {
         child: String,
         bound: PartBoundDef,
     },
+    /// v2.06: `ALTER TABLE parent DETACH PARTITION child
+    /// [CONCURRENTLY|FINALIZE]` (PG19 ATExecDetachPartition).
+    DetachPartition {
+        child: String,
+        /// 0 = plain, 1 = CONCURRENTLY, 2 = FINALIZE.
+        mode: u8,
+    },
+    /// v2.06: `ALTER TABLE t ALTER CONSTRAINT c [NOT] DEFERRABLE /
+    /// INITIALLY DEFERRED|IMMEDIATE / [NOT] ENFORCED` (PG19
+    /// ATExecAlterConstraint). None = clause absent.
+    AlterConstraint {
+        name: String,
+        deferrable: Option<bool>,
+        initially_deferred: Option<bool>,
+        enforced: Option<bool>,
+    },
+    /// v2.06: `ALTER TABLE t ADD PRIMARY KEY USING INDEX idx` (PG19
+    /// transformIndexConstraints): the unique index becomes the PK.
+    AddPrimaryKeyUsingIndex {
+        index: String,
+    },
     /// v0.96: `ALTER TABLE child INHERIT parent` (PG19 table inheritance).
     /// The parent must exist; every parent column must already exist in
     /// the child with an exactly matching type, and parent NOT NULL
@@ -2633,6 +2694,21 @@ pub enum AlterAction {
     ForceRowSecurity,
     /// v1.95: `ALTER TABLE t NO FORCE ROW LEVEL SECURITY` (PG19).
     NoForceRowSecurity,
+    /// v2.03: `ALTER TABLE t REPLICA IDENTITY {DEFAULT|FULL|NOTHING|
+    /// USING INDEX name}` (PG19 ReplicaIdentityStmt).
+    ReplicaIdentity {
+        kind: ReplicaKind,
+        index: Option<String>,
+    },
+}
+
+/// v2.03: replica identity kind in ALTER TABLE (PG19).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplicaKind {
+    Default,
+    Full,
+    Nothing,
+    Index,
 }
 
 /// v0.9: CREATE / ALTER SEQUENCE options. `None` = keep current value
@@ -2782,17 +2858,24 @@ pub(crate) enum ColCon {
     Unique(Option<String>),
     PKey(Option<String>),
     Default(DefaultExpr),
-    Check(Option<String>, Expr),
+    Check(Option<String>, Expr, bool, bool),
     References {
         name: Option<String>,
         tail: ParsedFkTail,
+    },
+    /// v2.03: `GENERATED ALWAYS AS (expr) STORED|VIRTUAL`.
+    Generated {
+        expr: Expr,
+        stored: bool,
     },
 }
 
 pub(crate) enum ParsedTableCon {
     PKey(Option<String>, Vec<String>),
+    /// v2.06: `PRIMARY KEY USING INDEX name` (ALTER ADD form).
+    PKeyUsingIndex(Option<String>, String),
     Unique(Option<String>, Vec<String>),
-    Check(Option<String>, Expr),
+    Check(Option<String>, Expr, bool, bool),
     Fk {
         name: Option<String>,
         cols: Vec<String>,
@@ -2813,6 +2896,34 @@ pub(crate) struct ParsedFkTail {
     pub(crate) ref_cols: Vec<String>,
     pub(crate) on_delete: FkAction,
     pub(crate) on_update: FkAction,
+    /// v2.06: MATCH FULL seen (MATCH PARTIAL/SIMPLE leave this false).
+    pub(crate) match_full: bool,
+    /// v2.06: ConstraintAttributeSpec results.
+    pub(crate) deferrable: bool,
+    pub(crate) initially_deferred: bool,
+    pub(crate) enforced: bool,
+    /// v2.06: trailing NOT VALID (ALTER ADD CONSTRAINT FK form).
+    pub(crate) not_valid: bool,
+}
+
+impl ParsedFkTail {
+    /// v2.06: build an FkDef from this tail (single construction site
+    /// for the attribute fields).
+    pub(crate) fn into_fk(self, name: String, cols: Vec<String>) -> FkDef {
+        FkDef {
+            name,
+            cols,
+            ref_table: self.ref_table,
+            ref_cols: self.ref_cols,
+            on_delete: self.on_delete,
+            on_update: self.on_update,
+            match_full: self.match_full,
+            deferrable: self.deferrable,
+            initially_deferred: self.initially_deferred,
+            enforced: self.enforced,
+            not_valid: self.not_valid,
+        }
+    }
 }
 
 /// Classify a DEFAULT expression into its stored form.
@@ -2854,6 +2965,7 @@ impl TableDef {
             inherits: Vec::new(),
             deferred_not_null: Vec::new(),
             of_type: None,
+            gen_cols: Vec::new(),
         }
     }
 }
@@ -2863,6 +2975,83 @@ impl TableDef {
 
 pub(crate) fn def_col_exists(def: &TableDef, n: &str) -> bool {
     def.columns.iter().any(|(c, _)| c == n)
+}
+
+/// v2.05: PG19 makeObjectName / ChooseConstraintName for an
+/// auto-generated constraint name: truncate the base to 63 bytes
+/// (NAMEDATALEN-1); on collision within the table, append 1, 2, ...
+/// re-truncating the stem so the result stays within 63 bytes
+/// (foreign_key.out: fktable2_..._charact_fkey then
+/// fktable2_..._charac_fkey1). Explicit names keep the caller's
+/// duplicate error.
+pub(crate) fn choose_auto_name(def: &TableDef, base: &str) -> String {
+    fn trunc(s: &str, n: usize) -> String {
+        let mut out = String::new();
+        for ch in s.chars() {
+            if out.len() + ch.len_utf8() > n {
+                break;
+            }
+            out.push(ch);
+        }
+        out
+    }
+    let cand = trunc(base, 63);
+    if !def_constraint_name_exists(def, &cand) {
+        return cand;
+    }
+    let mut k = 1;
+    loop {
+        let suffix = k.to_string();
+        let cand = format!("{}{}", trunc(base, 63 - suffix.len()), suffix);
+        if !def_constraint_name_exists(def, &cand) {
+            return cand;
+        }
+        k += 1;
+    }
+}
+
+/// v2.05: PG19 ChooseConstraintName for FOREIGN KEY constraints
+/// (tablecmds.c ChooseForeignKeyConstraintNameAddition +
+/// catalog.c makeObjectName): the name is
+/// `{table}_{col1_col2_...}_fkey`; when it exceeds 63 bytes the
+/// column addition is truncated (table and suffix stay intact);
+/// on collision the retry appends 1, 2, ... to the "fkey" suffix
+/// and re-truncates the addition (foreign_key.out:
+/// fktable2_..._charact_fkey, then fktable2_..._charac_fkey1).
+pub(crate) fn pg_fk_auto_name(
+    table: &str,
+    cols: &[String],
+    taken: impl Fn(&str) -> bool,
+) -> String {
+    fn trunc(s: &str, n: usize) -> String {
+        let mut out = String::new();
+        for ch in s.chars() {
+            if out.len() + ch.len_utf8() > n {
+                break;
+            }
+            out.push(ch);
+        }
+        out
+    }
+    // The addition itself is capped at 63 chars by PG.
+    let addition = trunc(&cols.join("_"), 63);
+    let make = |suffix: &str| -> String {
+        let name3 = format!("fkey{}", suffix);
+        let budget = 63usize.saturating_sub(table.len() + 1 + name3.len() + 1);
+        format!("{}_{}_{}", table, trunc(&addition, budget), name3)
+    };
+    let cand = make("");
+    if !taken(&cand) {
+        return cand;
+    }
+    let mut k = 1;
+    loop {
+        let cand = make(&k.to_string());
+        if !taken(&cand) {
+            return cand;
+        }
+        k += 1;
+    }
 }
 
 pub(crate) fn def_constraint_name_exists(def: &TableDef, cname: &str) -> bool {
@@ -2892,10 +3081,15 @@ pub(crate) fn def_add_pkey(
     if def.pkey.is_some() {
         return Err(err("multiple primary keys for table".to_string()));
     }
-    let cname = name.unwrap_or_else(|| format!("{}_pkey", table));
-    if def_constraint_name_exists(def, &cname) {
-        return Err(err(format!("constraint \"{}\" already exists", cname)));
-    }
+    let cname = match &name {
+        Some(n) => {
+            if def_constraint_name_exists(def, n) {
+                return Err(err(format!("constraint \"{}\" already exists", n)));
+            }
+            n.clone()
+        }
+        None => choose_auto_name(def, &format!("{}_pkey", table)),
+    };
     if !defer_col_check {
         for c in cols {
             let i = def.columns.iter().position(|(n, _)| n == c).unwrap();
@@ -2926,10 +3120,15 @@ pub(crate) fn def_add_unique(
             }
         }
     }
-    let cname = name.unwrap_or_else(|| format!("{}_{}_key", table, col));
-    if def_constraint_name_exists(def, &cname) {
-        return Err(err(format!("constraint \"{}\" already exists", cname)));
-    }
+    let cname = match &name {
+        Some(n) => {
+            if def_constraint_name_exists(def, n) {
+                return Err(err(format!("constraint \"{}\" already exists", n)));
+            }
+            n.clone()
+        }
+        None => choose_auto_name(def, &format!("{}_{}_key", table, col)),
+    };
     def.uniques.push(UniqueDef {
         name: cname,
         cols: cols.to_vec(),
@@ -2943,11 +3142,19 @@ pub(crate) fn def_add_check(
     name: Option<String>,
     e: Expr,
     col: &str,
+    // v2.06: NOT VALID / NOT ENFORCED from the attribute tail.
+    not_valid: bool,
+    enforced: bool,
 ) -> Result<(), SqlError> {
-    let cname = name.unwrap_or_else(|| format!("{}_{}_check", table, col));
-    if def_constraint_name_exists(def, &cname) {
-        return Err(err(format!("constraint \"{}\" already exists", cname)));
-    }
+    let cname = match &name {
+        Some(n) => {
+            if def_constraint_name_exists(def, n) {
+                return Err(err(format!("constraint \"{}\" already exists", n)));
+            }
+            n.clone()
+        }
+        None => choose_auto_name(def, &format!("{}_{}_check", table, col)),
+    };
     // CHECK expressions may only reference this table's columns.
     let mut refs = Vec::new();
     collect_col_refs(&e, &mut refs);
@@ -2965,9 +3172,10 @@ pub(crate) fn def_add_check(
     def.checks.push(CheckDef {
         name: cname,
         expr: e,
-        not_valid: false,
+        not_valid,
         kind: CheckKind::Check,
         no_inherit: false,
+        enforced,
     });
     Ok(())
 }
@@ -2989,18 +3197,16 @@ pub(crate) fn def_add_fk(
             }
         }
     }
-    let cname = name.unwrap_or_else(|| format!("{}_{}_fkey", table, cols[0]));
-    if def_constraint_name_exists(def, &cname) {
-        return Err(err(format!("constraint \"{}\" already exists", cname)));
-    }
-    def.fks.push(FkDef {
-        name: cname,
-        cols: cols.to_vec(),
-        ref_table: tail.ref_table,
-        ref_cols: tail.ref_cols,
-        on_delete: tail.on_delete,
-        on_update: tail.on_update,
-    });
+    let cname = match &name {
+        Some(n) => {
+            if def_constraint_name_exists(def, n) {
+                return Err(err(format!("constraint \"{}\" already exists", n)));
+            }
+            n.clone()
+        }
+        None => pg_fk_auto_name(table, cols, |n| def_constraint_name_exists(def, n)),
+    };
+    def.fks.push(tail.into_fk(cname, cols.to_vec()));
     Ok(())
 }
 
@@ -3045,6 +3251,8 @@ pub(crate) fn build_table_def(
             // v0.72: no column-level STORAGE syntax yet; LIKE ...
             // INCLUDING STORAGE fills this at exec.
             def.storage.push(None);
+            // v2.03: generated-column slot (filled in pass 2).
+            def.gen_cols.push(None);
         }
     }
     // v0.72: a bare `(LIKE src)` list contributes its columns at exec;
@@ -3097,6 +3305,7 @@ pub(crate) fn build_table_def(
                                 not_valid: false,
                                 kind: CheckKind::NotNull,
                                 no_inherit: true,
+                                enforced: true,
                             });
                         }
                         ColCon::Null => {
@@ -3124,9 +3333,15 @@ pub(crate) fn build_table_def(
                             false,
                         )?,
                         ColCon::Default(d) => def.defaults[i] = Some(d.clone()),
-                        ColCon::Check(n, e) => {
-                            def_add_check(table, &mut def, n.clone(), e.clone(), &c.name)?
-                        }
+                        ColCon::Check(n, e, nv, enf) => def_add_check(
+                            table,
+                            &mut def,
+                            n.clone(),
+                            e.clone(),
+                            &c.name,
+                            *nv,
+                            *enf,
+                        )?,
                         ColCon::References { name: n, tail } => def_add_fk(
                             table,
                             &mut def,
@@ -3137,13 +3352,27 @@ pub(crate) fn build_table_def(
                                 ref_cols: tail.ref_cols.clone(),
                                 on_delete: tail.on_delete,
                                 on_update: tail.on_update,
+                                match_full: tail.match_full,
+                                deferrable: tail.deferrable,
+                                initially_deferred: tail.initially_deferred,
+                                enforced: tail.enforced,
+                                not_valid: tail.not_valid,
                             },
                             false,
                         )?,
+                        // v2.03: generated column definition.
+                        ColCon::Generated { expr, stored } => {
+                            def.gen_cols[i] = Some((expr.clone(), *stored))
+                        }
                     }
                 }
             }
             TableItem::TableCon(tc) => match tc {
+                ParsedTableCon::PKeyUsingIndex(..) => {
+                    return Err(err(
+                        "PRIMARY KEY USING INDEX is only valid in ALTER TABLE".to_string()
+                    ));
+                }
                 ParsedTableCon::PKey(n, cols) => {
                     def_add_pkey(table, &mut def, n.clone(), cols, !inherits.is_empty())?
                 }
@@ -3158,8 +3387,8 @@ pub(crate) fn build_table_def(
                         !inherits.is_empty(),
                     )?
                 }
-                ParsedTableCon::Check(n, e) => {
-                    def_add_check(table, &mut def, n.clone(), e.clone(), table)?
+                ParsedTableCon::Check(n, e, nv, enf) => {
+                    def_add_check(table, &mut def, n.clone(), e.clone(), table, *nv, *enf)?
                 }
                 // v0.76: `CONSTRAINT name NOT NULL col` in CREATE TABLE —
                 // PG doesn't allow this syntax here, but we accept it by
@@ -3228,6 +3457,7 @@ pub(crate) fn build_table_def(
                                 not_valid: false,
                                 kind: CheckKind::NotNull,
                                 no_inherit: true,
+                                enforced: true,
                             });
                         }
                         def.not_null[i] = true;
@@ -3257,6 +3487,11 @@ pub(crate) fn build_table_def(
                         ref_cols: tail.ref_cols.clone(),
                         on_delete: tail.on_delete,
                         on_update: tail.on_update,
+                        match_full: tail.match_full,
+                        deferrable: tail.deferrable,
+                        initially_deferred: tail.initially_deferred,
+                        enforced: tail.enforced,
+                        not_valid: tail.not_valid,
                     },
                     !inherits.is_empty(),
                 )?,
@@ -5952,6 +6187,8 @@ pub enum Stmt {
         /// v1.96: CREATE PROCEDURE (stored as a void function flagged
         /// as a procedure; PG keeps a separate namespace).
         procedure: bool,
+        /// v2.04: RETURNS TABLE declared columns (name, type name).
+        table_cols: Vec<(String, String)>,
     },
     DropFunction {
         name: String,
@@ -6190,6 +6427,11 @@ pub enum Stmt {
         schemas: Vec<String>,
         publish: Option<(bool, bool, bool, bool)>,
         via_partition_root: Option<bool>,
+        /// v2.03: per-table (name, column list, row filter), parallel
+        /// to `tables`.
+        table_specs: Vec<(String, Option<Vec<String>>, Option<Expr>)>,
+        /// v2.03: publish_generated_columns option value.
+        publish_generated_columns: Option<String>,
     },
     /// v2.02: DROP PUBLICATION [IF EXISTS] name [, ...] [CASCADE|RESTRICT].
     DropPublication {
@@ -6212,6 +6454,17 @@ pub enum Stmt {
         publish: Option<(bool, bool, bool, bool)>,
         via_partition_root: Option<bool>,
         new_value: Option<String>,
+        /// v2.03: per-table specs, parallel to `tables`.
+        table_specs: Vec<(String, Option<Vec<String>>, Option<Expr>)>,
+        /// v2.03: publish_generated_columns option value.
+        publish_generated_columns: Option<String>,
+    },
+    /// v2.04: COMMENT ON PUBLICATION name IS 'text' | NULL — the
+    /// only COMMENT ON arm this engine models (it backs
+    /// obj_description over pg_publication in publication.sql).
+    CommentPublication {
+        name: String,
+        comment: Option<String>,
     },
     /// v1.96: DROP SCHEMA [IF EXISTS] name [, ...] [CASCADE|RESTRICT].
     DropSchema {
@@ -6247,9 +6500,13 @@ pub enum Stmt {
         /// v1.96: WITH DATA (default) vs WITH NO DATA.
         with_data: bool,
     },
-    /// v1.96: SET CONSTRAINTS ... (accepted no-op: constraints are
-    /// always immediate in this engine).
-    SetConstraints,
+    /// v1.96/v2.06: SET CONSTRAINTS {ALL | name [, ...]} {DEFERRED |
+    /// IMMEDIATE}. v2.06 gives it real per-transaction semantics.
+    /// `names == None` means ALL.
+    SetConstraints {
+        names: Option<Vec<String>>,
+        deferred: bool,
+    },
     /// v1.96: ALTER SCHEMA name OWNER TO role.
     AlterSchemaOwner {
         name: String,

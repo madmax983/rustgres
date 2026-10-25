@@ -295,6 +295,8 @@ pub enum WalRecord {
         security_definer: bool,
         /// v1.96 (RGSWAL26): CREATE PROCEDURE flag.
         is_procedure: bool,
+        /// v2.04 (RGSWAL29): RETURNS TABLE declared columns.
+        table_cols: Vec<(String, String)>,
         xmin: u64,
     },
     DropFunction {
@@ -322,6 +324,115 @@ pub enum WalRecord {
         toast_relid: u32,
         xmin: u64,
     },
+    // --- v2.04 (RGSWAL29): publication DDL. CREATE and ALTER both
+    // carry the full publication image (`WalPublication`), so replay
+    // is an upsert; DROP removes the entry. Before v2.04 the catalog
+    // was transactional via the undo log only and a restart forgot
+    // every publication.
+    CreatePublication {
+        name: String,
+        pub_: WalPublication,
+        xmin: u64,
+    },
+    AlterPublication {
+        name: String,
+        pub_: WalPublication,
+        xmin: u64,
+    },
+    DropPublication {
+        name: String,
+        xmax: u64,
+    },
+}
+
+/// v2.04: plain-data form of a `Publication` for WAL records and
+/// checkpoints. Per-table specs travel sorted by key for a
+/// deterministic image; row filters travel as s-expr strings
+/// (`sql::encode_expr`, the CHECK-constraint encoding).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WalPublication {
+    pub oid: u32,
+    pub comment: Option<String>,
+    pub owner: String,
+    pub all_tables: bool,
+    pub all_sequences: bool,
+    pub except_tables: Vec<String>,
+    pub tables: Vec<String>,
+    pub schemas: Vec<String>,
+    pub pubinsert: bool,
+    pub pubupdate: bool,
+    pub pubdelete: bool,
+    pub pubtruncate: bool,
+    pub via_partition_root: bool,
+    pub publish_generated_columns: String,
+    /// (lowercased table key, column list, filter s-expr).
+    pub specs: Vec<(String, Option<Vec<String>>, Option<String>)>,
+}
+
+impl WalPublication {
+    pub fn of(p: &crate::storage::Publication) -> Self {
+        let mut specs: Vec<(String, Option<Vec<String>>, Option<String>)> = p
+            .table_specs
+            .iter()
+            .map(|(k, s)| {
+                (
+                    k.clone(),
+                    s.cols.clone(),
+                    s.filter.as_ref().map(crate::sql::encode_expr),
+                )
+            })
+            .collect();
+        specs.sort_by(|a, b| a.0.cmp(&b.0));
+        WalPublication {
+            oid: p.oid,
+            comment: p.comment.clone(),
+            owner: p.owner.clone(),
+            all_tables: p.all_tables,
+            all_sequences: p.all_sequences,
+            except_tables: p.except_tables.clone(),
+            tables: p.tables.clone(),
+            schemas: p.schemas.clone(),
+            pubinsert: p.pubinsert,
+            pubupdate: p.pubupdate,
+            pubdelete: p.pubdelete,
+            pubtruncate: p.pubtruncate,
+            via_partition_root: p.via_partition_root,
+            publish_generated_columns: p.publish_generated_columns.clone(),
+            specs,
+        }
+    }
+
+    pub fn into_publication(self, name: String) -> crate::storage::Publication {
+        let mut table_specs =
+            std::collections::HashMap::with_hasher(crate::fxhash::FxBuildHasher::default());
+        for (k, cols, filter) in self.specs {
+            let filter = filter
+                .as_deref()
+                .map(crate::sql::decode_expr)
+                .transpose()
+                .ok()
+                .flatten();
+            table_specs.insert(k, crate::storage::PubTableSpec { cols, filter });
+        }
+        crate::storage::Publication {
+            name,
+            oid: self.oid,
+            comment: self.comment,
+            owner: self.owner,
+            all_tables: self.all_tables,
+            all_sequences: self.all_sequences,
+            except_tables: self.except_tables,
+            tables: self.tables,
+            schemas: self.schemas,
+            pubinsert: self.pubinsert,
+            pubupdate: self.pubupdate,
+            pubdelete: self.pubdelete,
+            pubtruncate: self.pubtruncate,
+            via_partition_root: self.via_partition_root,
+            publish_generated_columns: self.publish_generated_columns,
+            table_specs,
+        }
+    }
 }
 
 /// v0.86: one operator definition in WAL/checkpoint form.

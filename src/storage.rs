@@ -5642,6 +5642,26 @@ pub struct Table {
     /// creation order. Versions, WAL-replays, and checkpoints with the
     /// table via the s-expr constraints codec.
     pub policies: Vec<crate::sql::PolicyDef>,
+    /// v2.03: `pg_class.relreplident` — the table's replica identity
+    /// (PG19 `ALTER TABLE ... REPLICA IDENTITY`). Versions and
+    /// persists with the table via the constraints codec.
+    pub replica_identity: ReplicaIdentity,
+    /// v2.03: generated columns, parallel to `columns`:
+    /// `Some((expr, stored))` for `GENERATED ALWAYS AS (expr)
+    /// STORED|VIRTUAL`. Values are materialized on write for both
+    /// kinds in this engine. Persists via the constraints codec.
+    pub gen_cols: Vec<Option<(crate::sql::Expr, bool)>>,
+}
+
+/// v2.03: replica identity kind (PG19 `relreplident`).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum ReplicaIdentity {
+    #[default]
+    Default,
+    Full,
+    Nothing,
+    /// REPLICA IDENTITY USING INDEX <name>.
+    Index(String),
 }
 
 impl Table {
@@ -5700,6 +5720,9 @@ impl Table {
             rls_enabled: false,
             rls_forced: false,
             policies: Vec::new(),
+            // v2.03: DEFAULT replica identity, no generated columns.
+            replica_identity: ReplicaIdentity::Default,
+            gen_cols: vec![None; n],
         }
     }
 
@@ -5717,6 +5740,10 @@ impl Table {
         }
         t.not_null = def.not_null.clone();
         t.defaults = def.defaults.clone();
+        // v2.03: generated columns (LIKE-expanded defs may be shorter).
+        if def.gen_cols.len() == t.columns.len() {
+            t.gen_cols = def.gen_cols.clone();
+        }
         t.checks = def.checks.clone();
         t.uniques = def.uniques.clone();
         t.pkey = def.pkey.clone();
@@ -5876,6 +5903,10 @@ pub struct FuncDef {
     pub security_definer: bool,
     /// v1.96: CREATE PROCEDURE (separate PG namespace from functions).
     pub is_procedure: bool,
+    /// v2.04: RETURNS TABLE declared columns (name, type name);
+    /// empty for other return shapes. PG names a table function's
+    /// output columns from this list, not from the body's aliases.
+    pub table_cols: Vec<(String, String)>,
 }
 
 /// v1.38: a user-defined cast definition, keyed by (source, target)
@@ -6029,9 +6060,9 @@ pub struct Database {
     /// Transactional via the statement undo log
     /// (`WriteOp::CreatePublication` & friends — object_address.sql
     /// relies on a rolled-back FOR ALL TABLES publication never
-    /// becoming visible), but deliberately not WAL-logged or
-    /// checkpointed: a restart forgets publications, which only
-    /// narrows the guard (documented hold-back).
+    /// becoming visible).
+    /// v2.04: WAL-logged (full-image records, RGSWAL29) and
+    /// checkpointed (CHKPT 25), so publications survive restart.
     pub publications: HashMap<String, Publication, FxBuildHasher>,
     /// v1.96: large object contents (oid -> bytes) and owners.
     /// v1.96: user-defined aggregates by name.
@@ -6056,6 +6087,15 @@ pub struct Database {
 #[derive(Clone, Debug)]
 pub struct Publication {
     pub name: String,
+    /// v2.04: pg_publication.oid, allocated from `Database::next_oid`
+    /// at CREATE and preserved by ALTER/RENAME; carried by WAL and
+    /// checkpoint so catalog views and obj_description are stable
+    /// across restarts. 0 for records decoded from pre-v2.04 images
+    /// (none can exist: the checkpoint version bump refuses them).
+    pub oid: u32,
+    /// v2.04: COMMENT ON PUBLICATION text (pg_description), read back
+    /// via obj_description(oid, 'pg_publication').
+    pub comment: Option<String>,
     pub owner: String,
     pub all_tables: bool,
     pub all_sequences: bool,
@@ -6070,6 +6110,20 @@ pub struct Publication {
     pub pubdelete: bool,
     pub pubtruncate: bool,
     pub via_partition_root: bool,
+    /// v2.03: publish_generated_columns ('none' | 'stored').
+    pub publish_generated_columns: String,
+    /// v2.03: per-table specs keyed by lowercased unqualified table
+    /// name: column list (None = all columns) and row filter.
+    pub table_specs: std::collections::HashMap<String, PubTableSpec, FxBuildHasher>,
+}
+
+/// v2.03: one FOR TABLE entry's column list + row filter
+/// (pg_publication_rel.prattrs / prqual).
+#[derive(Clone, Debug, Default)]
+pub struct PubTableSpec {
+    /// None = no column list (all columns published).
+    pub cols: Option<Vec<String>>,
+    pub filter: Option<crate::sql::Expr>,
 }
 
 /// v0.13: a replication slot. Cluster-global (not per-database), and
@@ -6989,9 +7043,49 @@ pub struct TxnManager {
 /// for the whole engine keeps the locking discipline trivial (engine ->
 /// wal) at the cost of serializing statements — acceptable for v0.5.
 #[derive(Debug)]
+/// v2.06: one queued deferred FK check (PG19's after-trigger queue).
+/// Child entries re-validate by KEY: at fire time, any visible child
+/// row still carrying the key must find it in the parent (a row that
+/// was updated away or deleted inside the transaction no longer
+/// matches, mirroring PG's final-image semantics). Parent entries
+/// carry the referenced row's id and its full pre-change image; at
+/// fire time the row's current image decides the action.
+#[derive(Clone)]
+pub enum PendingFk {
+    Child {
+        child: String,
+        fk_name: String,
+        key: Vec<Value>,
+    },
+    Parent {
+        parent: String,
+        child: String,
+        fk_name: String,
+        row_id: u64,
+        old_values: Row,
+    },
+}
+
+/// v2.06: per-session deferred-FK state: the pending-trigger queue
+/// plus SET CONSTRAINTS mode overrides, keyed by (child table,
+/// constraint name). Lives for one transaction; the server clears it
+/// at transaction end and truncates it at savepoint rollback.
+#[derive(Clone, Debug, Default)]
+pub struct DeferredFkState {
+    pub queue: Vec<PendingFk>,
+    pub modes: HashMap<(String, String), bool>,
+    /// (child table, constraint) pairs currently being fired: their
+    /// own cascade planning must run immediate, not re-queue.
+    pub firing: HashSet<(String, String)>,
+}
+
 pub struct Engine {
     pub db: Database,
     pub txns: TxnManager,
+    /// v2.06: deferred FK queues by session id (interior-mutable:
+    /// FK checks run under `&Engine` in several DML paths; every
+    /// borrow is short and never held across a recursive call).
+    pub deferred_fk: std::cell::RefCell<HashMap<u64, DeferredFkState>>,
     /// v0.9: session-local `currval` state: (session id, sequence name) ->
     /// last `nextval` result in that session. Cleared when... never
     /// automatically (Postgres keeps it for the session); keyed by the
@@ -7032,6 +7126,7 @@ impl Engine {
                 lock_order: HashMap::new(),
             },
             seq_currval: HashMap::new(),
+            deferred_fk: std::cell::RefCell::new(HashMap::new()),
             seq_advanced: Vec::new(),
             seq_lastval: HashMap::new(),
             // v0.13: replication slots.

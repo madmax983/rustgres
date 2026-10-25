@@ -796,13 +796,47 @@ pub(crate) fn attach_partition(
                 .map(|rv| rv.values.clone())
                 .collect()
         };
+        // v2.06: for a DEFAULT attach the converted bound is a dummy
+        // that contains nothing; PG's rule is the inverse — every
+        // existing row must fall outside every SIBLING bound (a row
+        // that belongs in another partition violates the default
+        // partition constraint). Collect the sibling bounds up front.
+        let sibling_bounds: Vec<PartBound> = if matches!(bound_def, PartBoundDef::Default) {
+            let parent = eng
+                .db
+                .find_table(parent_name, ctx.snap, &ctx.all_xids, ctx.session)
+                .expect("parent still visible");
+            let mut out = Vec::new();
+            if let Some(pp) = &parent.partition {
+                for sib in &pp.children {
+                    if sib == child_name {
+                        continue;
+                    }
+                    if let Some(st) = eng.db.find_table(sib, ctx.snap, &ctx.all_xids, ctx.session)
+                        && let Some(sb) = st.partition.as_ref().and_then(|sp| sp.bound.clone())
+                    {
+                        out.push(sb);
+                    }
+                }
+            }
+            out
+        } else {
+            Vec::new()
+        };
         for values in &rows {
             // Map child row to parent column order, then check bound.
             // v0.70: expression partition keys are evaluated for real
             // (was NULL), via the shared key evaluator.
             let prow = remap_row_to_parent(&child_cols, &parent_cols, values);
             let key = eval_table_part_key(eng, ctx, parent_name, &pinfo, &parent_cols, &prow)?;
-            if !bound_contains(&pinfo.method, &bound, &key) {
+            let row_ok = if matches!(bound_def, PartBoundDef::Default) {
+                sibling_bounds
+                    .iter()
+                    .all(|sb| !bound_contains(&pinfo.method, sb, &key))
+            } else {
+                bound_contains(&pinfo.method, &bound, &key)
+            };
+            if !row_ok {
                 return Err(exec_err(
                     "23514",
                     format!(
@@ -1919,6 +1953,7 @@ pub(crate) fn expand_like_clauses(
                     not_valid: ck.not_valid,
                     kind: ck.kind,
                     no_inherit: ck.no_inherit,
+                    enforced: true,
                 });
             }
         }
@@ -2769,7 +2804,14 @@ pub(crate) fn validate_fk_def(
 /// namespace can't hold one `{constraint}` index per sibling); every
 /// other table keeps the historical `{constraint}` name.
 pub(crate) fn constraint_index_name(table: &str, con: &str, is_partition_child: bool) -> String {
-    if is_partition_child {
+    // v2.05: a constraint created directly on the child already
+    // carries the child's name (`{table}_pkey` from
+    // ChooseConstraintName), so prefixing again produced
+    // `{table}_{table}_pkey` and REPLICA IDENTITY USING INDEX
+    // could never find the backing index (42704). PG names the
+    // backing index after the constraint verbatim; the prefix is
+    // only needed when a parent-named constraint propagates.
+    if is_partition_child && !con.starts_with(&format!("{table}_")) {
         format!("{table}_{con}")
     } else {
         con.to_string()
@@ -2850,4 +2892,86 @@ pub(crate) fn create_constraint_index(
     eng.db.indexes.insert(ix_name.clone(), ix);
     ctx.writes.push(WriteOp::CreateIndex { name: ix_name });
     Ok(())
+}
+
+/// v2.06: `ALTER TABLE parent DETACH PARTITION child
+/// [CONCURRENTLY|FINALIZE]` (PG19 ATExecDetachPartition +
+/// RemoveInheritance): the child becomes a standalone table keeping
+/// its rows; an intermediate (itself partitioned) child keeps its
+/// own partitioning and children. PG's CONCURRENTLY two-phase detach
+/// (pending-detach state) has no analogue here — CONCURRENTLY and
+/// FINALIZE perform the same single-phase detach. The 25001
+/// transaction-block restriction for CONCURRENTLY is enforced by
+/// PG's utility hook; this engine's executor cannot see the block
+/// state, so it is not reproduced (see v206 scope.md).
+pub(crate) fn detach_partition(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    parent_name: &str,
+    child_name: &str,
+    _mode: u8,
+) -> Result<ExecResult, ExecError> {
+    require_table_owner(eng, ctx, parent_name)?;
+    let parent = eng
+        .db
+        .find_table(parent_name, ctx.snap, &ctx.all_xids, ctx.session)
+        .ok_or_else(|| {
+            exec_err(
+                "42P01",
+                format!("relation \"{}\" does not exist", parent_name),
+            )
+        })?;
+    let pinfo = parent.partition.clone().ok_or_else(|| {
+        exec_err(
+            "42809",
+            format!("relation \"{}\" is not partitioned", parent_name),
+        )
+    })?;
+    if !pinfo.children.iter().any(|c| c == child_name) {
+        return Err(exec_err(
+            "42P01",
+            format!(
+                "relation \"{}\" is not a partition of relation \"{}\"",
+                child_name, parent_name
+            ),
+        ));
+    }
+    let child = eng
+        .db
+        .find_table(child_name, ctx.snap, &ctx.all_xids, ctx.session)
+        .ok_or_else(|| {
+            exec_err(
+                "42P01",
+                format!("relation \"{}\" does not exist", child_name),
+            )
+        })?
+        .clone();
+    // Unlink on the parent side (transactional version swap).
+    parent_link_child(eng, ctx, parent_name, child_name, false);
+    // Child side: clear the parent link and bound. A leaf becomes a
+    // plain table; an intermediate keeps method/key/children.
+    let mut next = child.clone();
+    match &mut next.partition {
+        Some(pi) => {
+            pi.parent = None;
+            pi.bound = None;
+            pi.is_default = false;
+            if !pi.is_partitioned {
+                next.partition = None;
+            }
+        }
+        None => {
+            return Err(exec_err(
+                "42P01",
+                format!(
+                    "relation \"{}\" is not a partition of relation \"{}\"",
+                    child_name, parent_name
+                ),
+            ));
+        }
+    }
+    commit_table_version(eng, ctx, child_name, child, next);
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
 }

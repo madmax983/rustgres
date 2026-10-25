@@ -56,7 +56,7 @@ pub(crate) use crate::storage::{
 };
 pub(crate) use std::cell::RefCell;
 pub(crate) use std::cmp::Ordering;
-pub(crate) use std::collections::{HashMap, HashSet};
+pub(crate) use std::collections::{BTreeSet, HashMap, HashSet};
 pub(crate) use std::ops::Bound;
 pub(crate) use std::rc::Rc;
 
@@ -74,6 +74,7 @@ mod create;
 mod cte;
 mod ddl_func;
 mod ddl_types;
+mod deferred;
 mod describe;
 mod dispatch;
 mod dml;
@@ -286,6 +287,18 @@ mod v201_merge_tests;
 #[path = "test_mods/v202_guard_tests.rs"]
 mod v202_guard_tests;
 #[cfg(test)]
+#[path = "test_mods/v203_tests.rs"]
+mod v203_tests;
+#[cfg(test)]
+#[path = "test_mods/v204_tests.rs"]
+mod v204_tests;
+#[cfg(test)]
+#[path = "test_mods/v205_tests.rs"]
+mod v205_tests;
+#[cfg(test)]
+#[path = "test_mods/v206_tests.rs"]
+mod v206_tests;
+#[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;
 
@@ -303,6 +316,7 @@ pub(crate) use create::*;
 pub(crate) use cte::*;
 pub(crate) use ddl_func::*;
 pub(crate) use ddl_types::*;
+pub(crate) use deferred::*;
 pub(crate) use describe::*;
 pub(crate) use dispatch::*;
 pub(crate) use dml::*;

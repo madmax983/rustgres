@@ -1587,6 +1587,7 @@ pub(crate) fn exec_create_table_as(
         inherits: Vec::new(),
         deferred_not_null: Vec::new(),
         of_type: None,
+        gen_cols: vec![None; ncols],
     };
     // CTAS definitions never carry constraints; the effective def is discarded.
     let _ = create_table_from_def(eng, ctx, name, &def, temp)?;
@@ -2371,6 +2372,16 @@ pub(crate) fn exec_insert(
                         values[ci] = coerce_assign_composite(eng, v, Some(tname))?;
                     }
                 }
+                // v2.03: generated columns materialize on write.
+                compute_generated_columns(
+                    eng,
+                    ctx.snap,
+                    ctx.own,
+                    ctx.session,
+                    ctx.role,
+                    &meta,
+                    &mut values,
+                )?;
                 check_row_constraints(
                     eng,
                     ctx.snap,
@@ -2441,6 +2452,21 @@ pub(crate) fn exec_insert(
                 let mut explicit = vec![false; ncols];
                 for (v, &(ci, indir)) in row.iter().zip(targets.iter()) {
                     let (cname, ctype) = &meta.columns[ci];
+                    // v2.03: a non-DEFAULT value into a generated
+                    // column is 428C9 (PG19 "cannot insert a
+                    // non-DEFAULT value into column"); DEFAULT is the
+                    // one accepted spelling.
+                    if meta.gen_cols.get(ci).is_some_and(|g| g.is_some())
+                        && !matches!(v, InsertValue::Default)
+                    {
+                        return Err(exec_err(
+                            "428C9",
+                            format!(
+                                "cannot insert a non-DEFAULT value into column \"{}\"",
+                                cname
+                            ),
+                        ));
+                    }
                     // v0.84: indirection targets (`f2[1]`, `f3.if2`).
                     // PG19 rejects DEFAULT into an indirection path
                     // with 0A000 before evaluating any default, coerces
@@ -2543,6 +2569,16 @@ pub(crate) fn exec_insert(
                         }
                     }
                 }
+                // v2.03: generated columns materialize on write.
+                compute_generated_columns(
+                    q.eng,
+                    ctx.snap,
+                    ctx.own,
+                    ctx.session,
+                    ctx.role,
+                    &meta,
+                    &mut values,
+                )?;
                 // v0.9: NOT NULL + CHECK.
                 check_row_constraints(
                     q.eng,
@@ -3100,6 +3136,16 @@ pub(crate) fn exec_insert(
                             ),
                         ));
                     }
+                    let mut new_values = new_values;
+                    compute_generated_columns(
+                        eng,
+                        ctx.snap,
+                        ctx.own,
+                        ctx.session,
+                        ctx.role,
+                        &meta_for_upsert,
+                        &mut new_values,
+                    )?;
                     check_row_constraints(
                         eng,
                         ctx.snap,
@@ -3623,6 +3669,16 @@ pub(crate) fn exec_update(
                 })
             })
             .collect::<Result<_, _>>()?;
+        // v2.03: PG19 — a generated column can only be updated to
+        // DEFAULT (428C9); the value is always computed.
+        for ((name, _), &ci) in sets.iter().zip(set_cols.iter()) {
+            if meta.gen_cols.get(ci).is_some_and(|g| g.is_some()) {
+                return Err(exec_err(
+                    "428C9",
+                    format!("column \"{}\" can only be updated to DEFAULT", name),
+                ));
+            }
+        }
         let columns = meta.columns.clone();
         // v0.85: composite type names for positional record coercion on
         // UPDATE assignment.
@@ -3978,6 +4034,17 @@ pub(crate) fn exec_update(
                     ),
                 ));
             }
+            // v2.03: generated columns re-materialize on update.
+            let mut new_dst = new_dst;
+            compute_generated_columns(
+                eng,
+                ctx.snap,
+                ctx.own,
+                ctx.session,
+                ctx.role,
+                &dst_meta,
+                &mut new_dst,
+            )?;
             // v0.9: NOT NULL + CHECK on the new row (destination metadata).
             check_row_constraints(
                 eng,
@@ -4120,19 +4187,43 @@ pub(crate) fn exec_update(
         let from_schema = from_data.map(|(s, _)| s);
         (plan, moves, ret_new, ret_from, ret_prov_ids, from_schema)
     };
-    // v2.02: replica-identity guard for partitioned targets — PG
-    // checks each leaf result relation the statement actually touches
-    // (a WHERE-false UPDATE over a published partitioned table with
-    // no replica identity passes, because no leaf is ever opened).
+    // v2.02: replica-identity guard for partitioned targets.
+    // v2.05 correction (PG19 ExecInitModifyTable): PG initializes
+    // EVERY leaf result relation of a partitioned target (partition
+    // pruning uses only the partition key, never the statement's
+    // WHERE), so CheckCmdReplicaIdentity fires for all leaves even
+    // when no row matches — the publication suite's empty-table
+    // UPDATE testpub_tbl8 cases error in PG. The v2.02 touched-only
+    // rule let those through. Touched leaves stay in the set for
+    // safety (moves can name a non-descendant source).
     {
-        let touched: Vec<&str> = plan
+        let mut check_set: Vec<String> = plan
             .iter()
-            .map(|(dst, _, _, _)| dst.as_str())
-            .chain(moves.iter().map(|(src, _, _, _, _)| src.as_str()))
+            .map(|(dst, _, _, _)| dst.clone())
+            .chain(moves.iter().map(|(src, _, _, _, _)| src.clone()))
             .collect();
+        let is_partitioned = eng
+            .db
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+            .and_then(|t| t.partition.as_ref())
+            .is_some_and(|p| p.is_partitioned);
+        // PG exception: a constant-false WHERE prunes every
+        // partition at plan time, so no result relation is ever
+        // initialized and the guard does not fire (publication.sql
+        // testpub_parted: UPDATE ... WHERE false succeeds despite
+        // the missing replica identity).
+        let pruned_all = matches!(
+            where_,
+            Some(crate::sql::Expr::Literal(crate::sql::Literal::Bool(false)))
+        );
+        if is_partitioned && !pruned_all {
+            for (leaf, _) in partition_leaves(eng, ctx, table) {
+                check_set.push(leaf);
+            }
+        }
         let mut seen = HashSet::new();
-        for leaf in touched {
-            if seen.insert(leaf.to_string()) {
+        for leaf in &check_set {
+            if seen.insert(leaf.clone()) {
                 check_replica_identity_for(eng, ctx, leaf, true)?;
             }
         }
@@ -4753,11 +4844,29 @@ pub(crate) fn exec_delete(
         let using_schema = using_data.map(|(s, _)| s);
         (plan, plan_using, using_schema)
     };
-    // v2.02: replica-identity guard for partitioned targets — check
-    // each leaf the plan actually deletes from (see exec_update).
+    // v2.02: replica-identity guard for partitioned targets.
+    // v2.05: all leaves, as in exec_update (PG init-time check).
     {
+        let mut check_set: Vec<String> = plan
+            .iter()
+            .map(|(leaf, _, _, _, _, _)| leaf.clone())
+            .collect();
+        let is_partitioned = eng
+            .db
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+            .and_then(|t| t.partition.as_ref())
+            .is_some_and(|p| p.is_partitioned);
+        let pruned_all = matches!(
+            where_,
+            Some(crate::sql::Expr::Literal(crate::sql::Literal::Bool(false)))
+        );
+        if is_partitioned && !pruned_all {
+            for (leaf, _) in partition_leaves(eng, ctx, table) {
+                check_set.push(leaf);
+            }
+        }
         let mut seen = HashSet::new();
-        for (leaf, _, _, _, _, _) in &plan {
+        for leaf in &check_set {
             if seen.insert(leaf.clone()) {
                 check_replica_identity_for(eng, ctx, leaf, false)?;
             }
@@ -5070,11 +5179,16 @@ pub(crate) fn exec_drop(
     // named explicitly (performMultipleDeletions deletes each object
     // once). Track statement-level drops and skip repeats.
     let mut dropped: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // v2.05: the full statement set — FK references FROM a table that
+    // is itself being dropped by this statement do not block (PG19
+    // performMultipleDeletions resolves dependencies across the
+    // whole DROP list; alter_table check_fk_presence / attbl+atref).
+    let stmt_set: std::collections::HashSet<String> = names.iter().cloned().collect();
     for name in names {
         if dropped.contains(name) {
             continue;
         }
-        drop_one_table(eng, ctx, name, if_exists, cascade, &mut dropped)?;
+        drop_one_table(eng, ctx, name, if_exists, cascade, &mut dropped, &stmt_set)?;
     }
     // v1.96 finishing pass: schema attribution dies with the table.
     for name in &dropped {
@@ -5150,6 +5264,7 @@ pub(crate) fn drop_one_table(
     if_exists: bool,
     cascade: bool,
     dropped: &mut std::collections::HashSet<String>,
+    stmt_set: &std::collections::HashSet<String>,
 ) -> Result<(), ExecError> {
     // v0.11: only the owner (or a superuser) may drop a table.
     require_table_owner(eng, ctx, name)?;
@@ -5164,7 +5279,7 @@ pub(crate) fn drop_one_table(
         .unwrap_or_default();
     for child in &children {
         // Recurse (the child may itself be partitioned).
-        drop_one_table(eng, ctx, child, false, cascade, dropped)?;
+        drop_one_table(eng, ctx, child, false, cascade, dropped, stmt_set)?;
     }
     // v0.22: DROP resolves a session-local temp table first (PostgreSQL
     // semantics): dropping it reveals any permanent table of the same
@@ -5255,9 +5370,12 @@ pub(crate) fn drop_one_table(
         }
     };
     // Dependency scan: FKs from other tables, and views.
+    // v2.05: a referencing table that this same statement drops
+    // (named in the list, or a partition child already dropped by
+    // the recursion above) is not a blocker — its FK dies with it.
     let mut dep_fks: Vec<(String, String)> = Vec::new();
     for (tname, vs) in &eng.db.tables {
-        if tname == name {
+        if tname == name || stmt_set.contains(tname) || dropped.contains(tname) {
             continue;
         }
         let Some(ot) = vs

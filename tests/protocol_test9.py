@@ -365,12 +365,21 @@ def test_alter_table():
         t, r, e = c.q("INSERT INTO t2 VALUES (-2, 'neg2')")
         check("dropped check not enforced", t == ["INSERT 0 1"], f"{t} {e}")
 
-        # DROP COLUMN with dependent constraint needs CASCADE.
+        # DROP COLUMN dependency rules (PG19 ALTER TABLE docs:
+        # "Indexes and table constraints involving the column will
+        # be automatically dropped as well" — only OTHER objects,
+        # e.g. views, block under RESTRICT). v2.05 corrected this
+        # block, which previously encoded the engine's over-strict
+        # 2BP01 for a column's own UNIQUE constraint.
         c.q("ALTER TABLE t2 ADD CONSTRAINT u_bee UNIQUE (bee)")
+        c.q("CREATE VIEW v_bee AS SELECT bee FROM t2")
         t, r, e = c.q("ALTER TABLE t2 DROP COLUMN bee")
         check("drop column restrict", e == ["2BP01"], f"{e}")
         t, r, e = c.q("ALTER TABLE t2 DROP COLUMN bee CASCADE")
         check("drop column cascade", t == ["ALTER TABLE"], f"{t} {e}")
+        # The column's own UNIQUE constraint is AUTO: it would have
+        # been dropped with the column even without CASCADE (the
+        # CASCADE above was needed only for the view).
     finally:
         c.close()
         shutdown(proc, d)

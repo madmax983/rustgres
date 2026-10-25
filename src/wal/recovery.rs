@@ -274,6 +274,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             strict,
             security_definer,
             is_procedure,
+            table_cols,
             xmin,
         } => {
             if *xmin >= eng.txns.next_xid {
@@ -316,6 +317,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     strict: *strict,
                     security_definer: *security_definer,
                     is_procedure: *is_procedure,
+                    table_cols: table_cols.clone(),
                 };
                 let overloads = eng.db.functions.entry(name.clone()).or_default();
                 if let Some(slot) = overloads.iter_mut().find(|f| f.arg_types == def.arg_types) {
@@ -367,6 +369,26 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             }
             eng.db.operators.remove(name);
         }
+        // v2.04: publication records — full-image upsert / remove,
+        // applied here like the other catalog records. The OID
+        // counter resumes above every restored publication OID.
+        WalRecord::CreatePublication { name, pub_, xmin }
+        | WalRecord::AlterPublication { name, pub_, xmin } => {
+            if *xmin >= eng.txns.next_xid {
+                eng.txns.next_xid = *xmin + 1;
+            }
+            if pub_.oid >= eng.db.next_oid {
+                eng.db.next_oid = pub_.oid + 1;
+            }
+            let p = pub_.clone().into_publication(name.clone());
+            eng.db.publications.insert(name.clone(), p);
+        }
+        WalRecord::DropPublication { name, xmax } => {
+            if *xmax >= eng.txns.next_xid {
+                eng.txns.next_xid = *xmax + 1;
+            }
+            eng.db.publications.remove(name);
+        }
     }
     match r {
         // v0.11: role records are applied by the match above; nothing left
@@ -382,7 +404,11 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
         | WalRecord::CreateFunction { .. }
         | WalRecord::DropFunction { .. }
         | WalRecord::CreateOperator { .. }
-        | WalRecord::DropOperator { .. } => {}
+        | WalRecord::DropOperator { .. }
+        // v2.04: publication records likewise.
+        | WalRecord::CreatePublication { .. }
+        | WalRecord::AlterPublication { .. }
+        | WalRecord::DropPublication { .. } => {}
         // v0.13: replication slot records are applied here.
         WalRecord::ReplSlotCreate {
             name,
@@ -493,6 +519,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     t.rls_enabled = dc.rls_enabled;
                     t.rls_forced = dc.rls_forced;
                     t.policies = dc.policies;
+                    t.replica_identity = dc.replica_identity.clone();
+                    t.gen_cols = if dc.gen_cols.len() == t.columns.len() { dc.gen_cols.clone() } else { vec![None; t.columns.len()] };
                 }
                 Err(e) => {
                     return Err(format!(
@@ -804,6 +832,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     t.rls_enabled = dc.rls_enabled;
                     t.rls_forced = dc.rls_forced;
                     t.policies = dc.policies;
+                    t.replica_identity = dc.replica_identity.clone();
+                    t.gen_cols = if dc.gen_cols.len() == t.columns.len() { dc.gen_cols.clone() } else { vec![None; t.columns.len()] };
                 }
                 Err(e) => {
                     return Err(format!(
@@ -1077,6 +1107,34 @@ pub fn records_for_commit(
     // directory unopenable.
     let mut own_versions: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    // v2.04: ALTER PUBLICATION RENAME encodes in the undo log as
+    // DropPublication{new, prev: None} + CreatePublication{old,
+    // prev: Some} (the pair that makes rollback restore the old
+    // entry). For the WAL that pair means: drop the OLD name, then
+    // create the NEW name with the live image. Collect the pairs
+    // up front so the arms below can translate.
+    let mut pub_renames: Vec<(String, String)> = Vec::new();
+    for w in writes {
+        if let WriteOp::DropPublication {
+            name: new_name,
+            prev: None,
+        } = w
+        {
+            if let Some(old_name) = writes.iter().find_map(|w2| match w2 {
+                WriteOp::CreatePublication {
+                    name,
+                    prev: Some(_),
+                } if !eng.db.publications.contains_key(name)
+                    && eng.db.publications.contains_key(new_name) =>
+                {
+                    Some(name.clone())
+                }
+                _ => None,
+            }) {
+                pub_renames.push((old_name, new_name.clone()));
+            }
+        }
+    }
     let mut i = 0;
     while i < writes.len() {
         let op = &writes[i];
@@ -1727,6 +1785,7 @@ pub fn records_for_commit(
                         strict: f.strict,
                         security_definer: f.security_definer,
                         is_procedure: f.is_procedure,
+                        table_cols: f.table_cols.clone(),
                         xmin: own,
                     });
                 }
@@ -1779,12 +1838,58 @@ pub fn records_for_commit(
             WriteOp::CreateCast { .. } => {
                 // v1.91: no local increment (see CreateType arm note).
             }
-            // v2.02: publication DDL is likewise NOT WAL-logged:
-            // publications are an in-memory catalog and do not survive
-            // restart (documented hold-back on the v2.02 guard).
-            WriteOp::CreatePublication { .. }
-            | WriteOp::DropPublication { .. }
-            | WriteOp::AlterPublication { .. } => {}
+            // v2.04: publication DDL IS WAL-logged (it was not in
+            // v2.02/v2.03 — a restart forgot every publication). The
+            // new image is read from the catalog map, which the
+            // executor updated; CREATE/ALTER both log the full image
+            // (replay upserts), DROP logs the removal. Absent from
+            // the map at commit means a later DROP in the same txn
+            // removed it, so only the drop is logged.
+            WriteOp::CreatePublication { name, .. } => {
+                if pub_renames.iter().any(|(old, _)| old == name) {
+                    // Rename source: logged by the Drop arm below.
+                } else if let Some(p) = eng.db.publications.get(name) {
+                    out.push(WalRecord::CreatePublication {
+                        name: name.clone(),
+                        pub_: WalPublication::of(p),
+                        xmin: own,
+                    });
+                }
+            }
+            WriteOp::AlterPublication { name, .. } => {
+                if let Some(p) = eng.db.publications.get(name) {
+                    out.push(WalRecord::AlterPublication {
+                        name: name.clone(),
+                        pub_: WalPublication::of(p),
+                        xmin: own,
+                    });
+                }
+            }
+            WriteOp::DropPublication { name, prev } => {
+                if prev.is_none() {
+                    if let Some((old, _)) = pub_renames.iter().find(|(_, new)| new == name) {
+                        // Rename: drop the old name, create the new
+                        // one with its live image.
+                        out.push(WalRecord::DropPublication {
+                            name: old.clone(),
+                            xmax: own,
+                        });
+                        if let Some(p) = eng.db.publications.get(name) {
+                            out.push(WalRecord::CreatePublication {
+                                name: name.clone(),
+                                pub_: WalPublication::of(p),
+                                xmin: own,
+                            });
+                        }
+                        i += 1;
+                        continue;
+                    }
+                }
+                out.push(WalRecord::DropPublication {
+                    name: name.clone(),
+                    xmax: own,
+                });
+            }
             WriteOp::CreateIndex { name } => {
                 let Some(ix) = eng.db.indexes.get(name) else {
                     i += 1;

@@ -67,7 +67,10 @@ pub(crate) fn pg_class_scan(
         rows.push(QRow {
             cells: Row::new(vec![
                 Value::Int(t.oid as i64),
-                Value::text(name.as_str()),
+                // v2.04: relname is never schema-qualified in PG
+                // (the schema rides in relnamespace); storage keys
+                // here are dotted for schema tables.
+                Value::text(name.rsplit('.').next().unwrap_or(name.as_str())),
                 Value::Int(t.toast_relid as i64),
                 relkind,
                 Value::Bool(t.rls_enabled),
@@ -4571,5 +4574,451 @@ pub(crate) fn pg_stat_activity_scan(
         ]),
         prov: Vec::new(),
     });
+    (schema, rows)
+}
+
+// ---------------------------------------------------------------------------
+// v2.04: publication catalog views (PG19 catalog/pg_publication.h,
+// catalog/pg_publication_rel.h, catalog/system_views.sql). Virtual
+// like pg_class: a real table by the same name takes precedence.
+// ---------------------------------------------------------------------------
+
+fn pub_qcols(qual: &str, cols: &[(&str, ColType)]) -> Vec<QCol> {
+    cols.iter()
+        .map(|(n, ty)| QCol {
+            qual: qual.to_string(),
+            name: n.to_string(),
+            ty: ty.clone(),
+            hidden: false,
+            src_ord: 0,
+        })
+        .collect()
+}
+
+pub(crate) fn pg_publication_schema() -> Vec<QCol> {
+    pub_qcols(
+        "pg_publication",
+        &[
+            ("oid", ColType::Int),
+            ("pubname", ColType::Text),
+            ("pubowner", ColType::Int),
+            ("puballtables", ColType::Bool),
+            ("puballsequences", ColType::Bool),
+            ("pubinsert", ColType::Bool),
+            ("pubupdate", ColType::Bool),
+            ("pubdelete", ColType::Bool),
+            ("pubtruncate", ColType::Bool),
+            ("pubviaroot", ColType::Bool),
+            ("pubgencols", ColType::SingleChar),
+        ],
+    )
+}
+
+pub(crate) fn pg_publication_scan(db: &Database) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = pg_publication_schema();
+    let mut pubs: Vec<&crate::storage::Publication> = db.publications.values().collect();
+    pubs.sort_by_key(|p| p.oid);
+    let rows = pubs
+        .into_iter()
+        .map(|p| QRow {
+            cells: Row::new(vec![
+                Value::Int(p.oid as i64),
+                Value::text(p.name.as_str()),
+                Value::Int(crate::exec::role_oid(&p.owner) as i64),
+                Value::Bool(p.all_tables),
+                Value::Bool(p.all_sequences),
+                Value::Bool(p.pubinsert),
+                Value::Bool(p.pubupdate),
+                Value::Bool(p.pubdelete),
+                Value::Bool(p.pubtruncate),
+                Value::Bool(p.via_partition_root),
+                Value::SingleChar(if p.publish_generated_columns == "stored" {
+                    b's'
+                } else {
+                    b'n'
+                }),
+            ]),
+            prov: Vec::new(),
+        })
+        .collect();
+    (schema, rows)
+}
+
+pub(crate) fn pg_publication_rel_schema() -> Vec<QCol> {
+    pub_qcols(
+        "pg_publication_rel",
+        &[
+            ("oid", ColType::Int),
+            ("prpubid", ColType::Int),
+            ("prrelid", ColType::Int),
+            ("prexcept", ColType::Bool),
+            ("prqual", ColType::Text),
+            ("prattrs", ColType::Text),
+        ],
+    )
+}
+
+pub(crate) fn pg_publication_rel_scan(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = pg_publication_rel_schema();
+    let mut rows = Vec::new();
+    for (oid, pubname, table, except, filter, cols) in publication_rel_entries(db) {
+        let Some(p) = db.publications.get(&pubname) else {
+            continue;
+        };
+        let base = table.rsplit('.').next().unwrap_or(&table);
+        let relid = db
+            .tables
+            .keys()
+            .find(|k| k.rsplit('.').next().unwrap_or(k).eq_ignore_ascii_case(base))
+            .and_then(|k| db.find_table(k, snap, &[own], session))
+            .map(|t| t.oid as i64)
+            .unwrap_or(0);
+        let prattrs = cols.as_ref().and_then(|cs| {
+            let t = db
+                .tables
+                .keys()
+                .find(|k| k.rsplit('.').next().unwrap_or(k).eq_ignore_ascii_case(base))
+                .and_then(|k| db.find_table(k, snap, &[own], session))?;
+            let mut nums = Vec::new();
+            for c in cs {
+                let pos = t
+                    .columns
+                    .iter()
+                    .position(|(n, _)| n.eq_ignore_ascii_case(c))?;
+                nums.push(
+                    t.attnums
+                        .get(pos)
+                        .copied()
+                        .unwrap_or(pos as i16 + 1)
+                        .to_string(),
+                );
+            }
+            Some(nums.join(" "))
+        });
+        rows.push(QRow {
+            cells: Row::new(vec![
+                Value::Int(oid as i64),
+                Value::Int(p.oid as i64),
+                Value::Int(relid),
+                Value::Bool(except),
+                match &filter {
+                    Some(f) => Value::text(deparse_filter(f)),
+                    None => Value::Null,
+                },
+                match prattrs {
+                    Some(s) => Value::text(s),
+                    None => Value::Null,
+                },
+            ]),
+            prov: Vec::new(),
+        });
+    }
+    (schema, rows)
+}
+
+pub(crate) fn pg_publication_namespace_schema() -> Vec<QCol> {
+    pub_qcols(
+        "pg_publication_namespace",
+        &[
+            ("oid", ColType::Int),
+            ("prpubid", ColType::Int),
+            ("prnspid", ColType::Int),
+        ],
+    )
+}
+
+pub(crate) fn pg_publication_namespace_scan(db: &Database) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = pg_publication_namespace_schema();
+    let mut pubs: Vec<&crate::storage::Publication> = db.publications.values().collect();
+    pubs.sort_by_key(|p| p.oid);
+    let mut rows = Vec::new();
+    let mut idx: u32 = 0;
+    for p in pubs {
+        for s in &p.schemas {
+            idx += 1;
+            rows.push(QRow {
+                cells: Row::new(vec![
+                    Value::Int((611_700 + idx) as i64),
+                    Value::Int(p.oid as i64),
+                    Value::Int(schema_oid(s) as i64),
+                ]),
+                prov: Vec::new(),
+            });
+        }
+    }
+    (schema, rows)
+}
+
+pub(crate) fn pg_publication_tables_schema() -> Vec<QCol> {
+    pub_qcols(
+        "pg_publication_tables",
+        &[
+            ("pubname", ColType::Text),
+            ("schemaname", ColType::Text),
+            ("tablename", ColType::Text),
+            ("attnames", ColType::Array(crate::storage::ArrayElem::Text)),
+            ("rowfilter", ColType::Text),
+        ],
+    )
+}
+
+pub(crate) fn pg_publication_tables_scan(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = pg_publication_tables_schema();
+    let mut pubs: Vec<&crate::storage::Publication> = db.publications.values().collect();
+    pubs.sort_by_key(|p| p.oid);
+    let mut rows = Vec::new();
+    for p in pubs {
+        for r in publication_rel_rows(db, snap, own, session, p) {
+            rows.push(QRow {
+                cells: Row::new(vec![
+                    Value::text(p.name.as_str()),
+                    Value::text(r.schemaname.as_str()),
+                    Value::text(r.tablename.as_str()),
+                    Value::Array(Box::new(crate::storage::ArrayVal {
+                        elem: crate::storage::ArrayElem::Text,
+                        dims: vec![r.attnames.len() as i32],
+                        lower: vec![1],
+                        elems: r.attnames.iter().map(|a| Value::text(a.as_str())).collect(),
+                    })),
+                    match &r.filter {
+                        Some(f) => Value::text(deparse_filter(f)),
+                        None => Value::Null,
+                    },
+                ]),
+                prov: Vec::new(),
+            });
+        }
+    }
+    (schema, rows)
+}
+
+pub(crate) fn pg_publication_sequences_schema() -> Vec<QCol> {
+    pub_qcols(
+        "pg_publication_sequences",
+        &[
+            ("pubname", ColType::Text),
+            ("schemaname", ColType::Text),
+            ("sequencename", ColType::Text),
+        ],
+    )
+}
+
+pub(crate) fn pg_publication_sequences_scan(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = pg_publication_sequences_schema();
+    let mut pubs: Vec<&crate::storage::Publication> = db.publications.values().collect();
+    pubs.sort_by_key(|p| p.oid);
+    let mut rows = Vec::new();
+    for p in pubs {
+        if !p.all_sequences {
+            continue;
+        }
+        let mut names: Vec<&String> = db.sequences.keys().collect();
+        names.sort();
+        for name in names {
+            if db.find_sequence(name, snap, own).is_none() {
+                continue;
+            }
+            let (sch, base) = match name.rsplit_once('.') {
+                Some((s, b)) => (s.to_string(), b.to_string()),
+                None => (
+                    db.obj_schema
+                        .get(name.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| "public".to_string()),
+                    name.clone(),
+                ),
+            };
+            rows.push(QRow {
+                cells: Row::new(vec![
+                    Value::text(p.name.as_str()),
+                    Value::text(sch.as_str()),
+                    Value::text(base.as_str()),
+                ]),
+                prov: Vec::new(),
+            });
+        }
+    }
+    (schema, rows)
+}
+
+// ---------------------------------------------------------------------------
+// v2.06: pg_constraint (virtual, bounded subset). Synthesized from the
+// stored constraint records (checks / uniques / pkey / fks / not-null)
+// so catalog introspection — condeferrable, condeferred, conenforced,
+// convalidated — resolves. Constraint OIDs are synthetic: assigned
+// sequentially in (table, name) scan order from 20000; they are stable
+// within a scan but are not a durable identity. confupdtype /
+// confdeltype report 'r' for RESTRICT and for NO ACTION alike (the
+// engine's FkAction does not distinguish them).
+// ---------------------------------------------------------------------------
+
+pub(crate) fn pg_constraint_schema() -> Vec<QCol> {
+    [
+        ("oid", ColType::Int),
+        ("conname", ColType::Text),
+        ("connamespace", ColType::Int),
+        ("contype", ColType::SingleChar),
+        ("condeferrable", ColType::Bool),
+        ("condeferred", ColType::Bool),
+        ("conenforced", ColType::Bool),
+        ("convalidated", ColType::Bool),
+        ("conrelid", ColType::Int),
+        ("contypid", ColType::Int),
+        ("confrelid", ColType::Int),
+        ("conindid", ColType::Int),
+        ("conparentid", ColType::Int),
+        ("confupdtype", ColType::SingleChar),
+        ("confdeltype", ColType::SingleChar),
+        ("confmatchtype", ColType::SingleChar),
+        ("conkey", ColType::Array(ArrayElem::Int)),
+        ("confkey", ColType::Array(ArrayElem::Int)),
+    ]
+    .into_iter()
+    .map(|(n, ty)| QCol {
+        qual: "pg_constraint".to_string(),
+        name: n.to_string(),
+        ty,
+        hidden: false,
+        src_ord: 0,
+    })
+    .collect()
+}
+
+fn fk_action_char(a: FkAction) -> u8 {
+    match a {
+        FkAction::Restrict => b'r',
+        FkAction::Cascade => b'c',
+        FkAction::SetNull => b'n',
+        FkAction::SetDefault => b'd',
+    }
+}
+
+pub(crate) fn pg_constraint_scan(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = pg_constraint_schema();
+    let mut rows = Vec::new();
+    let mut names: Vec<&String> = db.tables.keys().collect();
+    names.sort();
+    if let Some(tmps) = db.temp_tables.get(&session) {
+        let mut tnames: Vec<&String> = tmps.keys().collect();
+        tnames.sort();
+        names.extend(tnames);
+    }
+    let mut next_oid: i64 = 20000;
+    let mut mk = |cells: Vec<Value>| {
+        let mut full = vec![Value::Int(next_oid)];
+        next_oid += 1;
+        full.extend(cells);
+        QRow {
+            cells: Row::new(full),
+            prov: Vec::new(),
+        }
+    };
+    let attnums = |t: &Table, cols: &[String]| -> Vec<i64> {
+        cols.iter()
+            .map(|c| t.column_index(c).map(|i| (i + 1) as i64).unwrap_or(0))
+            .collect()
+    };
+    for name in names {
+        let Some(t) = db.find_table(name, snap, &[own], session) else {
+            continue;
+        };
+        let relid = Value::Int(t.oid as i64);
+        let plain = |contype: u8,
+                     cname: &str,
+                     enforced: bool,
+                     validated: bool,
+                     conkey: Vec<i64>|
+         -> Vec<Value> {
+            vec![
+                Value::text(cname),
+                Value::Int(2200),
+                Value::SingleChar(contype),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Bool(enforced),
+                Value::Bool(validated),
+                relid.clone(),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::Int(0),
+                Value::SingleChar(b'a'),
+                Value::SingleChar(b'a'),
+                Value::SingleChar(b's'),
+                int_array(conkey),
+                Value::Null,
+            ]
+        };
+        if let Some(pk) = &t.pkey {
+            rows.push(mk(plain(b'p', &pk.name, true, true, attnums(t, &pk.cols))));
+        }
+        for u in &t.uniques {
+            rows.push(mk(plain(b'u', &u.name, true, true, attnums(t, &u.cols))));
+        }
+        for c in &t.checks {
+            let contype = match c.kind {
+                crate::sql::CheckKind::Check => b'c',
+                crate::sql::CheckKind::NotNull => b'n',
+            };
+            rows.push(mk(plain(
+                contype,
+                &c.name,
+                c.enforced,
+                !c.not_valid,
+                Vec::new(),
+            )));
+        }
+        for f in &t.fks {
+            let (confrelid, confkey) = match db.find_table(&f.ref_table, snap, &[own], session) {
+                Some(pt) => {
+                    let ref_cols = if f.ref_cols.is_empty() {
+                        pt.pkey.as_ref().map(|p| p.cols.clone()).unwrap_or_default()
+                    } else {
+                        f.ref_cols.clone()
+                    };
+                    (pt.oid as i64, int_array(attnums(pt, &ref_cols)))
+                }
+                None => (0, Value::Null),
+            };
+            rows.push(mk(vec![
+                Value::text(f.name.clone()),
+                Value::Int(2200),
+                Value::SingleChar(b'f'),
+                Value::Bool(f.deferrable),
+                Value::Bool(f.initially_deferred),
+                Value::Bool(f.enforced),
+                Value::Bool(!f.not_valid),
+                relid.clone(),
+                Value::Int(0),
+                Value::Int(confrelid),
+                Value::Int(0),
+                Value::Int(0),
+                Value::SingleChar(fk_action_char(f.on_update)),
+                Value::SingleChar(fk_action_char(f.on_delete)),
+                Value::SingleChar(if f.match_full { b'f' } else { b's' }),
+                int_array(attnums(t, &f.cols)),
+                confkey,
+            ]));
+        }
+    }
     (schema, rows)
 }

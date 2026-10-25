@@ -9,6 +9,9 @@ pub(crate) fn exec_create(
     def: &TableDef,
     temp: bool,
 ) -> Result<ExecResult, ExecError> {
+    // v2.03: generation expressions are validated at CREATE (PG19
+    // cookDefault): immutable, own non-generated columns only.
+    validate_generated_columns(eng, def)?;
     // v1.96 finishing pass: PG19 schema guards for CREATE TABLE:
     // system catalog tables need allow_system_table_mods, and a
     // TEMP table cannot be explicitly placed in a non-temp schema.

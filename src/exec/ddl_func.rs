@@ -168,6 +168,21 @@ pub(crate) fn resolve_func_type_name(
     if name.eq_ignore_ascii_case("void") {
         return Ok(ColType::Composite);
     }
+    // v2.04: `record` is PG19's polymorphic pseudo-type (the return
+    // of RETURNS TABLE functions) — same defer placeholder.
+    if name.eq_ignore_ascii_case("record") {
+        return Ok(ColType::Composite);
+    }
+    // v2.04: array types (`text[]`, `int[][]`) exist for every
+    // element type in PG; resolve the element and defer to the
+    // placeholder (call-time coercion is name-based).
+    if let Some(elem) = name.strip_suffix("[]") {
+        let elem = elem.trim();
+        if !elem.is_empty() {
+            resolve_func_type_name(eng, snap, own, session, elem)?;
+            return Ok(ColType::Composite);
+        }
+    }
     if let Some(st) = eng.db.types.get(name) {
         if st.composite.is_some() {
             return Ok(ColType::Composite);
@@ -879,6 +894,7 @@ pub(crate) fn exec_create_function(
     strict: bool,
     security_definer: bool,
     procedure: bool,
+    table_cols: &[(String, String)],
 ) -> Result<ExecResult, ExecError> {
     // v1.32: PG19 resolves the language first (before return-type
     // resolution): unknown LANGUAGE is 42883, not a parse error.
@@ -1112,6 +1128,7 @@ pub(crate) fn exec_create_function(
         strict,
         security_definer,
         is_procedure: procedure,
+        table_cols: table_cols.to_vec(),
     };
     // v1.96: record the function owner (DROP FUNCTION / GRANT checks).
     {
@@ -2089,6 +2106,11 @@ pub(crate) fn rewrite_select_refs(sel: &mut crate::sql::SelectStmt, arg_names: &
     if let Some(w) = &mut sel.where_ {
         rewrite_func_arg_expr(w, arg_names);
     }
+    // v2.04: FROM-clause function arguments can reference named
+    // args too (`pg_get_publication_tables(pubnames, ...)`) — the
+    // plpgsql rewriter already walks these; the SQL-body path
+    // missed them, surfacing as 42703 at call time.
+    rewrite_from_fn_refs(&mut sel.from, arg_names);
 }
 
 /// v1.33: rewrite named arg references in a DML RETURNING list.
@@ -2111,10 +2133,20 @@ pub(crate) fn rewrite_from_fn_refs(
     arg_names: &[Option<String>],
 ) {
     for f in from {
-        if let crate::sql::FromItem::Function { args, .. } = f {
-            for a in args.iter_mut() {
-                rewrite_func_arg_expr(a, arg_names);
+        match f {
+            crate::sql::FromItem::Function { args, .. } => {
+                for a in args.iter_mut() {
+                    rewrite_func_arg_expr(a, arg_names);
+                }
             }
+            // v2.04: function items nested in a JOIN tree (the
+            // publication test_gpt shape: SRF JOIN pg_publication
+            // JOIN pg_class) need the same walk.
+            crate::sql::FromItem::Join { left, right, .. } => {
+                rewrite_from_fn_refs(std::slice::from_mut(left), arg_names);
+                rewrite_from_fn_refs(std::slice::from_mut(right), arg_names);
+            }
+            _ => {}
         }
     }
 }
@@ -2336,6 +2368,34 @@ pub(crate) fn exec_create_aggregate(
             return Err(exec_err(
                 "42P13",
                 "parameter \"parallel\" must be SAFE, RESTRICTED, or UNSAFE".to_string(),
+            ));
+        }
+    }
+    // v2.04: PG19 pg_aggregate.c check_valid_polymorphic_signature —
+    // a polymorphic transition type (anyarray & family) can only be
+    // deduced from a polymorphic aggregate argument; with none (e.g.
+    // `AGG(*) ... STYPE = anyarray`) CREATE fails 42P13. This check
+    // was invisible while `SFUNC(int[])` definitions failed to parse:
+    // the aggregates died earlier with 42883 and coincidentally
+    // matched PG's expected ERROR.
+    let is_pseudo = |s: &str| {
+        let t = s.to_ascii_lowercase();
+        let t = t.rsplit('.').next().unwrap_or(&t).trim();
+        let t = t.strip_prefix("variadic ").unwrap_or(t);
+        t.starts_with("any")
+    };
+    let any_pseudo_arg = arg_types.iter().any(|t| is_pseudo(t));
+    if is_pseudo(stype) && !any_pseudo_arg {
+        return Err(exec_err(
+            "42P13",
+            "cannot determine transition data type".to_string(),
+        ));
+    }
+    if let Some(ms) = mstype {
+        if is_pseudo(ms) && !any_pseudo_arg {
+            return Err(exec_err(
+                "42P13",
+                "cannot determine transition data type".to_string(),
             ));
         }
     }
