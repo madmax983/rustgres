@@ -183,6 +183,10 @@ pub(crate) fn temp_key(cols: &[usize], values: &[Value]) -> IndexKey {
 /// explicit pass.
 /// v0.22: temp tables have no backing indexes; their constraints are
 /// checked by column positions with index key semantics.
+/// v2.06: same rescan-every-earlier-row shape as `check_insert_unique`
+/// had before its `BTreeSet<IndexKey>` fix (see there) -- O(plan_len) per
+/// row, O(plan_len^2) per statement. Same fix: one `BTreeSet<IndexKey>`
+/// per unique constraint, checked and extended incrementally.
 pub(crate) fn check_update_unique_pairs(
     db: &Database,
     table: &str,
@@ -200,16 +204,14 @@ pub(crate) fn check_update_unique_pairs(
             .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
             .collect()
     };
-    for (i, (_, _, values)) in plan.iter().enumerate() {
-        for (cname, cols) in &uniques {
+    let mut seen: Vec<BTreeSet<IndexKey>> = vec![BTreeSet::new(); uniques.len()];
+    for (_, _, values) in plan {
+        for ((cname, cols), seen_keys) in uniques.iter().zip(seen.iter_mut()) {
             let key = temp_key(cols, values);
             if key.0.iter().any(|v| matches!(v, Value::Null)) {
                 continue;
             }
-            if plan[..i]
-                .iter()
-                .any(|(_, _, prev)| temp_key(cols, prev) == key)
-            {
+            if !seen_keys.insert(key) {
                 return Err(unique_violation_err(cname));
             }
         }
