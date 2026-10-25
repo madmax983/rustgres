@@ -2,6 +2,162 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: multi-row UPDATE's pairwise new-vs-new unique check is O(batch_len^2) for any UNIQUE/PRIMARY KEY column — fix — 2026-10-25
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`check_update_unique_pairs` (`src/exec/indexes.rs`) used:
+
+```rust
+for (i, (_, _, values)) in plan.iter().enumerate() {
+    for (cname, cols) in &uniques {
+        let key = temp_key(cols, values);
+        if key.0.iter().any(|v| matches!(v, Value::Null)) {
+            continue;
+        }
+        if plan[..i].iter().any(|(_, _, prev)| temp_key(cols, prev) == key) {
+            return Err(unique_violation_err(cname));
+        }
+    }
+}
+```
+
+Replaced with one `BTreeSet<IndexKey>` per unique constraint, built
+incrementally -- the identical fix `#61` applied to
+`check_insert_unique`'s in-batch rescan:
+
+```rust
+let mut seen: Vec<BTreeSet<IndexKey>> = vec![BTreeSet::new(); uniques.len()];
+for (_, _, values) in plan {
+    for ((cname, cols), seen_keys) in uniques.iter().zip(seen.iter_mut()) {
+        let key = temp_key(cols, values);
+        if key.0.iter().any(|v| matches!(v, Value::Null)) {
+            continue;
+        }
+        if !seen_keys.insert(key) {
+            return Err(unique_violation_err(cname));
+        }
+    }
+}
+```
+
+Behavior and error semantics are unchanged: `seen_keys.insert` returns
+`false` exactly when the key was already present (from an earlier row
+in the same plan, inserted by either an earlier unique constraint's
+pass over this row or an earlier row's pass), so the first conflicting
+`(row, constraint)` pair in iteration order still reports the same
+constraint name as before.
+
+### Measurement
+
+Callgrind (valgrind 3.22.0), same harness/sizes as the baseline commit.
+
+Total `Ir`:
+
+| rows | before | after | delta |
+|---|---|---|---|
+| 500  | 296,887,470    | 146,370,404   | -50.70% |
+| 1500 | 1,817,538,835  | 440,272,599   | -75.77% |
+| 4500 | 13,834,762,432 | 1,353,887,561 | -90.21% |
+
+`check_update_unique_pairs` inclusive `Ir` (`callgrind_annotate
+--inclusive=yes --tree=calling`, the function's own subtree):
+
+| rows | before | after | delta |
+|---|---|---|---|
+| 500  | 155,137,443    | 4,785,326  | -96.92% |
+| 1500 | 1,393,903,443  | 16,565,770 | -98.81% |
+| 4500 | 12,538,201,443 | 57,153,397 | -99.54% |
+
+Growth per x3 step in row count, total `Ir`: x6.12/x7.61 (before, near
+O(n^2)'s x9) -> x3.01/x3.07 (after, near-linear, the O(log batch_len)
+per-row `BTreeSet` work) -- the asymptotic-improvement argument, not
+just a constant-factor win, matching `#61`'s curve shape exactly.
+
+`cargo test --all-features`: 1145/1145 unchanged. `cargo clippy
+--all-targets --all-features -- -D warnings`: 1009 pre-existing errors
+on both trees (confirmed via `git stash`), zero net new. `cargo fmt
+--all -- --check`: clean.
+
+### Reproduce
+
+```bash
+cargo build
+RUSTGRES_DATA_DIR=$(mktemp -d) valgrind --tool=callgrind \
+  --callgrind-out-file=/tmp/cg.out ./target/debug/rustgres &
+python3 benches/profile_update_unique.py --rows 4500 --timeout 600
+# SIGTERM the valgrind-wrapped server pid to flush, then:
+callgrind_annotate --inclusive=yes --tree=calling /tmp/cg.out \
+  | grep -m1 'check_update_unique_pairs \['
+```
+
+## Bolt: multi-row UPDATE's pairwise new-vs-new unique check is O(batch_len^2) for any UNIQUE/PRIMARY KEY column — baseline — 2026-10-25
+
+**Why this workload**: `#61` (2026-10-24) fixed the identical
+O(batch_len^2) in-batch rescan shape in `check_insert_unique` and left a
+note in this file that `check_update_unique_pairs` "has the identical
+O(n^2) shape for batched UPDATE's planned-row check" as an unmeasured
+follow-up. This round measures it. Unlike the INSERT case, the UPDATE
+check runs on *every* bulk UPDATE of a PK/unique table regardless of
+which columns the `SET` clause touches — `check_update_unique_pairs`
+rebuilds and compares the unique-index key for every planned row whether
+or not that row's key actually changed — so the public entry point is
+the ordinary bulk-update statement: `UPDATE orders SET status =
+'shipped' WHERE ship_date < ...`, a batch job touching thousands of rows
+of a PK table in one statement, never touching the PK column itself.
+`benches/profile_update_unique.py` (new, this round) creates
+`bench_upd_pk(id INT PRIMARY KEY, name TEXT, val INT)`, populates it
+with `--rows N` rows via one multi-VALUES INSERT (setup, not the
+target), then sends one `UPDATE bench_upd_pk SET val = val + 1` that
+touches every row.
+
+Reproduce (repeat for `--rows 500`, `--rows 1500`, `--rows 4500`):
+```bash
+cargo build
+RUSTGRES_DATA_DIR=$(mktemp -d) valgrind --tool=callgrind \
+  --callgrind-out-file=/tmp/cg.out ./target/debug/rustgres &
+python3 benches/profile_update_unique.py --rows 1500 --timeout 600
+# SIGTERM the valgrind-wrapped server pid to flush, then:
+callgrind_annotate --inclusive=yes --tree=calling /tmp/cg.out \
+  | grep -m1 'check_update_unique_pairs \['
+```
+
+📈 **Profile** (Callgrind, valgrind 3.22.0, current HEAD v2.05):
+
+| rows | total `Ir`     | `check_update_unique_pairs` inclusive `Ir`\* | % of total |
+|---|---|---|---|
+| 500  | 296,887,470    | 155,137,443    | 52.25% |
+| 1500 | 1,817,538,835  | 1,393,903,443  | 76.69% |
+| 4500 | 13,834,762,432 | 12,538,201,443 | 90.63% |
+
+\* `callgrind_annotate --inclusive=yes --tree=calling`, the function's
+own frame plus everything it calls (`temp_key`, `index_key_cmp`,
+`exact_as_i64`, `IndexKey::cmp`/`eq`, the per-row `Vec<Value>`
+allocation in `temp_key`, etc.) — i.e. the whole pairwise-check
+subtree, not just its own instructions.
+
+Already more than 10x past the 5%-of-profile floor even at the smallest
+size, and the share *grows* with batch size from 52% to 91% — exactly
+what an O(batch_len^2) subroutine inside an O(batch_len)-or-better
+statement looks like as the fixed setup cost (CREATE TABLE + the
+already-O(n log n) populating INSERT) becomes a smaller fraction of the
+total. Total `Ir` growth per x3 step in row count: x6.12 (500->1500),
+x7.61 (1500->4500) — approaching O(n^2)'s x9, same curve shape as the
+INSERT case in `#61`.
+
+💡 **Hypothesis**: `check_update_unique_pairs`'s loop (`plan[..i]
+.iter().any(|(_, _, prev)| temp_key(cols, prev) == key)`) rescans every
+earlier row of the *same UPDATE statement's plan* for every row, to
+catch two rows updated to the same unique key in one statement (the
+real index still holds only the old entries at plan time). This is O(i)
+work for row `i`, O(batch_len^2) for the statement, independent of table
+size. Same fix as `#61`: swap the rescan for one `BTreeSet<IndexKey>`
+per unique constraint, built incrementally via `IndexKey`'s existing
+`Ord` — O(log batch_len) per row instead of O(batch_len).
+
 ## Bolt: multi-row INSERT's in-batch duplicate check is O(batch_len^2) for any UNIQUE/PRIMARY KEY column — fix — 2026-10-24
 
 Fixes the target identified in the baseline entry immediately below
