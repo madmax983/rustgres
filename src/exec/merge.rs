@@ -1142,6 +1142,15 @@ pub(crate) fn exec_merge(
             _ => {}
         }
     }
+    // v2.07: old versions replaced by this MERGE's own UPDATE actions,
+    // per leaf — excluded from the against-table unique checks below
+    // (statement final-image semantics, like exec_update).
+    let mut merge_excl: HashMap<String, Vec<u64>> = HashMap::new();
+    for a in &acts {
+        if let MAct::Update { leaf, id, .. } = a {
+            merge_excl.entry(leaf.clone()).or_default().push(*id);
+        }
+    }
     for a in &acts {
         match a {
             MAct::Insert { dst, new, .. } => {
@@ -1164,24 +1173,20 @@ pub(crate) fn exec_merge(
                     dst,
                     &leaf_row,
                 )?;
-                if let Some(vname) = eng.db.unique_violation(
-                    dst,
-                    &leaf_row,
-                    None,
-                    ctx.snap,
-                    &ctx.all_xids,
-                    ctx.session,
-                ) {
-                    return Err(exec_err(
-                        "23505",
-                        format!(
-                            "duplicate key value violates unique constraint \"{}\"",
-                            vname
-                        ),
-                    ));
+                {
+                    let excl = merge_excl.get(dst).map(|v| v.as_slice()).unwrap_or(&[]);
+                    let violated = eng.db.unique_violations_all_multi(
+                        dst,
+                        &leaf_row,
+                        excl,
+                        ctx.snap,
+                        &ctx.all_xids,
+                        ctx.session,
+                    );
+                    resolve_unique_violations(eng, ctx, dst, violated)?;
                 }
             }
-            MAct::Update { leaf, id, new, .. } => {
+            MAct::Update { leaf, new, .. } => {
                 let lc = leaf_cols(eng, ctx, leaf);
                 let dst_meta = {
                     let t = eng
@@ -1201,21 +1206,17 @@ pub(crate) fn exec_merge(
                     leaf,
                     &leaf_row,
                 )?;
-                if let Some(vname) = eng.db.unique_violation(
-                    leaf,
-                    &leaf_row,
-                    Some(*id),
-                    ctx.snap,
-                    &ctx.all_xids,
-                    ctx.session,
-                ) {
-                    return Err(exec_err(
-                        "23505",
-                        format!(
-                            "duplicate key value violates unique constraint \"{}\"",
-                            vname
-                        ),
-                    ));
+                {
+                    let excl = merge_excl.get(leaf).map(|v| v.as_slice()).unwrap_or(&[]);
+                    let violated = eng.db.unique_violations_all_multi(
+                        leaf,
+                        &leaf_row,
+                        excl,
+                        ctx.snap,
+                        &ctx.all_xids,
+                        ctx.session,
+                    );
+                    resolve_unique_violations(eng, ctx, leaf, violated)?;
                 }
             }
             _ => {}
@@ -1244,6 +1245,27 @@ pub(crate) fn exec_merge(
                 for j in (i + 1)..all_new.len() {
                     let (a, b) = (&all_new[i], &all_new[j]);
                     if idxs.iter().all(|&k| a[k] != Value::Null && a[k] == b[k]) {
+                        // v2.07: pairwise conflicts on a currently
+                        // deferred constraint queue revalidation.
+                        if unique_mode_deferred(
+                            eng,
+                            ctx.snap,
+                            &ctx.all_xids,
+                            ctx.session,
+                            table,
+                            def,
+                        ) {
+                            let root = unique_constraint_root(
+                                eng,
+                                ctx.snap,
+                                &ctx.all_xids,
+                                ctx.session,
+                                table,
+                                &def.name,
+                            );
+                            queue_unique(eng, ctx.session, &root, &def.name);
+                            continue;
+                        }
                         return Err(exec_err(
                             "23505",
                             format!(

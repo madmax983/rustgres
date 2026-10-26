@@ -2300,6 +2300,25 @@ pub struct NotNullDef {
 pub struct UniqueDef {
     pub name: String,
     pub cols: Vec<String>,
+    /// v2.07: DEFERRABLE / INITIALLY DEFERRED (PG19 pg_constraint
+    /// condeferrable / condeferred). A deferrable unique/PK whose
+    /// current mode is deferred queues its DML violations and
+    /// revalidates against the final image at COMMIT / SET
+    /// CONSTRAINTS ... IMMEDIATE (see exec/deferred.rs).
+    pub deferrable: bool,
+    pub initially_deferred: bool,
+}
+
+impl UniqueDef {
+    /// A plain (non-deferrable) unique/PK definition.
+    pub(crate) fn plain(name: String, cols: Vec<String>) -> Self {
+        UniqueDef {
+            name,
+            cols,
+            deferrable: false,
+            initially_deferred: false,
+        }
+    }
 }
 
 /// v0.9: referential actions for foreign keys.
@@ -2672,6 +2691,12 @@ pub enum AlterAction {
     AddPrimaryKeyUsingIndex {
         index: String,
     },
+    /// v2.07: `ALTER TABLE t ADD UNIQUE USING INDEX idx` (PG19
+    /// transformIndexConstraints): the unique index becomes a UNIQUE
+    /// constraint named after the index.
+    AddUniqueUsingIndex {
+        index: String,
+    },
     /// v0.96: `ALTER TABLE child INHERIT parent` (PG19 table inheritance).
     /// The parent must exist; every parent column must already exist in
     /// the child with an exactly matching type, and parent NOT NULL
@@ -2855,8 +2880,11 @@ pub(crate) enum ColCon {
     /// v1.97: column-level `NOT NULL NO INHERIT` (PG19).
     NotNullNoInherit,
     Null,
-    Unique(Option<String>),
-    PKey(Option<String>),
+    /// v2.07: column UNIQUE with its ConstraintAttributeSpec results
+    /// (deferrable, initially_deferred).
+    Unique(Option<String>, bool, bool),
+    /// v2.07: column PRIMARY KEY with ConstraintAttributeSpec results.
+    PKey(Option<String>, bool, bool),
     Default(DefaultExpr),
     Check(Option<String>, Expr, bool, bool),
     References {
@@ -2871,10 +2899,15 @@ pub(crate) enum ColCon {
 }
 
 pub(crate) enum ParsedTableCon {
-    PKey(Option<String>, Vec<String>),
+    /// v2.07: table PRIMARY KEY (cols) + ConstraintAttributeSpec
+    /// results (deferrable, initially_deferred).
+    PKey(Option<String>, Vec<String>, bool, bool),
     /// v2.06: `PRIMARY KEY USING INDEX name` (ALTER ADD form).
     PKeyUsingIndex(Option<String>, String),
-    Unique(Option<String>, Vec<String>),
+    /// v2.07: table UNIQUE (cols) + ConstraintAttributeSpec results.
+    Unique(Option<String>, Vec<String>, bool, bool),
+    /// v2.07: `UNIQUE USING INDEX name` (ALTER ADD form).
+    UniqueUsingIndex(Option<String>, String),
     Check(Option<String>, Expr, bool, bool),
     Fk {
         name: Option<String>,
@@ -3061,6 +3094,7 @@ pub(crate) fn def_constraint_name_exists(def: &TableDef, cname: &str) -> bool {
         || def.pkey.as_ref().map(|p| p.name == cname).unwrap_or(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn def_add_pkey(
     table: &str,
     def: &mut TableDef,
@@ -3070,6 +3104,9 @@ pub(crate) fn def_add_pkey(
     // existence check and the NOT NULL marking are deferred to exec,
     // which validates against the merged column list.
     defer_col_check: bool,
+    // v2.07: ConstraintAttributeSpec results.
+    deferrable: bool,
+    initially_deferred: bool,
 ) -> Result<(), SqlError> {
     if !defer_col_check {
         for c in cols {
@@ -3099,10 +3136,13 @@ pub(crate) fn def_add_pkey(
     def.pkey = Some(UniqueDef {
         name: cname,
         cols: cols.to_vec(),
+        deferrable,
+        initially_deferred,
     });
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn def_add_unique(
     table: &str,
     def: &mut TableDef,
@@ -3112,6 +3152,9 @@ pub(crate) fn def_add_unique(
     // v0.96: with `INHERITS`, columns may come from the parents; the
     // existence check is deferred to exec (see def_add_pkey).
     defer_col_check: bool,
+    // v2.07: ConstraintAttributeSpec results.
+    deferrable: bool,
+    initially_deferred: bool,
 ) -> Result<(), SqlError> {
     if !defer_col_check {
         for c in cols {
@@ -3132,6 +3175,8 @@ pub(crate) fn def_add_unique(
     def.uniques.push(UniqueDef {
         name: cname,
         cols: cols.to_vec(),
+        deferrable,
+        initially_deferred,
     });
     Ok(())
 }
@@ -3317,20 +3362,24 @@ pub(crate) fn build_table_def(
                             }
                             def.not_null[i] = false
                         }
-                        ColCon::Unique(n) => def_add_unique(
+                        ColCon::Unique(n, df, idf) => def_add_unique(
                             table,
                             &mut def,
                             n.clone(),
                             std::slice::from_ref(&c.name),
                             &c.name,
                             false,
+                            *df,
+                            *idf,
                         )?,
-                        ColCon::PKey(n) => def_add_pkey(
+                        ColCon::PKey(n, df, idf) => def_add_pkey(
                             table,
                             &mut def,
                             n.clone(),
                             std::slice::from_ref(&c.name),
                             false,
+                            *df,
+                            *idf,
                         )?,
                         ColCon::Default(d) => def.defaults[i] = Some(d.clone()),
                         ColCon::Check(n, e, nv, enf) => def_add_check(
@@ -3368,15 +3417,21 @@ pub(crate) fn build_table_def(
                 }
             }
             TableItem::TableCon(tc) => match tc {
-                ParsedTableCon::PKeyUsingIndex(..) => {
+                ParsedTableCon::PKeyUsingIndex(..) | ParsedTableCon::UniqueUsingIndex(..) => {
                     return Err(err(
-                        "PRIMARY KEY USING INDEX is only valid in ALTER TABLE".to_string()
+                        "PRIMARY KEY / UNIQUE USING INDEX is only valid in ALTER TABLE".to_string(),
                     ));
                 }
-                ParsedTableCon::PKey(n, cols) => {
-                    def_add_pkey(table, &mut def, n.clone(), cols, !inherits.is_empty())?
-                }
-                ParsedTableCon::Unique(n, cols) => {
+                ParsedTableCon::PKey(n, cols, df, idf) => def_add_pkey(
+                    table,
+                    &mut def,
+                    n.clone(),
+                    cols,
+                    !inherits.is_empty(),
+                    *df,
+                    *idf,
+                )?,
+                ParsedTableCon::Unique(n, cols, df, idf) => {
                     let first = cols[0].clone();
                     def_add_unique(
                         table,
@@ -3385,6 +3440,8 @@ pub(crate) fn build_table_def(
                         cols,
                         &first,
                         !inherits.is_empty(),
+                        *df,
+                        *idf,
                     )?
                 }
                 ParsedTableCon::Check(n, e, nv, enf) => {
@@ -3430,9 +3487,9 @@ pub(crate) fn build_table_def(
                             let conflict = items.iter().any(|it| {
                                 if let TableItem::Col(c) = it {
                                     c.name == *col
-                                        && c.cons
-                                            .iter()
-                                            .any(|k| matches!(k, ColCon::NotNull | ColCon::PKey(_)))
+                                        && c.cons.iter().any(|k| {
+                                            matches!(k, ColCon::NotNull | ColCon::PKey(..))
+                                        })
                                 } else {
                                     false
                                 }

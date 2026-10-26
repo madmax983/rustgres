@@ -2607,7 +2607,7 @@ pub(crate) fn exec_insert(
             if is_partitioned_parent {
                 check_partitioned_insert_unique(eng, ctx, table, &built)?;
             } else {
-                check_insert_unique(&eng.db, table, &built, ctx.snap, &ctx.all_xids, ctx.session)?;
+                check_insert_unique(eng, table, &built, ctx.snap, &ctx.all_xids, ctx.session)?;
             }
         }
         // v0.9: child-side foreign keys. Rows inserted earlier in the same
@@ -4014,26 +4014,9 @@ pub(crate) fn exec_update(
                     .expect("destination leaf visible; engine lock held throughout");
                 TableMeta::of(dt)
             };
-            // v0.8: UNIQUE enforcement against the destination's indexes.
-            // The old version is excluded (it is being replaced); the
-            // check runs before any mutation, keeping the statement
-            // atomic.
-            if let Some(vname) = eng.db.unique_violation(
-                &dst,
-                &new_dst,
-                Some(*id),
-                ctx.snap,
-                &ctx.all_xids,
-                ctx.session,
-            ) {
-                return Err(exec_err(
-                    "23505",
-                    format!(
-                        "duplicate key value violates unique constraint \"{}\"",
-                        vname
-                    ),
-                ));
-            }
+            // v2.07: the against-table UNIQUE check for this row runs
+            // after the plan loop (below), judged against the
+            // statement's final image — see there.
             // v2.03: generated columns re-materialize on update.
             let mut new_dst = new_dst;
             compute_generated_columns(
@@ -4154,6 +4137,40 @@ pub(crate) fn exec_update(
                 )?;
             }
         }
+        // v2.07: UNIQUE enforcement against each destination's indexes,
+        // judged against the statement's FINAL image (PG19): every old
+        // version this statement replaces — planned updates on the
+        // leaf plus rows moved OUT of it — is excluded, so a key-shift
+        // like `UPDATE t SET i = i+1` passes; new-vs-new conflicts are
+        // the pairwise check below. Violations on currently-deferred
+        // constraints queue for commit-time revalidation instead of
+        // erroring at the statement.
+        {
+            let mut dst_rows: HashMap<&str, Vec<&Row>> = HashMap::new();
+            let mut dst_excl: HashMap<&str, Vec<u64>> = HashMap::new();
+            for (dst, id, _, nv) in &plan {
+                dst_rows.entry(dst.as_str()).or_default().push(nv);
+                dst_excl.entry(dst.as_str()).or_default().push(*id);
+            }
+            for (src, id, _, dst, nv) in &moves {
+                dst_rows.entry(dst.as_str()).or_default().push(nv);
+                dst_excl.entry(src.as_str()).or_default().push(*id);
+            }
+            for (dst, rows) in &dst_rows {
+                let excl = dst_excl.get(dst).map(|v| v.as_slice()).unwrap_or(&[]);
+                for nv in rows {
+                    let violated = eng.db.unique_violations_all_multi(
+                        dst,
+                        nv,
+                        excl,
+                        ctx.snap,
+                        &ctx.all_xids,
+                        ctx.session,
+                    );
+                    resolve_unique_violations(eng, ctx, dst, violated)?;
+                }
+            }
+        }
         // v0.8: pairwise unique check — two rows updated to the same unique
         // key in one statement (the index still holds only old entries).
         // v0.9: extended over cascaded updates, grouped by table. v0.70:
@@ -4179,7 +4196,7 @@ pub(crate) fn exec_update(
                     .push((*id, *xmax, nv.clone()));
             }
             for (t, p) in &by_table {
-                check_update_unique_pairs(&eng.db, t, p, ctx.snap, &ctx.all_xids, ctx.session)?;
+                check_update_unique_pairs(eng, t, p, ctx.snap, &ctx.all_xids, ctx.session)?;
             }
         }
         // Apply the cascade after the unique checks pass.
@@ -5055,33 +5072,93 @@ pub(crate) fn exec_truncate(
             "TRUNCATE ... RESTART IDENTITY is not supported yet",
         ));
     }
+    // v2.07: the covered set of a named table — itself, its partition
+    // ancestors, and its whole partition subtree. PG's TRUNCATE treats
+    // the partition tree as one object for FK purposes (truncate.c):
+    // an FK referencing the partitioned ROOT pulls its table in when
+    // a LEAF is named with CASCADE, and blocks a leaf truncate
+    // without CASCADE.
+    let covered_of = |eng: &Engine, ctx: &StmtCtx, t: &str| -> Vec<String> {
+        let mut out = vec![t.to_string()];
+        let mut cur = t.to_string();
+        loop {
+            let parent = eng
+                .db
+                .find_table(&cur, ctx.snap, &ctx.all_xids, ctx.session)
+                .and_then(|tt| tt.partition.as_ref().and_then(|p| p.parent.clone()));
+            match parent {
+                Some(p) => {
+                    if !out.contains(&p) {
+                        out.push(p.clone());
+                    }
+                    cur = p;
+                }
+                None => break,
+            }
+        }
+        let mut stack = vec![t.to_string()];
+        while let Some(n) = stack.pop() {
+            if let Some(tt) = eng.db.find_table(&n, ctx.snap, &ctx.all_xids, ctx.session) {
+                if let Some(p) = &tt.partition {
+                    for c in &p.children {
+                        if !out.contains(c) {
+                            out.push(c.clone());
+                        }
+                        stack.push(c.clone());
+                    }
+                }
+            }
+        }
+        out
+    };
     // Resolve the table closure first (statement atomicity: a missing
     // table or FK violation fails before anything is removed).
     let mut targets: Vec<String> = tables.to_vec();
     if cascade {
         // Like Postgres, CASCADE pulls in every table holding a foreign
-        // key that references a truncated table (transitively).
+        // key that references a truncated table (transitively) — where
+        // "references a truncated table" means references any table in
+        // its covered set (v2.07: incl. the partitioned root of a
+        // named leaf). Pulled tables are truncated IN FULL.
         let mut i = 0;
         while i < targets.len() {
             let t = targets[i].clone();
-            for (child, _) in fks_referencing(eng, ctx.snap, ctx.own, ctx.session, &t) {
-                if !targets.contains(&child) {
-                    targets.push(child);
+            for refd in covered_of(eng, ctx, &t) {
+                for (child, _) in fks_referencing(eng, ctx.snap, ctx.own, ctx.session, &refd) {
+                    if !targets.contains(&child) {
+                        targets.push(child);
+                    }
                 }
             }
             i += 1;
         }
     } else {
+        // v2.07: FK references from tables that are themselves in the
+        // statement's set do not block (PG's statement-set rule, the
+        // same one DROP TABLE learned in v2.05); references via any
+        // covered table (incl. partition ancestors) do.
+        let named_covered: Vec<String> = tables
+            .iter()
+            .flat_map(|t| covered_of(eng, ctx, t))
+            .collect();
         for t in tables {
-            let refs = fks_referencing(eng, ctx.snap, ctx.own, ctx.session, t);
-            if let Some((child, _)) = refs.first() {
-                return Err(exec_err(
-                    "2BP01",
-                    format!(
-                        "cannot truncate a table referenced in a foreign key constraint (\"{}\" references \"{}\")",
-                        child, t
-                    ),
-                ));
+            for refd in covered_of(eng, ctx, t) {
+                let refs = fks_referencing(eng, ctx.snap, ctx.own, ctx.session, &refd);
+                let blocker = refs.iter().find(|(child, _)| {
+                    !named_covered.contains(child)
+                        && !covered_of(eng, ctx, child)
+                            .iter()
+                            .any(|x| tables.contains(x))
+                });
+                if let Some((child, _)) = blocker {
+                    return Err(exec_err(
+                        "2BP01",
+                        format!(
+                            "cannot truncate a table referenced in a foreign key constraint (\"{}\" references \"{}\")",
+                            child, t
+                        ),
+                    ));
+                }
             }
         }
     }

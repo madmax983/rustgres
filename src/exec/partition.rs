@@ -1973,6 +1973,8 @@ pub(crate) fn expand_like_clauses(
                 def.uniques.push(UniqueDef {
                     name: cname,
                     cols: u.cols.clone(),
+                    deferrable: u.deferrable,
+                    initially_deferred: u.initially_deferred,
                 });
             }
             if def.pkey.is_none() {
@@ -1980,6 +1982,8 @@ pub(crate) fn expand_like_clauses(
                     def.pkey = Some(UniqueDef {
                         name: pk.name.clone(),
                         cols: pk.cols.clone(),
+                        deferrable: pk.deferrable,
+                        initially_deferred: pk.initially_deferred,
                     });
                 }
             }
@@ -2769,21 +2773,58 @@ pub(crate) fn validate_fk_def(
             ));
         }
     }
-    let is_key = parent
-        .pkey
+    // v2.07: PG19 (tablecmds.c) refuses an FK whose referenced key is
+    // backed ONLY by a deferrable (INITIALLY DEFERRED) unique/PK
+    // constraint — 55000. A DEFERRABLE INITIALLY IMMEDIATE constraint
+    // is immediate (indimmediate) and can be referenced, as can any
+    // other immediate unique constraint/index over the same columns.
+    let deferred_only = |u: &UniqueDef| u.deferrable && u.initially_deferred;
+    let pk_match = parent.pkey.as_ref().filter(|pk| pk.cols == ref_cols);
+    let uq_match = parent.uniques.iter().find(|u| u.cols == ref_cols);
+    // A backing index of a deferred-only constraint does not count
+    // (PG's indimmediate is false for it); other indexes do.
+    let parent_is_child = parent
+        .partition
         .as_ref()
-        .map(|pk| pk.cols == ref_cols)
-        .unwrap_or(false)
-        || parent.uniques.iter().any(|u| u.cols == ref_cols)
+        .is_some_and(|p| p.parent.is_some());
+    let deferred_backing: Vec<String> = parent
+        .uniques
+        .iter()
+        .chain(parent.pkey.iter())
+        .filter(|u| deferred_only(u))
+        .map(|u| constraint_index_name(&fk.ref_table, &u.name, parent_is_child))
+        .collect();
+    let idx_match = eng.db.indexes.values().any(|idx| {
+        idx.def.table == fk.ref_table
+            && idx.def.unique
+            && idx.def.col_names == ref_cols
+            && !deferred_backing.contains(&idx.def.name)
+    });
+    let is_key = pk_match.is_some_and(|pk| !deferred_only(pk))
+        || uq_match.is_some_and(|u| !deferred_only(u))
         // v0.75: a standalone unique index also satisfies the FK
         // uniqueness requirement (PG allows FKs to reference unique
         // indexes, not just constraints).
-        || eng.db.indexes.values().any(|idx| {
-            idx.def.table == fk.ref_table
-                && idx.def.unique
-                && idx.def.col_names == ref_cols
-        });
+        || idx_match;
     if !is_key {
+        if pk_match.is_some_and(|pk| deferred_only(pk)) {
+            return Err(exec_err(
+                "55000",
+                format!(
+                    "cannot use a deferrable primary key for referenced table \"{}\"",
+                    fk.ref_table
+                ),
+            ));
+        }
+        if uq_match.is_some_and(|u| deferred_only(u)) {
+            return Err(exec_err(
+                "55000",
+                format!(
+                    "cannot use a deferrable unique constraint for referenced table \"{}\"",
+                    fk.ref_table
+                ),
+            ));
+        }
         return Err(exec_err(
             "42830",
             format!(

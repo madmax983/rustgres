@@ -3,6 +3,7 @@
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
 ## Bolt: UPDATE/DELETE RLS target-visibility re-derives role/policy state per row — fix — 2026-10-18
+## Bolt: `exec::funcs::crc32c`/`crc32` are bit-by-bit (no table) — fix — 2026-10-26
 
 Fixes the target identified in the baseline entry immediately below
 this one.
@@ -96,6 +97,118 @@ ownership/superuser status), then runs 40 fixed UPDATE+DELETE
 iterations whose WHERE clauses each match thousands of candidate rows
 — every one of which pays the RLS target-visibility check — over the
 real wire protocol, debug build, fresh data dir.
+`src/exec/funcs.rs`: `crc32c` gets its own new `static CRC32C_TABLE:
+[u32; 256]` (Castagnoli polynomial `0x82F6_3B78`), built by a `const
+fn` at compile time, and its loop body changes from the 8-branch
+bit-by-bit form to one table lookup + XOR + shift per byte:
+
+```rust
+pub(crate) fn crc32c(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc = CRC32C_TABLE[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    !crc
+}
+```
+
+`crc32` (the IEEE variant) doesn't get a second table at all: it now
+delegates to `wal::encoding::crc32`, which already has a table-driven
+implementation for the exact same algorithm (same IEEE polynomial),
+built for WAL commit-frame checksums and already fixed once before
+(`CRC32_TABLE` is `static`, not `const` — see the 2026-10-21 entries
+below) so there's no reason to carry a second bit-by-bit copy and a
+second 1024-byte table:
+
+```rust
+pub(crate) fn crc32(data: &[u8]) -> u32 {
+    crate::wal::crc32(data)
+}
+```
+
+`CRC32C_TABLE` is deliberately `static`, following the same reasoning
+already proven for `CRC32_TABLE`: a `const` has no fixed address, so
+an unoptimized build would rematerialize the whole 1024-byte array by
+`memcpy` at every lookup (once per byte hashed) instead of a single
+indexed load.
+
+Behavior is unchanged for both functions: same polynomial, same
+initial value, same final one's-complement, same output for every
+input — only the per-byte step count changes.
+
+### Measurement
+
+Same harness (`benches/profile_crc32.py --count 20 --rows 1500
+--body-bytes 4096`), same workload, same machine, same session.
+
+Callgrind (valgrind 3.22.0):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total `Ir` | 163,573,356,041 | 21,767,745,416 | **-86.69%** |
+| `funcs::crc32c` inclusive `Ir` | 77,351,113,760 (47.29% of total) | 6,447,475,200 (29.62% of new total) | **-91.66%** |
+| `funcs::crc32` inclusive `Ir` | 77,351,088,920 (47.29% of total) | 6,447,655,200 (29.62% of new total) | **-91.66%** |
+| combined (`funcs::crc32c` + `funcs::crc32`) | 154,702,202,680 (94.58% of total) | 12,895,130,400 (59.24% of new total) | **-91.66%** |
+
+(`wal::encoding::crc32`'s own inclusive `Ir` in the after profile,
+6,773,784,804/31.12%, is slightly larger than `funcs::crc32`'s
+6,447,655,200/29.62% because the harness's bulk `INSERT`s also drive
+real WAL commit-frame checksums through the same function — exactly
+the call site this fix now shares instead of duplicating.)
+
+The -86.69% total-`Ir` delta clears the ≥5%-of-profile floor by
+17x, and the -91.66% delta on each target function individually is
+nowhere close to the floor's lower bound.
+
+`cargo test --all-features`: 1160/1160 passed (same count as the
+pre-fix tree — no behavior change). `cargo fmt --all -- --check`:
+clean. `cargo clippy --all-targets --all-features -- -D warnings`:
+1016 errors on both trees (compared via an isolated `git worktree`
+checkout of the baseline commit rather than `git stash`, to avoid
+racing a concurrent background build against the working tree);
+diffing the sorted `file:line` locations between the two runs shows
+every difference is an exact +16 line-number shift (the 16 lines this
+fix adds before line 8071) and nothing else — zero net new findings,
+zero resolved findings.
+
+**Direct behavior check**: `SELECT crc32(''), crc32('123456789'),
+crc32('rustgres'), crc32('The quick brown fox jumps over the lazy
+dog.')` returns `0`, `3421780262`, `2497790856`, `1368401385` —
+bit-for-bit identical to `zlib.crc32()` on the same inputs
+(`0x0`, `0xCBF43926`, `0x94E14388`, `0x519025E9`), cross-checked
+directly against Python's `zlib` module, not just against this
+codebase's own prior output. The vendored PG19 `strings` regression
+suite (`tests/conformance/schedule_runner.py --tests strings`, which
+exercises `crc32`/`crc32c` among its string/binary function cases):
+576 PASS, 0 EXPECTED-FAIL, 2 REAL-FAIL (both pre-existing and
+unrelated — a string-literal-continuation-comment case and a
+PL/pgSQL `DECLARE`-without-`BEGIN` case, neither touching
+`crc32`/`crc32c`), identical to a run against the baseline commit.
+
+### Reproduce
+
+```bash
+cargo build
+RUSTGRES_DATA_DIR=$(mktemp -d) valgrind --tool=callgrind \
+  --callgrind-out-file=/tmp/cg.out ./target/debug/rustgres &
+python3 benches/profile_crc32.py --count 20 --rows 1500 --body-bytes 4096 --timeout 600
+# SIGTERM the valgrind-wrapped server pid to flush, then:
+callgrind_annotate --auto=no --inclusive=yes --threshold=100 /tmp/cg.out \
+  | grep -E 'PROGRAM TOTALS|crc32c \[|crc32 \['
+```
+
+## Bolt: `exec::funcs::crc32c`/`crc32` are bit-by-bit (no table) — baseline — 2026-10-26
+
+**Why this workload**: no prior Bolt round in this repo has profiled
+`exec::funcs::crc32c`/`crc32` (added for PG 18 parity) — the SQL-level
+checksum functions a real client calls to verify or deduplicate bulk
+content (log lines, document bodies, blob chunks) without pulling the
+whole value back over the wire. `benches/profile_crc32.py` (new, this
+round) seeds a 1500-row table of ~4096-byte prose documents (the same
+document shape as `profile_toast.py`'s TOAST workload) and runs 20
+fixed iterations of `SELECT crc32c(body), crc32(body) FROM bench_crc`
+over the real wire protocol — a bulk checksum scan, not a synthetic
+microbenchmark of the CRC loop alone.
 
 Reproduce:
 ```bash
@@ -154,6 +267,63 @@ rowsecurity+test_setup cases).
 Before profiles committed:
 `benches/profiles/callgrind.out.rls-base-2026-10-18`,
 `benches/profiles/dhat.out.rls-base-2026-10-18`.
+RUSTGRES_DATA_DIR=$(mktemp -d) valgrind --tool=callgrind \
+  --callgrind-out-file=/tmp/cg.out ./target/debug/rustgres &
+python3 benches/profile_crc32.py --count 20 --rows 1500 --body-bytes 4096 --timeout 600
+# SIGTERM the valgrind-wrapped server pid to flush, then:
+callgrind_annotate --auto=no --inclusive=yes --threshold=100 /tmp/cg.out | head -40
+```
+
+📈 **Profile** (Callgrind, valgrind 3.22.0, current HEAD): **163,573,356,041**
+total `Ir`.
+
+| symbol (inclusive `Ir`) | Ir | % of total |
+|---|---|---|
+| `src/exec/funcs.rs::crc32c` | 77,351,113,760 | **47.29%** |
+| `src/exec/funcs.rs::crc32` | 77,351,088,920 | **47.29%** |
+| combined | 154,702,202,680 | **94.58%** |
+
+Comfortably past the 5%-of-profile floor: these two functions alone
+account for nearly the entire profile for this workload.
+
+💡 **Hypothesis**: both functions compute their checksum bit-by-bit —
+```rust
+let mut crc: u32 = 0xFFFF_FFFF;
+for &b in data {
+    crc ^= b as u32;
+    for _ in 0..8 {
+        if crc & 1 != 0 {
+            crc = (crc >> 1) ^ POLY;
+        } else {
+            crc >>= 1;
+        }
+    }
+}
+!crc
+```
+8 branchy shift/XOR steps per byte, instead of the standard 256-entry
+lookup-table construction (Sarwate's algorithm): one table lookup +
+XOR + shift per byte, the same ~8x-fewer-instructions shape already
+measured for `wal::encoding::crc32`'s WAL-checksum table (2026-10-21
+entry below: `-71.27%` on that function alone after the same class of
+fix, there for a different reason — a `const` table being
+rematerialized by `memcpy` rather than a missing table at all, but the
+table-vs-bit-by-bit mechanism itself is identical and already proven
+in this codebase). The comment directly above each function
+(`// Bit-by-bit implementation (no table); adequate for test-size
+inputs`) confirms this was a known, deliberate simplification, not an
+oversight discovered here — but a SQL function exposed on an
+arbitrary-width `TEXT`/`BYTEA` column is exactly the "more than
+test-size input" case that comment anticipates not being adequate for.
+
+`cargo test --all-features`: 1160/1160 passed. `cargo fmt --all --
+--check`: clean.
+
+Before profile committed:
+`benches/profiles/callgrind.out.crc32funcs-base-2026-10-26`.
+
+**Reproduce the exact number**: check out this commit, `cargo build`,
+repeat the Reproduce command above.
 
 ## Bolt: multi-row UPDATE's pairwise new-vs-new unique check is O(batch_len^2) for any UNIQUE/PRIMARY KEY column — fix — 2026-10-25
 

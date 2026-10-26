@@ -226,11 +226,16 @@ pub(crate) fn replica_identity_cols(
     use crate::storage::ReplicaIdentity;
     match &t.replica_identity {
         ReplicaIdentity::Default => match &t.pkey {
-            Some(pk) => (
+            // v2.07: a DEFERRABLE primary key's index is not
+            // indimmediate, and PG19 relcache.c RelationGetIndexList
+            // skips non-immediate indexes when choosing the replica
+            // index — a deferrable PK does NOT serve as replica
+            // identity (publication.sql testpub_tbl5d).
+            Some(pk) if !pk.deferrable => (
                 true,
                 RiCols::Cols(pk.cols.iter().map(|c| c.to_lowercase()).collect()),
             ),
-            None => (false, RiCols::Cols(Default::default())),
+            _ => (false, RiCols::Cols(Default::default())),
         },
         ReplicaIdentity::Full => (true, RiCols::Full),
         ReplicaIdentity::Nothing => (false, RiCols::Cols(Default::default())),
@@ -311,6 +316,28 @@ pub(crate) fn alter_replica_identity(
                         iname
                     ),
                 ));
+            }
+            // v2.07: PG19 tablecmds.c ATExecReplicaIdentity — "Deferred
+            // indexes are not guaranteed to be always unique": an index
+            // backing a DEFERRABLE unique/PK constraint is not
+            // indimmediate (0A000).
+            {
+                let is_child = t.partition.as_ref().is_some_and(|p| p.parent.is_some());
+                let deferrable_backed = t.uniques.iter().chain(t.pkey.iter()).any(|u| {
+                    u.deferrable
+                        && (u.name.eq_ignore_ascii_case(&def.name)
+                            || super::partition::constraint_index_name(name, &u.name, is_child)
+                                .eq_ignore_ascii_case(&def.name))
+                });
+                if deferrable_backed {
+                    return Err(exec_err(
+                        "0A000",
+                        format!(
+                            "cannot use non-immediate index \"{}\" as replica identity",
+                            iname
+                        ),
+                    ));
+                }
             }
             if def.exprs.iter().any(|e| e.is_some()) {
                 return Err(exec_err(
