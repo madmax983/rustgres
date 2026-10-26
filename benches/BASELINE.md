@@ -2,6 +2,7 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: UPDATE/DELETE RLS target-visibility re-derives role/policy state per row — fix — 2026-10-18
 ## Bolt: `exec::funcs::crc32c`/`crc32` are bit-by-bit (no table) — fix — 2026-10-26
 
 Fixes the target identified in the baseline entry immediately below
@@ -9,6 +10,93 @@ this one.
 
 ### Change
 
+`src/exec/rls.rs`: replaces `rls_visible_q` with two functions that
+split the statement-invariant work from the per-row work, mirroring
+the pattern `rls_filter_qrows` already uses for the SELECT/JOIN path:
+
+- `rls_visibility_groups(q, t, table_name, cmds)` — calls `rls_applies`
+  once and builds the per-cmd `applicable_policies` groups once;
+  returns `None` when RLS doesn't apply (every row visible) or
+  `Some(groups)`.
+- `rls_row_visible(q, schema, cells, groups)` — the per-row-only part:
+  evaluates each precomputed group's USING expression against one row.
+
+`src/exec/dml.rs`: both call sites (UPDATE's and DELETE's
+target-visibility filtering loops) now call `rls_visibility_groups`
+once before the loop and `rls_row_visible` inside it, instead of
+calling the old `rls_visible_q` (which repeated `rls_applies` +
+`applicable_policies`) on every row. Behavior is unchanged: same
+RLS-applies check, same per-cmd policy groups, same
+permissive-OR/restrictive-AND evaluation — just computed once per
+statement instead of once per row.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_rls_update.py --rows 3000 --iters 40`), same
+workload, same machine, same session.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes`,
+`--inclusive=yes` so callee cost is folded into each function):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total `Ir` | 4,598,295,452 | 3,200,423,169 | **-30.39%** |
+| `applicable_policies` inclusive `Ir` | 906,072,596 (19.70%) | 9,449,244 (0.30%) | **-98.96%** |
+| `rls_applies` inclusive `Ir` | 455,817,600 (9.91%) | 9,086,560 (0.28%) | **-98.01%** |
+| `role_closure` inclusive `Ir` | 678,611,462 (14.76%) | 7,546,288 (0.24%) | **-98.89%** |
+
+DHAT (same workload):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total bytes allocated | 190,123,093 | 168,109,333 | **-11.58%** |
+| Total blocks allocated | 2,595,896 | 1,617,416 | **-37.70%** |
+| Blocks under `role_closure`/`applicable_policies`/`rls_applies`/`role_bypassrls_snap` | 989,301 | 10,741 | **-98.91%** |
+
+The total-`Ir` reduction (-30.39%) clears the ≥5%-of-profile floor by
+6x; the allocation-block reduction (-37.70%) clears the ≥10% floor by
+nearly 4x. Both the `Ir` drop and the allocation-block drop land almost
+entirely inside the four role/policy-lookup functions identified in
+the baseline, confirming the hypothesis rather than just moving cost
+around.
+
+`cargo test --all-features`: 1055/1055 passed, unchanged (same count
+as the pre-change tree). `cargo fmt --all -- --check`: clean. `cargo
+clippy --all-targets --all-features -- -D warnings`: 913 errors on
+both trees (the same pre-existing toolchain/lint-version mismatch
+noted throughout this file), none in `rls.rs` and none on the changed
+lines in `dml.rs`; zero net new. `tests/conformance/schedule_runner.py
+--tests rowsecurity`: identical PASS=1035/REAL-FAIL=341 on both trees —
+zero behavior change.
+
+Before/after profiles committed:
+`benches/profiles/{callgrind,dhat}.out.rls-{base,after}-2026-10-18`.
+
+**Reproduce**: check out the parent (baseline) commit, `cargo build`,
+repeat the Callgrind command in the baseline entry's "Reproduce"
+section for the before numbers (swap `--tool=callgrind ...` for
+`--tool=dhat --dhat-out-file=/tmp/dhat.out` for the DHAT numbers);
+check out this commit, `cargo build`, repeat for the after numbers.
+
+## Bolt: UPDATE/DELETE RLS target-visibility re-derives role/policy state per row — baseline — 2026-10-18
+
+**Why this workload**: v1.95 (2026-10-14/17, row-level security) added
+USING/WITH CHECK policy evaluation on every SELECT/INSERT/UPDATE/
+DELETE row; no prior Bolt round has profiled it. `rls_filter_qrows`
+(the SELECT/JOIN path, same file) already hoists the
+per-statement-invariant "does RLS apply" and "which policies apply"
+computation out of its row loop — but `rls_visible_q`, the UPDATE/
+DELETE target-visibility check in dml.rs (used at two call sites, the
+UPDATE and DELETE target-collection loops), calls it fresh on every
+candidate row. `benches/profile_rls_update.py` (new) seeds a 3,000-row
+multi-tenant `orders`-shaped table, enables RLS with the textbook
+`USING (tenant_id = $N) WITH CHECK (tenant_id = $N)` tenant-isolation
+policy, switches to a non-owner, non-superuser role (`SET SESSION
+AUTHORIZATION`, so RLS actually applies instead of being bypassed by
+ownership/superuser status), then runs 40 fixed UPDATE+DELETE
+iterations whose WHERE clauses each match thousands of candidate rows
+— every one of which pays the RLS target-visibility check — over the
+real wire protocol, debug build, fresh data dir.
 `src/exec/funcs.rs`: `crc32c` gets its own new `static CRC32C_TABLE:
 [u32; 256]` (Castagnoli polynomial `0x82F6_3B78`), built by a `const
 fn` at compile time, and its loop body changes from the 8-branch
@@ -125,6 +213,60 @@ microbenchmark of the CRC loop alone.
 Reproduce:
 ```bash
 cargo build
+RUSTGRES_DATA_DIR=$(mktemp -d) valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out --collect-jumps=yes --cache-sim=yes ./target/debug/rustgres &
+python3 benches/profile_rls_update.py --rows 3000 --iters 40 --timeout 1800
+# SIGTERM the server to flush, then:
+callgrind_annotate --auto=no --inclusive=yes --threshold=100 /tmp/cg.out | head -60
+```
+
+📈 **Profile** (Callgrind, valgrind 3.22.0, current HEAD v1.96 +
+#53): **4,598,295,452** total `Ir`. Inclusive cost (`--inclusive=yes`,
+which folds callee cost into each function so the per-row redundancy
+is visible) on the UPDATE/DELETE target-visibility check:
+
+| function | inclusive `Ir` | % of total |
+|---|---|---|
+| `rls_visible_q` (UPDATE/DELETE per-row check) | 2,129,374,686 | **46.31%** |
+| `applicable_policies` (role-membership closure, called inside) | 906,072,596 | **19.70%** |
+| `rls_applies` (role-bypass/owner check, called inside) | 455,817,600 | **9.91%** |
+| `eval_group` (the USING-expr evaluation — the only part that actually depends on the row) | 696,516,480 | 15.15% |
+
+`applicable_policies` + `rls_applies` = **29.61%** of the whole
+profile, clearing the ≥5%-of-profile floor by nearly 6x — and that
+alone is *larger* than `eval_group`, the part of the check that
+genuinely depends on the row's data.
+
+💡 **Hypothesis**: `rls_visible_q(q, t, table_name, cmds, schema,
+cells)` is called once per candidate row from both UPDATE's and
+DELETE's target-collection loops in dml.rs. On every call it
+re-derives two values that cannot change across the rows of one
+statement — `q.role`, `q.snap`, `q.own`, and `t` are fixed for the
+whole statement:
+
+- `rls_applies` looks up the role (`role_bypassrls_snap` ->
+  `Database::find_role`, a hashmap lookup plus an MVCC-visibility scan
+  of that role's versions) and checks bypass/owner status.
+- `applicable_policies` calls `role_closure`, a BFS over membership
+  edges that allocates a fresh `Vec<String>` and clones the role name
+  (plus every transitively-inherited group name) *from scratch on
+  every row*, then filters `t.policies` against the result.
+
+Compare with `rls_filter_qrows` (same file, the SELECT/JOIN path): it
+already calls `rls_applies` once and builds the per-cmd policy groups
+once *before* its row loop, passing the precomputed groups into the
+loop. The UPDATE/DELETE path never got the same treatment. Hoisting
+the same way — compute "does RLS apply" and "which policies apply"
+once per statement, then only evaluate the row-dependent USING
+expression per row — should remove nearly all of the 29.61%.
+
+`cargo test --all-features`: 1055/1055 passed (pre-change tree,
+unmodified). `tests/conformance/schedule_runner.py --tests
+rowsecurity`: PASS=1035/REAL-FAIL=341 (of 1035+341 scored
+rowsecurity+test_setup cases).
+
+Before profiles committed:
+`benches/profiles/callgrind.out.rls-base-2026-10-18`,
+`benches/profiles/dhat.out.rls-base-2026-10-18`.
 RUSTGRES_DATA_DIR=$(mktemp -d) valgrind --tool=callgrind \
   --callgrind-out-file=/tmp/cg.out ./target/debug/rustgres &
 python3 benches/profile_crc32.py --count 20 --rows 1500 --body-bytes 4096 --timeout 600
