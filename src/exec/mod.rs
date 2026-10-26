@@ -299,6 +299,9 @@ mod v205_tests;
 #[path = "test_mods/v206_tests.rs"]
 mod v206_tests;
 #[cfg(test)]
+#[path = "test_mods/v207_tests.rs"]
+mod v207_tests;
+#[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;
 

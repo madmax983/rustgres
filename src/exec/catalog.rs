@@ -4942,8 +4942,12 @@ pub(crate) fn pg_constraint_scan(
             continue;
         };
         let relid = Value::Int(t.oid as i64);
+        // v2.07: the builder takes (condeferrable, condeferred) too —
+        // UNIQUE/PK rows now report their real stored flags.
         let plain = |contype: u8,
                      cname: &str,
+                     deferrable: bool,
+                     deferred: bool,
                      enforced: bool,
                      validated: bool,
                      conkey: Vec<i64>|
@@ -4952,8 +4956,8 @@ pub(crate) fn pg_constraint_scan(
                 Value::text(cname),
                 Value::Int(2200),
                 Value::SingleChar(contype),
-                Value::Bool(false),
-                Value::Bool(false),
+                Value::Bool(deferrable),
+                Value::Bool(deferred),
                 Value::Bool(enforced),
                 Value::Bool(validated),
                 relid.clone(),
@@ -4969,10 +4973,26 @@ pub(crate) fn pg_constraint_scan(
             ]
         };
         if let Some(pk) = &t.pkey {
-            rows.push(mk(plain(b'p', &pk.name, true, true, attnums(t, &pk.cols))));
+            rows.push(mk(plain(
+                b'p',
+                &pk.name,
+                pk.deferrable,
+                pk.initially_deferred,
+                true,
+                true,
+                attnums(t, &pk.cols),
+            )));
         }
         for u in &t.uniques {
-            rows.push(mk(plain(b'u', &u.name, true, true, attnums(t, &u.cols))));
+            rows.push(mk(plain(
+                b'u',
+                &u.name,
+                u.deferrable,
+                u.initially_deferred,
+                true,
+                true,
+                attnums(t, &u.cols),
+            )));
         }
         for c in &t.checks {
             let contype = match c.kind {
@@ -4982,6 +5002,8 @@ pub(crate) fn pg_constraint_scan(
             rows.push(mk(plain(
                 contype,
                 &c.name,
+                false,
+                false,
                 c.enforced,
                 !c.not_valid,
                 Vec::new(),

@@ -6799,6 +6799,114 @@ impl Database {
         None
     }
 
+    /// v2.07: like [`Self::unique_violation`], but returns EVERY
+    /// violated unique index's name (in index-name order). The
+    /// deferred-unique DML paths need the full set: a violation on a
+    /// currently-deferred constraint is queued, and it must not mask
+    /// a violation on an immediate constraint of the same row.
+    pub fn unique_violations_all(
+        &self,
+        table: &str,
+        values: &[Value],
+        exclude_row_id: Option<u64>,
+        snap: &Snapshot,
+        owns: &[u64],
+        session: u64,
+    ) -> Vec<String> {
+        match exclude_row_id {
+            Some(id) => self.unique_violations_all_multi(table, values, &[id], snap, owns, session),
+            None => self.unique_violations_all_multi(table, values, &[], snap, owns, session),
+        }
+    }
+
+    /// v2.07: [`Self::unique_violations_all`] with a SET of excluded
+    /// row ids. UPDATE statements pass every row id the statement
+    /// itself is replacing: PG judges a statement's unique checks
+    /// against its final image, so `UPDATE t SET i = i+1` must not
+    /// conflict with the old versions of the very rows it moves.
+    pub fn unique_violations_all_multi(
+        &self,
+        table: &str,
+        values: &[Value],
+        exclude: &[u64],
+        snap: &Snapshot,
+        owns: &[u64],
+        session: u64,
+    ) -> Vec<String> {
+        let Some(t) = self.find_table(table, snap, owns, session) else {
+            return Vec::new();
+        };
+        if self.is_temp_table(session, table) {
+            // Temp path: direct scan per constraint (mirrors
+            // temp_scan_constraint, with a set-valued exclusion).
+            let mut names: Vec<String> = Vec::new();
+            let mut cons: Vec<&UniqueDef> = t.uniques.iter().collect();
+            if let Some(pk) = &t.pkey {
+                cons.push(pk);
+            }
+            for c in cons {
+                let cols: Vec<usize> = c.cols.iter().filter_map(|n| t.column_index(n)).collect();
+                if cols.len() != c.cols.len() {
+                    continue;
+                }
+                if cols.iter().any(|&p| matches!(values[p], Value::Null)) {
+                    continue; // NULLs never conflict
+                }
+                let hit = t.rows.iter().any(|r| {
+                    if exclude.contains(&r.id) {
+                        return false;
+                    }
+                    let alive = if owns.contains(&r.xmax) {
+                        false // deleted by us: not a conflict
+                    } else {
+                        owns.contains(&r.xmin) || row_visible(r, snap, owns)
+                    };
+                    alive
+                        && cols.iter().all(|&p| {
+                            !matches!(r.values[p], Value::Null) && r.values[p] == values[p]
+                        })
+                });
+                if hit {
+                    names.push(c.name.clone());
+                }
+            }
+            return names;
+        }
+        let mut out = Vec::new();
+        for ix in self.visible_indexes_for(table, snap, owns, session) {
+            if !ix.def.unique || !ix.def.planner_usable {
+                continue;
+            }
+            let key = ix.key_for(values);
+            if key.0.iter().any(|v| matches!(v, Value::Null)) {
+                continue; // NULLs never conflict
+            }
+            let Some(bucket) = ix.tree.get(&key) else {
+                continue;
+            };
+            let hit = bucket.iter().any(|&id| {
+                if exclude.contains(&id) {
+                    return false;
+                }
+                match t.row_pos(id) {
+                    Some(pos) => {
+                        let r = &t.rows[pos];
+                        if owns.contains(&r.xmax) {
+                            false // deleted by us: not a conflict
+                        } else {
+                            owns.contains(&r.xmin) || row_visible(r, snap, owns)
+                        }
+                    }
+                    None => false, // vacuumed away: cannot conflict
+                }
+            });
+            if hit {
+                out.push(ix.def.name.clone());
+            }
+        }
+        out
+    }
+
     /// v0.22: scan a temp table's rows for a live row matching `values`
     /// on a PRIMARY KEY / UNIQUE constraint's columns. `only` restricts
     /// the scan to the named constraint (for ON CONFLICT arbiters);
@@ -7063,6 +7171,17 @@ pub enum PendingFk {
         fk_name: String,
         row_id: u64,
         old_values: Row,
+    },
+    /// v2.07: one queued deferred UNIQUE/PK revalidation (PG19's
+    /// deferred unique-index check). Unlike FK child entries this
+    /// carries no key: at fire time the whole table (the partition
+    /// root named here, plus its descendants) is rescanned and any
+    /// surviving duplicate key violates — a conflict that was
+    /// deleted or updated away before fire time is simply gone.
+    Unique {
+        /// Partition root (or the plain table) carrying the constraint.
+        table: String,
+        con_name: String,
     },
 }
 

@@ -20,14 +20,19 @@ pub(crate) fn unique_violation_err(index: &str) -> ExecError {
 /// Statement-atomic UNIQUE check for INSERT: every candidate row is checked
 /// against the indexes and against earlier rows of the same statement
 /// before any version is pushed.
+/// v2.07: violations on a currently-deferred UNIQUE/PK constraint are
+/// queued for commit-time revalidation instead of erroring (the
+/// caller passes the Engine so the deferred machinery can see them);
+/// violations on immediate constraints still error at the statement.
 pub(crate) fn check_insert_unique(
-    db: &Database,
+    eng: &Engine,
     table: &str,
     rows: &[Row],
     snap: &Snapshot,
     owns: &[u64],
     session: u64,
 ) -> Result<(), ExecError> {
+    let db = &eng.db;
     // v0.22: temp tables have no backing indexes; their constraints are
     // checked by column positions with index key semantics.
     let uniques: Vec<(String, Vec<usize>)> = if db.is_temp_table(session, table) {
@@ -56,11 +61,22 @@ pub(crate) fn check_insert_unique(
                 continue; // NULLs never conflict
             }
             if !seen_keys.insert(key) {
-                return Err(unique_violation_err(cname));
+                match unique_verdict(eng, snap, owns, session, table, cname) {
+                    UniqueVerdict::Queued => continue,
+                    UniqueVerdict::Immediate(name) => {
+                        return Err(unique_violation_err(&name));
+                    }
+                }
             }
         }
-        if let Some(name) = db.unique_violation(table, values, None, snap, owns, session) {
-            return Err(unique_violation_err(&name));
+        let violated = db.unique_violations_all(table, values, None, snap, owns, session);
+        for name in violated {
+            match unique_verdict(eng, snap, owns, session, table, &name) {
+                UniqueVerdict::Queued => continue,
+                UniqueVerdict::Immediate(n) => {
+                    return Err(unique_violation_err(&n));
+                }
+            }
         }
     }
     Ok(())
@@ -124,18 +140,36 @@ pub(crate) fn check_partitioned_insert_unique(
                     .iter()
                     .any(|prev| temp_key(cols, prev) == key)
                 {
-                    return Err(unique_violation_err(&leaf_constraint_name(
-                        eng, ctx, leaf, iname,
-                    )));
+                    // v2.07: deferred leaf constraints queue against
+                    // the partition root; immediate ones error naming
+                    // the constraint.
+                    match unique_verdict(eng, ctx.snap, &ctx.all_xids, ctx.session, leaf, iname) {
+                        UniqueVerdict::Queued => continue,
+                        UniqueVerdict::Immediate(_) => {
+                            return Err(unique_violation_err(&leaf_constraint_name(
+                                eng, ctx, leaf, iname,
+                            )));
+                        }
+                    }
                 }
             }
-            if let Some(name) =
-                eng.db
-                    .unique_violation(leaf, values, None, ctx.snap, &ctx.all_xids, ctx.session)
-            {
-                return Err(unique_violation_err(&leaf_constraint_name(
-                    eng, ctx, leaf, &name,
-                )));
+            let violated = eng.db.unique_violations_all(
+                leaf,
+                values,
+                None,
+                ctx.snap,
+                &ctx.all_xids,
+                ctx.session,
+            );
+            for name in violated {
+                match unique_verdict(eng, ctx.snap, &ctx.all_xids, ctx.session, leaf, &name) {
+                    UniqueVerdict::Queued => continue,
+                    UniqueVerdict::Immediate(_) => {
+                        return Err(unique_violation_err(&leaf_constraint_name(
+                            eng, ctx, leaf, &name,
+                        )));
+                    }
+                }
             }
         }
     }
@@ -188,13 +222,14 @@ pub(crate) fn temp_key(cols: &[usize], values: &[Value]) -> IndexKey {
 /// row, O(plan_len^2) per statement. Same fix: one `BTreeSet<IndexKey>`
 /// per unique constraint, checked and extended incrementally.
 pub(crate) fn check_update_unique_pairs(
-    db: &Database,
+    eng: &Engine,
     table: &str,
     plan: &[(u64, u64, Row)],
     snap: &Snapshot,
     owns: &[u64],
     session: u64,
 ) -> Result<(), ExecError> {
+    let db = &eng.db;
     let uniques: Vec<(String, Vec<usize>)> = if db.is_temp_table(session, table) {
         temp_unique_cols(db, table, snap, owns, session)
     } else {
@@ -212,7 +247,14 @@ pub(crate) fn check_update_unique_pairs(
                 continue;
             }
             if !seen_keys.insert(key) {
-                return Err(unique_violation_err(cname));
+                // v2.07: a pairwise conflict on a currently-deferred
+                // constraint queues commit-time revalidation instead.
+                match unique_verdict(eng, snap, owns, session, table, cname) {
+                    UniqueVerdict::Queued => continue,
+                    UniqueVerdict::Immediate(name) => {
+                        return Err(unique_violation_err(&name));
+                    }
+                }
             }
         }
     }

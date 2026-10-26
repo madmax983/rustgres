@@ -1975,10 +1975,12 @@ impl Parser {
             } else if self.eat_keyword("null") {
                 cons.push(ColCon::Null);
             } else if self.eat_keyword("unique") {
-                cons.push(ColCon::Unique(cname));
+                let (df, idf) = self.parse_unique_attrs()?;
+                cons.push(ColCon::Unique(cname, df, idf));
             } else if self.eat_keyword("primary") {
                 self.expect_keyword("key")?;
-                cons.push(ColCon::PKey(cname));
+                let (df, idf) = self.parse_unique_attrs()?;
+                cons.push(ColCon::PKey(cname, df, idf));
             } else if self.eat_keyword("default") {
                 if cons.iter().any(|c| matches!(c, ColCon::Generated { .. })) {
                     return Err(err(format!(
@@ -2075,10 +2077,18 @@ impl Parser {
                 return Ok(ParsedTableCon::PKeyUsingIndex(cname, idx));
             }
             let cols = self.parse_col_name_list()?;
-            Ok(ParsedTableCon::PKey(cname, cols))
+            let (df, idf) = self.parse_unique_attrs()?;
+            Ok(ParsedTableCon::PKey(cname, cols, df, idf))
         } else if self.eat_keyword("unique") {
+            // v2.07: UNIQUE USING INDEX name (ALTER TABLE ADD).
+            if self.eat_keyword("using") {
+                self.expect_keyword("index")?;
+                let idx = self.expect_ident()?;
+                return Ok(ParsedTableCon::UniqueUsingIndex(cname, idx));
+            }
             let cols = self.parse_col_name_list()?;
-            Ok(ParsedTableCon::Unique(cname, cols))
+            let (df, idf) = self.parse_unique_attrs()?;
+            Ok(ParsedTableCon::Unique(cname, cols, df, idf))
         } else if self.eat_keyword("check") {
             self.expect(Token::LParen, "'('")?;
             let e = self.parse_or()?;
@@ -2290,6 +2300,83 @@ impl Parser {
             enforced,
             not_valid,
         })
+    }
+
+    /// v2.07: trailing UNIQUE / PRIMARY KEY attributes (PG19 gram.y
+    /// ConstraintAttributeSpec as folded by parse_utilcmd.c
+    /// transformConstraintAttrs): [NOT] DEFERRABLE and INITIALLY
+    /// DEFERRED|IMMEDIATE, each at most once, in any order. ENFORCED /
+    /// NOT ENFORCED are supported only on CHECK and FOREIGN KEY
+    /// constraints — on UNIQUE/PK they are 42601 "misplaced ENFORCED
+    /// clause" / "misplaced NOT ENFORCED clause". INITIALLY DEFERRED
+    /// alone implies DEFERRABLE; with an explicit NOT DEFERRABLE it is
+    /// 42601. Returns (deferrable, initially_deferred). A NOT that is
+    /// not followed by DEFERRABLE or ENFORCED is NOT consumed (it may
+    /// start a following column constraint, e.g. `UNIQUE NOT NULL`).
+    pub(crate) fn parse_unique_attrs(&mut self) -> Result<(bool, bool), SqlError> {
+        let mut seen_deferrable = false;
+        let mut seen_initially = false;
+        let mut deferrable = false;
+        let mut initially_deferred = false;
+        loop {
+            let not_attr = matches!(self.peek(), Token::Ident(s) if s == "not")
+                && matches!(self.peek2(), Token::Ident(s) if s == "deferrable" || s == "enforced");
+            if not_attr {
+                self.next();
+                if self.eat_keyword("deferrable") {
+                    if seen_deferrable {
+                        return Err(err(
+                            "multiple DEFERRABLE/NOT DEFERRABLE clauses not allowed".to_string(),
+                        ));
+                    }
+                    seen_deferrable = true;
+                    deferrable = false;
+                } else {
+                    self.expect_keyword("enforced")?;
+                    return Err(err("misplaced NOT ENFORCED clause".to_string()));
+                }
+            } else if self.eat_keyword("deferrable") {
+                if seen_deferrable {
+                    return Err(err(
+                        "multiple DEFERRABLE/NOT DEFERRABLE clauses not allowed".to_string(),
+                    ));
+                }
+                seen_deferrable = true;
+                deferrable = true;
+            } else if self.eat_keyword("enforced") {
+                return Err(err("misplaced ENFORCED clause".to_string()));
+            } else if self.eat_keyword("initially") {
+                if seen_initially {
+                    return Err(err(
+                        "multiple INITIALLY IMMEDIATE/DEFERRED clauses not allowed".to_string(),
+                    ));
+                }
+                seen_initially = true;
+                if self.eat_keyword("deferred") {
+                    initially_deferred = true;
+                } else if !self.eat_keyword("immediate") {
+                    return Err(err(
+                        "syntax error: expected DEFERRED or IMMEDIATE".to_string()
+                    ));
+                }
+            } else {
+                break;
+            }
+        }
+        // PG19 transformConstraintAttrs (CONSTR_ATTR_DEFERRED): an
+        // explicit NOT DEFERRABLE + INITIALLY DEFERRED is a 42601;
+        // INITIALLY DEFERRED alone assumes DEFERRABLE.
+        if initially_deferred && !deferrable {
+            if seen_deferrable {
+                return Err(SqlError {
+                    code: "42601",
+                    message: "constraint declared INITIALLY DEFERRED must be DEFERRABLE"
+                        .to_string(),
+                });
+            }
+            deferrable = true;
+        }
+        Ok((deferrable, initially_deferred))
     }
 
     /// v2.06: trailing CHECK-constraint attributes (PG19
@@ -2720,14 +2807,18 @@ impl Parser {
                         }
                         not_null = false
                     }
-                    ColCon::Unique(n) => uniques.push(UniqueDef {
+                    ColCon::Unique(n, df, idf) => uniques.push(UniqueDef {
                         name: n.unwrap_or_else(|| format!("{}_key", col.name)),
                         cols: vec![col.name.clone()],
+                        deferrable: df,
+                        initially_deferred: idf,
                     }),
-                    ColCon::PKey(n) => {
+                    ColCon::PKey(n, df, idf) => {
                         pkey = Some(UniqueDef {
                             name: n.unwrap_or_else(|| format!("{}_pkey", col.name)),
                             cols: vec![col.name.clone()],
+                            deferrable: df,
+                            initially_deferred: idf,
                         });
                         not_null = true;
                     }
@@ -3002,20 +3093,27 @@ impl Parser {
             ParsedTableCon::PKeyUsingIndex(_name, idx) => {
                 Ok(AlterAction::AddPrimaryKeyUsingIndex { index: idx })
             }
-            ParsedTableCon::PKey(name, cols) => Ok(AlterAction::AddConstraint {
+            ParsedTableCon::UniqueUsingIndex(_name, idx) => {
+                Ok(AlterAction::AddUniqueUsingIndex { index: idx })
+            }
+            ParsedTableCon::PKey(name, cols, df, idf) => Ok(AlterAction::AddConstraint {
                 pkey: Some(UniqueDef {
                     name: name.unwrap_or_default(),
                     cols,
+                    deferrable: df,
+                    initially_deferred: idf,
                 }),
                 check: None,
                 unique: None,
                 fk: None,
                 notnull: None,
             }),
-            ParsedTableCon::Unique(name, cols) => Ok(AlterAction::AddConstraint {
+            ParsedTableCon::Unique(name, cols, df, idf) => Ok(AlterAction::AddConstraint {
                 unique: Some(UniqueDef {
                     name: name.unwrap_or_default(),
                     cols,
+                    deferrable: df,
+                    initially_deferred: idf,
                 }),
                 check: None,
                 pkey: None,
@@ -16395,6 +16493,17 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
             out.push(' ');
             sexpr_escape(c, &mut out);
         }
+        // v2.07: optional trailing (attrs deferrable initially_deferred)
+        // — emitted only when a flag is set, so pre-v2.07 encodings of
+        // plain constraints stay byte-identical; the decoder defaults
+        // a missing section to (0 0).
+        if u.deferrable || u.initially_deferred {
+            out.push_str(" (attrs ");
+            out.push_str(if u.deferrable { "1" } else { "0" });
+            out.push(' ');
+            out.push_str(if u.initially_deferred { "1" } else { "0" });
+            out.push(')');
+        }
         out.push(')');
     }
     out.push(')');
@@ -16405,6 +16514,13 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
             for c in &pk.cols {
                 out.push(' ');
                 sexpr_escape(c, &mut out);
+            }
+            if pk.deferrable || pk.initially_deferred {
+                out.push_str(" (attrs ");
+                out.push_str(if pk.deferrable { "1" } else { "0" });
+                out.push(' ');
+                out.push_str(if pk.initially_deferred { "1" } else { "0" });
+                out.push(')');
             }
             out.push(')');
         }
@@ -16647,16 +16763,53 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
     if p.atom()? != "uniques" {
         return Err("bad uniques head".into());
     }
+    // v2.07 helper: an optional trailing (attrs d i) sub-list inside a
+    // unique/pkey entry (pre-v2.07 encodings omit it -> (false, false)).
+    fn unique_attrs(p: &mut SexprParser) -> Result<(bool, bool), String> {
+        p.ws();
+        if p.chars.peek() != Some(&'(') {
+            return Ok((false, false));
+        }
+        p.open()?;
+        if p.atom()? != "attrs" {
+            return Err("bad unique attrs head".into());
+        }
+        let bit = |p: &mut SexprParser| -> Result<bool, String> {
+            match p.atom()?.as_str() {
+                "1" => Ok(true),
+                "0" => Ok(false),
+                o => Err(format!("bad unique attrs bit {}", o)),
+            }
+        };
+        let d = bit(p)?;
+        let i = bit(p)?;
+        p.close()?;
+        Ok((d, i))
+    }
     let mut uniques = Vec::new();
     while !sexpr_is_close(&mut p) {
         p.open()?;
         let name = p.atom()?;
         let mut cols = Vec::new();
-        while !sexpr_is_close(&mut p) {
+        let mut attrs = (false, false);
+        loop {
+            p.ws();
+            if sexpr_is_close(&mut p) {
+                break;
+            }
+            if p.chars.peek() == Some(&'(') {
+                attrs = unique_attrs(&mut p)?;
+                break;
+            }
             cols.push(p.atom()?);
         }
         p.close()?;
-        uniques.push(UniqueDef { name, cols });
+        uniques.push(UniqueDef {
+            name,
+            cols,
+            deferrable: attrs.0,
+            initially_deferred: attrs.1,
+        });
     }
     p.close()?;
     // (pkey -) | (pkey name cols...)
@@ -16669,10 +16822,26 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
     } else {
         let name = p.atom()?;
         let mut cols = Vec::new();
-        while !sexpr_is_close(&mut p) {
-            cols.push(p.atom()?);
+        let mut attrs = (false, false);
+        if name != "-" {
+            loop {
+                p.ws();
+                if sexpr_is_close(&mut p) {
+                    break;
+                }
+                if p.chars.peek() == Some(&'(') {
+                    attrs = unique_attrs(&mut p)?;
+                    break;
+                }
+                cols.push(p.atom()?);
+            }
         }
-        Some(UniqueDef { name, cols })
+        Some(UniqueDef {
+            name,
+            cols,
+            deferrable: attrs.0,
+            initially_deferred: attrs.1,
+        })
     };
     // Careful: `(pkey -)` encodes absence as the atom "-".
     let pkey = match &pkey {

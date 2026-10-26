@@ -1261,6 +1261,10 @@ pub(crate) fn exec_alter_one(
         AlterAction::AddPrimaryKeyUsingIndex { index } => {
             alter_add_primary_key_using_index(eng, ctx, name, index)
         }
+        // v2.07: ADD UNIQUE USING INDEX.
+        AlterAction::AddUniqueUsingIndex { index } => {
+            alter_add_unique_using_index(eng, ctx, name, index)
+        }
         // v0.96: table inheritance (PG19).
         AlterAction::Inherit { parent } => alter_inherit(eng, ctx, name, parent, true),
         AlterAction::NoInherit { parent } => alter_inherit(eng, ctx, name, parent, false),
@@ -4060,10 +4064,19 @@ pub(crate) fn alter_alter_constraint(
     } else if t.uniques.iter().any(|u| u.name == con)
         || t.pkey.as_ref().is_some_and(|p| p.name == con)
     {
-        // PG19 lets UNIQUE/PK constraints be (re)marked deferrable;
-        // this engine does not defer unique checks (named hold-back),
-        // so the catalog-only change is accepted. Enforceability is
-        // FK/CHECK-only in PG19.
+        // v2.07: PG19 ATExecAlterConstraint — deferrability can only
+        // be altered on FOREIGN KEY constraints, and enforceability
+        // only on FK/CHECK (tablecmds.c). Both clause families error
+        // on a UNIQUE/PK constraint; there is no catalog update.
+        if deferrable.is_some() || initially.is_some() {
+            return Err(exec_err(
+                "42809",
+                format!(
+                    "constraint \"{}\" of relation \"{}\" is not a foreign key constraint",
+                    con, name
+                ),
+            ));
+        }
         if enforced.is_some() {
             return Err(exec_err(
                 "42809",
@@ -4086,6 +4099,69 @@ pub(crate) fn alter_alter_constraint(
     Ok(ExecResult::Command {
         tag: "ALTER TABLE".to_string(),
     })
+}
+
+/// v2.07: PG19 parse_utilcmd.c transformIndexConstraints — an index
+/// adopted by a PRIMARY KEY / UNIQUE constraint must have default
+/// sorting behavior on every key column: no DESC / NULLS FIRST
+/// options (pg_index.indoption == 0), the column's own collation, and
+/// the type's default opclass. Anything else is 42809 with the
+/// per-column message. Column collations are not otherwise modeled
+/// on Table, so an explicitly named index collation other than
+/// "default" counts as non-default here.
+pub(crate) fn check_using_index_sorting(
+    t: &Table,
+    def: &crate::index::IndexDef,
+) -> Result<(), ExecError> {
+    use crate::storage::ColType;
+    fn default_opclass(ct: &ColType) -> Option<&'static str> {
+        Some(match ct {
+            ColType::SmallInt => "int2_ops",
+            ColType::Int | ColType::Regclass => "int4_ops",
+            ColType::BigInt => "int8_ops",
+            ColType::Float => "float8_ops",
+            ColType::Float4 => "float4_ops",
+            ColType::Numeric(_) => "numeric_ops",
+            ColType::Text | ColType::Varchar(_) => "text_ops",
+            ColType::Char(_) => "bpchar_ops",
+            ColType::Bool => "bool_ops",
+            ColType::Date => "date_ops",
+            ColType::Timestamp => "timestamp_ops",
+            ColType::Timestamptz => "timestamptz_ops",
+            ColType::Time => "time_ops",
+            ColType::TimeTz => "timetz_ops",
+            ColType::Interval => "interval_ops",
+            ColType::Uuid => "uuid_ops",
+            ColType::Bytea => "bytea_ops",
+            _ => return None,
+        })
+    }
+    for (i, &ci) in def.cols.iter().enumerate() {
+        let bad_sort = def.desc.get(i).copied().unwrap_or(false)
+            || def.nulls_first.get(i).copied().unwrap_or(false);
+        let bad_collate = matches!(
+            def.collates.get(i),
+            Some(Some(c)) if !c.eq_ignore_ascii_case("default")
+        );
+        let bad_opclass = match (
+            def.opclasses.get(i),
+            t.columns.get(ci).map(|(_, ct)| default_opclass(ct)),
+        ) {
+            (Some(Some(op)), Some(Some(dflt))) => !op.eq_ignore_ascii_case(dflt),
+            _ => false,
+        };
+        if bad_sort || bad_collate || bad_opclass {
+            return Err(exec_err(
+                "42809",
+                format!(
+                    "index \"{}\" column number {} does not have default sorting behavior",
+                    def.name,
+                    i + 1
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4156,6 +4232,7 @@ pub(crate) fn alter_add_primary_key_using_index(
             format!("index \"{}\" is not unique", index_name),
         ));
     }
+    check_using_index_sorting(&t, &def)?;
     if def
         .cols
         .iter()
@@ -4172,10 +4249,94 @@ pub(crate) fn alter_add_primary_key_using_index(
         ));
     }
     let mut next = t.clone();
-    next.pkey = Some(UniqueDef {
-        name: format!("{}_pkey", base_name(name)),
-        cols: def.col_names.clone(),
-    });
+    next.pkey = Some(UniqueDef::plain(
+        format!("{}_pkey", base_name(name)),
+        def.col_names.clone(),
+    ));
+    alter_swap(eng, ctx, name, None, next, None)?;
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// v2.07: ALTER TABLE ... ADD UNIQUE USING INDEX (PG19
+// transformIndexConstraints): the unique index becomes a UNIQUE
+// constraint named after the index. Unlike PRIMARY KEY, the index
+// columns need not be NOT NULL.
+// ---------------------------------------------------------------------------
+
+pub(crate) fn alter_add_unique_using_index(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    index_name: &str,
+) -> Result<ExecResult, ExecError> {
+    let t = eng
+        .db
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
+        .clone();
+    let def = eng
+        .db
+        .visible_indexes_for(name, ctx.snap, &ctx.all_xids, ctx.session)
+        .into_iter()
+        .find(|ix| ix.def.name.eq_ignore_ascii_case(index_name))
+        .map(|ix| ix.def.clone());
+    let def = match def {
+        Some(d) => d,
+        None => {
+            let elsewhere = eng
+                .db
+                .tables
+                .keys()
+                .filter(|tn| tn.as_str() != name)
+                .any(|tn| {
+                    eng.db
+                        .visible_indexes_for(tn, ctx.snap, &ctx.all_xids, ctx.session)
+                        .iter()
+                        .any(|ix| ix.def.name.eq_ignore_ascii_case(index_name))
+                });
+            if elsewhere {
+                return Err(exec_err(
+                    "42809",
+                    format!(
+                        "index \"{}\" does not belong to table \"{}\"",
+                        index_name, name
+                    ),
+                ));
+            }
+            return Err(exec_err(
+                "42704",
+                format!("index \"{}\" does not exist", index_name),
+            ));
+        }
+    };
+    if !def.unique {
+        return Err(exec_err(
+            "42809",
+            format!("index \"{}\" is not unique", index_name),
+        ));
+    }
+    check_using_index_sorting(&t, &def)?;
+    // PG19: the constraint takes the index's name; a name collision
+    // with an existing constraint is 42710.
+    if t.uniques.iter().any(|u| u.name == def.name)
+        || t.pkey.as_ref().is_some_and(|p| p.name == def.name)
+        || t.checks.iter().any(|c| c.name == def.name)
+        || t.fks.iter().any(|f| f.name == def.name)
+    {
+        return Err(exec_err(
+            "42710",
+            format!(
+                "constraint \"{}\" for relation \"{}\" already exists",
+                def.name, name
+            ),
+        ));
+    }
+    let mut next = t.clone();
+    next.uniques
+        .push(UniqueDef::plain(def.name.clone(), def.col_names.clone()));
     alter_swap(eng, ctx, name, None, next, None)?;
     Ok(ExecResult::Command {
         tag: "ALTER TABLE".to_string(),
