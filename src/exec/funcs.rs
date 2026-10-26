@@ -8068,38 +8068,54 @@ pub(crate) fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecErr
     }
 }
 
-/// CRC32C (Castagnoli) checksum, as in PG's crc32c() function.
-pub(crate) fn crc32c(data: &[u8]) -> u32 {
-    // Bit-by-bit implementation (no table); adequate for test-size inputs.
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            if crc & 1 != 0 {
+// Table-driven CRC32C (Castagnoli), same construction as
+// `wal::encoding::CRC32_TABLE` (see that module for the rationale: a
+// bit-by-bit loop over 8 branches/byte measured as the dominant cost of
+// a bulk crc32c()/crc32() scan -- benches/profile_crc32.py, 2026-10-26 --
+// so this swaps it for a 256-entry lookup table built at compile time.
+// `static`, not `const`: a `const` has no fixed address, so it would
+// rematerialize the whole 1024-byte array by `memcpy` at every use site
+// in an unoptimized build (the exact bug already fixed for
+// `wal::encoding::CRC32_TABLE`, benches/BASELINE.md 2026-10-21).
+static CRC32C_TABLE: [u32; 256] = build_crc32c_table();
+
+const fn build_crc32c_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            if crc & 1 == 1 {
                 crc = (crc >> 1) ^ 0x82F6_3B78;
             } else {
                 crc >>= 1;
             }
+            j += 1;
         }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+}
+
+/// CRC32C (Castagnoli) checksum, as in PG's crc32c() function.
+pub(crate) fn crc32c(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc = CRC32C_TABLE[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
     }
     !crc
 }
 
 /// v0.30: CRC-32 (IEEE, as in PG 18+'s crc32() function).
+///
+/// Delegates to `wal::encoding::crc32`, which already uses the
+/// table-driven construction (same algorithm, same IEEE polynomial) for
+/// WAL commit-frame checksums -- no need for a second copy of the loop
+/// or a second 1024-byte table.
 pub(crate) fn crc32(data: &[u8]) -> u32 {
-    // Bit-by-bit implementation (no table); adequate for test-size inputs.
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ 0xEDB8_8320;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    !crc
+    crate::wal::crc32(data)
 }
 
 /// Lowercase hex encode.
