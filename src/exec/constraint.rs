@@ -751,8 +751,11 @@ pub(crate) fn fk_parent_key_exists(
     key: &[Value],
     ignore: Option<(&str, u64)>,
 ) -> Result<bool, ExecError> {
-    // Collect the referenced table plus its partition tree.
-    let mut tables: Vec<(String, Table)> = Vec::new();
+    // Collect the referenced table plus its partition tree. Borrowed,
+    // not cloned: `eng` is only ever borrowed immutably here, so there
+    // is no need to deep-copy every row of every table just to check
+    // one key's presence (this runs once per child row checked).
+    let mut tables: Vec<(String, &Table)> = Vec::new();
     let mut stack = vec![fk.ref_table.clone()];
     let mut seen: HashSet<String> = HashSet::new();
     while let Some(name) = stack.pop() {
@@ -767,7 +770,7 @@ pub(crate) fn fk_parent_key_exists(
                 stack.push(c.clone());
             }
         }
-        tables.push((name, t.clone()));
+        tables.push((name, t));
     }
     for (name, t) in &tables {
         let meta = TableMeta::of(t);
