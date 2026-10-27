@@ -20,6 +20,7 @@ pub(crate) fn exec_alter_function(
     arg_types: &[String],
     volatility: crate::sql::FuncVolatility,
     owner: Option<&str>,
+    security: Option<bool>,
 ) -> Result<ExecResult, ExecError> {
     // v1.96: ALTER FUNCTION ... OWNER TO — reassign fn_owners
     // (must be current owner or superuser; new owner must exist).
@@ -114,7 +115,17 @@ pub(crate) fn exec_alter_function(
             format!("{}({}) is not a function", name, arg_types.join(", ")),
         ));
     }
-    slot.volatility = volatility;
+    // v2.09: a SECURITY-only ALTER passes the Volatile default from
+    // the parser; it must not clobber a stored STABLE/IMMUTABLE.
+    if security.is_none() {
+        slot.volatility = volatility;
+    }
+    // v2.09: SECURITY DEFINER/INVOKER flips the stored flag (the flag
+    // already exists on FuncDef from CREATE; only the ALTER action
+    // was missing).
+    if let Some(definer) = security {
+        slot.security_definer = definer;
+    }
     Ok(ExecResult::Command {
         tag: "ALTER FUNCTION".to_string(),
     })
@@ -1565,13 +1576,16 @@ pub(crate) fn exec_do_block(
     }
 }
 
-/// v1.00: `CREATE TRIGGER` (bounded, PG19 `CreateTrigStmt`). The
+/// v1.00/v2.09: `CREATE TRIGGER` (PG19 `CreateTrigStmt`). The
 /// trigger is stored on the table's catalog entry (`Table.triggers`),
 /// so creation is transactional (ROLLBACK-safe), WAL-logged, and
-/// checkpointed via the normal table-version machinery. Only BEFORE
-/// INSERT FOR EACH ROW triggers fire in v1.00; AFTER triggers, other
-/// events, WHEN clauses, and constraint triggers are cataloged but
-/// inert (documented gaps).
+/// checkpointed via the normal table-version machinery (v2.09 added
+/// the triggers section to the constraints codec — before that the
+/// in-memory version was the only copy). BEFORE ROW triggers fire
+/// for INSERT/UPDATE/DELETE, AFTER ROW triggers fire after the row
+/// change, WHEN is evaluated per row, and DEFERRABLE constraint
+/// triggers queue into the v2.06 deferred machinery (see
+/// exec/deferred.rs + exec/partition.rs firing code).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_create_trigger(
     eng: &mut Engine,
@@ -1583,8 +1597,14 @@ pub(crate) fn exec_create_trigger(
     for_each_row: bool,
     function: &str,
     args: &[String],
-    when: Option<&crate::sql::Expr>,
+    when: Option<crate::sql::Expr>,
     is_constraint: bool,
+    deferrable: bool,
+    initially_deferred: bool,
+    enforced: bool,
+    constr_rel: Option<String>,
+    update_cols: Vec<String>,
+    has_transition: bool,
 ) -> Result<ExecResult, ExecError> {
     // v0.11: creating a trigger needs table ownership (like ALTER).
     require_table_owner(eng, ctx, table)?;
@@ -1603,6 +1623,109 @@ pub(crate) fn exec_create_trigger(
             ),
         ));
     }
+    // v2.09: the FROM referenced table of a constraint trigger must
+    // exist (PG19 CreateTrigger checks the constrrel relation).
+    if let Some(cr) = &constr_rel {
+        if eng
+            .db
+            .find_table(cr, ctx.snap, &ctx.all_xids, ctx.session)
+            .is_none()
+        {
+            return Err(exec_err(
+                "42P01",
+                format!("relation \"{}\" does not exist", cr),
+            ));
+        }
+    }
+    // v2.09: UPDATE OF columns must exist on the table (PG19 42703).
+    for c in &update_cols {
+        if prev.column_index(c).is_none() {
+            return Err(exec_err(
+                "42703",
+                format!("column \"{}\" of relation \"{}\" does not exist", c, table),
+            ));
+        }
+    }
+    // v2.09 PG19 trigger.c CreateTrigger validations.
+    if has_transition {
+        let n_events = [
+            crate::sql::trig_event::INSERT,
+            crate::sql::trig_event::UPDATE,
+            crate::sql::trig_event::DELETE,
+            crate::sql::trig_event::TRUNCATE,
+        ]
+        .iter()
+        .filter(|b| events & **b != 0)
+        .count();
+        if n_events != 1 {
+            return Err(exec_err(
+                "0A000",
+                "transition tables cannot be specified for triggers with more than one event"
+                    .to_string(),
+            ));
+        }
+        if !update_cols.is_empty() {
+            return Err(exec_err(
+                "0A000",
+                "transition tables cannot be specified for triggers with column lists".to_string(),
+            ));
+        }
+        if for_each_row {
+            // Partitioned parent, or a partition itself: PG rejects
+            // ROW triggers with transition tables on both.
+            let is_parent = prev.partition.as_ref().is_some_and(|p| p.is_partitioned);
+            let is_child = prev
+                .partition
+                .as_ref()
+                .and_then(|p| p.parent.as_ref())
+                .is_some();
+            if is_parent {
+                return Err(exec_err(
+                    "0A000",
+                    format!(
+                        "\"{}\" is a partitioned table: ROW triggers with transition tables are not supported on partitioned tables",
+                        table
+                    ),
+                ));
+            }
+            if is_child {
+                return Err(exec_err(
+                    "0A000",
+                    "ROW triggers with transition tables are not supported on partitions"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    if let Some(w) = &when {
+        // PG19: WHEN may reference OLD/NEW row variables only.
+        let refs_old = expr_refs_rowvar(w, "old");
+        let refs_new = expr_refs_rowvar(w, "new");
+        if !for_each_row && (refs_old || refs_new) {
+            return Err(exec_err(
+                "42P17",
+                "statement trigger's WHEN condition cannot reference column values".to_string(),
+            ));
+        }
+        if events & crate::sql::trig_event::INSERT != 0 && refs_old {
+            return Err(exec_err(
+                "42P17",
+                "INSERT trigger's WHEN condition cannot reference OLD values".to_string(),
+            ));
+        }
+        if events & crate::sql::trig_event::DELETE != 0 && refs_new {
+            return Err(exec_err(
+                "42P17",
+                "DELETE trigger's WHEN condition cannot reference NEW values".to_string(),
+            ));
+        }
+        if timing == crate::sql::TriggerTiming::Before && expr_refs_new_syscol(w) {
+            return Err(exec_err(
+                "0A000",
+                "BEFORE trigger's WHEN condition cannot reference NEW system columns".to_string(),
+            ));
+        }
+    }
     // The function must exist and be a trigger function (PG19:
     // `RETURNS trigger`). Trigger functions take no arguments.
     let fdef = find_function_by_signature(eng, function, &[])
@@ -1613,9 +1736,6 @@ pub(crate) fn exec_create_trigger(
             format!("function \"{}\" must return type \"trigger\"", function),
         ));
     }
-    // v1.00: WHEN (...) is parsed and stored for catalog fidelity, but
-    // the executor does not evaluate it (documented gap).
-    let _ = when;
     let mut next = prev.clone();
     next.triggers.push(crate::sql::TriggerDef {
         name: name.to_string(),
@@ -1624,11 +1744,153 @@ pub(crate) fn exec_create_trigger(
         for_each_row,
         function: function.to_string(),
         args: args.to_vec(),
+        is_constraint,
+        deferrable,
+        initially_deferred,
+        enforced,
+        constr_rel,
+        update_cols,
+        when_expr: when,
+        has_transition,
     });
-    let _ = is_constraint;
     commit_table_version(eng, ctx, table, prev, next);
     Ok(ExecResult::Command {
         tag: "CREATE TRIGGER".to_string(),
+    })
+}
+
+/// v2.09: does the expression reference `<qual>.<anything>`?
+fn expr_refs_rowvar(e: &crate::sql::Expr, qual: &str) -> bool {
+    let mut found = false;
+    crate::exec::eval::walk_expr(e, &mut |x| {
+        if let crate::sql::Expr::Column { table: Some(t), .. } = x {
+            if t.eq_ignore_ascii_case(qual) {
+                found = true;
+            }
+        }
+        if let crate::sql::Expr::WholeRow { qual: q } = x {
+            if q.eq_ignore_ascii_case(qual) {
+                found = true;
+            }
+        }
+    });
+    found
+}
+
+/// v2.09: does the expression reference NEW.<system column>?
+/// (tableoid is the one system column the trigger scope serves.)
+fn expr_refs_new_syscol(e: &crate::sql::Expr) -> bool {
+    let mut found = false;
+    crate::exec::eval::walk_expr(e, &mut |x| {
+        if let crate::sql::Expr::Column {
+            table: Some(t),
+            name,
+        } = x
+        {
+            if t.eq_ignore_ascii_case("new") && name == "tableoid" {
+                found = true;
+            }
+        }
+    });
+    found
+}
+
+/// v2.09: `ALTER TRIGGER name ON table RENAME TO new_name`
+/// (PG19 RenameStmt OBJECT_TRIGGER): missing trigger 42704,
+/// duplicate new name 42723. Versions the table like CREATE/DROP.
+pub(crate) fn exec_alter_trigger_rename(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    table: &str,
+    new_name: &str,
+) -> Result<ExecResult, ExecError> {
+    require_table_owner(eng, ctx, table)?;
+    let prev = eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?
+        .clone();
+    if !prev.triggers.iter().any(|t| t.name == name) {
+        // v2.09 PG19 trigger.c renametrig: a trigger inherited from
+        // a partitioned parent (tgparentid set) cannot be renamed on
+        // the partition — rename it on the parent instead (0A000).
+        let mut ancestor = prev.partition.as_ref().and_then(|p| p.parent.clone());
+        while let Some(a) = ancestor {
+            let Some(at) = eng
+                .db
+                .find_table(&a, ctx.snap, &ctx.all_xids, ctx.session)
+                .cloned()
+            else {
+                break;
+            };
+            if at.triggers.iter().any(|t| t.name == name) {
+                return Err(exec_err(
+                    "0A000",
+                    format!(
+                        "cannot rename trigger \"{}\" on table \"{}\": rename the trigger on the partitioned table \"{}\" instead",
+                        name, table, a
+                    ),
+                ));
+            }
+            ancestor = at.partition.as_ref().and_then(|p| p.parent.clone());
+        }
+        return Err(exec_err(
+            "42704",
+            format!(
+                "trigger \"{}\" for relation \"{}\" does not exist",
+                name, table
+            ),
+        ));
+    }
+    // v2.09 PG19: the rename cascades to partition clones, so the
+    // new name must not collide with a trigger defined directly on
+    // any descendant partition either (42723).
+    {
+        let mut stack: Vec<String> = prev
+            .partition
+            .as_ref()
+            .map(|p| p.children.clone())
+            .unwrap_or_default();
+        while let Some(child) = stack.pop() {
+            if let Some(ct) = eng
+                .db
+                .find_table(&child, ctx.snap, &ctx.all_xids, ctx.session)
+                .cloned()
+            {
+                if ct.triggers.iter().any(|t| t.name == new_name) {
+                    return Err(exec_err(
+                        "42723",
+                        format!(
+                            "trigger \"{}\" for relation \"{}\" already exists",
+                            new_name, child
+                        ),
+                    ));
+                }
+                if let Some(cp) = &ct.partition {
+                    stack.extend(cp.children.iter().cloned());
+                }
+            }
+        }
+    }
+    if prev.triggers.iter().any(|t| t.name == new_name) {
+        return Err(exec_err(
+            "42723",
+            format!(
+                "trigger \"{}\" for relation \"{}\" already exists",
+                new_name, table
+            ),
+        ));
+    }
+    let mut next = prev.clone();
+    for t in next.triggers.iter_mut() {
+        if t.name == name {
+            t.name = new_name.to_string();
+        }
+    }
+    commit_table_version(eng, ctx, table, prev, next);
+    Ok(ExecResult::Command {
+        tag: "ALTER TRIGGER".to_string(),
     })
 }
 

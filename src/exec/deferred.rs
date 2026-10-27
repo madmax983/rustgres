@@ -14,7 +14,7 @@
 // happens, otherwise the referential action is planned then, with
 // the parent row's current image as the update target.
 use super::*;
-use crate::storage::{DeferredFkState, PendingFk};
+use crate::storage::{DeferredFkState, PendingFk, PendingTrig};
 
 /// The session's deferred state, cloned out (queue operations never
 /// hold the RefCell borrow across a recursive call).
@@ -27,7 +27,7 @@ fn state_of(eng: &Engine, session: u64) -> DeferredFkState {
 }
 
 fn store_state(eng: &Engine, session: u64, st: DeferredFkState) {
-    if st.queue.is_empty() && st.modes.is_empty() {
+    if st.queue.is_empty() && st.modes.is_empty() && st.trig_queue.is_empty() {
         eng.deferred_fk.borrow_mut().remove(&session);
     } else {
         eng.deferred_fk.borrow_mut().insert(session, st);
@@ -330,25 +330,131 @@ pub(crate) fn queue_parent_fk(
         });
 }
 
-/// Server savepoint support: (queue length, modes) snapshot.
+/// Server savepoint support: (queue length, modes, trig queue
+/// length) snapshot. v2.09 added the trigger queue length.
 pub(crate) fn deferred_mark(
     eng: &Engine,
     session: u64,
-) -> (usize, HashMap<(String, String), bool>) {
+) -> (usize, HashMap<(String, String), bool>, usize) {
     let st = state_of(eng, session);
-    (st.queue.len(), st.modes)
+    (st.queue.len(), st.modes, st.trig_queue.len())
 }
 
-/// Server savepoint support: truncate the queue and restore modes.
+/// Server savepoint support: truncate the queues and restore modes.
 pub(crate) fn deferred_restore(
     eng: &Engine,
     session: u64,
-    mark: &(usize, HashMap<(String, String), bool>),
+    mark: &(usize, HashMap<(String, String), bool>, usize),
 ) {
     let mut st = state_of(eng, session);
     st.queue.truncate(mark.0);
     st.modes = mark.1.clone();
+    st.trig_queue.truncate(mark.2);
     store_state(eng, session, st);
+}
+
+/// v2.09: is this constraint trigger currently deferred for the
+/// session? Non-deferrable / non-enforced triggers never defer; a
+/// trigger being fired right now is forced immediate.
+pub(crate) fn trig_mode_deferred(
+    eng: &Engine,
+    session: u64,
+    table: &str,
+    tr: &crate::sql::TriggerDef,
+) -> bool {
+    if !tr.deferrable || !tr.enforced {
+        return false;
+    }
+    let st = eng.deferred_fk.borrow();
+    let Some(st) = st.get(&session) else {
+        return tr.initially_deferred;
+    };
+    if st.firing.contains(&(table.to_string(), tr.name.clone())) {
+        return false;
+    }
+    st.modes
+        .get(&(table.to_string(), tr.name.clone()))
+        .copied()
+        .unwrap_or(tr.initially_deferred)
+}
+
+/// v2.09: queue one deferred constraint-trigger firing.
+pub(crate) fn queue_trig(
+    eng: &Engine,
+    session: u64,
+    def_table: &str,
+    fire_table: &str,
+    trigger_name: &str,
+    event: u8,
+    old_values: Option<Row>,
+    new_values: Option<Row>,
+) {
+    let mut map = eng.deferred_fk.borrow_mut();
+    map.entry(session)
+        .or_default()
+        .trig_queue
+        .push(PendingTrig {
+            def_table: def_table.to_string(),
+            fire_table: fire_table.to_string(),
+            trigger_name: trigger_name.to_string(),
+            event,
+            old_values,
+            new_values,
+        });
+}
+
+/// v2.09: fire one queued constraint trigger (flush path). The
+/// definition is re-read from the defining table (a trigger dropped
+/// inside the transaction simply does not fire, like PG's queue
+/// invalidation on DROP); the body runs against the queued images
+/// in the firing table's column order.
+fn fire_queued_trigger(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    e: &PendingTrig,
+) -> Result<(), ExecError> {
+    let Some(dt) = eng
+        .db
+        .find_table(&e.def_table, ctx.snap, &ctx.all_xids, ctx.session)
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let Some(tr) = dt
+        .triggers
+        .iter()
+        .find(|t| t.name == e.trigger_name)
+        .cloned()
+    else {
+        return Ok(());
+    };
+    if !tr.enforced {
+        return Ok(());
+    }
+    let Some(ft) = eng
+        .db
+        .find_table(&e.fire_table, ctx.snap, &ctx.all_xids, ctx.session)
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let tctx = TrigCtx {
+        name: tr.name.clone(),
+        table: e.fire_table.clone(),
+        timing: tr.timing,
+        event: e.event,
+        args: tr.args.clone(),
+        relid: ft.oid as i64,
+    };
+    fire_one_trigger(
+        eng,
+        ctx,
+        &tctx,
+        &tr,
+        &ft.columns,
+        e.new_values.as_ref().map(|r| &r[..]),
+        e.old_values.as_ref().map(|r| &r[..]),
+    )
 }
 
 pub(crate) fn deferred_clear(eng: &Engine, session: u64) {
@@ -560,7 +666,39 @@ pub(crate) fn flush_deferred_fk(
             taken
         };
         if batch.is_empty() {
-            return Ok(());
+            // v2.09: drain queued constraint-trigger firings whose
+            // (table, trigger) matches the selection, in queue order.
+            let tbatch: Vec<PendingTrig> = {
+                let mut map = eng.deferred_fk.borrow_mut();
+                let Some(st) = map.get_mut(&ctx.session) else {
+                    return Ok(());
+                };
+                let mut taken = Vec::new();
+                let mut kept = Vec::new();
+                for e in std::mem::take(&mut st.trig_queue) {
+                    let hit = match only {
+                        None => true,
+                        Some(set) => set.contains(&(e.def_table.clone(), e.trigger_name.clone())),
+                    };
+                    if hit {
+                        taken.push(e);
+                    } else {
+                        kept.push(e);
+                    }
+                }
+                st.trig_queue = kept;
+                taken
+            };
+            if tbatch.is_empty() {
+                return Ok(());
+            }
+            for e in tbatch {
+                fire_queued_trigger(eng, ctx, &e)?;
+            }
+            // Firing a trigger body cannot queue FK entries in this
+            // engine (bodies have no DML), but loop once more for
+            // symmetry with the FK drain above.
+            continue;
         }
         for e in batch {
             match e {
@@ -596,6 +734,9 @@ pub(crate) fn flush_deferred_fk(
 enum ConRes {
     Fk(FkDef),
     Unique(UniqueDef),
+    /// v2.09: a constraint trigger (SET CONSTRAINTS resolves trigger
+    /// names in PG — they ARE constraints for this purpose).
+    Trig(crate::sql::TriggerDef),
     /// CHECK / NOT NULL constraints: they resolve (so an unknown-name
     /// 42704 is not raised) but can never be deferrable (55000).
     Other,
@@ -606,6 +747,7 @@ impl ConRes {
         match self {
             ConRes::Fk(f) => f.deferrable,
             ConRes::Unique(u) => u.deferrable,
+            ConRes::Trig(t) => t.deferrable,
             ConRes::Other => false,
         }
     }
@@ -613,6 +755,7 @@ impl ConRes {
         match self {
             ConRes::Fk(f) => &f.name,
             ConRes::Unique(u) => &u.name,
+            ConRes::Trig(t) => &t.name,
             ConRes::Other => "",
         }
     }
@@ -636,6 +779,11 @@ fn all_constraints(eng: &Engine, ctx: &StmtCtx) -> Vec<(String, String, ConRes)>
         }
         if let Some(p) = &t.pkey {
             out.push((name.to_string(), p.name.clone(), ConRes::Unique(p.clone())));
+        }
+        for tr in &t.triggers {
+            if tr.is_constraint {
+                out.push((name.to_string(), tr.name.clone(), ConRes::Trig(tr.clone())));
+            }
         }
     };
     for (name, versions) in &eng.db.tables {

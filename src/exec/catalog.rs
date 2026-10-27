@@ -5009,6 +5009,48 @@ pub(crate) fn pg_constraint_scan(
                 Vec::new(),
             )));
         }
+        // v2.09: a pure constraint trigger (no same-named stored
+        // constraint) gets a contype-'t' pg_constraint row, like PG
+        // (constraint triggers create a pg_constraint entry whose
+        // oid pg_trigger.tgconstraint points at).
+        for tr in &t.triggers {
+            if !tr.is_constraint {
+                continue;
+            }
+            let dup = t.pkey.as_ref().is_some_and(|p| p.name == tr.name)
+                || t.uniques.iter().any(|u| u.name == tr.name)
+                || t.checks.iter().any(|c| c.name == tr.name)
+                || t.fks.iter().any(|f| f.name == tr.name);
+            if dup {
+                continue;
+            }
+            let confrelid = match &tr.constr_rel {
+                Some(cr) => db
+                    .find_table(cr, snap, &[own], session)
+                    .map(|ct| ct.oid as i64)
+                    .unwrap_or(0),
+                None => 0,
+            };
+            rows.push(mk(vec![
+                Value::text(tr.name.clone()),
+                Value::Int(2200),
+                Value::SingleChar(b't'),
+                Value::Bool(tr.deferrable),
+                Value::Bool(tr.initially_deferred),
+                Value::Bool(tr.enforced),
+                Value::Bool(true),
+                relid.clone(),
+                Value::Int(0),
+                Value::Int(confrelid),
+                Value::Int(0),
+                Value::Int(0),
+                Value::SingleChar(b'a'),
+                Value::SingleChar(b'a'),
+                Value::SingleChar(b's'),
+                int_array(Vec::new()),
+                Value::Null,
+            ]));
+        }
         for f in &t.fks {
             let (confrelid, confkey) = match db.find_table(&f.ref_table, snap, &[own], session) {
                 Some(pt) => {
@@ -5043,4 +5085,321 @@ pub(crate) fn pg_constraint_scan(
         }
     }
     (schema, rows)
+}
+
+// ---------------------------------------------------------------------------
+// v2.09: pg_trigger (virtual). Synthesized from the stored TriggerDefs
+// (Table.triggers) so catalog introspection — tgdeferrable,
+// tginitdeferred, tgconstraint, tgparentid — resolves. Trigger OIDs
+// are synthetic: assigned sequentially in (table, trigger) scan order
+// from 30000, stable within a scan only (same discipline as
+// pg_constraint's 20000 range). A trigger on a partitioned table also
+// emits one cloned row per descendant leaf with tgparentid pointing
+// at the parent's row (PG19 clones triggers onto partitions).
+// tgtype uses the PG19 bit layout (catalog/pg_trigger.h): ROW=1,
+// BEFORE=2, INSERT=4, DELETE=8, UPDATE=16, TRUNCATE=32.
+// ---------------------------------------------------------------------------
+
+pub(crate) fn pg_trigger_schema() -> Vec<QCol> {
+    [
+        ("oid", ColType::Int),
+        ("tgrelid", ColType::Int),
+        ("tgparentid", ColType::Int),
+        ("tgname", ColType::Text),
+        ("tgfoid", ColType::Int),
+        ("tgtype", ColType::SmallInt),
+        ("tgenabled", ColType::SingleChar),
+        ("tgisinternal", ColType::Bool),
+        ("tgconstrrelid", ColType::Int),
+        ("tgconstrindid", ColType::Int),
+        ("tgconstraint", ColType::Int),
+        ("tgdeferrable", ColType::Bool),
+        ("tginitdeferred", ColType::Bool),
+        ("tgnargs", ColType::SmallInt),
+        ("tgattr", ColType::Array(ArrayElem::Int)),
+        ("tgargs", ColType::Bytea),
+        ("tgqual", ColType::Text),
+        ("tgoldtable", ColType::Text),
+        ("tgnewtable", ColType::Text),
+    ]
+    .into_iter()
+    .map(|(n, ty)| QCol {
+        qual: "pg_trigger".to_string(),
+        name: n.to_string(),
+        ty,
+        hidden: false,
+        src_ord: 0,
+    })
+    .collect()
+}
+
+/// The pg_trigger tgtype bitmask for a stored definition.
+pub(crate) fn trigger_tgtype(tr: &crate::sql::TriggerDef) -> i64 {
+    let mut t: i64 = 0;
+    if tr.for_each_row {
+        t |= 1; // TRIGGER_TYPE_ROW
+    }
+    if tr.timing == crate::sql::TriggerTiming::Before {
+        t |= 2; // TRIGGER_TYPE_BEFORE (AFTER is 0)
+    }
+    if (tr.events & crate::sql::trig_event::INSERT) != 0 {
+        t |= 4;
+    }
+    if (tr.events & crate::sql::trig_event::DELETE) != 0 {
+        t |= 8;
+    }
+    if (tr.events & crate::sql::trig_event::UPDATE) != 0 {
+        t |= 16;
+    }
+    if (tr.events & crate::sql::trig_event::TRUNCATE) != 0 {
+        t |= 32;
+    }
+    t
+}
+
+/// One materialized pg_trigger row before OID assignment:
+/// (table name, table, definition, parent trigger name or None).
+type TrigRowSrc = (String, Table, crate::sql::TriggerDef, Option<String>);
+
+fn collect_trigger_rows(db: &Database, snap: &Snapshot, own: u64, session: u64) -> Vec<TrigRowSrc> {
+    let mut out: Vec<TrigRowSrc> = Vec::new();
+    let mut names: Vec<&String> = db.tables.keys().collect();
+    names.sort();
+    if let Some(tmps) = db.temp_tables.get(&session) {
+        let mut tnames: Vec<&String> = tmps.keys().collect();
+        tnames.sort();
+        names.extend(tnames);
+    }
+    // Descendants of each partitioned table (for cloned rows).
+    fn descendants(
+        db: &Database,
+        snap: &Snapshot,
+        own: u64,
+        session: u64,
+        root: &str,
+        depth: usize,
+        out: &mut Vec<String>,
+    ) {
+        if depth > 32 {
+            return;
+        }
+        if let Some(t) = db.find_table(root, snap, &[own], session) {
+            if let Some(pi) = &t.partition {
+                for c in &pi.children {
+                    out.push(c.clone());
+                    descendants(db, snap, own, session, c, depth + 1, out);
+                }
+            }
+        }
+    }
+    for name in &names {
+        let Some(t) = db.find_table(name, snap, &[own], session) else {
+            continue;
+        };
+        for tr in &t.triggers {
+            out.push((name.to_string(), t.clone(), tr.clone(), None));
+        }
+        if t.partition.is_some() && !t.triggers.is_empty() {
+            let mut desc = Vec::new();
+            descendants(db, snap, own, session, name, 0, &mut desc);
+            desc.sort();
+            desc.dedup();
+            for d in desc {
+                if d == **name {
+                    continue;
+                }
+                let Some(dt) = db.find_table(&d, snap, &[own], session) else {
+                    continue;
+                };
+                for tr in &t.triggers {
+                    out.push((d.clone(), dt.clone(), tr.clone(), Some(tr.name.clone())));
+                }
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn pg_trigger_scan(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = pg_trigger_schema();
+    // The pg_constraint synthetic-OID map, so tgconstraint points at
+    // the very row pg_constraint emits for the same (table, name).
+    let (_, con_rows) = pg_constraint_scan(db, snap, own, session);
+    // Build (relid, conname) -> oid from the constraint scan rows:
+    // row layout is [oid, conname, connamespace, contype, ...,
+    // conrelid at index 8].
+    let mut con_map: std::collections::HashMap<(i64, String), i64> =
+        std::collections::HashMap::new();
+    for r in &con_rows {
+        if let (Value::Int(oid), Value::Text(cn), Value::Int(relid)) =
+            (&r.cells[0], &r.cells[1], &r.cells[8])
+        {
+            con_map.insert((*relid, cn.to_string()), *oid);
+        }
+    }
+    // Function OIDs: synthetic, by first-seen order in the function
+    // registry (name-sorted for determinism), from 40000.
+    let mut fn_names: Vec<&String> = db.functions.keys().collect();
+    fn_names.sort();
+    let fn_oid_of = |fname: &str| -> i64 {
+        fn_names
+            .iter()
+            .position(|n| n.as_str() == fname)
+            .map(|i| 40000 + i as i64)
+            .unwrap_or(0)
+    };
+    let src = collect_trigger_rows(db, snap, own, session);
+    // First pass: assign OIDs; remember each (table, trigger) parent's
+    // OID for tgparentid on cloned rows.
+    let mut oids: Vec<i64> = Vec::with_capacity(src.len());
+    let mut oid_of: std::collections::HashMap<(String, String), i64> =
+        std::collections::HashMap::new();
+    for (i, (tname, _, tr, parent)) in src.iter().enumerate() {
+        let oid = 30000 + i as i64;
+        oids.push(oid);
+        if parent.is_none() {
+            oid_of.insert((tname.clone(), tr.name.clone()), oid);
+        }
+    }
+    let mut rows = Vec::new();
+    for (i, (tname, t, tr, parent)) in src.iter().enumerate() {
+        let relid = t.oid as i64;
+        let tgparentid = match parent {
+            Some(pname) => {
+                // The parent's own row lives on the partitioned
+                // ancestor; find it by walking up: the ancestor is
+                // the (only) table whose trigger set contains pname
+                // and which has this table in its tree. We recorded
+                // parents in scan order — the defining table is the
+                // one whose non-cloned row for pname has this table
+                // as a descendant; use the first such OID.
+                let mut found = 0;
+                for (j, (pt, _, ptr, pp)) in src.iter().enumerate() {
+                    if pp.is_none() && &ptr.name == pname && pt != tname {
+                        found = oids[j];
+                        break;
+                    }
+                }
+                found
+            }
+            None => 0,
+        };
+        let constr_relid = match &tr.constr_rel {
+            Some(cr) => db
+                .find_table(cr, snap, &[own], session)
+                .map(|ct| ct.oid as i64)
+                .unwrap_or(0),
+            None => 0,
+        };
+        // tgconstraint: for constraint triggers, the pg_constraint
+        // row of the same name on the trigger's table (an FK with
+        // the same name, or the synthesized contype-'t' row that
+        // pg_constraint_scan emits for a pure constraint trigger).
+        let tgconstraint = if tr.is_constraint {
+            let def_relid = if parent.is_some() { relid } else { relid };
+            con_map
+                .get(&(def_relid, tr.name.clone()))
+                .copied()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let tgattr: Vec<i64> = tr
+            .update_cols
+            .iter()
+            .map(|c| t.column_index(c).map(|ix| (ix + 1) as i64).unwrap_or(0))
+            .collect();
+        rows.push(QRow {
+            cells: Row::new(vec![
+                Value::Int(oids[i]),
+                Value::Int(relid),
+                Value::Int(tgparentid),
+                Value::text(tr.name.clone()),
+                Value::Int(fn_oid_of(&tr.function)),
+                Value::Int(trigger_tgtype(tr)),
+                Value::SingleChar(b'O'),
+                Value::Bool(false),
+                Value::Int(constr_relid),
+                Value::Int(0),
+                Value::Int(tgconstraint),
+                Value::Bool(tr.deferrable),
+                Value::Bool(tr.initially_deferred),
+                Value::Int(tr.args.len() as i64),
+                int_array(tgattr),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]),
+            prov: Vec::new(),
+        });
+    }
+    (schema, rows)
+}
+
+/// v2.09: render a CREATE TRIGGER definition for one stored trigger
+/// (pg_get_triggerdef's core; the pretty variant is not rendered
+/// differently in this engine).
+pub(crate) fn trigger_def_text(tname: &str, tr: &crate::sql::TriggerDef) -> String {
+    let timing = match tr.timing {
+        crate::sql::TriggerTiming::Before => "BEFORE",
+        crate::sql::TriggerTiming::After => "AFTER",
+    };
+    let mut events: Vec<&str> = Vec::new();
+    if (tr.events & crate::sql::trig_event::INSERT) != 0 {
+        events.push("INSERT");
+    }
+    if (tr.events & crate::sql::trig_event::DELETE) != 0 {
+        events.push("DELETE");
+    }
+    if (tr.events & crate::sql::trig_event::UPDATE) != 0 {
+        if tr.update_cols.is_empty() {
+            events.push("UPDATE");
+        } else {
+            events.push("UPDATE");
+        }
+    }
+    if (tr.events & crate::sql::trig_event::TRUNCATE) != 0 {
+        events.push("TRUNCATE");
+    }
+    let ev = if !tr.update_cols.is_empty()
+        && (tr.events & crate::sql::trig_event::UPDATE) != 0
+        && tr.events == crate::sql::trig_event::UPDATE
+    {
+        format!("UPDATE OF {}", tr.update_cols.join(", "))
+    } else {
+        events.join(" OR ")
+    };
+    let constraint = if tr.is_constraint { "CONSTRAINT " } else { "" };
+    let level = if tr.for_each_row { "ROW" } else { "STATEMENT" };
+    format!(
+        "CREATE {}{}TRIGGER {} {} {} ON {} FOR EACH {} EXECUTE FUNCTION {}()",
+        constraint, "", tr.name, timing, ev, tname, level, tr.function
+    )
+}
+
+/// v2.09: pg_get_triggerdef's lookup — the rendered definition for
+/// the synthetic pg_trigger OID, or None when no such row exists.
+pub(crate) fn pg_triggerdef_for_oid(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    oid: i64,
+) -> Option<String> {
+    let src = collect_trigger_rows(db, snap, own, session);
+    src.iter()
+        .enumerate()
+        .find_map(|(i, (tname, _t, tr, _parent))| {
+            if 30000 + i as i64 == oid {
+                Some(trigger_def_text(tname, tr))
+            } else {
+                None
+            }
+        })
 }

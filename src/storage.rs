@@ -7190,6 +7190,28 @@ pub enum PendingFk {
     },
 }
 
+/// v2.09: one queued deferred constraint-trigger firing (PG19
+/// trigger.c's AfterTriggerEvent for a user constraint trigger).
+/// Carries the full OLD/NEW images as queued; at fire time the body
+/// runs against these images (PG re-fetches the row for RI triggers,
+/// but user constraint triggers receive the queued transition — the
+/// images here are the statement-time images, which is what the
+/// suite's deferred bodies observe through NEW).
+#[derive(Clone, Debug)]
+pub struct PendingTrig {
+    /// Table the trigger is DEFINED on (the SET CONSTRAINTS /
+    /// mode-override key, and where the definition is read from).
+    pub def_table: String,
+    /// Table whose rows fired it (the leaf for routed rows); its
+    /// column order is the images' order.
+    pub fire_table: String,
+    pub trigger_name: String,
+    /// Single `trig_event::*` bit.
+    pub event: u8,
+    pub old_values: Option<Row>,
+    pub new_values: Option<Row>,
+}
+
 /// v2.06: per-session deferred-FK state: the pending-trigger queue
 /// plus SET CONSTRAINTS mode overrides, keyed by (child table,
 /// constraint name). Lives for one transaction; the server clears it
@@ -7201,6 +7223,11 @@ pub struct DeferredFkState {
     /// (child table, constraint) pairs currently being fired: their
     /// own cascade planning must run immediate, not re-queue.
     pub firing: HashSet<(String, String)>,
+    /// v2.09: queued deferred constraint-trigger firings, in queue
+    /// order (PG19 fires the after-trigger queue in order; FK/UNIQUE
+    /// entries above and trigger entries here are fired FK-first —
+    /// a documented ordering simplification vs PG's single queue).
+    pub trig_queue: Vec<PendingTrig>,
 }
 
 pub struct Engine {

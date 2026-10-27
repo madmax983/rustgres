@@ -3442,6 +3442,27 @@ pub(crate) fn exec_insert(
     for (leaf, leaf_inserts) in &routed {
         apply_row_inserts(eng, ctx, leaf, leaf_inserts)?;
     }
+    // v2.09: AFTER INSERT FOR EACH ROW triggers (incl. deferred
+    // constraint triggers, which queue instead of firing). Runs per
+    // leaf with the leaf's columns; triggers defined on partitioned
+    // ancestors apply too (trigger_defs_for_leaf).
+    for (leaf, leaf_inserts) in &routed {
+        if leaf_inserts.is_empty() {
+            continue;
+        }
+        let leaf_cols: Vec<(String, ColType)> = {
+            let t = eng
+                .db
+                .find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session)
+                .expect("leaf still visible");
+            t.columns.clone()
+        };
+        let pairs: Vec<(Option<Row>, Option<Row>)> = leaf_inserts
+            .iter()
+            .map(|(_, r)| (None, Some(r.clone())))
+            .collect();
+        fire_after_row_triggers(eng, ctx, leaf, &leaf_cols, trig_event::INSERT, &pairs, None)?;
+    }
     // Apply DO UPDATEs: delete old version + insert new version.
     // Pre-allocate the new row ids (the table borrow below conflicts).
     // v0.71: each update carries its target table (the leaf, for a
@@ -4429,6 +4450,9 @@ pub(crate) fn exec_update(
     // Apply: UPDATE = delete old version + insert new version, per leaf.
     // v0.70: moved rows are deleted from their source leaf and inserted
     // into the routed destination leaf.
+    // v2.09: (leaf, old, new) images for AFTER UPDATE triggers,
+    // collected during the apply loop below.
+    let mut after_update_pairs: Vec<(String, Row, Row)> = Vec::new();
     let n = plan.len() + moves.len();
     // v1.40: old -> new version id, for RETURNING system columns.
     let mut new_id_of: Vec<(u64, u64)> = Vec::with_capacity(n);
@@ -4481,6 +4505,7 @@ pub(crate) fn exec_update(
                         prev_xmax,
                         old_values: old_values.clone(),
                     });
+                    after_update_pairs.push((leaf.clone(), old_values.clone(), new_values.clone()));
                     indexed.push((new_id, new_values, old_values, old_toast));
                 }
             }
@@ -4554,6 +4579,39 @@ pub(crate) fn exec_update(
         dsts.sort_unstable();
         for dst in &dsts {
             apply_row_inserts(eng, ctx, dst, &by_dst[dst.as_str()])?;
+        }
+    }
+    // v2.09: AFTER UPDATE FOR EACH ROW triggers, per leaf, in plan
+    // order. UPDATE OF matching uses the statement's SET list.
+    if !after_update_pairs.is_empty() {
+        let set_cols: Vec<String> = sets.iter().map(|(c, _)| c.clone()).collect();
+        let mut by_leaf: std::collections::HashMap<String, Vec<(Option<Row>, Option<Row>)>> =
+            std::collections::HashMap::new();
+        let mut leaf_order: Vec<String> = Vec::new();
+        for (leaf, o, n) in after_update_pairs {
+            if !by_leaf.contains_key(&leaf) {
+                leaf_order.push(leaf.clone());
+            }
+            by_leaf.entry(leaf).or_default().push((Some(o), Some(n)));
+        }
+        for leaf in leaf_order {
+            let leaf_cols: Vec<(String, ColType)> = {
+                let t = eng
+                    .db
+                    .find_table(&leaf, ctx.snap, &ctx.all_xids, ctx.session)
+                    .expect("leaf still visible");
+                t.columns.clone()
+            };
+            let pairs = by_leaf.remove(&leaf).unwrap_or_default();
+            fire_after_row_triggers(
+                eng,
+                ctx,
+                &leaf,
+                &leaf_cols,
+                trig_event::UPDATE,
+                &pairs,
+                Some(&set_cols),
+            )?;
         }
     }
     // v0.10: RETURNING evaluates against the NEW row values. v0.70:
@@ -5085,6 +5143,41 @@ pub(crate) fn exec_delete(
         leaves.sort_unstable();
         for leaf in &leaves {
             toast_delete_chunks(eng, ctx, leaf, &vids_by_leaf[leaf.as_str()])?;
+        }
+    }
+    // v2.09: AFTER DELETE FOR EACH ROW triggers, per leaf (the
+    // plan's leaf-order images), in plan order.
+    {
+        let mut by_leaf: std::collections::HashMap<String, Vec<(Option<Row>, Option<Row>)>> =
+            std::collections::HashMap::new();
+        let mut leaf_order: Vec<String> = Vec::new();
+        for (leaf, _, _, _, leaf_values, _) in &plan {
+            if !by_leaf.contains_key(leaf) {
+                leaf_order.push(leaf.clone());
+            }
+            by_leaf
+                .entry(leaf.clone())
+                .or_default()
+                .push((Some(leaf_values.clone()), None));
+        }
+        for leaf in leaf_order {
+            let leaf_cols: Vec<(String, ColType)> = {
+                let t = eng
+                    .db
+                    .find_table(&leaf, ctx.snap, &ctx.all_xids, ctx.session)
+                    .expect("leaf still visible");
+                t.columns.clone()
+            };
+            let pairs = by_leaf.remove(&leaf).unwrap_or_default();
+            fire_after_row_triggers(
+                eng,
+                ctx,
+                &leaf,
+                &leaf_cols,
+                trig_event::DELETE,
+                &pairs,
+                None,
+            )?;
         }
     }
     // v0.10: RETURNING.

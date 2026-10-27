@@ -256,6 +256,19 @@ pub(crate) fn from_schema_item(
                 out.push(apply_aliases(schema)?);
                 return Ok(());
             }
+            // v2.09: pg_trigger is virtual too (bounded catalog subset).
+            if name == "pg_trigger" && eng.db.find_table(name, snap, &[own], session).is_none() {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let schema: Vec<QCol> = pg_trigger_schema()
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                out.push(apply_aliases(schema)?);
+                return Ok(());
+            }
             // v0.88: pg_attribute is virtual too (bounded catalog subset).
             if name == "pg_attribute" && eng.db.find_table(name, snap, &[own], session).is_none() {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());

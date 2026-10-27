@@ -1404,27 +1404,128 @@ pub(crate) fn fire_before_insert_triggers(
     let mut out: Vec<Option<Row>> = Vec::with_capacity(rows.len());
     for row in rows {
         let mut cur: Option<Vec<Value>> = Some(row[..].to_vec());
-        for stmts in &bodies {
-            let Some(row_vals) = cur else { break };
-            cur = exec_trigger_body(eng, ctx, table, cols, &row_vals, stmts)?;
+        for (tr, stmts) in firing.iter().zip(bodies.iter()) {
+            let Some(row_vals) = cur.take() else { break };
+            // v2.09: WHEN gates BEFORE row triggers too (PG19
+            // ExecCallTriggerFunc evaluates the qual first).
+            let tctx = TrigCtx {
+                name: tr.name.clone(),
+                table: table.to_string(),
+                timing: tr.timing,
+                event: trig_event::INSERT,
+                args: tr.args.clone(),
+                relid: eng
+                    .db
+                    .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+                    .map(|t| t.oid as i64)
+                    .unwrap_or(0),
+            };
+            if !trigger_when_matches(
+                eng,
+                ctx,
+                &tctx,
+                cols,
+                Some(&row_vals),
+                None,
+                tr.when_expr.as_ref(),
+            )? {
+                cur = Some(row_vals);
+                continue;
+            }
+            cur = exec_trigger_body(eng, ctx, &tctx, cols, Some(&row_vals), None, stmts)?;
         }
         out.push(cur.map(Row::new));
     }
     Ok(out)
 }
 
-/// v1.00: execute one trigger-function body for a single NEW row.
-/// Returns `Ok(Some(row))` for the (possibly modified) row to insert,
-/// `Ok(None)` when the body returned NULL (the row is suppressed).
+/// v2.09: the firing context of one trigger invocation (PG19's
+/// TriggerData, reduced to what bodies can observe: TG_NAME,
+/// TG_TABLE_NAME, TG_WHEN, TG_OP, TG_LEVEL).
+#[derive(Clone)]
+pub(crate) struct TrigCtx {
+    pub name: String,
+    pub table: String,
+    pub timing: TriggerTiming,
+    /// Single `trig_event::*` bit being fired.
+    pub event: u8,
+    /// v2.09: the trigger's EXECUTE arguments (TG_ARGV).
+    pub args: Vec<String>,
+    /// v2.09: OID of the firing table (NEW.tableoid / TG_RELID).
+    pub relid: i64,
+}
+
+impl TrigCtx {
+    fn op_name(&self) -> &'static str {
+        match self.event {
+            trig_event::INSERT => "INSERT",
+            trig_event::DELETE => "DELETE",
+            trig_event::UPDATE => "UPDATE",
+            _ => "TRUNCATE",
+        }
+    }
+    fn when_name(&self) -> &'static str {
+        match self.timing {
+            TriggerTiming::Before => "BEFORE",
+            TriggerTiming::After => "AFTER",
+        }
+    }
+}
+
+/// v2.09: how a trigger-body statement list ended.
+enum TrigFlow {
+    /// Fell off the end of the list.
+    End,
+    /// `RETURN NEW` / `RETURN OLD` / `RETURN NULL` executed; the
+    /// payload is which row the function returned (None = NULL).
+    Return(Option<RowChoice>),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum RowChoice {
+    New,
+    Old,
+}
+
+/// v1.00/v2.09: execute one trigger-function body for a single row
+/// pair. `new_row` / `old_row` are None when the event has no such
+/// image (INSERT has no OLD; DELETE has no NEW — the missing image
+/// reads as all-NULL, like PG). Returns the row the function
+/// returned: Some(row) for RETURN NEW/OLD (with NEW assignments
+/// applied), None for RETURN NULL. Falling off the end without
+/// RETURN is 2F005, as in PG.
 pub(crate) fn exec_trigger_body(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
-    table: &str,
+    tctx: &TrigCtx,
     cols: &[(String, ColType)],
-    new_row: &[Value],
+    new_row: Option<&[Value]>,
+    old_row: Option<&[Value]>,
     stmts: &[TriggerBodyStmt],
 ) -> Result<Option<Vec<Value>>, ExecError> {
-    let mut row: Vec<Value> = new_row.to_vec();
+    let nulls: Vec<Value> = vec![Value::Null; cols.len()];
+    let mut new_vals: Vec<Value> = new_row.unwrap_or(&nulls).to_vec();
+    let old_vals: Vec<Value> = old_row.unwrap_or(&nulls).to_vec();
+    match exec_trigger_stmts(eng, ctx, tctx, cols, &mut new_vals, &old_vals, stmts)? {
+        TrigFlow::Return(Some(RowChoice::New)) => Ok(Some(new_vals)),
+        TrigFlow::Return(Some(RowChoice::Old)) => Ok(Some(old_vals)),
+        TrigFlow::Return(None) => Ok(None),
+        TrigFlow::End => Err(exec_err(
+            "2F005",
+            "control reached end of trigger procedure without RETURN".to_string(),
+        )),
+    }
+}
+
+fn exec_trigger_stmts(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    tctx: &TrigCtx,
+    cols: &[(String, ColType)],
+    new_vals: &mut Vec<Value>,
+    old_vals: &[Value],
+    stmts: &[TriggerBodyStmt],
+) -> Result<TrigFlow, ExecError> {
     for stmt in stmts {
         match stmt {
             TriggerBodyStmt::Assign { col, expr } => {
@@ -1433,26 +1534,19 @@ pub(crate) fn exec_trigger_body(
                         "42703",
                         format!(
                             "column \"{}\" of relation \"{}\" does not exist",
-                            col, table
+                            col, tctx.table
                         ),
                     )
                 })?;
-                let val = eval_trigger_expr(eng, ctx, table, cols, &row, expr)?;
-                // Coerce like a normal INSERT assignment would.
-                row[idx] = coerce_value(val, &cols[idx].1, col)?;
+                let val = eval_trigger_expr(eng, ctx, tctx, cols, new_vals, old_vals, expr)?;
+                new_vals[idx] = coerce_value(val, &cols[idx].1, col)?;
             }
             TriggerBodyStmt::Perform(expr) => {
-                // v1.96: evaluate for side effects, discard result.
-                let _ = eval_trigger_expr(eng, ctx, table, cols, &row, expr)?;
+                let _ = eval_trigger_expr(eng, ctx, tctx, cols, new_vals, old_vals, expr)?;
             }
-            TriggerBodyStmt::ReturnNew => return Ok(Some(row)),
-            TriggerBodyStmt::ReturnOld => {
-                // v1.00: INSERT has no OLD row. PG would return the
-                // (all-null) OLD row; the bounded grammar only runs on
-                // INSERT, so treat it as the current NEW row.
-                return Ok(Some(row));
-            }
-            TriggerBodyStmt::ReturnNull => return Ok(None),
+            TriggerBodyStmt::ReturnNew => return Ok(TrigFlow::Return(Some(RowChoice::New))),
+            TriggerBodyStmt::ReturnOld => return Ok(TrigFlow::Return(Some(RowChoice::Old))),
+            TriggerBodyStmt::ReturnNull => return Ok(TrigFlow::Return(None)),
             TriggerBodyStmt::Raise {
                 level,
                 format,
@@ -1460,7 +1554,7 @@ pub(crate) fn exec_trigger_body(
             } => {
                 let vals: Vec<Value> = args
                     .iter()
-                    .map(|e| eval_trigger_expr(eng, ctx, table, cols, &row, e))
+                    .map(|e| eval_trigger_expr(eng, ctx, tctx, cols, new_vals, old_vals, e))
                     .collect::<Result<Vec<_>, _>>()?;
                 let msg = format_raise_message(format, &vals);
                 match level {
@@ -1468,50 +1562,411 @@ pub(crate) fn exec_trigger_body(
                     RaiseLevel::Exception => return Err(exec_err("P0001", msg)),
                 }
             }
+            TriggerBodyStmt::If {
+                branches,
+                else_body,
+            } => {
+                let mut taken = false;
+                for (cond, body) in branches {
+                    let v = eval_trigger_expr(eng, ctx, tctx, cols, new_vals, old_vals, cond)?;
+                    if matches!(v, Value::Bool(true)) {
+                        let flow =
+                            exec_trigger_stmts(eng, ctx, tctx, cols, new_vals, old_vals, body)?;
+                        if !matches!(flow, TrigFlow::End) {
+                            return Ok(flow);
+                        }
+                        taken = true;
+                        break;
+                    }
+                }
+                if !taken && !else_body.is_empty() {
+                    let flow =
+                        exec_trigger_stmts(eng, ctx, tctx, cols, new_vals, old_vals, else_body)?;
+                    if !matches!(flow, TrigFlow::End) {
+                        return Ok(flow);
+                    }
+                }
+            }
+            TriggerBodyStmt::Block { body, handlers } => {
+                match exec_trigger_stmts(eng, ctx, tctx, cols, new_vals, old_vals, body) {
+                    Ok(flow) => {
+                        if !matches!(flow, TrigFlow::End) {
+                            return Ok(flow);
+                        }
+                    }
+                    Err(e) => {
+                        // PG19: an EXCEPTION handler matching the
+                        // error's SQLSTATE (by condition name or by
+                        // explicit SQLSTATE) runs instead; the error
+                        // is then considered handled.
+                        let handler = handlers.iter().find(|(keys, _)| {
+                            keys.iter().any(|k| {
+                                k == "others"
+                                    || k.eq_ignore_ascii_case(e.code)
+                                    || k == &format!("sqlstate:{}", e.code)
+                                    || condition_name_for_sqlstate(e.code).is_some_and(|n| n == k)
+                            })
+                        });
+                        match handler {
+                            Some((_, hbody)) => {
+                                let flow = exec_trigger_stmts(
+                                    eng, ctx, tctx, cols, new_vals, old_vals, hbody,
+                                )?;
+                                if !matches!(flow, TrigFlow::End) {
+                                    return Ok(flow);
+                                }
+                            }
+                            None => return Err(e),
+                        }
+                    }
+                }
+            }
         }
     }
-    // Falling off the end without RETURN: PG19 raises 2F005
-    // (null_value_not_allowed / "control reached end of trigger
-    // procedure without RETURN").
-    Err(exec_err(
-        "2F005",
-        "control reached end of trigger procedure without RETURN".to_string(),
-    ))
+    Ok(TrigFlow::End)
 }
 
-/// v1.00: evaluate a trigger-body expression against the NEW row. The
-/// scope is qualified as `new`, so both `new.col` and bare `col`
-/// resolve against the row (PG19 trigger bodies see NEW/OLD as the
-/// row variables).
+/// v2.09: the plpgsql condition name for a SQLSTATE (the subset the
+/// suite's EXCEPTION blocks name), for handler matching.
+fn condition_name_for_sqlstate(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "22012" => "division_by_zero",
+        "23505" => "unique_violation",
+        "23503" => "foreign_key_violation",
+        "23514" => "check_violation",
+        "23502" => "not_null_violation",
+        "42P01" => "undefined_table",
+        "42703" => "undefined_column",
+        "42883" => "undefined_function",
+        "42601" => "syntax_error",
+        "22P02" => "invalid_text_representation",
+        "22003" => "numeric_value_out_of_range",
+        "P0001" => "raise_exception",
+        _ => return None,
+    })
+}
+
+/// v1.00/v2.09: evaluate a trigger-body expression with NEW and OLD
+/// in scope (qualified `new` / `old`; bare columns resolve against
+/// NEW first, the v1.00 behavior) plus the TG_* variables.
 pub(crate) fn eval_trigger_expr(
     eng: &mut Engine,
     ctx: &StmtCtx,
-    _table: &str,
+    tctx: &TrigCtx,
     cols: &[(String, ColType)],
-    row: &[Value],
+    new_row: &[Value],
+    old_row: &[Value],
     expr: &Expr,
 ) -> Result<Value, ExecError> {
-    let schema: Vec<QCol> = cols
-        .iter()
-        .enumerate()
-        .map(|(i, (n, ty))| QCol {
-            qual: "new".to_string(),
-            name: n.clone(),
-            ty: *ty,
-            hidden: false,
-            src_ord: i as u32,
-        })
-        .collect();
-    eval_partition_key_expr(
+    // v2.09: TG_ARGV[i] — the trigger's EXECUTE arguments as text.
+    if let Expr::Subscript { array, indices } = expr {
+        if let Expr::Column { table: None, name } = &**array {
+            if name == "tg_argv" && indices.len() == 1 {
+                let iv = eval_trigger_expr(eng, ctx, tctx, cols, new_row, old_row, &indices[0])?;
+                let idx = match iv {
+                    Value::Int(i) => i,
+                    Value::SmallInt(i) => i as i64,
+                    Value::BigInt(i) => i,
+                    _ => {
+                        return Err(exec_err(
+                            "22023",
+                            "TG_ARGV index must be an integer".to_string(),
+                        ));
+                    }
+                };
+                return Ok(tctx
+                    .args
+                    .get(idx as usize)
+                    .map(|a| Value::text(a.clone()))
+                    .unwrap_or(Value::Null));
+            }
+        }
+    }
+    // TG_* variables are expression leaves, not columns.
+    if let Expr::Column { table: None, name } = expr {
+        let v = match name.as_str() {
+            "tg_name" => Some(Value::text(tctx.name.clone())),
+            "tg_table_name" => Some(Value::text(tctx.table.clone())),
+            "tg_when" => Some(Value::text(tctx.when_name().to_string())),
+            "tg_op" => Some(Value::text(tctx.op_name().to_string())),
+            "tg_level" => Some(Value::text("ROW".to_string())),
+            "tg_nargs" => Some(Value::Int(0)),
+            "tg_relid" => Some(Value::Int(0)),
+            _ => None,
+        };
+        if let Some(v) = v {
+            return Ok(v);
+        }
+    }
+    // TG_* variables can appear anywhere inside a compound
+    // expression (e.g. `TG_LEVEL = 'ROW'`); fold them to literals
+    // first, since the row evaluator only knows columns.
+    let owned;
+    let expr = if expr_has_tg_var(expr) {
+        owned = subst_tg_vars(expr, tctx);
+        &owned
+    } else {
+        expr
+    };
+    let mk_schema = |qual: &str| -> Vec<QCol> {
+        cols.iter()
+            .enumerate()
+            .map(|(i, (n, ty))| QCol {
+                qual: qual.to_string(),
+                name: n.clone(),
+                ty: *ty,
+                hidden: false,
+                src_ord: i as u32,
+            })
+            .collect()
+    };
+    let schema_new = mk_schema("new");
+    let schema_old = mk_schema("old");
+    let mut lock_ids = Vec::new();
+    let mut q = Q {
         eng,
-        ctx.snap,
-        ctx.own,
-        ctx.session,
-        ctx.role,
-        &schema,
-        row,
-        expr,
-    )
+        snap: ctx.snap,
+        own: ctx.own,
+        all_xids: ctx.all_xids.clone(),
+        session: ctx.session,
+        depth: 0,
+        lock_ids: &mut lock_ids,
+        ctes: Vec::new(),
+        wctx: None,
+        srf_vals: Vec::new(),
+        role: ctx.role,
+        read_only: false,
+        priv_scopes: Vec::new(),
+        priv_role_override: None,
+        hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+        immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+        plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
+        hashed_in: Rc::new(RefCell::new(Vec::new())),
+        pending_updates: None,
+        write: None,
+    };
+    let scope_new = Scope {
+        schema: &schema_new,
+        row: new_row,
+        prov: None,
+    };
+    let scope_old = Scope {
+        schema: &schema_old,
+        row: old_row,
+        prov: None,
+    };
+    eval_expr(&mut q, &[scope_new, scope_old], expr)
+}
+
+/// v2.09: evaluate a trigger's WHEN clause for one row pair (PG19
+/// ExecCallTriggerFunc: the qual is evaluated with OLD/NEW in scope;
+/// NULL counts as false). No WHEN = always fire.
+pub(crate) fn trigger_when_matches(
+    eng: &mut Engine,
+    ctx: &StmtCtx,
+    tctx: &TrigCtx,
+    cols: &[(String, ColType)],
+    new_row: Option<&[Value]>,
+    old_row: Option<&[Value]>,
+    when: Option<&Expr>,
+) -> Result<bool, ExecError> {
+    let Some(w) = when else { return Ok(true) };
+    let nulls: Vec<Value> = vec![Value::Null; cols.len()];
+    let v = eval_trigger_expr(
+        eng,
+        ctx,
+        tctx,
+        cols,
+        new_row.unwrap_or(&nulls),
+        old_row.unwrap_or(&nulls),
+        w,
+    )?;
+    Ok(matches!(v, Value::Bool(true)))
+}
+
+/// v2.09: every trigger definition that applies to rows landing in
+/// `leaf`: the leaf's own triggers plus the triggers of every
+/// partitioned ancestor (PG19 clones a parent's triggers onto its
+/// partitions). Returns (defining table, definition) pairs, the
+/// leaf's own first, in creation order per table.
+pub(crate) fn trigger_defs_for_leaf(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    leaf: &str,
+) -> Vec<(String, TriggerDef)> {
+    let mut out = Vec::new();
+    if let Some(t) = eng
+        .db
+        .find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session)
+    {
+        for tr in &t.triggers {
+            out.push((leaf.to_string(), tr.clone()));
+        }
+    }
+    let mut names: Vec<&String> = eng.db.tables.keys().collect();
+    names.sort();
+    for name in names {
+        if name == leaf {
+            continue;
+        }
+        let Some(t) = eng
+            .db
+            .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+        else {
+            continue;
+        };
+        if t.partition.is_none() || t.triggers.is_empty() {
+            continue;
+        }
+        if partition_tree_contains(eng, ctx, name, leaf, 0) {
+            for tr in &t.triggers {
+                out.push((name.clone(), tr.clone()));
+            }
+        }
+    }
+    out
+}
+
+fn partition_tree_contains(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    root: &str,
+    leaf: &str,
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    let Some(t) = eng
+        .db
+        .find_table(root, ctx.snap, &ctx.all_xids, ctx.session)
+    else {
+        return false;
+    };
+    let Some(pi) = &t.partition else { return false };
+    for c in &pi.children {
+        if c == leaf || partition_tree_contains(eng, ctx, c, leaf, depth + 1) {
+            return true;
+        }
+    }
+    false
+}
+
+/// v2.09: fire (or queue, for deferred constraint triggers) the
+/// AFTER FOR EACH ROW triggers applying to `leaf` for one event.
+/// `pairs` are (OLD, NEW) images in `cols` order; either side is
+/// None for INSERT/DELETE respectively. `set_cols` is the UPDATE
+/// statement's SET column list (for UPDATE OF matching; None uses
+/// value-change detection). Deferred constraint triggers queue into
+/// the v2.06 deferred state and fire from flush_deferred_fk.
+pub(crate) fn fire_after_row_triggers(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    leaf: &str,
+    cols: &[(String, ColType)],
+    event: u8,
+    pairs: &[(Option<Row>, Option<Row>)],
+    set_cols: Option<&[String]>,
+) -> Result<(), ExecError> {
+    let defs = trigger_defs_for_leaf(eng, ctx, leaf);
+    for (def_table, tr) in &defs {
+        if tr.timing != TriggerTiming::After
+            || !tr.for_each_row
+            || !tr.enforced
+            || tr.has_transition
+        {
+            continue;
+        }
+        if (tr.events & event) == 0 {
+            continue;
+        }
+        if event == trig_event::UPDATE && !tr.update_cols.is_empty() {
+            let hit = match set_cols {
+                Some(cols_set) => tr.update_cols.iter().any(|c| cols_set.contains(c)),
+                None => pairs.iter().any(|(o, n)| {
+                    tr.update_cols.iter().any(|c| {
+                        let idx = cols.iter().position(|(cn, _)| cn == c);
+                        match (idx, o, n) {
+                            (Some(i), Some(o), Some(n)) => o[i] != n[i],
+                            _ => true,
+                        }
+                    })
+                }),
+            };
+            if !hit {
+                continue;
+            }
+        }
+        let tctx = TrigCtx {
+            name: tr.name.clone(),
+            table: leaf.to_string(),
+            timing: tr.timing,
+            event,
+            args: tr.args.clone(),
+            relid: eng
+                .db
+                .find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session)
+                .map(|t| t.oid as i64)
+                .unwrap_or(0),
+        };
+        for (old, new) in pairs {
+            let old_ref = old.as_ref().map(|r| &r[..]);
+            let new_ref = new.as_ref().map(|r| &r[..]);
+            if !trigger_when_matches(
+                eng,
+                ctx,
+                &tctx,
+                cols,
+                new_ref,
+                old_ref,
+                tr.when_expr.as_ref(),
+            )? {
+                continue;
+            }
+            if tr.is_constraint && trig_mode_deferred(eng, ctx.session, def_table, tr) {
+                queue_trig(
+                    eng,
+                    ctx.session,
+                    def_table,
+                    leaf,
+                    &tr.name,
+                    event,
+                    old.clone(),
+                    new.clone(),
+                );
+                continue;
+            }
+            fire_one_trigger(eng, ctx, &tctx, tr, cols, new_ref, old_ref)?;
+        }
+    }
+    Ok(())
+}
+
+/// v2.09: run one AFTER trigger body for one row pair (the return
+/// value is ignored for AFTER triggers, per PG).
+pub(crate) fn fire_one_trigger(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    tctx: &TrigCtx,
+    tr: &TriggerDef,
+    cols: &[(String, ColType)],
+    new_row: Option<&[Value]>,
+    old_row: Option<&[Value]>,
+) -> Result<(), ExecError> {
+    let fdef = find_function_by_signature(eng, &tr.function, &[]).ok_or_else(|| {
+        exec_err(
+            "42883",
+            format!("function {}() does not exist", tr.function),
+        )
+    })?;
+    let stmts = parse_trigger_body(&fdef.body).map_err(|e| {
+        exec_err(
+            e.code,
+            format!("invalid trigger function body: {}", e.message),
+        )
+    })?;
+    let _ = exec_trigger_body(eng, ctx, tctx, cols, new_row, old_row, &stmts)?;
+    Ok(())
 }
 
 /// v1.00: expand a `RAISE ... '<format>'` format string. Each `%`
@@ -3021,4 +3476,160 @@ pub(crate) fn detach_partition(
     Ok(ExecResult::Command {
         tag: "ALTER TABLE".to_string(),
     })
+}
+
+/// v2.09: does this expression reference a TG_* variable?
+fn expr_has_tg_var(e: &Expr) -> bool {
+    let mut found = false;
+    eval::walk_expr(e, &mut |x| {
+        if let Expr::Column { table: None, name } = x {
+            if name.starts_with("tg_") {
+                found = true;
+            }
+        }
+        if let Expr::Column {
+            table: Some(_),
+            name,
+        } = x
+        {
+            if name == "tableoid" {
+                found = true;
+            }
+        }
+    });
+    found
+}
+
+/// v2.09: fold TG_* column leaves to literals (mirrors
+/// merge.rs's subst_tableoid container set, extended).
+fn subst_tg_vars(e: &Expr, tctx: &TrigCtx) -> Expr {
+    let lit = |v: &str| Expr::Literal(crate::sql::Literal::Text(v.into()));
+    match e {
+        Expr::Column {
+            table: Some(q),
+            name,
+        } if name == "tableoid"
+            && (q.eq_ignore_ascii_case("new") || q.eq_ignore_ascii_case("old")) =>
+        {
+            Expr::Literal(crate::sql::Literal::Int(tctx.relid))
+        }
+        Expr::Column { table: None, name } => match name.as_str() {
+            "tg_name" => lit(&tctx.name),
+            "tg_table_name" => lit(&tctx.table.clone()),
+            "tg_when" => lit(tctx.when_name()),
+            "tg_op" => lit(tctx.op_name()),
+            "tg_level" => lit("ROW"),
+            "tg_nargs" => Expr::Literal(crate::sql::Literal::Int(0)),
+            "tg_relid" => Expr::Literal(crate::sql::Literal::Int(tctx.relid)),
+            _ => e.clone(),
+        },
+        Expr::Arith { op, left, right } => Expr::Arith {
+            op: *op,
+            left: Box::new(subst_tg_vars(left, tctx)),
+            right: Box::new(subst_tg_vars(right, tctx)),
+        },
+        Expr::Cmp { op, left, right } => Expr::Cmp {
+            op: *op,
+            left: Box::new(subst_tg_vars(left, tctx)),
+            right: Box::new(subst_tg_vars(right, tctx)),
+        },
+        Expr::And(a, b) => Expr::And(
+            Box::new(subst_tg_vars(a, tctx)),
+            Box::new(subst_tg_vars(b, tctx)),
+        ),
+        Expr::Or(a, b) => Expr::Or(
+            Box::new(subst_tg_vars(a, tctx)),
+            Box::new(subst_tg_vars(b, tctx)),
+        ),
+        Expr::Not(a) => Expr::Not(Box::new(subst_tg_vars(a, tctx))),
+        Expr::Neg(a) => Expr::Neg(Box::new(subst_tg_vars(a, tctx))),
+        Expr::BitNot(a) => Expr::BitNot(Box::new(subst_tg_vars(a, tctx))),
+        Expr::Cast { expr, to, written } => Expr::Cast {
+            expr: Box::new(subst_tg_vars(expr, tctx)),
+            to: *to,
+            written: written.clone(),
+        },
+        Expr::IsNull { expr, neg } => Expr::IsNull {
+            expr: Box::new(subst_tg_vars(expr, tctx)),
+            neg: *neg,
+        },
+        Expr::IsBool { expr, neg, val } => Expr::IsBool {
+            expr: Box::new(subst_tg_vars(expr, tctx)),
+            neg: *neg,
+            val: *val,
+        },
+        Expr::IsDistinctFrom { left, right, neg } => Expr::IsDistinctFrom {
+            left: Box::new(subst_tg_vars(left, tctx)),
+            right: Box::new(subst_tg_vars(right, tctx)),
+            neg: *neg,
+        },
+        Expr::Between {
+            expr,
+            low,
+            high,
+            neg,
+        } => Expr::Between {
+            expr: Box::new(subst_tg_vars(expr, tctx)),
+            low: Box::new(subst_tg_vars(low, tctx)),
+            high: Box::new(subst_tg_vars(high, tctx)),
+            neg: *neg,
+        },
+        Expr::Like {
+            expr,
+            pattern,
+            not,
+            ilike,
+            escape,
+        } => Expr::Like {
+            expr: Box::new(subst_tg_vars(expr, tctx)),
+            pattern: Box::new(subst_tg_vars(pattern, tctx)),
+            not: *not,
+            ilike: *ilike,
+            escape: escape.as_ref().map(|x| Box::new(subst_tg_vars(x, tctx))),
+        },
+        // TG_ARGV[<int literal>] folds to the argument text.
+        Expr::Subscript { array, indices }
+            if matches!(&**array, Expr::Column { table: None, name } if name == "tg_argv")
+                && indices.len() == 1 =>
+        {
+            match &indices[0] {
+                Expr::Literal(crate::sql::Literal::Int(i)) => tctx
+                    .args
+                    .get(*i as usize)
+                    .map(|a| Expr::Literal(crate::sql::Literal::Text(a.clone().into())))
+                    .unwrap_or(Expr::Literal(crate::sql::Literal::Null)),
+                _ => e.clone(),
+            }
+        }
+        Expr::Subscript { array, indices } => Expr::Subscript {
+            array: Box::new(subst_tg_vars(array, tctx)),
+            indices: indices.iter().map(|i| subst_tg_vars(i, tctx)).collect(),
+        },
+        Expr::Func { name, args } => Expr::Func {
+            name: name.clone(),
+            args: args.iter().map(|a| subst_tg_vars(a, tctx)).collect(),
+        },
+        Expr::NamedArg { name, expr } => Expr::NamedArg {
+            name: name.clone(),
+            expr: Box::new(subst_tg_vars(expr, tctx)),
+        },
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => Expr::Case {
+            operand: operand.as_ref().map(|x| Box::new(subst_tg_vars(x, tctx))),
+            whens: whens
+                .iter()
+                .map(|(a, b)| {
+                    (
+                        Box::new(subst_tg_vars(a, tctx)),
+                        Box::new(subst_tg_vars(b, tctx)),
+                    )
+                })
+                .collect(),
+            else_: else_.as_ref().map(|x| Box::new(subst_tg_vars(x, tctx))),
+        },
+        other => other.clone(),
+    }
 }

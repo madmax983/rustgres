@@ -667,6 +667,7 @@ impl Parser {
                 Token::Ident(s) if s == "domain" => self.parse_alter_domain(),
                 Token::Ident(s) if s == "type" => self.parse_alter_type(),
                 Token::Ident(s) if s == "function" => self.parse_alter_function(),
+                Token::Ident(s) if s == "trigger" => self.parse_alter_trigger(),
                 Token::Ident(s) if s == "policy" => self.parse_alter_policy(),
                 Token::Ident(s) if s == "publication" => self.parse_alter_publication(),
                 Token::Ident(s) if s == "default" => self.parse_alter_default_privileges(),
@@ -1289,6 +1290,15 @@ impl Parser {
         }
         // v1.00: CREATE [CONSTRAINT] TRIGGER (bounded).
         if matches!(self.peek(), Token::Ident(s) if s == "trigger") {
+            return self.parse_create_trigger();
+        }
+        // v2.09: CREATE CONSTRAINT TRIGGER — the CONSTRAINT keyword
+        // comes first (PG19 gram.y CreateTrigStmt second production);
+        // v1.00-v2.08 fell through to the CREATE TABLE path here and
+        // died with "expected TABLE, found constraint".
+        if matches!(self.peek(), Token::Ident(s) if s == "constraint")
+            && matches!(self.peek2(), Token::Ident(s) if s == "trigger")
+        {
             return self.parse_create_trigger();
         }
         // v1.95: CREATE POLICY name ON table ... (PG19).
@@ -3978,25 +3988,29 @@ impl Parser {
         })
     }
 
-    /// v1.00: `CREATE [CONSTRAINT] TRIGGER name {BEFORE|AFTER|INSTEAD OF}
-    /// event [OR event ...] ON table [WHEN (...)] FOR EACH {ROW|STATEMENT}
-    /// EXECUTE {FUNCTION|PROCEDURE} func(args)` (PG19 `CreateTrigStmt`,
-    /// bounded). Timing, events, row/statement granularity, the function
-    /// name, and WHEN are all parsed; only BEFORE INSERT FOR EACH ROW
-    /// triggers fire in v1.00.
+    /// v1.00/v2.09: `CREATE [CONSTRAINT] TRIGGER` (PG19 gram.y
+    /// CreateTrigStmt, both productions). Plain form: `CREATE TRIGGER
+    /// name {BEFORE|AFTER} event [OR ...] [UPDATE OF col [, ...]] ON
+    /// table [REFERENCING ...] [FOR EACH {ROW|STATEMENT}] [WHEN (...)]
+    /// EXECUTE {FUNCTION|PROCEDURE} f(args)` — WHEN is also accepted
+    /// before FOR EACH (the v1.00 position). Constraint form: `CREATE
+    /// CONSTRAINT TRIGGER name AFTER event [OR ...] ON table
+    /// [FROM reftable] ConstraintAttributeSpec FOR EACH ROW
+    /// [WHEN (...)] EXECUTE ...` (AFTER + ROW only, per gram.y).
     pub(crate) fn parse_create_trigger(&mut self) -> Result<Stmt, SqlError> {
+        // CONSTRAINT (if present) precedes TRIGGER in the constraint
+        // form and follows it in no form; accept it in either spot.
+        let mut is_constraint = self.eat_keyword("constraint");
         self.expect_keyword("trigger")?;
-        // v1.00: PG19 `CONSTRAINT TRIGGER` (parsed; enforcement is a
-        // documented gap, like WHEN below).
-        let is_constraint = self.eat_keyword("constraint");
+        if self.eat_keyword("constraint") {
+            is_constraint = true;
+        }
         let name = self.expect_ident()?;
         let timing = if self.eat_keyword("before") {
             TriggerTiming::Before
         } else if self.eat_keyword("after") {
             TriggerTiming::After
         } else if self.eat_keyword("instead") {
-            // PG19: INSTEAD OF is only valid on views; rustgres has no
-            // view triggers at all, so this is an honest 0A000.
             self.expect_keyword("of")?;
             return Err(SqlError {
                 message: "INSTEAD OF triggers are not supported".to_string(),
@@ -4007,18 +4021,49 @@ impl Parser {
                 "syntax error: expected BEFORE, AFTER, or INSTEAD OF".to_string()
             ));
         };
+        if is_constraint && timing != TriggerTiming::After {
+            // PG19 gram.y: the constraint production is AFTER-only.
+            return Err(err(
+                "syntax error: constraint triggers must be AFTER".to_string()
+            ));
+        }
         let mut events: u8 = 0;
+        let mut update_cols: Vec<String> = Vec::new();
         loop {
-            if self.eat_keyword("insert") {
-                events |= trig_event::INSERT;
+            // PG19 gram.y TriggerEvents: repeating an event (plain
+            // UPDATE after UPDATE OF included) is a parse error, as
+            // is a repeated UPDATE OF column (42701).
+            let bit = if self.eat_keyword("insert") {
+                trig_event::INSERT
             } else if self.eat_keyword("delete") {
-                events |= trig_event::DELETE;
+                trig_event::DELETE
             } else if self.eat_keyword("update") {
-                events |= trig_event::UPDATE;
+                trig_event::UPDATE
             } else if self.eat_keyword("truncate") {
-                events |= trig_event::TRUNCATE;
+                trig_event::TRUNCATE
             } else {
                 break;
+            };
+            if events & bit != 0 {
+                return Err(err("duplicate trigger events specified".to_string()));
+            }
+            events |= bit;
+            if bit == trig_event::UPDATE && self.eat_keyword("of") {
+                // PG19 TriggerEvents: UPDATE OF col [, ...]
+                loop {
+                    let c = self.expect_ident()?;
+                    if update_cols.contains(&c) {
+                        return Err(SqlError {
+                            message: format!("column \"{}\" specified more than once", c),
+                            code: "42701",
+                        });
+                    }
+                    update_cols.push(c);
+                    if !matches!(self.peek(), Token::Comma) {
+                        break;
+                    }
+                    self.next(); // ','
+                }
             }
             if !self.eat_keyword("or") {
                 break;
@@ -4030,16 +4075,44 @@ impl Parser {
             ));
         }
         self.expect_keyword("on")?;
-        let table = self.expect_ident()?;
-        // v1.96: constraint-trigger deferrable options
-        // `[NOT] DEFERRABLE` / `INITIALLY DEFERRED|IMMEDIATE`
-        // (parsed; deferral itself is not enforced, like WHEN).
+        let table = self.parse_table_name()?;
+        // Constraint form: OptConstrFromTable — FROM <referenced table>.
+        let mut constr_rel: Option<String> = None;
+        if is_constraint && self.eat_keyword("from") {
+            constr_rel = Some(self.parse_table_name()?);
+        }
+        // ConstraintAttributeSpec (either form; PG validates placement
+        // per kind — the executor reports the same errors PG does for
+        // the cases in the suite): [NOT] DEFERRABLE, INITIALLY
+        // DEFERRED|IMMEDIATE, [NOT] ENFORCED, in any order/repetition
+        // PG's spec list allows.
+        let mut deferrable = false;
+        let mut initially_deferred = false;
+        let mut enforced = true;
         loop {
             if self.eat_keyword("not") {
-                self.expect_keyword("deferrable")?;
+                if self.eat_keyword("deferrable") {
+                    deferrable = false;
+                } else if self.eat_keyword("enforced") {
+                    enforced = false;
+                } else {
+                    return Err(err(
+                        "syntax error: expected DEFERRABLE or ENFORCED after NOT".to_string(),
+                    ));
+                }
             } else if self.eat_keyword("deferrable") {
+                deferrable = true;
+            } else if self.eat_keyword("enforced") {
+                enforced = true;
             } else if self.eat_keyword("initially") {
-                if !(self.eat_keyword("deferred") || self.eat_keyword("immediate")) {
+                if self.eat_keyword("deferred") {
+                    initially_deferred = true;
+                    // parse_utilcmd.c: INITIALLY DEFERRED alone
+                    // implies DEFERRABLE.
+                    deferrable = true;
+                } else if self.eat_keyword("immediate") {
+                    initially_deferred = false;
+                } else {
                     return Err(err(
                         "syntax error: expected DEFERRED or IMMEDIATE".to_string()
                     ));
@@ -4048,8 +4121,38 @@ impl Parser {
                 break;
             }
         }
-        // Optional WHEN clause (parsed; not evaluated in v1.00).
-        let when = if self.eat_keyword("when") {
+        if initially_deferred && !deferrable {
+            return Err(err(
+                "syntax error: INITIALLY DEFERRED requires DEFERRABLE".to_string()
+            ));
+        }
+        // REFERENCING clause (transition tables): parsed and
+        // discarded — transition tables are a recorded hold-back.
+        let has_transition = self.eat_keyword("referencing");
+        if has_transition {
+            loop {
+                let _old = self.eat_keyword("old");
+                if !_old && !self.eat_keyword("new") {
+                    break;
+                }
+                self.expect_keyword("table")?;
+                if self.eat_keyword("as") {
+                    let _ = self.expect_ident()?;
+                } else {
+                    let _ = self.expect_ident()?;
+                }
+                if !matches!(self.peek(), Token::Ident(_)) {
+                    break;
+                }
+                // Another OLD/NEW TABLE item follows only if the next
+                // token is OLD or NEW; FOR/WHEN terminate the clause.
+                if !(matches!(self.peek(), Token::Ident(s) if s == "old" || s == "new")) {
+                    break;
+                }
+            }
+        }
+        // WHEN is legal before FOR EACH (v1.00 position) ...
+        let mut when = if self.eat_keyword("when") {
             self.expect(Token::LParen, "'('")?;
             let expr = self.parse_or()?;
             self.expect(Token::RParen, "')'")?;
@@ -4066,8 +4169,19 @@ impl Parser {
         } else {
             return Err(err("syntax error: expected ROW or STATEMENT".to_string()));
         };
+        if is_constraint && !for_each_row {
+            return Err(err(
+                "syntax error: constraint triggers must be FOR EACH ROW".to_string(),
+            ));
+        }
+        // ... and after it (the PG19 gram.y position).
+        if when.is_none() && self.eat_keyword("when") {
+            self.expect(Token::LParen, "'('")?;
+            let expr = self.parse_or()?;
+            self.expect(Token::RParen, "')'")?;
+            when = Some(expr);
+        }
         self.expect_keyword("execute")?;
-        // PG19 accepts both FUNCTION and PROCEDURE here.
         if !(self.eat_keyword("function") || self.eat_keyword("procedure")) {
             return Err(err(
                 "syntax error: expected FUNCTION or PROCEDURE".to_string()
@@ -4079,10 +4193,16 @@ impl Parser {
         if !matches!(self.peek(), Token::RParen) {
             loop {
                 let arg = self.parse_or()?;
-                // v1.00: trigger arguments are accepted syntactically
-                // and stored as source text, but not passed to the
-                // function (no TG_ARGV).
-                args.push(format!("{:?}", arg));
+                // v2.09: a literal argument is stored as its value
+                // text so TG_ARGV can serve it at fire time (PG
+                // passes the argument strings); non-literal args
+                // keep the v1.00 debug-text form (stored, unserved).
+                args.push(match &arg {
+                    crate::sql::Expr::Literal(crate::sql::Literal::Text(t)) => t.to_string(),
+                    crate::sql::Expr::Literal(crate::sql::Literal::Int(i)) => i.to_string(),
+                    crate::sql::Expr::Literal(crate::sql::Literal::Float(f)) => f.to_string(),
+                    _ => format!("{:?}", arg),
+                });
                 if !matches!(self.peek(), Token::Comma) {
                     break;
                 }
@@ -4100,6 +4220,29 @@ impl Parser {
             args,
             when,
             is_constraint,
+            deferrable,
+            initially_deferred,
+            enforced,
+            constr_rel,
+            update_cols,
+            has_transition,
+        })
+    }
+
+    /// v2.09: `ALTER TRIGGER name ON table RENAME TO new_name`
+    /// (PG19 RenameStmt, OBJECT_TRIGGER).
+    pub(crate) fn parse_alter_trigger(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("trigger")?;
+        let name = self.expect_ident()?;
+        self.expect_keyword("on")?;
+        let table = self.parse_table_name()?;
+        self.expect_keyword("rename")?;
+        self.expect_keyword("to")?;
+        let new_name = self.expect_ident()?;
+        Ok(Stmt::AlterTriggerRename {
+            name,
+            table,
+            new_name,
         })
     }
 
@@ -4931,28 +5074,25 @@ impl Parser {
     /// token of the body; it must start with `BEGIN` and end with `END`.
     pub(crate) fn parse_trigger_body_stmts(&mut self) -> Result<Vec<TriggerBodyStmt>, SqlError> {
         self.expect_keyword("begin")?;
-        let mut stmts = Vec::new();
-        loop {
-            // `END` terminates the body (an optional trailing `;`
-            // before it is allowed).
-            if matches!(self.peek(), Token::Ident(s) if s == "end") {
-                self.next();
-                break;
+        let mut stmts = self.parse_trigger_stmt_list()?;
+        // v2.09: the function body's own block may carry an EXCEPTION
+        // section (plpgsql: the outermost BEGIN is a block like any
+        // other). Wrap the body in a Block node when it does.
+        if matches!(self.peek(), Token::Ident(s) if s == "exception") {
+            self.next(); // 'exception'
+            let mut handlers = Vec::new();
+            while matches!(self.peek(), Token::Ident(s) if s == "when") {
+                self.next(); // 'when'
+                let keys = self.parse_trigger_exception_when()?;
+                let hbody = self.parse_trigger_stmt_list()?;
+                handlers.push((keys, hbody));
             }
-            stmts.push(self.parse_trigger_body_stmt()?);
-            // Statements are `;`-separated; the `;` before `END` is
-            // optional.
-            if matches!(self.peek(), Token::Semi) {
-                self.next();
-            } else if !matches!(self.peek(), Token::Ident(s) if s == "end") {
-                return Err(err(format!(
-                    "syntax error in trigger body: expected ';' or END, found {:?}",
-                    self.peek()
-                )));
-            }
+            stmts = vec![TriggerBodyStmt::Block {
+                body: stmts,
+                handlers,
+            }];
         }
-        // Nothing may follow END (an optional trailing `;` is allowed,
-        // like PG's plpgsql).
+        self.expect_keyword("end")?;
         if matches!(self.peek(), Token::Semi) {
             self.next();
         }
@@ -4965,8 +5105,113 @@ impl Parser {
         }
     }
 
-    /// v1.00: parse one trigger-body statement (see [`parse_trigger_body`]).
+    /// v2.09: parse trigger-body statements until a list terminator
+    /// (`END`, `EXCEPTION`, `ELSIF`, `ELSE`) at this nesting level;
+    /// the terminator is NOT consumed. Statements are `;`-separated.
+    pub(crate) fn parse_trigger_stmt_list(&mut self) -> Result<Vec<TriggerBodyStmt>, SqlError> {
+        let mut stmts = Vec::new();
+        loop {
+            if matches!(self.peek(), Token::Ident(s) if s == "end" || s == "exception" || s == "elsif" || s == "else")
+            {
+                break;
+            }
+            if matches!(self.peek(), Token::EOF) {
+                return Err(err(
+                    "syntax error in trigger body: unexpected end of body".to_string()
+                ));
+            }
+            stmts.push(self.parse_trigger_body_stmt()?);
+            if matches!(self.peek(), Token::Semi) {
+                self.next();
+            } else if !matches!(self.peek(), Token::Ident(s) if s == "end" || s == "exception" || s == "elsif" || s == "else")
+            {
+                return Err(err(format!(
+                    "syntax error in trigger body: expected ';', found {:?}",
+                    self.peek()
+                )));
+            }
+        }
+        Ok(stmts)
+    }
+
+    /// v2.09: parse an `EXCEPTION WHEN ... THEN` handler condition
+    /// list (the WHEN is already consumed). Returns the handler keys:
+    /// condition names lowercased, `sqlstate:XXYYY` for SQLSTATE
+    /// literals, `others` for OTHERS. Consumes the closing THEN.
+    pub(crate) fn parse_trigger_exception_when(&mut self) -> Result<Vec<String>, SqlError> {
+        let mut keys = Vec::new();
+        loop {
+            match self.next() {
+                Token::Ident(s) if s == "sqlstate" => match self.next() {
+                    Token::Str(lit) => keys.push(format!("sqlstate:{}", lit.to_uppercase())),
+                    other => {
+                        return Err(err(format!(
+                            "syntax error in trigger body: expected SQLSTATE string, found {:?}",
+                            other
+                        )));
+                    }
+                },
+                Token::Ident(s) if s == "then" => break,
+                Token::Ident(s) if s == "or" => continue,
+                Token::Ident(s) => keys.push(s),
+                other => {
+                    return Err(err(format!(
+                        "syntax error in trigger body: unexpected {:?} in WHEN condition",
+                        other
+                    )));
+                }
+            }
+        }
+        Ok(keys)
+    }
+
+    /// v1.00/v2.09: parse one trigger-body statement (see
+    /// [`parse_trigger_body`]).
     pub(crate) fn parse_trigger_body_stmt(&mut self) -> Result<TriggerBodyStmt, SqlError> {
+        // v2.09: nested `BEGIN ... [EXCEPTION ...] END` block.
+        if matches!(self.peek(), Token::Ident(s) if s == "begin") {
+            self.next(); // 'begin'
+            let body = self.parse_trigger_stmt_list()?;
+            let mut handlers = Vec::new();
+            if matches!(self.peek(), Token::Ident(s) if s == "exception") {
+                self.next(); // 'exception'
+                while matches!(self.peek(), Token::Ident(s) if s == "when") {
+                    self.next(); // 'when'
+                    let keys = self.parse_trigger_exception_when()?;
+                    let hbody = self.parse_trigger_stmt_list()?;
+                    handlers.push((keys, hbody));
+                }
+            }
+            self.expect_keyword("end")?;
+            return Ok(TriggerBodyStmt::Block { body, handlers });
+        }
+        // v2.09: `IF cond THEN ... [ELSIF ...] [ELSE ...] END IF`.
+        if matches!(self.peek(), Token::Ident(s) if s == "if") {
+            self.next(); // 'if'
+            let cond = self.parse_or()?;
+            self.expect_keyword("then")?;
+            let body = self.parse_trigger_stmt_list()?;
+            let mut branches = vec![(cond, body)];
+            while matches!(self.peek(), Token::Ident(s) if s == "elsif") {
+                self.next(); // 'elsif'
+                let c = self.parse_or()?;
+                self.expect_keyword("then")?;
+                let b = self.parse_trigger_stmt_list()?;
+                branches.push((c, b));
+            }
+            let else_body = if matches!(self.peek(), Token::Ident(s) if s == "else") {
+                self.next(); // 'else'
+                self.parse_trigger_stmt_list()?
+            } else {
+                Vec::new()
+            };
+            self.expect_keyword("end")?;
+            self.expect_keyword("if")?;
+            return Ok(TriggerBodyStmt::If {
+                branches,
+                else_body,
+            });
+        }
         // Assignment: `NEW.<col> = <expr>` or `NEW.<col> := <expr>`.
         // (`OLD` assignments are rejected: PG forbids them.)
         if matches!(self.peek(), Token::Ident(s) if s == "new")
@@ -4975,7 +5220,6 @@ impl Parser {
             self.next(); // 'new'
             self.next(); // '.'
             let col = self.expect_ident()?;
-            // `=` or `:=` (the lexer produces Colon + Eq for `:=`).
             if matches!(self.peek(), Token::Eq) {
                 self.next();
             } else if matches!(self.peek(), Token::Colon) && matches!(self.peek2(), Token::Eq) {
@@ -5009,9 +5253,9 @@ impl Parser {
         if matches!(self.peek(), Token::Ident(s) if s == "raise") {
             self.next();
             let level = match self.next() {
-                Token::Ident(s) if s == "warning" => RaiseLevel::Warning,
                 Token::Ident(s) if s == "notice" => RaiseLevel::Notice,
                 Token::Ident(s) if s == "exception" => RaiseLevel::Exception,
+                Token::Ident(s) if s == "warning" => RaiseLevel::Warning,
                 other => {
                     return Err(SqlError {
                         message: format!(
@@ -5630,6 +5874,7 @@ impl Parser {
                     arg_types,
                     volatility: FuncVolatility::Volatile,
                     owner: Some(new_owner),
+                    security: None,
                 });
             }
             return Err(err(
@@ -5680,6 +5925,26 @@ impl Parser {
                 arg_types,
                 volatility: FuncVolatility::Volatile,
                 owner: Some(new_owner),
+                security: None,
+            });
+        }
+        // v2.09: SECURITY DEFINER|INVOKER (PG19 AlterFunctionStmt).
+        if self.eat_keyword("security") {
+            let definer = if self.eat_keyword("definer") {
+                true
+            } else if self.eat_keyword("invoker") {
+                false
+            } else {
+                return Err(err(
+                    "syntax error: expected DEFINER or INVOKER after SECURITY".to_string(),
+                ));
+            };
+            return Ok(Stmt::AlterFunction {
+                name,
+                arg_types,
+                volatility: FuncVolatility::Volatile,
+                owner: None,
+                security: Some(definer),
             });
         }
         let volatility = if self.eat_keyword("immutable") {
@@ -5701,6 +5966,7 @@ impl Parser {
             arg_types,
             volatility,
             owner: None,
+            security: None,
         })
     }
 
@@ -16648,6 +16914,58 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
             }
         }
     }
+    out.push(')');
+    // v2.09: triggers, trailing optional section (pre-v2.09 encodings
+    // omit it and decode with no triggers — which also repairs the
+    // pre-v2.09 behavior where triggers never survived WAL/checkpoint
+    // at all). One entry per trigger:
+    // (name timing events row func nargs arg* (tattrs is_constraint
+    // deferrable initially_deferred enforced) constr_rel|- (updcols
+    // col*) (when expr|-))
+    out.push_str(" (triggers");
+    for tr in &t.triggers {
+        out.push_str(" (");
+        sexpr_escape(&tr.name, &mut out);
+        out.push_str(match tr.timing {
+            crate::sql::TriggerTiming::Before => " b ",
+            crate::sql::TriggerTiming::After => " a ",
+        });
+        out.push_str(&tr.events.to_string());
+        out.push_str(if tr.for_each_row { " 1 " } else { " 0 " });
+        sexpr_escape(&tr.function, &mut out);
+        out.push(' ');
+        out.push_str(&tr.args.len().to_string());
+        for a in &tr.args {
+            out.push(' ');
+            sexpr_escape(a, &mut out);
+        }
+        out.push_str(" (tattrs ");
+        out.push_str(if tr.is_constraint { "1" } else { "0" });
+        out.push(' ');
+        out.push_str(if tr.deferrable { "1" } else { "0" });
+        out.push(' ');
+        out.push_str(if tr.initially_deferred { "1" } else { "0" });
+        out.push(' ');
+        out.push_str(if tr.enforced { "1" } else { "0" });
+        out.push(' ');
+        out.push_str(if tr.has_transition { "1" } else { "0" });
+        out.push_str(") ");
+        match &tr.constr_rel {
+            Some(r) => sexpr_escape(r, &mut out),
+            None => out.push('-'),
+        }
+        out.push_str(" (updcols");
+        for c in &tr.update_cols {
+            out.push(' ');
+            sexpr_escape(c, &mut out);
+        }
+        out.push_str(") (when ");
+        match &tr.when_expr {
+            Some(e) => encode_expr_inner(e, &mut out),
+            None => out.push('-'),
+        }
+        out.push_str("))");
+    }
     out.push_str("))");
     out
 }
@@ -16668,6 +16986,8 @@ pub struct DecodedConstraints {
     /// pre-v2.03 encodings: Default / no generated columns).
     pub replica_identity: crate::storage::ReplicaIdentity,
     pub gen_cols: Vec<Option<(Expr, bool)>>,
+    /// v2.09: triggers (absent in pre-v2.09 encodings: none).
+    pub triggers: Vec<TriggerDef>,
 }
 
 pub(crate) fn sexpr_is_close(p: &mut SexprParser) -> bool {
@@ -17063,6 +17383,8 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
     // v2.03: optional trailing (replident ...) / (gencols ...) sections.
     let mut replica_identity = crate::storage::ReplicaIdentity::Default;
     let mut gen_cols: Vec<Option<(Expr, bool)>> = Vec::new();
+    // v2.09: optional trailing (triggers ...) section.
+    let mut triggers: Vec<TriggerDef> = Vec::new();
     while !sexpr_is_close(&mut p) {
         p.open()?;
         match p.atom()?.as_str() {
@@ -17106,6 +17428,105 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
                 }
                 p.close()?;
             }
+            "triggers" => {
+                while !sexpr_is_close(&mut p) {
+                    p.open()?;
+                    let name = p.atom()?;
+                    let timing = match p.atom()?.as_str() {
+                        "b" => TriggerTiming::Before,
+                        "a" => TriggerTiming::After,
+                        o => return Err(format!("bad trigger timing {}", o)),
+                    };
+                    let events: u8 = p
+                        .atom()?
+                        .parse()
+                        .map_err(|_| "bad trigger events".to_string())?;
+                    let for_each_row = match p.atom()?.as_str() {
+                        "1" => true,
+                        "0" => false,
+                        o => return Err(format!("bad trigger row flag {}", o)),
+                    };
+                    let function = p.atom()?;
+                    let nargs: usize = p
+                        .atom()?
+                        .parse()
+                        .map_err(|_| "bad trigger nargs".to_string())?;
+                    let mut args = Vec::new();
+                    for _ in 0..nargs {
+                        args.push(p.atom()?);
+                    }
+                    p.open()?;
+                    if p.atom()? != "tattrs" {
+                        return Err("bad tattrs head".into());
+                    }
+                    let bit = |p: &mut SexprParser| -> Result<bool, String> {
+                        match p.atom()?.as_str() {
+                            "1" => Ok(true),
+                            "0" => Ok(false),
+                            o => Err(format!("bad tattrs bit {}", o)),
+                        }
+                    };
+                    let is_constraint = bit(&mut p)?;
+                    let deferrable = bit(&mut p)?;
+                    let initially_deferred = bit(&mut p)?;
+                    let enforced = bit(&mut p)?;
+                    // Optional 5th bit (has_transition); encodings
+                    // written before it existed close right here.
+                    p.ws();
+                    let has_transition = if p.chars.peek() == Some(&')') {
+                        false
+                    } else {
+                        bit(&mut p)?
+                    };
+                    p.close()?;
+                    p.ws();
+                    let constr_rel = if p.chars.peek() == Some(&'-') {
+                        p.chars.next();
+                        None
+                    } else {
+                        Some(p.atom()?)
+                    };
+                    p.open()?;
+                    if p.atom()? != "updcols" {
+                        return Err("bad updcols head".into());
+                    }
+                    let mut update_cols = Vec::new();
+                    while !sexpr_is_close(&mut p) {
+                        update_cols.push(p.atom()?);
+                    }
+                    p.close()?;
+                    p.open()?;
+                    if p.atom()? != "when" {
+                        return Err("bad trigger when head".into());
+                    }
+                    p.ws();
+                    let when_expr = if p.chars.peek() == Some(&'-') {
+                        p.chars.next();
+                        None
+                    } else {
+                        Some(p.expr()?)
+                    };
+                    p.close()?;
+                    p.close()?;
+                    triggers.push(TriggerDef {
+                        name,
+                        timing,
+                        events,
+                        for_each_row,
+                        function,
+                        args,
+                        is_constraint,
+                        deferrable,
+                        initially_deferred,
+                        enforced,
+                        constr_rel,
+                        update_cols,
+                        when_expr,
+                        has_transition,
+                    });
+                }
+                p.close()?;
+            }
             o => return Err(format!("bad trailing constraints section {}", o)),
         }
     }
@@ -17126,6 +17547,7 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
         policies,
         replica_identity,
         gen_cols,
+        triggers,
     })
 }
 

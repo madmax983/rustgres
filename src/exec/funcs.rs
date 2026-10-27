@@ -2236,6 +2236,30 @@ pub(crate) fn eval_func(
     // catalog). pg_get_expr returns our stored pg_get_expr text form
     // unchanged; pg_describe_object / obj_description resolve
     // publication objects by OID.
+    // v2.09: pg_get_triggerdef(oid[, pretty]) over the virtual
+    // pg_trigger rows; unknown OID is 42704 in PG (cache lookup
+    // failure) — here a missing row yields NULL-free 22023 like the
+    // other catalog helpers' not-found path... PG actually errors
+    // "could not find trigger with OID"; mirror with 42704.
+    if name == "pg_get_triggerdef" && !args.is_empty() {
+        let v = eval_expr(q, scopes, &args[0])?;
+        let Value::Int(oid) = v else {
+            return Ok(Value::Null);
+        };
+        if let Some(text) = pg_triggerdef_for_oid(&q.eng.db, q.snap, q.own, q.session, oid) {
+            return Ok(Value::text(text));
+        }
+        return Err(exec_err(
+            "42704",
+            format!("trigger with OID {} does not exist", oid),
+        ));
+    }
+    // v2.09: pg_trigger_depth() — 0 outside a trigger (the only
+    // context this engine can be asked from SQL; bodies do not call
+    // it in the supported subset).
+    if name == "pg_trigger_depth" && args.is_empty() {
+        return Ok(Value::Int(0));
+    }
     if name == "pg_get_expr" && !args.is_empty() {
         let v = eval_expr(q, scopes, &args[0])?;
         return Ok(v);
@@ -11676,9 +11700,10 @@ pub(crate) fn func_result_type(
         "current_setting" | "makeaclitem" | "pg_get_userbyid" => Ok(ColType::Text),
         // v2.04: catalog description helpers used by the publication
         // suite (pg_get_expr deparses our stored filter text form).
-        "pg_get_expr" | "pg_describe_object" | "obj_description" | "shobj_description" => {
-            Ok(ColType::Text)
-        }
+        "pg_get_expr" | "pg_describe_object" | "obj_description" | "shobj_description"
+        | "pg_get_triggerdef" => Ok(ColType::Text),
+        // v2.09: pg_trigger_depth() is int.
+        "pg_trigger_depth" => Ok(ColType::Int),
         // v1.96: large-object family result types.
         "lo_create" | "lo_creat" | "lo_open" | "lo_close" | "lowrite" | "lo_truncate"
         | "lo_unlink" | "lo_from_bytea" | "lo_put" => Ok(ColType::Int),

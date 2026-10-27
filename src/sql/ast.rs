@@ -5966,6 +5966,35 @@ pub struct TriggerDef {
     /// `TG_ARGV`). Kept so the DDL round-trips faithfully.
     #[allow(dead_code)]
     pub args: Vec<String>,
+    /// v2.09: `CREATE CONSTRAINT TRIGGER` (PG19 `CreateTrigStmt.
+    /// isconstraint`). Constraint triggers are always AFTER / FOR EACH
+    /// ROW and may be DEFERRABLE.
+    pub is_constraint: bool,
+    /// v2.09: DEFERRABLE (constraint triggers only; PG19
+    /// `pg_trigger.tgdeferrable`).
+    pub deferrable: bool,
+    /// v2.09: INITIALLY DEFERRED (PG19 `tginitdeferred`); implies
+    /// deferrable when set at parse time (parse_utilcmd rule, applied
+    /// in the parser).
+    pub initially_deferred: bool,
+    /// v2.09: [NOT] ENFORCED on a constraint trigger (default true;
+    /// PG19 ConstraintAttributeSpec CAS_ENFORCED). A non-enforced
+    /// constraint trigger never fires.
+    pub enforced: bool,
+    /// v2.09: the `FROM <table>` referenced table of a constraint
+    /// trigger (PG19 `tgconstrrelid`); `None` for plain triggers.
+    pub constr_rel: Option<String>,
+    /// v2.09: the trigger was declared with REFERENCING transition
+    /// tables. Transition tables are not materialized (held back),
+    /// so such triggers are cataloged but never fired.
+    pub has_transition: bool,
+    /// v2.09: `UPDATE OF col [, ...]` column list (PG19 `tgattr`);
+    /// empty means any column.
+    pub update_cols: Vec<String>,
+    /// v2.09: the `WHEN (...)` expression, stored (v1.00 parsed but
+    /// discarded it) and evaluated per row at fire time with OLD/NEW
+    /// in scope. Persisted through the constraints codec.
+    pub when_expr: Option<Expr>,
 }
 
 /// v1.00: one statement of a bounded trigger-function body
@@ -5993,6 +6022,24 @@ pub enum TriggerBodyStmt {
     /// bodies are plpgsql; CREATE CONSTRAINT TRIGGER trojan tests
     /// rely on it).
     Perform(Expr),
+    /// v2.09: `IF <cond> THEN <body> [ELSIF <cond> THEN <body> ...]
+    /// [ELSE <body>] END IF` (PG19 plpgsql PLPGSQL_STMT_IF). Branches
+    /// are tried in order; the first true condition's body runs.
+    If {
+        branches: Vec<(Expr, Vec<TriggerBodyStmt>)>,
+        else_body: Vec<TriggerBodyStmt>,
+    },
+    /// v2.09: a nested `BEGIN <body> [EXCEPTION WHEN <cond> THEN
+    /// <body> ...] END` block (PG19 PLPGSQL_STMT_BLOCK with an
+    /// exception section). Handler keys are lowercased condition
+    /// names (`division_by_zero`), `sqlstate 'XXYYY'` rendered as
+    /// `sqlstate:XXYYY`, or `others`. An error raised inside `body`
+    /// whose SQLSTATE matches a handler runs that handler instead of
+    /// propagating; the handler's own RETURN ends the function.
+    Block {
+        body: Vec<TriggerBodyStmt>,
+        handlers: Vec<(Vec<String>, Vec<TriggerBodyStmt>)>,
+    },
 }
 
 /// v1.00: `RAISE` levels supported in trigger bodies. v1.96 adds
@@ -6230,6 +6277,9 @@ pub enum Stmt {
         arg_types: Vec<String>,
         volatility: FuncVolatility,
         owner: Option<String>,
+        /// v2.09: `SECURITY DEFINER` (Some(true)) / `SECURITY
+        /// INVOKER` (Some(false)) action; None for other actions.
+        security: Option<bool>,
     },
     // --- v0.86: CREATE FUNCTION (bounded): SQL-language and internal
     // functions, plus bounded plpgsql (v0.97: single-RETURN bodies
@@ -6291,11 +6341,29 @@ pub enum Stmt {
         function: String,
         /// `EXECUTE FUNCTION f(args)` argument source texts.
         args: Vec<String>,
-        /// v1.00: `WHEN (...)` is parsed; the executor does not
-        /// evaluate it (documented gap).
+        /// v1.00: `WHEN (...)` — parsed and (v2.09) stored on the
+        /// trigger and evaluated per row at fire time.
         when: Option<Expr>,
         /// `CONSTRAINT` triggers are cataloged; enforcement is a gap.
         is_constraint: bool,
+        /// v2.09: constraint-trigger attributes (PG19
+        /// ConstraintAttributeSpec): DEFERRABLE / INITIALLY DEFERRED /
+        /// [NOT] ENFORCED, plus the `FROM <table>` referenced table
+        /// and the `UPDATE OF` column list.
+        deferrable: bool,
+        initially_deferred: bool,
+        enforced: bool,
+        constr_rel: Option<String>,
+        update_cols: Vec<String>,
+        /// v2.09: REFERENCING transition tables were declared.
+        has_transition: bool,
+    },
+    /// v2.09: `ALTER TRIGGER name ON table RENAME TO new_name`
+    /// (PG19 RenameStmt OBJECT_TRIGGER).
+    AlterTriggerRename {
+        name: String,
+        table: String,
+        new_name: String,
     },
     /// v1.00: `DROP TRIGGER [IF EXISTS] name ON table [CASCADE|RESTRICT]`.
     DropTrigger {

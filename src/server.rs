@@ -245,7 +245,11 @@ struct Txn {
     /// v2.06: deferred-FK (queue length, SET CONSTRAINTS modes)
     /// snapshots in lockstep with `savepoints` — ROLLBACK TO
     /// truncates the queue and restores the modes, like PG19.
-    deferred_marks: Vec<(usize, std::collections::HashMap<(String, String), bool>)>,
+    deferred_marks: Vec<(
+        usize,
+        std::collections::HashMap<(String, String), bool>,
+        usize,
+    )>,
 }
 
 impl Txn {
@@ -4478,7 +4482,7 @@ fn autocommit_execute(
     let xid = guard.begin_txn();
     let snap = guard.take_snapshot();
     let mut writes: Vec<WriteOp> = Vec::new();
-    let (result, notices) = {
+    let (result, mut notices) = {
         let mut ctx = StmtCtx {
             snap: &snap,
             own: xid,
@@ -4535,12 +4539,23 @@ fn autocommit_execute(
             notices: Vec::new(),
             writes: &mut writes,
         };
-        if let Err(e) = exec::flush_deferred_fk(&mut guard, &mut ctx, None) {
-            drop(ctx);
-            undo_all(&mut guard, &[xid], &writes);
-            exec::deferred_clear(&mut guard, sid);
-            retire_txn(&mut guard, xid);
-            return Err(e);
+        match exec::flush_deferred_fk(&mut guard, &mut ctx, None) {
+            Ok(()) => {
+                // v2.09: deferred constraint triggers may RAISE
+                // NOTICE at fire time; forward those notices with
+                // the statement's own (previously they were dropped
+                // with this throwaway ctx).
+                let mut flush_notices = std::mem::take(&mut ctx.notices);
+                drop(ctx);
+                notices.append(&mut flush_notices);
+            }
+            Err(e) => {
+                drop(ctx);
+                undo_all(&mut guard, &[xid], &writes);
+                exec::deferred_clear(&mut guard, sid);
+                retire_txn(&mut guard, xid);
+                return Err(e);
+            }
         }
     }
     exec::deferred_clear(&mut guard, sid);
@@ -4811,15 +4826,24 @@ fn commit_taken_txn(
             notices: Vec::new(),
             writes: &mut t.writes,
         };
-        if let Err(e) = exec::flush_deferred_fk(&mut guard, &mut ctx, None) {
-            drop(ctx);
-            undo_all(&mut guard, &t.all_xids(), &t.writes);
-            retire_txn_family_sid(&mut guard, &t, session.sid);
-            auto_vacuum(&mut guard, &t.writes);
-            drop(guard);
-            session.cursors.clear();
-            revert_guc_stack(session, t.guc_stack, false);
-            return Err(e);
+        match exec::flush_deferred_fk(&mut guard, &mut ctx, None) {
+            Ok(()) => {
+                // v2.09: forward deferred-trigger notices (RAISE
+                // NOTICE at COMMIT) to the session's pending queue.
+                let flush_notices = std::mem::take(&mut ctx.notices);
+                drop(ctx);
+                session.pending_notices.extend(flush_notices);
+            }
+            Err(e) => {
+                drop(ctx);
+                undo_all(&mut guard, &t.all_xids(), &t.writes);
+                retire_txn_family_sid(&mut guard, &t, session.sid);
+                auto_vacuum(&mut guard, &t.writes);
+                drop(guard);
+                session.cursors.clear();
+                revert_guc_stack(session, t.guc_stack, false);
+                return Err(e);
+            }
         }
     }
     // Derive the records from the write log and make them durable BEFORE
