@@ -36,7 +36,10 @@ pub(crate) const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK16";
 /// v2.04: version 25 adds the publications section (the whole
 /// `Database::publications` catalog). v24 checkpoints are refused;
 /// remove the data directory to start fresh.
-pub(crate) const CHKPT_VERSION: u32 = 26;
+/// v2.08: version 27 adds the per-index `nulls_not_distinct` byte.
+/// v26 checkpoints are refused; remove the data directory to start
+/// fresh.
+pub(crate) const CHKPT_VERSION: u32 = 27;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -101,9 +104,12 @@ pub(crate) const CHKPT_VERSION: u32 = 26;
 /// v2.04: `RGSWAL29` — new publication records (tags 31-33) carrying
 /// the full publication image. Older logs (down to MIN_READABLE)
 /// still read; they simply contain no publication records.
-pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL29";
+/// v2.08: `RGSWAL30` — CreateIndex records carry `nulls_not_distinct`
+/// (trailing byte). Older logs (down to MIN_READABLE) still read;
+/// the field decodes as false.
+pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL30";
 /// v1.80: the format version number in [`WAL_MAGIC`].
-pub(crate) const WAL_VERSION: u32 = 29;
+pub(crate) const WAL_VERSION: u32 = 30;
 /// v1.80: oldest WAL format this build can replay.
 pub(crate) const MIN_READABLE_WAL_VERSION: u32 = 20;
 pub(crate) const WAL_HEADER_LEN: u64 = 16;
@@ -565,6 +571,8 @@ impl Wal {
             // v1.99: per-column collation / operator class.
             ix_body.opt_str_list(&ix.def.collates);
             ix_body.opt_str_list(&ix.def.opclasses);
+            // v2.08 (checkpoint v27): NULLS NOT DISTINCT.
+            ix_body.u8(ix.def.nulls_not_distinct as u8);
             ix_body.u64(ix.def.created_xmin);
             ix_body.u64(0); // live index: no committed drop
             n_indexes += 1;
@@ -1336,6 +1344,8 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         exprs.resize(n_cols, None);
         collates.resize(n_cols, None);
         opclasses.resize(n_cols, None);
+        // v2.08 (checkpoint v27): NULLS NOT DISTINCT.
+        let nulls_not_distinct = d.u8().map_err(|e| bad(&e))? != 0;
         let created_xmin = d.u64().map_err(|e| bad(&e))?;
         let dropped_xmax = d.u64().map_err(|e| bad(&e))?;
         let bad_idx = |why: String| {
@@ -1387,6 +1397,7 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 opclasses,
                 predicate,
                 planner_usable,
+                nulls_not_distinct,
             });
             if planner_usable {
                 for r in &t.rows {

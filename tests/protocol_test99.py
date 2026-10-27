@@ -28,7 +28,7 @@ Sections:
   F. partition-moving UPDATE moves chunks with the row
   G. UPDATE chunks survive a restart (WAL-logged)
   H. repeated updates: no chunk/metadata accumulation
-  I. WAL magic is RGSWAL29 (v2.04: WAL 29 adds publication records (CreatePublication/DropPublication/AlterPublication, tags 31-33) + CreateFunction RETURNS TABLE columns (trailing, decode gated >= 29); v1.99: WAL 28 adds per-key collation/opclass lists to CreateIndex records (trailing, decode gated >= 28; magic bumped in lockstep -- recovery derives the decode version from the magic); v1.96: WAL 27 adds the rolreplication trailing byte to role records (decode gated >= 27); WAL 26: membership option bytes + rolinherit in role records; v1.94: tsvector/tsquery ColType+Value tags;
+  I. WAL magic is RGSWAL30 (v2.08: WAL 30 adds the nulls_not_distinct trailing byte to CreateIndex records (decode gated >= 30); v2.04: WAL 29 adds publication records (CreatePublication/DropPublication/AlterPublication, tags 31-33) + CreateFunction RETURNS TABLE columns (trailing, decode gated >= 29); v1.99: WAL 28 adds per-key collation/opclass lists to CreateIndex records (trailing, decode gated >= 28; magic bumped in lockstep -- recovery derives the decode version from the magic); v1.96: WAL 27 adds the rolreplication trailing byte to role records (decode gated >= 27); WAL 26: membership option bytes + rolinherit in role records; v1.94: tsvector/tsquery ColType+Value tags;
      v1.41: attnums/next_attnum/fillfactor in
      CreateTable/AlterTable; v1.80: partition fields in CreateTable/AlterTable)
 """
@@ -321,7 +321,7 @@ def main():
         stop_server(proc)
     with open(os.path.join(data_dir, "wal.log"), "rb") as f:
         magic = f.read(8)
-    check("I1 WAL magic is RGSWAL29", magic == b"RGSWAL29")
+    check("I1 WAL magic is RGSWAL30", magic == b"RGSWAL30")
     shutil.rmtree(data_dir, ignore_errors=True)
 
     print(f"protocol_test99: {passed} passed, {failed} failed")

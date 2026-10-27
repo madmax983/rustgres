@@ -246,7 +246,8 @@ pub(crate) fn resolve_unique_violations(
 /// root table and every partition descendant, group visible rows by
 /// the constraint key (IndexKey semantics, so NUMERIC 1 == INT 1),
 /// and fail 23505 on any surviving duplicate. NULL keys never
-/// conflict. Rows are remapped to the root's column order by name.
+/// conflict unless the constraint is NULLS NOT DISTINCT (v2.08).
+/// Rows are remapped to the root's column order by name.
 fn fire_unique(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -296,8 +297,8 @@ fn fire_unique(
         {
             let vals = remap_parent_to_leaf(&t.columns, &root_cols, &r.values);
             let key = temp_key(&key_pos, &vals);
-            if key.0.iter().any(|v| matches!(v, Value::Null)) {
-                continue; // NULLs never conflict
+            if !u.nulls_not_distinct && key.0.iter().any(|v| matches!(v, Value::Null)) {
+                continue; // NULLs never conflict (NULLS DISTINCT)
             }
             if !seen.insert(key) {
                 return Err(unique_violation_err(con_name));

@@ -965,6 +965,7 @@ impl Enc {
                 predicate,
                 collates,
                 opclasses,
+                nulls_not_distinct,
                 xmin,
             } => {
                 self.u8(5);
@@ -994,6 +995,8 @@ impl Enc {
                 // prefix of this layout.
                 self.opt_str_list(collates);
                 self.opt_str_list(opclasses);
+                // v2.08 (RGSWAL30): NULLS NOT DISTINCT, trailing.
+                self.u8(*nulls_not_distinct as u8);
             }
             WalRecord::DropIndex { name, xmax } => {
                 self.u8(6);
@@ -2271,6 +2274,13 @@ impl<'a> Dec<'a> {
                 } else {
                     (Vec::new(), Vec::new())
                 };
+                // v2.08: NULLS NOT DISTINCT rides RGSWAL30+ only
+                // (trailing byte).
+                let nulls_not_distinct = if self.wal_version >= 30 {
+                    self.u8()? != 0
+                } else {
+                    false
+                };
                 Ok(WalRecord::CreateIndex {
                     name,
                     table,
@@ -2283,6 +2293,7 @@ impl<'a> Dec<'a> {
                     predicate,
                     collates,
                     opclasses,
+                    nulls_not_distinct,
                     xmin,
                 })
             }

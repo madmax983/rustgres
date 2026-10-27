@@ -35,13 +35,19 @@ pub(crate) fn check_insert_unique(
     let db = &eng.db;
     // v0.22: temp tables have no backing indexes; their constraints are
     // checked by column positions with index key semantics.
-    let uniques: Vec<(String, Vec<usize>)> = if db.is_temp_table(session, table) {
+    let uniques: Vec<(String, Vec<usize>, bool)> = if db.is_temp_table(session, table) {
         temp_unique_cols(db, table, snap, owns, session)
     } else {
         db.visible_indexes_for(table, snap, owns, session)
             .into_iter()
             .filter(|ix| ix.def.unique && ix.def.planner_usable)
-            .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
+            .map(|ix| {
+                (
+                    ix.def.name.clone(),
+                    ix.def.cols.clone(),
+                    ix.def.nulls_not_distinct,
+                )
+            })
             .collect()
     };
     // v2.05: `seen` tracks, per unique constraint, the keys of rows
@@ -55,10 +61,12 @@ pub(crate) fn check_insert_unique(
     // of a single INSERT statement, not just the table.
     let mut seen: Vec<BTreeSet<IndexKey>> = vec![BTreeSet::new(); uniques.len()];
     for values in rows {
-        for ((cname, cols), seen_keys) in uniques.iter().zip(seen.iter_mut()) {
+        for ((cname, cols, nnd), seen_keys) in uniques.iter().zip(seen.iter_mut()) {
             let key = temp_key(cols, values);
-            if key.0.iter().any(|v| matches!(v, Value::Null)) {
-                continue; // NULLs never conflict
+            // v2.08: NULLs never conflict — unless the index is
+            // NULLS NOT DISTINCT, where they compare equal.
+            if !nnd && key.0.iter().any(|v| matches!(v, Value::Null)) {
+                continue;
             }
             if !seen_keys.insert(key) {
                 match unique_verdict(eng, snap, owns, session, table, cname) {
@@ -119,22 +127,28 @@ pub(crate) fn check_partitioned_insert_unique(
                 .expect("leaf still visible; engine lock held throughout");
             lt.columns.clone()
         };
-        let uniques: Vec<(String, Vec<usize>)> = eng
+        let uniques: Vec<(String, Vec<usize>, bool)> = eng
             .db
             .visible_indexes_for(leaf, ctx.snap, &ctx.all_xids, ctx.session)
             .into_iter()
             .filter(|ix| ix.def.unique && ix.def.planner_usable)
-            .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
+            .map(|ix| {
+                (
+                    ix.def.name.clone(),
+                    ix.def.cols.clone(),
+                    ix.def.nulls_not_distinct,
+                )
+            })
             .collect();
         let leaf_rows: Vec<Vec<Value>> = idxs
             .iter()
             .map(|&i| remap_parent_to_leaf(&parent_cols, &leaf_cols, &rows[i]))
             .collect();
         for (j, values) in leaf_rows.iter().enumerate() {
-            for (iname, cols) in &uniques {
+            for (iname, cols, nnd) in &uniques {
                 let key = temp_key(cols, values);
-                if key.0.iter().any(|v| matches!(v, Value::Null)) {
-                    continue; // NULLs never conflict
+                if !nnd && key.0.iter().any(|v| matches!(v, Value::Null)) {
+                    continue; // NULLs never conflict (NULLS DISTINCT)
                 }
                 if leaf_rows[..j]
                     .iter()
@@ -185,7 +199,7 @@ pub(crate) fn temp_unique_cols(
     snap: &Snapshot,
     owns: &[u64],
     session: u64,
-) -> Vec<(String, Vec<usize>)> {
+) -> Vec<(String, Vec<usize>, bool)> {
     let Some(t) = db.find_table(table, snap, owns, session) else {
         return Vec::new();
     };
@@ -193,7 +207,7 @@ pub(crate) fn temp_unique_cols(
     let mut push = |u: &UniqueDef| {
         let cols: Vec<usize> = u.cols.iter().filter_map(|c| t.column_index(c)).collect();
         if cols.len() == u.cols.len() {
-            out.push((u.name.clone(), cols));
+            out.push((u.name.clone(), cols, u.nulls_not_distinct));
         }
     };
     if let Some(pk) = &t.pkey {
@@ -230,20 +244,26 @@ pub(crate) fn check_update_unique_pairs(
     session: u64,
 ) -> Result<(), ExecError> {
     let db = &eng.db;
-    let uniques: Vec<(String, Vec<usize>)> = if db.is_temp_table(session, table) {
+    let uniques: Vec<(String, Vec<usize>, bool)> = if db.is_temp_table(session, table) {
         temp_unique_cols(db, table, snap, owns, session)
     } else {
         db.visible_indexes_for(table, snap, owns, session)
             .into_iter()
             .filter(|ix| ix.def.unique && ix.def.planner_usable)
-            .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
+            .map(|ix| {
+                (
+                    ix.def.name.clone(),
+                    ix.def.cols.clone(),
+                    ix.def.nulls_not_distinct,
+                )
+            })
             .collect()
     };
     let mut seen: Vec<BTreeSet<IndexKey>> = vec![BTreeSet::new(); uniques.len()];
     for (_, _, values) in plan {
-        for ((cname, cols), seen_keys) in uniques.iter().zip(seen.iter_mut()) {
+        for ((cname, cols, nnd), seen_keys) in uniques.iter().zip(seen.iter_mut()) {
             let key = temp_key(cols, values);
-            if key.0.iter().any(|v| matches!(v, Value::Null)) {
+            if !nnd && key.0.iter().any(|v| matches!(v, Value::Null)) {
                 continue;
             }
             if !seen_keys.insert(key) {
@@ -382,6 +402,8 @@ pub(crate) fn exec_create_index(
     unique: bool,
     if_not_exists: bool,
     predicate: Option<&str>,
+    // v2.08: NULLS NOT DISTINCT.
+    nulls_not_distinct: bool,
 ) -> Result<ExecResult, ExecError> {
     // v0.11: indexing a table needs its owner (or a superuser).
     require_table_owner(eng, ctx, table)?;
@@ -619,6 +641,7 @@ pub(crate) fn exec_create_index(
         opclasses,
         predicate: predicate.map(|s| s.to_string()),
         planner_usable,
+        nulls_not_distinct,
     });
     if planner_usable && mv_rows.is_some() {
         // Matview build: keys come from the rows computed above;
@@ -631,7 +654,7 @@ pub(crate) fn exec_create_index(
         }
         if unique {
             for (key, ids) in &ix.tree {
-                if key.0.iter().any(|v| matches!(v, Value::Null)) {
+                if !nulls_not_distinct && key.0.iter().any(|v| matches!(v, Value::Null)) {
                     continue;
                 }
                 if ids.len() >= 2 {
@@ -661,7 +684,7 @@ pub(crate) fn exec_create_index(
             // fails the CREATE, like Postgres. Conservative: versions deleted
             // only by still-active transactions (or by us) count as live.
             for (key, ids) in &ix.tree {
-                if key.0.iter().any(|v| matches!(v, Value::Null)) {
+                if !nulls_not_distinct && key.0.iter().any(|v| matches!(v, Value::Null)) {
                     continue;
                 }
                 let mut live = 0u32;

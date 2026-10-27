@@ -6770,8 +6770,9 @@ impl Database {
                 continue;
             }
             let key = ix.key_for(values);
-            if key.0.iter().any(|v| matches!(v, Value::Null)) {
-                continue; // NULLs never conflict
+            // v2.08: NULLs never conflict unless NULLS NOT DISTINCT.
+            if !ix.def.nulls_not_distinct && key.0.iter().any(|v| matches!(v, Value::Null)) {
+                continue;
             }
             let Some(bucket) = ix.tree.get(&key) else {
                 continue;
@@ -6849,8 +6850,8 @@ impl Database {
                 if cols.len() != c.cols.len() {
                     continue;
                 }
-                if cols.iter().any(|&p| matches!(values[p], Value::Null)) {
-                    continue; // NULLs never conflict
+                if !c.nulls_not_distinct && cols.iter().any(|&p| matches!(values[p], Value::Null)) {
+                    continue; // NULLs never conflict (NULLS DISTINCT)
                 }
                 let hit = t.rows.iter().any(|r| {
                     if exclude.contains(&r.id) {
@@ -6863,7 +6864,8 @@ impl Database {
                     };
                     alive
                         && cols.iter().all(|&p| {
-                            !matches!(r.values[p], Value::Null) && r.values[p] == values[p]
+                            (c.nulls_not_distinct || !matches!(r.values[p], Value::Null))
+                                && r.values[p] == values[p]
                         })
                 });
                 if hit {
@@ -6878,8 +6880,8 @@ impl Database {
                 continue;
             }
             let key = ix.key_for(values);
-            if key.0.iter().any(|v| matches!(v, Value::Null)) {
-                continue; // NULLs never conflict
+            if !ix.def.nulls_not_distinct && key.0.iter().any(|v| matches!(v, Value::Null)) {
+                continue; // NULLs never conflict (NULLS DISTINCT)
             }
             let Some(bucket) = ix.tree.get(&key) else {
                 continue;
@@ -6934,8 +6936,8 @@ impl Database {
             if cols.len() != c.cols.len() {
                 continue; // schema changed under us; shouldn't happen
             }
-            if cols.iter().any(|&p| matches!(values[p], Value::Null)) {
-                continue; // NULLs never conflict
+            if !c.nulls_not_distinct && cols.iter().any(|&p| matches!(values[p], Value::Null)) {
+                continue; // NULLs never conflict (NULLS DISTINCT)
             }
             for r in &t.rows {
                 if Some(r.id) == exclude_row_id {
@@ -6949,9 +6951,12 @@ impl Database {
                 if !alive {
                     continue;
                 }
-                let same = cols
-                    .iter()
-                    .all(|&p| !matches!(r.values[p], Value::Null) && r.values[p] == values[p]);
+                // v2.08: under NULLS NOT DISTINCT a stored NULL
+                // matches a candidate NULL (raw Value equality).
+                let same = cols.iter().all(|&p| {
+                    (c.nulls_not_distinct || !matches!(r.values[p], Value::Null))
+                        && r.values[p] == values[p]
+                });
                 if same {
                     return Some((c.name.clone(), r.id));
                 }
@@ -6987,8 +6992,8 @@ impl Database {
             .into_iter()
             .find(|ix| ix.def.name == index_name && ix.def.unique)?;
         let key = ix.key_for(values);
-        if key.0.iter().any(|v| matches!(v, Value::Null)) {
-            return None; // NULLs never conflict
+        if !ix.def.nulls_not_distinct && key.0.iter().any(|v| matches!(v, Value::Null)) {
+            return None; // NULLs never conflict (NULLS DISTINCT)
         }
         let bucket = ix.tree.get(&key)?;
         for &id in bucket {
@@ -7053,8 +7058,8 @@ impl Database {
                 continue;
             }
             let key = ix.key_for(values);
-            if key.0.iter().any(|v| matches!(v, Value::Null)) {
-                continue; // NULLs never conflict
+            if !ix.def.nulls_not_distinct && key.0.iter().any(|v| matches!(v, Value::Null)) {
+                continue; // NULLs never conflict (NULLS DISTINCT)
             }
             let Some(bucket) = ix.tree.get(&key) else {
                 continue;

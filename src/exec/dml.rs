@@ -470,6 +470,11 @@ pub(crate) struct UpsertPlan {
     /// name). DO NOTHING without an arbiter arbitrates every usable
     /// leaf constraint instead of the parent's index list.
     pub(crate) explicit_arbiter: bool,
+    /// v2.08: nulls_not_distinct of each arbiter index (parallel to
+    /// `indexes`); a leaf index is arbiter-compatible only when its
+    /// null treatment matches (PG19 execPartition.c
+    /// IsIndexCompatibleAsArbiter).
+    pub(crate) arbiter_nnd: Vec<bool>,
 }
 
 /// v1.99: the column name when an ON CONFLICT inference element is a
@@ -542,6 +547,9 @@ pub(crate) fn plan_upsert(
     // the index name with that prefix stripped. Parents and plain
     // tables keep the historical `{constraint}` name.
     let is_child = t.partition.as_ref().is_some_and(|p| p.parent.is_some());
+    // v2.08: the trailing bool is the index's nulls_not_distinct —
+    // a column-list inference spec names no null treatment, so it
+    // means NULLS DISTINCT and can only match a distinct index.
     let mut unique: Vec<(
         String,
         Vec<usize>,
@@ -549,6 +557,7 @@ pub(crate) fn plan_upsert(
         Option<String>,
         Vec<Option<String>>,
         Vec<Option<String>>,
+        bool,
     )> = if eng.db.is_temp_table(ctx.session, table) {
         let mut out = Vec::new();
         let mut push = |u: &UniqueDef| {
@@ -562,6 +571,7 @@ pub(crate) fn plan_upsert(
                     Some(u.name.clone()),
                     vec![None; n],
                     vec![None; n],
+                    u.nulls_not_distinct,
                 ));
             }
         };
@@ -600,6 +610,7 @@ pub(crate) fn plan_upsert(
                     con,
                     ix.def.collates.clone(),
                     ix.def.opclasses.clone(),
+                    ix.def.nulls_not_distinct,
                 )
             })
             .collect()
@@ -612,7 +623,8 @@ pub(crate) fn plan_upsert(
         )
     };
     let explicit_arbiter = !matches!(oc.arbiter, ConflictArbiter::None);
-    let resolved: Vec<(String, Vec<usize>, Option<String>)> = match &oc.arbiter {
+    // v2.08: the trailing bool carries the arbiter's null treatment.
+    let resolved: Vec<(String, Vec<usize>, Option<String>, bool)> = match &oc.arbiter {
         ConflictArbiter::None => {
             if let ConflictAction::DoUpdate { .. } = &oc.action {
                 return Err(exec_err(
@@ -623,7 +635,7 @@ pub(crate) fn plan_upsert(
             // DO NOTHING without an arbiter: every unique index arbitrates.
             unique
                 .iter()
-                .map(|(n, cols, _, con, _, _)| (n.clone(), cols.clone(), con.clone()))
+                .map(|(n, cols, _, con, _, _, nnd)| (n.clone(), cols.clone(), con.clone(), *nnd))
                 .collect()
         }
         ConflictArbiter::Columns(cols) => {
@@ -644,12 +656,17 @@ pub(crate) fn plan_upsert(
                     }
                 }
             }
+            // v2.08: an inference spec without a null treatment is
+            // NULLS DISTINCT (PG19 IndexStmt default), so an NND
+            // index never satisfies it — even when it is the only
+            // unique index on those columns (the conflict then
+            // surfaces as the NND index's own 23505, per PG).
             let found = unique
                 .iter()
-                .find(|(_, _, cn, _, co, op)| arbiter_elems_match(cn, co, op, cols));
+                .find(|(_, _, cn, _, co, op, nnd)| !*nnd && arbiter_elems_match(cn, co, op, cols));
             match found {
-                Some((n, pcols, _, con, _, _)) => {
-                    vec![(n.clone(), pcols.clone(), con.clone())]
+                Some((n, pcols, _, con, _, _, nnd)) => {
+                    vec![(n.clone(), pcols.clone(), con.clone(), *nnd)]
                 }
                 None => {
                     // v1.99: the inference may still be satisfied by
@@ -667,6 +684,7 @@ pub(crate) fn plan_upsert(
                             .iter()
                             .any(|ix| {
                                 ix.def.unique
+                                    && !ix.def.nulls_not_distinct
                                     && arbiter_elems_match(
                                         &ix.def.col_names,
                                         &ix.def.collates,
@@ -689,18 +707,20 @@ pub(crate) fn plan_upsert(
         // standalone CREATE UNIQUE INDEX is not a constraint (42P10).
         ConflictArbiter::Constraint(name) => unique
             .iter()
-            .find(|(_, _, _, con, _, _)| con.as_deref() == Some(name.as_str()))
-            .map(|(n, cols, _, con, _, _)| vec![(n.clone(), cols.clone(), con.clone())])
+            .find(|(_, _, _, con, _, _, _)| con.as_deref() == Some(name.as_str()))
+            .map(|(n, cols, _, con, _, _, nnd)| vec![(n.clone(), cols.clone(), con.clone(), *nnd)])
             .ok_or_else(no_arbiter)?,
     };
     let indexes: Vec<(String, Vec<usize>)> = resolved
         .iter()
-        .map(|(n, cols, _)| (n.clone(), cols.clone()))
+        .map(|(n, cols, _, _)| (n.clone(), cols.clone()))
         .collect();
-    let con_names: Vec<Option<String>> = resolved.iter().map(|(_, _, con)| con.clone()).collect();
+    let con_names: Vec<Option<String>> =
+        resolved.iter().map(|(_, _, con, _)| con.clone()).collect();
+    let arbiter_nnd: Vec<bool> = resolved.iter().map(|(_, _, _, nnd)| *nnd).collect();
     let key_names: Vec<Vec<String>> = resolved
         .iter()
-        .map(|(_, cols, _)| {
+        .map(|(_, cols, _, _)| {
             cols.iter()
                 .map(|&p| meta.columns[p].0.clone())
                 .collect::<Vec<_>>()
@@ -744,6 +764,7 @@ pub(crate) fn plan_upsert(
         con_names,
         key_names,
         explicit_arbiter,
+        arbiter_nnd,
     })
 }
 
@@ -822,12 +843,13 @@ pub(crate) struct LeafUpsertCtx {
     /// The leaf's column list (for parent<->leaf remapping).
     pub(crate) cols: Vec<(String, ColType)>,
     /// The plan's explicit arbiter mapped to this leaf's backing
-    /// indexes: (leaf index name, leaf key positions).
-    pub(crate) arbiters: Vec<(String, Vec<usize>)>,
+    /// indexes: (leaf index name, leaf key positions, v2.08
+    /// nulls_not_distinct).
+    pub(crate) arbiters: Vec<(String, Vec<usize>, bool)>,
     /// Every unique index on the leaf, for DO NOTHING without an
     /// arbiter (PG19: the individual leaf partitions' constraints are
     /// considered, not the whole hierarchy's).
-    pub(crate) all_unique: Vec<(String, Vec<usize>)>,
+    pub(crate) all_unique: Vec<(String, Vec<usize>, bool)>,
 }
 
 /// v0.71: build the per-leaf upsert context: map the parent arbiter
@@ -856,20 +878,35 @@ pub(crate) fn leaf_upsert_ctx(
     };
     let mut arbiters = Vec::with_capacity(plan.key_names.len());
     if plan.explicit_arbiter {
-        for (key_names, con) in plan.key_names.iter().zip(plan.con_names.iter()) {
+        for ((key_names, con), want_nnd) in plan
+            .key_names
+            .iter()
+            .zip(plan.con_names.iter())
+            .zip(plan.arbiter_nnd.iter())
+        {
             // v0.71: map the parent arbiter to the leaf unique index with
             // the same key column names. This covers PARTITION OF
             // children (v0.70 `{leaf}_{constraint}` naming) and ATTACHed
             // partitions (which keep their own index names). A standalone
             // parent unique index (con == None) has no per-leaf backing
-            // index in this engine.
+            // index in this engine. v2.08: the leaf index must also
+            // match the arbiter's null treatment (PG19
+            // IsIndexCompatibleAsArbiter).
             let found = con.as_ref().and_then(|_| {
                 eng.db
                     .visible_indexes_for(leaf, ctx.snap, &ctx.all_xids, ctx.session)
                     .into_iter()
                     .filter(|ix| ix.def.unique && ix.def.planner_usable)
-                    .find(|ix| ix.def.col_names == *key_names)
-                    .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
+                    .find(|ix| {
+                        ix.def.col_names == *key_names && ix.def.nulls_not_distinct == *want_nnd
+                    })
+                    .map(|ix| {
+                        (
+                            ix.def.name.clone(),
+                            ix.def.cols.clone(),
+                            ix.def.nulls_not_distinct,
+                        )
+                    })
             });
             match found {
                 Some(pair) => arbiters.push(pair),
@@ -877,12 +914,18 @@ pub(crate) fn leaf_upsert_ctx(
             }
         }
     }
-    let all_unique: Vec<(String, Vec<usize>)> = eng
+    let all_unique: Vec<(String, Vec<usize>, bool)> = eng
         .db
         .visible_indexes_for(leaf, ctx.snap, &ctx.all_xids, ctx.session)
         .into_iter()
         .filter(|ix| ix.def.unique && ix.def.planner_usable)
-        .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
+        .map(|ix| {
+            (
+                ix.def.name.clone(),
+                ix.def.cols.clone(),
+                ix.def.nulls_not_distinct,
+            )
+        })
         .collect();
     Ok(LeafUpsertCtx {
         cols,
@@ -2793,7 +2836,10 @@ pub(crate) fn exec_insert(
             // arbitrate in the leaf's column order and index space.
             // `ctable`/`cvalues`/`arbiters` are the conflict-search target:
             // the leaf for a partitioned target, else the table itself.
-            let (ctable, cvalues, arbiters): (String, Vec<Value>, Vec<(String, Vec<usize>)>) =
+            // v2.08: arbiters carry their nulls_not_distinct flag;
+            // NULL key parts skip same-statement tracking only for
+            // NULLS DISTINCT indexes.
+            let (ctable, cvalues, arbiters): (String, Vec<Value>, Vec<(String, Vec<usize>, bool)>) =
                 if partitioned_upsert {
                     let leaf = find_row_leaf(eng, ctx, table, values)?;
                     if !leaf_ctxs.contains_key(&leaf) {
@@ -2810,11 +2856,19 @@ pub(crate) fn exec_insert(
                     };
                     (leaf, cvalues, arbiters)
                 } else {
-                    (table.to_string(), values.to_vec(), plan.indexes.clone())
+                    (
+                        table.to_string(),
+                        values.to_vec(),
+                        plan.indexes
+                            .iter()
+                            .zip(plan.arbiter_nnd.iter())
+                            .map(|((n, c), nnd)| (n.clone(), c.clone(), *nnd))
+                            .collect(),
+                    )
                 };
             // 1. Conflict with a table row?
             let mut conflict: Option<u64> = None;
-            for (iname, _) in &arbiters {
+            for (iname, _, _) in &arbiters {
                 if let Some(id) = eng.db.unique_conflict_row(
                     &ctable,
                     iname,
@@ -2830,9 +2884,9 @@ pub(crate) fn exec_insert(
             }
             // 2. Conflict with a row planned earlier in this statement?
             if conflict.is_none() {
-                for (iname, kcols) in &arbiters {
-                    // NULL key parts never conflict.
-                    if kcols.iter().any(|&c| cvalues[c] == Value::Null) {
+                for (iname, kcols, nnd) in &arbiters {
+                    // NULL key parts never conflict (NULLS DISTINCT).
+                    if !nnd && kcols.iter().any(|&c| cvalues[c] == Value::Null) {
                         continue;
                     }
                     if let Some(id) = key_map.get(&(iname.clone(), arbiter_key(&cvalues, kcols))) {
@@ -2841,11 +2895,101 @@ pub(crate) fn exec_insert(
                     }
                 }
             }
+            // 2b. v2.08: with an explicit arbiter, a violation on a
+            // NON-arbiter unique index is not absorbed by the action —
+            // PG's speculative insertion checks every unique index and
+            // only the arbiter's conflict is actionable (insert_conflict
+            // #71: ON CONFLICT ON CONSTRAINT <distinct constraint> with
+            // a NULL key passes that constraint, then the NULLS NOT
+            // DISTINCT index raises its own 23505). Without an explicit
+            // arbiter the arbiter list already covers every index.
+            if conflict.is_none() && plan.explicit_arbiter {
+                let non_arbiters: Vec<(String, Vec<usize>, bool)> = if partitioned_upsert {
+                    let lu = &leaf_ctxs[&ctable];
+                    lu.all_unique
+                        .iter()
+                        .filter(|(n, _, _)| !lu.arbiters.iter().any(|(a, _, _)| a == n))
+                        .cloned()
+                        .collect()
+                } else if eng.db.is_temp_table(ctx.session, table) {
+                    // Temp tables arbitrate on constraint definitions
+                    // (no backing indexes); the non-arbiter set is the
+                    // remaining UNIQUE/PK constraints.
+                    let t = eng
+                        .db
+                        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+                        .expect("target still visible");
+                    let mut out = Vec::new();
+                    let mut push = |u: &UniqueDef| {
+                        if plan.indexes.iter().any(|(n, _)| n == &u.name) {
+                            return;
+                        }
+                        let cols: Vec<usize> =
+                            u.cols.iter().filter_map(|c| t.column_index(c)).collect();
+                        if cols.len() == u.cols.len() {
+                            out.push((u.name.clone(), cols, u.nulls_not_distinct));
+                        }
+                    };
+                    if let Some(pk) = &t.pkey {
+                        push(pk);
+                    }
+                    for u in &t.uniques {
+                        push(u);
+                    }
+                    out
+                } else {
+                    eng.db
+                        .visible_indexes_for(table, ctx.snap, &ctx.all_xids, ctx.session)
+                        .into_iter()
+                        .filter(|ix| {
+                            ix.def.unique
+                                && ix.def.planner_usable
+                                && !plan.indexes.iter().any(|(n, _)| n == &ix.def.name)
+                        })
+                        .map(|ix| {
+                            (
+                                ix.def.name.clone(),
+                                ix.def.cols.clone(),
+                                ix.def.nulls_not_distinct,
+                            )
+                        })
+                        .collect()
+                };
+                let mut violated: Vec<String> = Vec::new();
+                for (iname, icols, innd) in &non_arbiters {
+                    if !innd && icols.iter().any(|&c| cvalues[c] == Value::Null) {
+                        continue;
+                    }
+                    let hit_table = eng.db.unique_conflict_row(
+                        &ctable,
+                        iname,
+                        &cvalues,
+                        None,
+                        ctx.snap,
+                        &ctx.all_xids,
+                        ctx.session,
+                    );
+                    let hit_planned = latest.iter().any(|(pid, prow)| {
+                        (!partitioned_upsert
+                            || planned_leaf.get(pid).map(|l| l.as_str()) == Some(ctable.as_str()))
+                            && temp_key(icols, prow) == temp_key(icols, &cvalues)
+                    });
+                    if hit_table.is_some() || hit_planned {
+                        violated.push(iname.clone());
+                    }
+                }
+                if !violated.is_empty() {
+                    // Deferred non-arbiter constraints queue like any
+                    // other DML violation; immediate ones raise 23505
+                    // naming the constraint/index.
+                    resolve_unique_violations(eng, ctx, &ctable, violated)?;
+                }
+            }
             let Some(tid) = conflict else {
                 // No conflict: insert.
                 let id = eng.alloc_row_id();
-                for (iname, kcols) in &arbiters {
-                    if kcols.iter().any(|&c| cvalues[c] == Value::Null) {
+                for (iname, kcols, nnd) in &arbiters {
+                    if !nnd && kcols.iter().any(|&c| cvalues[c] == Value::Null) {
                         continue;
                     }
                     key_map.insert((iname.clone(), arbiter_key(&cvalues, kcols)), id);
@@ -3224,13 +3368,13 @@ pub(crate) fn exec_insert(
                         t.rows[t.row_pos(tid).expect("conflict target still present")].xmax
                     };
                     // Refresh the same-statement key map when the key changed.
-                    for (iname, kcols) in &arbiters {
+                    for (iname, kcols, nnd) in &arbiters {
                         let old_null = kcols.iter().any(|&c| target_values[c] == Value::Null);
                         let new_null = kcols.iter().any(|&c| store_values[c] == Value::Null);
-                        if !old_null {
+                        if *nnd || !old_null {
                             key_map.remove(&(iname.clone(), arbiter_key(&target_values, kcols)));
                         }
-                        if !new_null {
+                        if *nnd || !new_null {
                             key_map.insert((iname.clone(), arbiter_key(&store_values, kcols)), tid);
                         }
                     }

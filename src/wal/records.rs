@@ -124,6 +124,9 @@ pub enum WalRecord {
         /// v1.99: per-key-column operator classes; parallel to
         /// `columns`.
         opclasses: Vec<Option<String>>,
+        /// v2.08 (RGSWAL30): NULLS NOT DISTINCT unique index;
+        /// trailing field, present only in RGSWAL30+ images.
+        nulls_not_distinct: bool,
         xmin: u64,
     },
     DropIndex {

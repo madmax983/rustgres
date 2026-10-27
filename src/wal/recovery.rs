@@ -699,6 +699,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             predicate,
             collates,
             opclasses,
+            nulls_not_distinct,
             xmin,
         } => {
             // Rebuild the index from the table's current rows: at recovery
@@ -748,6 +749,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     opclasses: op,
                     predicate: predicate.clone(),
                     planner_usable,
+                    nulls_not_distinct: *nulls_not_distinct,
                 });
                 if planner_usable {
                     for r in &t.rows {
@@ -1922,6 +1924,7 @@ pub fn records_for_commit(
                     predicate: ix.def.predicate.clone(),
                     collates: ix.def.collates.clone(),
                     opclasses: ix.def.opclasses.clone(),
+                    nulls_not_distinct: ix.def.nulls_not_distinct,
                     xmin: own,
                 });
             }

@@ -1704,8 +1704,9 @@ pub(crate) fn alter_column_type_ext(
                     .map(|&p| values.get(p).cloned().unwrap_or(Value::Null))
                     .collect(),
             );
-            // PG: NULLs are distinct in unique constraints.
-            if key.0.iter().any(|v| matches!(v, Value::Null)) {
+            // PG: NULLs are distinct in unique constraints, unless
+            // NULLS NOT DISTINCT (v2.08).
+            if !def.nulls_not_distinct && key.0.iter().any(|v| matches!(v, Value::Null)) {
                 continue;
             }
             if seen.contains(&key) {
@@ -1967,12 +1968,12 @@ pub(crate) fn alter_add_column_ext(
         });
     }
     // Backing indexes for new unique/pkey constraints.
-    let mut new_indexes: Vec<(String, Vec<String>)> = Vec::new();
+    let mut new_indexes: Vec<(String, Vec<String>, bool)> = Vec::new();
     for u in uniques {
-        new_indexes.push((u.name.clone(), u.cols.clone()));
+        new_indexes.push((u.name.clone(), u.cols.clone(), u.nulls_not_distinct));
     }
     if let Some(pk) = pkey {
-        new_indexes.push((pk.name.clone(), pk.cols.clone()));
+        new_indexes.push((pk.name.clone(), pk.cols.clone(), false));
     }
     // v0.37: adding the first toastable column earns the table a toast
     // table (like PG), so reltoastrelid is set even before any row is
@@ -1981,13 +1982,13 @@ pub(crate) fn alter_add_column_ext(
     // old version (whose toast_relid is still 0).
     ensure_toast_table_eager(eng, ctx, name, &mut next);
     alter_swap(eng, ctx, name, None, next, Some(new_rows))?;
-    for (ix_name, cols) in new_indexes {
+    for (ix_name, cols, nnd) in new_indexes {
         if eng.db.is_temp_table(ctx.session, name) {
             // v0.77: temp tables have no backing global indexes (v0.22);
             // duplicates are checked by scanning the rows.
-            temp_unique_dup_check(eng, ctx, name, &ix_name, &cols)?;
+            temp_unique_dup_check(eng, ctx, name, &ix_name, &cols, nnd)?;
         } else {
-            create_constraint_index(eng, ctx, name, &ix_name, &cols, true)?;
+            create_constraint_index(eng, ctx, name, &ix_name, &cols, true, nnd)?;
         }
     }
     Ok(ExecResult::Command {
@@ -2537,6 +2538,8 @@ pub(crate) fn alter_drop_column_ext(
         col_names: Vec<String>,
         unique: bool,
         internal: bool,
+        // v2.08: NULLS NOT DISTINCT survives the rebuild.
+        nulls_not_distinct: bool,
     }
     let mut shifted: Vec<ShiftedIndex> = Vec::with_capacity(index_defs.len());
     for (ix_name, cols, col_names) in index_defs {
@@ -2548,6 +2551,7 @@ pub(crate) fn alter_drop_column_ext(
             col_names,
             unique: snapshot.def.unique,
             internal: snapshot.def.internal,
+            nulls_not_distinct: snapshot.def.nulls_not_distinct,
         });
     }
     alter_swap(eng, ctx, name, None, next, Some(new_rows))?;
@@ -2557,13 +2561,14 @@ pub(crate) fn alter_drop_column_ext(
         col_names,
         unique,
         internal,
+        nulls_not_distinct,
     } in shifted
     {
         let new_cols: Vec<usize> = cols
             .into_iter()
             .map(|p| if p > ci { p - 1 } else { p })
             .collect();
-        let mut ix = Index::new(IndexDef::plain(
+        let mut def = IndexDef::plain(
             ix_name.clone(),
             name.to_string(),
             new_cols,
@@ -2571,7 +2576,9 @@ pub(crate) fn alter_drop_column_ext(
             unique,
             internal,
             ctx.own,
-        ));
+        );
+        def.nulls_not_distinct = nulls_not_distinct;
+        let mut ix = Index::new(def);
         let t2 = eng
             .db
             .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
@@ -2629,6 +2636,8 @@ pub(crate) fn temp_unique_dup_check(
     table: &str,
     cname: &str,
     cols: &[String],
+    // v2.08: NULLS NOT DISTINCT of the constraint being added.
+    nulls_not_distinct: bool,
 ) -> Result<(), ExecError> {
     let t = eng
         .db
@@ -2652,8 +2661,9 @@ pub(crate) fn temp_unique_dup_check(
         .filter(|r| row_visible(r, ctx.snap, &ctx.all_xids))
     {
         let key = temp_key(&positions, &r.values);
-        // PG: NULLs are distinct in unique constraints.
-        if key.0.iter().any(|v| matches!(v, Value::Null)) {
+        // PG: NULLs are distinct in unique constraints, unless the
+        // constraint is NULLS NOT DISTINCT (v2.08).
+        if !nulls_not_distinct && key.0.iter().any(|v| matches!(v, Value::Null)) {
             continue;
         }
         if seen.contains(&key) {
@@ -2993,9 +3003,9 @@ pub(crate) fn alter_add_constraint(
         if eng.db.is_temp_table(ctx.session, name) {
             // v0.77: temp tables have no backing global indexes (v0.22);
             // duplicates are checked by scanning the rows.
-            temp_unique_dup_check(eng, ctx, name, &u.name, &u.cols)?;
+            temp_unique_dup_check(eng, ctx, name, &u.name, &u.cols, u.nulls_not_distinct)?;
         } else {
-            create_constraint_index(eng, ctx, name, &u.name, &u.cols, true)?;
+            create_constraint_index(eng, ctx, name, &u.name, &u.cols, true, u.nulls_not_distinct)?;
         }
         return Ok(ExecResult::Command {
             tag: "ALTER TABLE".to_string(),
@@ -3051,9 +3061,9 @@ pub(crate) fn alter_add_constraint(
         alter_swap(eng, ctx, name, None, next, None)?;
         if eng.db.is_temp_table(ctx.session, name) {
             // v0.77: temp tables have no backing global indexes (v0.22).
-            temp_unique_dup_check(eng, ctx, name, &pk.name, &pk.cols)?;
+            temp_unique_dup_check(eng, ctx, name, &pk.name, &pk.cols, false)?;
         } else {
-            create_constraint_index(eng, ctx, name, &pk.name, &pk.cols, true)?;
+            create_constraint_index(eng, ctx, name, &pk.name, &pk.cols, true, false)?;
         }
         return Ok(ExecResult::Command {
             tag: "ALTER TABLE".to_string(),
@@ -4232,6 +4242,17 @@ pub(crate) fn alter_add_primary_key_using_index(
             format!("index \"{}\" is not unique", index_name),
         ));
     }
+    // v2.08: PG19 catalog/index.c — an NND index cannot back a
+    // PRIMARY KEY (42P16).
+    if def.nulls_not_distinct {
+        return Err(exec_err(
+            "42P16",
+            format!(
+                "primary keys cannot use NULLS NOT DISTINCT indexes (index \"{}\")",
+                index_name
+            ),
+        ));
+    }
     check_using_index_sorting(&t, &def)?;
     if def
         .cols
@@ -4335,8 +4356,11 @@ pub(crate) fn alter_add_unique_using_index(
         ));
     }
     let mut next = t.clone();
-    next.uniques
-        .push(UniqueDef::plain(def.name.clone(), def.col_names.clone()));
+    // v2.08: the new constraint adopts the index's null treatment
+    // (PG19: the constraint's index IS this index).
+    let mut udef = UniqueDef::plain(def.name.clone(), def.col_names.clone());
+    udef.nulls_not_distinct = def.nulls_not_distinct;
+    next.uniques.push(udef);
     alter_swap(eng, ctx, name, None, next, None)?;
     Ok(ExecResult::Command {
         tag: "ALTER TABLE".to_string(),

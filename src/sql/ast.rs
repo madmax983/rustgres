@@ -2307,6 +2307,11 @@ pub struct UniqueDef {
     /// CONSTRAINTS ... IMMEDIATE (see exec/deferred.rs).
     pub deferrable: bool,
     pub initially_deferred: bool,
+    /// v2.08: NULLS NOT DISTINCT (PG19 pg_index.indnullsnotdistinct on
+    /// the backing index). Under the flag, NULL key parts compare
+    /// EQUAL for uniqueness instead of never conflicting. Always false
+    /// for PRIMARY KEY (the grammar has no null-treatment clause).
+    pub nulls_not_distinct: bool,
 }
 
 impl UniqueDef {
@@ -2317,6 +2322,7 @@ impl UniqueDef {
             cols,
             deferrable: false,
             initially_deferred: false,
+            nulls_not_distinct: false,
         }
     }
 }
@@ -2881,8 +2887,8 @@ pub(crate) enum ColCon {
     NotNullNoInherit,
     Null,
     /// v2.07: column UNIQUE with its ConstraintAttributeSpec results
-    /// (deferrable, initially_deferred).
-    Unique(Option<String>, bool, bool),
+    /// (deferrable, initially_deferred). v2.08: plus nulls_not_distinct.
+    Unique(Option<String>, bool, bool, bool),
     /// v2.07: column PRIMARY KEY with ConstraintAttributeSpec results.
     PKey(Option<String>, bool, bool),
     Default(DefaultExpr),
@@ -2905,7 +2911,8 @@ pub(crate) enum ParsedTableCon {
     /// v2.06: `PRIMARY KEY USING INDEX name` (ALTER ADD form).
     PKeyUsingIndex(Option<String>, String),
     /// v2.07: table UNIQUE (cols) + ConstraintAttributeSpec results.
-    Unique(Option<String>, Vec<String>, bool, bool),
+    /// v2.08: plus nulls_not_distinct.
+    Unique(Option<String>, Vec<String>, bool, bool, bool),
     /// v2.07: `UNIQUE USING INDEX name` (ALTER ADD form).
     UniqueUsingIndex(Option<String>, String),
     Check(Option<String>, Expr, bool, bool),
@@ -3138,6 +3145,7 @@ pub(crate) fn def_add_pkey(
         cols: cols.to_vec(),
         deferrable,
         initially_deferred,
+        nulls_not_distinct: false,
     });
     Ok(())
 }
@@ -3155,6 +3163,8 @@ pub(crate) fn def_add_unique(
     // v2.07: ConstraintAttributeSpec results.
     deferrable: bool,
     initially_deferred: bool,
+    // v2.08: NULLS NOT DISTINCT (parsed before the column list).
+    nulls_not_distinct: bool,
 ) -> Result<(), SqlError> {
     if !defer_col_check {
         for c in cols {
@@ -3177,6 +3187,7 @@ pub(crate) fn def_add_unique(
         cols: cols.to_vec(),
         deferrable,
         initially_deferred,
+        nulls_not_distinct,
     });
     Ok(())
 }
@@ -3362,7 +3373,7 @@ pub(crate) fn build_table_def(
                             }
                             def.not_null[i] = false
                         }
-                        ColCon::Unique(n, df, idf) => def_add_unique(
+                        ColCon::Unique(n, df, idf, nnd) => def_add_unique(
                             table,
                             &mut def,
                             n.clone(),
@@ -3371,6 +3382,7 @@ pub(crate) fn build_table_def(
                             false,
                             *df,
                             *idf,
+                            *nnd,
                         )?,
                         ColCon::PKey(n, df, idf) => def_add_pkey(
                             table,
@@ -3431,7 +3443,7 @@ pub(crate) fn build_table_def(
                     *df,
                     *idf,
                 )?,
-                ParsedTableCon::Unique(n, cols, df, idf) => {
+                ParsedTableCon::Unique(n, cols, df, idf, nnd) => {
                     let first = cols[0].clone();
                     def_add_unique(
                         table,
@@ -3442,6 +3454,7 @@ pub(crate) fn build_table_def(
                         !inherits.is_empty(),
                         *df,
                         *idf,
+                        *nnd,
                     )?
                 }
                 ParsedTableCon::Check(n, e, nv, enf) => {
@@ -6785,6 +6798,8 @@ pub enum Stmt {
         if_not_exists: bool,
         /// v0.88: partial-index predicate source (`WHERE ...`), if any.
         predicate: Option<String>,
+        /// v2.08: NULLS NOT DISTINCT (only meaningful when unique).
+        nulls_not_distinct: bool,
     },
     DropIndex {
         names: Vec<String>,

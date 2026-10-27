@@ -275,6 +275,10 @@ pub struct IndexDef {
     /// A wrong choice here would cost correctness, not just speed, so
     /// they stay invisible until the planner learns them.
     pub planner_usable: bool,
+    /// v2.08: NULLS NOT DISTINCT (PG19 pg_index.indnullsnotdistinct).
+    /// Only meaningful for unique indexes: NULL key parts compare
+    /// EQUAL for uniqueness instead of never conflicting.
+    pub nulls_not_distinct: bool,
 }
 
 impl IndexDef {
@@ -306,6 +310,7 @@ impl IndexDef {
             opclasses: vec![None; n],
             predicate: None,
             planner_usable: true,
+            nulls_not_distinct: false,
         }
     }
 }

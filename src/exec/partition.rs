@@ -1975,6 +1975,7 @@ pub(crate) fn expand_like_clauses(
                     cols: u.cols.clone(),
                     deferrable: u.deferrable,
                     initially_deferred: u.initially_deferred,
+                    nulls_not_distinct: u.nulls_not_distinct,
                 });
             }
             if def.pkey.is_none() {
@@ -1984,6 +1985,7 @@ pub(crate) fn expand_like_clauses(
                         cols: pk.cols.clone(),
                         deferrable: pk.deferrable,
                         initially_deferred: pk.initially_deferred,
+                        nulls_not_distinct: pk.nulls_not_distinct,
                     });
                 }
             }
@@ -2866,6 +2868,8 @@ pub(crate) fn create_constraint_index(
     cname: &str,
     cols: &[String],
     internal: bool,
+    // v2.08: NULLS NOT DISTINCT of the owning constraint.
+    nulls_not_distinct: bool,
 ) -> Result<(), ExecError> {
     let t = eng
         .db
@@ -2901,7 +2905,7 @@ pub(crate) fn create_constraint_index(
         }
         seen.push(pos);
     }
-    let mut ix = Index::new(IndexDef::plain(
+    let mut def = IndexDef::plain(
         ix_name.clone(),
         table.to_string(),
         seen,
@@ -2909,7 +2913,9 @@ pub(crate) fn create_constraint_index(
         true,
         internal,
         ctx.own,
-    ));
+    );
+    def.nulls_not_distinct = nulls_not_distinct;
+    let mut ix = Index::new(def);
     for r in &t.rows {
         let key = ix.key_for(&r.values);
         ix.insert(key, r.id);
@@ -2917,7 +2923,7 @@ pub(crate) fn create_constraint_index(
     // Duplicate check among versions that could still become visible
     // (mirrors CREATE UNIQUE INDEX).
     for (key, ids) in &ix.tree {
-        if key.0.iter().any(|v| matches!(v, Value::Null)) {
+        if !nulls_not_distinct && key.0.iter().any(|v| matches!(v, Value::Null)) {
             continue;
         }
         if ids.len() > 1 {

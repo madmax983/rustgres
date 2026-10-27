@@ -128,10 +128,10 @@ pub(crate) fn exec_create(
     // tables get none — the global index map cannot represent them.)
     if !temp {
         if let Some(pk) = &eff_def.pkey {
-            create_constraint_index(eng, ctx, name, &pk.name, &pk.cols, true)?;
+            create_constraint_index(eng, ctx, name, &pk.name, &pk.cols, true, false)?;
         }
         for u in &eff_def.uniques {
-            create_constraint_index(eng, ctx, name, &u.name, &u.cols, true)?;
+            create_constraint_index(eng, ctx, name, &u.name, &u.cols, true, u.nulls_not_distinct)?;
         }
     }
     Ok(ExecResult::Command {

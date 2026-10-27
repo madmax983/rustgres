@@ -1414,6 +1414,10 @@ impl Parser {
                     "syntax error: index requires at least one column".to_string()
                 ));
             }
+            // v2.08: gram.y IndexStmt — opt_unique_null_treatment
+            // sits after the column list (and INCLUDE, unsupported
+            // here), before reloptions/WHERE.
+            let nulls_not_distinct = self.parse_nulls_not_distinct()?;
             // v0.88: partial index predicate.
             let predicate = if self.eat_keyword("where") {
                 let start = self.pos;
@@ -1436,6 +1440,7 @@ impl Parser {
                 unique,
                 if_not_exists,
                 predicate,
+                nulls_not_distinct,
             });
         }
         // v0.9: CREATE SEQUENCE (CREATE VIEW is intercepted before
@@ -1975,8 +1980,9 @@ impl Parser {
             } else if self.eat_keyword("null") {
                 cons.push(ColCon::Null);
             } else if self.eat_keyword("unique") {
+                let nnd = self.parse_nulls_not_distinct()?;
                 let (df, idf) = self.parse_unique_attrs()?;
-                cons.push(ColCon::Unique(cname, df, idf));
+                cons.push(ColCon::Unique(cname, df, idf, nnd));
             } else if self.eat_keyword("primary") {
                 self.expect_keyword("key")?;
                 let (df, idf) = self.parse_unique_attrs()?;
@@ -2086,9 +2092,12 @@ impl Parser {
                 let idx = self.expect_ident()?;
                 return Ok(ParsedTableCon::UniqueUsingIndex(cname, idx));
             }
+            // v2.08: gram.y places opt_unique_null_treatment between
+            // UNIQUE and the column list for table constraints.
+            let nnd = self.parse_nulls_not_distinct()?;
             let cols = self.parse_col_name_list()?;
             let (df, idf) = self.parse_unique_attrs()?;
-            Ok(ParsedTableCon::Unique(cname, cols, df, idf))
+            Ok(ParsedTableCon::Unique(cname, cols, df, idf, nnd))
         } else if self.eat_keyword("check") {
             self.expect(Token::LParen, "'('")?;
             let e = self.parse_or()?;
@@ -2300,6 +2309,23 @@ impl Parser {
             enforced,
             not_valid,
         })
+    }
+
+    /// v2.08: PG19 `opt_unique_null_treatment`: `NULLS DISTINCT` |
+    /// `NULLS NOT DISTINCT` | empty. Returns true iff NOT DISTINCT.
+    /// Position differs by construct (gram.y): right after UNIQUE for
+    /// column/table constraints (before the column list), and after
+    /// the column list for CREATE INDEX.
+    pub(crate) fn parse_nulls_not_distinct(&mut self) -> Result<bool, SqlError> {
+        if self.eat_keyword("nulls") {
+            if self.eat_keyword("not") {
+                self.expect_keyword("distinct")?;
+                return Ok(true);
+            }
+            self.expect_keyword("distinct")?;
+            return Ok(false);
+        }
+        Ok(false)
     }
 
     /// v2.07: trailing UNIQUE / PRIMARY KEY attributes (PG19 gram.y
@@ -2807,11 +2833,12 @@ impl Parser {
                         }
                         not_null = false
                     }
-                    ColCon::Unique(n, df, idf) => uniques.push(UniqueDef {
+                    ColCon::Unique(n, df, idf, nnd) => uniques.push(UniqueDef {
                         name: n.unwrap_or_else(|| format!("{}_key", col.name)),
                         cols: vec![col.name.clone()],
                         deferrable: df,
                         initially_deferred: idf,
+                        nulls_not_distinct: nnd,
                     }),
                     ColCon::PKey(n, df, idf) => {
                         pkey = Some(UniqueDef {
@@ -2819,6 +2846,7 @@ impl Parser {
                             cols: vec![col.name.clone()],
                             deferrable: df,
                             initially_deferred: idf,
+                            nulls_not_distinct: false,
                         });
                         not_null = true;
                     }
@@ -3102,18 +3130,20 @@ impl Parser {
                     cols,
                     deferrable: df,
                     initially_deferred: idf,
+                    nulls_not_distinct: false,
                 }),
                 check: None,
                 unique: None,
                 fk: None,
                 notnull: None,
             }),
-            ParsedTableCon::Unique(name, cols, df, idf) => Ok(AlterAction::AddConstraint {
+            ParsedTableCon::Unique(name, cols, df, idf, nnd) => Ok(AlterAction::AddConstraint {
                 unique: Some(UniqueDef {
                     name: name.unwrap_or_default(),
                     cols,
                     deferrable: df,
                     initially_deferred: idf,
+                    nulls_not_distinct: nnd,
                 }),
                 check: None,
                 pkey: None,
@@ -16496,12 +16526,16 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
         // v2.07: optional trailing (attrs deferrable initially_deferred)
         // — emitted only when a flag is set, so pre-v2.07 encodings of
         // plain constraints stay byte-identical; the decoder defaults
-        // a missing section to (0 0).
-        if u.deferrable || u.initially_deferred {
+        // a missing section to (0 0). v2.08: a third bit
+        // (nulls_not_distinct) is appended only when set.
+        if u.deferrable || u.initially_deferred || u.nulls_not_distinct {
             out.push_str(" (attrs ");
             out.push_str(if u.deferrable { "1" } else { "0" });
             out.push(' ');
             out.push_str(if u.initially_deferred { "1" } else { "0" });
+            if u.nulls_not_distinct {
+                out.push_str(" 1");
+            }
             out.push(')');
         }
         out.push(')');
@@ -16515,11 +16549,14 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
                 out.push(' ');
                 sexpr_escape(c, &mut out);
             }
-            if pk.deferrable || pk.initially_deferred {
+            if pk.deferrable || pk.initially_deferred || pk.nulls_not_distinct {
                 out.push_str(" (attrs ");
                 out.push_str(if pk.deferrable { "1" } else { "0" });
                 out.push(' ');
                 out.push_str(if pk.initially_deferred { "1" } else { "0" });
+                if pk.nulls_not_distinct {
+                    out.push_str(" 1");
+                }
                 out.push(')');
             }
             out.push(')');
@@ -16763,12 +16800,14 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
     if p.atom()? != "uniques" {
         return Err("bad uniques head".into());
     }
-    // v2.07 helper: an optional trailing (attrs d i) sub-list inside a
-    // unique/pkey entry (pre-v2.07 encodings omit it -> (false, false)).
-    fn unique_attrs(p: &mut SexprParser) -> Result<(bool, bool), String> {
+    // v2.07 helper: an optional trailing (attrs d i [n]) sub-list
+    // inside a unique/pkey entry (pre-v2.07 encodings omit it ->
+    // all false; v2.08 appends the nulls_not_distinct bit only when
+    // set, so two-bit sections decode with n = false).
+    fn unique_attrs(p: &mut SexprParser) -> Result<(bool, bool, bool), String> {
         p.ws();
         if p.chars.peek() != Some(&'(') {
-            return Ok((false, false));
+            return Ok((false, false, false));
         }
         p.open()?;
         if p.atom()? != "attrs" {
@@ -16783,15 +16822,16 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
         };
         let d = bit(p)?;
         let i = bit(p)?;
+        let n = if sexpr_is_close(p) { false } else { bit(p)? };
         p.close()?;
-        Ok((d, i))
+        Ok((d, i, n))
     }
     let mut uniques = Vec::new();
     while !sexpr_is_close(&mut p) {
         p.open()?;
         let name = p.atom()?;
         let mut cols = Vec::new();
-        let mut attrs = (false, false);
+        let mut attrs = (false, false, false);
         loop {
             p.ws();
             if sexpr_is_close(&mut p) {
@@ -16809,6 +16849,7 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
             cols,
             deferrable: attrs.0,
             initially_deferred: attrs.1,
+            nulls_not_distinct: attrs.2,
         });
     }
     p.close()?;
@@ -16822,7 +16863,7 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
     } else {
         let name = p.atom()?;
         let mut cols = Vec::new();
-        let mut attrs = (false, false);
+        let mut attrs = (false, false, false);
         if name != "-" {
             loop {
                 p.ws();
@@ -16841,6 +16882,7 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
             cols,
             deferrable: attrs.0,
             initially_deferred: attrs.1,
+            nulls_not_distinct: attrs.2,
         })
     };
     // Careful: `(pkey -)` encodes absence as the atom "-".
