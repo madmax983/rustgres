@@ -2,6 +2,140 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `fk_parent_key_exists` deep-clones the referenced table on every child-row FK check — fix — 2026-10-27
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec/constraint.rs`: `fk_parent_key_exists` collected the
+referenced table (plus every partition leaf) into
+`Vec<(String, Table)>`, cloning each `Table` via `t.clone()` even
+though `eng: &Engine` is only ever borrowed immutably for the whole
+function — there is no mutable-borrow conflict that the clone was
+working around. Changed the collection to `Vec<(String, &Table)>`,
+dropping the `.clone()` entirely; the rest of the function (column
+lookup, row scan, visibility filter) is unchanged since it only ever
+read through the reference anyway. `check_fk_child_row_pv` (the
+immediate per-row INSERT/UPDATE FK check) and the v2.06/v2.07 deferred
+`fire_child`/`fire_parent` paths both call into this function, so both
+get the fix from one four-line change.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_fk_insert.py --variant fk
+--parent-rows {500,1000,2000} --child-rows 1000`), same workload, same
+machine, same session.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`), total `Ir`:
+
+| parent rows (M) | before | after | delta |
+|---|---|---|---|
+| 500  | 1,270,711,015 | 659,376,969   | **-48.11%** |
+| 1000 | 2,380,847,040 | 1,180,938,339 | **-50.40%** |
+| 2000 | 3,565,640,369 | 1,271,112,428 | **-64.35%** |
+
+The `nofk` control (same workload, child table's `parent_id` column
+has no `REFERENCES` clause, so `fk_parent_key_exists` is never called)
+is unchanged by the fix at every size (143,287,521 / 187,164,734 /
+276,797,378 vs. the baseline's 143,301,471 / 187,124,988 /
+276,804,141 — noise-level, confirming the fix is isolated to the
+FK-check path with no side effects elsewhere).
+
+DHAT (M=500, same workload):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total bytes allocated | 61,135,873 | 7,543,873 | **-87.66%** |
+| Total blocks allocated | 607,311    | 88,311    | **-85.46%** |
+
+Both the `Ir` reduction (48–64%) and the allocation reduction (85–88%)
+clear their floors (≥5% / ≥10%) many times over, and track the
+baseline's finding that this subtree is 88–92% of the workload's
+total `Ir` — the clone was the dominant cost, not a rounding error on
+top of an already-cheap check. The after-fix growth curve across M
+(659M → 1181M → 1271M) is also far flatter than the before-fix one
+(1271M → 2381M → 3566M), closer to the `nofk` control's own growth —
+consistent with removing the O(M) clone and leaving only the O(M) scan
+that was always inherent to checking existence against an
+un-indexed-for-this-purpose row store.
+
+`cargo test --all-features`: 1181/1181 passed, unchanged. `cargo fmt
+--all`: clean, no changes. `cargo clippy --all-targets --all-features
+-- -D warnings`: 1019 errors on both the pre-fix and post-fix tree
+(same pre-existing toolchain/lint-version mismatch noted throughout
+this file), confirmed via `git stash`/`git stash pop` around the
+clippy run; zero net new.
+
+Before/after profiles committed:
+`benches/profiles/{callgrind,dhat}.out.fkinsert-{base,after}-n{500,1000,2000}-2026-10-27`
+(dhat only at n500).
+
+**Reproduce**: check out the parent (baseline) commit, `cargo build`,
+`python3 benches/profile_fk_insert.py --tool callgrind --variant fk
+--parent-rows 500` (repeat for 1000/2000, and with `--tool dhat` for
+the allocation numbers) for the before numbers; check out this
+commit, `cargo build`, repeat for the after numbers.
+
+## Bolt: `fk_parent_key_exists` deep-clones the referenced table on every child-row FK check — baseline — 2026-10-27
+
+**Why this workload**: every prior Bolt INSERT harness in this file
+targets a PK-less table or a self-contained UNIQUE/PK check; none
+exercises an actual `REFERENCES` constraint (child table → parent
+table), even though FK enforcement is the default (not `DEFERRABLE`)
+and this is one of the most ordinary bulk-load shapes there is: an
+ETL job or batch loader inserting fact/detail rows (`orders`,
+`line_items`) that each reference an existing dimension/parent row
+(`customers`, `products`). New harness, `benches/profile_fk_insert.py`
+(self-contained: launches its own `rustgres` instance directly under
+valgrind, mirroring `tests/cg_dhat_v171.py`'s pattern): creates a
+`bench_fk_parent(id INT PRIMARY KEY, name TEXT)` table with M rows,
+a `bench_fk_child(id INT PRIMARY KEY, parent_id INT REFERENCES
+bench_fk_parent(id), val TEXT)` table, then runs one multi-row
+`INSERT INTO bench_fk_child SELECT ...` of 1,000 rows, each `parent_id`
+a valid, cyclically-chosen key — so every one of the 1,000 rows' FK
+checks is a real, successful existence lookup. `--variant nofk` is a
+control that drops the `REFERENCES` clause, letting the FK-check
+subtree's share of the profile be measured directly by subtraction
+instead of by eyeballing a flat `callgrind_annotate` listing (the
+function is small and inlines into several generic `Vec`/`Table`
+clone sites shared with unrelated callers, so a flat per-function
+listing alone can't isolate its cost).
+
+Reading the code path before touching anything: every non-deferred
+child-row FK check
+(`check_fk_child_row_pv` → `fk_parent_key_exists`, both in
+`src/exec/constraint.rs`) calls `eng.db.find_table(...).cloned()` —
+cloning the *entire* referenced `Table` (and every partition leaf),
+including its full `Vec<RowVersion>` row store — just to scan it for
+one key. This runs once per child row per FK, so a single multi-row
+INSERT into an FK-checked table clones the referenced table N times
+(N = rows in the INSERT), each clone costing O(M) (M = parent table
+size) regardless of where in the scan the matching key is found.
+
+Baseline (callgrind, valgrind 3.22.0), total `Ir`, 1,000-row child
+INSERT:
+
+| parent rows (M) | `fk` variant | `nofk` control | delta (FK-check subtree) | share of `fk` total |
+|---|---|---|---|---|
+| 500  | 1,270,711,015 | 143,301,471 | 1,127,409,544 | **88.7%** |
+| 1000 | 2,380,847,040 | 187,124,988 | 2,193,722,052 | **92.1%** |
+| 2000 | 3,565,640,369 | 276,804,141 | 3,288,836,228 | **92.2%** |
+
+The FK-check subtree is 88.7–92.2% of this workload's total
+instructions — nowhere close to the 5%-of-profile floor, it's nearly
+the entire profile. The `nofk` control's own total grows only mildly
+with M (one-time parent-population cost), confirming the growth in
+the `fk` variant's total is coming from the per-row FK check, not from
+table setup. Hypothesis: `fk_parent_key_exists`'s `t.clone()` (deep
+copy of the whole parent `Table`, done once per child row checked, M
+times per statement) is unnecessary — `eng` is only ever borrowed
+immutably in this function, so the referenced table can be scanned by
+reference with zero clones. Fix and measurement in the entry above
+this one.
+
 ## Bolt: UPDATE/DELETE RLS target-visibility re-derives role/policy state per row — fix — 2026-10-18
 ## Bolt: `exec::funcs::crc32c`/`crc32` are bit-by-bit (no table) — fix — 2026-10-26
 
