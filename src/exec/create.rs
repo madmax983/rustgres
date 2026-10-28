@@ -106,6 +106,22 @@ pub(crate) fn exec_create(
         for c in &eff_def.checks {
             check_expr_cast_usages(eng, ctx, &c.expr)?;
         }
+        // v2.10: CHECK column references are validated against the
+        // MERGED column list here (the parser defers the check when
+        // INHERITS is present, since parent columns are only known
+        // at exec; PG validates against the merged list at CREATE).
+        for c in &eff_def.checks {
+            let mut refs = Vec::new();
+            collect_col_refs(&c.expr, &mut refs);
+            for (qual, r) in refs {
+                if qual.is_none() && !eff_def.columns.iter().any(|(n, _)| n == &r) {
+                    return Err(exec_err(
+                        "42703",
+                        format!("column \"{}\" does not exist", r),
+                    ));
+                }
+            }
+        }
         for d in eff_def.defaults.iter().flatten() {
             if let crate::sql::DefaultExpr::Expr(e) = d {
                 check_expr_cast_usages(eng, ctx, e)?;

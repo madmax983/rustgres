@@ -5072,7 +5072,100 @@ impl Parser {
     /// v1.00: parse the statement list of a trigger-function body (see
     /// [`parse_trigger_body`]). The parser is positioned at the first
     /// token of the body; it must start with `BEGIN` and end with `END`.
-    pub(crate) fn parse_trigger_body_stmts(&mut self) -> Result<Vec<TriggerBodyStmt>, SqlError> {
+    pub(crate) fn parse_trigger_body_stmts(&mut self) -> Result<TriggerBody, SqlError> {
+        // v2.10: optional DECLARE section before BEGIN. Declaration
+        // types are consumed token-wise (the bounded grammar is
+        // dynamically typed); a default (`:= expr` / `DEFAULT expr`)
+        // is parsed as an expression.
+        let mut decls: Vec<TriggerDecl> = Vec::new();
+        if matches!(self.peek(), Token::Ident(s) if s == "declare") {
+            self.next(); // 'declare'
+            while !matches!(self.peek(), Token::Ident(s) if s == "begin") {
+                if matches!(self.peek(), Token::EOF) {
+                    return Err(err(
+                        "syntax error in trigger body: DECLARE section without BEGIN".to_string(),
+                    ));
+                }
+                if matches!(self.peek(), Token::Semi) {
+                    self.next();
+                    continue;
+                }
+                let name = self.expect_ident()?;
+                // v2.10: `name ALIAS FOR new|old` binds the row
+                // image; other alias targets ($n) are consumed only.
+                if matches!(self.peek(), Token::Ident(s) if s == "alias") {
+                    self.next(); // 'alias'
+                    self.eat_keyword("for");
+                    let target = self.expect_ident().unwrap_or_default();
+                    while !matches!(self.peek(), Token::Semi | Token::EOF) {
+                        self.next();
+                    }
+                    if matches!(self.peek(), Token::Semi) {
+                        self.next();
+                    }
+                    let alias_for = if target == "new" || target == "old" {
+                        Some(target)
+                    } else {
+                        None
+                    };
+                    decls.push(TriggerDecl {
+                        name,
+                        default: None,
+                        alias_for,
+                    });
+                    continue;
+                }
+                let mut default: Option<Expr> = None;
+                let mut depth = 0i32;
+                loop {
+                    match self.peek().clone() {
+                        Token::Semi if depth == 0 => {
+                            self.next();
+                            break;
+                        }
+                        Token::EOF => {
+                            return Err(err(
+                                "syntax error in trigger body: unterminated declaration"
+                                    .to_string(),
+                            ));
+                        }
+                        Token::LParen => {
+                            depth += 1;
+                            self.next();
+                        }
+                        Token::RParen => {
+                            depth -= 1;
+                            self.next();
+                        }
+                        Token::Colon if depth == 0 && matches!(self.peek2(), Token::Eq) => {
+                            self.next();
+                            self.next();
+                            default = Some(self.parse_or()?);
+                            if matches!(self.peek(), Token::Semi) {
+                                self.next();
+                            }
+                            break;
+                        }
+                        Token::Ident(s) if depth == 0 && s == "default" => {
+                            self.next();
+                            default = Some(self.parse_or()?);
+                            if matches!(self.peek(), Token::Semi) {
+                                self.next();
+                            }
+                            break;
+                        }
+                        _ => {
+                            self.next();
+                        }
+                    }
+                }
+                decls.push(TriggerDecl {
+                    name,
+                    default,
+                    alias_for: None,
+                });
+            }
+        }
         self.expect_keyword("begin")?;
         let mut stmts = self.parse_trigger_stmt_list()?;
         // v2.09: the function body's own block may carry an EXCEPTION
@@ -5097,7 +5190,7 @@ impl Parser {
             self.next();
         }
         match self.next() {
-            Token::EOF => Ok(stmts),
+            Token::EOF => Ok(TriggerBody { decls, stmts }),
             other => Err(err(format!(
                 "syntax error in trigger body: unexpected {:?} after END",
                 other
@@ -5111,6 +5204,12 @@ impl Parser {
     pub(crate) fn parse_trigger_stmt_list(&mut self) -> Result<Vec<TriggerBodyStmt>, SqlError> {
         let mut stmts = Vec::new();
         loop {
+            // v2.10: empty statements (`;;`) are tolerated, as in
+            // plpgsql.
+            if matches!(self.peek(), Token::Semi) {
+                self.next();
+                continue;
+            }
             if matches!(self.peek(), Token::Ident(s) if s == "end" || s == "exception" || s == "elsif" || s == "else")
             {
                 break;
@@ -5165,6 +5264,74 @@ impl Parser {
         Ok(keys)
     }
 
+    /// v2.10: parse an IF/ELSIF condition (the THEN is NOT
+    /// consumed). plpgsql splices the condition into a SELECT, so
+    /// after a plain-expression parse fails or leaves tokens (the
+    /// `count(*) = 0 FROM t WHERE ...` form), the whole fragment is
+    /// parsed as `SELECT <fragment>`. A trailing ISNULL / NOTNULL
+    /// postfix wraps the expression (PG gram.y postfix operators).
+    pub(crate) fn parse_trigger_cond(&mut self) -> Result<TrigCond, SqlError> {
+        let start = self.pos;
+        let mut depth = 0i32;
+        let mut case_depth = 0i32;
+        let mut i = self.pos;
+        while let Some(tok) = self.tokens.get(i) {
+            match tok {
+                Token::EOF => break,
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                Token::Semi if depth == 0 && case_depth == 0 => break,
+                Token::Ident(s) if depth == 0 && case_depth == 0 => {
+                    if s == "case" {
+                        case_depth += 1;
+                    } else if s == "then" {
+                        break;
+                    }
+                }
+                Token::Ident(s) if depth == 0 && s == "case" => case_depth += 1,
+                Token::Ident(s) if depth == 0 && s == "end" && case_depth > 0 => {
+                    case_depth -= 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let toks = self.tokens[start..i].to_vec();
+        self.pos = i;
+        // Try a plain expression over the fragment.
+        let mut etoks = toks.clone();
+        etoks.push(Token::EOF);
+        let mut ep = Parser {
+            tokens: etoks,
+            pos: 0,
+            unnamed_seq: 0,
+            allow_similar_to: true,
+            last_bit_typmod: None,
+        };
+        if let Ok(mut e) = ep.parse_or() {
+            let rest: Vec<Token> = ep.tokens[ep.pos..].to_vec();
+            let rest_is_eof = rest.iter().all(|t| matches!(t, Token::EOF));
+            if rest_is_eof {
+                return Ok(TrigCond::Expr(e));
+            }
+            if rest.len() == 2
+                && matches!(&rest[1], Token::EOF)
+                && matches!(&rest[0], Token::Ident(s) if s == "isnull" || s == "notnull")
+            {
+                let neg = matches!(&rest[0], Token::Ident(s) if s == "notnull");
+                e = Expr::IsNull {
+                    expr: Box::new(e),
+                    neg,
+                };
+                return Ok(TrigCond::Expr(e));
+            }
+        }
+        // SELECT-splice fallback.
+        let text = format!("select {}", tokens_to_sql(&toks));
+        let stmt = parse_statement_inner(&text)?;
+        Ok(TrigCond::Query(Box::new(stmt)))
+    }
+
     /// v1.00/v2.09: parse one trigger-body statement (see
     /// [`parse_trigger_body`]).
     pub(crate) fn parse_trigger_body_stmt(&mut self) -> Result<TriggerBodyStmt, SqlError> {
@@ -5186,15 +5353,17 @@ impl Parser {
             return Ok(TriggerBodyStmt::Block { body, handlers });
         }
         // v2.09: `IF cond THEN ... [ELSIF ...] [ELSE ...] END IF`.
+        // v2.10: conditions go through parse_trigger_cond (plpgsql
+        // SELECT-splice semantics + ISNULL postfix).
         if matches!(self.peek(), Token::Ident(s) if s == "if") {
             self.next(); // 'if'
-            let cond = self.parse_or()?;
+            let cond = self.parse_trigger_cond()?;
             self.expect_keyword("then")?;
             let body = self.parse_trigger_stmt_list()?;
             let mut branches = vec![(cond, body)];
             while matches!(self.peek(), Token::Ident(s) if s == "elsif") {
                 self.next(); // 'elsif'
-                let c = self.parse_or()?;
+                let c = self.parse_trigger_cond()?;
                 self.expect_keyword("then")?;
                 let b = self.parse_trigger_stmt_list()?;
                 branches.push((c, b));
@@ -5211,6 +5380,19 @@ impl Parser {
                 branches,
                 else_body,
             });
+        }
+        // v2.10: whole-row assignment `NEW := <expr>` / `NEW = <expr>`.
+        if matches!(self.peek(), Token::Ident(s) if s == "new")
+            && (matches!(self.peek2(), Token::Eq)
+                || (matches!(self.peek2(), Token::Colon) && matches!(self.peek3(), Token::Eq)))
+        {
+            self.next(); // 'new'
+            if matches!(self.peek(), Token::Colon) {
+                self.next();
+            }
+            self.next(); // '='
+            let expr = self.parse_or()?;
+            return Ok(TriggerBodyStmt::AssignNewWhole(expr));
         }
         // Assignment: `NEW.<col> = <expr>` or `NEW.<col> := <expr>`.
         // (`OLD` assignments are rejected: PG forbids them.)
@@ -5234,13 +5416,14 @@ impl Parser {
             let expr = self.parse_or()?;
             return Ok(TriggerBodyStmt::Assign { col, expr });
         }
-        // `RETURN NEW | OLD | NULL`.
+        // `RETURN NEW | OLD | NULL` (v2.10: or an ALIAS name).
         if matches!(self.peek(), Token::Ident(s) if s == "return") {
             self.next();
             match self.next() {
                 Token::Ident(s) if s == "new" => return Ok(TriggerBodyStmt::ReturnNew),
                 Token::Ident(s) if s == "old" => return Ok(TriggerBodyStmt::ReturnOld),
                 Token::Ident(s) if s == "null" => return Ok(TriggerBodyStmt::ReturnNull),
+                Token::Ident(s) => return Ok(TriggerBodyStmt::ReturnAlias(s)),
                 other => {
                     return Err(err(format!(
                         "syntax error in trigger body: expected NEW, OLD, or NULL after RETURN, found {:?}",
@@ -5266,6 +5449,22 @@ impl Parser {
                     });
                 }
             };
+            // v2.10: `RAISE EXCEPTION SQLSTATE '<code>'` — no format
+            // string (PG19 PLPGSQL_STMT_RAISE sqlstate option).
+            if matches!(level, RaiseLevel::Exception)
+                && matches!(self.peek(), Token::Ident(s) if s == "sqlstate")
+            {
+                self.next(); // 'sqlstate'
+                return match self.next() {
+                    Token::Str(s) => Ok(TriggerBodyStmt::RaiseSqlstate {
+                        code: s.to_uppercase(),
+                    }),
+                    other => Err(err(format!(
+                        "syntax error in trigger body: expected SQLSTATE string, found {:?}",
+                        other
+                    ))),
+                };
+            }
             let format = match self.next() {
                 Token::Str(s) => s,
                 other => {
@@ -5287,15 +5486,346 @@ impl Parser {
             });
         }
         // v1.96: `PERFORM <expr>`.
+        // v2.10: `PERFORM <query>` — a SELECT / WITH...SELECT / the
+        // `PERFORM FROM ...` shorthand runs as a query for effect.
         if matches!(self.peek(), Token::Ident(s) if s == "perform") {
             self.next();
+            if matches!(self.peek(), Token::Ident(s) if s == "select" || s == "with" || s == "from")
+            {
+                let span = self.capture_sql_span();
+                let text = tokens_to_sql(&span);
+                let text = if matches!(span.first(), Some(Token::Ident(s)) if s == "from") {
+                    format!("select {}", text)
+                } else {
+                    text
+                };
+                let stmt = parse_statement_inner(&text)?;
+                return Ok(TriggerBodyStmt::PerformQuery(stmt));
+            }
             let expr = self.parse_or()?;
             return Ok(TriggerBodyStmt::Perform(expr));
+        }
+        // v2.10: `FOR var IN ... LOOP ... END LOOP`.
+        if matches!(self.peek(), Token::Ident(s) if s == "for")
+            && matches!(self.peek2(), Token::Ident(_))
+        {
+            return self.parse_trigger_for();
+        }
+        // v2.10: `EXECUTE <expr>` — dynamic SQL.
+        if matches!(self.peek(), Token::Ident(s) if s == "execute") {
+            self.next();
+            let expr = self.parse_or()?;
+            return Ok(TriggerBodyStmt::Execute(expr));
+        }
+        // v2.10: SQL statements — INSERT / UPDATE / DELETE / WITH /
+        // SELECT (INTO forms split at the token level).
+        if matches!(self.peek(), Token::Ident(s) if s == "insert" || s == "update" || s == "delete" || s == "with" || s == "select")
+        {
+            let span = self.capture_sql_span();
+            return self.trigger_sql_stmt(span);
+        }
+        // v2.10: `var := <expr>` / `var = <expr>` — assignment to a
+        // DECLAREd variable.
+        if let Token::Ident(var) = self.peek().clone() {
+            let is_assign = matches!(self.peek2(), Token::Eq)
+                || (matches!(self.peek2(), Token::Colon) && matches!(self.peek3(), Token::Eq));
+            if is_assign {
+                self.next(); // var
+                if matches!(self.peek(), Token::Colon) {
+                    self.next();
+                }
+                self.next(); // '='
+                let expr = self.parse_or()?;
+                return Ok(TriggerBodyStmt::VarAssign { var, expr });
+            }
         }
         Err(err(format!(
             "syntax error in trigger body: unexpected {:?}",
             self.peek()
         )))
+    }
+
+    /// v2.10: capture the tokens of one SQL statement starting at the
+    /// current position, stopping before the `;` at paren depth 0
+    /// (or before a body-list terminator / EOF). CASE...END pairs are
+    /// tracked so an `END` inside an expression does not terminate
+    /// the span early. The terminating token is NOT consumed.
+    pub(crate) fn capture_sql_span(&mut self) -> Vec<Token> {
+        let start = self.pos;
+        let mut depth = 0i32;
+        let mut case_depth = 0i32;
+        let mut i = self.pos;
+        while let Some(tok) = self.tokens.get(i) {
+            match tok {
+                Token::EOF => break,
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                Token::Semi if depth == 0 && case_depth == 0 => break,
+                Token::Ident(s) if depth == 0 && case_depth == 0 => {
+                    if s == "case" {
+                        case_depth += 1;
+                    } else if s == "end" || s == "exception" || s == "elsif" || s == "else" {
+                        break;
+                    }
+                }
+                Token::Ident(s) if depth == 0 && s == "case" => case_depth += 1,
+                Token::Ident(s) if depth == 0 && s == "end" && case_depth > 0 => {
+                    case_depth -= 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let span = self.tokens[start..i].to_vec();
+        self.pos = i;
+        span
+    }
+
+    /// v2.10: turn a captured SQL statement span into a trigger-body
+    /// statement: SELECT / WITH...SELECT spans are split at a
+    /// top-level INTO clause (SELECT INTO); everything else parses
+    /// as a plain statement (DML). A SELECT without INTO becomes a
+    /// zero-target SelectInto, which raises PG's "query has no
+    /// destination" error at fire time (not at CREATE time).
+    pub(crate) fn trigger_sql_stmt(
+        &mut self,
+        span: Vec<Token>,
+    ) -> Result<TriggerBodyStmt, SqlError> {
+        let is_select_span = matches!(span.first(), Some(Token::Ident(s)) if s == "select")
+            || (matches!(span.first(), Some(Token::Ident(s)) if s == "with")
+                && with_main_verb(&span) == Some("select"));
+        if is_select_span {
+            if let Some((targets, query_tokens)) = split_select_into(&span) {
+                let text = tokens_to_sql(&query_tokens);
+                let stmt = parse_statement_inner(&text)?;
+                return Ok(TriggerBodyStmt::SelectInto {
+                    targets,
+                    query: Box::new(stmt),
+                });
+            }
+            let text = tokens_to_sql(&span);
+            let stmt = parse_statement_inner(&text)?;
+            return Ok(TriggerBodyStmt::SelectInto {
+                targets: Vec::new(),
+                query: Box::new(stmt),
+            });
+        }
+        // v2.10: DML with `RETURNING ... INTO <targets>` — the INTO
+        // segment trails the RETURNING list; split it off and bind
+        // the first returned row at execution.
+        if matches!(span.first(), Some(Token::Ident(s)) if s == "insert" || s == "update" || s == "delete")
+            || (matches!(span.first(), Some(Token::Ident(s)) if s == "with")
+                && matches!(
+                    with_main_verb(&span),
+                    Some("insert") | Some("update") | Some("delete")
+                ))
+        {
+            let mut depth = 0i32;
+            let mut returning_at: Option<usize> = None;
+            let mut into_at: Option<usize> = None;
+            for (i, t) in span.iter().enumerate() {
+                match t {
+                    Token::LParen => depth += 1,
+                    Token::RParen => depth -= 1,
+                    Token::Ident(s) if depth == 0 && s == "returning" => {
+                        returning_at = Some(i);
+                    }
+                    Token::Ident(s) if depth == 0 && s == "into" => {
+                        if returning_at.is_some() {
+                            into_at = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(ia) = into_at {
+                let mut targets: Vec<TrigIntoTarget> = Vec::new();
+                let mut j = ia + 1;
+                let mut valid = true;
+                loop {
+                    match span.get(j) {
+                        Some(Token::Ident(name)) => {
+                            let name = name.clone();
+                            if matches!(span.get(j + 1), Some(Token::Dot)) {
+                                match span.get(j + 2) {
+                                    Some(Token::Ident(col)) => {
+                                        if name == "new" {
+                                            targets.push(TrigIntoTarget::NewCol(col.clone()));
+                                        } else {
+                                            targets.push(TrigIntoTarget::Var(name));
+                                        }
+                                        j += 3;
+                                    }
+                                    _ => {
+                                        valid = false;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                targets.push(TrigIntoTarget::Var(name));
+                                j += 1;
+                            }
+                        }
+                        _ => {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    if matches!(span.get(j), Some(Token::Comma)) {
+                        j += 1;
+                        continue;
+                    }
+                    break;
+                }
+                if valid && j == span.len() && !targets.is_empty() {
+                    let text = tokens_to_sql(&span[..ia]);
+                    let stmt = parse_statement_inner(&text)?;
+                    return Ok(TriggerBodyStmt::DmlInto {
+                        targets,
+                        stmt: Box::new(stmt),
+                    });
+                }
+            }
+        }
+        let text = tokens_to_sql(&span);
+        let stmt = parse_statement_inner(&text)?;
+        Ok(TriggerBodyStmt::Dml(stmt))
+    }
+
+    /// v2.10: parse `FOR var IN ... LOOP body END LOOP` (the FOR is
+    /// at the current position). Forms: integer range
+    /// `[REVERSE] low .. high`, query, and `EXECUTE <expr>`.
+    pub(crate) fn parse_trigger_for(&mut self) -> Result<TriggerBodyStmt, SqlError> {
+        self.next(); // 'for'
+        let var = self.expect_ident()?;
+        self.expect_keyword("in")?;
+        let reverse = self.eat_keyword("reverse");
+        // `FOR var IN EXECUTE <expr> LOOP`.
+        if matches!(self.peek(), Token::Ident(s) if s == "execute") {
+            self.next();
+            let expr = self.parse_or()?;
+            self.expect_keyword("loop")?;
+            let body = self.parse_trigger_stmt_list()?;
+            self.expect_keyword("end")?;
+            self.expect_keyword("loop")?;
+            return Ok(TriggerBodyStmt::ForQuery {
+                var,
+                source: TrigForSource::Dynamic(expr),
+                body,
+            });
+        }
+        // Scan for a top-level `..` (range) vs `LOOP` (query).
+        let mut depth = 0i32;
+        let mut case_depth = 0i32;
+        let mut i = self.pos;
+        let mut dotdot: Option<usize> = None;
+        let mut loop_at: Option<usize> = None;
+        while let Some(tok) = self.tokens.get(i) {
+            match tok {
+                Token::EOF => break,
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                Token::Semi if depth == 0 => break,
+                Token::Dot if depth == 0 && matches!(self.tokens.get(i + 1), Some(Token::Dot)) => {
+                    dotdot = Some(i);
+                    break;
+                }
+                // The lexer fuses `1..3` into Number("1.") +
+                // Number(".3"); treat that pair as a range too.
+                Token::Number(a)
+                    if depth == 0
+                        && a.len() > 1
+                        && a.ends_with('.')
+                        && matches!(self.tokens.get(i + 1), Some(Token::Number(b)) if b.starts_with('.') && b.len() > 1) =>
+                {
+                    dotdot = Some(i);
+                    break;
+                }
+                Token::Ident(s) if depth == 0 && case_depth == 0 => {
+                    if s == "case" {
+                        case_depth += 1;
+                    } else if s == "loop" {
+                        loop_at = Some(i);
+                        break;
+                    } else if s == "end" {
+                        break;
+                    }
+                }
+                Token::Ident(s) if depth == 0 && s == "case" => case_depth += 1,
+                Token::Ident(s) if depth == 0 && s == "end" && case_depth > 0 => {
+                    case_depth -= 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if let Some(dd) = dotdot {
+            // Fused-number form (`1..3`): the bounds split inside the
+            // two Number tokens at dd and dd+1.
+            let fused = matches!(self.tokens.get(dd), Some(Token::Number(a)) if a.ends_with('.'));
+            // Find the LOOP keyword after the high bound.
+            let mut j = dd + 2;
+            let mut d2 = 0i32;
+            while let Some(tok) = self.tokens.get(j) {
+                match tok {
+                    Token::LParen => d2 += 1,
+                    Token::RParen => d2 -= 1,
+                    Token::Ident(s) if d2 == 0 && s == "loop" => break,
+                    Token::EOF => break,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if !matches!(self.tokens.get(j), Some(Token::Ident(s)) if s == "loop") {
+                return Err(err(
+                    "syntax error in trigger body: expected LOOP in FOR".to_string()
+                ));
+            }
+            let (low, high) = if fused {
+                let (a, b) = match (self.tokens.get(dd), self.tokens.get(dd + 1)) {
+                    (Some(Token::Number(a)), Some(Token::Number(b))) => (a.clone(), b.clone()),
+                    _ => unreachable!(),
+                };
+                let mut low_toks = self.tokens[self.pos..dd].to_vec();
+                low_toks.push(Token::Number(a.trim_end_matches('.').to_string()));
+                let mut high_toks = vec![Token::Number(b[1..].to_string())];
+                high_toks.extend_from_slice(&self.tokens[dd + 2..j]);
+                (expr_from_tokens(&low_toks)?, expr_from_tokens(&high_toks)?)
+            } else {
+                (
+                    expr_from_tokens(&self.tokens[self.pos..dd])?,
+                    expr_from_tokens(&self.tokens[dd + 2..j])?,
+                )
+            };
+            self.pos = j + 1; // past LOOP
+            let body = self.parse_trigger_stmt_list()?;
+            self.expect_keyword("end")?;
+            self.expect_keyword("loop")?;
+            return Ok(TriggerBodyStmt::ForRange {
+                var,
+                low,
+                high,
+                reverse,
+                body,
+            });
+        }
+        let Some(la) = loop_at else {
+            return Err(err(
+                "syntax error in trigger body: expected LOOP in FOR".to_string()
+            ));
+        };
+        let text = tokens_to_sql(&self.tokens[self.pos..la]);
+        let stmt = parse_statement_inner(&text)?;
+        self.pos = la + 1; // past LOOP
+        let body = self.parse_trigger_stmt_list()?;
+        self.expect_keyword("end")?;
+        self.expect_keyword("loop")?;
+        Ok(TriggerBodyStmt::ForQuery {
+            var,
+            source: TrigForSource::Query(stmt),
+            body,
+        })
     }
 
     /// v0.86: `DROP OPERATOR [IF EXISTS] name (lefttype, righttype)`
@@ -15402,6 +15932,199 @@ pub fn collect_table_refs(sel: &SelectStmt, out: &mut Vec<String>) {
     }
 }
 
+/// v2.10: parse an expression from a token slice (used for FOR-loop
+/// range bounds captured out of a trigger body).
+pub(crate) fn expr_from_tokens(toks: &[Token]) -> Result<Expr, SqlError> {
+    let mut toks = toks.to_vec();
+    toks.push(Token::EOF);
+    let mut p = Parser {
+        tokens: toks,
+        pos: 0,
+        unnamed_seq: 0,
+        allow_similar_to: true,
+        last_bit_typmod: None,
+    };
+    let e = p.parse_or()?;
+    match p.next() {
+        Token::EOF => Ok(e),
+        other => Err(err(format!(
+            "syntax error in trigger body: unexpected {:?} in expression",
+            other
+        ))),
+    }
+}
+
+/// v2.10: for a span starting with WITH, find the main statement verb
+/// (`select` / `insert` / `update` / `delete`) after the CTE list.
+pub(crate) fn with_main_verb(span: &[Token]) -> Option<&'static str> {
+    let mut i = 1; // past WITH
+    if matches!(span.get(i), Some(Token::Ident(s)) if s == "recursive") {
+        i += 1;
+    }
+    loop {
+        // CTE name
+        match span.get(i) {
+            Some(Token::Ident(_)) | Some(Token::QIdent(_)) => i += 1,
+            _ => return None,
+        }
+        // optional (column list)
+        if matches!(span.get(i), Some(Token::LParen)) {
+            let mut depth = 0i32;
+            while let Some(t) = span.get(i) {
+                match t {
+                    Token::LParen => depth += 1,
+                    Token::RParen => {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    Token::EOF => return None,
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+        // AS [NOT] [MATERIALIZED] ( body )
+        if !matches!(span.get(i), Some(Token::Ident(s)) if s == "as") {
+            return None;
+        }
+        i += 1;
+        if matches!(span.get(i), Some(Token::Ident(s)) if s == "not") {
+            i += 1;
+        }
+        if matches!(span.get(i), Some(Token::Ident(s)) if s == "materialized") {
+            i += 1;
+        }
+        if !matches!(span.get(i), Some(Token::LParen)) {
+            return None;
+        }
+        let mut depth = 0i32;
+        while let Some(t) = span.get(i) {
+            match t {
+                Token::LParen => depth += 1,
+                Token::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        i += 1;
+                        break;
+                    }
+                }
+                Token::EOF => return None,
+                _ => {}
+            }
+            i += 1;
+        }
+        if matches!(span.get(i), Some(Token::Comma)) {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    match span.get(i) {
+        Some(Token::Ident(s)) if s == "select" => Some("select"),
+        Some(Token::Ident(s)) if s == "insert" => Some("insert"),
+        Some(Token::Ident(s)) if s == "update" => Some("update"),
+        Some(Token::Ident(s)) if s == "delete" => Some("delete"),
+        _ => None,
+    }
+}
+
+/// v2.10: split a SELECT span at its top-level INTO clause. Returns
+/// the INTO targets and the remaining query tokens (span minus the
+/// `INTO <targets>` segment), or None when there is no top-level
+/// INTO. Targets are `var`, `var.field` (record — modeled as the
+/// variable), or `NEW.col`.
+pub(crate) fn split_select_into(span: &[Token]) -> Option<(Vec<TrigIntoTarget>, Vec<Token>)> {
+    // Parenthesized regions (CTE bodies, subqueries) are skipped by
+    // the depth tracking, so the first depth-0 INTO is the main
+    // statement's INTO clause.
+    let mut depth = 0i32;
+    let mut into_at: Option<usize> = None;
+    let mut i = 0;
+    while let Some(t) = span.get(i) {
+        match t {
+            Token::LParen => depth += 1,
+            Token::RParen => depth -= 1,
+            Token::Ident(s) if depth == 0 && s == "into" => {
+                into_at = Some(i);
+                break;
+            }
+            Token::EOF => break,
+            _ => {}
+        }
+        i += 1;
+    }
+    let into_at = into_at?;
+    // Parse the target list: ident [. ident] (, ident [. ident])*
+    // until a clause keyword or a non-matching token.
+    const STOP: &[&str] = &[
+        "from",
+        "where",
+        "group",
+        "order",
+        "limit",
+        "having",
+        "union",
+        "intersect",
+        "except",
+        "window",
+        "fetch",
+        "for",
+        "offset",
+        "values",
+        "returning",
+    ];
+    let mut targets: Vec<TrigIntoTarget> = Vec::new();
+    let mut j = into_at + 1;
+    loop {
+        match span.get(j) {
+            Some(Token::Ident(name)) => {
+                let name = name.clone();
+                if matches!(span.get(j + 1), Some(Token::Dot)) {
+                    match span.get(j + 2) {
+                        Some(Token::Ident(col)) => {
+                            let col = col.clone();
+                            if name == "new" {
+                                targets.push(TrigIntoTarget::NewCol(col));
+                            } else {
+                                targets.push(TrigIntoTarget::Var(name));
+                            }
+                            j += 3;
+                        }
+                        _ => return None,
+                    }
+                } else {
+                    targets.push(TrigIntoTarget::Var(name));
+                    j += 1;
+                }
+            }
+            Some(Token::QIdent(name)) => {
+                targets.push(TrigIntoTarget::Var(name.clone()));
+                j += 1;
+            }
+            _ => return None,
+        }
+        if matches!(span.get(j), Some(Token::Comma)) {
+            j += 1;
+            continue;
+        }
+        break;
+    }
+    if targets.is_empty() {
+        return None;
+    }
+    if let Some(Token::Ident(s)) = span.get(j) {
+        if !STOP.contains(&s.as_str()) {
+            return None;
+        }
+    }
+    let mut query: Vec<Token> = span[..into_at].to_vec();
+    query.extend_from_slice(&span[j..]);
+    Some((targets, query))
+}
+
 /// Parse one statement from already-trimmed text (no view interception).
 pub(crate) fn parse_statement_inner(text: &str) -> Result<Stmt, SqlError> {
     let tokens = tokenize(text)?;
@@ -16695,6 +17418,9 @@ pub(crate) fn coltype_by_name(name: &str) -> Result<ColType, String> {
         "real" | "float4" => ColType::Float4,
         "numeric" | "decimal" => ColType::Numeric(None),
         "text" | "varchar" | "character varying" => ColType::Text,
+        // v2.10: `bpchar` (and bare char names) resolve as function
+        // argument/return types too (PG's internal name for char).
+        "bpchar" | "char" | "character" => ColType::Char(None),
         "boolean" | "bool" => ColType::Bool,
         "date" => ColType::Date,
         "timestamp" | "timestamp without time zone" => ColType::Timestamp,

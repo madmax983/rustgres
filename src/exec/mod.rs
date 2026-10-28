@@ -44,9 +44,9 @@ pub(crate) use crate::sql::{
     IsolationLevel, JoinKind, JsonOp, JsonTableSpec, JtBehavior, JtColumn, Literal, MergeAction,
     MergeWhen, OnConflict, OrderTerm, OrderedSetAgg, PolicyCmd, QuantKind, QuantOp, RaiseLevel,
     SelectItem, SelectStmt, SequenceOpts, SerialKind, SetOpKind, SetOpRoot, SqlError, Stmt,
-    TableDef, TriggerBodyStmt, TriggerDef, TriggerTiming, UniqueDef, WindowFrame, WindowFunc,
-    collect_col_refs, collect_table_refs, parse_statement, parse_trigger_body, trig_event,
-    validate_constraint_expr,
+    TableDef, TrigCond, TrigForSource, TrigIntoTarget, TriggerBody, TriggerBodyStmt, TriggerDef,
+    TriggerTiming, UniqueDef, WindowFrame, WindowFunc, collect_col_refs, collect_table_refs,
+    parse_statement, parse_trigger_body, trig_event, validate_constraint_expr,
 };
 pub(crate) use crate::storage::index_visible;
 pub(crate) use crate::storage::{
@@ -307,6 +307,9 @@ mod v208_tests;
 #[cfg(test)]
 #[path = "test_mods/v209_tests.rs"]
 mod v209_tests;
+#[cfg(test)]
+#[path = "test_mods/v210_tests.rs"]
+mod v210_tests;
 #[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;

@@ -2254,11 +2254,10 @@ pub(crate) fn eval_func(
             format!("trigger with OID {} does not exist", oid),
         ));
     }
-    // v2.09: pg_trigger_depth() — 0 outside a trigger (the only
-    // context this engine can be asked from SQL; bodies do not call
-    // it in the supported subset).
+    // v2.09/v2.10: pg_trigger_depth() — the live trigger call depth
+    // (trigger.c's counter, thread-local here); 0 outside a trigger.
     if name == "pg_trigger_depth" && args.is_empty() {
-        return Ok(Value::Int(0));
+        return Ok(Value::Int(TriggerDepthGuard::current()));
     }
     if name == "pg_get_expr" && !args.is_empty() {
         let v = eval_expr(q, scopes, &args[0])?;
@@ -3233,6 +3232,8 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         "pg_lsn" => n == 1,
         // v0.73: row_to_json(record) takes exactly one argument.
         "row_to_json" => n == 1,
+        // v2.10: make_tuple_indirect(record) takes exactly one argument.
+        "make_tuple_indirect" => n == 1,
         "scale" | "trim_scale" => n == 1,
         "min_scale" => n == 1,
         "pi" | "random" => n == 0,
@@ -3699,6 +3700,10 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         "boolne" => eval_cmp_vals(CmpOp::Ne, &vals[0], &vals[1]),
         // v0.73: row_to_json(record) -> json (json.c). The JSON document
         // is carried as text typed `ColType::Json`.
+        // v2.10: make_tuple_indirect(record) -> record (PG converts
+        // the tuple to an indirect TOAST pointer; this engine has no
+        // TOAST indirection, so the faithful result is the identity).
+        "make_tuple_indirect" => Ok(vals[0].clone()),
         "row_to_json" => match &vals[0] {
             Value::Null => Ok(Value::Null),
             Value::Record(fields) => Ok(Value::text(row_to_json_text(fields))),
@@ -11618,6 +11623,8 @@ pub(crate) fn func_result_type(
         "pg_lsn" => Ok(ColType::PgLsn), // v0.64: native pg_lsn type (OID 3220)
         // v0.73: row_to_json returns json (OID 114).
         "row_to_json" => Ok(ColType::Json),
+        // v2.10: make_tuple_indirect returns its record argument's type.
+        "make_tuple_indirect" => Ok(ColType::Record),
         // v0.76: pg_typeof returns regtype (reported as text); json_array
         // returns json (OID 114).
         "pg_typeof" => Ok(ColType::Text),

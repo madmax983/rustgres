@@ -3201,6 +3201,10 @@ pub(crate) fn def_add_check(
     // v2.06: NOT VALID / NOT ENFORCED from the attribute tail.
     not_valid: bool,
     enforced: bool,
+    // v2.10: with `INHERITS`, referenced columns may come from the
+    // parents; the existence check is deferred to exec, which
+    // validates against the merged column list (see def_add_pkey).
+    defer_col_check: bool,
 ) -> Result<(), SqlError> {
     let cname = match &name {
         Some(n) => {
@@ -3221,7 +3225,7 @@ pub(crate) fn def_add_check(
                 q, r
             )));
         }
-        if !def_col_exists(def, &r) {
+        if !defer_col_check && !def_col_exists(def, &r) {
             return Err(err(format!("column \"{}\" does not exist", r)));
         }
     }
@@ -3402,6 +3406,7 @@ pub(crate) fn build_table_def(
                             &c.name,
                             *nv,
                             *enf,
+                            !inherits.is_empty(),
                         )?,
                         ColCon::References { name: n, tail } => def_add_fk(
                             table,
@@ -3457,9 +3462,16 @@ pub(crate) fn build_table_def(
                         *nnd,
                     )?
                 }
-                ParsedTableCon::Check(n, e, nv, enf) => {
-                    def_add_check(table, &mut def, n.clone(), e.clone(), table, *nv, *enf)?
-                }
+                ParsedTableCon::Check(n, e, nv, enf) => def_add_check(
+                    table,
+                    &mut def,
+                    n.clone(),
+                    e.clone(),
+                    table,
+                    *nv,
+                    *enf,
+                    !inherits.is_empty(),
+                )?,
                 // v0.76: `CONSTRAINT name NOT NULL col` in CREATE TABLE —
                 // PG doesn't allow this syntax here, but we accept it by
                 // marking the column NOT NULL (like a column constraint).
@@ -5884,7 +5896,7 @@ pub fn parse_plpgsql_body(
 ///
 /// Expressions reuse the main SQL expression parser. Anything else is a
 /// 42601 syntax error (like PG's plpgsql validator at CREATE time).
-pub fn parse_trigger_body(body: &str) -> Result<Vec<TriggerBodyStmt>, SqlError> {
+pub fn parse_trigger_body(body: &str) -> Result<TriggerBody, SqlError> {
     let tokens = tokenize(body)?;
     let mut p = Parser {
         tokens,
@@ -5894,6 +5906,55 @@ pub fn parse_trigger_body(body: &str) -> Result<Vec<TriggerBodyStmt>, SqlError> 
         last_bit_typmod: None,
     };
     p.parse_trigger_body_stmts()
+}
+
+/// v2.10: a parsed trigger-function body: the optional `DECLARE`
+/// section's variables (name + optional default expression; declared
+/// types are consumed but not modeled — values are dynamically typed
+/// like the rest of the bounded trigger grammar) plus the statement
+/// list.
+#[derive(Clone, Debug)]
+pub struct TriggerBody {
+    pub decls: Vec<TriggerDecl>,
+    pub stmts: Vec<TriggerBodyStmt>,
+}
+
+/// v2.10: one `DECLARE`d variable of a trigger body.
+#[derive(Clone, Debug)]
+pub struct TriggerDecl {
+    pub name: String,
+    pub default: Option<Expr>,
+    /// v2.10: `name ALIAS FOR NEW|OLD` — the variable names the
+    /// trigger's row image (PG19 plpgsql alias declarations).
+    pub alias_for: Option<String>,
+}
+
+/// v2.10: an IF/ELSIF condition of a trigger body. plpgsql splices
+/// the condition text into a SELECT, so a condition may be a plain
+/// expression or a query fragment (`count(*) = 0 FROM t WHERE ...`).
+#[derive(Clone, Debug)]
+pub enum TrigCond {
+    Expr(Expr),
+    Query(Box<Stmt>),
+}
+
+/// v2.10: a `SELECT ... INTO` / DML target in a trigger body.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TrigIntoTarget {
+    /// A DECLAREd variable (or the FOR record variable).
+    Var(String),
+    /// `NEW.<col>`.
+    NewCol(String),
+}
+
+/// v2.10: the row source of a `FOR var IN ... LOOP`.
+#[derive(Clone, Debug)]
+pub enum TrigForSource {
+    /// A parsed query statement (`Stmt::Select`).
+    Query(Stmt),
+    /// `FOR var IN EXECUTE <expr> LOOP` — the expression yields the
+    /// query text at run time.
+    Dynamic(Expr),
 }
 
 /// v0.86: `VOLATILE` / `STABLE` / `IMMUTABLE` markers. Stored for
@@ -6026,9 +6087,12 @@ pub enum TriggerBodyStmt {
     /// [ELSE <body>] END IF` (PG19 plpgsql PLPGSQL_STMT_IF). Branches
     /// are tried in order; the first true condition's body runs.
     If {
-        branches: Vec<(Expr, Vec<TriggerBodyStmt>)>,
+        branches: Vec<(TrigCond, Vec<TriggerBodyStmt>)>,
         else_body: Vec<TriggerBodyStmt>,
     },
+    /// v2.10: `RETURN <alias>` where the name is an ALIAS FOR NEW /
+    /// OLD declaration (PG allows returning the alias directly).
+    ReturnAlias(String),
     /// v2.09: a nested `BEGIN <body> [EXCEPTION WHEN <cond> THEN
     /// <body> ...] END` block (PG19 PLPGSQL_STMT_BLOCK with an
     /// exception section). Handler keys are lowercased condition
@@ -6039,6 +6103,65 @@ pub enum TriggerBodyStmt {
     Block {
         body: Vec<TriggerBodyStmt>,
         handlers: Vec<(Vec<String>, Vec<TriggerBodyStmt>)>,
+    },
+    /// v2.10: `var := <expr>` / `var = <expr>` — assignment to a
+    /// DECLAREd variable (PG19 PLPGSQL_STMT_ASSIGN for scalars).
+    VarAssign { var: String, expr: Expr },
+    /// v2.10: `NEW := <expr>` — whole-row assignment to NEW (PG19
+    /// PLPGSQL_STMT_ASSIGN on the NEW record); the expression must
+    /// evaluate to a record, whose fields replace NEW's by name.
+    AssignNewWhole(Expr),
+    /// v2.10: a DML statement (`INSERT` / `UPDATE` / `DELETE`,
+    /// including the `WITH ... <dml>` forms) executed through the
+    /// statement executor with NEW/OLD/variable binding (PG19
+    /// PLPGSQL_STMT_EXECSQL for DML). Sets FOUND from the affected
+    /// row count.
+    Dml(Stmt),
+    /// v2.10: `SELECT ... INTO <targets>` (PG19
+    /// PLPGSQL_STMT_EXECSQL with an INTO clause; non-STRICT: no rows
+    /// leaves targets NULL and FOUND false, extra rows are ignored
+    /// after the first).
+    SelectInto {
+        targets: Vec<TrigIntoTarget>,
+        query: Box<Stmt>,
+    },
+    /// v2.10: DML with `RETURNING ... INTO <targets>` (PG19
+    /// PLPGSQL_STMT_EXECSQL: the INTO clause after RETURNING binds
+    /// the first returned row).
+    DmlInto {
+        targets: Vec<TrigIntoTarget>,
+        stmt: Box<Stmt>,
+    },
+    /// v2.10: `PERFORM <query>` — a SELECT (or WITH...SELECT, or the
+    /// `PERFORM FROM ...` shorthand) run for effect, rows discarded,
+    /// FOUND set (PG19 PLPGSQL_STMT_PERFORM over an EXECSQL query).
+    PerformQuery(Stmt),
+    /// v2.10: `EXECUTE <expr>` — dynamic SQL (PG19
+    /// PLPGSQL_STMT_DYNEXECUTE without INTO/USING, which stay
+    /// unsupported). The expression yields the command text, which is
+    /// parsed and executed through the statement executor.
+    Execute(Expr),
+    /// v2.10: `RAISE EXCEPTION SQLSTATE '<code>'` (PG19
+    /// PLPGSQL_STMT_RAISE with a SQLSTATE option and no format
+    /// string; the message is empty).
+    RaiseSqlstate { code: String },
+    /// v2.10: `FOR var IN <low> .. <high> LOOP` (PG19
+    /// PLPGSQL_STMT_FORC; `REVERSE` iterates downward).
+    ForRange {
+        var: String,
+        low: Expr,
+        high: Expr,
+        reverse: bool,
+        body: Vec<TriggerBodyStmt>,
+    },
+    /// v2.10: `FOR var IN <query> LOOP` / `FOR var IN EXECUTE <expr>
+    /// LOOP` (PG19 PLPGSQL_STMT_FORS / DYNFORS). The variable binds
+    /// each row: `var` reads as the first column, `var.<col>` as the
+    /// named column.
+    ForQuery {
+        var: String,
+        source: TrigForSource,
+        body: Vec<TriggerBodyStmt>,
     },
 }
 

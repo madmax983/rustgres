@@ -1385,7 +1385,7 @@ pub(crate) fn fire_before_insert_triggers(
         return Ok(rows.iter().map(|r| Some(r.clone())).collect());
     }
     // Resolve and parse each trigger's function body once.
-    let mut bodies: Vec<Vec<TriggerBodyStmt>> = Vec::with_capacity(firing.len());
+    let mut bodies: Vec<TriggerBody> = Vec::with_capacity(firing.len());
     for tr in &firing {
         let fdef = find_function_by_signature(eng, &tr.function, &[]).ok_or_else(|| {
             exec_err(
@@ -1393,18 +1393,18 @@ pub(crate) fn fire_before_insert_triggers(
                 format!("function {}() does not exist", tr.function),
             )
         })?;
-        let stmts = parse_trigger_body(&fdef.body).map_err(|e| {
+        let body = parse_trigger_body(&fdef.body).map_err(|e| {
             exec_err(
                 e.code,
                 format!("invalid trigger function body: {}", e.message),
             )
         })?;
-        bodies.push(stmts);
+        bodies.push(body);
     }
     let mut out: Vec<Option<Row>> = Vec::with_capacity(rows.len());
     for row in rows {
         let mut cur: Option<Vec<Value>> = Some(row[..].to_vec());
-        for (tr, stmts) in firing.iter().zip(bodies.iter()) {
+        for (tr, body) in firing.iter().zip(bodies.iter()) {
             let Some(row_vals) = cur.take() else { break };
             // v2.09: WHEN gates BEFORE row triggers too (PG19
             // ExecCallTriggerFunc evaluates the qual first).
@@ -1432,7 +1432,7 @@ pub(crate) fn fire_before_insert_triggers(
                 cur = Some(row_vals);
                 continue;
             }
-            cur = exec_trigger_body(eng, ctx, &tctx, cols, Some(&row_vals), None, stmts)?;
+            cur = exec_trigger_body(eng, ctx, &tctx, cols, Some(&row_vals), None, body)?;
         }
         out.push(cur.map(Row::new));
     }
@@ -1487,13 +1487,41 @@ enum RowChoice {
     Old,
 }
 
-/// v1.00/v2.09: execute one trigger-function body for a single row
-/// pair. `new_row` / `old_row` are None when the event has no such
-/// image (INSERT has no OLD; DELETE has no NEW — the missing image
-/// reads as all-NULL, like PG). Returns the row the function
+/// v2.10: mutable per-invocation state of a trigger body: DECLAREd
+/// variables, FOR-loop record bindings (variable name -> the current
+/// row as (column name, value) pairs), and the FOUND flag (PG19
+/// plpgsql's `found` variable, set by DML / SELECT INTO / PERFORM /
+/// FOR).
+#[derive(Default)]
+pub(crate) struct TrigRun {
+    pub vars: HashMap<String, Value>,
+    pub recs: HashMap<String, Vec<(String, Value)>>,
+    pub found: bool,
+    /// v2.10: `ALIAS FOR NEW|OLD` bindings (true = NEW, false = OLD).
+    pub aliases: HashMap<String, bool>,
+}
+
+impl TrigRun {
+    /// Read a scalar variable: a record variable reads as its first
+    /// column (bounded model of PG's composite read in scalar
+    /// contexts the suites use).
+    fn get_var(&self, name: &str) -> Option<Value> {
+        if let Some(row) = self.recs.get(name) {
+            return row.first().map(|(_, v)| v.clone());
+        }
+        self.vars.get(name).cloned()
+    }
+}
+
+/// v1.00/v2.09/v2.10: execute one trigger-function body for a single
+/// row pair. `new_row` / `old_row` are None when the event has no
+/// such image (INSERT has no OLD; DELETE has no NEW — the missing
+/// image reads as all-NULL, like PG). Returns the row the function
 /// returned: Some(row) for RETURN NEW/OLD (with NEW assignments
 /// applied), None for RETURN NULL. Falling off the end without
-/// RETURN is 2F005, as in PG.
+/// RETURN is 2F005, as in PG. v2.10: the invocation runs at
+/// pg_trigger_depth()+1 (RAII guard) and DECLARE defaults are
+/// evaluated in declaration order.
 pub(crate) fn exec_trigger_body(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -1501,12 +1529,34 @@ pub(crate) fn exec_trigger_body(
     cols: &[(String, ColType)],
     new_row: Option<&[Value]>,
     old_row: Option<&[Value]>,
-    stmts: &[TriggerBodyStmt],
+    body: &TriggerBody,
 ) -> Result<Option<Vec<Value>>, ExecError> {
+    let _depth = TriggerDepthGuard::enter()?;
     let nulls: Vec<Value> = vec![Value::Null; cols.len()];
     let mut new_vals: Vec<Value> = new_row.unwrap_or(&nulls).to_vec();
     let old_vals: Vec<Value> = old_row.unwrap_or(&nulls).to_vec();
-    match exec_trigger_stmts(eng, ctx, tctx, cols, &mut new_vals, &old_vals, stmts)? {
+    let mut run = TrigRun::default();
+    for d in &body.decls {
+        if let Some(target) = &d.alias_for {
+            run.aliases.insert(d.name.clone(), target == "new");
+            continue;
+        }
+        let v = match &d.default {
+            Some(e) => eval_trigger_expr(eng, ctx, tctx, cols, &new_vals, &old_vals, &run, e)?,
+            None => Value::Null,
+        };
+        run.vars.insert(d.name.clone(), v);
+    }
+    match exec_trigger_stmts(
+        eng,
+        ctx,
+        tctx,
+        cols,
+        &mut new_vals,
+        &old_vals,
+        &mut run,
+        &body.stmts,
+    )? {
         TrigFlow::Return(Some(RowChoice::New)) => Ok(Some(new_vals)),
         TrigFlow::Return(Some(RowChoice::Old)) => Ok(Some(old_vals)),
         TrigFlow::Return(None) => Ok(None),
@@ -1524,6 +1574,7 @@ fn exec_trigger_stmts(
     cols: &[(String, ColType)],
     new_vals: &mut Vec<Value>,
     old_vals: &[Value],
+    run: &mut TrigRun,
     stmts: &[TriggerBodyStmt],
 ) -> Result<TrigFlow, ExecError> {
     for stmt in stmts {
@@ -1538,11 +1589,11 @@ fn exec_trigger_stmts(
                         ),
                     )
                 })?;
-                let val = eval_trigger_expr(eng, ctx, tctx, cols, new_vals, old_vals, expr)?;
+                let val = eval_trigger_expr(eng, ctx, tctx, cols, new_vals, old_vals, run, expr)?;
                 new_vals[idx] = coerce_value(val, &cols[idx].1, col)?;
             }
             TriggerBodyStmt::Perform(expr) => {
-                let _ = eval_trigger_expr(eng, ctx, tctx, cols, new_vals, old_vals, expr)?;
+                let _ = eval_trigger_expr(eng, ctx, tctx, cols, new_vals, old_vals, run, expr)?;
             }
             TriggerBodyStmt::ReturnNew => return Ok(TrigFlow::Return(Some(RowChoice::New))),
             TriggerBodyStmt::ReturnOld => return Ok(TrigFlow::Return(Some(RowChoice::Old))),
@@ -1554,7 +1605,7 @@ fn exec_trigger_stmts(
             } => {
                 let vals: Vec<Value> = args
                     .iter()
-                    .map(|e| eval_trigger_expr(eng, ctx, tctx, cols, new_vals, old_vals, e))
+                    .map(|e| eval_trigger_expr(eng, ctx, tctx, cols, new_vals, old_vals, run, e))
                     .collect::<Result<Vec<_>, _>>()?;
                 let msg = format_raise_message(format, &vals);
                 match level {
@@ -1568,10 +1619,26 @@ fn exec_trigger_stmts(
             } => {
                 let mut taken = false;
                 for (cond, body) in branches {
-                    let v = eval_trigger_expr(eng, ctx, tctx, cols, new_vals, old_vals, cond)?;
+                    let v = match cond {
+                        TrigCond::Expr(e) => {
+                            eval_trigger_expr(eng, ctx, tctx, cols, new_vals, old_vals, run, e)?
+                        }
+                        TrigCond::Query(q) => {
+                            let mut bound = (**q).clone();
+                            bind_trigger_stmt(
+                                eng, ctx, tctx, cols, new_vals, old_vals, run, &mut bound,
+                            )?;
+                            let res = execute(eng, ctx, &bound)?;
+                            result_rows(&res)
+                                .first()
+                                .and_then(|r| r.first().cloned())
+                                .unwrap_or(Value::Null)
+                        }
+                    };
                     if matches!(v, Value::Bool(true)) {
-                        let flow =
-                            exec_trigger_stmts(eng, ctx, tctx, cols, new_vals, old_vals, body)?;
+                        let flow = exec_trigger_stmts(
+                            eng, ctx, tctx, cols, new_vals, old_vals, run, body,
+                        )?;
                         if !matches!(flow, TrigFlow::End) {
                             return Ok(flow);
                         }
@@ -1580,15 +1647,17 @@ fn exec_trigger_stmts(
                     }
                 }
                 if !taken && !else_body.is_empty() {
-                    let flow =
-                        exec_trigger_stmts(eng, ctx, tctx, cols, new_vals, old_vals, else_body)?;
+                    let flow = exec_trigger_stmts(
+                        eng, ctx, tctx, cols, new_vals, old_vals, run, else_body,
+                    )?;
                     if !matches!(flow, TrigFlow::End) {
                         return Ok(flow);
                     }
                 }
             }
             TriggerBodyStmt::Block { body, handlers } => {
-                match exec_trigger_stmts(eng, ctx, tctx, cols, new_vals, old_vals, body) {
+                let write_mark = ctx.writes.len();
+                match exec_trigger_stmts(eng, ctx, tctx, cols, new_vals, old_vals, run, body) {
                     Ok(flow) => {
                         if !matches!(flow, TrigFlow::End) {
                             return Ok(flow);
@@ -1609,8 +1678,13 @@ fn exec_trigger_stmts(
                         });
                         match handler {
                             Some((_, hbody)) => {
+                                // v2.10: an EXCEPTION handler is a
+                                // subtransaction in PG — roll the
+                                // failed block's writes back before
+                                // the handler runs.
+                                ctx.writes.truncate(write_mark);
                                 let flow = exec_trigger_stmts(
-                                    eng, ctx, tctx, cols, new_vals, old_vals, hbody,
+                                    eng, ctx, tctx, cols, new_vals, old_vals, run, hbody,
                                 )?;
                                 if !matches!(flow, TrigFlow::End) {
                                     return Ok(flow);
@@ -1621,9 +1695,762 @@ fn exec_trigger_stmts(
                     }
                 }
             }
+            TriggerBodyStmt::ReturnAlias(name) => {
+                return match run.aliases.get(name) {
+                    Some(true) => Ok(TrigFlow::Return(Some(RowChoice::New))),
+                    Some(false) => Ok(TrigFlow::Return(Some(RowChoice::Old))),
+                    None => Err(exec_err(
+                        "42601",
+                        format!(
+                            "RETURN value in a trigger function must be NEW, OLD, NULL, or an alias for one of them (got {:?})",
+                            name
+                        ),
+                    )),
+                };
+            }
+            // ---- v2.10 arms: variables, DML, dynamic SQL, loops ----
+            TriggerBodyStmt::AssignNewWhole(expr) => {
+                let v = eval_trigger_expr(eng, ctx, tctx, cols, new_vals, old_vals, run, expr)?;
+                match v {
+                    Value::Record(fields) => {
+                        for (fname, fval) in &fields {
+                            if let Some(idx) = cols.iter().position(|(n, _)| n == fname) {
+                                new_vals[idx] = coerce_value(fval.clone(), &cols[idx].1, fname)?;
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(exec_err(
+                            "42804",
+                            "assignment to NEW must be a record value".to_string(),
+                        ));
+                    }
+                }
+            }
+            TriggerBodyStmt::VarAssign { var, expr } => {
+                if !run.vars.contains_key(var) && !run.recs.contains_key(var) {
+                    return Err(exec_err(
+                        "42703",
+                        format!("variable \"{}\" does not exist", var),
+                    ));
+                }
+                let val = eval_trigger_expr(eng, ctx, tctx, cols, new_vals, old_vals, run, expr)?;
+                run.recs.remove(var);
+                run.vars.insert(var.clone(), val);
+            }
+            TriggerBodyStmt::Dml(stmt) => {
+                let mut bound = stmt.clone();
+                bind_trigger_stmt(eng, ctx, tctx, cols, new_vals, old_vals, run, &mut bound)?;
+                let res = execute(eng, ctx, &bound)?;
+                run.found = result_affected(&res) > 0;
+            }
+            TriggerBodyStmt::SelectInto { targets, query } => {
+                if targets.is_empty() {
+                    return Err(exec_err(
+                        "42601",
+                        "query has no destination for result data".to_string(),
+                    ));
+                }
+                let mut bound = (**query).clone();
+                bind_trigger_stmt(eng, ctx, tctx, cols, new_vals, old_vals, run, &mut bound)?;
+                let res = execute(eng, ctx, &bound)?;
+                let rows = result_rows(&res);
+                run.found = !rows.is_empty();
+                // v2.10: a single variable target receiving a
+                // multi-column row binds as a record (SELECT INTO
+                // rec * FROM ...), readable as var.<col>.
+                if targets.len() == 1 {
+                    if let TrigIntoTarget::Var(name) = &targets[0] {
+                        if let Some(first) = rows.first() {
+                            if first.len() > 1 {
+                                if let ExecResult::Select { columns, .. } = &res {
+                                    let rec: Vec<(String, Value)> = columns
+                                        .iter()
+                                        .map(|(n, _)| n.clone())
+                                        .zip(first[..].iter().cloned())
+                                        .collect();
+                                    run.recs.insert(name.clone(), rec);
+                                    run.vars.insert(
+                                        name.clone(),
+                                        first.first().cloned().unwrap_or(Value::Null),
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+                assign_into_targets(tctx, cols, new_vals, run, targets, &rows)?;
+            }
+            TriggerBodyStmt::DmlInto { targets, stmt } => {
+                let mut bound = (**stmt).clone();
+                bind_trigger_stmt(eng, ctx, tctx, cols, new_vals, old_vals, run, &mut bound)?;
+                let res = execute(eng, ctx, &bound)?;
+                run.found = result_affected(&res) > 0;
+                let rows = result_rows(&res);
+                assign_into_targets(tctx, cols, new_vals, run, targets, &rows)?;
+            }
+            TriggerBodyStmt::PerformQuery(stmt) => {
+                let mut bound = stmt.clone();
+                bind_trigger_stmt(eng, ctx, tctx, cols, new_vals, old_vals, run, &mut bound)?;
+                let res = execute(eng, ctx, &bound)?;
+                run.found = result_affected(&res) > 0;
+            }
+            TriggerBodyStmt::Execute(expr) => {
+                let v = eval_trigger_expr(eng, ctx, tctx, cols, new_vals, old_vals, run, expr)?;
+                let text = value_to_text_cast(&v);
+                let mut stmt = crate::sql::parse_statement(&text).map_err(sql_err)?;
+                bind_trigger_stmt(eng, ctx, tctx, cols, new_vals, old_vals, run, &mut stmt)?;
+                let res = execute(eng, ctx, &stmt)?;
+                run.found = result_affected(&res) > 0;
+            }
+            TriggerBodyStmt::RaiseSqlstate { code } => {
+                // ExecError.code is &'static str; a user-chosen
+                // SQLSTATE is leaked once per distinct raise site
+                // execution (bounded, process-lifetime).
+                let code: &'static str = Box::leak(code.clone().into_boxed_str());
+                return Err(exec_err(code, String::new()));
+            }
+            TriggerBodyStmt::ForRange {
+                var,
+                low,
+                high,
+                reverse,
+                body,
+            } => {
+                let lo = eval_trigger_expr(eng, ctx, tctx, cols, new_vals, old_vals, run, low)?;
+                let hi = eval_trigger_expr(eng, ctx, tctx, cols, new_vals, old_vals, run, high)?;
+                let (Some(lo), Some(hi)) = (value_as_i64(&lo), value_as_i64(&hi)) else {
+                    return Err(exec_err(
+                        "22P02",
+                        "FOR loop bounds must be integers".to_string(),
+                    ));
+                };
+                let mut vals: Vec<i64> = if *reverse {
+                    (hi..=lo).rev().collect()
+                } else {
+                    (lo..=hi).collect()
+                };
+                if vals.len() > 1_000_000 {
+                    vals.truncate(1_000_000);
+                }
+                run.found = !vals.is_empty();
+                let saved = run.vars.get(var).cloned();
+                for v in vals {
+                    run.vars.insert(var.clone(), Value::BigInt(v));
+                    let flow =
+                        exec_trigger_stmts(eng, ctx, tctx, cols, new_vals, old_vals, run, body)?;
+                    if !matches!(flow, TrigFlow::End) {
+                        return Ok(flow);
+                    }
+                }
+                match saved {
+                    Some(v) => {
+                        run.vars.insert(var.clone(), v);
+                    }
+                    None => {
+                        run.vars.remove(var);
+                    }
+                }
+            }
+            TriggerBodyStmt::ForQuery { var, source, body } => {
+                let stmt = match source {
+                    TrigForSource::Query(s) => s.clone(),
+                    TrigForSource::Dynamic(expr) => {
+                        let v =
+                            eval_trigger_expr(eng, ctx, tctx, cols, new_vals, old_vals, run, expr)?;
+                        crate::sql::parse_statement(&value_to_text_cast(&v)).map_err(sql_err)?
+                    }
+                };
+                let mut bound = stmt;
+                bind_trigger_stmt(eng, ctx, tctx, cols, new_vals, old_vals, run, &mut bound)?;
+                let res = execute(eng, ctx, &bound)?;
+                let (colnames, rows): (Vec<String>, Vec<Row>) = match &res {
+                    ExecResult::Select { columns, rows } => (
+                        columns.iter().map(|(n, _)| n.clone()).collect(),
+                        rows.clone(),
+                    ),
+                    ExecResult::Dml { columns, rows, .. } => (
+                        columns.iter().map(|(n, _)| n.clone()).collect(),
+                        rows.clone(),
+                    ),
+                    _ => (Vec::new(), Vec::new()),
+                };
+                run.found = !rows.is_empty();
+                let saved_var = run.vars.get(var).cloned();
+                let saved_rec = run.recs.get(var).cloned();
+                for row in &rows {
+                    let rec: Vec<(String, Value)> = colnames
+                        .iter()
+                        .cloned()
+                        .zip(row[..].iter().cloned())
+                        .collect();
+                    run.recs.insert(var.clone(), rec);
+                    let flow =
+                        exec_trigger_stmts(eng, ctx, tctx, cols, new_vals, old_vals, run, body)?;
+                    if !matches!(flow, TrigFlow::End) {
+                        return Ok(flow);
+                    }
+                }
+                match saved_rec {
+                    Some(r) => {
+                        run.recs.insert(var.clone(), r);
+                    }
+                    None => {
+                        run.recs.remove(var);
+                    }
+                }
+                match saved_var {
+                    Some(v) => {
+                        run.vars.insert(var.clone(), v);
+                    }
+                    None => {
+                        run.vars.remove(var);
+                    }
+                }
+            }
         }
     }
     Ok(TrigFlow::End)
+}
+
+/// v2.10: assign a result set's first row (or all-NULL when empty)
+/// to SELECT INTO / RETURNING INTO targets.
+fn assign_into_targets(
+    tctx: &TrigCtx,
+    cols: &[(String, ColType)],
+    new_vals: &mut Vec<Value>,
+    run: &mut TrigRun,
+    targets: &[TrigIntoTarget],
+    rows: &[Row],
+) -> Result<(), ExecError> {
+    let first: Vec<Value> = rows
+        .first()
+        .map(|r| r[..].to_vec())
+        .unwrap_or_else(|| vec![Value::Null; targets.len()]);
+    for (i, t) in targets.iter().enumerate() {
+        let v = first.get(i).cloned().unwrap_or(Value::Null);
+        match t {
+            TrigIntoTarget::Var(name) => {
+                run.vars.insert(name.clone(), v);
+            }
+            TrigIntoTarget::NewCol(col) => {
+                let idx = cols.iter().position(|(n, _)| n == col).ok_or_else(|| {
+                    exec_err(
+                        "42703",
+                        format!(
+                            "column \"{}\" of relation \"{}\" does not exist",
+                            col, tctx.table
+                        ),
+                    )
+                })?;
+                new_vals[idx] = coerce_value(v, &cols[idx].1, col)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// v2.10: rows carried by an ExecResult (empty for plain commands).
+fn result_rows(res: &ExecResult) -> Vec<Row> {
+    match res {
+        ExecResult::Select { rows, .. }
+        | ExecResult::Explain { rows, .. }
+        | ExecResult::Dml { rows, .. } => rows.clone(),
+        ExecResult::Command { .. } => Vec::new(),
+    }
+}
+
+/// v2.10: the affected/returned row count of an ExecResult, for
+/// FOUND: SELECT/PERFORM count result rows; DML counts the tag's
+/// trailing count (or RETURNING rows when present).
+fn result_affected(res: &ExecResult) -> usize {
+    match res {
+        ExecResult::Select { rows, .. } | ExecResult::Explain { rows, .. } => rows.len(),
+        ExecResult::Dml { tag, rows, .. } => {
+            if !rows.is_empty() {
+                rows.len()
+            } else {
+                tag.rsplit(' ')
+                    .next()
+                    .and_then(|t| t.parse::<usize>().ok())
+                    .unwrap_or(0)
+            }
+        }
+        ExecResult::Command { tag } => tag
+            .rsplit(' ')
+            .next()
+            .and_then(|t| t.parse::<usize>().ok())
+            .unwrap_or(0),
+    }
+}
+
+fn value_as_i64(v: &Value) -> Option<i64> {
+    match v {
+        Value::SmallInt(i) => Some(*i as i64),
+        Value::Int(i) => Some(*i),
+        Value::BigInt(i) => Some(*i),
+        _ => None,
+    }
+}
+
+/// v2.10: bind a statement about to run from a trigger body: rewrite
+/// NEW.col / OLD.col / variable / record-field / FOUND references to
+/// $N parameters, then fold them to literals with the existing
+/// subst_params walker (the plpgsql binding strategy). References
+/// the bounded rewriter does not reach stay as column refs and fail
+/// or resolve against the statement's own tables, as before.
+fn bind_trigger_stmt(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    tctx: &TrigCtx,
+    cols: &[(String, ColType)],
+    new_vals: &[Value],
+    old_vals: &[Value],
+    run: &TrigRun,
+    stmt: &mut Stmt,
+) -> Result<(), ExecError> {
+    let _ = (eng, ctx);
+    let mut slots: Vec<Option<Value>> = Vec::new();
+    // v2.10: `VALUES (NEW.*)` / `(OLD.*)` — a whole-row reference in
+    // an INSERT row expands to one parameter per column, in the
+    // firing table's column order (PG's NEW.* expansion).
+    if let Stmt::Insert { rows, .. } = stmt {
+        for row in rows.iter_mut() {
+            let mut out: Vec<InsertValue> = Vec::with_capacity(row.len());
+            for v in row.drain(..) {
+                let whole = match &v {
+                    InsertValue::Expr(Expr::WholeRow { qual })
+                        if qual.eq_ignore_ascii_case("new") || qual.eq_ignore_ascii_case("old") =>
+                    {
+                        Some(qual.eq_ignore_ascii_case("new"))
+                    }
+                    _ => None,
+                };
+                match whole {
+                    Some(is_new) => {
+                        let vals = if is_new { new_vals } else { old_vals };
+                        for val in vals {
+                            slots.push(Some(val.clone()));
+                            out.push(InsertValue::Expr(Expr::Param(slots.len() as u32)));
+                        }
+                    }
+                    None => out.push(v),
+                }
+            }
+            *row = out;
+        }
+    }
+    rewrite_stmt_refs(stmt, &mut |e| {
+        rewrite_ref_expr(e, tctx, cols, new_vals, old_vals, run, &mut slots)
+    });
+    if !slots.is_empty() {
+        subst_params(stmt, &slots)?;
+    }
+    Ok(())
+}
+
+/// v2.10: apply an expression rewriter to every expression of the
+/// statement kinds a trigger body can hold (INSERT/UPDATE/DELETE/
+/// SELECT, incl. WITH wrappers handled by subst_params' own CTE
+/// walk — here we rewrite the top-level shapes subst_params would
+/// visit, using the same traversal discipline: rewrite first into
+/// Param placeholders, then let subst_params do the full walk).
+fn rewrite_stmt_refs(stmt: &mut Stmt, f: &mut impl FnMut(&Expr) -> Expr) {
+    match stmt {
+        Stmt::Insert {
+            rows,
+            select,
+            with,
+            on_conflict,
+            returning,
+            ..
+        } => {
+            let _ = (with, on_conflict, returning);
+            for row in rows {
+                for v in row {
+                    if let InsertValue::Expr(e) = v {
+                        *e = f(e);
+                    }
+                }
+            }
+            if let Some(sel) = select {
+                rewrite_select_refs(sel, f);
+            }
+        }
+        Stmt::Select(sel) => rewrite_select_refs(sel, f),
+        Stmt::Update { sets, where_, .. } => {
+            for (_, e) in sets {
+                *e = f(e);
+            }
+            if let Some(w) = where_ {
+                *w = f(w);
+            }
+        }
+        Stmt::Delete { where_, .. } => {
+            if let Some(w) = where_ {
+                *w = f(w);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_select_refs(sel: &mut SelectStmt, f: &mut impl FnMut(&Expr) -> Expr) {
+    for item in &mut sel.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            *expr = f(expr);
+        }
+    }
+    if let Some(w) = &mut sel.where_ {
+        *w = f(w);
+    }
+    if let Some(h) = &mut sel.having {
+        *h = f(h);
+    }
+}
+
+/// v2.10: rewrite one expression's NEW/OLD/var/record/FOUND/TG
+/// references into $N parameter placeholders, appending each bound
+/// value to `slots`. Mirrors subst_tg_vars' variant coverage;
+/// anything unhandled is cloned unchanged.
+fn rewrite_ref_expr(
+    e: &Expr,
+    tctx: &TrigCtx,
+    cols: &[(String, ColType)],
+    new_vals: &[Value],
+    old_vals: &[Value],
+    run: &TrigRun,
+    slots: &mut Vec<Option<Value>>,
+) -> Expr {
+    let push = |v: Value, slots: &mut Vec<Option<Value>>| -> Expr {
+        slots.push(Some(v));
+        Expr::Param(slots.len() as u32)
+    };
+    match e {
+        Expr::Column {
+            table: Some(q),
+            name,
+        } if q.eq_ignore_ascii_case("new") || q.eq_ignore_ascii_case("old") => {
+            if name == "tableoid" {
+                return push(Value::Int(tctx.relid), slots);
+            }
+            let row = if q.eq_ignore_ascii_case("new") {
+                new_vals
+            } else {
+                old_vals
+            };
+            match cols.iter().position(|(n, _)| n == name) {
+                Some(i) => push(row.get(i).cloned().unwrap_or(Value::Null), slots),
+                None => e.clone(),
+            }
+        }
+        Expr::Column {
+            table: Some(q),
+            name,
+        } if run.aliases.contains_key(q.as_str()) => {
+            let is_new = run.aliases[q.as_str()];
+            let row = if is_new { new_vals } else { old_vals };
+            match cols.iter().position(|(n, _)| n == name) {
+                Some(i) => push(row.get(i).cloned().unwrap_or(Value::Null), slots),
+                None => e.clone(),
+            }
+        }
+        Expr::Column {
+            table: Some(q),
+            name,
+        } => match run.recs.get(q.as_str()) {
+            Some(rec) => match rec.iter().find(|(n, _)| n == name) {
+                Some((_, v)) => push(v.clone(), slots),
+                None => e.clone(),
+            },
+            None => e.clone(),
+        },
+        Expr::Column { table: None, name } => {
+            if name == "found" {
+                return push(Value::Bool(run.found), slots);
+            }
+            match run.get_var(name) {
+                Some(v) => push(v, slots),
+                None => match name.as_str() {
+                    "tg_name" => push(Value::text(tctx.name.clone()), slots),
+                    "tg_table_name" => push(Value::text(tctx.table.clone()), slots),
+                    "tg_relname" => push(Value::text(tctx.table.clone()), slots),
+                    "tg_table_schema" => push(Value::text("public".to_string()), slots),
+                    "tg_when" => push(Value::text(tctx.when_name().to_string()), slots),
+                    "tg_op" => push(Value::text(tctx.op_name().to_string()), slots),
+                    "tg_level" => push(Value::text("ROW".to_string()), slots),
+                    "tg_nargs" => push(Value::Int(tctx.args.len() as i64), slots),
+                    "tg_relid" => push(Value::Int(tctx.relid), slots),
+                    _ => e.clone(),
+                },
+            }
+        }
+        Expr::Subscript { array, indices } => {
+            // TG_ARGV[i] folds to the i-th trigger argument (PG:
+            // out-of-range subscripts yield NULL).
+            if let Expr::Column { table: None, name } = &**array {
+                if name == "tg_argv" && indices.len() == 1 {
+                    let idx =
+                        rewrite_ref_expr(&indices[0], tctx, cols, new_vals, old_vals, run, slots);
+                    let i = match &idx {
+                        Expr::Literal(crate::sql::Literal::Int(i)) => Some(*i),
+                        Expr::Param(k) => match slots.get((*k as usize).saturating_sub(1)) {
+                            Some(Some(Value::Int(i))) => Some(*i),
+                            Some(Some(Value::BigInt(i))) => Some(*i),
+                            Some(Some(Value::SmallInt(i))) => Some(*i as i64),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(i) = i {
+                        return match tctx.args.get(i as usize) {
+                            Some(a) => push(Value::text(a.clone()), slots),
+                            None => push(Value::Null, slots),
+                        };
+                    }
+                }
+            }
+            Expr::Subscript {
+                array: Box::new(rewrite_ref_expr(
+                    array, tctx, cols, new_vals, old_vals, run, slots,
+                )),
+                indices: indices
+                    .iter()
+                    .map(|x| rewrite_ref_expr(x, tctx, cols, new_vals, old_vals, run, slots))
+                    .collect(),
+            }
+        }
+        Expr::Arith { op, left, right } => Expr::Arith {
+            op: *op,
+            left: Box::new(rewrite_ref_expr(
+                left, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+            right: Box::new(rewrite_ref_expr(
+                right, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+        },
+        Expr::Cmp { op, left, right } => Expr::Cmp {
+            op: *op,
+            left: Box::new(rewrite_ref_expr(
+                left, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+            right: Box::new(rewrite_ref_expr(
+                right, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+        },
+        Expr::And(a, b) => Expr::And(
+            Box::new(rewrite_ref_expr(
+                a, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+            Box::new(rewrite_ref_expr(
+                b, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+        ),
+        Expr::Or(a, b) => Expr::Or(
+            Box::new(rewrite_ref_expr(
+                a, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+            Box::new(rewrite_ref_expr(
+                b, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+        ),
+        Expr::Not(a) => Expr::Not(Box::new(rewrite_ref_expr(
+            a, tctx, cols, new_vals, old_vals, run, slots,
+        ))),
+        Expr::Neg(a) => Expr::Neg(Box::new(rewrite_ref_expr(
+            a, tctx, cols, new_vals, old_vals, run, slots,
+        ))),
+        Expr::BitNot(a) => Expr::BitNot(Box::new(rewrite_ref_expr(
+            a, tctx, cols, new_vals, old_vals, run, slots,
+        ))),
+        Expr::Cast { expr, to, written } => Expr::Cast {
+            expr: Box::new(rewrite_ref_expr(
+                expr, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+            to: *to,
+            written: written.clone(),
+        },
+        Expr::IsNull { expr, neg } => Expr::IsNull {
+            expr: Box::new(rewrite_ref_expr(
+                expr, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+            neg: *neg,
+        },
+        Expr::IsBool { expr, neg, val } => Expr::IsBool {
+            expr: Box::new(rewrite_ref_expr(
+                expr, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+            neg: *neg,
+            val: *val,
+        },
+        Expr::IsDistinctFrom { left, right, neg } => Expr::IsDistinctFrom {
+            left: Box::new(rewrite_ref_expr(
+                left, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+            right: Box::new(rewrite_ref_expr(
+                right, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+            neg: *neg,
+        },
+        Expr::Between {
+            expr,
+            low,
+            high,
+            neg,
+        } => Expr::Between {
+            expr: Box::new(rewrite_ref_expr(
+                expr, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+            low: Box::new(rewrite_ref_expr(
+                low, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+            high: Box::new(rewrite_ref_expr(
+                high, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+            neg: *neg,
+        },
+        Expr::Like {
+            expr,
+            pattern,
+            not,
+            ilike,
+            escape,
+        } => Expr::Like {
+            expr: Box::new(rewrite_ref_expr(
+                expr, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+            pattern: Box::new(rewrite_ref_expr(
+                pattern, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+            not: *not,
+            ilike: *ilike,
+            escape: escape.as_ref().map(|x| {
+                Box::new(rewrite_ref_expr(
+                    x, tctx, cols, new_vals, old_vals, run, slots,
+                ))
+            }),
+        },
+        Expr::Concat(a, b) => Expr::Concat(
+            Box::new(rewrite_ref_expr(
+                a, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+            Box::new(rewrite_ref_expr(
+                b, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+        ),
+        Expr::Row(items) => Expr::Row(
+            items
+                .iter()
+                .map(|a| rewrite_ref_expr(a, tctx, cols, new_vals, old_vals, run, slots))
+                .collect(),
+        ),
+        Expr::FieldAccess { expr, field } => Expr::FieldAccess {
+            expr: Box::new(rewrite_ref_expr(
+                expr, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+            field: field.clone(),
+        },
+        Expr::JsonOp { op, left, right } => Expr::JsonOp {
+            op: *op,
+            left: Box::new(rewrite_ref_expr(
+                left, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+            right: Box::new(rewrite_ref_expr(
+                right, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+        },
+        Expr::Regex {
+            expr,
+            pattern,
+            not,
+            case_insensitive,
+        } => Expr::Regex {
+            expr: Box::new(rewrite_ref_expr(
+                expr, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+            pattern: Box::new(rewrite_ref_expr(
+                pattern, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+            not: *not,
+            case_insensitive: *case_insensitive,
+        },
+        Expr::Extract { field, from } => Expr::Extract {
+            field: field.clone(),
+            from: Box::new(rewrite_ref_expr(
+                from, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+        },
+        Expr::AtTimeZone { expr, zone } => Expr::AtTimeZone {
+            expr: Box::new(rewrite_ref_expr(
+                expr, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+            zone: zone.as_ref().map(|z| {
+                Box::new(rewrite_ref_expr(
+                    z, tctx, cols, new_vals, old_vals, run, slots,
+                ))
+            }),
+        },
+        Expr::ArrayCtor { elems, nested } => Expr::ArrayCtor {
+            elems: elems
+                .iter()
+                .map(|a| rewrite_ref_expr(a, tctx, cols, new_vals, old_vals, run, slots))
+                .collect(),
+            nested: *nested,
+        },
+        Expr::UserOp { op, left, right } => Expr::UserOp {
+            op: op.clone(),
+            left: Box::new(rewrite_ref_expr(
+                left, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+            right: Box::new(rewrite_ref_expr(
+                right, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+        },
+        Expr::Func { name, args } => Expr::Func {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| rewrite_ref_expr(a, tctx, cols, new_vals, old_vals, run, slots))
+                .collect(),
+        },
+        Expr::NamedArg { name, expr } => Expr::NamedArg {
+            name: name.clone(),
+            expr: Box::new(rewrite_ref_expr(
+                expr, tctx, cols, new_vals, old_vals, run, slots,
+            )),
+        },
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => Expr::Case {
+            operand: operand.as_ref().map(|x| {
+                Box::new(rewrite_ref_expr(
+                    x, tctx, cols, new_vals, old_vals, run, slots,
+                ))
+            }),
+            whens: whens
+                .iter()
+                .map(|(a, b)| {
+                    (
+                        Box::new(rewrite_ref_expr(
+                            a, tctx, cols, new_vals, old_vals, run, slots,
+                        )),
+                        Box::new(rewrite_ref_expr(
+                            b, tctx, cols, new_vals, old_vals, run, slots,
+                        )),
+                    )
+                })
+                .collect(),
+            else_: else_.as_ref().map(|x| {
+                Box::new(rewrite_ref_expr(
+                    x, tctx, cols, new_vals, old_vals, run, slots,
+                ))
+            }),
+        },
+        other => other.clone(),
+    }
 }
 
 /// v2.09: the plpgsql condition name for a SQLSTATE (the subset the
@@ -1656,13 +2483,15 @@ pub(crate) fn eval_trigger_expr(
     cols: &[(String, ColType)],
     new_row: &[Value],
     old_row: &[Value],
+    run: &TrigRun,
     expr: &Expr,
 ) -> Result<Value, ExecError> {
     // v2.09: TG_ARGV[i] — the trigger's EXECUTE arguments as text.
     if let Expr::Subscript { array, indices } = expr {
         if let Expr::Column { table: None, name } = &**array {
             if name == "tg_argv" && indices.len() == 1 {
-                let iv = eval_trigger_expr(eng, ctx, tctx, cols, new_row, old_row, &indices[0])?;
+                let iv =
+                    eval_trigger_expr(eng, ctx, tctx, cols, new_row, old_row, run, &indices[0])?;
                 let idx = match iv {
                     Value::Int(i) => i,
                     Value::SmallInt(i) => i as i64,
@@ -1682,22 +2511,117 @@ pub(crate) fn eval_trigger_expr(
             }
         }
     }
+    // v2.10: bare NEW / OLD read as whole-row records (whole-row
+    // assignment and record-valued function arguments).
+    if let Expr::Column { table: None, name } = expr {
+        if name == "new" || name == "old" {
+            let row = if name == "new" { new_row } else { old_row };
+            return Ok(Value::Record(
+                cols.iter()
+                    .map(|(n, _)| n.clone())
+                    .zip(row.iter().cloned())
+                    .collect(),
+            ));
+        }
+    }
     // TG_* variables are expression leaves, not columns.
     if let Expr::Column { table: None, name } = expr {
         let v = match name.as_str() {
             "tg_name" => Some(Value::text(tctx.name.clone())),
             "tg_table_name" => Some(Value::text(tctx.table.clone())),
+            "tg_relname" => Some(Value::text(tctx.table.clone())),
+            "tg_table_schema" => Some(Value::text("public".to_string())),
             "tg_when" => Some(Value::text(tctx.when_name().to_string())),
             "tg_op" => Some(Value::text(tctx.op_name().to_string())),
             "tg_level" => Some(Value::text("ROW".to_string())),
-            "tg_nargs" => Some(Value::Int(0)),
-            "tg_relid" => Some(Value::Int(0)),
+            "tg_nargs" => Some(Value::Int(tctx.args.len() as i64)),
+            "tg_relid" => Some(Value::Int(tctx.relid)),
             _ => None,
         };
         if let Some(v) = v {
             return Ok(v);
         }
     }
+    // v2.10: `(ps).pfname`-style field access on NEW/OLD/alias/
+    // record bases parses as FieldAccess over a bare column.
+    if let Expr::FieldAccess { expr, field } = expr {
+        if let Expr::Column { table: None, name } = &**expr {
+            let row: Option<&[Value]> = if name == "new" {
+                Some(new_row)
+            } else if name == "old" {
+                Some(old_row)
+            } else if let Some(is_new) = run.aliases.get(name.as_str()) {
+                Some(if *is_new { new_row } else { old_row })
+            } else {
+                None
+            };
+            if let Some(row) = row {
+                return Ok(cols
+                    .iter()
+                    .position(|(n, _)| n == field)
+                    .map(|i| row.get(i).cloned().unwrap_or(Value::Null))
+                    .unwrap_or(Value::Null));
+            }
+            if let Some(rec) = run.recs.get(name.as_str()) {
+                return Ok(rec
+                    .iter()
+                    .find(|(n, _)| n == field)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or(Value::Null));
+            }
+            if let Some(Value::Record(fields)) = run.vars.get(name.as_str()) {
+                return Ok(fields
+                    .iter()
+                    .find(|(n, _)| n == field)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or(Value::Null));
+            }
+        }
+    }
+    // v2.10: FOUND, declared variables, and record fields are
+    // expression leaves too.
+    if let Expr::Column { table: None, name } = expr {
+        if name == "found" {
+            return Ok(Value::Bool(run.found));
+        }
+        if let Some(v) = run.get_var(name) {
+            return Ok(v);
+        }
+    }
+    if let Expr::Column {
+        table: Some(q),
+        name,
+    } = expr
+    {
+        if let Some(is_new) = run.aliases.get(q.as_str()) {
+            let row = if *is_new { new_row } else { old_row };
+            return Ok(cols
+                .iter()
+                .position(|(n, _)| n == name)
+                .map(|i| row.get(i).cloned().unwrap_or(Value::Null))
+                .unwrap_or(Value::Null));
+        }
+        if let Some(rec) = run.recs.get(q.as_str()) {
+            return Ok(rec
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or(Value::Null));
+        }
+    }
+    // v2.10: fold variable/record/FOUND references inside compound
+    // expressions to literals (via the $N rewrite + subst_expr),
+    // since the row evaluator only knows columns.
+    let owned_v;
+    let expr = if expr_has_run_ref(expr, run) {
+        let mut slots: Vec<Option<Value>> = Vec::new();
+        let mut rw = rewrite_ref_expr(expr, tctx, cols, new_row, old_row, run, &mut slots);
+        subst_expr(&mut rw, &slots)?;
+        owned_v = rw;
+        &owned_v
+    } else {
+        expr
+    };
     // TG_* variables can appear anywhere inside a compound
     // expression (e.g. `TG_LEVEL = 'ROW'`); fold them to literals
     // first, since the row evaluator only knows columns.
@@ -1779,6 +2703,7 @@ pub(crate) fn trigger_when_matches(
         cols,
         new_row.unwrap_or(&nulls),
         old_row.unwrap_or(&nulls),
+        &TrigRun::default(),
         w,
     )?;
     Ok(matches!(v, Value::Bool(true)))
@@ -1942,6 +2867,153 @@ pub(crate) fn fire_after_row_triggers(
     Ok(())
 }
 
+/// v2.10: cheap per-leaf check used by the UPDATE/DELETE plan loops
+/// to skip the BEFORE-trigger hook entirely when no BEFORE row
+/// trigger for the event exists on the leaf or its ancestors.
+pub(crate) fn leaf_has_before_triggers(eng: &Engine, ctx: &StmtCtx, leaf: &str, event: u8) -> bool {
+    trigger_defs_for_leaf(eng, ctx, leaf).iter().any(|(_, tr)| {
+        tr.timing == TriggerTiming::Before
+            && tr.for_each_row
+            && tr.enforced
+            && !tr.has_transition
+            && (tr.events & event) != 0
+    })
+}
+
+/// v2.10 (secondary): fire the BEFORE UPDATE FOR EACH ROW triggers
+/// for one planned row pair (PG19 ExecBRUpdateTriggers). Returns the
+/// (possibly trigger-modified) NEW image, or None when a body
+/// returned NULL (the row is skipped). UPDATE OF matching uses the
+/// statement's SET column list, as for AFTER triggers.
+pub(crate) fn fire_before_update_triggers(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    leaf: &str,
+    cols: &[(String, ColType)],
+    old_row: &[Value],
+    new_row: &[Value],
+    set_cols: &[String],
+) -> Result<Option<Vec<Value>>, ExecError> {
+    let defs = trigger_defs_for_leaf(eng, ctx, leaf);
+    let mut cur: Vec<Value> = new_row.to_vec();
+    for (def_table, tr) in &defs {
+        let _ = def_table;
+        if tr.timing != TriggerTiming::Before
+            || !tr.for_each_row
+            || !tr.enforced
+            || tr.has_transition
+            || (tr.events & trig_event::UPDATE) == 0
+        {
+            continue;
+        }
+        if !tr.update_cols.is_empty() && !tr.update_cols.iter().any(|c| set_cols.contains(c)) {
+            continue;
+        }
+        let tctx = TrigCtx {
+            name: tr.name.clone(),
+            table: leaf.to_string(),
+            timing: tr.timing,
+            event: trig_event::UPDATE,
+            args: tr.args.clone(),
+            relid: eng
+                .db
+                .find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session)
+                .map(|t| t.oid as i64)
+                .unwrap_or(0),
+        };
+        if !trigger_when_matches(
+            eng,
+            ctx,
+            &tctx,
+            cols,
+            Some(&cur),
+            Some(old_row),
+            tr.when_expr.as_ref(),
+        )? {
+            continue;
+        }
+        let fdef = find_function_by_signature(eng, &tr.function, &[]).ok_or_else(|| {
+            exec_err(
+                "42883",
+                format!("function {}() does not exist", tr.function),
+            )
+        })?;
+        let body = parse_trigger_body(&fdef.body).map_err(|e| {
+            exec_err(
+                e.code,
+                format!("invalid trigger function body: {}", e.message),
+            )
+        })?;
+        match exec_trigger_body(eng, ctx, &tctx, cols, Some(&cur), Some(old_row), &body)? {
+            Some(nv) => cur = nv,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(cur))
+}
+
+/// v2.10 (secondary): fire the BEFORE DELETE FOR EACH ROW triggers
+/// for one planned row (PG19 ExecBRDeleteTriggers). Returns false
+/// when a body returned NULL (the row is not deleted).
+pub(crate) fn fire_before_delete_triggers(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    leaf: &str,
+    cols: &[(String, ColType)],
+    old_row: &[Value],
+) -> Result<bool, ExecError> {
+    let defs = trigger_defs_for_leaf(eng, ctx, leaf);
+    for (_def_table, tr) in &defs {
+        if tr.timing != TriggerTiming::Before
+            || !tr.for_each_row
+            || !tr.enforced
+            || tr.has_transition
+            || (tr.events & trig_event::DELETE) == 0
+        {
+            continue;
+        }
+        let tctx = TrigCtx {
+            name: tr.name.clone(),
+            table: leaf.to_string(),
+            timing: tr.timing,
+            event: trig_event::DELETE,
+            args: tr.args.clone(),
+            relid: eng
+                .db
+                .find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session)
+                .map(|t| t.oid as i64)
+                .unwrap_or(0),
+        };
+        if !trigger_when_matches(
+            eng,
+            ctx,
+            &tctx,
+            cols,
+            None,
+            Some(old_row),
+            tr.when_expr.as_ref(),
+        )? {
+            continue;
+        }
+        let fdef = find_function_by_signature(eng, &tr.function, &[]).ok_or_else(|| {
+            exec_err(
+                "42883",
+                format!("function {}() does not exist", tr.function),
+            )
+        })?;
+        let body = parse_trigger_body(&fdef.body).map_err(|e| {
+            exec_err(
+                e.code,
+                format!("invalid trigger function body: {}", e.message),
+            )
+        })?;
+        if exec_trigger_body(eng, ctx, &tctx, cols, None, Some(old_row), &body)?.is_none() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// v2.09: run one AFTER trigger body for one row pair (the return
 /// value is ignored for AFTER triggers, per PG).
 pub(crate) fn fire_one_trigger(
@@ -1959,13 +3031,13 @@ pub(crate) fn fire_one_trigger(
             format!("function {}() does not exist", tr.function),
         )
     })?;
-    let stmts = parse_trigger_body(&fdef.body).map_err(|e| {
+    let body = parse_trigger_body(&fdef.body).map_err(|e| {
         exec_err(
             e.code,
             format!("invalid trigger function body: {}", e.message),
         )
     })?;
-    let _ = exec_trigger_body(eng, ctx, tctx, cols, new_row, old_row, &stmts)?;
+    let _ = exec_trigger_body(eng, ctx, tctx, cols, new_row, old_row, &body)?;
     Ok(())
 }
 
@@ -3500,6 +4572,26 @@ fn expr_has_tg_var(e: &Expr) -> bool {
     found
 }
 
+/// v2.10: does an expression reference a declared variable, a
+/// record variable/field, or FOUND (all folded before row eval)?
+fn expr_has_run_ref(e: &Expr, run: &TrigRun) -> bool {
+    let mut hit = false;
+    walk_expr(e, &mut |x| match x {
+        Expr::Column { table: None, name } => {
+            if name == "found" || run.vars.contains_key(name) || run.recs.contains_key(name) {
+                hit = true;
+            }
+        }
+        Expr::Column { table: Some(q), .. } => {
+            if run.recs.contains_key(q.as_str()) || run.aliases.contains_key(q.as_str()) {
+                hit = true;
+            }
+        }
+        _ => {}
+    });
+    hit
+}
+
 /// v2.09: fold TG_* column leaves to literals (mirrors
 /// merge.rs's subst_tableoid container set, extended).
 fn subst_tg_vars(e: &Expr, tctx: &TrigCtx) -> Expr {
@@ -3516,10 +4608,12 @@ fn subst_tg_vars(e: &Expr, tctx: &TrigCtx) -> Expr {
         Expr::Column { table: None, name } => match name.as_str() {
             "tg_name" => lit(&tctx.name),
             "tg_table_name" => lit(&tctx.table.clone()),
+            "tg_relname" => lit(&tctx.table.clone()),
+            "tg_table_schema" => lit("public"),
             "tg_when" => lit(tctx.when_name()),
             "tg_op" => lit(tctx.op_name()),
             "tg_level" => lit("ROW"),
-            "tg_nargs" => Expr::Literal(crate::sql::Literal::Int(0)),
+            "tg_nargs" => Expr::Literal(crate::sql::Literal::Int(tctx.args.len() as i64)),
             "tg_relid" => Expr::Literal(crate::sql::Literal::Int(tctx.relid)),
             _ => e.clone(),
         },
@@ -3605,6 +4699,11 @@ fn subst_tg_vars(e: &Expr, tctx: &TrigCtx) -> Expr {
             array: Box::new(subst_tg_vars(array, tctx)),
             indices: indices.iter().map(|i| subst_tg_vars(i, tctx)).collect(),
         },
+        Expr::Concat(a, b) => Expr::Concat(
+            Box::new(subst_tg_vars(a, tctx)),
+            Box::new(subst_tg_vars(b, tctx)),
+        ),
+        Expr::Row(items) => Expr::Row(items.iter().map(|a| subst_tg_vars(a, tctx)).collect()),
         Expr::Func { name, args } => Expr::Func {
             name: name.clone(),
             args: args.iter().map(|a| subst_tg_vars(a, tctx)).collect(),

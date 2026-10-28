@@ -4447,6 +4447,74 @@ pub(crate) fn exec_update(
             }
         }
     }
+    // v2.10: BEFORE UPDATE FOR EACH ROW triggers run over the plan
+    // before anything is applied (PG19 ExecBRUpdateTriggers): a body
+    // returning NULL drops the row from the plan; RETURN NEW (with
+    // assignments) substitutes the planned image. Partition-key
+    // `moves` are not re-fired (documented hold-back). The hook is
+    // skipped wholesale when no leaf has a BEFORE UPDATE trigger.
+    // HELD BACK for partitioned parents: PG fires parent BEFORE
+    // triggers BEFORE routing, so trigger-modified keys route by
+    // their NEW value; rustgres routes UPDATEs by the pre-trigger
+    // row, so firing here would corrupt row movement — partitioned
+    // parents keep the pre-v2.10 (inert) behavior.
+    let plan = {
+        let root_is_partitioned = eng
+            .db
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+            .map(|t| {
+                t.partition
+                    .as_ref()
+                    .is_some_and(|p| p.is_partitioned && !p.children.is_empty())
+            })
+            .unwrap_or(false);
+        let mut bt_leaves: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if !root_is_partitioned {
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for (dst, _, _, _) in &plan {
+                if seen.insert(dst.as_str())
+                    && leaf_has_before_triggers(eng, ctx, dst, trig_event::UPDATE)
+                {
+                    bt_leaves.insert(dst.clone());
+                }
+            }
+        }
+        if bt_leaves.is_empty() {
+            plan
+        } else {
+            let set_cols: Vec<String> = sets.iter().map(|(c, _)| c.clone()).collect();
+            let mut kept = Vec::with_capacity(plan.len());
+            for (dst, old_id, prev_xmax, new_values) in plan {
+                if !bt_leaves.contains(&dst) {
+                    kept.push((dst, old_id, prev_xmax, new_values));
+                    continue;
+                }
+                let (leaf_cols, old_values) = {
+                    let t = eng
+                        .db
+                        .find_table(&dst, ctx.snap, &ctx.all_xids, ctx.session)
+                        .expect("leaf still visible; engine lock held throughout");
+                    let pos = t
+                        .row_pos(old_id)
+                        .expect("row version still present; engine lock held throughout");
+                    (t.columns.clone(), t.rows[pos].values.clone())
+                };
+                match fire_before_update_triggers(
+                    eng,
+                    ctx,
+                    &dst,
+                    &leaf_cols,
+                    &old_values,
+                    &new_values[..],
+                    &set_cols,
+                )? {
+                    Some(nv) => kept.push((dst, old_id, prev_xmax, Row::new(nv))),
+                    None => {}
+                }
+            }
+            kept
+        }
+    };
     // Apply: UPDATE = delete old version + insert new version, per leaf.
     // v0.70: moved rows are deleted from their source leaf and inserted
     // into the routed destination leaf.
@@ -5021,6 +5089,61 @@ pub(crate) fn exec_delete(
                 ));
                 // v0.76: parallel USING row for RETURNING.
                 plan_using.push(using_row);
+            }
+        }
+        // v2.10: BEFORE DELETE FOR EACH ROW triggers (PG19
+        // ExecBRDeleteTriggers): a body returning NULL keeps the row
+        // (it leaves the plan, so FK cascades and RETURNING skip it
+        // too). Skipped wholesale when no leaf has such a trigger.
+        // The leaf scan is per DISTINCT leaf (an 80k-row plan must
+        // not rescan the catalog per row). Held back for partitioned
+        // parents, like BEFORE UPDATE (PG fires parent BEFORE
+        // triggers before routing; see the UPDATE hook note).
+        {
+            let root_is_partitioned = eng
+                .db
+                .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+                .map(|t| {
+                    t.partition
+                        .as_ref()
+                        .is_some_and(|p| p.is_partitioned && !p.children.is_empty())
+                })
+                .unwrap_or(false);
+            let mut bt_leaves: std::collections::HashSet<String> = std::collections::HashSet::new();
+            if !root_is_partitioned {
+                let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                for (leaf, _, _, _, _, _) in &plan {
+                    if seen.insert(leaf.as_str())
+                        && leaf_has_before_triggers(eng, ctx, leaf, trig_event::DELETE)
+                    {
+                        bt_leaves.insert(leaf.clone());
+                    }
+                }
+            }
+            if !bt_leaves.is_empty() {
+                let mut kept_plan = Vec::with_capacity(plan.len());
+                let mut kept_using = Vec::with_capacity(plan_using.len());
+                for (entry, using_row) in plan.into_iter().zip(plan_using.into_iter()) {
+                    let (leaf, _, _, _, leaf_values, _) = &entry;
+                    if !bt_leaves.contains(leaf.as_str()) {
+                        kept_plan.push(entry);
+                        kept_using.push(using_row);
+                        continue;
+                    }
+                    let leaf_cols: Vec<(String, ColType)> = {
+                        let t = eng
+                            .db
+                            .find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session)
+                            .expect("leaf still visible; engine lock held throughout");
+                        t.columns.clone()
+                    };
+                    if fire_before_delete_triggers(eng, ctx, leaf, &leaf_cols, &leaf_values[..])? {
+                        kept_plan.push(entry);
+                        kept_using.push(using_row);
+                    }
+                }
+                plan = kept_plan;
+                plan_using = kept_using;
             }
         }
         // v0.9: parent-side FK actions for the deleted rows, grouped by

@@ -131,6 +131,14 @@ thread_local! {
     pub(crate) static NOTICE_SINK: RefCell<Option<std::rc::Rc<RefCell<Vec<String>>>>> =
         const { RefCell::new(None) };
 
+    /// v2.10: trigger call depth (PG19 trigger.c's static
+    /// `trigger_depth`, backing pg_trigger_depth()). Incremented for
+    /// the duration of every trigger-body execution — immediate
+    /// BEFORE/AFTER firing and the deferred-queue flush alike — on
+    /// this statement's thread (thread-per-connection, like
+    /// NOTICE_SINK). 0 outside any trigger.
+    pub(crate) static TRIGGER_DEPTH: RefCell<i64> = const { RefCell::new(0) };
+
     /// v1.26: LATERAL namespace markers (PG19 `scanNameSpaceForRefname` /
     /// `check_agglevels_and_constraints`, PG19's parse-time LATERAL
     /// rules). Each entry is `(ns_base, depth)`:
@@ -157,6 +165,32 @@ thread_local! {
     /// cross-nest right subtree. Saved/restored on nesting.
     pub(crate) static LATERAL_INHERIT: RefCell<Option<(usize, usize)>> =
         const { RefCell::new(None) };
+}
+
+/// v2.10: RAII trigger-depth increment; restores on drop so every
+/// exit path (including `?`) unwinds pg_trigger_depth().
+pub(crate) struct TriggerDepthGuard;
+impl TriggerDepthGuard {
+    pub(crate) fn enter() -> Result<Self, ExecError> {
+        let too_deep = TRIGGER_DEPTH.with(|d| {
+            let mut d = d.borrow_mut();
+            *d += 1;
+            *d > 1000
+        });
+        if too_deep {
+            TRIGGER_DEPTH.with(|d| *d.borrow_mut() -= 1);
+            return Err(exec_err("54001", "stack depth limit exceeded".to_string()));
+        }
+        Ok(TriggerDepthGuard)
+    }
+    pub(crate) fn current() -> i64 {
+        TRIGGER_DEPTH.with(|d| *d.borrow())
+    }
+}
+impl Drop for TriggerDepthGuard {
+    fn drop(&mut self) {
+        TRIGGER_DEPTH.with(|d| *d.borrow_mut() -= 1);
+    }
 }
 
 /// v1.26: pushes a LATERAL namespace marker; pops it on drop, so every
