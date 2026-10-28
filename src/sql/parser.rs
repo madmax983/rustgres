@@ -703,7 +703,7 @@ impl Parser {
             // --- v0.17: SET / SHOW / RESET
             "set" => self.parse_set(),
             "show" => Ok(Stmt::Show {
-                name: self.expect_ident()?,
+                name: self.expect_qualified_ident()?,
             }),
             "reset" => {
                 // RESET name | RESET ALL
@@ -718,7 +718,7 @@ impl Parser {
                     }
                     self.pos = save;
                 }
-                let name = self.expect_ident()?;
+                let name = self.expect_qualified_ident()?;
                 // v1.95: RESET SESSION AUTHORIZATION (two-word name).
                 if name == "session"
                     && matches!(self.peek(), Token::Ident(s) if s == "authorization")
@@ -11464,7 +11464,10 @@ impl Parser {
                 local,
             });
         }
-        let name = self.expect_ident()?;
+        // v2.11: GUC names may be qualified (custom variable classes
+        // like `plpgsql.extra_errors`, PG19 VarName = ColId ['.' ColId
+        // ...]); parse the dotted form into one name.
+        let name = self.expect_qualified_ident()?;
         // v1.07: SET [LOCAL|SESSION] ROLE name|NONE — PG19 treats this as
         // the "role" GUC; the bare form (no TO) is the SQL-standard syntax.
         // `SET ROLE TO 'name'` / `SET role = 'name'` go through the generic

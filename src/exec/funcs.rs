@@ -884,6 +884,8 @@ pub(crate) fn run_func_dml(
 /// `PLPGSQL_RC_RETURN` code; the bounded executor needs the same
 /// distinction so a `FOR` loop body can `RETURN` out of the whole
 /// function while `RETURN NEXT` merely accumulates a row.
+/// v2.11 adds the loop-control flows (EXIT / CONTINUE) and
+/// ReturnBare (a bare `RETURN`).
 pub(crate) enum PlFlow {
     /// `RETURN <expr>` - terminal; carries the SELECT output.
     Return(SelectOut),
@@ -891,9 +893,20 @@ pub(crate) enum PlFlow {
     /// (scalar bodies always end with RETURN - the parser appends an
     /// implicit `RETURN NULL`, PG19 `add_dummy_return`, pl_comp.c).
     Continue,
+    /// v2.11: bare `RETURN` executed (void / SETOF fall-off rules
+    /// are applied by `run_plpgsql_body`).
+    ReturnBare,
+    /// v2.11: `EXIT` — leave the innermost loop.
+    Exit,
+    /// v2.11: `CONTINUE` — next iteration of the innermost loop.
+    ContinueLoop,
 }
 
 /// v1.03: mutable execution state for one plpgsql call.
+/// v2.11 adds record storage, the FOUND flag / ROW_COUNT
+/// diagnostics, the last caught error (for GET STACKED DIAGNOSTICS
+/// and bare RAISE), and the block scope stack used to resolve
+/// shadowed variable names.
 pub(crate) struct PlpgsqlRun {
     /// Bound arguments followed by one slot per DECLAREd variable
     /// (`params[nargs + i]`). Named argument/variable references were
@@ -902,6 +915,37 @@ pub(crate) struct PlpgsqlRun {
     pub(crate) nargs: usize,
     /// Accumulated `RETURN NEXT` rows (SETOF functions only).
     pub(crate) accum: Vec<Row>,
+    /// v2.11: record variables by name: the current row as
+    /// (column name, value) pairs. The variable's param slot also
+    /// holds the same row as a `Value::Record` so whole-record reads
+    /// (`RETURN rec`) see it.
+    pub(crate) recs: HashMap<String, Vec<(String, Value)>>,
+    /// v2.11: the FOUND flag (kept in sync with the `found`
+    /// variable's param slot).
+    pub(crate) found: bool,
+    /// v2.11: GET DIAGNOSTICS ROW_COUNT of the last statement.
+    pub(crate) row_count: i64,
+    /// v2.11: (SQLSTATE, message) of the last error caught by an
+    /// EXCEPTION handler.
+    pub(crate) last_error: Option<(String, String)>,
+    /// v2.11: decl-index lists of the nested blocks currently
+    /// executing (innermost last), for shadowed name resolution.
+    pub(crate) scopes: Vec<Vec<usize>>,
+}
+
+impl PlpgsqlRun {
+    pub(crate) fn new(params: Vec<Option<Value>>, nargs: usize) -> Self {
+        PlpgsqlRun {
+            params,
+            nargs,
+            accum: Vec::new(),
+            recs: HashMap::new(),
+            found: false,
+            row_count: 0,
+            last_error: None,
+            scopes: Vec::new(),
+        }
+    }
 }
 
 /// v1.03: evaluate a `SELECT <expr>` plpgsql fragment (RETURN, RETURN
@@ -910,6 +954,7 @@ pub(crate) fn run_plpgsql_select(
     q: &mut Q,
     scopes: &[Scope],
     sel: &Stmt,
+    pb: &crate::sql::PlpgsqlBody,
     run: &PlpgsqlRun,
     what: &str,
 ) -> Result<SelectOut, ExecError> {
@@ -920,7 +965,7 @@ pub(crate) fn run_plpgsql_select(
         ));
     };
     let mut stmt = Stmt::Select(inner.clone());
-    subst_params(&mut stmt, &run.params)?;
+    bind_plpgsql_stmt(&mut stmt, pb, run)?;
     let Stmt::Select(bound) = stmt else {
         return Err(exec_err(
             "XX000",
@@ -930,26 +975,921 @@ pub(crate) fn run_plpgsql_select(
     run_select(q, &bound, scopes)
 }
 
-/// v1.03: slot of a DECLAREd variable in [`PlpgsqlRun::params`].
-/// Undeclared names are rejected at CREATE; this is a
-/// catalog-corruption guard (XX000, never a user-facing code path).
-pub(crate) fn plpgsql_var_index(
+/// v2.11: is this declaration a record variable (its value lives in
+/// `PlpgsqlRun::recs` as well as its slot)?
+pub(crate) fn plpgsql_is_record_decl(d: &crate::sql::PlpgsqlDecl) -> bool {
+    d.type_name.eq_ignore_ascii_case("record")
+        || d.type_name.to_ascii_lowercase().ends_with("%rowtype")
+}
+
+/// v2.11: is a `plpgsql.extra_errors` check active for this
+/// statement? (PG19 pl_exec.c: the GUC is a comma list of check
+/// names or 'all'; the executor reads the per-statement GUC
+/// snapshot the server installs for current_setting().)
+pub(crate) fn plpgsql_extra_error(check: &str) -> bool {
+    let Some(v) = crate::exec::installed_guc("plpgsql.extra_errors") else {
+        return false;
+    };
+    v.to_ascii_lowercase()
+        .split(',')
+        .any(|p| p.trim() == "all" || p.trim() == check)
+}
+
+/// v2.11: field names of a declaration whose type is a table rowtype
+/// or a composite type (`t test_01`, `t test_01%rowtype`) — in PG19
+/// such a variable IS a record variable. None for scalar types and
+/// for the untyped `record` (whose fields come from each assigned
+/// row instead).
+pub(crate) fn plpgsql_rowtype_field_names(
+    q: &mut Q,
+    d: &crate::sql::PlpgsqlDecl,
+) -> Option<Vec<String>> {
+    if d.is_cursor || d.type_name.eq_ignore_ascii_case("record") {
+        return None;
+    }
+    let low = d.type_name.trim().to_ascii_lowercase();
+    let base = low.strip_suffix("%rowtype").unwrap_or(low.as_str());
+    func_rowtype_fields(q, base).ok().map(|(names, _)| names)
+}
+
+/// v2.11: absolute `params` index of a declaration, resolving ALIAS
+/// declarations to their target's slot (the CREATE/rebuild rewrite
+/// records the target in `alias_slot`, 1-based).
+pub(crate) fn plpgsql_decl_slot(
+    pb: &crate::sql::PlpgsqlBody,
+    run: &PlpgsqlRun,
+    idx: usize,
+) -> Option<usize> {
+    let d = pb.decls.get(idx)?;
+    if d.alias_for.is_some() {
+        return d.alias_slot.map(|s| (s - 1) as usize);
+    }
+    Some(run.nargs + idx)
+}
+
+/// v2.11: resolve a variable name to its absolute `params` index:
+/// active block scopes first (innermost block wins — shadowing),
+/// then the flat decl list in order (ALIAS-aware).
+pub(crate) fn plpgsql_slot(
+    pb: &crate::sql::PlpgsqlBody,
+    run: &PlpgsqlRun,
+    var: &str,
+) -> Option<usize> {
+    for scope in run.scopes.iter().rev() {
+        for &idx in scope {
+            if pb.decls.get(idx).is_some_and(|d| d.name == var) {
+                return plpgsql_decl_slot(pb, run, idx);
+            }
+        }
+    }
+    for (idx, d) in pb.decls.iter().enumerate() {
+        if d.name == var {
+            return plpgsql_decl_slot(pb, run, idx);
+        }
+    }
+    None
+}
+
+/// v2.11: the declaration behind an absolute slot, when the slot is
+/// a declared variable's (not an argument's).
+pub(crate) fn plpgsql_decl_for_slot<'x>(
+    pb: &'x crate::sql::PlpgsqlBody,
+    run: &PlpgsqlRun,
+    slot: usize,
+) -> Option<&'x crate::sql::PlpgsqlDecl> {
+    if slot < run.nargs {
+        return None;
+    }
+    // ALIAS decls share their target's slot; prefer a non-alias
+    // decl claiming the slot, else any decl resolving to it.
+    let mut alias_hit: Option<&crate::sql::PlpgsqlDecl> = None;
+    for (idx, d) in pb.decls.iter().enumerate() {
+        if plpgsql_decl_slot(pb, run, idx) == Some(slot) {
+            if d.alias_for.is_none() {
+                return Some(d);
+            }
+            alias_hit = Some(d);
+        }
+    }
+    alias_hit
+}
+
+/// v2.11: set FOUND (and keep the `found` variable's slot in sync).
+pub(crate) fn plpgsql_set_found(pb: &crate::sql::PlpgsqlBody, run: &mut PlpgsqlRun, v: bool) {
+    run.found = v;
+    if let Some(slot) = plpgsql_slot(pb, run, "found") {
+        if slot < run.params.len() {
+            run.params[slot] = Some(Value::Bool(v));
+        }
+    }
+}
+
+/// v2.11: set the statement diagnostics (FOUND + ROW_COUNT) after a
+/// statement kind that updates them.
+pub(crate) fn plpgsql_set_diag(
+    pb: &crate::sql::PlpgsqlBody,
+    run: &mut PlpgsqlRun,
+    found: bool,
+    row_count: i64,
+) {
+    run.row_count = row_count;
+    plpgsql_set_found(pb, run, found);
+}
+
+/// v2.11: coerce an assigned value to a declaration's type; record /
+/// cursor / untyped (alias-without-fixup) declarations and Record
+/// values pass through untouched.
+pub(crate) fn plpgsql_coerce_for_decl(
+    q: &mut Q,
+    v: &Value,
+    d: Option<&crate::sql::PlpgsqlDecl>,
+) -> Result<Value, ExecError> {
+    let Some(d) = d else {
+        return Ok(v.clone());
+    };
+    if d.is_cursor
+        || d.type_name.is_empty()
+        || plpgsql_is_record_decl(d)
+        || plpgsql_rowtype_field_names(q, d).is_some()
+        || matches!(v, Value::Record(_))
+    {
+        return Ok(v.clone());
+    }
+    coerce_to_type_name(q, v, &d.type_name)
+}
+
+/// v2.11: the current field value of a record held at 1-based param
+/// `slot1` (from the slot's Record value, or from `recs` by decl).
+pub(crate) fn plpgsql_record_field(
+    pb: &crate::sql::PlpgsqlBody,
+    run: &PlpgsqlRun,
+    slot1: u32,
+    field: &str,
+) -> Option<Value> {
+    if let Some(Some(Value::Record(fields))) = run.params.get((slot1 - 1) as usize) {
+        if let Some((_, v)) = fields.iter().find(|(n, _)| n.eq_ignore_ascii_case(field)) {
+            return Some(v.clone());
+        }
+    }
+    if (slot1 as usize) > run.nargs {
+        if let Some(d) = pb.decls.get((slot1 - 1) as usize - run.nargs) {
+            if let Some(rec) = run.recs.get(&d.name) {
+                if let Some((_, v)) = rec.iter().find(|(n, _)| n.eq_ignore_ascii_case(field)) {
+                    return Some(v.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// v2.11: rewrite record-field references in one expression:
+/// `FieldAccess(Param(rec), field)` becomes a fresh Param holding
+/// the field's current value (appended to `params`), because
+/// `subst_params` cannot carry Record values (param_literal maps
+/// them to NULL). Unresolvable fields are left alone (they degrade
+/// to NULL through the Record -> NULL substitution, never a panic).
+pub(crate) fn rewrite_record_refs_expr(
+    e: &mut Expr,
+    pb: &crate::sql::PlpgsqlBody,
+    run: &PlpgsqlRun,
+    params: &mut Vec<Option<Value>>,
+) {
+    fn rr_box(
+        b: &mut Box<Expr>,
+        pb: &crate::sql::PlpgsqlBody,
+        run: &PlpgsqlRun,
+        params: &mut Vec<Option<Value>>,
+    ) {
+        rewrite_record_refs_expr(b.as_mut(), pb, run, params);
+    }
+    fn rr_opt(
+        o: &mut Option<Box<Expr>>,
+        pb: &crate::sql::PlpgsqlBody,
+        run: &PlpgsqlRun,
+        params: &mut Vec<Option<Value>>,
+    ) {
+        if let Some(b) = o {
+            rr_box(b, pb, run, params);
+        }
+    }
+    // Recurse into children first (coverage mirrors subst_expr).
+    match e {
+        Expr::Arith { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::JsonOp { left, right, .. }
+        | Expr::Concat(left, right)
+        | Expr::Cmp { left, right, .. }
+        | Expr::IsDistinctFrom { left, right, .. } => {
+            rr_box(left, pb, run, params);
+            rr_box(right, pb, run, params);
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            rr_box(expr, pb, run, params);
+            rr_box(pattern, pb, run, params);
+            rr_opt(escape, pb, run, params);
+        }
+        Expr::Regex { expr, pattern, .. } => {
+            rr_box(expr, pb, run, params);
+            rr_box(pattern, pb, run, params);
+        }
+        Expr::FieldAccess { expr, .. } => {
+            rr_box(expr, pb, run, params);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            rr_box(expr, pb, run, params);
+            rr_box(low, pb, run, params);
+            rr_box(high, pb, run, params);
+        }
+        Expr::Not(x)
+        | Expr::BitNot(x)
+        | Expr::Neg(x)
+        | Expr::IsNull { expr: x, .. }
+        | Expr::IsBool { expr: x, .. }
+        | Expr::Cast { expr: x, .. }
+        | Expr::CastNamed { expr: x, .. }
+        | Expr::NamedArg { expr: x, .. } => {
+            rr_box(x, pb, run, params);
+        }
+        Expr::AtTimeZone { expr, zone } => {
+            rr_box(expr, pb, run, params);
+            rr_opt(zone, pb, run, params);
+        }
+        Expr::Func { args, .. } => {
+            for a in args {
+                rewrite_record_refs_expr(a, pb, run, params);
+            }
+        }
+        Expr::Extract { from, .. } => rr_box(from, pb, run, params),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            rr_opt(operand, pb, run, params);
+            for (k, v) in whens {
+                rr_box(k, pb, run, params);
+                rr_box(v, pb, run, params);
+            }
+            rr_opt(else_, pb, run, params);
+        }
+        Expr::Row(elems) | Expr::ArrayCtor { elems, .. } => {
+            for x in elems {
+                rewrite_record_refs_expr(x, pb, run, params);
+            }
+        }
+        Expr::Subscript { array, indices } => {
+            rr_box(array, pb, run, params);
+            for i in indices {
+                rewrite_record_refs_expr(i, pb, run, params);
+            }
+        }
+        Expr::Agg { arg, arg2, .. } => {
+            rr_opt(arg, pb, run, params);
+            rr_opt(arg2, pb, run, params);
+        }
+        Expr::ScalarSub(s) => rewrite_record_refs_select(s, pb, run, params),
+        Expr::InSub { expr, sub, .. } => {
+            rr_box(expr, pb, run, params);
+            rewrite_record_refs_select(sub, pb, run, params);
+        }
+        Expr::Exists { sub, .. } => rewrite_record_refs_select(sub, pb, run, params),
+        Expr::Quantified { left, sub, .. } => {
+            rr_box(left, pb, run, params);
+            rewrite_record_refs_select(sub, pb, run, params);
+        }
+        _ => {}
+    }
+    // Now the FieldAccess(Param, field) at this node itself.
+    if let Expr::FieldAccess { expr, field } = e {
+        if let Expr::Param(n) = **expr {
+            if let Some(v) = plpgsql_record_field(pb, run, n, field) {
+                params.push(Some(v));
+                *e = Expr::Param(params.len() as u32);
+            }
+        }
+    }
+}
+
+/// v2.11: record-field rewrite over a SELECT's expression positions.
+pub(crate) fn rewrite_record_refs_select(
+    sel: &mut SelectStmt,
+    pb: &crate::sql::PlpgsqlBody,
+    run: &PlpgsqlRun,
+    params: &mut Vec<Option<Value>>,
+) {
+    for item in &mut sel.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            rewrite_record_refs_expr(expr, pb, run, params);
+        }
+    }
+    if let Some(w) = &mut sel.where_ {
+        rewrite_record_refs_expr(w, pb, run, params);
+    }
+    if let Some(h) = &mut sel.having {
+        rewrite_record_refs_expr(h, pb, run, params);
+    }
+    for g in &mut sel.group_by {
+        for x in g {
+            rewrite_record_refs_expr(x, pb, run, params);
+        }
+    }
+    for o in &mut sel.order_by {
+        rewrite_record_refs_expr(&mut o.expr, pb, run, params);
+    }
+    for f in &mut sel.from {
+        if let crate::sql::FromItem::Function { args, .. } = f {
+            for a in args {
+                rewrite_record_refs_expr(a, pb, run, params);
+            }
+        }
+    }
+    for c in &mut sel.with {
+        match &mut c.body {
+            crate::sql::CteBody::Simple(s) => rewrite_record_refs_select(s, pb, run, params),
+            crate::sql::CteBody::Union { left, right, .. } => {
+                rewrite_record_refs_select(left, pb, run, params);
+                rewrite_record_refs_select(right, pb, run, params);
+            }
+            crate::sql::CteBody::Dml(d) => rewrite_record_refs_stmt(d, pb, run, params),
+        }
+    }
+}
+
+/// v2.11: record-field rewrite over a whole statement.
+pub(crate) fn rewrite_record_refs_stmt(
+    stmt: &mut Stmt,
+    pb: &crate::sql::PlpgsqlBody,
+    run: &PlpgsqlRun,
+    params: &mut Vec<Option<Value>>,
+) {
+    match stmt {
+        Stmt::Select(sel) => rewrite_record_refs_select(sel, pb, run, params),
+        Stmt::Explain { stmt: inner, .. } => rewrite_record_refs_stmt(inner, pb, run, params),
+        Stmt::Insert {
+            rows,
+            select,
+            on_conflict,
+            returning,
+            ..
+        } => {
+            for row in rows {
+                for v in row {
+                    if let crate::sql::InsertValue::Expr(e) = v {
+                        rewrite_record_refs_expr(e, pb, run, params);
+                    }
+                }
+            }
+            if let Some(sel) = select {
+                rewrite_record_refs_select(sel, pb, run, params);
+            }
+            if let Some(oc) = on_conflict {
+                if let crate::sql::ConflictAction::DoUpdate { sets, where_ } = &mut oc.action {
+                    for (_, e) in sets {
+                        rewrite_record_refs_expr(e, pb, run, params);
+                    }
+                    if let Some(w) = where_ {
+                        rewrite_record_refs_expr(w, pb, run, params);
+                    }
+                }
+            }
+            for item in returning {
+                if let SelectItem::Expr { expr, .. } = item {
+                    rewrite_record_refs_expr(expr, pb, run, params);
+                }
+            }
+        }
+        Stmt::Update {
+            sets,
+            where_,
+            returning,
+            ..
+        } => {
+            for (_, e) in sets {
+                rewrite_record_refs_expr(e, pb, run, params);
+            }
+            if let Some(w) = where_ {
+                rewrite_record_refs_expr(w, pb, run, params);
+            }
+            for item in returning {
+                if let SelectItem::Expr { expr, .. } = item {
+                    rewrite_record_refs_expr(expr, pb, run, params);
+                }
+            }
+        }
+        Stmt::Delete {
+            where_, returning, ..
+        } => {
+            if let Some(w) = where_ {
+                rewrite_record_refs_expr(w, pb, run, params);
+            }
+            for item in returning {
+                if let SelectItem::Expr { expr, .. } = item {
+                    rewrite_record_refs_expr(expr, pb, run, params);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// v2.11: bind a statement for execution from a plpgsql body:
+/// record-field pre-bind, then the ordinary $N substitution against
+/// the run's current parameter values.
+pub(crate) fn bind_plpgsql_stmt(
+    stmt: &mut Stmt,
+    pb: &crate::sql::PlpgsqlBody,
+    run: &PlpgsqlRun,
+) -> Result<(), ExecError> {
+    let mut params = run.params.clone();
+    rewrite_record_refs_stmt(stmt, pb, run, &mut params);
+    subst_params(stmt, &params)
+}
+
+/// v2.11: run a SELECT (or EXPLAIN of a SELECT) from a plpgsql body
+/// with the current bindings — the shared evaluator for RETURN,
+/// conditions, SELECT INTO, PERFORM, and loop sources.
+pub(crate) fn eval_plpgsql_query(
+    q: &mut Q,
+    scopes: &[Scope],
+    stmt: &Stmt,
+    pb: &crate::sql::PlpgsqlBody,
+    run: &PlpgsqlRun,
+) -> Result<SelectOut, ExecError> {
+    let mut bound = stmt.clone();
+    bind_plpgsql_stmt(&mut bound, pb, run)?;
+    match &bound {
+        Stmt::Select(sel) => run_select(q, sel, scopes),
+        Stmt::Explain {
+            stmt: inner,
+            analyze,
+            costs,
+            opts,
+        } => {
+            let Stmt::Select(sel) = &**inner else {
+                return Err(exec_err(
+                    "XX000",
+                    "plpgsql query is not SELECT or EXPLAIN of SELECT".to_string(),
+                ));
+            };
+            let rows = explain_rows(q, scopes, sel, *analyze, *costs, opts.verbose)?;
+            Ok(SelectOut {
+                columns: vec![("QUERY PLAN".to_string(), ColType::Text)],
+                rows,
+            })
+        }
+        _ => Err(exec_err(
+            "XX000",
+            "plpgsql query is not a SELECT".to_string(),
+        )),
+    }
+}
+
+/// v2.11: the affected-row count encoded in a command tag
+/// (`INSERT 0 3` -> 3; anything else -> 0).
+pub(crate) fn plpgsql_tag_count(tag: &str) -> i64 {
+    tag.rsplit(' ')
+        .next()
+        .and_then(|t| t.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+/// v2.11: execute any statement from a plpgsql body through the
+/// statement write context (the `run_nested_dml` bridge, generalized
+/// beyond DML): SELECT results come back as rows, DML as its
+/// RETURNING rows, and the affected count is the tag/row count.
+/// Returns (output, affected).
+pub(crate) fn exec_plpgsql_stmt(
+    q: &mut Q,
+    stmt: &Stmt,
+    pb: &crate::sql::PlpgsqlBody,
+    run: &PlpgsqlRun,
+    what: &str,
+) -> Result<(SelectOut, i64), ExecError> {
+    let mut bound = stmt.clone();
+    bind_plpgsql_stmt(&mut bound, pb, run)?;
+    let Some(w) = q.write.as_mut().map(QWrite::reborrow) else {
+        return Err(exec_err(
+            "0A000",
+            format!(
+                "statements are not supported in {} here: the calling query level has no statement write context",
+                what
+            ),
+        ));
+    };
+    if q.read_only {
+        let (cmd, target) = match &bound {
+            Stmt::Insert { table, .. } => ("INSERT", table.as_str()),
+            Stmt::Update { table, .. } => ("UPDATE", table.as_str()),
+            Stmt::Delete { table, .. } => ("DELETE", table.as_str()),
+            Stmt::Merge { table, .. } => ("MERGE", table.as_str()),
+            _ => ("", ""),
+        };
+        if !cmd.is_empty() && !q.eng.db.is_temp_table(q.session, target) {
+            return Err(exec_err(
+                "25006",
+                format!("cannot execute {} in a read-only transaction", cmd),
+            ));
+        }
+    }
+    let mut ctx = StmtCtx {
+        snap: q.snap,
+        own: q.own,
+        write_xid: w.write_xid,
+        all_xids: q.all_xids.clone(),
+        level: w.level,
+        writes: &mut *w.writes,
+        session: q.session,
+        role: q.priv_role_override.as_deref().unwrap_or(q.role),
+        read_only: q.read_only,
+        default_toast_compression: w.default_toast_compression,
+        notices: Vec::new(),
+    };
+    let out = execute_inner(&mut *q.eng, &mut ctx, &bound)?;
+    for msg in ctx.notices.drain(..) {
+        push_notice(msg);
+    }
+    match out {
+        ExecResult::Select { columns, rows } | ExecResult::Explain { columns, rows } => {
+            let n = rows.len() as i64;
+            Ok((SelectOut { columns, rows }, n))
+        }
+        ExecResult::Dml { columns, rows, tag } => {
+            let n = if !rows.is_empty() {
+                rows.len() as i64
+            } else {
+                plpgsql_tag_count(&tag)
+            };
+            Ok((SelectOut { columns, rows }, n))
+        }
+        ExecResult::Command { tag } => {
+            let n = plpgsql_tag_count(&tag);
+            Ok((
+                SelectOut {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                },
+                n,
+            ))
+        }
+    }
+}
+
+/// v2.11: bind a whole row to a record variable (param slot +
+/// `recs`), or clear it when `row` is None.
+pub(crate) fn plpgsql_bind_record(
+    pb: &crate::sql::PlpgsqlBody,
+    run: &mut PlpgsqlRun,
+    name: &str,
+    cols: &[String],
+    row: Option<&Row>,
+) {
+    match row {
+        Some(r) => {
+            let fields: Vec<(String, Value)> =
+                cols.iter().cloned().zip(r[..].iter().cloned()).collect();
+            if let Some(slot) = plpgsql_slot(pb, run, name) {
+                if slot < run.params.len() {
+                    run.params[slot] = Some(Value::Record(fields.clone()));
+                }
+            }
+            run.recs.insert(name.to_string(), fields);
+        }
+        None => {
+            if let Some(slot) = plpgsql_slot(pb, run, name) {
+                if slot < run.params.len() {
+                    run.params[slot] = Some(Value::Null);
+                }
+            }
+            run.recs.remove(name);
+        }
+    }
+}
+
+/// v2.11: assign one scalar value to an INTO/assignment target.
+pub(crate) fn plpgsql_assign_target(
+    q: &mut Q,
+    pb: &crate::sql::PlpgsqlBody,
+    run: &mut PlpgsqlRun,
+    target: &crate::sql::PlTarget,
+    v: Value,
+) -> Result<(), ExecError> {
+    use crate::sql::PlTarget as T;
+    match target {
+        T::Param(n) => {
+            let idx = (*n as usize).saturating_sub(1);
+            if idx < run.params.len() {
+                run.params[idx] = Some(v);
+            }
+            Ok(())
+        }
+        T::Var(name) => {
+            let slot = plpgsql_slot(pb, run, name).ok_or_else(|| {
+                exec_err(
+                    "XX000",
+                    format!("plpgsql variable \"{}\" is not declared", name),
+                )
+            })?;
+            let decl = plpgsql_decl_for_slot(pb, run, slot).cloned();
+            if matches!(v, Value::Record(_)) {
+                if let Value::Record(fields) = &v {
+                    run.recs.insert(name.clone(), fields.clone());
+                }
+            }
+            let v = plpgsql_coerce_for_decl(q, &v, decl.as_ref())?;
+            if slot < run.params.len() {
+                run.params[slot] = Some(v);
+            }
+            Ok(())
+        }
+        T::Field(var, field) => plpgsql_assign_field(run, pb, var, field, v),
+    }
+}
+
+/// v2.11: assign one field of a record variable.
+pub(crate) fn plpgsql_assign_field(
+    run: &mut PlpgsqlRun,
     pb: &crate::sql::PlpgsqlBody,
     var: &str,
-) -> Result<usize, ExecError> {
-    pb.decls.iter().position(|d| d.name == var).ok_or_else(|| {
-        exec_err(
-            "XX000",
-            format!("plpgsql variable \"{}\" is not declared", var),
+    field: &str,
+    v: Value,
+) -> Result<(), ExecError> {
+    let mut fields: Vec<(String, Value)> = run
+        .recs
+        .get(var)
+        .cloned()
+        .or_else(
+            || match plpgsql_slot(pb, run, var).and_then(|s| run.params.get(s)) {
+                Some(Some(Value::Record(f))) => Some(f.clone()),
+                _ => None,
+            },
         )
+        .unwrap_or_default();
+    if let Some((_, val)) = fields
+        .iter_mut()
+        .find(|(n, _)| n.eq_ignore_ascii_case(field))
+    {
+        *val = v;
+    } else {
+        fields.push((field.to_string(), v));
+    }
+    if let Some(slot) = plpgsql_slot(pb, run, var) {
+        if slot < run.params.len() {
+            run.params[slot] = Some(Value::Record(fields.clone()));
+        }
+    }
+    run.recs.insert(var.to_string(), fields);
+    Ok(())
+}
+
+/// v2.11: assign a SELECT INTO / RETURNING INTO result row (or the
+/// all-NULL no-row case) to the target list. A lone record target
+/// with a multi-column row binds as a record.
+pub(crate) fn plpgsql_assign_into(
+    q: &mut Q,
+    pb: &crate::sql::PlpgsqlBody,
+    run: &mut PlpgsqlRun,
+    targets: &[crate::sql::PlTarget],
+    out: &SelectOut,
+) -> Result<(), ExecError> {
+    // PG19 extra check (pl_exec.c exec_move_row*): with
+    // plpgsql.extra_errors = strict_multi_assignment, a source row
+    // whose field count differs from the target's is a 42804 error
+    // instead of a silent positional prefix assignment.
+    if plpgsql_extra_error("strict_multi_assignment") {
+        let tgt = plpgsql_into_target_fields(q, pb, run, targets);
+        if let Some(tgt) = tgt {
+            if tgt != out.columns.len() {
+                return Err(exec_err(
+                    "42804",
+                    "number of source and target fields in assignment does not match".to_string(),
+                ));
+            }
+        }
+    }
+    let row = out.rows.first();
+    if targets.len() == 1 {
+        if let crate::sql::PlTarget::Var(name) = &targets[0] {
+            let slot = plpgsql_slot(pb, run, name);
+            let decl = slot
+                .and_then(|s| plpgsql_decl_for_slot(pb, run, s))
+                .cloned();
+            // A rowtype/composite-typed variable is a record whose
+            // fields are the type's fields (positionally bound); an
+            // untyped `record` takes the row's own column names.
+            let rowtype_names = decl
+                .as_ref()
+                .and_then(|d| plpgsql_rowtype_field_names(q, d));
+            let is_rec = decl.as_ref().is_some_and(|d| plpgsql_is_record_decl(d));
+            if is_rec || rowtype_names.is_some() {
+                let cols: Vec<String> = rowtype_names
+                    .unwrap_or_else(|| out.columns.iter().map(|(n, _)| n.clone()).collect());
+                match row {
+                    Some(r) => {
+                        let padded = Row::new(
+                            cols.iter()
+                                .enumerate()
+                                .map(|(i, _)| r.get(i).cloned().unwrap_or(Value::Null))
+                                .collect(),
+                        );
+                        plpgsql_bind_record(pb, run, name, &cols, Some(&padded));
+                    }
+                    None => plpgsql_bind_record(pb, run, name, &cols, None),
+                }
+                return Ok(());
+            }
+        }
+    }
+    for (i, t) in targets.iter().enumerate() {
+        let v = row.and_then(|r| r.get(i).cloned()).unwrap_or(Value::Null);
+        plpgsql_assign_target(q, pb, run, t, v)?;
+    }
+    Ok(())
+}
+
+/// v2.11: how many fields an INTO target list expects, for the
+/// strict_multi_assignment extra check. A lone untyped `record`
+/// target defines its own fields (no check); a lone rowtype /
+/// composite target expects the type's field count; anything else
+/// expects one field per target.
+pub(crate) fn plpgsql_into_target_fields(
+    q: &mut Q,
+    pb: &crate::sql::PlpgsqlBody,
+    run: &PlpgsqlRun,
+    targets: &[crate::sql::PlTarget],
+) -> Option<usize> {
+    if targets.len() == 1 {
+        if let crate::sql::PlTarget::Var(name) = &targets[0] {
+            let decl = plpgsql_slot(pb, run, name)
+                .and_then(|s| plpgsql_decl_for_slot(pb, run, s))
+                .cloned();
+            if let Some(d) = decl {
+                if d.type_name.eq_ignore_ascii_case("record") {
+                    return None;
+                }
+                if let Some(names) = plpgsql_rowtype_field_names(q, &d) {
+                    return Some(names.len());
+                }
+            }
+            return Some(1);
+        }
+        return Some(1);
+    }
+    Some(targets.len())
+}
+
+/// v2.11: evaluate declaration initializers in declaration order
+/// (each may reference arguments and earlier variables), then reset
+/// the diagnostics (FOUND = false, ROW_COUNT = 0).
+pub(crate) fn init_plpgsql_decls(
+    q: &mut Q,
+    scopes: &[Scope],
+    pb: &crate::sql::PlpgsqlBody,
+    run: &mut PlpgsqlRun,
+) -> Result<(), ExecError> {
+    for (idx, d) in pb.decls.iter().enumerate() {
+        if d.alias_for.is_some() || d.is_cursor {
+            continue;
+        }
+        if let Some(def) = &d.default {
+            let out = eval_plpgsql_query(q, scopes, def, pb, run)?;
+            let v = out
+                .rows
+                .first()
+                .map(|r| r[0].clone())
+                .unwrap_or(Value::Null);
+            let v = plpgsql_coerce_for_decl(q, &v, Some(d))?;
+            let slot = run.nargs + idx;
+            if slot < run.params.len() {
+                run.params[slot] = Some(v);
+            }
+        }
+    }
+    run.found = false;
+    run.row_count = 0;
+    if let Some(slot) = plpgsql_slot(pb, run, "found") {
+        if slot < run.params.len() {
+            run.params[slot] = Some(Value::Bool(false));
+        }
+    }
+    Ok(())
+}
+
+/// v2.11: the write-log length (the subtransaction mark for
+/// EXCEPTION blocks), or None when this query level has no write
+/// context.
+pub(crate) fn plpgsql_write_mark(q: &Q) -> Option<usize> {
+    q.write.as_ref().map(|w| w.writes.len())
+}
+
+/// v2.11: roll the write log back to a mark taken by
+/// `plpgsql_write_mark` (the EXCEPTION-block subtransaction
+/// analogue). Write ops are applied to storage as they execute and
+/// recorded in the log as undo records, so rollback reverse-applies
+/// them with `undo_write_op` — the same primitive the server's
+/// ROLLBACK TO SAVEPOINT path uses (sequence advances are
+/// non-transactional and survive, like PG).
+pub(crate) fn plpgsql_write_rollback(q: &mut Q, mark: Option<usize>) {
+    let Some(m) = mark else {
+        return;
+    };
+    let ops: Vec<WriteOp> = {
+        let Some(w) = q.write.as_mut() else {
+            return;
+        };
+        if w.writes.len() <= m {
+            Vec::new()
+        } else {
+            w.writes.drain(m..).collect()
+        }
+    };
+    if ops.is_empty() {
+        return;
+    }
+    let owns = q.all_xids.clone();
+    let mut kept_seq: Vec<WriteOp> = Vec::new();
+    for op in ops.into_iter().rev() {
+        if matches!(op, WriteOp::SeqAdvance { .. }) {
+            kept_seq.push(op);
+        } else {
+            crate::storage::undo_write_op(&mut *q.eng, &owns, &op);
+        }
+    }
+    if !kept_seq.is_empty() {
+        if let Some(w) = q.write.as_mut() {
+            w.writes.extend(kept_seq.into_iter().rev());
+        }
+    }
+}
+
+/// v2.11: find the handler for an error in a handler list (first
+/// matching clause wins, PG's `exception_matches_conditions`).
+pub(crate) fn plpgsql_find_handler<'x>(
+    handlers: &'x [crate::sql::PlpgsqlHandler],
+    code: &str,
+) -> Option<&'x crate::sql::PlpgsqlHandler> {
+    handlers.iter().find(|h| {
+        h.sqlstates
+            .iter()
+            .any(|c| crate::sql::plpgsql_condition_matches(c, code))
     })
+}
+
+/// v2.11: how a loop should treat a body statement list's flow.
+enum LoopStep {
+    Next,
+    Break,
+    Done(PlFlow),
+}
+
+/// v2.11: classify a loop body's flow.
+fn loop_step(flow: PlFlow) -> Result<LoopStep, ExecError> {
+    match flow {
+        PlFlow::Continue => Ok(LoopStep::Next),
+        PlFlow::ContinueLoop => Ok(LoopStep::Next),
+        PlFlow::Exit => Ok(LoopStep::Break),
+        other => Ok(LoopStep::Done(other)),
+    }
+}
+
+/// v2.11: append rows to the SETOF result (RETURN NEXT / RETURN
+/// QUERY share the coercion: each row's first cell coerced to the
+/// function's return type, PG19 `exec_stmt_return_next`).
+pub(crate) fn append_next_rows(
+    q: &mut Q,
+    run: &mut PlpgsqlRun,
+    out: SelectOut,
+    ret_type: &str,
+) -> Result<(), ExecError> {
+    for row in out.rows {
+        let v = row.first().cloned().unwrap_or(Value::Null);
+        let v = coerce_to_type_name(q, &v, ret_type)?;
+        run.accum.push(Row::new(vec![v]));
+    }
+    Ok(())
 }
 
 /// v1.01: run one statement list of a bounded PL/pgSQL body.
 /// `RETURN` ends the function immediately (like PG's
 /// `PLPGSQL_RC_RETURN`); `RETURN NEXT` appends a row and continues;
-/// falling off the end is `PlFlow::Continue` (only SETOF bodies can do
-/// this - scalar bodies end with RETURN).
+/// falling off the end is `PlFlow::Continue` (only SETOF bodies can
+/// do this - scalar bodies end with RETURN).
+/// v2.11: the general interpreter — IF/CASE, SELECT INTO, DML
+/// through the statement executor, EXECUTE ... INTO/USING, PERFORM
+/// over full queries, nested blocks with EXCEPTION handlers (with
+/// write rollback to the block-entry mark — PG's subtransaction
+/// semantics for persistent state), FOR (range + query + dynamic),
+/// WHILE/LOOP, EXIT/CONTINUE, RETURN QUERY, GET DIAGNOSTICS, and
+/// the FOUND/ROW_COUNT diagnostics plumbing.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_plpgsql_stmts(
     q: &mut Q,
     scopes: &[Scope],
@@ -957,7 +1897,9 @@ pub(crate) fn run_plpgsql_stmts(
     pb: &crate::sql::PlpgsqlBody,
     run: &mut PlpgsqlRun,
     ret_type: &str,
+    fname: &str,
 ) -> Result<PlFlow, ExecError> {
+    use crate::sql::PlpgsqlStmt as S;
     for (idx, s) in stmts.iter().enumerate() {
         // v1.96 finishing pass: reaching the parser-appended dummy
         // RETURN on the body's main list is falling off the end,
@@ -966,16 +1908,19 @@ pub(crate) fn run_plpgsql_stmts(
         if pb.trailing_dummy
             && std::ptr::eq(stmts, pb.stmts.as_slice())
             && idx + 1 == stmts.len()
-            && matches!(s, crate::sql::PlpgsqlStmt::Return(_))
+            && matches!(s, S::Return(_))
         {
             return Ok(PlFlow::Continue);
         }
         match s {
-            crate::sql::PlpgsqlStmt::Return(sel) => {
-                let out = run_plpgsql_select(q, scopes, sel, run, "RETURN")?;
+            S::Return(sel) => {
+                let out = run_plpgsql_select(q, scopes, sel, pb, run, "RETURN")?;
                 return Ok(PlFlow::Return(out));
             }
-            crate::sql::PlpgsqlStmt::Utility(u) => {
+            S::ReturnBare => {
+                return Ok(PlFlow::ReturnBare);
+            }
+            S::Utility(u) => {
                 // Utility statements execute for side effects; results
                 // are discarded. ANALYZE has a direct core entry;
                 // GRANT/REVOKE forms run through the generic utility
@@ -995,43 +1940,17 @@ pub(crate) fn run_plpgsql_stmts(
                     run_func_utility(q, u, "<plpgsql body>")?;
                 }
             }
-            crate::sql::PlpgsqlStmt::Execute(sel) => {
-                // v1.96: EXECUTE <expr> — evaluate to the command
-                // string, parse it, and run it as a utility statement
-                // (side effects only; result rows are discarded in
-                // this bounded subset via the Command-only check in
-                // run_func_utility).
-                let out = run_plpgsql_select(q, scopes, sel, run, "EXECUTE")?;
-                let v = out
-                    .rows
-                    .first()
-                    .map(|r| r[0].clone())
-                    .unwrap_or(Value::Null);
-                if v == Value::Null {
-                    return Err(exec_err("22004", "EXECUTE string is null".to_string()));
-                }
-                let text = match eval_cast(&v, ColType::Text)? {
-                    Value::Text(s) | Value::BpChar(s) => s.to_string(),
-                    _ => {
-                        return Err(exec_err(
-                            "XX000",
-                            "EXECUTE expression did not produce text".to_string(),
-                        ));
-                    }
-                };
-                let stmt = crate::sql::parse_statement_inner(&text).map_err(sql_err)?;
-                run_func_utility(q, &stmt, "<plpgsql body>")?;
-            }
-            crate::sql::PlpgsqlStmt::Perform(sel) => {
+            S::Perform(sel) => {
                 // v1.96: PERFORM <expr> — evaluate for side effects,
-                // discard the result.
-                let _ = run_plpgsql_select(q, scopes, sel, run, "PERFORM")?;
+                // discard the result. v2.11: PERFORM sets FOUND.
+                let out = run_plpgsql_select(q, scopes, sel, pb, run, "PERFORM")?;
+                plpgsql_set_diag(pb, run, !out.rows.is_empty(), out.rows.len() as i64);
             }
-            crate::sql::PlpgsqlStmt::Assert { cond, message } => {
+            S::Assert { cond, message } => {
                 // v1.96: ASSERT — P0004 when the condition is not
                 // true (false OR NULL), message from the optional
                 // second expression (PG pl_exec.c exec_stmt_assert).
-                let out = run_plpgsql_select(q, scopes, cond, run, "ASSERT")?;
+                let out = run_plpgsql_select(q, scopes, cond, pb, run, "ASSERT")?;
                 let ok = matches!(
                     out.rows.first().and_then(|r| r.first()),
                     Some(Value::Bool(true))
@@ -1039,7 +1958,7 @@ pub(crate) fn run_plpgsql_stmts(
                 if !ok {
                     let msg = match message {
                         Some(m) => {
-                            let mout = run_plpgsql_select(q, scopes, m, run, "ASSERT")?;
+                            let mout = run_plpgsql_select(q, scopes, m, pb, run, "ASSERT")?;
                             match mout.rows.first().and_then(|r| r.first()) {
                                 Some(Value::Text(s)) | Some(Value::BpChar(s)) => s.to_string(),
                                 Some(other) => format!("{:?}", other),
@@ -1051,113 +1970,667 @@ pub(crate) fn run_plpgsql_stmts(
                     return Err(exec_err("P0004", msg));
                 }
             }
-            crate::sql::PlpgsqlStmt::Raise {
+            S::Raise {
                 level,
                 format,
                 args,
+                sqlstate,
+                using_message,
             } => {
                 // v1.02: `RAISE NOTICE|EXCEPTION '<format>', <args>...`
-                // (PG19 `exec_stmt_raise`, pl_exec.c). Each `%` consumes
-                // the next argument in its text-cast form (`%%` is a
-                // literal `%`); the shared `format_raise_message`
-                // evaluator is the same one the v1.00 trigger bodies
-                // use. Arguments are `$n`-substituted (named args were
-                // rewritten at CREATE) and evaluated like any
-                // expression. NOTICE goes to the statement-scoped sink
-                // (`execute()` drains it into `StmtCtx.notices`);
-                // EXCEPTION aborts the call, defaulting to P0001
-                // (raise_exception) like PG, and is trappable by the
-                // v1.01 WHEN handlers.
-                let mut vals = Vec::with_capacity(args.len());
-                for a in args {
-                    let mut e = a.clone();
-                    subst_expr(&mut e, &run.params)?;
-                    vals.push(eval_expr(q, scopes, &e)?);
-                }
-                let msg = format_raise_message(format, &vals);
+                // (PG19 `exec_stmt_raise`, pl_exec.c), extended in
+                // v2.11 with condition names, SQLSTATE, and USING.
+                let msg = if !format.is_empty() {
+                    let mut vals = Vec::with_capacity(args.len());
+                    for a in args {
+                        let mut e = a.clone();
+                        subst_expr(&mut e, &run.params)?;
+                        vals.push(eval_expr(q, scopes, &e)?);
+                    }
+                    format_raise_message(format, &vals)
+                } else if let Some(m) = using_message {
+                    let out = run_plpgsql_select(q, scopes, m, pb, run, "RAISE")?;
+                    match out.rows.first().and_then(|r| r.first()) {
+                        Some(Value::Text(s)) | Some(Value::BpChar(s)) => s.to_string(),
+                        Some(other) => value_to_text_cast(other),
+                        _ => String::new(),
+                    }
+                } else {
+                    String::new()
+                };
+                let code: &'static str = match sqlstate {
+                    Some(crate::sql::RaiseCode::Lit(lit)) => intern_sqlstate(lit),
+                    Some(crate::sql::RaiseCode::Expr(sel)) => {
+                        let out = run_plpgsql_select(q, scopes, sel, pb, run, "RAISE")?;
+                        let raw = match out.rows.first().and_then(|r| r.first()) {
+                            Some(Value::Text(s)) | Some(Value::BpChar(s)) => s.to_string(),
+                            _ => {
+                                return Err(exec_err(
+                                    "22023",
+                                    "RAISE ... USING ERRCODE requires a SQLSTATE string"
+                                        .to_string(),
+                                ));
+                            }
+                        };
+                        // A condition name is also accepted (PG19
+                        // exec_stmt_raise resolves errcode text via
+                        // plpgsql_recognize_err_condition).
+                        match crate::sql::plpgsql_condition_named(&raw) {
+                            Ok(codes) => intern_sqlstate(&codes[0]),
+                            Err(_) => {
+                                if raw.len() != 5
+                                    || !raw
+                                        .chars()
+                                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+                                {
+                                    return Err(exec_err(
+                                        "22023",
+                                        format!("invalid SQLSTATE code \"{}\"", raw),
+                                    ));
+                                }
+                                intern_sqlstate(&raw)
+                            }
+                        }
+                    }
+                    None => {
+                        if *level == crate::sql::RaiseLevel::Exception {
+                            "P0001"
+                        } else {
+                            "00000"
+                        }
+                    }
+                };
                 match level {
                     crate::sql::RaiseLevel::Notice | crate::sql::RaiseLevel::Warning => {
                         push_notice(msg)
                     }
                     crate::sql::RaiseLevel::Exception => {
-                        return Err(exec_err("P0001", msg));
+                        return Err(ExecError {
+                            code,
+                            message: msg,
+                            detail: None,
+                        });
                     }
                 }
             }
-            crate::sql::PlpgsqlStmt::Assign { var, select } => {
+            S::Reraise => {
+                return Err(match &run.last_error {
+                    Some((code, msg)) => ExecError {
+                        code: intern_sqlstate(code),
+                        message: msg.clone(),
+                        detail: None,
+                    },
+                    None => exec_err(
+                        "0A000",
+                        "RAISE without parameters can only be used within an exception handler"
+                            .to_string(),
+                    ),
+                });
+            }
+            S::Assign { var, select } => {
                 // v1.03: `var := <expr>` (PG19 `exec_stmt_assign`,
                 // pl_exec.c): evaluate like RETURN, coerce to the
                 // declared type (`exec_assign_value`), and write the
                 // variable's slot. A 0-row SELECT assigns NULL (PG's
                 // `SELECT ... INTO` strictness does not apply to `:=`).
-                let idx = plpgsql_var_index(pb, var)?;
-                let out = run_plpgsql_select(q, scopes, select, run, "assignment")?;
+                // v2.11: assignment goes through the target machinery
+                // (ALIAS- and scope-aware).
+                let out = run_plpgsql_select(q, scopes, select, pb, run, "assignment")?;
                 let v = out
                     .rows
                     .first()
                     .map(|r| r[0].clone())
                     .unwrap_or(Value::Null);
-                let v = coerce_to_type_name(q, &v, &pb.decls[idx].type_name)?;
-                run.params[run.nargs + idx] = Some(v);
+                plpgsql_assign_target(q, pb, run, &crate::sql::PlTarget::Var(var.clone()), v)?;
             }
-            crate::sql::PlpgsqlStmt::ForQuery { var, query, body } => {
-                // v1.03: `FOR var IN <query> LOOP` (PG19
-                // `exec_stmt_fors`, pl_exec.c). The query is a
-                // row-producing SELECT or EXPLAIN; each row binds the
-                // (DECLAREd) variable to the row's first column,
-                // coerced to its declared type.
-                let idx = plpgsql_var_index(pb, var)?;
-                let mut qq = query.clone();
-                subst_params(&mut qq, &run.params)?;
-                let rows: Vec<Row> = match &qq {
-                    Stmt::Select(sel) => run_select(q, sel, scopes)?.rows,
-                    Stmt::Explain {
-                        stmt,
-                        analyze,
-                        costs,
-                        opts,
-                    } => {
-                        let Stmt::Select(inner) = &**stmt else {
-                            return Err(exec_err(
-                                "XX000",
-                                "plpgsql FOR over non-SELECT EXPLAIN".to_string(),
-                            ));
-                        };
-                        // v1.46: thread VERBOSE through for `Output:`.
-                        explain_rows(q, scopes, inner, *analyze, *costs, opts.verbose)?
+            S::AssignField { var, field, select } => {
+                let out = run_plpgsql_select(q, scopes, select, pb, run, "assignment")?;
+                let v = out
+                    .rows
+                    .first()
+                    .map(|r| r[0].clone())
+                    .unwrap_or(Value::Null);
+                plpgsql_assign_field(run, pb, var, field, v)?;
+            }
+            S::AssignParam { index, select } => {
+                let out = run_plpgsql_select(q, scopes, select, pb, run, "assignment")?;
+                let v = out
+                    .rows
+                    .first()
+                    .map(|r| r[0].clone())
+                    .unwrap_or(Value::Null);
+                plpgsql_assign_target(q, pb, run, &crate::sql::PlTarget::Param(*index), v)?;
+            }
+            S::If {
+                branches,
+                else_body,
+            } => {
+                let mut taken: Option<&[crate::sql::PlpgsqlStmt]> = None;
+                for (cond, body) in branches {
+                    let out = eval_plpgsql_query(q, scopes, cond, pb, run)?;
+                    if matches!(out.rows.first().map(|r| &r[0]), Some(Value::Bool(true))) {
+                        taken = Some(body);
+                        break;
                     }
-                    _ => {
-                        return Err(exec_err(
-                            "XX000",
-                            "plpgsql FOR query is not SELECT or EXPLAIN".to_string(),
-                        ));
-                    }
-                };
-                for row in rows {
-                    let cell = row.first().cloned().unwrap_or(Value::Null);
-                    let cell = coerce_to_type_name(q, &cell, &pb.decls[idx].type_name)?;
-                    run.params[run.nargs + idx] = Some(cell);
-                    match run_plpgsql_stmts(q, scopes, body, pb, run, ret_type)? {
-                        PlFlow::Return(out) => return Ok(PlFlow::Return(out)),
+                }
+                if taken.is_none() && !else_body.is_empty() {
+                    taken = Some(else_body);
+                }
+                if let Some(body) = taken {
+                    match run_plpgsql_stmts(q, scopes, body, pb, run, ret_type, fname)? {
                         PlFlow::Continue => {}
+                        other => return Ok(other),
                     }
                 }
             }
-            crate::sql::PlpgsqlStmt::ReturnNext(sel) => {
+            S::Case {
+                branches,
+                else_body,
+            } => {
+                let mut taken: Option<&[crate::sql::PlpgsqlStmt]> = None;
+                for (cond, body) in branches {
+                    let out = eval_plpgsql_query(q, scopes, cond, pb, run)?;
+                    if matches!(out.rows.first().map(|r| &r[0]), Some(Value::Bool(true))) {
+                        taken = Some(body);
+                        break;
+                    }
+                }
+                if taken.is_none() && !else_body.is_empty() {
+                    taken = Some(else_body);
+                }
+                match taken {
+                    Some(body) => {
+                        match run_plpgsql_stmts(q, scopes, body, pb, run, ret_type, fname)? {
+                            PlFlow::Continue => {}
+                            other => return Ok(other),
+                        }
+                    }
+                    None => {
+                        return Err(exec_err("20000", "case not found".to_string()));
+                    }
+                }
+            }
+            S::SelectInto {
+                targets,
+                query,
+                strict,
+            } => {
+                let out = eval_plpgsql_query(q, scopes, query, pb, run)?;
+                if targets.is_empty() {
+                    return Err(exec_err(
+                        "42601",
+                        "SELECT ... INTO in a plpgsql body requires targets".to_string(),
+                    ));
+                }
+                if out.rows.is_empty() {
+                    if *strict {
+                        return Err(exec_err("P0002", "query returned no rows".to_string()));
+                    }
+                    plpgsql_assign_into(q, pb, run, targets, &out)?;
+                    plpgsql_set_diag(pb, run, false, 0);
+                } else {
+                    if (*strict || plpgsql_extra_error("too_many_rows")) && out.rows.len() > 1 {
+                        return Err(exec_err(
+                            "P0003",
+                            "query returned more than one row".to_string(),
+                        ));
+                    }
+                    plpgsql_assign_into(q, pb, run, targets, &out)?;
+                    plpgsql_set_diag(pb, run, true, 1);
+                }
+            }
+            S::Dml {
+                stmt: inner,
+                targets,
+                strict,
+            } => {
+                let (out, affected) = exec_plpgsql_stmt(q, inner, pb, run, "plpgsql")?;
+                match targets {
+                    Some(targets) if !targets.is_empty() => {
+                        if out.rows.is_empty() {
+                            if *strict {
+                                return Err(exec_err(
+                                    "P0002",
+                                    "query returned no rows".to_string(),
+                                ));
+                            }
+                            plpgsql_assign_into(q, pb, run, targets, &out)?;
+                            plpgsql_set_diag(pb, run, false, 0);
+                        } else {
+                            // PG19: a DML statement with an INTO
+                            // target (mod_stmt) errors on >1 returned
+                            // row exactly like STRICT does.
+                            if out.rows.len() > 1 {
+                                return Err(exec_err(
+                                    "P0003",
+                                    "query returned more than one row".to_string(),
+                                ));
+                            }
+                            plpgsql_assign_into(q, pb, run, targets, &out)?;
+                            plpgsql_set_diag(pb, run, true, affected);
+                        }
+                    }
+                    _ => {
+                        plpgsql_set_diag(pb, run, affected > 0, affected);
+                    }
+                }
+            }
+            S::ExecuteInto {
+                expr,
+                targets,
+                strict,
+                using,
+            } => {
+                let (out, affected) = plpgsql_exec_dynamic(q, scopes, expr, using, pb, run)?;
+                match targets {
+                    Some(targets) if !targets.is_empty() => {
+                        if out.rows.is_empty() {
+                            if *strict {
+                                return Err(exec_err(
+                                    "P0002",
+                                    "query returned no rows".to_string(),
+                                ));
+                            }
+                            plpgsql_assign_into(q, pb, run, targets, &out)?;
+                            plpgsql_set_diag(pb, run, false, 0);
+                        } else {
+                            if (*strict || plpgsql_extra_error("too_many_rows"))
+                                && out.rows.len() > 1
+                            {
+                                return Err(exec_err(
+                                    "P0003",
+                                    "query returned more than one row".to_string(),
+                                ));
+                            }
+                            plpgsql_assign_into(q, pb, run, targets, &out)?;
+                            plpgsql_set_diag(pb, run, true, affected);
+                        }
+                    }
+                    _ => {
+                        plpgsql_set_diag(pb, run, affected > 0, affected);
+                    }
+                }
+            }
+            S::PerformQuery(query) => {
+                let out = eval_plpgsql_query(q, scopes, query, pb, run)?;
+                plpgsql_set_diag(pb, run, !out.rows.is_empty(), out.rows.len() as i64);
+            }
+            S::ReturnNext(sel) => {
                 // v1.03: `RETURN NEXT <expr>` (PG19
                 // `exec_stmt_return_next`, pl_exec.c): coerce to the
                 // function's return type and append to the result set
                 // without ending the function.
-                let out = run_plpgsql_select(q, scopes, sel, run, "RETURN NEXT")?;
-                for row in out.rows {
-                    let v = row.first().cloned().unwrap_or(Value::Null);
-                    let v = coerce_to_type_name(q, &v, ret_type)?;
-                    run.accum.push(Row::new(vec![v]));
+                let out = run_plpgsql_select(q, scopes, sel, pb, run, "RETURN NEXT")?;
+                append_next_rows(q, run, out, ret_type)?;
+            }
+            S::ReturnQuery(query) => {
+                let out = eval_plpgsql_query(q, scopes, query, pb, run)?;
+                append_next_rows(q, run, out, ret_type)?;
+            }
+            S::ReturnQueryExecute(expr) => {
+                let (out, _) = plpgsql_exec_dynamic(q, scopes, expr, &[], pb, run)?;
+                append_next_rows(q, run, out, ret_type)?;
+            }
+            S::ForQuery { .. } | S::ForRange { .. } => {
+                match run_plpgsql_for(q, scopes, s, pb, run, ret_type, fname)? {
+                    PlFlow::Continue => {}
+                    other => return Ok(other),
+                }
+            }
+            S::While { cond, body } => loop {
+                let out = eval_plpgsql_query(q, scopes, cond, pb, run)?;
+                if !matches!(out.rows.first().map(|r| &r[0]), Some(Value::Bool(true))) {
+                    break;
+                }
+                match loop_step(run_plpgsql_stmts(
+                    q, scopes, body, pb, run, ret_type, fname,
+                )?)? {
+                    LoopStep::Next => {}
+                    LoopStep::Break => break,
+                    LoopStep::Done(f) => return Ok(f),
+                }
+            },
+            S::Loop { body } => loop {
+                match loop_step(run_plpgsql_stmts(
+                    q, scopes, body, pb, run, ret_type, fname,
+                )?)? {
+                    LoopStep::Next => {}
+                    LoopStep::Break => break,
+                    LoopStep::Done(f) => return Ok(f),
+                }
+            },
+            S::Exit { when } => {
+                let hit = match when {
+                    Some(cond) => {
+                        let out = eval_plpgsql_query(q, scopes, cond, pb, run)?;
+                        matches!(out.rows.first().map(|r| &r[0]), Some(Value::Bool(true)))
+                    }
+                    None => true,
+                };
+                if hit {
+                    return Ok(PlFlow::Exit);
+                }
+            }
+            S::Continue { when } => {
+                let hit = match when {
+                    Some(cond) => {
+                        let out = eval_plpgsql_query(q, scopes, cond, pb, run)?;
+                        matches!(out.rows.first().map(|r| &r[0]), Some(Value::Bool(true)))
+                    }
+                    None => true,
+                };
+                if hit {
+                    return Ok(PlFlow::ContinueLoop);
+                }
+            }
+            S::Block {
+                decl_idx,
+                stmts: inner,
+                handlers,
+                ..
+            } => {
+                run.scopes.push(decl_idx.clone());
+                let mark = plpgsql_write_mark(q);
+                let mut result = (|| -> Result<PlFlow, ExecError> {
+                    // Initialize this block's own declarations.
+                    for &idx in decl_idx {
+                        let d = &pb.decls[idx];
+                        if d.alias_for.is_some() || d.is_cursor {
+                            continue;
+                        }
+                        if let Some(def) = &d.default {
+                            let out = eval_plpgsql_query(q, scopes, def, pb, run)?;
+                            let v = out
+                                .rows
+                                .first()
+                                .map(|r| r[0].clone())
+                                .unwrap_or(Value::Null);
+                            let v = plpgsql_coerce_for_decl(q, &v, Some(d))?;
+                            if let Some(slot) = plpgsql_decl_slot(pb, run, idx) {
+                                if slot < run.params.len() {
+                                    run.params[slot] = Some(v);
+                                }
+                            }
+                        }
+                    }
+                    run_plpgsql_stmts(q, scopes, inner, pb, run, ret_type, fname)
+                })();
+                if let Err(e) = &result {
+                    if let Some(h) = plpgsql_find_handler(handlers, e.code) {
+                        plpgsql_write_rollback(q, mark);
+                        run.last_error = Some((e.code.to_string(), e.message.clone()));
+                        result = run_plpgsql_stmts(q, scopes, &h.stmts, pb, run, ret_type, fname);
+                    }
+                }
+                run.scopes.pop();
+                match result? {
+                    PlFlow::Continue => {}
+                    other => return Ok(other),
+                }
+            }
+            S::GetDiagnostics { stacked, assigns } => {
+                for (target, item) in assigns {
+                    let v = if *stacked {
+                        match item.as_str() {
+                            "returned_sqlstate" => Value::Text(
+                                run.last_error
+                                    .as_ref()
+                                    .map(|(c, _)| c.clone())
+                                    .unwrap_or_else(|| "00000".to_string())
+                                    .into(),
+                            ),
+                            "message_text" => Value::Text(
+                                run.last_error
+                                    .as_ref()
+                                    .map(|(_, m)| m.clone())
+                                    .unwrap_or_default()
+                                    .into(),
+                            ),
+                            "pg_context" => {
+                                Value::Text(format!("PL/pgSQL function {}()", fname).into())
+                            }
+                            _ => Value::Text(String::new().into()),
+                        }
+                    } else {
+                        match item.as_str() {
+                            "row_count" => Value::BigInt(run.row_count),
+                            _ => Value::Text(String::new().into()),
+                        }
+                    };
+                    plpgsql_assign_target(q, pb, run, target, v)?;
                 }
             }
         }
     }
     Ok(PlFlow::Continue)
+}
+
+/// v2.11: EXECUTE (and RETURN QUERY EXECUTE): evaluate the command
+/// string, parse it, bind USING values as its $N parameters
+/// (left-to-right), and execute through the statement bridge.
+/// Returns (output, affected).
+pub(crate) fn plpgsql_exec_dynamic(
+    q: &mut Q,
+    scopes: &[Scope],
+    expr: &Stmt,
+    using: &[Stmt],
+    pb: &crate::sql::PlpgsqlBody,
+    run: &PlpgsqlRun,
+) -> Result<(SelectOut, i64), ExecError> {
+    let out = eval_plpgsql_query(q, scopes, expr, pb, run)?;
+    let text = match out.rows.first().and_then(|r| r.first()) {
+        Some(Value::Text(s)) | Some(Value::BpChar(s)) => s.to_string(),
+        Some(_) => {
+            return Err(exec_err(
+                "42804",
+                "EXECUTE argument must be a text expression".to_string(),
+            ));
+        }
+        None => {
+            return Err(exec_err(
+                "22004",
+                "EXECUTE argument must not be null".to_string(),
+            ));
+        }
+    };
+    let text = text.trim().trim_end_matches(';').trim().to_string();
+    let mut dyn_stmt = crate::sql::parse_statement_inner(&text).map_err(sql_err)?;
+    if !using.is_empty() {
+        let mut vals: Vec<Option<Value>> = Vec::new();
+        for u in using {
+            let uout = eval_plpgsql_query(q, scopes, u, pb, run)?;
+            vals.push(Some(
+                uout.rows
+                    .first()
+                    .map(|r| r[0].clone())
+                    .unwrap_or(Value::Null),
+            ));
+        }
+        subst_params(&mut dyn_stmt, &vals)?;
+    }
+    exec_plpgsql_stmt(q, &dyn_stmt, pb, run, "EXECUTE")
+}
+
+/// v2.11: run one FOR loop (range or query/dynamic source).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_plpgsql_for(
+    q: &mut Q,
+    scopes: &[Scope],
+    stmt: &crate::sql::PlpgsqlStmt,
+    pb: &crate::sql::PlpgsqlBody,
+    run: &mut PlpgsqlRun,
+    ret_type: &str,
+    fname: &str,
+) -> Result<PlFlow, ExecError> {
+    use crate::sql::PlpgsqlStmt as S;
+    match stmt {
+        S::ForRange {
+            var,
+            low,
+            high,
+            step,
+            reverse,
+            body,
+        } => {
+            // v2.11: PG19 exec_stmt_fori: bounds and step are
+            // evaluated once; the variable (auto-declared integer,
+            // or an argument in the name-collision case) takes each
+            // value in turn and keeps the last one after the loop.
+            let slot = plpgsql_slot(pb, run, var).ok_or_else(|| {
+                exec_err(
+                    "XX000",
+                    format!("loop variable \"{}\" is not declared", var),
+                )
+            })?;
+            let lo = plpgsql_for_bound(q, scopes, low, pb, run)?;
+            let hi = plpgsql_for_bound(q, scopes, high, pb, run)?;
+            let st = match step {
+                Some(s) => {
+                    let v = plpgsql_for_bound(q, scopes, s, pb, run)?;
+                    if v <= 0 {
+                        return Err(exec_err(
+                            "22023",
+                            "argument of BY must be greater than zero".to_string(),
+                        ));
+                    }
+                    v
+                }
+                None => 1,
+            };
+            let mut i = lo;
+            let mut ran = false;
+            loop {
+                let in_range = if *reverse { i >= hi } else { i <= hi };
+                if !in_range {
+                    break;
+                }
+                ran = true;
+                if slot < run.params.len() {
+                    run.params[slot] = Some(Value::BigInt(i));
+                }
+                match loop_step(run_plpgsql_stmts(
+                    q, scopes, body, pb, run, ret_type, fname,
+                )?)? {
+                    LoopStep::Next => {}
+                    LoopStep::Break => break,
+                    LoopStep::Done(f) => {
+                        plpgsql_set_diag(pb, run, true, 1);
+                        return Ok(f);
+                    }
+                }
+                i = if *reverse {
+                    i.wrapping_sub(st)
+                } else {
+                    i.wrapping_add(st)
+                };
+            }
+            plpgsql_set_diag(pb, run, ran, if ran { 1 } else { 0 });
+            Ok(PlFlow::Continue)
+        }
+        S::ForQuery {
+            var,
+            query,
+            body,
+            dynamic,
+        } => {
+            // v1.03: `FOR var IN <query> LOOP` (PG19
+            // `exec_stmt_fors`, pl_exec.c). The query is a
+            // row-producing SELECT or EXPLAIN; each row binds the
+            // (DECLAREd) variable to the row's first column,
+            // coerced to its declared type — or, v2.11, the whole
+            // row when the variable is a record.
+            let out = if *dynamic {
+                let (o, _) = plpgsql_exec_dynamic(q, scopes, query, &[], pb, run)?;
+                o
+            } else {
+                eval_plpgsql_query(q, scopes, query, pb, run)?
+            };
+            let decl = pb.decls.iter().find(|d| &d.name == var).cloned();
+            let is_record = decl.as_ref().is_some_and(plpgsql_is_record_decl);
+            let slot = plpgsql_slot(pb, run, var);
+            let cols: Vec<String> = out.columns.iter().map(|(n, _)| n.clone()).collect();
+            let mut seen = false;
+            for row in &out.rows {
+                seen = true;
+                if is_record {
+                    plpgsql_bind_record(pb, run, var, &cols, Some(row));
+                } else if let Some(s) = slot {
+                    if s < run.params.len() {
+                        let cell = row.first().cloned().unwrap_or(Value::Null);
+                        let cell = plpgsql_coerce_for_decl(q, &cell, decl.as_ref())?;
+                        run.params[s] = Some(cell);
+                    }
+                }
+                match loop_step(run_plpgsql_stmts(
+                    q, scopes, body, pb, run, ret_type, fname,
+                )?)? {
+                    LoopStep::Next => {}
+                    LoopStep::Break => break,
+                    LoopStep::Done(f) => {
+                        plpgsql_set_diag(pb, run, true, 1);
+                        return Ok(f);
+                    }
+                }
+            }
+            plpgsql_set_diag(pb, run, seen, if seen { 1 } else { 0 });
+            Ok(PlFlow::Continue)
+        }
+        _ => unreachable!("run_plpgsql_for called on a non-FOR statement"),
+    }
+}
+
+/// v2.11: evaluate a FOR integer bound (SELECT-wrapped expression).
+pub(crate) fn plpgsql_for_bound(
+    q: &mut Q,
+    scopes: &[Scope],
+    sel: &Stmt,
+    pb: &crate::sql::PlpgsqlBody,
+    run: &PlpgsqlRun,
+) -> Result<i64, ExecError> {
+    let out = eval_plpgsql_query(q, scopes, sel, pb, run)?;
+    match out.rows.first().map(|r| &r[0]) {
+        Some(Value::Int(n)) => Ok(*n as i64),
+        Some(Value::BigInt(n)) => Ok(*n),
+        Some(Value::SmallInt(n)) => Ok(*n as i64),
+        Some(Value::Null) | None => Err(exec_err(
+            "22004",
+            "FOR loop bound must not be null".to_string(),
+        )),
+        Some(other) => Err(exec_err(
+            "42804",
+            format!(
+                "FOR loop bound has the wrong type: {}",
+                value_type_name(other)
+            ),
+        )),
+    }
+}
+
+/// v2.11: the single-NULL-row result (void / trigger / bare-RETURN
+/// scalar), with the column named and typed after the function.
+pub(crate) fn plpgsql_null_row_result(
+    q: &mut Q,
+    fdef: &crate::storage::FuncDef,
+) -> Result<SelectOut, ExecError> {
+    let coltype = resolve_func_type_name(q.eng, q.snap, q.own, q.session, &fdef.ret_type)?;
+    Ok(SelectOut {
+        columns: vec![(fdef.name.clone(), coltype)],
+        rows: vec![crate::storage::Row::new(vec![Value::Null])],
+    })
+}
+
+/// v2.11: the SETOF fall-off result: accumulated RETURN NEXT /
+/// RETURN QUERY rows under the function's result column.
+pub(crate) fn plpgsql_setof_result(
+    q: &mut Q,
+    fdef: &crate::storage::FuncDef,
+    run: PlpgsqlRun,
+) -> Result<SelectOut, ExecError> {
+    let coltype = resolve_func_type_name(q.eng, q.snap, q.own, q.session, &fdef.ret_type)?;
+    Ok(SelectOut {
+        columns: vec![(fdef.name.clone(), coltype)],
+        rows: run.accum,
+    })
 }
 
 /// v1.01: run a bounded PL/pgSQL body: statement sequence with
@@ -1170,15 +2643,16 @@ pub(crate) fn run_plpgsql_stmts(
 /// Errors raised *inside* a handler propagate untrapped (PG only wraps
 /// the body in PG_TRY, not the handler).
 ///
-/// Deliberate deviation from PG19: no subtransaction is opened around
-/// the body, so a trapped error does NOT roll back the effects of
-/// statements that already ran (rustgres has no subtransaction
-/// machinery; ANALYZE has no transactional effects to roll back).
-///
 /// v1.03: DECLAREd variables get one `None` slot each appended to the
 /// parameter vector; `RETURN NEXT` accumulates rows for SETOF
 /// functions (the output column is named after the function, PG19
 /// `pl_exec.c` `exec_stmt_return_next` + `do_compile` naming).
+///
+/// v2.11: declaration initializers are evaluated at entry; the
+/// body's EXCEPTION handlers now roll the call's writes back to the
+/// entry mark (PG's subtransaction semantics for persistent state —
+/// closing the v1.01 documented deviation for the write log;
+/// variable assignments are NOT rolled back, matching PG).
 pub(crate) fn run_plpgsql_body(
     q: &mut Q,
     scopes: &[Scope],
@@ -1218,15 +2692,20 @@ pub(crate) fn run_plpgsql_body(
         write: q.write.as_mut().map(QWrite::reborrow),
     };
     let nargs = params.len();
-    let mut run = PlpgsqlRun {
-        params: params.to_vec(),
-        nargs,
-        accum: Vec::new(),
-    };
+    let mut run = PlpgsqlRun::new(params.to_vec(), nargs);
     run.params
         .extend(std::iter::repeat(None).take(pb.decls.len()));
-    let flow = match run_plpgsql_stmts(&mut call_q, scopes, &pb.stmts, pb, &mut run, &fdef.ret_type)
-    {
+    init_plpgsql_decls(&mut call_q, scopes, pb, &mut run)?;
+    let mark = plpgsql_write_mark(&call_q);
+    let flow = match run_plpgsql_stmts(
+        &mut call_q,
+        scopes,
+        &pb.stmts,
+        pb,
+        &mut run,
+        &fdef.ret_type,
+        &fdef.name,
+    ) {
         Ok(f) => f,
         Err(e) => {
             let handler = pb.handlers.iter().find(|h| {
@@ -1236,7 +2715,17 @@ pub(crate) fn run_plpgsql_body(
             });
             match handler {
                 Some(h) => {
-                    run_plpgsql_stmts(&mut call_q, scopes, &h.stmts, pb, &mut run, &fdef.ret_type)?
+                    plpgsql_write_rollback(&mut call_q, mark);
+                    run.last_error = Some((e.code.to_string(), e.message.clone()));
+                    run_plpgsql_stmts(
+                        &mut call_q,
+                        scopes,
+                        &h.stmts,
+                        pb,
+                        &mut run,
+                        &fdef.ret_type,
+                        &fdef.name,
+                    )?
                 }
                 None => return Err(e),
             }
@@ -1244,48 +2733,47 @@ pub(crate) fn run_plpgsql_body(
     };
     match flow {
         PlFlow::Return(out) => Ok(out),
-        PlFlow::Continue => {
-            // v1.03: SETOF bodies fall off the end and return the
-            // accumulated RETURN NEXT rows (possibly zero).
-            // v1.96 finishing pass: scalar bodies reach here by
-            // falling off the end (the parser's dummy RETURN is
-            // reported as Continue by run_plpgsql_stmts). PG19:
-            // void and trigger functions may fall off; any other
-            // scalar function is 2F005.
-            if !fdef.returns_set {
-                if fdef.ret_type.eq_ignore_ascii_case("void")
-                    || fdef.ret_type.eq_ignore_ascii_case("trigger")
-                {
-                    let coltype = resolve_func_type_name(
-                        call_q.eng,
-                        call_q.snap,
-                        call_q.own,
-                        call_q.session,
-                        &fdef.ret_type,
-                    )?;
-                    return Ok(SelectOut {
-                        columns: vec![(fdef.name.clone(), coltype)],
-                        rows: vec![crate::storage::Row::new(vec![Value::Null])],
-                    });
-                }
-                return Err(exec_err(
-                    "2F005",
-                    "control reached end of function without RETURN".to_string(),
-                ));
+        PlFlow::ReturnBare => {
+            // v2.11: bare RETURN — SETOF returns what accumulated;
+            // anything else returns the NULL datum (PG19
+            // exec_stmt_return with a NULL expression).
+            if fdef.returns_set {
+                plpgsql_setof_result(&mut call_q, fdef, run)
+            } else {
+                plpgsql_null_row_result(&mut call_q, fdef)
             }
-            let coltype = resolve_func_type_name(
-                call_q.eng,
-                call_q.snap,
-                call_q.own,
-                call_q.session,
-                &fdef.ret_type,
-            )?;
-            Ok(SelectOut {
-                columns: vec![(fdef.name.clone(), coltype)],
-                rows: run.accum,
-            })
         }
+        PlFlow::Exit | PlFlow::ContinueLoop => {
+            // EXIT/CONTINUE reaching the top has no loop to act on;
+            // treat as falling off the end (defensive — the parser
+            // only emits them inside loop bodies in practice).
+            plpgsql_falloff_result(&mut call_q, fdef, run)
+        }
+        PlFlow::Continue => plpgsql_falloff_result(&mut call_q, fdef, run),
     }
+}
+
+/// v2.11: the fall-off-the-end result of a plpgsql body (v1.03/v1.96
+/// semantics preserved): SETOF returns accumulated rows; void and
+/// trigger functions return the NULL row; any other scalar function
+/// is 2F005.
+pub(crate) fn plpgsql_falloff_result(
+    call_q: &mut Q,
+    fdef: &crate::storage::FuncDef,
+    run: PlpgsqlRun,
+) -> Result<SelectOut, ExecError> {
+    if !fdef.returns_set {
+        if fdef.ret_type.eq_ignore_ascii_case("void")
+            || fdef.ret_type.eq_ignore_ascii_case("trigger")
+        {
+            return plpgsql_null_row_result(call_q, fdef);
+        }
+        return Err(exec_err(
+            "2F005",
+            "control reached end of function without RETURN".to_string(),
+        ));
+    }
+    plpgsql_setof_result(call_q, fdef, run)
 }
 
 /// v0.86: scalar call of a user function. SQL bodies run via

@@ -179,6 +179,10 @@ end$$;",
 /// v1.96: WARNING joined NOTICE/EXCEPTION as a supported level
 /// (PG19 supports it; the privileges suite's plpgsql bodies use it),
 /// so it must now CREATE cleanly instead of erroring.
+/// v2.11: DEBUG/LOG/INFO are accepted too (PG19 supports every
+/// level; they behave as NOTICE-class here — the client_min_messages
+/// filtering PG applies is a session-GUC concern), so they CREATE
+/// cleanly and run.
 #[test]
 fn raise_unsupported_level_is_0a000() {
     let mut eng = engine();
@@ -191,11 +195,12 @@ fn raise_unsupported_level_is_0a000() {
         let (r, _) = run_n(
             &mut eng,
             &format!(
-                "create function lvl102() returns int as 'begin raise {level} ''x''; return 1; end' language plpgsql"
+                "create function lvl102_{level}() returns int as 'begin raise {level} ''x''; return 1; end' language plpgsql"
             ),
         );
-        let (code, _) = err_of(r);
-        assert_eq!(code, "0A000", "level {level}");
+        r.unwrap();
+        let (r, _) = run_n(&mut eng, &format!("select lvl102_{level}()"));
+        assert_eq!(rows_of(r.unwrap()), vec![vec!["1"]], "level {level}");
     }
 }
 

@@ -56,6 +56,27 @@ pub(crate) fn exec_err(code: &'static str, message: impl Into<String>) -> ExecEr
     }
 }
 
+/// v2.11: intern a dynamically chosen SQLSTATE (RAISE SQLSTATE /
+/// USING errcode / trigger RAISE with a variable code) into a
+/// `&'static str` for [`ExecError::code`]. Each distinct code is
+/// leaked exactly once per process (a 5-char string), replacing the
+/// v2.10 per-raise `Box::leak` in the trigger executor: the table is
+/// bounded by the number of distinct SQLSTATEs ever raised (at most
+/// the 36^5 code space in theory, in practice a handful).
+pub(crate) fn intern_sqlstate(code: &str) -> &'static str {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static TABLE: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = table.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(s) = guard.get(code) {
+        return s;
+    }
+    let leaked: &'static str = Box::leak(code.to_string().into_boxed_str());
+    guard.insert(code.to_string(), leaked);
+    leaked
+}
+
 /// v0.71: error with a PG-style DETAIL line.
 pub(crate) fn exec_err_detail(
     code: &'static str,

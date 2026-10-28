@@ -1757,8 +1757,13 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 let ct = d.str().map_err(|e| bad(&e))?;
                 table_cols.push((cn, ct));
             }
-            let (parsed, plpgsql) =
-                crate::exec::rebuild_function_bodies(lang, &arg_names, &body, returns_set);
+            let (parsed, plpgsql) = crate::exec::rebuild_function_bodies(
+                lang,
+                &arg_names,
+                &body,
+                returns_set,
+                ret_type.eq_ignore_ascii_case("void"),
+            );
             overloads.push(crate::storage::FuncDef {
                 name: name.clone(),
                 arg_names,

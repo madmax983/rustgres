@@ -1806,9 +1806,9 @@ fn exec_trigger_stmts(
             }
             TriggerBodyStmt::RaiseSqlstate { code } => {
                 // ExecError.code is &'static str; a user-chosen
-                // SQLSTATE is leaked once per distinct raise site
-                // execution (bounded, process-lifetime).
-                let code: &'static str = Box::leak(code.clone().into_boxed_str());
+                // SQLSTATE goes through the v2.11 intern table
+                // (leaked once per distinct code, not per raise).
+                let code: &'static str = intern_sqlstate(code);
                 return Err(exec_err(code, String::new()));
             }
             TriggerBodyStmt::ForRange {

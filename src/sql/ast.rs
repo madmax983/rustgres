@@ -4207,6 +4207,13 @@ pub enum PlpgsqlStmt {
         level: RaiseLevel,
         format: String,
         args: Vec<Expr>,
+        /// v2.11: explicit SQLSTATE (RAISE SQLSTATE / condition-name
+        /// RAISE / USING errcode). `None` keeps the default: P0001
+        /// for EXCEPTION.
+        sqlstate: Option<RaiseCode>,
+        /// v2.11: `USING message = <expr>` override, stored as a
+        /// parsed `SELECT <expr>`.
+        using_message: Option<Box<Stmt>>,
     },
     /// v1.03: `var := <expr>` — scalar assignment to a DECLAREd variable.
     /// Stored as the parsed `SELECT <expr>` (always `Stmt::Select`,
@@ -4222,17 +4229,16 @@ pub enum PlpgsqlStmt {
         var: String,
         query: Stmt,
         body: Vec<PlpgsqlStmt>,
+        /// v2.11: the source is `EXECUTE <expr>` (a dynamic query);
+        /// `query` then holds the `SELECT <expr>` yielding the
+        /// command string instead of the query itself.
+        dynamic: bool,
     },
     /// v1.03: `RETURN NEXT <expr>` — only valid in `RETURNS SETOF`
     /// functions (enforced at parse). Stored as the parsed
     /// `SELECT <expr>` (always `Stmt::Select`); the executor appends the
     /// row to the result set and continues.
     ReturnNext(Stmt),
-    /// v1.96: `EXECUTE <expr>` — dynamic SQL. Stored as the parsed
-    /// `SELECT <expr>` (always `Stmt::Select`) yielding the command
-    /// string; the executor parses and runs it. INTO/USING clauses
-    /// are outside the bounded subset (rejected at parse).
-    Execute(Stmt),
     /// v1.96: `PERFORM <expr>` — evaluate the expression (function
     /// calls run for their side effects) and discard the result.
     /// Stored as the parsed `SELECT <expr>`.
@@ -4241,6 +4247,149 @@ pub enum PlpgsqlStmt {
     /// condition is not true. Both parts stored as parsed
     /// `SELECT <expr>` statements.
     Assert { cond: Stmt, message: Option<Stmt> },
+    /// v2.11: `IF <cond> THEN ... [ELSIF <cond> THEN ...] [ELSE ...]
+    /// END IF` (PG19 PLPGSQL_STMT_IF). Conditions are stored as
+    /// `SELECT <cond>` statements — the `IF count(*) = 0 FROM t`
+    /// splice form is then just a SELECT whose item is the
+    /// condition, exactly like PG's exec_eval_expr path.
+    If {
+        branches: Vec<(Stmt, Vec<PlpgsqlStmt>)>,
+        else_body: Vec<PlpgsqlStmt>,
+    },
+    /// v2.11: `SELECT ... INTO <targets>` (PG19 PLPGSQL_STMT_EXECSQL
+    /// with an INTO clause). Non-STRICT: no rows leaves targets NULL
+    /// and FOUND false; extra rows are ignored after the first.
+    /// STRICT: no rows is P0002, more than one row is P0003.
+    SelectInto {
+        targets: Vec<PlTarget>,
+        query: Box<Stmt>,
+        strict: bool,
+    },
+    /// v2.11: a bare DML statement (`INSERT` / `UPDATE` / `DELETE` /
+    /// `MERGE`, including WITH forms) executed through the statement
+    /// executor with variable binding (PG19 PLPGSQL_STMT_EXECSQL).
+    /// `targets` is the optional `RETURNING ... INTO` clause. Sets
+    /// FOUND / ROW_COUNT from the affected row count.
+    Dml {
+        stmt: Box<Stmt>,
+        targets: Option<Vec<PlTarget>>,
+        strict: bool,
+    },
+    /// v2.11: `EXECUTE <expr> [INTO <targets>] [USING <expr>, ...]`
+    /// (PG19 PLPGSQL_STMT_DYNEXECUTE). The expression is stored as a
+    /// parsed `SELECT <expr>` yielding the command string; USING
+    /// expressions are stored the same way and bind `$1..` in the
+    /// dynamic command.
+    ExecuteInto {
+        expr: Box<Stmt>,
+        targets: Option<Vec<PlTarget>>,
+        strict: bool,
+        using: Vec<Stmt>,
+    },
+    /// v2.11: `PERFORM <query>` — a full SELECT (or WITH...SELECT)
+    /// run for effect, rows discarded, FOUND set (PG19
+    /// PLPGSQL_STMT_PERFORM over an EXECSQL query).
+    PerformQuery(Box<Stmt>),
+    /// v2.11: a nested `BEGIN [DECLARE ...] <stmts> [EXCEPTION ...]
+    /// END` block (PG19 PLPGSQL_STMT_BLOCK). Block-local
+    /// declarations live in the body's flat `decls` list; `decl_idx`
+    /// holds their indices there (name shadowing is resolved by the
+    /// CREATE-time rewriter and the executor's scope stack).
+    Block {
+        label: Option<String>,
+        decl_idx: Vec<usize>,
+        stmts: Vec<PlpgsqlStmt>,
+        handlers: Vec<PlpgsqlHandler>,
+    },
+    /// v2.11: `FOR var IN [REVERSE] <low> .. <high> [BY <step>] LOOP`
+    /// (PG19 PLPGSQL_STMT_FORC). Bounds are `SELECT <expr>`
+    /// statements, evaluated once.
+    ForRange {
+        var: String,
+        low: Box<Stmt>,
+        high: Box<Stmt>,
+        step: Option<Box<Stmt>>,
+        reverse: bool,
+        body: Vec<PlpgsqlStmt>,
+    },
+    /// v2.11: `WHILE <cond> LOOP ... END LOOP` (PG19
+    /// PLPGSQL_STMT_WHILE). The condition is a `SELECT <cond>`.
+    While {
+        cond: Box<Stmt>,
+        body: Vec<PlpgsqlStmt>,
+    },
+    /// v2.11: `LOOP ... END LOOP` (PG19 PLPGSQL_STMT_LOOP).
+    Loop { body: Vec<PlpgsqlStmt> },
+    /// v2.11: `CASE [operand] WHEN ... THEN ... [ELSE ...] END CASE`
+    /// (PG19 PLPGSQL_STMT_CASE). Branches are stored uniformly as
+    /// `SELECT <bool>` condition statements (a simple CASE folds the
+    /// operand comparison into the condition text at parse time).
+    Case {
+        branches: Vec<(Stmt, Vec<PlpgsqlStmt>)>,
+        else_body: Vec<PlpgsqlStmt>,
+    },
+    /// v2.11: `EXIT [label] [WHEN <cond>]` (PG19 PLPGSQL_STMT_EXIT).
+    /// Labels are parsed and ignored (loops are not labeled in the
+    /// bounded executor; EXIT always leaves the innermost loop).
+    Exit { when: Option<Box<Stmt>> },
+    /// v2.11: `CONTINUE [label] [WHEN <cond>]`.
+    Continue { when: Option<Box<Stmt>> },
+    /// v2.11: `RETURN QUERY <select>` (PG19
+    /// PLPGSQL_STMT_RETURN_QUERY): append every result row to the
+    /// SETOF result and continue.
+    ReturnQuery(Box<Stmt>),
+    /// v2.11: `RETURN QUERY EXECUTE <expr>`: like RETURN QUERY over
+    /// a dynamically built command string.
+    ReturnQueryExecute(Box<Stmt>),
+    /// v2.11: bare `RETURN` (PG19 PLPGSQL_STMT_RETURN with a NULL
+    /// expression): ends a void function/procedure; in a SETOF
+    /// function it returns the accumulated rows; in a scalar
+    /// function it is the fall-off-the-end error (2F005).
+    ReturnBare,
+    /// v2.11: `rec.field := <expr>` — assignment to one field of a
+    /// record variable. Stored like `Assign` (a `SELECT <expr>`).
+    AssignField {
+        var: String,
+        field: String,
+        select: Stmt,
+    },
+    /// v2.11: `$n := <expr>` — assignment to a positional parameter
+    /// (an OUT/INOUT argument in PG).
+    AssignParam { index: u32, select: Stmt },
+    /// v2.11: `GET [STACKED] DIAGNOSTICS <target> = <item> [, ...]`
+    /// (PG19 PLPGSQL_STMT_GETDIAG). Items are lowercased item names
+    /// (`row_count`, `returned_sqlstate`, ...).
+    GetDiagnostics {
+        stacked: bool,
+        assigns: Vec<(PlTarget, String)>,
+    },
+    /// v2.11: bare `RAISE` — re-raise the error caught by the
+    /// enclosing EXCEPTION handler (PG19 PLPGSQL_STMT_RAISE with no
+    /// options).
+    Reraise,
+}
+
+/// v2.11: how a RAISE's SQLSTATE is determined at run time.
+#[derive(Clone, Debug)]
+pub enum RaiseCode {
+    /// A literal 5-char SQLSTATE (from `RAISE SQLSTATE 'xxxxx'`,
+    /// a condition name resolved at parse time, or
+    /// `USING errcode = 'xxxxx'` / `errcode = <condition name>`).
+    Lit(String),
+    /// `USING errcode = <expr>`: a `SELECT <expr>` statement whose
+    /// value is the SQLSTATE text (or a condition name).
+    Expr(Box<Stmt>),
+}
+
+/// v2.11: an assignment / INTO target in a plpgsql body.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PlTarget {
+    /// A DECLAREd variable (or a function argument name).
+    Var(String),
+    /// `rec.field` — one field of a record variable.
+    Field(String, String),
+    /// `$n` — a positional parameter.
+    Param(u32),
 }
 
 /// v1.01: one `WHEN <conditions> THEN <statements>` clause.
@@ -4260,7 +4409,13 @@ pub struct PlpgsqlHandler {
 pub struct PlpgsqlBody {
     /// v1.03: scalar variable declarations from an optional `DECLARE`
     /// section (empty when the body has none).
+    /// v2.11: also holds nested-block declarations (flat, in parse
+    /// order) and the implicit `found` variable (appended last when
+    /// the body declares no variable of that name).
     pub decls: Vec<PlpgsqlDecl>,
+    /// v2.11: the body's `<<label>>`, if any (for label-qualified
+    /// variable references like `outer.rec.field`).
+    pub label: Option<String>,
     pub stmts: Vec<PlpgsqlStmt>,
     pub handlers: Vec<PlpgsqlHandler>,
     /// v1.96 finishing pass: the main statement list ends with the
@@ -4273,10 +4428,33 @@ pub struct PlpgsqlBody {
 
 /// v1.03: one scalar variable declaration (`name type`) from a plpgsql
 /// `DECLARE` section. No initializers, no row/record types.
+/// v2.11: full declaration grammar (PG19 pl_gram.y decl_statement):
+/// initializers (`:=` / `=` / DEFAULT), `ALIAS FOR $n|name`, record /
+/// %TYPE / %ROWTYPE types, and cursor declarations (parsed as
+/// refcursor placeholders; cursor machinery is held back).
 #[derive(Clone, Debug)]
 pub struct PlpgsqlDecl {
     pub name: String,
+    /// The declared type name as written (empty for ALIAS decls
+    /// until the CREATE-time fixup copies the aliased arg's type).
     pub type_name: String,
+    /// v2.11: initializer expression, stored as `SELECT <expr>`.
+    pub default: Option<Stmt>,
+    /// v2.11: `ALIAS FOR <target>` — the target text (`$1`, an
+    /// argument/variable name, or `new` / `old`).
+    pub alias_for: Option<String>,
+    /// v2.11: for ALIAS declarations, the 1-based parameter slot the
+    /// alias resolves to, computed by the CREATE/rebuild rewrite
+    /// (which knows the argument names). `None` until rewritten.
+    pub alias_slot: Option<u32>,
+    /// v2.11: a `CURSOR ... FOR query` declaration (held back at
+    /// run time; the slot behaves as a NULL refcursor).
+    pub is_cursor: bool,
+    /// v2.11: an implicit declaration invented by the parser (a FOR
+    /// loop variable, or the `found` variable). Implicit decls may
+    /// share a name with a function argument (the argument wins in
+    /// the CREATE-time rewrite map).
+    pub implicit: bool,
 }
 
 /// v1.01: sentinel for the OTHERS pseudo-condition (never a real
@@ -4778,114 +4956,266 @@ pub(crate) fn split_top_level_commas(s: &str) -> Vec<&str> {
     parts
 }
 
-/// v1.02: parse `RAISE <level> '<format>' [, <expr> ...]` (the RAISE
-/// keyword already stripped). PG19 pl_gram.y `stmt_raise`.
-///
-/// Only NOTICE and EXCEPTION are supported in the bounded grammar;
-/// any other level (DEBUG/LOG/INFO/WARNING) is an honest 0A000,
-/// mirroring the v1.00 trigger-body rule. Each argument parses as a
-/// scalar expression via the same `SELECT <expr>` trick the RETURN
-/// path uses, so the named-argument `rewrite_func_arg_refs` machinery
-/// in exec.rs applies to RAISE args unchanged.
+/// v2.11: parse a single-quoted string literal at the start of `s`
+/// (an optional `E` prefix is accepted and stripped; backslash
+/// escapes are kept raw, a bounded deviation from PG's E-string
+/// processing). Returns (content, rest) or None.
+pub(crate) fn plpgsql_parse_string_literal(s: &str) -> Option<(String, &str)> {
+    let s = s.trim_start();
+    let s = if (s.starts_with('E') || s.starts_with('e')) && s[1..].starts_with('\'') {
+        &s[1..]
+    } else {
+        s
+    };
+    let lit = s.strip_prefix('\'')?;
+    let mut out = String::new();
+    let mut chars = lit.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '\'' {
+            if chars.peek().is_some_and(|(_, d)| *d == '\'') {
+                out.push('\'');
+                chars.next();
+            } else {
+                return Some((out, &lit[i + 1..]));
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    None
+}
+
+/// v1.02/v2.11: parse a RAISE statement (the RAISE keyword already
+/// stripped). PG19 pl_gram.y `stmt_raise`: `[level] ['format'
+/// [, args]] [USING option = expr [, ...]]`, a condition name, or
+/// `SQLSTATE 'xxxxx'`; a bare RAISE re-raises. Levels NOTICE /
+/// WARNING / EXCEPTION plus LOG / INFO / DEBUG (notice-class here).
+/// Each argument parses as a scalar expression via the same
+/// `SELECT <expr>` trick the RETURN path uses.
 pub(crate) fn parse_plpgsql_raise(rest: &str) -> Result<PlpgsqlStmt, SqlError> {
     let syntax = |msg: String| SqlError {
         message: msg,
         code: "42601",
     };
-    let rest = rest.trim_start();
-    // Level word (word boundary, like plpgsql_strip_kw).
-    let mut lvl_len = 0;
-    for (i, c) in rest.char_indices() {
-        if c.is_alphanumeric() || c == '_' {
-            lvl_len = i + c.len_utf8();
-        } else {
-            break;
-        }
+    let rest = rest.trim().trim_end_matches(';').trim();
+    if rest.is_empty() {
+        return Ok(PlpgsqlStmt::Reraise);
     }
-    let (lvl_word, after_lvl) = rest.split_at(lvl_len);
-    let level = match lvl_word.to_ascii_lowercase().as_str() {
-        "notice" => RaiseLevel::Notice,
-        "exception" => RaiseLevel::Exception,
-        "warning" => RaiseLevel::Warning,
-        _ => {
-            return Err(SqlError {
-                message: format!(
-                    "RAISE level '{}' is not supported in plpgsql function bodies",
-                    lvl_word
-                ),
-                code: "0A000",
-            });
-        }
+    // Split off a trailing USING clause (top level).
+    let (main, using_text) = match plpgsql_top_level_kw(rest, "using") {
+        Some(p) => (rest[..p].trim(), Some(rest[p + 5..].trim())),
+        None => (rest, None),
     };
-    // Format string: a single-quoted literal with '' escapes.
-    let after_lvl = after_lvl.trim_start();
-    let lit = after_lvl
-        .strip_prefix('\'')
-        .ok_or_else(|| syntax("RAISE requires a format string literal".to_string()))?;
-    let mut format = String::new();
-    let mut chars = lit.char_indices().peekable();
-    let mut end_byte: Option<usize> = None;
-    while let Some((i, c)) = chars.next() {
-        if c == '\'' {
-            if chars.peek().is_some_and(|(_, d)| *d == '\'') {
-                format.push('\'');
-                chars.next();
-            } else {
-                end_byte = Some(i);
-                break;
-            }
-        } else {
-            format.push(c);
-        }
-    }
-    let end_byte =
-        end_byte.ok_or_else(|| syntax("unterminated string literal in RAISE".to_string()))?;
-    let after_fmt = lit[end_byte + 1..].trim_start();
-    // Optional `, <expr> ...` argument list.
-    let mut args = Vec::new();
-    if !after_fmt.is_empty() {
-        let list = after_fmt
-            .strip_prefix(',')
-            .ok_or_else(|| syntax("expected ',' after RAISE format string".to_string()))?;
-        for part in split_top_level_commas(list) {
+    let mut sqlstate: Option<RaiseCode> = None;
+    let mut using_message: Option<Box<Stmt>> = None;
+    if let Some(u) = using_text {
+        for part in split_top_level_commas(u) {
             let part = part.trim();
             if part.is_empty() {
-                return Err(syntax(
-                    "empty expression in RAISE argument list".to_string(),
-                ));
+                continue;
             }
-            let stmt = parse_statement(&format!("SELECT {}", part)).map_err(|e| SqlError {
-                message: format!("syntax error in RAISE argument: {}", e.message),
-                code: "42601",
-            })?;
-            let Stmt::Select(sel) = stmt else {
-                return Err(SqlError {
-                    message: "internal error: RAISE argument did not parse as SELECT".to_string(),
-                    code: "XX000",
-                });
-            };
-            let mut items = sel.items.into_iter();
-            match (items.next(), items.next()) {
-                (Some(SelectItem::Expr { expr, .. }), None) => args.push(expr),
-                _ => {
+            let (name, value) = match plpgsql_find_assign_op(part) {
+                Some((pos, oplen)) => (
+                    part[..pos].trim().to_ascii_lowercase(),
+                    part[pos + oplen..].trim(),
+                ),
+                None => {
                     return Err(syntax(format!(
-                        "RAISE argument is not a scalar expression: {}",
+                        "bad RAISE USING option: {}",
                         part.chars().take(40).collect::<String>()
                     )));
                 }
+            };
+            match name.as_str() {
+                "message" => {
+                    let st =
+                        parse_statement(&format!("SELECT {}", value)).map_err(|e| SqlError {
+                            message: format!("syntax error in RAISE USING message: {}", e.message),
+                            code: "42601",
+                        })?;
+                    if !matches!(st, Stmt::Select(_)) {
+                        return Err(syntax(
+                            "RAISE USING message did not parse as an expression".to_string(),
+                        ));
+                    }
+                    using_message = Some(Box::new(st));
+                }
+                "errcode" => {
+                    // Literal string or condition name resolve now;
+                    // anything else evaluates at run time.
+                    if let Some((lit, tail)) = plpgsql_parse_string_literal(value) {
+                        if tail.trim().is_empty() {
+                            sqlstate = Some(RaiseCode::Lit(lit.to_uppercase()));
+                            continue;
+                        }
+                    }
+                    if let Ok(codes) = plpgsql_condition_named(value) {
+                        if let Some(c) = codes.into_iter().next() {
+                            sqlstate = Some(RaiseCode::Lit(c));
+                            continue;
+                        }
+                    }
+                    let st =
+                        parse_statement(&format!("SELECT {}", value)).map_err(|e| SqlError {
+                            message: format!("syntax error in RAISE USING errcode: {}", e.message),
+                            code: "42601",
+                        })?;
+                    if !matches!(st, Stmt::Select(_)) {
+                        return Err(syntax(
+                            "RAISE USING errcode did not parse as an expression".to_string(),
+                        ));
+                    }
+                    sqlstate = Some(RaiseCode::Expr(Box::new(st)));
+                }
+                // detail / hint / column / constraint / datatype /
+                // table / schema: parsed for validity, not stored
+                // (the engine has no error-field model for them).
+                _ => {
+                    let _ =
+                        parse_statement(&format!("SELECT {}", value)).map_err(|e| SqlError {
+                            message: format!("syntax error in RAISE USING {}: {}", name, e.message),
+                            code: "42601",
+                        })?;
+                }
             }
         }
+    }
+    // Level / condition / SQLSTATE / bare format string.
+    let mut level = RaiseLevel::Exception;
+    let mut rest2 = main;
+    let mut default_msg: Option<String> = None;
+    let first_word: String = {
+        let mut w = String::new();
+        for c in main.chars() {
+            if c.is_alphanumeric() || c == '_' {
+                w.push(c);
+            } else {
+                break;
+            }
+        }
+        w.to_ascii_lowercase()
+    };
+    if !first_word.is_empty() {
+        match first_word.as_str() {
+            "notice" => {
+                level = RaiseLevel::Notice;
+                rest2 = main[first_word.len()..].trim_start();
+            }
+            "warning" => {
+                level = RaiseLevel::Warning;
+                rest2 = main[first_word.len()..].trim_start();
+            }
+            "exception" => {
+                level = RaiseLevel::Exception;
+                rest2 = main[first_word.len()..].trim_start();
+            }
+            "log" | "info" | "debug" => {
+                level = RaiseLevel::Notice;
+                rest2 = main[first_word.len()..].trim_start();
+            }
+            "sqlstate" => {
+                let after = main[first_word.len()..].trim_start();
+                let (code, tail) = plpgsql_parse_string_literal(after).ok_or_else(|| {
+                    syntax("RAISE SQLSTATE requires a string literal".to_string())
+                })?;
+                if code.len() != 5
+                    || !code
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
+                {
+                    return Err(syntax("invalid SQLSTATE code".to_string()));
+                }
+                sqlstate = Some(RaiseCode::Lit(code));
+                rest2 = tail.trim();
+                // Any remaining text is the format position; PG
+                // treats `RAISE SQLSTATE 'x' USING ...` only, so a
+                // non-empty remainder is handled as a format below.
+                let _ = rest2;
+                return Ok(PlpgsqlStmt::Raise {
+                    level: RaiseLevel::Exception,
+                    format: String::new(),
+                    args: Vec::new(),
+                    sqlstate,
+                    using_message,
+                });
+            }
+            _ => {
+                if let Ok(codes) = plpgsql_condition_named(&first_word) {
+                    // RAISE <condition name>: the level is EXCEPTION
+                    // and the code is the condition's SQLSTATE.
+                    if sqlstate.is_none() {
+                        if let Some(c) = codes.into_iter().next() {
+                            sqlstate = Some(RaiseCode::Lit(c));
+                        }
+                    }
+                    default_msg = Some(first_word.replace('_', " "));
+                    rest2 = main[first_word.len()..].trim_start();
+                }
+                // Otherwise the statement starts with its format
+                // string (level defaults to EXCEPTION).
+            }
+        }
+    }
+    // Format string + optional `, args`.
+    let mut format = String::new();
+    let mut args: Vec<Expr> = Vec::new();
+    let r = rest2.trim();
+    if !r.is_empty() {
+        let (fmt, after_fmt) = plpgsql_parse_string_literal(r)
+            .ok_or_else(|| syntax("RAISE requires a format string literal".to_string()))?;
+        format = fmt;
+        let after_fmt = after_fmt.trim_start();
+        if !after_fmt.is_empty() {
+            let list = after_fmt
+                .strip_prefix(',')
+                .ok_or_else(|| syntax("expected ',' after RAISE format string".to_string()))?;
+            for part in split_top_level_commas(list) {
+                let part = part.trim();
+                if part.is_empty() {
+                    return Err(syntax(
+                        "empty expression in RAISE argument list".to_string(),
+                    ));
+                }
+                let stmt = parse_statement(&format!("SELECT {}", part)).map_err(|e| SqlError {
+                    message: format!("syntax error in RAISE argument: {}", e.message),
+                    code: "42601",
+                })?;
+                let Stmt::Select(sel) = stmt else {
+                    return Err(SqlError {
+                        message: "internal error: RAISE argument did not parse as SELECT"
+                            .to_string(),
+                        code: "XX000",
+                    });
+                };
+                let mut items = sel.items.into_iter();
+                match (items.next(), items.next()) {
+                    (Some(SelectItem::Expr { expr, .. }), None) => args.push(expr),
+                    _ => {
+                        return Err(syntax(format!(
+                            "RAISE argument is not a scalar expression: {}",
+                            part.chars().take(40).collect::<String>()
+                        )));
+                    }
+                }
+            }
+        }
+    } else if let Some(m) = default_msg {
+        format = m;
+    }
+    // v1.02 compat: a bare level with no format, no condition, and
+    // no USING message stays a 42601 (the engine's recorded bounded
+    // behavior for `RAISE NOTICE;`).
+    if format.is_empty() && args.is_empty() && sqlstate.is_none() && using_message.is_none() {
+        return Err(syntax("RAISE requires a format string literal".to_string()));
     }
     Ok(PlpgsqlStmt::Raise {
         level,
         format,
         args,
+        sqlstate,
+        using_message,
     })
 }
-
-// ============================================================================
-// v1.03: plpgsql DECLARE / := / FOR..LOOP / RETURN NEXT
-// ============================================================================
 
 /// Skip a `$tag$...$tag$` (or `$$...$$`) dollar-quoted string starting at
 /// `chars[i] == '$'`. Returns the index just past the closing delimiter,
@@ -4974,7 +5304,12 @@ pub(crate) fn plpgsql_find_token(s: &str, tok: &str, word: bool) -> Vec<usize> {
             i += 1;
             continue;
         }
-        if i + tl <= chars.len() && chars[i..i + tl] == tok_chars[..] {
+        if i + tl <= chars.len()
+            && chars[i..i + tl]
+                .iter()
+                .zip(tok_chars.iter())
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        {
             let mut ok = true;
             if word {
                 // `tok` is ASCII here, so byte slicing is safe.
@@ -5077,102 +5412,354 @@ pub(crate) fn parse_plpgsql_return_next(rest: &str) -> Result<PlpgsqlStmt, SqlEr
     Ok(PlpgsqlStmt::ReturnNext(stmt))
 }
 
-/// v1.03: parse `var := <expr>` (the statement is known to contain a
-/// depth-0 `:=`). The variable name is validated against the DECLAREd
-/// names at CREATE time, not here.
-pub(crate) fn parse_plpgsql_assign(text: &str) -> Result<PlpgsqlStmt, SqlError> {
-    let syntax = |msg: String| SqlError {
-        message: msg,
-        code: "42601",
-    };
-    let t = text.trim();
-    let op =
-        plpgsql_find_assign(t).ok_or_else(|| syntax("bad assignment statement".to_string()))?;
-    let (lhs, rhs) = t.split_at(op);
-    let (var, var_rest) =
-        split_ident(lhs).ok_or_else(|| syntax(format!("bad assignment target: {}", lhs.trim())))?;
-    if !var_rest.trim().is_empty() {
-        return Err(syntax(format!("bad assignment target: {}", lhs.trim())));
+/// v2.11: find the first top-level (`paren depth 0`, outside strings /
+/// comments / dollar quotes) occurrence of keyword `kw` in `s`.
+/// Returns its byte position. CASE...END depth is NOT tracked, so a
+/// `then` inside a CASE expression can shadow an IF's THEN — callers
+/// that care (IF conditions) accept the first depth-0 hit, which is
+/// correct unless the condition itself opens with a CASE expression.
+pub(crate) fn plpgsql_top_level_kw(s: &str, kw: &str) -> Option<usize> {
+    let chars: Vec<char> = s.chars().collect();
+    let byte_off: Vec<usize> = s.char_indices().map(|(b, _)| b).collect();
+    let mut depth: i64 = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' || c == '"' {
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == c {
+                    if i + 1 < chars.len() && chars[i + 1] == c {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == '-' && i + 1 < chars.len() && chars[i + 1] == '-' {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            i = (i + 2).min(chars.len());
+            continue;
+        }
+        if c == '$' {
+            if let Some(next) = plpgsql_dollar_skip(&chars, i) {
+                i = next;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && (c.is_alphabetic() || c == '_') {
+            // Try a word match at i.
+            let b = byte_off[i];
+            if s[b..].len() >= kw.len() && s[b..b + kw.len()].eq_ignore_ascii_case(kw) {
+                let after_ok = i + kw.len() >= chars.len()
+                    || !(chars[i + kw.len()].is_alphanumeric() || chars[i + kw.len()] == '_');
+                let before_ok = i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
+                if after_ok && before_ok {
+                    return Some(b);
+                }
+            }
+        }
+        i += 1;
     }
-    let expr = rhs[2..].trim();
-    if expr.is_empty() {
-        return Err(syntax(":= requires an expression".to_string()));
-    }
-    let stmt = parse_statement(&format!("SELECT {}", expr)).map_err(|e| SqlError {
-        message: format!("syntax error in assignment expression: {}", e.message),
-        code: "42601",
-    })?;
-    if !matches!(stmt, Stmt::Select(_)) {
-        return Err(SqlError {
-            message: "internal error: assignment did not parse as SELECT".to_string(),
-            code: "XX000",
-        });
-    }
-    Ok(PlpgsqlStmt::Assign { var, select: stmt })
+    None
 }
 
-/// v1.03: parse one `name type` declaration (trailing `;` already split
-/// off). Only plain scalar `name type` is accepted: no initializers,
-/// no CONSTANT, no constraints (bounded subset, 0A000).
+/// v2.11: find a top-level assignment operator (`:=` or a bare `=`
+/// that is not part of `>=` / `<=` / `<>` / `!=` / `==`) in `s`,
+/// outside strings/parens. Returns (byte index, operator length).
+pub(crate) fn plpgsql_find_assign_op(s: &str) -> Option<(usize, usize)> {
+    if let Some(p) = plpgsql_find_assign(s) {
+        return Some((p, 2));
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let byte_off: Vec<usize> = s.char_indices().map(|(b, _)| b).collect();
+    let mut depth: i64 = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' || c == '"' {
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == c {
+                    if i + 1 < chars.len() && chars[i + 1] == c {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == '$' {
+            if let Some(next) = plpgsql_dollar_skip(&chars, i) {
+                i = next;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            '=' if depth == 0 => {
+                let prev = if i == 0 { ' ' } else { chars[i - 1] };
+                let next = chars.get(i + 1).copied().unwrap_or(' ');
+                if !matches!(prev, '<' | '>' | '!' | '=' | ':') && next != '=' {
+                    return Some((byte_off[i], 1));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// v2.11: strip leading `--` line comments and whitespace from a
+/// plpgsql text fragment (the statement splitter keeps comments
+/// attached to the following statement).
+pub(crate) fn plpgsql_strip_comments(s: &str) -> &str {
+    let mut t = s;
+    loop {
+        let u = t.trim_start();
+        if let Some(rest) = u.strip_prefix("--") {
+            match rest.find('\n') {
+                Some(i) => {
+                    t = &rest[i + 1..];
+                }
+                None => return "",
+            }
+        } else if let Some(rest) = u.strip_prefix("/*") {
+            match rest.find("*/") {
+                Some(i) => {
+                    t = &rest[i + 2..];
+                }
+                None => return "",
+            }
+        } else {
+            return u;
+        }
+    }
+}
+
+/// v1.03/v2.11: parse one declaration (trailing `;` already split
+/// off). Full pl_gram.y decl_statement grammar: `[CONSTANT] name
+/// type [COLLATE x] [NOT NULL] [{:=|=|DEFAULT} expr]`, `name ALIAS
+/// FOR $n|name`, and `name CURSOR [(args)] FOR query` (a refcursor
+/// placeholder; cursor machinery is held back).
 pub(crate) fn parse_plpgsql_decl(text: &str) -> Result<PlpgsqlDecl, SqlError> {
     let syntax = |msg: String| SqlError {
         message: msg,
         code: "42601",
     };
-    let unsupported = |msg: String| SqlError {
-        message: msg,
-        code: "0A000",
-    };
-    let t = text.trim();
-    if plpgsql_starts_with_kw(t, "constant") {
-        return Err(unsupported(
-            "CONSTANT variable declarations are not supported".to_string(),
-        ));
+    let mut t = text.trim();
+    // CONSTANT may precede the name (pl_gram.y allows both orders;
+    // the post-type position is stripped with the type cleanup).
+    if let Some(r) = plpgsql_strip_kw(t, "constant") {
+        t = r.trim_start();
     }
     let (name, rest) =
         split_ident(t).ok_or_else(|| syntax(format!("bad variable declaration: {}", t)))?;
-    let type_name = rest.trim();
-    if type_name.is_empty() {
-        return Err(syntax(format!("declaration of \"{}\" needs a type", name)));
+    let mut rest = rest.trim();
+    if let Some(r) = plpgsql_strip_kw(rest, "constant") {
+        rest = r.trim_start();
     }
-    // Anything beyond a bare type name (constraints, defaults) is out
-    // of the bounded subset.
-    for kw in ["not", "null", "default", "collate", "check", "references"] {
-        if !plpgsql_kw_positions(type_name, kw).is_empty() {
-            return Err(unsupported(format!(
-                "only plain \"name type\" declarations are supported, got: {}",
+    // ALIAS FOR <target>.
+    if plpgsql_starts_with_kw(rest, "alias") {
+        let r = plpgsql_strip_kw(rest, "alias").unwrap_or("");
+        let r = plpgsql_strip_kw(r.trim_start(), "for")
+            .ok_or_else(|| syntax(format!("ALIAS declaration needs FOR: {}", t)))?;
+        let (target, tail) = split_ident(r.trim())
+            .ok_or_else(|| syntax(format!("ALIAS declaration needs a target: {}", t)))?;
+        if !tail.trim().is_empty() {
+            return Err(syntax(format!(
+                "junk after ALIAS target in declaration: {}",
                 t
             )));
         }
+        return Ok(PlpgsqlDecl {
+            name,
+            type_name: String::new(),
+            default: None,
+            alias_for: Some(target),
+            is_cursor: false,
+            implicit: false,
+            alias_slot: None,
+        });
+    }
+    // CURSOR declaration: `name CURSOR [(args)] FOR <query>` or
+    // `name CURSOR FOR <query>`; also plain `name refcursor` falls
+    // through to the ordinary path below.
+    if plpgsql_starts_with_kw(rest, "cursor") {
+        return Ok(PlpgsqlDecl {
+            name,
+            type_name: "refcursor".to_string(),
+            default: None,
+            alias_for: None,
+            is_cursor: true,
+            implicit: false,
+            alias_slot: None,
+        });
+    }
+    // Split off an initializer: `:= expr`, `= expr`, or
+    // `DEFAULT expr` at top level.
+    let (type_part, default) = match plpgsql_find_assign_op(rest) {
+        Some((pos, oplen)) => {
+            let expr = rest[pos + oplen..].trim();
+            if expr.is_empty() {
+                return Err(syntax(format!(
+                    "declaration of \"{}\" has an empty initializer",
+                    name
+                )));
+            }
+            let stmt = parse_statement(&format!("SELECT {}", expr)).map_err(|e| SqlError {
+                message: format!("syntax error in declaration initializer: {}", e.message),
+                code: "42601",
+            })?;
+            if !matches!(stmt, Stmt::Select(_)) {
+                return Err(syntax(
+                    "declaration initializer did not parse as an expression".to_string(),
+                ));
+            }
+            (&rest[..pos], Some(stmt))
+        }
+        None => match plpgsql_top_level_kw(rest, "default") {
+            Some(pos) => {
+                let expr = rest[pos + 7..].trim();
+                if expr.is_empty() {
+                    return Err(syntax(format!(
+                        "declaration of \"{}\" has an empty DEFAULT",
+                        name
+                    )));
+                }
+                let stmt = parse_statement(&format!("SELECT {}", expr)).map_err(|e| SqlError {
+                    message: format!("syntax error in declaration DEFAULT: {}", e.message),
+                    code: "42601",
+                })?;
+                if !matches!(stmt, Stmt::Select(_)) {
+                    return Err(syntax(
+                        "declaration DEFAULT did not parse as an expression".to_string(),
+                    ));
+                }
+                (&rest[..pos], Some(stmt))
+            }
+            None => (rest, None),
+        },
+    };
+    // Clean the type text: drop NOT NULL / CONSTANT / COLLATE <name>.
+    let mut ty = type_part.trim().to_string();
+    loop {
+        let before = ty.clone();
+        if let Some(p) = plpgsql_top_level_kw(&ty, "collate") {
+            let after = ty[p + 7..].trim_start();
+            let (_, tail) = split_ident(after).unwrap_or((String::new(), after));
+            ty = format!("{}{}", &ty[..p], tail).trim().to_string();
+        }
+        for kw in ["not null", "constant"] {
+            if let Some(p) = find_top_level_phrase(&ty, kw) {
+                ty = format!("{}{}", &ty[..p], &ty[p + kw.len()..])
+                    .trim()
+                    .to_string();
+            }
+        }
+        if ty == before {
+            break;
+        }
+    }
+    let ty = ty.split_whitespace().collect::<Vec<_>>().join(" ");
+    // v2.11: a trailing typmod (`char(2)`, `numeric(10,2)`,
+    // `varchar(10)`) is not part of the type name the catalog
+    // resolves; drop it (assignment-time length enforcement via
+    // typmod is out of scope, matching how function argument types
+    // carry no typmod either).
+    let ty = if ty.ends_with(')') {
+        match ty.rfind('(') {
+            Some(p)
+                if ty[p + 1..ty.len() - 1]
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == ',' || c == ' ') =>
+            {
+                ty[..p].trim_end().to_string()
+            }
+            _ => ty,
+        }
+    } else {
+        ty
+    };
+    if ty.is_empty() {
+        return Err(syntax(format!("declaration of \"{}\" needs a type", name)));
     }
     Ok(PlpgsqlDecl {
         name,
-        type_name: type_name.to_string(),
+        type_name: ty,
+        default,
+        alias_for: None,
+        is_cursor: false,
+        implicit: false,
+        alias_slot: None,
     })
 }
 
-/// v1.03: parse a `DECLARE` section (text between `DECLARE` and the
-/// `BEGIN` that opens the body block).
+/// v2.11: byte position of a top-level two-word phrase (`not null`)
+/// in `s`, or None. Built on the single-keyword scanner: the first
+/// word must be followed by the second as the next word.
+pub(crate) fn find_top_level_phrase(s: &str, phrase: &str) -> Option<usize> {
+    let mut words = phrase.split_whitespace();
+    let first = words.next()?;
+    let second = words.next()?;
+    let mut from = 0;
+    while let Some(rel) = plpgsql_top_level_kw(&s[from..], first) {
+        let p = from + rel;
+        let after = s[p + first.len()..].trim_start();
+        if after.len() >= second.len()
+            && after[..second.len()].eq_ignore_ascii_case(second)
+            && after[second.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+        {
+            return Some(p);
+        }
+        from = p + first.len();
+    }
+    None
+}
+
+/// v1.03/v2.11: parse a `DECLARE` section (text between `DECLARE` and
+/// the `BEGIN` that opens the body block). An empty section is legal
+/// (PG19: `DECLARE BEGIN ...`).
 pub(crate) fn parse_plpgsql_decls(decl_text: &str) -> Result<Vec<PlpgsqlDecl>, SqlError> {
     let syntax = |msg: String| SqlError {
         message: msg,
         code: "42601",
-    };
-    let unsupported = |msg: String| SqlError {
-        message: msg,
-        code: "0A000",
     };
     let mut decls = Vec::new();
     for chunk in split_plpgsql_chunks(decl_text) {
         let t = chunk.trim();
         if t.is_empty() {
             continue;
-        }
-        if plpgsql_find_assign(t).is_some() {
-            return Err(unsupported(format!(
-                "variable initializers (:=) are not supported in DECLARE: {}",
-                t.chars().take(40).collect::<String>()
-            )));
         }
         let decl = parse_plpgsql_decl(t)?;
         if decls.iter().any(|d: &PlpgsqlDecl| d.name == decl.name) {
@@ -5183,61 +5770,636 @@ pub(crate) fn parse_plpgsql_decls(decl_text: &str) -> Result<Vec<PlpgsqlDecl>, S
         }
         decls.push(decl);
     }
-    if decls.is_empty() {
-        return Err(syntax(
-            "DECLARE section without variable declarations".to_string(),
-        ));
-    }
     Ok(decls)
 }
 
-/// v1.03: parse one statement of a FOR-loop body. Only `:=` assignment,
-/// `RETURN NEXT`, and bare `RETURN` are allowed (bounded subset).
-pub(crate) fn parse_plpgsql_for_body_stmt(text: &str) -> Result<PlpgsqlStmt, SqlError> {
-    // v1.96: strip leading `--` line comments (the statement
-    // splitter keeps them attached to the following statement).
-    let mut t = text.trim();
-    loop {
-        let s = t.trim_start();
-        if let Some(rest) = s.strip_prefix("--") {
-            match rest.find('\n') {
-                Some(i) => {
-                    t = rest[i + 1..].trim();
+/// v2.11: count occurrences of the two-word sequence `end <kw>` at
+/// word boundaries outside strings in one chunk (e.g. `end if`).
+pub(crate) fn plpgsql_count_end_kw(s: &str, kw: &str) -> usize {
+    let mut n = 0;
+    for p in plpgsql_kw_positions(s, "end") {
+        let rest = s[p + 3..].trim_start();
+        if plpgsql_starts_with_kw(rest, kw) {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// v2.11: which compound construct a gather is collecting.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum GatherKind {
+    If,
+    Loop,
+    Block,
+    Case,
+}
+
+/// v2.11: (opens, closes) contributed by one chunk for `kind`.
+/// Heuristics mirror the chunk grammar: a nested construct always
+/// starts at a statement boundary, hence inside some chunk at a
+/// keyword position the token scanners can see (strings skipped).
+pub(crate) fn gather_delta(chunk: &str, kind: GatherKind) -> (usize, usize) {
+    match kind {
+        GatherKind::If => {
+            let ends = plpgsql_count_end_kw(chunk, "if");
+            let opens = plpgsql_kw_positions(chunk, "if").len().saturating_sub(ends);
+            (opens, ends)
+        }
+        GatherKind::Loop => {
+            let ends = plpgsql_count_end_kw(chunk, "loop");
+            let opens = plpgsql_kw_positions(chunk, "loop")
+                .len()
+                .saturating_sub(ends);
+            (opens, ends)
+        }
+        GatherKind::Block => {
+            let opens = plpgsql_kw_positions(chunk, "begin").len();
+            let end_total = plpgsql_kw_positions(chunk, "end").len();
+            let suffixed = plpgsql_count_end_kw(chunk, "if")
+                + plpgsql_count_end_kw(chunk, "loop")
+                + plpgsql_count_end_kw(chunk, "case");
+            (opens, end_total.saturating_sub(suffixed))
+        }
+        GatherKind::Case => {
+            let ends = plpgsql_count_end_kw(chunk, "case");
+            let opens = plpgsql_kw_positions(chunk, "case")
+                .len()
+                .saturating_sub(ends);
+            (opens, ends)
+        }
+    }
+}
+
+/// v2.11: given chunks and the index of a compound statement's first
+/// chunk, return the index of its closing chunk. Depth is tracked
+/// with `gather_delta`; a block written as `DECLARE ...; BEGIN ...`
+/// only opens at its BEGIN chunk, so scanning continues until some
+/// opener has been seen.
+pub(crate) fn gather_construct(chunks: &[String], start: usize, kind: GatherKind) -> usize {
+    let mut depth: i64 = 0;
+    let mut seen = false;
+    let mut j = start;
+    while j < chunks.len() {
+        let (o, c) = gather_delta(&chunks[j], kind);
+        depth += o as i64;
+        if depth > 0 {
+            seen = true;
+        }
+        depth -= c as i64;
+        if seen && depth <= 0 {
+            return j;
+        }
+        j += 1;
+    }
+    chunks.len().saturating_sub(1)
+}
+
+/// v2.11: split a plpgsql text into trimmed, comment-stripped,
+/// non-empty statement chunks.
+pub(crate) fn plpgsql_chunks(text: &str) -> Vec<String> {
+    split_plpgsql_chunks(text)
+        .iter()
+        .map(|c| plpgsql_strip_comments(c).trim().to_string())
+        .filter(|c| !c.is_empty())
+        .collect()
+}
+
+/// v2.11: push a statement onto a list. Statements after a RETURN
+/// are kept (PG treats them as unreachable dead code; the executor
+/// returns at the RETURN before reaching them).
+pub(crate) fn plpgsql_push_stmt2(
+    stmts: &mut Vec<PlpgsqlStmt>,
+    stmt: PlpgsqlStmt,
+    ctx: &str,
+) -> Result<(), SqlError> {
+    let _ = ctx;
+    stmts.push(stmt);
+    Ok(())
+}
+
+/// v2.11: parse an IF/CASE/WHILE condition: an expression evaluated
+/// as a query, stored as a `SELECT <text>` statement (the FROM-splice
+/// form `count(*) = 0 FROM t` is then an ordinary SELECT).
+pub(crate) fn parse_plpgsql_cond(text: &str) -> Result<Stmt, SqlError> {
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let t = plpgsql_strip_comments(text).trim();
+    if t.is_empty() {
+        return Err(syntax("empty condition".to_string()));
+    }
+    let stmt = parse_statement(&format!("SELECT {}", t)).map_err(|e| SqlError {
+        message: format!("syntax error in condition: {}", e.message),
+        code: "42601",
+    })?;
+    if !matches!(stmt, Stmt::Select(_)) {
+        return Err(syntax(
+            "condition did not parse as an expression".to_string(),
+        ));
+    }
+    Ok(stmt)
+}
+
+/// v2.11: parse an INTO / assignment target: `name`, `name.field`,
+/// or `$n`.
+pub(crate) fn parse_pl_target(s: &str) -> Result<PlTarget, SqlError> {
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let t = s.trim();
+    if let Some(digits) = t.strip_prefix('$') {
+        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+            let n: u32 = digits
+                .parse()
+                .map_err(|_| syntax(format!("bad parameter target: {}", t)))?;
+            return Ok(PlTarget::Param(n));
+        }
+    }
+    let (name, rest) = split_ident(t).ok_or_else(|| syntax(format!("bad target: {}", t)))?;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Ok(PlTarget::Var(name));
+    }
+    if let Some(f) = rest.strip_prefix('.') {
+        let (field, tail) = split_ident(f).ok_or_else(|| syntax(format!("bad target: {}", t)))?;
+        if !tail.trim().is_empty() {
+            return Err(syntax(format!("bad target: {}", t)));
+        }
+        return Ok(PlTarget::Field(name, field));
+    }
+    Err(syntax(format!("bad target: {}", t)))
+}
+
+/// v2.11: make sure a FOR loop variable has a declaration: PG
+/// auto-declares it (integer for range loops, record for query
+/// loops). An existing declaration (or a same-named argument, which
+/// the CREATE-time map resolves first) is left alone.
+pub(crate) fn ensure_loop_decl(decls: &mut Vec<PlpgsqlDecl>, var: &str, type_name: &str) {
+    if decls.iter().any(|d| d.name == var) {
+        return;
+    }
+    decls.push(PlpgsqlDecl {
+        name: var.to_string(),
+        type_name: type_name.to_string(),
+        default: None,
+        alias_for: None,
+        is_cursor: false,
+        implicit: true,
+        alias_slot: None,
+    });
+}
+
+/// v2.11: parse a statement list from raw text (the body of a block,
+/// branch, or loop). Compound statements (IF / FOR / WHILE / LOOP /
+/// CASE / nested blocks) span several `;`-chunks and are gathered
+/// before parsing; everything else is one chunk.
+pub(crate) fn parse_plpgsql_stmt_list(
+    text: &str,
+    decls: &mut Vec<PlpgsqlDecl>,
+) -> Result<Vec<PlpgsqlStmt>, SqlError> {
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let chunks = plpgsql_chunks(text);
+    let mut out: Vec<PlpgsqlStmt> = Vec::new();
+    let mut i = 0;
+    while i < chunks.len() {
+        let c = chunks[i].as_str();
+        if plpgsql_starts_with_kw(c, "if") {
+            let e = gather_construct(&chunks, i, GatherKind::If);
+            let raw = chunks[i..=e].join(";\n");
+            let stmt = parse_plpgsql_if(&raw, decls)?;
+            plpgsql_push_stmt2(&mut out, stmt, "body")?;
+            i = e + 1;
+        } else if plpgsql_starts_with_kw(c, "for") {
+            let e = gather_construct(&chunks, i, GatherKind::Loop);
+            let raw = chunks[i..=e].join(";\n");
+            let stmt = parse_plpgsql_for(&raw, decls)?;
+            plpgsql_push_stmt2(&mut out, stmt, "body")?;
+            i = e + 1;
+        } else if plpgsql_starts_with_kw(c, "while") {
+            let e = gather_construct(&chunks, i, GatherKind::Loop);
+            let raw = chunks[i..=e].join(";\n");
+            let stmt = parse_plpgsql_while(&raw, decls)?;
+            plpgsql_push_stmt2(&mut out, stmt, "body")?;
+            i = e + 1;
+        } else if plpgsql_starts_with_kw(c, "loop") {
+            let e = gather_construct(&chunks, i, GatherKind::Loop);
+            let raw = chunks[i..=e].join(";\n");
+            let inner = plpgsql_strip_kw(plpgsql_strip_comments(&raw), "loop")
+                .ok_or_else(|| syntax("expected LOOP".to_string()))?;
+            let inner = plpgsql_strip_end_loop(inner.trim())
+                .ok_or_else(|| syntax("LOOP without END LOOP".to_string()))?;
+            let body = parse_plpgsql_stmt_list(inner, decls)?;
+            plpgsql_push_stmt2(&mut out, PlpgsqlStmt::Loop { body }, "body")?;
+            i = e + 1;
+        } else if plpgsql_starts_with_kw(c, "case") {
+            let e = gather_construct(&chunks, i, GatherKind::Case);
+            let raw = chunks[i..=e].join(";\n");
+            let stmt = parse_plpgsql_case(&raw, decls)?;
+            plpgsql_push_stmt2(&mut out, stmt, "body")?;
+            i = e + 1;
+        } else if plpgsql_starts_with_kw(c, "begin")
+            || plpgsql_starts_with_kw(c, "declare")
+            || c.starts_with("<<")
+        {
+            let e = gather_construct(&chunks, i, GatherKind::Block);
+            let raw = chunks[i..=e].join(";\n");
+            let stmt = parse_plpgsql_block(&raw, decls)?;
+            plpgsql_push_stmt2(&mut out, stmt, "body")?;
+            i = e + 1;
+        } else if plpgsql_starts_with_kw(c, "exception") || plpgsql_starts_with_kw(c, "when") {
+            return Err(syntax(format!(
+                "misplaced {} in plpgsql body",
+                if plpgsql_starts_with_kw(c, "when") {
+                    "WHEN"
+                } else {
+                    "EXCEPTION"
                 }
-                None => {
-                    t = "";
-                    break;
-                }
-            }
+            )));
         } else {
-            t = s;
+            let stmt = parse_plpgsql_stmt(c)?;
+            plpgsql_push_stmt2(&mut out, stmt, "body")?;
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// v2.11: parse the contents of one block (the text between BEGIN
+/// and its matching END): statements plus the optional EXCEPTION
+/// section. Used for the function body itself and for nested blocks.
+pub(crate) fn parse_plpgsql_block_contents(
+    text: &str,
+    decls: &mut Vec<PlpgsqlDecl>,
+) -> Result<(Vec<PlpgsqlStmt>, Vec<PlpgsqlHandler>), SqlError> {
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let chunks = plpgsql_chunks(text);
+    // Find a top-level EXCEPTION chunk: cumulative construct depth
+    // across all four families must be zero before it.
+    let mut exc_idx: Option<usize> = None;
+    let mut depth: i64 = 0;
+    for (j, c) in chunks.iter().enumerate() {
+        if depth == 0 && plpgsql_starts_with_kw(c, "exception") {
+            exc_idx = Some(j);
             break;
         }
-    }
-    let t = t;
-    if let Some(rest) = plpgsql_strip_kw(t, "return") {
-        if let Some(after) = plpgsql_strip_kw(rest.trim(), "next") {
-            return parse_plpgsql_return_next(after);
+        for kind in [
+            GatherKind::If,
+            GatherKind::Loop,
+            GatherKind::Block,
+            GatherKind::Case,
+        ] {
+            let (o, cl) = gather_delta(c, kind);
+            depth += o as i64 - cl as i64;
         }
-        return parse_plpgsql_return(rest);
     }
-    if plpgsql_find_assign(t).is_some() {
-        return parse_plpgsql_assign(t);
+    let (stmt_chunks, handler_chunks): (&[String], &[String]) = match exc_idx {
+        Some(j) => (&chunks[..j], &chunks[j..]),
+        None => (&chunks[..], &[]),
+    };
+    let stmts = parse_plpgsql_stmt_list(&stmt_chunks.join(";\n"), decls)?;
+    let mut handlers: Vec<PlpgsqlHandler> = Vec::new();
+    if !handler_chunks.is_empty() {
+        // First chunk is EXCEPTION (possibly with a WHEN attached).
+        let mut groups: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+        let mut first = handler_chunks[0].clone();
+        if let Some(after) = plpgsql_strip_kw(&first, "exception") {
+            let after = after.trim().to_string();
+            first = after;
+        }
+        let mut pending: Vec<String> = if first.is_empty() {
+            Vec::new()
+        } else {
+            vec![first]
+        };
+        for c in pending.drain(..).chain(handler_chunks[1..].iter().cloned()) {
+            if plpgsql_starts_with_kw(&c, "when") {
+                groups.push((Vec::new(), Vec::new()));
+                let (sqlstates, frag) = parse_plpgsql_when_header(&c)?;
+                groups.last_mut().unwrap().0 = sqlstates;
+                if let Some(f) = frag {
+                    groups.last_mut().unwrap().1.push(f);
+                }
+            } else {
+                match groups.last_mut() {
+                    Some(g) => g.1.push(c),
+                    None => return Err(syntax("expected WHEN after EXCEPTION".to_string())),
+                }
+            }
+        }
+        if groups.is_empty() {
+            return Err(syntax("EXCEPTION section without WHEN clause".to_string()));
+        }
+        for (sqlstates, parts) in groups {
+            let body = parse_plpgsql_stmt_list(&parts.join(";\n"), decls)?;
+            handlers.push(PlpgsqlHandler {
+                sqlstates,
+                stmts: body,
+            });
+        }
     }
-    Err(SqlError {
-        message: format!(
-            "unsupported statement in FOR loop body (only :=, RETURN, and RETURN NEXT are supported): {}",
-            t.chars().take(60).collect::<String>()
-        ),
-        code: "0A000",
+    Ok((stmts, handlers))
+}
+
+/// v2.11: parse a WHEN header chunk (`when <conds> then [frag]`):
+/// returns the trapped SQLSTATEs and the first body fragment after
+/// THEN (the rest of the handler's statements arrive as following
+/// chunks). Generalizes the v1.01 `parse_plpgsql_when`, which only
+/// allowed a single statement.
+pub(crate) fn parse_plpgsql_when_header(
+    chunk: &str,
+) -> Result<(Vec<String>, Option<String>), SqlError> {
+    let rest = plpgsql_strip_kw(chunk, "when").ok_or_else(|| SqlError {
+        message: "expected WHEN".to_string(),
+        code: "42601",
+    })?;
+    let mut sqlstates = Vec::new();
+    let mut p = rest;
+    loop {
+        let (codes, restp) = parse_plpgsql_condition(p)?;
+        sqlstates.extend(codes);
+        p = restp.trim_start();
+        if let Some(after) = plpgsql_strip_kw(p, "or") {
+            p = after;
+            continue;
+        }
+        break;
+    }
+    let after = plpgsql_strip_kw(p, "then").ok_or_else(|| SqlError {
+        message: "expected THEN in WHEN clause".to_string(),
+        code: "42601",
+    })?;
+    let frag = after.trim();
+    Ok((
+        sqlstates,
+        if frag.is_empty() {
+            None
+        } else {
+            Some(frag.to_string())
+        },
+    ))
+}
+
+/// v2.11: strip the trailing `END [label]` of a block body text.
+pub(crate) fn plpgsql_strip_outer_end<'a>(
+    text: &'a str,
+    label: Option<&str>,
+) -> Result<&'a str, SqlError> {
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    // A trailing `;` after the final END is fine (the v1.01 chunk
+    // splitter dropped it with the empty trailing chunk).
+    let t = text.trim_end().trim_end_matches(';').trim_end();
+    if let Some(inner) = plpgsql_strip_end(t) {
+        return Ok(inner);
+    }
+    // `END <label>` form: strip the label word, then END.
+    if let Some(l) = label {
+        if t.len() > l.len() && t[t.len() - l.len()..].eq_ignore_ascii_case(l) {
+            let before = t[..t.len() - l.len()].trim_end();
+            if let Some(inner) = plpgsql_strip_end(before) {
+                return Ok(inner);
+            }
+        }
+    }
+    Err(syntax("plpgsql body must end with END".to_string()))
+}
+
+/// v2.11: parse an `IF ... END IF` raw span (chunks re-joined).
+pub(crate) fn parse_plpgsql_if(
+    raw: &str,
+    decls: &mut Vec<PlpgsqlDecl>,
+) -> Result<PlpgsqlStmt, SqlError> {
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let t = plpgsql_strip_comments(raw).trim().to_string();
+    let rest = plpgsql_strip_kw(&t, "if")
+        .ok_or_else(|| syntax("expected IF".to_string()))?
+        .to_string();
+    let then_pos =
+        plpgsql_top_level_kw(&rest, "then").ok_or_else(|| syntax("IF without THEN".to_string()))?;
+    let first_cond = rest[..then_pos].trim().to_string();
+    let after = rest[then_pos + 4..].to_string();
+    // Split the remainder into segments at depth-0 ELSIF / ELSE,
+    // terminated by the depth-0 END IF chunk.
+    let chunks = plpgsql_chunks(&after);
+    let mut segments: Vec<(Option<String>, Vec<String>)> = vec![(None, Vec::new())];
+    let mut depth: i64 = 0;
+    for c in &chunks {
+        if depth == 0 && plpgsql_starts_with_kw(c, "elsif") {
+            segments.push((Some(c.clone()), Vec::new()));
+            continue;
+        }
+        if depth == 0 && plpgsql_starts_with_kw(c, "else") {
+            segments.push((Some(c.clone()), Vec::new()));
+            continue;
+        }
+        if depth == 0 && plpgsql_count_end_kw(c, "if") > 0 {
+            break;
+        }
+        let (o, cl) = gather_delta(c, GatherKind::If);
+        depth += o as i64 - cl as i64;
+        segments.last_mut().unwrap().1.push(c.clone());
+    }
+    let mut branches: Vec<(Stmt, Vec<PlpgsqlStmt>)> = Vec::new();
+    let mut else_body: Vec<PlpgsqlStmt> = Vec::new();
+    for (idx, (header, parts)) in segments.into_iter().enumerate() {
+        match header {
+            None => {
+                let cond = parse_plpgsql_cond(&first_cond)?;
+                let body = parse_plpgsql_stmt_list(&parts.join(";\n"), decls)?;
+                branches.push((cond, body));
+            }
+            Some(h) if idx > 0 && plpgsql_starts_with_kw(&h, "elsif") => {
+                let r = plpgsql_strip_kw(&h, "elsif").unwrap_or("");
+                let tp = plpgsql_top_level_kw(r, "then")
+                    .ok_or_else(|| syntax("ELSIF without THEN".to_string()))?;
+                let cond = parse_plpgsql_cond(r[..tp].trim())?;
+                let mut all: Vec<String> = Vec::new();
+                let frag = r[tp + 4..].trim();
+                if !frag.is_empty() {
+                    all.push(frag.to_string());
+                }
+                all.extend(parts);
+                let body = parse_plpgsql_stmt_list(&all.join(";\n"), decls)?;
+                branches.push((cond, body));
+            }
+            Some(h) => {
+                let r = plpgsql_strip_kw(&h, "else").unwrap_or("");
+                let mut all: Vec<String> = Vec::new();
+                let frag = r.trim();
+                if !frag.is_empty() {
+                    all.push(frag.to_string());
+                }
+                all.extend(parts);
+                else_body = parse_plpgsql_stmt_list(&all.join(";\n"), decls)?;
+            }
+        }
+    }
+    Ok(PlpgsqlStmt::If {
+        branches,
+        else_body,
     })
 }
 
-/// v1.03: parse `FOR var IN <query> LOOP <stmts> END LOOP` (`text`
-/// includes the trailing `END LOOP`). The query must be a `SELECT` or
-/// `EXPLAIN`; the loop variable must be DECLAREd (checked at CREATE).
-/// Nested FOR loops are not supported (0A000).
-pub(crate) fn parse_plpgsql_for(text: &str) -> Result<PlpgsqlStmt, SqlError> {
+/// v2.11: parse a `CASE ... END CASE` raw span.
+pub(crate) fn parse_plpgsql_case(
+    raw: &str,
+    decls: &mut Vec<PlpgsqlDecl>,
+) -> Result<PlpgsqlStmt, SqlError> {
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let t = plpgsql_strip_comments(raw).trim().to_string();
+    let rest = plpgsql_strip_kw(&t, "case")
+        .ok_or_else(|| syntax("expected CASE".to_string()))?
+        .trim()
+        .to_string();
+    // Strip the trailing END CASE.
+    let low = rest.to_ascii_lowercase();
+    let inner = if low.ends_with("end case") {
+        rest[..rest.len() - 8].trim().to_string()
+    } else {
+        return Err(syntax("CASE without END CASE".to_string()));
+    };
+    // The operand (simple CASE) is the text before the first WHEN.
+    let first_when = plpgsql_top_level_kw(&inner, "when")
+        .ok_or_else(|| syntax("CASE without WHEN".to_string()))?;
+    let operand = inner[..first_when].trim().to_string();
+    let after = inner[first_when..].to_string();
+    let chunks = plpgsql_chunks(&after);
+    let mut segments: Vec<(Option<String>, Vec<String>)> = Vec::new();
+    let mut depth: i64 = 0;
+    for c in &chunks {
+        if depth == 0 && plpgsql_starts_with_kw(c, "when") {
+            segments.push((Some(c.clone()), Vec::new()));
+            continue;
+        }
+        if depth == 0 && plpgsql_starts_with_kw(c, "else") {
+            segments.push((Some(c.clone()), Vec::new()));
+            continue;
+        }
+        let (o, cl) = gather_delta(c, GatherKind::Case);
+        depth += o as i64 - cl as i64;
+        match segments.last_mut() {
+            Some(g) => g.1.push(c.clone()),
+            None => return Err(syntax("CASE body before first WHEN".to_string())),
+        }
+    }
+    let mut branches: Vec<(Stmt, Vec<PlpgsqlStmt>)> = Vec::new();
+    let mut else_body: Vec<PlpgsqlStmt> = Vec::new();
+    for (header, parts) in segments {
+        let h = header.unwrap_or_default();
+        if plpgsql_starts_with_kw(&h, "when") {
+            let r = plpgsql_strip_kw(&h, "when").unwrap_or("");
+            let tp = plpgsql_top_level_kw(r, "then")
+                .ok_or_else(|| syntax("WHEN without THEN in CASE".to_string()))?;
+            let val = r[..tp].trim();
+            let mut all: Vec<String> = Vec::new();
+            let frag = r[tp + 4..].trim();
+            if !frag.is_empty() {
+                all.push(frag.to_string());
+            }
+            all.extend(parts);
+            let body = parse_plpgsql_stmt_list(&all.join(";\n"), decls)?;
+            if operand.is_empty() {
+                // Searched CASE: the WHEN text is the condition.
+                let cond = parse_plpgsql_cond(val)?;
+                branches.push((cond, body));
+            } else {
+                // Simple CASE: a WHEN may list several values
+                // (`WHEN 2, 3 THEN`) — one branch per value, all
+                // sharing the body.
+                for v in split_top_level_commas(val) {
+                    let cond_text = format!("({}) = ({})", operand, v.trim());
+                    let cond = parse_plpgsql_cond(&cond_text)?;
+                    branches.push((cond, body.clone()));
+                }
+            }
+        } else {
+            let r = plpgsql_strip_kw(&h, "else").unwrap_or("");
+            let mut all: Vec<String> = Vec::new();
+            let frag = r.trim();
+            if !frag.is_empty() {
+                all.push(frag.to_string());
+            }
+            all.extend(parts);
+            else_body = parse_plpgsql_stmt_list(&all.join(";\n"), decls)?;
+        }
+    }
+    Ok(PlpgsqlStmt::Case {
+        branches,
+        else_body,
+    })
+}
+
+/// v2.11: find a top-level `..` (range operator) in `s`: byte index,
+/// outside strings/parens, not part of a numeric literal like `1..2`
+/// (which IS the range form — the digits are fine) and not a
+/// qualified name dot.
+pub(crate) fn plpgsql_top_level_dotdot(s: &str) -> Option<usize> {
+    let chars: Vec<char> = s.chars().collect();
+    let byte_off: Vec<usize> = s.char_indices().map(|(b, _)| b).collect();
+    let mut depth: i64 = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' || c == '"' {
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == c {
+                    if i + 1 < chars.len() && chars[i + 1] == c {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == '$' {
+            if let Some(next) = plpgsql_dollar_skip(&chars, i) {
+                i = next;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            '.' if depth == 0 && i + 1 < chars.len() && chars[i + 1] == '.' => {
+                return Some(byte_off[i]);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// v2.11: parse a `FOR ... END LOOP` raw span: range form, EXECUTE
+/// form, or query form (PG19 PLPGSQL_STMT_FORC / DYNFORS / FORS).
+/// Undeclared loop variables are auto-declared (integer / record).
+pub(crate) fn parse_plpgsql_for(
+    text: &str,
+    decls: &mut Vec<PlpgsqlDecl>,
+) -> Result<PlpgsqlStmt, SqlError> {
     let syntax = |msg: String| SqlError {
         message: msg,
         code: "42601",
@@ -5246,36 +6408,95 @@ pub(crate) fn parse_plpgsql_for(text: &str) -> Result<PlpgsqlStmt, SqlError> {
     let rest = plpgsql_strip_kw(t, "for").ok_or_else(|| syntax("expected FOR".to_string()))?;
     let (var, rest) =
         split_ident(rest).ok_or_else(|| syntax("FOR requires a loop variable".to_string()))?;
-    let rest = plpgsql_strip_kw(rest.trim_start(), "in")
-        .ok_or_else(|| syntax("expected IN after FOR loop variable".to_string()))?;
-    // Find LOOP: the query is the first depth-0 `LOOP`-terminated prefix
-    // that parses as a statement (a column named `loop` must not end the
-    // query early).
-    let mut found: Option<(&str, &str)> = None;
-    let mut first_err: Option<SqlError> = None;
-    for lp in plpgsql_kw_positions(rest, "loop") {
-        let q = rest[..lp].trim();
-        if q.is_empty() {
+    let mut rest = plpgsql_strip_kw(rest.trim_start(), "in")
+        .ok_or_else(|| syntax("expected IN after FOR loop variable".to_string()))?
+        .trim()
+        .to_string();
+    let mut reverse = false;
+    if plpgsql_starts_with_kw(&rest, "reverse") {
+        reverse = true;
+        rest = plpgsql_strip_kw(&rest, "reverse")
+            .unwrap_or("")
+            .trim()
+            .to_string();
+    }
+    // Find LOOP: the source is the first LOOP-terminated prefix that
+    // classifies (range / EXECUTE / query).
+    let mut found: Option<(String, String)> = None;
+    for lp in plpgsql_kw_positions(&rest, "loop") {
+        let src = rest[..lp].trim().to_string();
+        if src.is_empty() {
             continue;
         }
-        match parse_statement(q) {
-            Ok(_) => {
-                found = Some((q, rest[lp + 4..].trim()));
-                break;
-            }
-            Err(e) => {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
-            }
+        let ok = plpgsql_top_level_dotdot(&src).is_some()
+            || plpgsql_starts_with_kw(&src, "execute")
+            || parse_statement(&src).is_ok();
+        if ok {
+            found = Some((src, rest[lp + 4..].trim().to_string()));
+            break;
         }
     }
-    let (query_text, body_after) = found.ok_or_else(|| {
-        first_err.unwrap_or_else(|| syntax("FOR requires IN <query> LOOP".to_string()))
-    })?;
-    let inner = plpgsql_strip_end_loop(body_after)
+    let (source, body_after) =
+        found.ok_or_else(|| syntax("FOR requires IN <query> LOOP".to_string()))?;
+    let inner = plpgsql_strip_end_loop(&body_after)
         .ok_or_else(|| syntax("FOR loop without END LOOP".to_string()))?;
-    let query = parse_statement(query_text).map_err(|e| SqlError {
+    // Range form.
+    if let Some(dp) = plpgsql_top_level_dotdot(&source) {
+        let low_text = source[..dp].trim();
+        let rest2 = source[dp + 2..].trim();
+        let (high_text, step_text) = match plpgsql_top_level_kw(rest2, "by") {
+            Some(bp) => (rest2[..bp].trim(), Some(rest2[bp + 2..].trim())),
+            None => (rest2, None),
+        };
+        let mk = |x: &str| -> Result<Stmt, SqlError> {
+            let st = parse_statement(&format!("SELECT {}", x)).map_err(|e| SqlError {
+                message: format!("syntax error in FOR bound: {}", e.message),
+                code: "42601",
+            })?;
+            if !matches!(st, Stmt::Select(_)) {
+                return Err(syntax(
+                    "FOR bound did not parse as an expression".to_string(),
+                ));
+            }
+            Ok(st)
+        };
+        ensure_loop_decl(decls, &var, "integer");
+        let body = parse_plpgsql_stmt_list(inner, decls)?;
+        return Ok(PlpgsqlStmt::ForRange {
+            var,
+            low: Box::new(mk(low_text)?),
+            high: Box::new(mk(high_text)?),
+            step: match step_text {
+                Some(x) => Some(Box::new(mk(x)?)),
+                None => None,
+            },
+            reverse,
+            body,
+        });
+    }
+    // EXECUTE form.
+    if plpgsql_starts_with_kw(&source, "execute") {
+        let expr_text = plpgsql_strip_kw(&source, "execute").unwrap_or("").trim();
+        let st = parse_statement(&format!("SELECT {}", expr_text)).map_err(|e| SqlError {
+            message: format!("syntax error in FOR EXECUTE: {}", e.message),
+            code: "42601",
+        })?;
+        if !matches!(st, Stmt::Select(_)) {
+            return Err(syntax(
+                "FOR EXECUTE did not parse as an expression".to_string(),
+            ));
+        }
+        ensure_loop_decl(decls, &var, "record");
+        let body = parse_plpgsql_stmt_list(inner, decls)?;
+        return Ok(PlpgsqlStmt::ForQuery {
+            var,
+            query: st,
+            body,
+            dynamic: true,
+        });
+    }
+    // Query form.
+    let query = parse_statement(&source).map_err(|e| SqlError {
         message: format!("syntax error in FOR loop query: {}", e.message),
         code: "42601",
     })?;
@@ -5287,22 +6508,106 @@ pub(crate) fn parse_plpgsql_for(text: &str) -> Result<PlpgsqlStmt, SqlError> {
             ));
         }
     }
-    let mut body = Vec::new();
-    for chunk in split_plpgsql_chunks(inner) {
-        let c = chunk.trim();
-        if c.is_empty() {
-            continue;
-        }
-        let stmt = parse_plpgsql_for_body_stmt(c)?;
-        plpgsql_push_stmt(&mut body, stmt, "FOR loop body")?;
-    }
-    Ok(PlpgsqlStmt::ForQuery { var, query, body })
+    ensure_loop_decl(decls, &var, "record");
+    let body = parse_plpgsql_stmt_list(inner, decls)?;
+    Ok(PlpgsqlStmt::ForQuery {
+        var,
+        query,
+        body,
+        dynamic: false,
+    })
 }
 
-/// v1.03: reject RETURN/RETURN NEXT placement against the function's
-/// declared shape: `RETURN <expr>` is illegal in a `RETURNS SETOF`
-/// function (use `RETURN NEXT`), and `RETURN NEXT` is illegal in a
-/// scalar function (PG19 pl_comp.c `check_sql_stmt` equivalents).
+/// v2.11: parse a `WHILE <cond> LOOP ... END LOOP` raw span.
+pub(crate) fn parse_plpgsql_while(
+    raw: &str,
+    decls: &mut Vec<PlpgsqlDecl>,
+) -> Result<PlpgsqlStmt, SqlError> {
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let t = plpgsql_strip_comments(raw).trim().to_string();
+    let rest = plpgsql_strip_kw(&t, "while")
+        .ok_or_else(|| syntax("expected WHILE".to_string()))?
+        .to_string();
+    let mut found: Option<(Stmt, String)> = None;
+    for lp in plpgsql_kw_positions(&rest, "loop") {
+        let cand = rest[..lp].trim();
+        if cand.is_empty() {
+            continue;
+        }
+        if let Ok(cond) = parse_plpgsql_cond(cand) {
+            found = Some((cond, rest[lp + 4..].trim().to_string()));
+            break;
+        }
+    }
+    let (cond, body_after) =
+        found.ok_or_else(|| syntax("WHILE requires <cond> LOOP".to_string()))?;
+    let inner = plpgsql_strip_end_loop(&body_after)
+        .ok_or_else(|| syntax("WHILE loop without END LOOP".to_string()))?;
+    let body = parse_plpgsql_stmt_list(inner, decls)?;
+    Ok(PlpgsqlStmt::While {
+        cond: Box::new(cond),
+        body,
+    })
+}
+
+/// v2.11: parse a nested block raw span:
+/// `[<<label>>] [DECLARE <decls>] BEGIN <contents> END [label]`.
+pub(crate) fn parse_plpgsql_block(
+    raw: &str,
+    decls: &mut Vec<PlpgsqlDecl>,
+) -> Result<PlpgsqlStmt, SqlError> {
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let mut t = plpgsql_strip_comments(raw).trim().to_string();
+    let mut label: Option<String> = None;
+    if t.starts_with("<<") {
+        let close = t
+            .find(">>")
+            .ok_or_else(|| syntax("unterminated block label".to_string()))?;
+        let name = t[2..close].trim().to_lowercase();
+        if name.is_empty() {
+            return Err(syntax("empty block label".to_string()));
+        }
+        label = Some(name);
+        t = t[close + 2..].trim().to_string();
+    }
+    let mut decl_idx: Vec<usize> = Vec::new();
+    if plpgsql_starts_with_kw(&t, "declare") {
+        let after = plpgsql_strip_kw(&t, "declare").unwrap_or("");
+        let bp = plpgsql_top_level_kw(after, "begin")
+            .ok_or_else(|| syntax("DECLARE section without BEGIN".to_string()))?;
+        let new_decls = parse_plpgsql_decls(after[..bp].trim())?;
+        for d in new_decls {
+            decl_idx.push(decls.len());
+            decls.push(d);
+        }
+        t = after[bp..].trim().to_string();
+    }
+    if !plpgsql_starts_with_kw(&t, "begin") {
+        return Err(syntax(format!(
+            "plpgsql block must start with BEGIN, got: {}",
+            t.chars().take(40).collect::<String>()
+        )));
+    }
+    let after_begin = plpgsql_strip_kw(&t, "begin").unwrap_or("");
+    let inner = plpgsql_strip_outer_end(after_begin, label.as_deref())?;
+    let (stmts, handlers) = parse_plpgsql_block_contents(inner, decls)?;
+    Ok(PlpgsqlStmt::Block {
+        label,
+        decl_idx,
+        stmts,
+        handlers,
+    })
+}
+
+/// v1.03/v2.11: reject RETURN/RETURN NEXT placement against the
+/// function's declared shape (PG19 pl_comp.c `check_sql_stmt`
+/// equivalents), recursing through every compound statement.
 pub(crate) fn plpgsql_validate_returns(
     stmts: &[PlpgsqlStmt],
     handlers: &[PlpgsqlHandler],
@@ -5312,11 +6617,6 @@ pub(crate) fn plpgsql_validate_returns(
     fn walk(stmts: &[PlpgsqlStmt], returns_set: bool, is_void: bool) -> Result<(), SqlError> {
         for s in stmts {
             match s {
-                // v1.96 finishing pass: PG19 — RETURN with an
-                // expression is a compile error in a void function
-                // (and in a DO block). This parser only builds
-                // Return with an expression (a bare RETURN is a
-                // syntax error here), so any Return qualifies.
                 PlpgsqlStmt::Return(_) if is_void => {
                     return Err(SqlError {
                         message: "RETURN cannot have a parameter in function returning void"
@@ -5336,7 +6636,51 @@ pub(crate) fn plpgsql_validate_returns(
                         code: "42601",
                     });
                 }
-                PlpgsqlStmt::ForQuery { body, .. } => walk(body, returns_set, is_void)?,
+                // v2.11 fix (PG19 pl_gram.y make_return_stmt): a bare
+                // RETURN is legal only in SETOF / void / OUT-param
+                // functions; in a scalar function the expression is
+                // mandatory and its absence is a CREATE-time syntax
+                // error ("missing expression").
+                PlpgsqlStmt::ReturnBare if !returns_set && !is_void => {
+                    return Err(SqlError {
+                        message: "missing expression at or near \";\"".to_string(),
+                        code: "42601",
+                    });
+                }
+                PlpgsqlStmt::ReturnQuery(_) | PlpgsqlStmt::ReturnQueryExecute(_) => {
+                    if !returns_set {
+                        return Err(SqlError {
+                            message: "RETURN QUERY cannot be used in a non-SETOF function"
+                                .to_string(),
+                            code: "42601",
+                        });
+                    }
+                }
+                PlpgsqlStmt::ForQuery { body, .. }
+                | PlpgsqlStmt::ForRange { body, .. }
+                | PlpgsqlStmt::While { body, .. }
+                | PlpgsqlStmt::Loop { body } => walk(body, returns_set, is_void)?,
+                PlpgsqlStmt::If {
+                    branches,
+                    else_body,
+                }
+                | PlpgsqlStmt::Case {
+                    branches,
+                    else_body,
+                } => {
+                    for (_, b) in branches {
+                        walk(b, returns_set, is_void)?;
+                    }
+                    walk(else_body, returns_set, is_void)?;
+                }
+                PlpgsqlStmt::Block {
+                    stmts, handlers, ..
+                } => {
+                    walk(stmts, returns_set, is_void)?;
+                    for h in handlers {
+                        walk(&h.stmts, returns_set, is_void)?;
+                    }
+                }
                 _ => {}
             }
         }
@@ -5349,32 +6693,178 @@ pub(crate) fn plpgsql_validate_returns(
     Ok(())
 }
 
-/// v1.03: every `FOR` loop variable and `:=` assignment target must be
-/// DECLAREd (PG requires a declared variable for both; an undeclared
-/// name is 42601 at CREATE, like PG's plpgsql validator).
+/// v1.03/v2.11: every assignment / INTO / diagnostics target and FOR
+/// loop variable must be DECLAREd (an undeclared name is 42601 at
+/// CREATE, like PG's plpgsql validator). Recurses through every
+/// compound statement; block-local declarations are in the flat
+/// `decls` list, so name membership is the check.
 pub(crate) fn plpgsql_validate_vars(
     decls: &[PlpgsqlDecl],
     stmts: &[PlpgsqlStmt],
     handlers: &[PlpgsqlHandler],
+    body_label: Option<&str>,
 ) -> Result<(), SqlError> {
-    fn walk(stmts: &[PlpgsqlStmt], decls: &[PlpgsqlDecl]) -> Result<(), SqlError> {
+    // All block labels in the body (a label-qualified target like
+    // `outer.x` names the variable `x` of the block labeled `outer`).
+    fn collect_labels(stmts: &[PlpgsqlStmt], out: &mut std::collections::HashSet<String>) {
         for s in stmts {
             match s {
-                PlpgsqlStmt::ForQuery { var, body, .. } => {
-                    if !decls.iter().any(|d| d.name == *var) {
+                PlpgsqlStmt::Block {
+                    label,
+                    stmts,
+                    handlers,
+                    ..
+                } => {
+                    if let Some(l) = label {
+                        out.insert(l.clone());
+                    }
+                    collect_labels(stmts, out);
+                    for h in handlers {
+                        collect_labels(&h.stmts, out);
+                    }
+                }
+                PlpgsqlStmt::ForQuery { body, .. }
+                | PlpgsqlStmt::ForRange { body, .. }
+                | PlpgsqlStmt::While { body, .. }
+                | PlpgsqlStmt::Loop { body } => collect_labels(body, out),
+                PlpgsqlStmt::If {
+                    branches,
+                    else_body,
+                }
+                | PlpgsqlStmt::Case {
+                    branches,
+                    else_body,
+                } => {
+                    for (_, b) in branches {
+                        collect_labels(b, out);
+                    }
+                    collect_labels(else_body, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut labels: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(l) = body_label {
+        labels.insert(l.to_string());
+    }
+    collect_labels(stmts, &mut labels);
+    for h in handlers {
+        collect_labels(&h.stmts, &mut labels);
+    }
+    fn declared(decls: &[PlpgsqlDecl], name: &str) -> bool {
+        decls.iter().any(|d| d.name == name)
+    }
+    fn check_target(
+        decls: &[PlpgsqlDecl],
+        labels: &std::collections::HashSet<String>,
+        t: &PlTarget,
+        what: &str,
+    ) -> Result<(), SqlError> {
+        match t {
+            PlTarget::Var(name) => {
+                if !declared(decls, name) {
+                    return Err(SqlError {
+                        message: format!("{} \"{}\" is not declared", what, name),
+                        code: "42601",
+                    });
+                }
+                Ok(())
+            }
+            PlTarget::Field(name, field) => {
+                // `rec.field`: rec must be declared. `label.var`:
+                // the label must exist and var must be declared.
+                if declared(decls, name) {
+                    return Ok(());
+                }
+                if labels.contains(name) && declared(decls, field) {
+                    return Ok(());
+                }
+                Err(SqlError {
+                    message: format!("{} \"{}\" is not declared", what, name),
+                    code: "42601",
+                })
+            }
+            PlTarget::Param(_) => Ok(()),
+        }
+    }
+    fn check_targets(
+        decls: &[PlpgsqlDecl],
+        labels: &std::collections::HashSet<String>,
+        targets: &[PlTarget],
+    ) -> Result<(), SqlError> {
+        for t in targets {
+            check_target(decls, labels, t, "INTO target")?;
+        }
+        Ok(())
+    }
+    fn walk(
+        stmts: &[PlpgsqlStmt],
+        decls: &[PlpgsqlDecl],
+        labels: &std::collections::HashSet<String>,
+    ) -> Result<(), SqlError> {
+        for s in stmts {
+            match s {
+                PlpgsqlStmt::ForQuery { var, body, .. }
+                | PlpgsqlStmt::ForRange { var, body, .. } => {
+                    if !declared(decls, var) {
                         return Err(SqlError {
                             message: format!("FOR loop variable \"{}\" is not declared", var),
                             code: "42601",
                         });
                     }
-                    walk(body, decls)?;
+                    walk(body, decls, labels)?;
                 }
                 PlpgsqlStmt::Assign { var, .. } => {
-                    if !decls.iter().any(|d| d.name == *var) {
+                    if !declared(decls, var) {
                         return Err(SqlError {
                             message: format!("assignment target \"{}\" is not declared", var),
                             code: "42601",
                         });
+                    }
+                }
+                PlpgsqlStmt::AssignField { var, field, .. } => {
+                    check_target(
+                        decls,
+                        labels,
+                        &PlTarget::Field(var.clone(), field.clone()),
+                        "assignment target",
+                    )?;
+                }
+                PlpgsqlStmt::SelectInto { targets, .. } => check_targets(decls, labels, targets)?,
+                PlpgsqlStmt::Dml {
+                    targets: Some(ts), ..
+                }
+                | PlpgsqlStmt::ExecuteInto {
+                    targets: Some(ts), ..
+                } => check_targets(decls, labels, ts)?,
+                PlpgsqlStmt::GetDiagnostics { assigns, .. } => {
+                    for (t, _) in assigns {
+                        check_target(decls, labels, t, "GET DIAGNOSTICS target")?;
+                    }
+                }
+                PlpgsqlStmt::While { body, .. } | PlpgsqlStmt::Loop { body } => {
+                    walk(body, decls, labels)?;
+                }
+                PlpgsqlStmt::If {
+                    branches,
+                    else_body,
+                }
+                | PlpgsqlStmt::Case {
+                    branches,
+                    else_body,
+                } => {
+                    for (_, b) in branches {
+                        walk(b, decls, labels)?;
+                    }
+                    walk(else_body, decls, labels)?;
+                }
+                PlpgsqlStmt::Block {
+                    stmts, handlers, ..
+                } => {
+                    walk(stmts, decls, labels)?;
+                    for h in handlers {
+                        walk(&h.stmts, decls, labels)?;
                     }
                 }
                 _ => {}
@@ -5382,79 +6872,354 @@ pub(crate) fn plpgsql_validate_vars(
         }
         Ok(())
     }
-    walk(stmts, decls)?;
+    walk(stmts, decls, &labels)?;
     for h in handlers {
-        walk(&h.stmts, decls)?;
+        walk(&h.stmts, decls, &labels)?;
     }
     Ok(())
 }
 
+/// v2.11: try to read an assignment at the very start of `t`:
+/// `<target> := <rhs>` or `<target> = <rhs>` where the target is a
+/// variable, a record field, or `$n`. Returns (target, rhs text).
+pub(crate) fn plpgsql_try_assign(t: &str) -> Option<(PlTarget, &str)> {
+    let t = t.trim();
+    let (target, rest) = if let Some(d) = t.strip_prefix('$') {
+        let nd = d.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if nd == 0 {
+            return None;
+        }
+        let n: u32 = d[..nd].parse().ok()?;
+        (PlTarget::Param(n), &d[nd..])
+    } else {
+        let (name, r) = split_ident(t)?;
+        let r = r.trim_start();
+        if let Some(f) = r.strip_prefix('.') {
+            let (field, r2) = split_ident(f)?;
+            (PlTarget::Field(name, field), r2)
+        } else if r.starts_with('[') {
+            // Subscript target: not an assignment form we build.
+            return None;
+        } else {
+            (PlTarget::Var(name), r)
+        }
+    };
+    let rest = rest.trim_start();
+    let rhs = if let Some(x) = rest.strip_prefix(":=") {
+        x
+    } else if rest.starts_with('=') && !rest.starts_with("==") && !rest.starts_with("=>") {
+        &rest[1..]
+    } else {
+        return None;
+    };
+    let rhs = rhs.trim();
+    if rhs.is_empty() {
+        return None;
+    }
+    Some((target, rhs))
+}
+
+/// v2.11: parse a SELECT-with-INTO statement text (`SELECT ...` or
+/// `WITH ... SELECT ...`). Returns None when the text has no
+/// top-level INTO (the caller then treats it as a bare query).
+pub(crate) fn parse_plpgsql_select_into(t: &str) -> Option<Result<PlpgsqlStmt, SqlError>> {
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let pos = plpgsql_top_level_kw(t, "into")?;
+    let before = t[..pos].trim();
+    let mut after = t[pos + 4..].trim_start();
+    let mut strict = false;
+    if plpgsql_starts_with_kw(after, "strict") {
+        strict = true;
+        after = plpgsql_strip_kw(after, "strict").unwrap_or("").trim_start();
+    }
+    // PG19 read_into_target: the target list is one datum followed
+    // by comma-separated datums only; the first token that is not
+    // part of that list resumes the query's select list (so
+    // `SELECT INTO b bal FROM t` targets `b` and selects `bal`, and
+    // `SELECT INTO rec * FROM t` targets `rec` and selects `*`).
+    let bytes = after.as_bytes();
+    let mut i = 0usize;
+    let mut targets = Vec::new();
+    loop {
+        while i < after.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let start = i;
+        while i < after.len()
+            && (bytes[i].is_ascii_alphanumeric()
+                || bytes[i] == b'_'
+                || bytes[i] == b'.'
+                || bytes[i] == b'$')
+        {
+            i += 1;
+        }
+        let tok = after[start..i].trim();
+        if tok.is_empty() {
+            return Some(Err(syntax("SELECT INTO requires a target".to_string())));
+        }
+        match parse_pl_target(tok) {
+            Ok(x) => targets.push(x),
+            Err(e) => return Some(Err(e)),
+        }
+        let mut j = i;
+        while j < after.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j < after.len() && bytes[j] == b',' {
+            i = j + 1;
+            continue;
+        }
+        i = j;
+        break;
+    }
+    let tail = after[i..].trim();
+    let query_text = if tail.is_empty() {
+        before.to_string()
+    } else {
+        format!("{} {}", before, tail)
+    };
+    let query = match parse_statement(&query_text) {
+        Ok(q) => q,
+        Err(e) => {
+            return Some(Err(SqlError {
+                message: format!("syntax error in SELECT INTO query: {}", e.message),
+                code: "42601",
+            }));
+        }
+    };
+    if !matches!(query, Stmt::Select(_)) {
+        return Some(Err(syntax("SELECT INTO query is not a SELECT".to_string())));
+    }
+    Some(Ok(PlpgsqlStmt::SelectInto {
+        targets,
+        query: Box::new(query),
+        strict,
+    }))
+}
+
+/// v2.11: parse a DML statement text (INSERT / UPDATE / DELETE /
+/// MERGE, plain or WITH-prefixed), extracting a trailing
+/// `RETURNING ... INTO <targets>` clause when present. Returns None
+/// when the text is not DML.
+pub(crate) fn parse_plpgsql_dml(t: &str) -> Result<Option<PlpgsqlStmt>, SqlError> {
+    let (core, targets, strict_flag) = if let Some(rp) = plpgsql_top_level_kw(t, "returning") {
+        match plpgsql_top_level_kw(&t[rp..], "into") {
+            Some(rel) => {
+                let ip = rp + rel;
+                let mut after = t[ip + 4..].trim();
+                let mut strict = false;
+                if plpgsql_starts_with_kw(after, "strict") {
+                    strict = true;
+                    after = plpgsql_strip_kw(after, "strict").unwrap_or("").trim();
+                }
+                let mut ts = Vec::new();
+                for part in split_top_level_commas(after) {
+                    ts.push(parse_pl_target(part)?);
+                }
+                (t[..ip].trim().to_string(), Some(ts), strict)
+            }
+            None => (t.to_string(), None, false),
+        }
+    } else {
+        (t.to_string(), None, false)
+    };
+    let stmt = parse_statement(&core).map_err(|e| SqlError {
+        message: format!("syntax error in plpgsql statement: {}", e.message),
+        code: "42601",
+    })?;
+    match stmt {
+        Stmt::Insert { .. } | Stmt::Update { .. } | Stmt::Delete { .. } | Stmt::Merge { .. } => {
+            Ok(Some(PlpgsqlStmt::Dml {
+                stmt: Box::new(stmt),
+                targets,
+                strict: strict_flag,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// v2.11: parse an EXECUTE statement (the EXECUTE keyword already
+/// stripped): `<expr> [INTO [STRICT] <targets>] [USING <expr>, ...]`
+/// or `<expr> [USING ...]`.
+pub(crate) fn parse_plpgsql_execute(rest: &str) -> Result<PlpgsqlStmt, SqlError> {
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let rest = rest.trim().trim_end_matches(';').trim();
+    let into_pos = plpgsql_top_level_kw(rest, "into");
+    let using_pos = plpgsql_top_level_kw(rest, "using");
+    let first = [into_pos, using_pos].into_iter().flatten().min();
+    let expr_text = match first {
+        Some(p) => rest[..p].trim(),
+        None => rest,
+    };
+    let expr = parse_statement(&format!("SELECT {}", expr_text)).map_err(|_| {
+        syntax(format!(
+            "unsupported EXECUTE form: {}",
+            rest.chars().take(60).collect::<String>()
+        ))
+    })?;
+    if !matches!(expr, Stmt::Select(_)) {
+        return Err(syntax(
+            "EXECUTE expression is not an expression".to_string(),
+        ));
+    }
+    let mut targets: Option<Vec<PlTarget>> = None;
+    let mut strict = false;
+    if let Some(ip) = into_pos {
+        let after = rest[ip + 4..].trim_start();
+        let (mut after, st) = if plpgsql_starts_with_kw(after, "strict") {
+            (
+                plpgsql_strip_kw(after, "strict").unwrap_or("").trim_start(),
+                true,
+            )
+        } else {
+            (after, false)
+        };
+        strict = st;
+        if let Some(up_rel) = plpgsql_top_level_kw(after, "using") {
+            after = after[..up_rel].trim_end();
+            let _ = &mut after;
+        }
+        let text = if let Some(up_rel) = plpgsql_top_level_kw(rest[ip + 4..].trim_start(), "using")
+        {
+            rest[ip + 4..].trim_start()[..up_rel].trim()
+        } else {
+            after
+        };
+        let mut ts = Vec::new();
+        for part in split_top_level_commas(text) {
+            ts.push(parse_pl_target(part)?);
+        }
+        targets = Some(ts);
+    }
+    let mut using: Vec<Stmt> = Vec::new();
+    if let Some(up) = using_pos {
+        let list = rest[up + 5..].trim();
+        for part in split_top_level_commas(list) {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let st = parse_statement(&format!("SELECT {}", part)).map_err(|e| SqlError {
+                message: format!("syntax error in EXECUTE USING: {}", e.message),
+                code: "42601",
+            })?;
+            if !matches!(st, Stmt::Select(_)) {
+                return Err(syntax(
+                    "EXECUTE USING item did not parse as an expression".to_string(),
+                ));
+            }
+            using.push(st);
+        }
+    }
+    Ok(PlpgsqlStmt::ExecuteInto {
+        expr: Box::new(expr),
+        targets,
+        strict,
+        using,
+    })
+}
+
+/// v1.01/v2.11: parse one single-chunk statement of a plpgsql body.
+/// Compound statements (IF / FOR / WHILE / LOOP / CASE / blocks) are
+/// assembled by `parse_plpgsql_stmt_list` before this is called.
 pub(crate) fn parse_plpgsql_stmt(text: &str) -> Result<PlpgsqlStmt, SqlError> {
     fn unsupported(text: &str) -> SqlError {
         SqlError {
             message: format!(
-                "unsupported statement in plpgsql body (only RETURN, RETURN NEXT, :=, FOR..LOOP, RAISE, and ANALYZE are supported): {}",
+                "unsupported statement in plpgsql body (only RETURN, RETURN NEXT, RETURN QUERY, :=, FOR..LOOP, IF, CASE, WHILE, LOOP, RAISE, SELECT INTO, DML, EXECUTE, PERFORM, GET DIAGNOSTICS, EXIT, CONTINUE, and ANALYZE are supported): {}",
                 text.chars().take(60).collect::<String>()
             ),
             code: "0A000",
         }
     }
-    // v1.96: strip leading `--` line comments (kept attached by
-    // the statement splitter).
-    let mut t = text.trim();
-    loop {
-        let s = t.trim_start();
-        if let Some(rest) = s.strip_prefix("--") {
-            match rest.find('\n') {
-                Some(i) => {
-                    t = rest[i + 1..].trim();
-                }
-                None => {
-                    t = "";
-                    break;
-                }
-            }
-        } else {
-            t = s;
-            break;
-        }
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let t = plpgsql_strip_comments(text).trim();
+    if t.is_empty() {
+        return Err(syntax("empty statement".to_string()));
     }
-    let t = t;
+    // RETURN family. A variable literally named `return` assigned
+    // with := / = is an assignment, not a RETURN (PG treats `return`
+    // as an unreserved keyword here).
     if let Some(rest) = plpgsql_strip_kw(t, "return") {
-        // v1.03: `RETURN NEXT <expr>` (SETOF functions only; placement is
-        // validated against `returns_set` in `parse_plpgsql_body`).
-        if let Some(after) = plpgsql_strip_kw(rest.trim(), "next") {
+        let r = rest.trim_start();
+        if r.starts_with(":=") || (r.starts_with('=') && !r.starts_with("==")) {
+            // fall through to the assignment path below
+        } else if r.is_empty() || r == ";" {
+            return Ok(PlpgsqlStmt::ReturnBare);
+        } else if let Some(after) = plpgsql_strip_kw(r, "next") {
+            if after.trim().is_empty() {
+                return Err(SqlError {
+                    message:
+                        "RETURN NEXT without a value is only supported for OUT-parameter functions"
+                            .to_string(),
+                    code: "0A000",
+                });
+            }
             return parse_plpgsql_return_next(after);
+        } else if let Some(after) = plpgsql_strip_kw(r, "query") {
+            let q = after.trim();
+            if let Some(e) = plpgsql_strip_kw(q, "execute") {
+                let st =
+                    parse_statement(&format!("SELECT {}", e.trim())).map_err(|_| unsupported(t))?;
+                return match st {
+                    Stmt::Select(_) => Ok(PlpgsqlStmt::ReturnQueryExecute(Box::new(st))),
+                    _ => Err(unsupported(t)),
+                };
+            }
+            let st = parse_statement(q).map_err(|_| unsupported(t))?;
+            return match st {
+                Stmt::Select(_) => Ok(PlpgsqlStmt::ReturnQuery(Box::new(st))),
+                _ => Err(unsupported(t)),
+            };
+        } else {
+            return parse_plpgsql_return(rest);
         }
-        return parse_plpgsql_return(rest);
     }
-    // v1.02: `RAISE NOTICE|EXCEPTION '<format>' [, <expr> ...]`.
+    // RAISE (all forms; bare RAISE is Reraise).
     if let Some(rest) = plpgsql_strip_kw(t, "raise") {
         return parse_plpgsql_raise(rest);
     }
-    // v1.96: `EXECUTE <expr>` dynamic SQL and `PERFORM <expr>`. The
-    // expression is stored as a parsed SELECT (like RETURN). EXECUTE
-    // with INTO/USING is outside the bounded subset.
+    // EXECUTE dynamic SQL.
     if let Some(rest) = plpgsql_strip_kw(t, "execute") {
-        let rest = rest.trim().trim_end_matches(';').trim();
-        if plpgsql_has_bare_kw(rest, "into") || plpgsql_has_bare_kw(rest, "using") {
-            return Err(unsupported(t));
-        }
-        let sel = parse_statement(&format!("SELECT {}", rest)).map_err(|_| unsupported(t))?;
-        return match sel {
-            Stmt::Select(_) => Ok(PlpgsqlStmt::Execute(sel)),
-            _ => Err(unsupported(t)),
-        };
+        return parse_plpgsql_execute(rest);
     }
+    // PERFORM: a full query, or an expression.
     if let Some(rest) = plpgsql_strip_kw(t, "perform") {
         let rest = rest.trim().trim_end_matches(';').trim();
+        let query_form = plpgsql_starts_with_kw(rest, "select")
+            || plpgsql_starts_with_kw(rest, "with")
+            || plpgsql_starts_with_kw(rest, "values")
+            || plpgsql_starts_with_kw(rest, "table")
+            || rest.starts_with('*');
+        if query_form {
+            let qtext = if let Some(x) = rest.strip_prefix('*') {
+                format!("SELECT *{}", x)
+            } else {
+                rest.to_string()
+            };
+            if let Ok(st) = parse_statement(&qtext) {
+                if matches!(st, Stmt::Select(_)) {
+                    return Ok(PlpgsqlStmt::PerformQuery(Box::new(st)));
+                }
+            }
+        }
         let sel = parse_statement(&format!("SELECT {}", rest)).map_err(|_| unsupported(t))?;
         return match sel {
             Stmt::Select(_) => Ok(PlpgsqlStmt::Perform(sel)),
             _ => Err(unsupported(t)),
         };
     }
-    // v1.96: `ASSERT <cond> [, <message>]`.
+    // ASSERT <cond> [, <message>].
     if let Some(rest) = plpgsql_strip_kw(t, "assert") {
         let rest = rest.trim().trim_end_matches(';').trim();
         let (cond_text, msg_text) = match plpgsql_top_level_comma(rest) {
@@ -5477,16 +7242,121 @@ pub(crate) fn parse_plpgsql_stmt(text: &str) -> Result<PlpgsqlStmt, SqlError> {
             _ => Err(unsupported(t)),
         };
     }
-    // v1.03: `var := <expr>` scalar assignment.
-    if plpgsql_find_assign(t).is_some() {
-        return parse_plpgsql_assign(t);
+    // GET [STACKED] DIAGNOSTICS.
+    if plpgsql_starts_with_kw(t, "get") {
+        let rest = plpgsql_strip_kw(t, "get").unwrap_or("").trim_start();
+        let (rest, stacked) = match plpgsql_strip_kw(rest, "stacked") {
+            Some(r) => (r.trim_start(), true),
+            None => (rest, false),
+        };
+        let rest = plpgsql_strip_kw(rest, "diagnostics").ok_or_else(|| unsupported(t))?;
+        let mut assigns = Vec::new();
+        for part in split_top_level_commas(rest.trim()) {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let (pos, oplen) = plpgsql_find_assign_op(part)
+                .ok_or_else(|| syntax(format!("bad GET DIAGNOSTICS item: {}", part)))?;
+            let target = parse_pl_target(part[..pos].trim())?;
+            let item_text = part[pos + oplen..].trim();
+            let (item, _) = split_ident(item_text)
+                .ok_or_else(|| syntax(format!("bad GET DIAGNOSTICS item: {}", part)))?;
+            assigns.push((target, item.to_ascii_lowercase()));
+        }
+        if assigns.is_empty() {
+            return Err(syntax("GET DIAGNOSTICS without assignments".to_string()));
+        }
+        return Ok(PlpgsqlStmt::GetDiagnostics { stacked, assigns });
     }
+    // EXIT / CONTINUE [label] [WHEN <cond>].
+    for (kw, is_exit) in [("exit", true), ("continue", false)] {
+        if let Some(rest) = plpgsql_strip_kw(t, kw) {
+            let mut r = rest.trim();
+            // Optional label: a leading identifier that is not WHEN.
+            if !r.is_empty() && !plpgsql_starts_with_kw(r, "when") {
+                if let Some((_, tail)) = split_ident(r) {
+                    r = tail.trim();
+                }
+            }
+            let when = if r.is_empty() {
+                None
+            } else if let Some(c) = plpgsql_strip_kw(r, "when") {
+                Some(Box::new(parse_plpgsql_cond(c)?))
+            } else {
+                return Err(unsupported(t));
+            };
+            return Ok(if is_exit {
+                PlpgsqlStmt::Exit { when }
+            } else {
+                PlpgsqlStmt::Continue { when }
+            });
+        }
+    }
+    // SELECT ... INTO / bare SELECT / WITH ... SELECT INTO.
+    if plpgsql_starts_with_kw(t, "select") || plpgsql_starts_with_kw(t, "with") {
+        if let Some(r) = parse_plpgsql_select_into(t) {
+            return r;
+        }
+        // No INTO: a WITH-prefixed DML, or a bare SELECT (which PG
+        // executes and then errors 42601 "query has no destination";
+        // model it as a SELECT INTO with no targets).
+        if let Some(d) = parse_plpgsql_dml(t)? {
+            return Ok(d);
+        }
+        let st = parse_statement(t).map_err(|_| unsupported(t))?;
+        return match st {
+            Stmt::Select(_) => Ok(PlpgsqlStmt::SelectInto {
+                targets: Vec::new(),
+                query: Box::new(st),
+                strict: false,
+            }),
+            _ => Err(unsupported(t)),
+        };
+    }
+    // Bare DML.
+    if plpgsql_starts_with_kw(t, "insert")
+        || plpgsql_starts_with_kw(t, "update")
+        || plpgsql_starts_with_kw(t, "delete")
+        || plpgsql_starts_with_kw(t, "merge")
+    {
+        if let Some(d) = parse_plpgsql_dml(t)? {
+            return Ok(d);
+        }
+        return Err(unsupported(t));
+    }
+    // Assignment: `target := expr` / `target = expr`.
+    if let Some((target, rhs)) = plpgsql_try_assign(t) {
+        // A statement keyword can never be an assignment target; the
+        // dispatch above has already claimed those, except utility
+        // starters (analyze/grant/...), whose next token is never an
+        // assignment operator, so this is safe.
+        let stmt = parse_statement(&format!("SELECT {}", rhs)).map_err(|e| SqlError {
+            message: format!("syntax error in assignment expression: {}", e.message),
+            code: "42601",
+        })?;
+        if !matches!(stmt, Stmt::Select(_)) {
+            return Err(syntax(
+                "assignment expression did not parse as SELECT".to_string(),
+            ));
+        }
+        return Ok(match target {
+            PlTarget::Var(var) => PlpgsqlStmt::Assign { var, select: stmt },
+            PlTarget::Field(var, field) => PlpgsqlStmt::AssignField {
+                var,
+                field,
+                select: stmt,
+            },
+            PlTarget::Param(index) => PlpgsqlStmt::AssignParam {
+                index,
+                select: stmt,
+            },
+        });
+    }
+    // Utility statements (ANALYZE, GRANT/REVOKE forms).
     let stmt = parse_statement(t).map_err(|_| unsupported(t))?;
     match stmt {
         Stmt::Analyze { .. } => Ok(PlpgsqlStmt::Utility(stmt)),
-        // v1.96: plain SQL statements a body may run for effect —
-        // GRANT/REVOKE (object and role forms) execute through the
-        // utility path in the executor.
         Stmt::Grant { .. }
         | Stmt::Revoke { .. }
         | Stmt::GrantRole { .. }
@@ -5530,55 +7400,6 @@ pub(crate) fn plpgsql_top_level_comma(text: &str) -> Option<usize> {
         }
     }
     None
-}
-
-/// v1.96: does `text` contain the bare keyword `kw` outside string
-/// literals and parentheses? (For EXECUTE's INTO/USING detection —
-/// a keyword inside a format string or a nested call is not a
-/// clause.)
-pub(crate) fn plpgsql_has_bare_kw(text: &str, kw: &str) -> bool {
-    let b = text.as_bytes();
-    let mut i = 0;
-    let mut depth = 0i32;
-    while i < b.len() {
-        match b[i] {
-            b'\'' => {
-                i += 1;
-                while i < b.len() {
-                    if b[i] == b'\'' {
-                        if i + 1 < b.len() && b[i + 1] == b'\'' {
-                            i += 2;
-                            continue;
-                        }
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            b'(' => {
-                depth += 1;
-                i += 1;
-            }
-            b')' => {
-                depth -= 1;
-                i += 1;
-            }
-            c if c.is_ascii_alphabetic() || c == b'_' => {
-                let start = i;
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
-                    i += 1;
-                }
-                if depth == 0 && text[start..i].eq_ignore_ascii_case(kw) {
-                    return true;
-                }
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-    false
 }
 
 /// v1.01: parse one WHEN condition (`name` or `SQLSTATE 'code'`,
@@ -5628,40 +7449,6 @@ pub(crate) fn parse_plpgsql_condition(p: &str) -> Result<(Vec<String>, &str), Sq
     Ok((plpgsql_condition_named(name)?, restp))
 }
 
-/// v1.01: parse one `WHEN <conditions> THEN <statement>` clause (the
-/// WHEN keyword already stripped; PG19 pl_gram.y `proc_exception`).
-/// Conditions are `cond [OR cond ...]`; each condition is a name or
-/// `SQLSTATE 'code'`.
-pub(crate) fn parse_plpgsql_when(rest: &str) -> Result<PlpgsqlHandler, SqlError> {
-    let mut sqlstates = Vec::new();
-    let mut p = rest;
-    loop {
-        let (codes, restp) = parse_plpgsql_condition(p)?;
-        sqlstates.extend(codes);
-        p = restp.trim_start();
-        if let Some(after) = plpgsql_strip_kw(p, "or") {
-            p = after;
-            continue;
-        }
-        break;
-    }
-    let after = plpgsql_strip_kw(p, "then").ok_or_else(|| SqlError {
-        message: "expected THEN in WHEN clause".to_string(),
-        code: "42601",
-    })?;
-    let stmt_text = after.trim();
-    if stmt_text.is_empty() {
-        return Err(SqlError {
-            message: "WHEN ... THEN requires a statement".to_string(),
-            code: "42601",
-        });
-    }
-    Ok(PlpgsqlHandler {
-        sqlstates,
-        stmts: vec![parse_plpgsql_stmt(stmt_text)?],
-    })
-}
-
 /// v1.01: append an implicit `RETURN NULL` unless the statement list
 /// already ends with RETURN (PG19 `add_dummy_return`, `pl_comp.c`).
 pub(crate) fn plpgsql_ensure_trailing_return(stmts: &mut Vec<PlpgsqlStmt>) -> Result<(), SqlError> {
@@ -5676,39 +7463,14 @@ pub(crate) fn plpgsql_ensure_trailing_return(stmts: &mut Vec<PlpgsqlStmt>) -> Re
     Ok(())
 }
 
-/// v1.01: push a statement onto a bounded statement list, enforcing
-/// that RETURN ends the list: at most one RETURN per list and nothing
-/// may follow it. (PG would treat a second RETURN as dead code; the
-/// bounded subset keeps that case an honest 0A000.)
-pub(crate) fn plpgsql_push_stmt(
-    stmts: &mut Vec<PlpgsqlStmt>,
-    stmt: PlpgsqlStmt,
-    ctx: &str,
-) -> Result<(), SqlError> {
-    if stmts.iter().any(|s| matches!(s, PlpgsqlStmt::Return(_))) {
-        return Err(SqlError {
-            message: format!("statement after RETURN in plpgsql {ctx}"),
-            code: "0A000",
-        });
-    }
-    stmts.push(stmt);
-    Ok(())
-}
-
-/// v1.01: parse a bounded PL/pgSQL body:
-/// `[DECLARE <decls>] BEGIN <stmts> [EXCEPTION <handlers>] END`
-/// (PG19 pl_gram.y `pl_block` / `decl_sect` / `exception_sect`; no labels).
+/// v1.01/v2.11: parse a PL/pgSQL body:
+/// `[<<label>>] [DECLARE <decls>] BEGIN <stmts> [EXCEPTION
+/// <handlers>] END [label]` (PG19 pl_gram.y `pl_block`).
 ///
-/// Each statement is `RETURN <expr>`, `RETURN NEXT <expr>` (SETOF only),
-/// `var := <expr>`, `FOR var IN <query> LOOP <stmts> END LOOP`, `RAISE`,
-/// or a supported utility statement (currently only ANALYZE); each
-/// handler is `WHEN <cond> [OR <cond> ...] THEN <statement>`, and
-/// further `;`-separated statements after the THEN belong to the same
-/// handler until the next WHEN or END.
-///
-/// `returns_set` selects the function's declared shape so RETURN /
-/// RETURN NEXT placement can be validated the way PG's validator does
-/// at CREATE time.
+/// v2.11 restructures the parse around `parse_plpgsql_block_contents`
+/// + `parse_plpgsql_stmt_list`, so the full statement grammar (IF /
+/// SELECT INTO / DML / nested blocks / loops) is available at every
+/// nesting level, not just a bounded top-level subset.
 pub fn parse_plpgsql_body(
     body: &str,
     returns_set: bool,
@@ -5722,150 +7484,55 @@ pub fn parse_plpgsql_body(
         message: msg,
         code: "42601",
     };
-    // v1.03: optional DECLARE section before BEGIN.
+    let mut text = plpgsql_strip_comments(body).trim().to_string();
+    // Optional block label `<<name>>`.
+    let mut label: Option<String> = None;
+    if text.starts_with("<<") {
+        let close = text
+            .find(">>")
+            .ok_or_else(|| syntax("unterminated block label".to_string()))?;
+        let name = text[2..close].trim().to_lowercase();
+        if name.is_empty() {
+            return Err(syntax("empty block label".to_string()));
+        }
+        label = Some(name);
+        text = text[close + 2..].trim().to_string();
+    }
+    // Optional DECLARE section before BEGIN.
     let mut decls: Vec<PlpgsqlDecl> = Vec::new();
-    let mut code = body;
-    if plpgsql_starts_with_kw(body.trim_start(), "declare") {
-        let after = plpgsql_strip_kw(body.trim_start(), "declare").unwrap_or("");
-        let bp = plpgsql_kw_positions(after, "begin")
-            .into_iter()
-            .next()
+    let mut code = text;
+    if plpgsql_starts_with_kw(&code, "declare") {
+        let after = plpgsql_strip_kw(&code, "declare").unwrap_or("");
+        let bp = plpgsql_top_level_kw(after, "begin")
             .ok_or_else(|| syntax("DECLARE section without BEGIN".to_string()))?;
         decls = parse_plpgsql_decls(after[..bp].trim())?;
-        code = after[bp..].trim_start();
+        code = after[bp..].trim().to_string();
     }
-    let mut chunks = split_plpgsql_chunks(code);
-    while chunks.last().is_some_and(|c| c.trim().is_empty()) {
-        chunks.pop();
+    if !plpgsql_starts_with_kw(&code, "begin") {
+        return Err(unsupported(format!(
+            "plpgsql body must start with BEGIN, got: {}",
+            code.chars().take(40).collect::<String>()
+        )));
     }
-    let n = chunks.len();
-    if n == 0 {
-        return Err(unsupported("empty plpgsql body".to_string()));
+    let after_begin = plpgsql_strip_kw(&code, "begin").unwrap_or("");
+    let inner = plpgsql_strip_outer_end(after_begin, label.as_deref())?;
+    let (mut stmts, mut handlers) = parse_plpgsql_block_contents(inner, &mut decls)?;
+    // v2.11: the implicit FOUND variable (PG19: a function-local
+    // bool, initially false). Appended last so user declaration
+    // indices never shift; skipped when the user declared the name.
+    if !decls.iter().any(|d| d.name == "found") {
+        decls.push(PlpgsqlDecl {
+            name: "found".to_string(),
+            type_name: "boolean".to_string(),
+            default: None,
+            alias_for: None,
+            is_cursor: false,
+            implicit: true,
+            alias_slot: None,
+        });
     }
-    // Statement texts in order: first chunk (BEGIN stripped), middle
-    // chunks, last chunk (END stripped).
-    let mut texts: Vec<String> = Vec::with_capacity(n);
-    if n == 1 {
-        let rest = plpgsql_strip_kw(chunks[0].trim(), "begin").ok_or_else(|| {
-            unsupported(format!(
-                "plpgsql body must start with BEGIN, got: {}",
-                chunks[0].trim().chars().take(40).collect::<String>()
-            ))
-        })?;
-        let inner = plpgsql_strip_end(rest)
-            .ok_or_else(|| syntax("plpgsql body must end with END".to_string()))?;
-        texts.push(inner.trim().to_string());
-    } else {
-        let rest = plpgsql_strip_kw(chunks[0].trim(), "begin").ok_or_else(|| {
-            unsupported(format!(
-                "plpgsql body must start with BEGIN, got: {}",
-                chunks[0].trim().chars().take(40).collect::<String>()
-            ))
-        })?;
-        texts.push(rest.trim().to_string());
-        for c in &chunks[1..n - 1] {
-            texts.push(c.trim().to_string());
-        }
-        let inner = plpgsql_strip_end(&chunks[n - 1])
-            .ok_or_else(|| syntax("plpgsql body must end with END".to_string()))?;
-        texts.push(inner.trim().to_string());
-    }
-    let mut stmts: Vec<PlpgsqlStmt> = Vec::new();
-    let mut handlers: Vec<PlpgsqlHandler> = Vec::new();
-    let mut cur_handler: Option<PlpgsqlHandler> = None;
-    let mut in_exception = false;
-    // v1.03: FOR..LOOP spans `;`-separated chunks, so walk by index and
-    // accumulate loop chunks until one ends with END LOOP.
-    let mut i = 0;
-    while i < texts.len() {
-        let t = texts[i].trim();
-        if !t.is_empty() && plpgsql_starts_with_kw(t, "for") {
-            let mut buf = String::new();
-            let mut j = i;
-            let mut closed = false;
-            while j < texts.len() {
-                if !buf.is_empty() {
-                    buf.push_str(";\n");
-                }
-                buf.push_str(texts[j].trim());
-                if plpgsql_ends_with_end_loop(texts[j].trim()) {
-                    closed = true;
-                    break;
-                }
-                j += 1;
-            }
-            if !closed {
-                return Err(syntax("FOR loop without END LOOP".to_string()));
-            }
-            let stmt = parse_plpgsql_for(&buf)?;
-            if in_exception {
-                let h = cur_handler
-                    .as_mut()
-                    .ok_or_else(|| syntax("expected WHEN after EXCEPTION".to_string()))?;
-                plpgsql_push_stmt(&mut h.stmts, stmt, "WHEN handler")?;
-            } else {
-                plpgsql_push_stmt(&mut stmts, stmt, "body")?;
-            }
-            i = j + 1;
-            continue;
-        }
-        if !in_exception {
-            if let Some(after) = plpgsql_strip_kw(t, "exception") {
-                in_exception = true;
-                let after = after.trim();
-                if after.is_empty() {
-                    i += 1;
-                    continue;
-                }
-                let w = plpgsql_strip_kw(after, "when")
-                    .ok_or_else(|| syntax("expected WHEN after EXCEPTION".to_string()))?;
-                cur_handler = Some(parse_plpgsql_when(w)?);
-                i += 1;
-                continue;
-            }
-            if t.is_empty() {
-                i += 1;
-                continue;
-            }
-            if plpgsql_starts_with_kw(t, "when") {
-                return Err(syntax("WHEN outside EXCEPTION section".to_string()));
-            }
-            let stmt = parse_plpgsql_stmt(t)?;
-            plpgsql_push_stmt(&mut stmts, stmt, "body")?;
-        } else {
-            if t.is_empty() {
-                i += 1;
-                continue;
-            }
-            if plpgsql_starts_with_kw(t, "exception") {
-                return Err(syntax("duplicate EXCEPTION section".to_string()));
-            }
-            if let Some(w) = plpgsql_strip_kw(t, "when") {
-                if let Some(h) = cur_handler.take() {
-                    handlers.push(h);
-                }
-                cur_handler = Some(parse_plpgsql_when(w)?);
-                i += 1;
-                continue;
-            }
-            let h = cur_handler
-                .as_mut()
-                .ok_or_else(|| syntax("expected WHEN after EXCEPTION".to_string()))?;
-            let stmt = parse_plpgsql_stmt(t)?;
-            plpgsql_push_stmt(&mut h.stmts, stmt, "WHEN handler")?;
-        }
-        i += 1;
-    }
-    if let Some(h) = cur_handler.take() {
-        handlers.push(h);
-    }
-    if in_exception && handlers.is_empty() {
-        return Err(syntax("EXCEPTION section without WHEN clause".to_string()));
-    }
-    // v1.03: validate RETURN / RETURN NEXT against the declared shape,
-    // and that every FOR variable / := target is DECLAREd.
     plpgsql_validate_returns(&stmts, &handlers, returns_set, is_void)?;
-    plpgsql_validate_vars(&decls, &stmts, &handlers)?;
+    plpgsql_validate_vars(&decls, &stmts, &handlers, label.as_deref())?;
     // v1.03: a SETOF function returns its accumulated rows; no dummy
     // RETURN is appended (PG19 `add_dummy_return` only applies to
     // scalar functions).
@@ -5879,6 +7546,7 @@ pub fn parse_plpgsql_body(
     }
     Ok(PlpgsqlBody {
         decls,
+        label,
         stmts,
         handlers,
         trailing_dummy,

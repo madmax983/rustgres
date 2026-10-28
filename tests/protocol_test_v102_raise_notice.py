@@ -217,12 +217,18 @@ end$$;""")
         r, e, n = c.q("select lvl102_warning();")
         check("raise warning: call returns + message delivered",
               r == [['1']] and n == ["x"], f"{r} {e} {n}")
+        # v2.11: DEBUG/LOG/INFO are supported too (PG19 supports
+        # every level; they behave as NOTICE-class here) — they used
+        # to be an honest 0A000.
         for level in ["debug", "log", "info"]:
             r, e, n = c.q(
                 f"create function lvl102_{level}() returns int as "
                 f"'begin raise {level} ''x''; return 1; end' language plpgsql;"
             )
-            check(f"0A000: raise {level} unsupported", e == "0A000", e)
+            check(f"raise {level}: create ok (v2.11)", e is None, e)
+            r, e, n = c.q(f"select lvl102_{level}();")
+            check(f"raise {level}: call returns + message delivered",
+                  r == [['1']] and n == ["x"], f"{r} {e} {n}")
 
         # --- CHECKPOINT + restart durability ---
         c.q("CHECKPOINT;")

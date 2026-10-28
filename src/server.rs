@@ -326,7 +326,9 @@ fn guc_saved_value(session: &Session, name: &str) -> Option<SavedGuc> {
         "bytea_output" => Some(SavedGuc::ByteaOutput(session.bytea_output)),
         "default_toast_compression" => Some(SavedGuc::Toast(session.default_toast_compression)),
         // v1.07: unmodeled GUCs live in `session.gucs`.
-        _ if is_generic_guc(name) => Some(SavedGuc::Generic(session.gucs.get(name).cloned())),
+        _ if is_generic_guc(name) || is_custom_guc(name) => {
+            Some(SavedGuc::Generic(session.gucs.get(name).cloned()))
+        }
         "default_transaction_isolation" => {
             Some(SavedGuc::DefaultTxnLevel(session.default_txn_level))
         }
@@ -359,7 +361,7 @@ fn restore_saved_guc(session: &mut Session, name: &str, saved: SavedGuc) {
             session.default_toast_compression = v;
         }
         // v1.07: unmodeled GUCs.
-        (n, SavedGuc::Generic(v)) if is_generic_guc(n) => match v {
+        (n, SavedGuc::Generic(v)) if is_generic_guc(n) || is_custom_guc(n) => match v {
             Some(s) => {
                 session.gucs.insert(n.to_string(), s);
             }
@@ -2445,14 +2447,23 @@ fn guc_value(session: &Session, name: &str) -> Option<String> {
         "session_user" => Some(session.session_user.clone()),
         "session_authorization" => Some(session.session_user.clone()),
         // v1.07: generic validated GUCs (stored value or compiled
-        // default).
-        _ if is_generic_guc(name) => Some(
-            session
-                .gucs
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| guc_default(name).to_string()),
-        ),
+        // default). v2.11: custom variable classes share the storage;
+        // their compiled default is the empty string.
+        _ if is_generic_guc(name) || is_custom_guc(name) => {
+            // v2.11: a custom name PG19 would not recognize (bad
+            // syntax, or an unknown name under the reserved plpgsql
+            // prefix) is unrecognized here too (42704 upstream).
+            if is_custom_guc(name) && !custom_guc_recognized(session, name) {
+                return None;
+            }
+            Some(session.gucs.get(name).cloned().unwrap_or_else(|| {
+                if is_custom_guc(name) {
+                    String::new()
+                } else {
+                    guc_default(name).to_string()
+                }
+            }))
+        }
         _ => None,
     }
 }
@@ -2858,6 +2869,104 @@ fn is_generic_guc(name: &str) -> bool {
     )
 }
 
+/// v2.11: a dotted name is a PG19 custom variable class
+/// (`plpgsql.extra_errors`, `myapp.flag`, ...): any such parameter
+/// exists implicitly, holds a plain string, and defaults to "".
+fn is_custom_guc(name: &str) -> bool {
+    name.contains('.')
+}
+
+/// v2.11: PG19 guc.c `valid_custom_variable_name`: two or more
+/// dot-separated simple identifiers — each component non-empty,
+/// first char [A-Za-z_] or high-bit, later chars may add [0-9$].
+fn valid_custom_guc_name(name: &str) -> bool {
+    if !name.contains('.') {
+        return false;
+    }
+    name.split('.').all(|part| {
+        !part.is_empty()
+            && part.chars().enumerate().all(|(i, c)| {
+                if i == 0 {
+                    c.is_ascii_alphabetic() || c == '_' || (c as u32) >= 0x80
+                } else {
+                    c.is_ascii_alphanumeric() || c == '_' || c == '$' || (c as u32) >= 0x80
+                }
+            })
+    })
+}
+
+/// v2.11: the real `plpgsql.*` parameters (pl_handler.c
+/// DefineCustom*Variable). The plpgsql prefix is reserved in this
+/// engine (plpgsql is compiled in, i.e. always "loaded"), so any
+/// other `plpgsql.*` name is not assignable (PG19 guc.c
+/// `assignable_custom_variable_name` reserved-prefix rule).
+fn is_known_plpgsql_guc(name: &str) -> bool {
+    matches!(
+        name,
+        "plpgsql.variable_conflict"
+            | "plpgsql.print_strict_params"
+            | "plpgsql.check_asserts"
+            | "plpgsql.extra_warnings"
+            | "plpgsql.extra_errors"
+    )
+}
+
+/// v2.11: whether a custom-class name is recognized for SHOW /
+/// RESET / current_setting: syntactically valid, and for the
+/// reserved plpgsql prefix either a real plpgsql parameter or a
+/// placeholder stored by an earlier SET.
+fn custom_guc_recognized(session: &Session, name: &str) -> bool {
+    valid_custom_guc_name(name)
+        && !(name.starts_with("plpgsql.")
+            && !is_known_plpgsql_guc(name)
+            && !session.gucs.contains_key(name))
+}
+
+/// v2.11: the SET-side rejection for a custom-class name, if any
+/// (PG19: 42602 ERRCODE_INVALID_NAME in both failure modes).
+fn custom_guc_set_error(name: &str) -> Option<ExecError> {
+    if !valid_custom_guc_name(name) {
+        return Some(ExecError {
+            detail: Some(
+                "Custom parameter names must be two or more simple identifiers separated by dots."
+                    .to_string(),
+            ),
+            code: "42602",
+            message: format!("invalid configuration parameter name \"{}\"", name),
+        });
+    }
+    if name.starts_with("plpgsql.") && !is_known_plpgsql_guc(name) {
+        return Some(ExecError {
+            detail: Some("\"plpgsql\" is a reserved prefix.".to_string()),
+            code: "42602",
+            message: format!("invalid configuration parameter name \"{}\"", name),
+        });
+    }
+    None
+}
+
+/// v2.11: the GUC transaction stack stores `&'static str` names; the
+/// known generic GUCs have static spellings via `name_to_static`,
+/// while custom-class names are interned once per distinct name
+/// (bounded by the number of distinct names a server ever sets,
+/// the same leak-once discipline as the SQLSTATE intern table).
+fn guc_stack_name(name: &str) -> &'static str {
+    if is_generic_guc(name) {
+        return name_to_static(name);
+    }
+    static NAMES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, &'static str>>,
+    > = std::sync::OnceLock::new();
+    let map = NAMES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = map.lock().unwrap();
+    if let Some(s) = guard.get(name) {
+        return s;
+    }
+    let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+    guard.insert(name.to_string(), leaked);
+    leaked
+}
+
 /// v1.07: compiled default of a generic GUC, in canonical text form
 /// (PG19 `boot_val`s).
 fn guc_default(name: &str) -> &'static str {
@@ -3075,6 +3184,11 @@ fn message_level_rank(level: &str) -> i32 {
 /// `standard_conforming_strings = off` which is 0A000 (PG19:
 /// "non-standard string literals are not supported").
 fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
+    // v2.11: custom variable classes accept any string verbatim
+    // (PG19 imposes no type check on class-placeholder parameters).
+    if is_custom_guc(name) {
+        return Ok(value.to_string());
+    }
     let invalid = || ExecError {
         detail: None,
         code: "22023",
@@ -3666,15 +3780,20 @@ fn stmt_set_guc(
         // `extra_float_digits`, `work_mem`, ...): PG19-validated and
         // stored; RESET restores the compiled default. `SET ... TO
         // DEFAULT` is a reset, like PG.
-        _ if is_generic_guc(name) => {
+        _ if is_generic_guc(name) || is_custom_guc(name) => {
+            if is_custom_guc(name) {
+                if let Some(e) = custom_guc_set_error(name) {
+                    return Err(e);
+                }
+            }
             match value {
                 SetValue::Default => {
-                    push_guc_entry(session, name_to_static(name), local);
+                    push_guc_entry(session, guc_stack_name(name), local);
                     session.gucs.remove(name);
                 }
                 SetValue::Str(s) => {
                     let canon = validate_generic_guc(name, s)?;
-                    push_guc_entry(session, name_to_static(name), local);
+                    push_guc_entry(session, guc_stack_name(name), local);
                     session.gucs.insert(name.to_string(), canon);
                 }
             }
@@ -3692,8 +3811,10 @@ fn stmt_set_guc(
             message: format!("parameter \"{}\" cannot be changed", name),
         }),
         // v1.07: generic GUCs reset to their compiled default.
-        _ if is_generic_guc(name) => {
-            push_guc_entry(session, name_to_static(name), false);
+        _ if is_generic_guc(name)
+            || (is_custom_guc(name) && custom_guc_recognized(session, name)) =>
+        {
+            push_guc_entry(session, guc_stack_name(name), false);
             session.gucs.remove(name);
             Ok(ExecResult::Command {
                 tag: "RESET".to_string(),
@@ -3850,8 +3971,10 @@ fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecE
             message: format!("parameter \"{}\" cannot be changed", name),
         }),
         // v1.07: generic GUCs reset to their compiled default.
-        _ if is_generic_guc(name) => {
-            push_guc_entry(session, name_to_static(name), false);
+        _ if is_generic_guc(name)
+            || (is_custom_guc(name) && custom_guc_recognized(session, name)) =>
+        {
+            push_guc_entry(session, guc_stack_name(name), false);
             session.gucs.remove(name);
             Ok(ExecResult::Command {
                 tag: "RESET".to_string(),

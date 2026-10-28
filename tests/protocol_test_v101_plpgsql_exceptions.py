@@ -213,7 +213,15 @@ language plpgsql volatile;""")
         check("42601: assignment needs DECLARE", e == "42601", e)
         r, e = c.q("""create function bad101b() returns int as
 'begin insert into revalidate_bug values (1); return 1; end' language plpgsql;""")
-        check("0A000: insert unsupported", e == "0A000", e)
+        # v2.11: bare DML statements run in plpgsql bodies now (the
+        # general interpreter) — this used to be an honest 0A000.
+        check("insert: create ok (v2.11)", e is None, e)
+        r, e = c.q("select bad101b();")
+        check("insert: call returns 1", r == [['1']], f"{r} {e}")
+        r, e = c.q("select c from revalidate_bug where c = 1;")
+        check("insert: row landed", r == [['1']], f"{r} {e}")
+        r, e = c.q("delete from revalidate_bug where c = 1;")
+        check("insert: cleanup for restart checks", e is None, e)
         r, e = c.q("""create function bad101c() returns int as
 'begin return 1; exception when nosuchcond then return 0; end' language plpgsql;""")
         check("42704: unknown condition", e == "42704", e)

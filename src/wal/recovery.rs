@@ -297,8 +297,13 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     ));
                 }
             };
-            let (parsed, plpgsql) =
-                crate::exec::rebuild_function_bodies(lang, arg_names, body, *returns_set);
+            let (parsed, plpgsql) = crate::exec::rebuild_function_bodies(
+                lang,
+                arg_names,
+                body,
+                *returns_set,
+                ret_type.eq_ignore_ascii_case("void"),
+            );
             // v0.87: replay appends to the overload list (replacing any
             // existing overload with the same signature).
             {

@@ -3270,12 +3270,23 @@ pub(crate) fn resolve_function_overload(
 ) -> Option<crate::storage::FuncDef> {
     let overloads = eng.db.functions.get(name)?;
     let mut arity_match: Option<&crate::storage::FuncDef> = None;
+    let mut plain_match: Option<&crate::storage::FuncDef> = None;
     for fdef in overloads {
         if fdef.arg_types.len() != arg_vals.len() {
             continue;
         }
         if arity_match.is_none() {
             arity_match = Some(fdef);
+        }
+        // v2.11: PG19 prefers a non-variadic candidate on conflict
+        // (a `variadic T[]` parameter packs the call arguments; it is
+        // only chosen when no plain candidate fits). Our variadic
+        // packing is not implemented, so in the fallback tier prefer
+        // the first candidate whose parameters are not array-typed
+        // over an array-typed one (e.g. pleast(numeric) must win over
+        // pleast(variadic numeric[]) for a scalar call).
+        if plain_match.is_none() && fdef.arg_types.iter().all(|t| !t.contains('[')) {
+            plain_match = Some(fdef);
         }
         // Prefer exact type matches.
         let exact = fdef
@@ -3290,7 +3301,7 @@ pub(crate) fn resolve_function_overload(
             return Some(fdef.clone());
         }
     }
-    arity_match.cloned()
+    plain_match.or(arity_match).cloned()
 }
 
 /// v0.87: resolve a function by (name, declared argument type names) for

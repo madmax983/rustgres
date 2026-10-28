@@ -383,13 +383,16 @@ fn plpgsql_bounded_subset() {
         ),
         "42601"
     );
-    // WHILE is still outside the subset: 0A000.
+    // v2.11: WHILE is in the general interpreter now (it was 0A000
+    // in the bounded subset).
+    run(
+        &mut eng,
+        "CREATE FUNCTION bad97w() returns int as 'begin while true loop return 1; end loop; end' language plpgsql",
+    )
+    .unwrap();
     assert_eq!(
-        err_code(
-            &mut eng,
-            "CREATE FUNCTION bad97w() returns int as 'begin while true loop return 1; end loop; end' language plpgsql"
-        ),
-        "0A000"
+        rows_of(run(&mut eng, "SELECT bad97w()").unwrap()),
+        vec![vec!["1"]]
     );
     // v1.32: unknown languages now parse (PG19 gram.y accepts any
     // language name) and fail at CREATE with 42883
@@ -543,19 +546,31 @@ fn plpgsql_exceptions() {
         ),
         "42601"
     );
+    // v2.11: statements after RETURN are legal (unreachable), as in
+    // PG — the v1.01 bounded parser rejected them with 0A000.
+    run(
+        &mut eng,
+        "CREATE FUNCTION bad101b() returns int as 'begin return 1; return 2; end' language plpgsql",
+    )
+    .unwrap();
     assert_eq!(
-        err_code(
-            &mut eng,
-            "CREATE FUNCTION bad101b() returns int as 'begin return 1; return 2; end' language plpgsql"
-        ),
-        "0A000"
+        rows_of(run(&mut eng, "SELECT bad101b()").unwrap()),
+        vec![vec!["1"]]
+    );
+    // v2.11: bare DML statements run in plpgsql bodies (the general
+    // interpreter) — the v1.01 bounded parser rejected them 0A000.
+    run(
+        &mut eng,
+        "CREATE FUNCTION bad101c() returns int as 'begin insert into t101a values (2, ''y''); return 1; end' language plpgsql",
+    )
+    .unwrap();
+    assert_eq!(
+        rows_of(run(&mut eng, "SELECT bad101c()").unwrap()),
+        vec![vec!["1"]]
     );
     assert_eq!(
-        err_code(
-            &mut eng,
-            "CREATE FUNCTION bad101c() returns int as 'begin insert into t101a values (2, ''y''); return 1; end' language plpgsql"
-        ),
-        "0A000"
+        rows_of(run(&mut eng, "SELECT count(*) FROM t101a WHERE a = 2").unwrap()),
+        vec![vec!["1"]]
     );
     // Unknown condition name is 42704; malformed RETURN is 42601.
     assert_eq!(
@@ -565,6 +580,9 @@ fn plpgsql_exceptions() {
         ),
         "42704"
     );
+    // PG19 (pl_gram.y make_return_stmt): a bare RETURN in a scalar
+    // function is a CREATE-time 42601 ("missing expression"); it is
+    // legal only in void / SETOF / OUT-param functions.
     assert_eq!(
         err_code(
             &mut eng,
