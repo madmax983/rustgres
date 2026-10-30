@@ -3514,8 +3514,15 @@ impl Parser {
         } else {
             self.next(); // ')'
         }
-        self.expect_keyword("returns")?;
-        let mut returns_set = self.eat_keyword("setof");
+        // v2.12: RETURNS may be omitted when the parameter list
+        // carries OUT/INOUT parameters (PG19 functioncmds.c: the
+        // return type is then the record of the outputs).
+        let has_out_params = args.iter().any(|a| a.mode.is_output());
+        let returns_kw = self.eat_keyword("returns");
+        if !returns_kw && !has_out_params {
+            self.expect_keyword("returns")?;
+        }
+        let mut returns_set = returns_kw && self.eat_keyword("setof");
         // v2.04: RETURNS TABLE (col type, ...) — PG models this as a
         // record-returning function whose OUT columns are the list.
         // The executor drives the call schema from the body's final
@@ -3523,7 +3530,17 @@ impl Parser {
         // the list is parsed and type-checked, then folded to
         // record + setof.
         let mut table_cols: Vec<(String, String)> = Vec::new();
-        let ret_type = if matches!(self.peek(), Token::Ident(w) if w == "table")
+        let ret_type = if !returns_kw {
+            // Omitted RETURNS with output parameters: PG19 takes
+            // the single output's type when there is exactly one
+            // output parameter, else record.
+            let outs: Vec<&FuncArg> = args.iter().filter(|a| a.mode.is_output()).collect();
+            if outs.len() == 1 {
+                outs[0].type_name.clone()
+            } else {
+                "record".to_string()
+            }
+        } else if matches!(self.peek(), Token::Ident(w) if w == "table")
             && matches!(self.peek2(), Token::LParen)
         {
             self.next(); // TABLE
@@ -3851,6 +3868,36 @@ impl Parser {
     /// names like `double precision` require an argument name, except
     /// `double precision` itself which is special-cased.)
     pub(crate) fn parse_func_arg(&mut self) -> Result<FuncArg, SqlError> {
+        // v2.12: an optional argument-mode keyword (PG19
+        // FunctionParameterMode): IN (the default), OUT, INOUT, or
+        // VARIADIC, written before the optional argument name.
+        let mut mode = crate::sql::ArgMode::In;
+        if let Token::Ident(w) = self.peek() {
+            match w.to_ascii_lowercase().as_str() {
+                "out" => {
+                    self.next();
+                    mode = crate::sql::ArgMode::Out;
+                }
+                "inout" => {
+                    self.next();
+                    mode = crate::sql::ArgMode::Inout;
+                }
+                "variadic" => {
+                    self.next();
+                    mode = crate::sql::ArgMode::Variadic;
+                }
+                "in" => {
+                    // `IN` is consumed as a mode only when another
+                    // identifier (the name or the type) follows; a
+                    // lone `in` cannot start a type in this grammar,
+                    // so consuming unconditionally is safe here except
+                    // for a bare type literally named "in", which PG
+                    // also reserves in this position.
+                    self.next();
+                }
+                _ => {}
+            }
+        }
         let w1 = self.expect_ident()?;
         // v2.04: a bare array type (`text[]` with no arg name, as in
         // DROP FUNCTION f(text[], text)) — the `[` suffix belongs to
@@ -3878,6 +3925,7 @@ impl Parser {
                 name: None,
                 type_name,
                 default: None,
+                mode,
             }
         } else {
             let type_name = self.parse_func_type_name()?;
@@ -3885,6 +3933,7 @@ impl Parser {
                 name: Some(w1),
                 type_name,
                 default: None,
+                mode,
             }
         };
         // v1.96: arg DEFAULT expr / `= expr` — parsed and carried so
@@ -3947,14 +3996,30 @@ impl Parser {
         };
         let name = self.expect_qualified_ident()?;
         let mut arg_types = Vec::new();
+        let mut arg_modes: Vec<u8> = Vec::new();
         let mut args_omitted = true;
         if *self.peek() == Token::LParen {
             args_omitted = false;
             self.next();
             if *self.peek() != Token::RParen {
                 loop {
+                    // v2.12 finishing: record whether a mode keyword
+                    // was written (and which), for PG19's DROP
+                    // matching (modeless entries are wildcards);
+                    // parse_func_arg itself defaults mode to IN.
+                    let mode_code = match self.peek() {
+                        Token::Ident(w) => match w.to_ascii_lowercase().as_str() {
+                            "in" => Some(crate::sql::ArgMode::In.code()),
+                            "out" => Some(crate::sql::ArgMode::Out.code()),
+                            "inout" => Some(crate::sql::ArgMode::Inout.code()),
+                            "variadic" => Some(crate::sql::ArgMode::Variadic.code()),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
                     let arg = self.parse_func_arg()?;
                     arg_types.push(arg.type_name);
+                    arg_modes.push(mode_code.unwrap_or(u8::MAX));
                     match self.next() {
                         Token::Comma => continue,
                         Token::RParen => break,
@@ -3980,6 +4045,7 @@ impl Parser {
         Ok(Stmt::DropFunction {
             name,
             arg_types,
+            arg_modes,
             if_exists,
             cascade,
             procedure,

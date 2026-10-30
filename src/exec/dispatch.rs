@@ -432,6 +432,7 @@ pub(crate) fn execute_inner(
         Stmt::DropFunction {
             name,
             arg_types,
+            arg_modes,
             if_exists,
             cascade,
             procedure,
@@ -442,6 +443,7 @@ pub(crate) fn execute_inner(
             ctx,
             name,
             arg_types,
+            arg_modes,
             *if_exists,
             *cascade,
             *procedure,

@@ -172,6 +172,11 @@ pub(crate) fn resolve_func_type_name(
     if name.eq_ignore_ascii_case("cstring") {
         return Ok(ColType::Composite);
     }
+    // v2.12: `refcursor` is a portal name held as text (PG19: the
+    // refcursor type's base representation is a CString name).
+    if name.eq_ignore_ascii_case("refcursor") {
+        return Ok(ColType::Text);
+    }
     // v1.96: `void` is PG19's return type for procedures and
     // no-result functions. It resolves to the defer-triggering
     // Composite placeholder like shell types: FuncDef keeps the
@@ -891,6 +896,69 @@ pub(crate) fn substitute_func_params(
 /// OR REPLACE was given.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
+/// v2.12 finishing (PG19 pl_gram.y getdiag_target): a GET
+/// DIAGNOSTICS assignment target must be a scalar variable; a
+/// record/composite-typed variable (DTYPE_REC / DTYPE_ROW in PG)
+/// is a CREATE-time syntax error. `rec_names` holds the variable
+/// and argument names the caller resolved to record/composite
+/// types. Targets may be label-qualified (`outer.x`) or fielded
+/// (`r.f`); either end segment naming a record variable fires.
+fn check_getdiag_targets(
+    stmts: &[crate::sql::PlpgsqlStmt],
+    handlers: &[crate::sql::PlpgsqlHandler],
+    rec_names: &[String],
+) -> Result<(), ExecError> {
+    for s in stmts {
+        match s {
+            crate::sql::PlpgsqlStmt::GetDiagnostics { assigns, .. } => {
+                for (t, _) in assigns {
+                    // Only a whole-variable target can be a record;
+                    // a field target (`rec.field`) denotes a scalar
+                    // field datum in PG19 and stays legal.
+                    if let crate::sql::PlTarget::Var(name) = t {
+                        if rec_names.iter().any(|n| n == name) {
+                            return Err(exec_err(
+                                "42601",
+                                format!("\"{}\" is not a scalar variable", name),
+                            ));
+                        }
+                    }
+                }
+            }
+            crate::sql::PlpgsqlStmt::If {
+                branches,
+                else_body,
+            }
+            | crate::sql::PlpgsqlStmt::Case {
+                branches,
+                else_body,
+            } => {
+                for (_, b) in branches {
+                    check_getdiag_targets(b, &[], rec_names)?;
+                }
+                check_getdiag_targets(else_body, &[], rec_names)?;
+            }
+            crate::sql::PlpgsqlStmt::ForQuery { body, .. }
+            | crate::sql::PlpgsqlStmt::ForRange { body, .. }
+            | crate::sql::PlpgsqlStmt::ForCursor { body, .. }
+            | crate::sql::PlpgsqlStmt::While { body, .. }
+            | crate::sql::PlpgsqlStmt::Loop { body } => {
+                check_getdiag_targets(body, &[], rec_names)?;
+            }
+            crate::sql::PlpgsqlStmt::Block {
+                stmts, handlers, ..
+            } => {
+                check_getdiag_targets(stmts, handlers, rec_names)?;
+            }
+            _ => {}
+        }
+    }
+    for h in handlers {
+        check_getdiag_targets(&h.stmts, &[], rec_names)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn exec_create_function(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -910,16 +978,35 @@ pub(crate) fn exec_create_function(
     // v1.32: PG19 resolves the language first (before return-type
     // resolution): unknown LANGUAGE is 42883, not a parse error.
     let lang = resolve_func_lang(lang_name)?;
+    // v2.12: PG19 VARIADIC rules (functioncmds.c): a VARIADIC
+    // parameter must be the last input parameter and its declared
+    // type must be an array type.
+    for (i, a) in args.iter().enumerate() {
+        if a.mode == crate::sql::ArgMode::Variadic {
+            if args[i + 1..].iter().any(|x| x.mode.is_input()) {
+                return Err(exec_err(
+                    "42P13",
+                    "VARIADIC parameter must be the last input parameter".to_string(),
+                ));
+            }
+            let t = canon_func_type_name(&a.type_name);
+            if !(t.ends_with("[]") || t == "anyarray") {
+                return Err(exec_err(
+                    "42P13",
+                    "VARIADIC parameter must be an array".to_string(),
+                ));
+            }
+        }
+    }
     // v1.96 finishing pass: PG19 parameter-default rules
     // (functioncmds.c): only input parameters may have defaults,
     // and once an input parameter has one, every later input
-    // parameter must have one too. This engine's parser does not
-    // model arg modes — a leading OUT keyword lands in the arg
-    // NAME slot — so OUT detection uses that shape.
+    // parameter must have one too. v2.12: arg modes are parsed, so
+    // OUT detection uses the real mode.
     {
         let mut seen_default = false;
         for a in args {
-            let is_out = a.name.as_deref() == Some("out");
+            let is_out = a.mode == crate::sql::ArgMode::Out;
             if is_out && a.default.is_some() {
                 return Err(exec_err(
                     "42P13",
@@ -936,6 +1023,76 @@ pub(crate) fn exec_create_function(
                     "42P13",
                     "input parameters after one with a default value must also have defaults"
                         .to_string(),
+                ));
+            }
+        }
+    }
+    // v2.12 finishing: PG19 duplicate parameter names
+    // (functioncmds.c interpret_function_parameter_list): a name may
+    // be shared by a pure-IN/VARIADIC parameter and a pure-OUT/TABLE
+    // parameter ("pure in doesn't conflict with pure out"); any
+    // other repetition — including INOUT against anything — is
+    // 42P13.
+    {
+        // class: 0 = in-only (IN/VARIADIC), 1 = out-only (OUT /
+        // RETURNS TABLE column), 2 = both (INOUT).
+        let mut named: Vec<(&str, u8)> = Vec::new();
+        for a in args {
+            if let Some(n) = a.name.as_deref() {
+                let cls = match a.mode {
+                    crate::sql::ArgMode::In | crate::sql::ArgMode::Variadic => 0,
+                    crate::sql::ArgMode::Out => 1,
+                    crate::sql::ArgMode::Inout => 2,
+                };
+                named.push((n, cls));
+            }
+        }
+        for (n, _) in table_cols {
+            named.push((n.as_str(), 1));
+        }
+        for i in 0..named.len() {
+            for j in i + 1..named.len() {
+                if named[i].0 == named[j].0 {
+                    let (x, y) = (named[i].1, named[j].1);
+                    if (x == 0 && y == 1) || (x == 1 && y == 0) {
+                        continue;
+                    }
+                    return Err(exec_err(
+                        "42P13",
+                        format!("parameter name \"{}\" used more than once", named[i].0),
+                    ));
+                }
+            }
+        }
+    }
+    // v2.12 finishing: PG19 RETURNS-vs-OUT consistency
+    // (functioncmds.c: prorettype must equal requiredResultType —
+    // the single output's type, or RECORD for several outputs).
+    // An omitted RETURNS was already synthesized by the parser to
+    // exactly that type, so this only fires on an explicit clause.
+    // RETURNS TABLE defines its own outputs; skip it.
+    if !procedure && table_cols.is_empty() {
+        let outs: Vec<&str> = args
+            .iter()
+            .filter(|a| a.mode.is_output())
+            .map(|a| a.type_name.as_str())
+            .collect();
+        if !outs.is_empty() && !ret_type.is_empty() {
+            let rt = canon_func_type_name(ret_type);
+            if outs.len() == 1 {
+                if rt != canon_func_type_name(outs[0]) {
+                    return Err(exec_err(
+                        "42P13",
+                        format!(
+                            "function result type must be {} because of OUT parameters",
+                            canon_func_type_name(outs[0])
+                        ),
+                    ));
+                }
+            } else if rt != "record" {
+                return Err(exec_err(
+                    "42P13",
+                    "function result type must be record because of OUT parameters".to_string(),
                 ));
             }
         }
@@ -1004,7 +1161,9 @@ pub(crate) fn exec_create_function(
     // functions; only the void-RETURN error is fatal here (other
     // parse gaps belong to the desugar path's subset).
     if lang == crate::sql::FuncLang::Plpgsql && ret_type.eq_ignore_ascii_case("void") {
-        if let Err(e) = crate::sql::parse_plpgsql_body(body, returns_set, true) {
+        if let Err(e) =
+            crate::sql::parse_plpgsql_body(body, returns_set, true, false, &func_arg_names(args))
+        {
             if e.message.contains("RETURN cannot have a parameter") {
                 return Err(exec_err(e.code, format!("plpgsql: {}", e.message)));
             }
@@ -1018,7 +1177,13 @@ pub(crate) fn exec_create_function(
         // v1.03: SETOF bodies skip the v0.97 single-RETURN desugar so a
         // bare RETURN is honestly rejected (42601) instead of silently
         // becoming a SQL SELECT body.
-        let desugared = if returns_set {
+        // v2.12 finishing: bodies of functions WITH output parameters
+        // skip it too — the desugar would bypass the plpgsql grammar
+        // validation entirely (e.g. `RETURN expr` in an OUT function
+        // must error "RETURN cannot have a parameter in function
+        // with OUT parameters", which only parse_plpgsql_body knows).
+        let has_out_pre = !table_cols.is_empty() || args.iter().any(|a| a.mode.is_output());
+        let desugared = if returns_set || has_out_pre {
             None
         } else {
             crate::sql::desugar_plpgsql_body(body).ok()
@@ -1029,10 +1194,20 @@ pub(crate) fn exec_create_function(
                 &owned_body
             }
             None => {
+                // v2.12: output parameters (OUT/INOUT args or
+                // RETURNS TABLE columns) make bare RETURN / bare
+                // RETURN NEXT legal shapes.
+                let has_out = !table_cols.is_empty() || args.iter().any(|a| a.mode.is_output());
+                // v2.12: RETURNS TABLE column names are visible in
+                // the body exactly like argument names.
+                let mut vis_names = func_arg_names(args);
+                vis_names.extend(table_cols.iter().map(|(n, _)| n.clone()));
                 let mut pb = crate::sql::parse_plpgsql_body(
                     body,
                     returns_set,
                     ret_type.eq_ignore_ascii_case("void"),
+                    has_out,
+                    &vis_names,
                 )
                 .map_err(|e| exec_err(e.code, format!("plpgsql: {}", e.message)))?;
                 // v1.03: resolve DECLAREd variable types now (like PG's
@@ -1068,28 +1243,56 @@ pub(crate) fn exec_create_function(
                     resolve_func_type_name(eng, ctx.snap, ctx.own, ctx.session, &d.type_name)
                         .map_err(|e| exec_err(e.code, format!("plpgsql: {}", e.message)))?;
                 }
-                // v1.03: a variable name colliding with an argument name
-                // is ambiguous - reject (PG: the variable would shadow
-                // the argument, which the bounded subset forbids).
-                // v2.11: ALIAS and implicit (FOR-loop / FOUND) decls are
-                // exempt: an alias BY DEFINITION names an argument, and
-                // an implicit loop variable matching an argument name
-                // resolves to the argument in the rewrite map.
-                for d in &pb.decls {
-                    if d.alias_for.is_some() || d.implicit {
-                        continue;
+                // v2.12 finishing: GET DIAGNOSTICS targets must be
+                // scalar variables (PG19 pl_gram.y getdiag_target).
+                // Record-typed names: arguments or declarations
+                // whose type resolves to a composite/record, plus
+                // `record` and %ROWTYPE declarations (the fx case in
+                // plpgsql.sql: an argument of a composite type).
+                {
+                    let mut rec_names: Vec<String> = Vec::new();
+                    for a in args {
+                        if let Some(n) = &a.name {
+                            if let Ok(ct) = resolve_func_type_name(
+                                eng,
+                                ctx.snap,
+                                ctx.own,
+                                ctx.session,
+                                &a.type_name,
+                            ) {
+                                if matches!(ct, ColType::Composite | ColType::Record) {
+                                    rec_names.push(n.clone());
+                                }
+                            }
+                        }
                     }
-                    if args
-                        .iter()
-                        .any(|a| a.name.as_deref() == Some(d.name.as_str()))
-                    {
-                        return Err(exec_err(
-                            "42601",
-                            format!("plpgsql: variable \"{}\" is already defined", d.name),
-                        ));
+                    for d in &pb.decls {
+                        let tn = d.type_name.as_str();
+                        let is_rec = tn.eq_ignore_ascii_case("record")
+                            || tn.to_ascii_uppercase().contains("%ROWTYPE")
+                            || matches!(
+                                resolve_func_type_name(eng, ctx.snap, ctx.own, ctx.session, tn),
+                                Ok(ColType::Composite | ColType::Record)
+                            );
+                        if is_rec {
+                            rec_names.push(d.name.clone());
+                        }
+                    }
+                    if !rec_names.is_empty() {
+                        check_getdiag_targets(&pb.stmts, &pb.handlers, &rec_names)?;
                     }
                 }
+                // v2.12: a variable name colliding with an argument
+                // name is NOT an error — PG19 allows the declaration
+                // to shadow the argument (with an extra_warnings
+                // notice this engine does not emit); the rewrite map
+                // gives the declaration the name in its block. (The
+                // v1.03/v2.11 rejection broke use_refcursor,
+                // shadowtest, and pl_qual_names, all of which PG
+                // creates successfully.)
                 let arg_names: Vec<Option<String>> = args.iter().map(|a| a.name.clone()).collect();
+                let arg_modes: Vec<u8> = args.iter().map(|a| a.mode.code()).collect();
+                inject_plpgsql_arg_vars(&mut pb, &arg_names, &arg_modes, table_cols);
                 rewrite_plpgsql_body_refs(&mut pb, &arg_names);
                 plpgsql_body = Some(pb);
                 body
@@ -1133,8 +1336,37 @@ pub(crate) fn exec_create_function(
     }
     // v0.87: overload-aware CREATE. `prev` is the specific overload
     // being replaced (by signature), if any.
+    // v2.12: the signature is the INPUT argument types (PG19
+    // proargtypes); find_function_by_signature also accepts a full
+    // type list for legacy callers.
     let new_arg_types: Vec<String> = args.iter().map(|a| a.type_name.clone()).collect();
-    let prev = find_function_by_signature(eng, name, &new_arg_types);
+    let new_input_types: Vec<String> = args
+        .iter()
+        .filter(|a| a.mode.is_input())
+        .map(|a| a.type_name.clone())
+        .collect();
+    // v2.12 finishing: CREATE / CREATE OR REPLACE identity is the
+    // INPUT argument list alone (PG19 proargtypes). The shared
+    // finder's full-list fallback must NOT fire here: a routine
+    // whose inputs are (int,int) does not block creating one whose
+    // inputs are (int,int,int) merely because the first routine's
+    // full list (OUT included) also has three entries (the ptest10
+    // pair in create_procedure.sql).
+    let prev = eng
+        .db
+        .functions
+        .get(name)
+        .and_then(|overloads| {
+            overloads.iter().find(|f| {
+                let ins = f.input_arg_types();
+                ins.len() == new_input_types.len()
+                    && ins
+                        .iter()
+                        .zip(new_input_types.iter())
+                        .all(|(a, b)| canon_func_type_name(a) == canon_func_type_name(b))
+            })
+        })
+        .cloned();
     if prev.is_some() && !or_replace {
         // v1.32: PG-verbatim message (pg_proc.c ProcedureCreate).
         return Err(exec_err(
@@ -1174,6 +1406,9 @@ pub(crate) fn exec_create_function(
         security_definer,
         is_procedure: procedure,
         table_cols: table_cols.to_vec(),
+        // v2.12: argument modes (IN/OUT/INOUT/VARIADIC), parallel
+        // to arg_types.
+        arg_modes: args.iter().map(|a| a.mode.code()).collect(),
     };
     // v1.96: record the function owner (DROP FUNCTION / GRANT checks).
     {
@@ -1275,6 +1510,7 @@ pub(crate) fn exec_drop_function(
     ctx: &mut StmtCtx,
     name: &str,
     arg_types: &[String],
+    arg_modes: &[u8],
     if_exists: bool,
     cascade: bool,
     procedure: bool,
@@ -1308,8 +1544,72 @@ pub(crate) fn exec_drop_function(
                 ));
             }
         }
-    } else {
+    } else if arg_modes.is_empty() {
+        // Internal callers (roles.rs dependency cascades) pass a
+        // stored def's full type list without mode information:
+        // keep the legacy single-match lookup for them.
         find_function_by_signature(eng, name, arg_types)
+    } else {
+        // v2.12 finishing (PG19 LookupFuncName as used by DROP):
+        // the written list is matched BOTH as the input-argument
+        // list and as the full argument list (OUT included); a
+        // written mode must match the stored mode, a modeless entry
+        // (u8::MAX) is a wildcard. The union of both interpretations
+        // must name exactly one routine — e.g. with ptest10
+        // (OUT int,int,int) and (IN int,int,int) both present, the
+        // bare list (int,int,int) matches one by inputs and both by
+        // full list, so PG19 reports the name not unique (42725);
+        // (out int,int,int) matches only the first.
+        let overloads = eng.db.functions.get(name).cloned().unwrap_or_default();
+        let mut cands: Vec<crate::storage::FuncDef> = Vec::new();
+        for f in &overloads {
+            let types_eq = |stored: &[String]| {
+                stored.len() == arg_types.len()
+                    && stored
+                        .iter()
+                        .zip(arg_types.iter())
+                        .all(|(a, b)| canon_func_type_name(a) == canon_func_type_name(b))
+            };
+            let mut matched = false;
+            if types_eq(&f.arg_types) {
+                matched = arg_modes
+                    .iter()
+                    .zip(f.arg_modes.iter())
+                    .all(|(g, s)| *g == u8::MAX || g == s);
+            }
+            if !matched {
+                let ins = f.input_arg_types();
+                if types_eq(&ins) {
+                    let in_modes: Vec<u8> = f
+                        .arg_modes
+                        .iter()
+                        .copied()
+                        .filter(|m| crate::sql::ArgMode::from_code(*m).is_input())
+                        .collect();
+                    matched = arg_modes
+                        .iter()
+                        .zip(in_modes.iter())
+                        .all(|(g, s)| *g == u8::MAX || g == s);
+                }
+            }
+            if matched {
+                cands.push(f.clone());
+            }
+        }
+        match cands.len() {
+            0 => None,
+            1 => Some(cands.into_iter().next().unwrap()),
+            _ => {
+                return Err(exec_err(
+                    "42725",
+                    format!(
+                        "{} name \"{}\" is not unique; specify the argument list to identify the routine to drop",
+                        if procedure { "procedure" } else { "function" },
+                        name
+                    ),
+                ));
+            }
+        }
     };
     let Some(dropped) = prev else {
         if !if_exists {
@@ -1422,8 +1722,15 @@ pub(crate) fn exec_drop_function(
             .functions
             .get_mut(name)
             .expect("overload found above");
+        // v2.12 finishing: the removal key is the full identity —
+        // types AND modes AND kind. Keying on types alone deleted
+        // every same-full-types overload: the ptest10 pair
+        // (OUT int,int,int) / (IN int,int,int) share the type list
+        // (int,int,int), so dropping one dropped both.
         overloads.retain(|f| {
-            !(f.arg_types.len() == dropped.arg_types.len()
+            !(f.is_procedure == dropped.is_procedure
+                && f.arg_modes == dropped.arg_modes
+                && f.arg_types.len() == dropped.arg_types.len()
                 && f.arg_types
                     .iter()
                     .zip(dropped.arg_types.iter())
@@ -1553,7 +1860,7 @@ pub(crate) fn exec_do_block(
     ctx: &mut StmtCtx,
     body: &str,
 ) -> Result<ExecResult, ExecError> {
-    let mut pb = crate::sql::parse_plpgsql_body(body, false, true).map_err(sql_err)?;
+    let mut pb = crate::sql::parse_plpgsql_body(body, false, true, false, &[]).map_err(sql_err)?;
     // v2.11: DO blocks get the same name rewrite as function bodies
     // (no arguments; declared variables become $N slots).
     rewrite_plpgsql_body_refs(&mut pb, &[]);
@@ -2856,6 +3163,15 @@ pub(crate) fn rewrite_plpgsql_body_refs(
     // as the walk enters them.
     let mut label_scopes: LabelScopes = HashMap::new();
 
+    // v2.12: substitute a cursor variable's name with its `$n` slot
+    // form when the rewrite map knows it; unresolved names (dynamic
+    // cases) pass through for the executor's name lookup.
+    fn cursor_var_to_slot(var: &mut String, map: &HashMap<String, u32>) {
+        if let Some(slot) = map.get(var.as_str()) {
+            *var = format!("${}", slot);
+        }
+    }
+
     // Resolve one decl into `map` (first definition wins unless this
     // is a block-scope insert, handled by callers cloning the map).
     fn decl_slot(
@@ -2887,10 +3203,32 @@ pub(crate) fn rewrite_plpgsql_body_refs(
     }
     // Declaration defaults: rewrite each with the progressive map,
     // then fold the decl into both maps.
+    // v2.12: a non-implicit, non-alias declaration whose name matches
+    // an ARGUMENT shadows it (PG19): the first such declaration
+    // replaces the argument's entry in both maps. Later declarations
+    // with the same name (nested blocks) keep first-wins — the block
+    // walk clones its own map for those.
+    let arg_name_set: std::collections::HashSet<&str> =
+        arg_names.iter().flatten().map(|s| s.as_str()).collect();
+    let mut shadowed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let ndecls = pb.decls.len();
     let mut progressive = base.clone();
     for (idx, d) in pb.decls.iter_mut().enumerate() {
         if let Some(def) = &mut d.default {
             rewrite_stmt_map(def, &progressive, &label_scopes);
+        }
+        // v2.12: rewrite a bound cursor's query with its parameter
+        // names mapped to the extra slots past the decl vector
+        // (slot = nargs + total_decls + param_idx + 1); cursor
+        // parameters shadow same-named arguments inside the query.
+        if d.is_cursor {
+            if let Some(q) = &mut d.cursor_query {
+                let mut cmap = progressive.clone();
+                for (j, (pn, _)) in d.cursor_params.iter().enumerate() {
+                    cmap.insert(pn.clone(), (nargs + ndecls + j + 1) as u32);
+                }
+                rewrite_stmt_map(q, &cmap, &label_scopes);
+            }
         }
         let slot = decl_slot(d, idx, nargs, &progressive);
         if d.alias_for.is_some() {
@@ -2903,6 +3241,14 @@ pub(crate) fn rewrite_plpgsql_body_refs(
                 // An implicit FOR variable named like an argument:
                 // the argument keeps the name (PG resolves the loop
                 // variable to the argument in that case).
+            } else if !d.implicit
+                && d.alias_for.is_none()
+                && arg_name_set.contains(d.name.as_str())
+                && !shadowed.contains(&d.name)
+            {
+                base.insert(d.name.clone(), slot);
+                progressive.insert(d.name.clone(), slot);
+                shadowed.insert(d.name.clone());
             } else {
                 base.entry(d.name.clone()).or_insert(slot);
             }
@@ -2958,8 +3304,61 @@ pub(crate) fn rewrite_plpgsql_body_refs(
             P::Return(sel) | P::ReturnNext(sel) | P::Perform(sel) => {
                 rewrite_stmt_map(sel, map, &*labels);
             }
-            P::ReturnQuery(sel) | P::ReturnQueryExecute(sel) => {
+            P::ReturnNextBare => {}
+            P::ReturnQuery(sel) => {
                 rewrite_stmt_map(sel.as_mut(), map, &*labels);
+            }
+            P::ReturnQueryExecute { expr, using } => {
+                rewrite_stmt_map(expr, map, &*labels);
+                for u in using {
+                    rewrite_stmt_map(u, map, &*labels);
+                }
+            }
+            // v2.12: cursor statements — the cursor VARIABLE resolves
+            // to its `$n` slot form when the name is known (declared
+            // cursor, refcursor variable, or argument); embedded
+            // expressions rewrite normally.
+            P::OpenBound { var, args } => {
+                cursor_var_to_slot(var, map);
+                for (_, a) in args {
+                    rewrite_stmt_map(a, map, &*labels);
+                }
+            }
+            P::OpenFor {
+                var,
+                query,
+                dynamic,
+                using,
+                ..
+            } => {
+                cursor_var_to_slot(var, map);
+                if let Some(q) = query {
+                    rewrite_stmt_map(q.as_mut(), map, &*labels);
+                }
+                if let Some(d) = dynamic {
+                    rewrite_stmt_map(d, map, &*labels);
+                }
+                for u in using {
+                    rewrite_stmt_map(u, map, &*labels);
+                }
+            }
+            P::Fetch { var, count, .. } | P::Move { var, count, .. } => {
+                cursor_var_to_slot(var, map);
+                if let Some(c) = count {
+                    rewrite_stmt_map(c, map, &*labels);
+                }
+            }
+            P::Close { var } => {
+                cursor_var_to_slot(var, map);
+            }
+            P::ForCursor {
+                cursor, args, body, ..
+            } => {
+                cursor_var_to_slot(cursor, map);
+                for (_, a) in args {
+                    rewrite_stmt_map(a, map, &*labels);
+                }
+                walk(body, map, labels, pb_decls, nargs);
             }
             P::Assign { select, .. }
             | P::AssignField { select, .. }
@@ -3104,6 +3503,67 @@ pub(crate) fn rewrite_plpgsql_body_refs(
     }
 }
 
+/// v2.12: make a plpgsql body's named arguments and RETURNS TABLE
+/// columns addressable as variables. Named arguments become implicit
+/// ALIAS declarations pointing at their own parameter slot (so
+/// `j := ...` on an OUT/INOUT argument, and assignments to IN
+/// arguments, resolve through the ordinary decl machinery); RETURNS
+/// TABLE columns become implicit plain declarations (their slots
+/// are ordinary decl slots, initialized NULL). A name the body
+/// already DECLAREs is left alone — the declaration shadows the
+/// argument (PG19 shadowing rules; shadowtest / pl_qual_names).
+pub(crate) fn inject_plpgsql_arg_vars(
+    pb: &mut crate::sql::PlpgsqlBody,
+    arg_names: &[Option<String>],
+    arg_modes: &[u8],
+    table_cols: &[(String, String)],
+) {
+    let _ = arg_modes;
+    for (i, n) in arg_names.iter().enumerate() {
+        let Some(name) = n else { continue };
+        if pb.decls.iter().any(|d| &d.name == name) {
+            continue;
+        }
+        pb.decls.push(crate::sql::PlpgsqlDecl {
+            name: name.clone(),
+            type_name: String::new(),
+            default: None,
+            alias_for: Some(name.clone()),
+            is_cursor: false,
+            implicit: true,
+            alias_slot: Some((i + 1) as u32),
+            cursor_query: None,
+            cursor_params: Vec::new(),
+            cursor_scroll: None,
+            is_constant: false,
+        });
+    }
+    for (cn, ct) in table_cols {
+        if pb.decls.iter().any(|d| &d.name == cn) {
+            continue;
+        }
+        pb.decls.push(crate::sql::PlpgsqlDecl {
+            name: cn.clone(),
+            type_name: ct.clone(),
+            default: None,
+            alias_for: None,
+            is_cursor: false,
+            implicit: true,
+            alias_slot: None,
+            cursor_query: None,
+            cursor_params: Vec::new(),
+            cursor_scroll: None,
+            is_constant: false,
+        });
+    }
+}
+
+/// v2.12: the declared argument names of a CREATE FUNCTION arg
+/// list (for plpgsql name validation).
+pub(crate) fn func_arg_names(args: &[crate::sql::FuncArg]) -> Vec<String> {
+    args.iter().filter_map(|a| a.name.clone()).collect()
+}
+
 /// v1.01: rebuild a function's parsed bodies from stored body text
 /// (WAL replay / checkpoint restore). For plpgsql the multi-statement
 /// form (original source) is tried first; the v0.97 single-RETURN form
@@ -3115,20 +3575,40 @@ pub(crate) fn rewrite_plpgsql_body_refs(
 pub(crate) fn rebuild_function_bodies(
     lang: crate::sql::FuncLang,
     arg_names: &[Option<String>],
+    arg_modes: &[u8],
     body: &str,
     returns_set: bool,
     is_void: bool,
+    table_cols: &[(String, String)],
 ) -> (Option<Vec<Stmt>>, Option<crate::sql::PlpgsqlBody>) {
     if lang == crate::sql::FuncLang::Plpgsql {
         // v1.03: SETOF bodies skip the single-RETURN desugar exactly as
         // CREATE does (see exec_create_function).
-        let desugared = if returns_set {
+        // v2.12 finishing: output-parameter bodies skip it too (see
+        // exec_create_function for the validation-bypass rationale).
+        let has_out_pre = !table_cols.is_empty()
+            || arg_modes
+                .iter()
+                .any(|m| crate::sql::ArgMode::from_code(*m).is_output());
+        let desugared = if returns_set || has_out_pre {
             None
         } else {
             crate::sql::desugar_plpgsql_body(body).ok()
         };
         if desugared.is_none() {
-            if let Ok(mut pb) = crate::sql::parse_plpgsql_body(body, returns_set, is_void) {
+            let has_out = !table_cols.is_empty()
+                || arg_modes
+                    .iter()
+                    .any(|m| crate::sql::ArgMode::from_code(*m).is_output());
+            let rebuild_arg_names: Vec<String> = arg_names.iter().flatten().cloned().collect();
+            if let Ok(mut pb) = crate::sql::parse_plpgsql_body(
+                body,
+                returns_set,
+                is_void,
+                has_out,
+                &rebuild_arg_names,
+            ) {
+                inject_plpgsql_arg_vars(&mut pb, arg_names, arg_modes, table_cols);
                 rewrite_plpgsql_body_refs(&mut pb, arg_names);
                 return (None, Some(pb));
             }

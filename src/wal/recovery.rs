@@ -275,6 +275,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             security_definer,
             is_procedure,
             table_cols,
+            arg_modes,
             xmin,
         } => {
             if *xmin >= eng.txns.next_xid {
@@ -300,9 +301,11 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             let (parsed, plpgsql) = crate::exec::rebuild_function_bodies(
                 lang,
                 arg_names,
+                arg_modes,
                 body,
                 *returns_set,
                 ret_type.eq_ignore_ascii_case("void"),
+                table_cols,
             );
             // v0.87: replay appends to the overload list (replacing any
             // existing overload with the same signature).
@@ -323,6 +326,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     security_definer: *security_definer,
                     is_procedure: *is_procedure,
                     table_cols: table_cols.clone(),
+                    arg_modes: arg_modes.clone(),
                 };
                 let overloads = eng.db.functions.entry(name.clone()).or_default();
                 if let Some(slot) = overloads.iter_mut().find(|f| f.arg_types == def.arg_types) {
@@ -335,14 +339,25 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
         WalRecord::DropFunction {
             name,
             arg_types,
+            arg_modes,
             xmax,
         } => {
             if *xmax >= eng.txns.next_xid {
                 eng.txns.next_xid = *xmax + 1;
             }
             // v0.87: remove the specific overload by signature.
+            // v2.12 finishing (RGSWAL32): when the record carries
+            // modes, the key is types AND modes (two overloads can
+            // share the full type list and differ only in modes);
+            // pre-32 records keep the types-only key.
             if let Some(overloads) = eng.db.functions.get_mut(name) {
-                overloads.retain(|f| &f.arg_types != arg_types);
+                if arg_modes.is_empty() {
+                    overloads.retain(|f| &f.arg_types != arg_types);
+                } else {
+                    overloads.retain(|f| {
+                        &f.arg_types != arg_types || &f.arg_modes != arg_modes
+                    });
+                }
                 if overloads.is_empty() {
                     eng.db.functions.remove(name);
                 }
@@ -1795,20 +1810,28 @@ pub fn records_for_commit(
                         security_definer: f.security_definer,
                         is_procedure: f.is_procedure,
                         table_cols: f.table_cols.clone(),
+                        arg_modes: f.arg_modes.clone(),
                         xmin: own,
                     });
                 }
                 // v1.91: no local increment (see CreateType arm note).
             }
             // v0.87: WAL-log the specific overload's signature.
+            // v2.12 finishing (RGSWAL32): include the modes so
+            // replay removes exactly the dropped overload.
             WriteOp::DropFunction { name, prev, .. } => {
                 let arg_types = prev
                     .as_ref()
                     .map(|f| f.arg_types.clone())
                     .unwrap_or_default();
+                let arg_modes = prev
+                    .as_ref()
+                    .map(|f| f.arg_modes.clone())
+                    .unwrap_or_default();
                 out.push(WalRecord::DropFunction {
                     name: name.clone(),
                     arg_types,
+                    arg_modes,
                     xmax: own,
                 });
                 // v1.91: no local increment (see CreateType arm note).

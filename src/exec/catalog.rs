@@ -2899,7 +2899,9 @@ pub(crate) fn select_foldable(
                 }
                 if let Some(overloads) = db.functions.get(name) {
                     for cand in overloads {
-                        if cand.arg_types.len() != args.len() {
+                        // v2.12: mode-aware arity (input args /
+                        // variadic), like the call paths.
+                        if !crate::exec::argc_matches(cand, args.len()) {
                             continue;
                         }
                         // A VOLATILE callee makes the body

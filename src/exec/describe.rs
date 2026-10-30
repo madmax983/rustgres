@@ -1816,6 +1816,13 @@ pub(crate) fn arith_operand_type(
         Expr::Agg { .. } | Expr::WithinGroup { .. } | Expr::ScalarSub(_) => Ok(Some(expr_type(
             eng, snap, own, session, schemas, outer, ctes, e,
         )?)),
+        // v2.12: array subscript / slice operands type as their
+        // element / array type via expr_type (previously they fell
+        // into the boolean-predicate catch-all below and every
+        // `arr[i] + 1` failed describe with a bogus boolean error).
+        Expr::Subscript { .. } | Expr::Slice { .. } => Ok(Some(expr_type(
+            eng, snap, own, session, schemas, outer, ctes, e,
+        )?)),
         Expr::Cast { to, .. } => Ok(Some(*to)),
         Expr::Func { .. } => Ok(Some(expr_type(
             eng, snap, own, session, schemas, outer, ctes, e,

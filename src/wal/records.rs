@@ -300,12 +300,23 @@ pub enum WalRecord {
         is_procedure: bool,
         /// v2.04 (RGSWAL29): RETURNS TABLE declared columns.
         table_cols: Vec<(String, String)>,
+        /// v2.12 (RGSWAL31): argument modes (`ArgMode::code` bytes),
+        /// parallel to `arg_types`; trailing field, present only in
+        /// RGSWAL31+ images (older images decode as all-IN).
+        arg_modes: Vec<u8>,
         xmin: u64,
     },
     DropFunction {
         name: String,
         /// v0.87: the specific overload's argument types.
         arg_types: Vec<String>,
+        /// v2.12 finishing (RGSWAL32): the dropped overload's
+        /// argument modes, parallel to `arg_types`; trailing field,
+        /// present only in RGSWAL32+ images (older images decode as
+        /// empty and replay falls back to the types-only key).
+        /// Without it, replaying a drop of one of two same-full-types
+        /// overloads removed both.
+        arg_modes: Vec<u8>,
         xmax: u64,
     },
     CreateOperator {

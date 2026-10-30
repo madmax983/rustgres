@@ -1287,6 +1287,7 @@ impl Enc {
                 security_definer,
                 is_procedure,
                 table_cols,
+                arg_modes,
                 xmin,
             } => {
                 self.u8(24);
@@ -1321,10 +1322,16 @@ impl Enc {
                     self.str(ct);
                 }
                 self.u64(*xmin);
+                // v2.12 (RGSWAL31): argument modes, trailing.
+                self.u32(arg_modes.len() as u32);
+                for m in arg_modes {
+                    self.u8(*m);
+                }
             }
             WalRecord::DropFunction {
                 name,
                 arg_types,
+                arg_modes,
                 xmax,
             } => {
                 self.u8(25);
@@ -1332,6 +1339,12 @@ impl Enc {
                 self.u32(arg_types.len() as u32);
                 for t in arg_types {
                     self.str(t);
+                }
+                // v2.12 finishing (RGSWAL32): argument modes,
+                // trailing.
+                self.u32(arg_modes.len() as u32);
+                for m in arg_modes {
+                    self.u8(*m);
                 }
                 self.u64(*xmax);
             }
@@ -2651,6 +2664,17 @@ impl<'a> Dec<'a> {
                     Vec::new()
                 };
                 let xmin = self.u64()?;
+                // v2.12: argument modes ride RGSWAL31+ only.
+                let arg_modes = if self.wal_version >= 31 {
+                    let n = self.u32()? as usize;
+                    let mut v = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        v.push(self.u8()?);
+                    }
+                    v
+                } else {
+                    Vec::new()
+                };
                 Ok(WalRecord::CreateFunction {
                     name,
                     arg_names,
@@ -2664,6 +2688,7 @@ impl<'a> Dec<'a> {
                     security_definer,
                     is_procedure,
                     table_cols,
+                    arg_modes,
                     xmin,
                 })
             }
@@ -2674,10 +2699,23 @@ impl<'a> Dec<'a> {
                 for _ in 0..n_args {
                     arg_types.push(self.str()?);
                 }
+                // v2.12 finishing (RGSWAL32): argument modes,
+                // trailing; older images carry none.
+                let arg_modes = if self.wal_version >= 32 {
+                    let n_modes = self.u32()? as usize;
+                    let mut v = Vec::with_capacity(n_modes);
+                    for _ in 0..n_modes {
+                        v.push(self.u8()?);
+                    }
+                    v
+                } else {
+                    Vec::new()
+                };
                 let xmax = self.u64()?;
                 Ok(WalRecord::DropFunction {
                     name,
                     arg_types,
+                    arg_modes,
                     xmax,
                 })
             }

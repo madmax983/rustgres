@@ -3274,7 +3274,18 @@ pub(crate) fn exec_drop_schema(
                 .map(|f| (f.arg_types.clone(), f.is_procedure))
                 .collect();
             for (atypes, is_proc) in overloads {
-                exec_drop_function(eng, ctx, fname, &atypes, true, true, is_proc, false, false)?;
+                exec_drop_function(
+                    eng,
+                    ctx,
+                    fname,
+                    &atypes,
+                    &[],
+                    true,
+                    true,
+                    is_proc,
+                    false,
+                    false,
+                )?;
             }
         }
         let prev = eng.db.schemas.clone();
@@ -3709,6 +3720,7 @@ pub(crate) fn exec_drop_owned(
                         ctx,
                         &fname,
                         &f.arg_types,
+                        &[],
                         true,
                         true,
                         f.is_procedure,

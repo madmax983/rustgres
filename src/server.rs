@@ -2000,7 +2000,7 @@ fn allowed_in_aborted(stmt: &Stmt) -> bool {
 /// the current row, BACKWARD excludes it, and NEXT skips past it.
 /// Indices are clamped into `[0, len]`; an empty window parks the cursor
 /// after the last row (forward) or before the first row (backward).
-fn cursor_window(dir: &FetchDir, pos: i64, len: usize) -> (usize, usize, i64) {
+pub(crate) fn cursor_window(dir: &FetchDir, pos: i64, len: usize) -> (usize, usize, i64) {
     let n = len as i64;
     enum Kind {
         Fwd,
@@ -2057,8 +2057,14 @@ fn cursor_window(dir: &FetchDir, pos: i64, len: usize) -> (usize, usize, i64) {
         }
         // v0.83: PG leaves the cursor BEFORE the first row when a backward
         // fetch/move runs to the start (s == 0), not ON the first row.
+        // v2.12: that rule is for running INTO the start (BACKWARD ALL,
+        // or a count larger than the remaining rows — the clamped
+        // window). A backward fetch that lands exactly on the first
+        // row leaves the cursor ON it (PG19 SPI semantics: FETCH
+        // PRIOR onto row 1, then MOVE FORWARD 1 / FETCH NEXT
+        // continues from row 1).
         Kind::Bwd => {
-            if s == 0 {
+            if matches!(dir, FetchDir::Backward(None)) || neg {
                 -1
             } else {
                 s
@@ -2113,6 +2119,48 @@ fn cursor_declare(
     Ok(cmd("DECLARE CURSOR"))
 }
 
+/// v2.12: SQL-level FETCH/MOVE against a plpgsql portal (a
+/// refcursor returned from a function and fetched in the same
+/// transaction). Same window model and tags as session cursors.
+fn pl_portal_fetch(name: &str, dir: &FetchDir, is_move: bool) -> Result<ExecResult, ExecError> {
+    let res = crate::exec::pl_portal_with(name, |p| {
+        let goes_backward = matches!(dir, FetchDir::Backward(_));
+        if goes_backward && !p.scroll {
+            return Err(ExecError {
+                detail: None,
+                code: "55000",
+                message: "cursor can only scan forward".to_string(),
+            });
+        }
+        let (s, e, new_pos) = cursor_window(dir, p.pos, p.rows.len());
+        p.pos = new_pos;
+        let mut rows: Vec<Row> = p.rows[s..e].to_vec();
+        if goes_backward {
+            rows.reverse();
+        }
+        Ok((p.cols.clone(), rows))
+    });
+    let (cols, rows) = match res {
+        Some(r) => r?,
+        None => {
+            return Err(ExecError {
+                detail: None,
+                code: "34000",
+                message: format!("cursor \"{}\" does not exist", name),
+            });
+        }
+    };
+    let n = rows.len();
+    if is_move {
+        return Ok(cmd(&format!("MOVE {}", n)));
+    }
+    Ok(ExecResult::Dml {
+        tag: format!("FETCH {}", n),
+        columns: cols,
+        rows,
+    })
+}
+
 fn cursor_fetch(
     engine: &Arc<Mutex<Engine>>,
     wal: &Arc<Mutex<Wal>>,
@@ -2121,6 +2169,11 @@ fn cursor_fetch(
     dir: &FetchDir,
     is_move: bool,
 ) -> Result<ExecResult, ExecError> {
+    // v2.12: a name that is not a session cursor may be a plpgsql
+    // portal (returned refcursor).
+    if !session.cursors.contains_key(name) {
+        return pl_portal_fetch(name, dir, is_move);
+    }
     // v0.89: existence and liveness check; take the lazy query out so
     // the materialization below can borrow `session` mutably.
     let query = {
@@ -2212,7 +2265,8 @@ fn cursor_fetch(
 fn cursor_close(session: &mut Session, name: Option<&str>) -> Result<ExecResult, ExecError> {
     match name {
         Some(n) => {
-            if session.cursors.remove(n).is_none() {
+            // v2.12: fall back to the plpgsql portal registry.
+            if session.cursors.remove(n).is_none() && !crate::exec::pl_portal_remove(n) {
                 return Err(ExecError {
                     detail: None,
                     code: "34000",
@@ -2220,7 +2274,10 @@ fn cursor_close(session: &mut Session, name: Option<&str>) -> Result<ExecResult,
                 });
             }
         }
-        None => session.cursors.clear(),
+        None => {
+            session.cursors.clear();
+            crate::exec::pl_portals_clear();
+        }
     }
     Ok(cmd("CLOSE CURSOR"))
 }
@@ -4879,6 +4936,7 @@ fn abort_implicit_txn(engine: &Arc<Mutex<Engine>>, session: &mut Session) {
         drop(guard);
         // v0.16: every cursor dies with the aborted transaction.
         session.cursors.clear();
+        crate::exec::pl_portals_clear();
         // v0.66: an aborted transaction reverts every in-transaction GUC
         // change (SET and SET LOCAL), like PG19.
         revert_guc_stack(session, t.guc_stack, false);
@@ -4923,6 +4981,7 @@ fn commit_taken_txn(
         // v0.16: every cursor dies with the aborted transaction
         // (even WITH HOLD ones — there is no committed data to hold).
         session.cursors.clear();
+        crate::exec::pl_portals_clear();
         // v0.66: an aborted transaction reverts every in-transaction
         // GUC change (SET and SET LOCAL), like PG19.
         revert_guc_stack(session, t.guc_stack, false);
@@ -4964,6 +5023,7 @@ fn commit_taken_txn(
                 auto_vacuum(&mut guard, &t.writes);
                 drop(guard);
                 session.cursors.clear();
+                crate::exec::pl_portals_clear();
                 revert_guc_stack(session, t.guc_stack, false);
                 return Err(e);
             }
@@ -5005,6 +5065,8 @@ fn commit_taken_txn(
     drop(guard);
     // v0.16: plain cursors die at COMMIT; WITH HOLD cursors survive.
     session.cursors.retain(|_, c| c.with_hold);
+    // v2.12: plpgsql portals have no WITH HOLD form; all die at COMMIT.
+    crate::exec::pl_portals_clear();
     // v0.66: SET LOCAL effects end with the transaction (commit or
     // not); plain SET/RESET persist for the session, like PG19.
     revert_guc_stack(session, t.guc_stack, true);
@@ -5280,6 +5342,7 @@ fn txn_rollback(
         drop(guard);
         // v0.16: ROLLBACK closes every cursor, including WITH HOLD ones.
         session.cursors.clear();
+        crate::exec::pl_portals_clear();
         // v0.66: rollback reverts every in-transaction GUC change (SET
         // and SET LOCAL), like PG19.
         revert_guc_stack(session, t.guc_stack, false);
@@ -5295,6 +5358,7 @@ fn txn_rollback(
         auto_vacuum(&mut guard, &t.writes);
         // v0.16: ROLLBACK closes every cursor, including WITH HOLD ones.
         session.cursors.clear();
+        crate::exec::pl_portals_clear();
         // v0.66: rollback reverts every in-transaction GUC change (SET
         // and SET LOCAL), like PG19.
         revert_guc_stack(session, t.guc_stack, false);
@@ -5465,6 +5529,11 @@ fn txn_rollback_to(
         .map(|m| m.names.clone());
     if let Some(names) = names {
         session.cursors.retain(|k, _| names.contains(k));
+        // v2.12: portals created after the savepoint are not in the
+        // retained name set model; the registry has no savepoint
+        // tracking, so a rollback-to clears it wholesale (a
+        // conservative superset of PG's close-portals-after-savepoint).
+        crate::exec::pl_portals_clear();
     }
     session
         .txn

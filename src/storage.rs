@@ -5907,6 +5907,38 @@ pub struct FuncDef {
     /// empty for other return shapes. PG names a table function's
     /// output columns from this list, not from the body's aliases.
     pub table_cols: Vec<(String, String)>,
+    /// v2.12: argument modes parallel to `arg_types`
+    /// (`crate::sql::ArgMode::code` bytes: 0 IN, 1 OUT, 2 INOUT,
+    /// 3 VARIADIC). May be shorter than `arg_types` for definitions
+    /// built by older code paths; missing entries mean IN.
+    pub arg_modes: Vec<u8>,
+}
+
+impl FuncDef {
+    /// v2.12: the mode of argument `i` (IN when not recorded).
+    pub fn arg_mode(&self, i: usize) -> crate::sql::ArgMode {
+        crate::sql::ArgMode::from_code(self.arg_modes.get(i).copied().unwrap_or(0))
+    }
+    /// v2.12: the function's identity argument types: input
+    /// arguments only (IN / INOUT / VARIADIC), PG19 proargtypes.
+    pub fn input_arg_types(&self) -> Vec<String> {
+        self.arg_types
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.arg_mode(*i).is_input())
+            .map(|(_, t)| t.clone())
+            .collect()
+    }
+    /// v2.12: does the function declare any output parameters
+    /// (OUT/INOUT args, or RETURNS TABLE columns)?
+    pub fn has_outputs(&self) -> bool {
+        !self.table_cols.is_empty()
+            || self
+                .arg_types
+                .iter()
+                .enumerate()
+                .any(|(i, _)| self.arg_mode(i).is_output())
+    }
 }
 
 /// v1.38: a user-defined cast definition, keyed by (source, target)

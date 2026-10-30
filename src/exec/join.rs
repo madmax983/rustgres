@@ -2133,12 +2133,7 @@ pub(crate) fn lateral_function_schema(
     // v0.86: user-defined functions in FROM (Describe path). A scalar
     // function returning a table rowtype expands to the table's columns.
     // v0.87: resolve overload by arity for the describe path.
-    if let Some(fdef) = eng
-        .db
-        .functions
-        .get(name)
-        .and_then(|ovs| ovs.iter().find(|f| f.arg_types.len() == args.len()))
-    {
+    if let Some(fdef) = crate::exec::overload_for_argc(eng, name, args.len()) {
         if let Some(t) = eng.db.find_table(&fdef.ret_type, snap, &[own], session) {
             let mut cols = Vec::with_capacity(t.columns.len());
             for (idx, (cn, ct)) in t.columns.iter().enumerate() {
@@ -2151,6 +2146,17 @@ pub(crate) fn lateral_function_schema(
                 });
             }
             return Ok(cols);
+        }
+        // v2.12: output parameters (OUT/INOUT args) name and
+        // type the FROM result columns (any return shape).
+        if fdef.has_outputs() && fdef.table_cols.is_empty() {
+            let defs = crate::exec::fdef_output_defs(&fdef);
+            let names: Vec<String> = defs.iter().map(|o| o.name.clone()).collect();
+            let tys: Vec<ColType> = defs
+                .iter()
+                .map(|o| crate::sql::coltype_by_name(&o.type_name).unwrap_or(ColType::Text))
+                .collect();
+            return function_item_schema(name, &names, &tys, alias, col_aliases);
         }
         // v1.03: RETURNS SETOF <scalar> — a single column named for the
         // function (PG names the output column after the function).

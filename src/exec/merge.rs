@@ -1115,6 +1115,98 @@ pub(crate) fn exec_merge(
         }
         out
     };
+    // v2.12 (secondary a): BEFORE UPDATE / BEFORE DELETE row
+    // triggers for MERGE's matched actions (PG19 nodeModifyTable
+    // ExecMergeMatched: ExecBRUpdateTriggers / ExecBRDeleteTriggers
+    // run before the action executes; a NULL return suppresses the
+    // action for that row). The BEFORE INSERT pass above already
+    // implements the same contract for NOT MATCHED inserts
+    // (audited: NEW substitution via `replaced` included). Trigger
+    // NEW images substitute back into the planned action, in parent
+    // column order, so validation and apply see the final rows.
+    let acts: Vec<MAct> = {
+        // The UPDATE OF column filter sees the union of the SET
+        // columns across all UPDATE WHEN clauses (an approximation
+        // of PG's per-action list; no suite case splits them).
+        let mut set_cols: Vec<String> = Vec::new();
+        for w in whens {
+            if let MergeAction::Update { sets } = &w.action {
+                for (c, _) in sets {
+                    if !set_cols.contains(c) {
+                        set_cols.push(c.clone());
+                    }
+                }
+            }
+        }
+        let mut out: Vec<MAct> = Vec::with_capacity(acts.len());
+        for a in acts {
+            match a {
+                MAct::Update {
+                    leaf,
+                    id,
+                    xmax,
+                    old,
+                    new,
+                    src,
+                } => {
+                    let lc: Vec<(String, ColType)> = if leaf == table {
+                        columns.clone()
+                    } else {
+                        eng.db
+                            .find_table(&leaf, ctx.snap, &ctx.all_xids, ctx.session)
+                            .map(|t| t.columns.clone())
+                            .unwrap_or_else(|| columns.clone())
+                    };
+                    let old_l = crate::exec::reorder_row(&columns, &lc, &old.to_vec());
+                    let new_l = crate::exec::reorder_row(&columns, &lc, &new.to_vec());
+                    match fire_before_update_triggers(
+                        eng, ctx, &leaf, &lc, &old_l, &new_l, &set_cols,
+                    )? {
+                        None => { /* suppressed by a NULL-returning trigger */ }
+                        Some(final_l) => {
+                            let new_parent = crate::exec::reorder_row(&lc, &columns, &final_l);
+                            out.push(MAct::Update {
+                                leaf,
+                                id,
+                                xmax,
+                                old,
+                                new: Row::new(new_parent),
+                                src,
+                            });
+                        }
+                    }
+                }
+                MAct::Delete {
+                    leaf,
+                    id,
+                    xmax,
+                    old,
+                    src,
+                } => {
+                    let lc: Vec<(String, ColType)> = if leaf == table {
+                        columns.clone()
+                    } else {
+                        eng.db
+                            .find_table(&leaf, ctx.snap, &ctx.all_xids, ctx.session)
+                            .map(|t| t.columns.clone())
+                            .unwrap_or_else(|| columns.clone())
+                    };
+                    let old_l = crate::exec::reorder_row(&columns, &lc, &old.to_vec());
+                    if fire_before_delete_triggers(eng, ctx, &leaf, &lc, &old_l)? {
+                        out.push(MAct::Delete {
+                            leaf,
+                            id,
+                            xmax,
+                            old,
+                            src,
+                        });
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+        out
+    };
     // --- validate planned writes -----------------------------------------
     // Destination leaf metadata + column order per leaf.
     let leaf_cols = |eng: &Engine, ctx: &StmtCtx, leaf: &str| -> Vec<(String, ColType)> {

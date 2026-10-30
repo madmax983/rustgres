@@ -295,7 +295,8 @@ pub(crate) fn expr_is_volatile(db: &Database, e: &Expr) -> bool {
             if let Some(overloads) = db.functions.get(name) {
                 let mut arity_match = false;
                 for fdef in overloads {
-                    if fdef.arg_types.len() == args.len() {
+                    // v2.12: mode-aware arity (input args / variadic).
+                    if crate::exec::argc_matches(fdef, args.len()) {
                         arity_match = true;
                         if fdef.volatility == crate::sql::FuncVolatility::Volatile {
                             return true;

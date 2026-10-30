@@ -343,13 +343,13 @@ fn v103_plpgsql_validation() {
         ),
         "42601"
     );
-    // Variable colliding with an argument name.
-    assert_eq!(
-        err_code(
-            &mut eng,
-            "CREATE FUNCTION c103(a int) RETURNS int AS $$ declare a text; begin return 1; end; $$ LANGUAGE plpgsql"
-        ),
-        "42601"
+    // v2.12: a variable colliding with an argument name is NOT an
+    // error in PG19 — the declaration shadows the argument
+    // (use_refcursor / shadowtest / pl_qual_names all rely on it).
+    // The v1.03 expectation of 42601 was the bounded subset's rule,
+    // retired with the general interpreter.
+    ok(
+        "CREATE FUNCTION c103(a int) RETURNS int AS $$ declare a text; begin return 1; end; $$ LANGUAGE plpgsql",
     );
 }
 #[test]
@@ -595,7 +595,9 @@ fn plpgsql_exceptions() {
         parse_plpgsql_body(
             "begin return 1; when others then return 2; end",
             false,
-            false
+            false,
+            false,
+            &[]
         )
         .is_err()
     );
@@ -603,7 +605,9 @@ fn plpgsql_exceptions() {
         parse_plpgsql_body(
             "begin return 1; exception when others return 2; end",
             false,
-            false
+            false,
+            false,
+            &[]
         )
         .is_err()
     );
@@ -623,6 +627,8 @@ fn plpgsql_exceptions() {
         "begin return 1; exception when division_by_zero or unique_violation then return 0; end",
         false,
         false,
+        false,
+        &[],
     )
     .unwrap();
     assert_eq!(pb.handlers[0].sqlstates, vec!["22012", "23505"]);

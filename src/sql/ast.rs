@@ -4004,6 +4004,47 @@ pub enum FetchDir {
     Last,
 }
 
+/// v2.12: a `CREATE FUNCTION` argument mode (PG19 `FunctionParameterMode`).
+/// The stored byte form lives on `FuncDef::arg_modes`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArgMode {
+    In,
+    Out,
+    Inout,
+    Variadic,
+}
+
+impl ArgMode {
+    /// Byte code stored in `FuncDef::arg_modes` (and the WAL /
+    /// checkpoint images).
+    pub fn code(self) -> u8 {
+        match self {
+            ArgMode::In => 0,
+            ArgMode::Out => 1,
+            ArgMode::Inout => 2,
+            ArgMode::Variadic => 3,
+        }
+    }
+    pub fn from_code(b: u8) -> ArgMode {
+        match b {
+            1 => ArgMode::Out,
+            2 => ArgMode::Inout,
+            3 => ArgMode::Variadic,
+            _ => ArgMode::In,
+        }
+    }
+    /// Input arguments (IN / INOUT / VARIADIC) form the function's
+    /// identity and are supplied by the caller (PG19 proargtypes
+    /// covers exactly these).
+    pub fn is_input(self) -> bool {
+        !matches!(self, ArgMode::Out)
+    }
+    /// Output arguments (OUT / INOUT) form the function's result row.
+    pub fn is_output(self) -> bool {
+        matches!(self, ArgMode::Out | ArgMode::Inout)
+    }
+}
+
 /// v0.86: a single `CREATE FUNCTION` argument: the optional argument
 /// name and the declared type name as written.
 #[derive(Clone, Debug)]
@@ -4014,6 +4055,8 @@ pub struct FuncArg {
     /// CREATE FUNCTION can run the PG19 type-USAGE walk over the
     /// casts it names (defaults are not yet evaluated at call time).
     pub default: Option<Expr>,
+    /// v2.12: the argument mode (IN when no mode keyword was written).
+    pub mode: ArgMode,
 }
 
 /// v0.86: function languages we can execute. `plpgsql` is accepted only
@@ -4340,7 +4383,59 @@ pub enum PlpgsqlStmt {
     ReturnQuery(Box<Stmt>),
     /// v2.11: `RETURN QUERY EXECUTE <expr>`: like RETURN QUERY over
     /// a dynamically built command string.
-    ReturnQueryExecute(Box<Stmt>),
+    /// v2.12: `USING <expr>, ...` values bind `$1..` in the command.
+    ReturnQueryExecute { expr: Box<Stmt>, using: Vec<Stmt> },
+    /// v2.12: bare `RETURN NEXT` (PG19 PLPGSQL_STMT_RETURN_NEXT with
+    /// no expression): appends the current OUT / RETURNS TABLE
+    /// output row to the SETOF result.
+    ReturnNextBare,
+    /// v2.12: `OPEN <cursor>` for a bound cursor declaration, with
+    /// the OPEN argument list (empty when the cursor takes no
+    /// parameters). Arguments are (optional parameter name, value
+    /// expression as a `SELECT <expr>` statement) in written order.
+    OpenBound {
+        var: String,
+        args: Vec<(Option<String>, Stmt)>,
+    },
+    /// v2.12: `OPEN <var> [SCROLL] FOR <query>` and
+    /// `OPEN <var> [SCROLL] FOR EXECUTE <expr> [USING ...]`
+    /// (PG19 PLPGSQL_STMT_OPEN). `scroll` is the effective
+    /// scrollability (declaration default applied at parse).
+    OpenFor {
+        var: String,
+        scroll: bool,
+        query: Option<Box<Stmt>>,
+        dynamic: Option<Box<Stmt>>,
+        using: Vec<Stmt>,
+    },
+    /// v2.12: `FETCH [direction] [FROM|IN] <var> [INTO <targets>]`
+    /// (PG19 PLPGSQL_STMT_FETCH). The count expression (for
+    /// FORWARD/BACKWARD/RELATIVE/ABSOLUTE n) is a `SELECT <expr>`.
+    Fetch {
+        var: String,
+        dir: PlFetchDir,
+        count: Option<Box<Stmt>>,
+        targets: Option<Vec<PlTarget>>,
+    },
+    /// v2.12: `MOVE [direction] [FROM|IN] <var>` — a FETCH with no
+    /// INTO target (PG19 PLPGSQL_STMT_FETCH with is_move).
+    Move {
+        var: String,
+        dir: PlFetchDir,
+        count: Option<Box<Stmt>>,
+    },
+    /// v2.12: `CLOSE <var>` (PG19 PLPGSQL_STMT_CLOSE).
+    Close { var: String },
+    /// v2.12: `FOR <var> IN <cursor>[(args)] LOOP ... END LOOP`
+    /// (PG19 PLPGSQL_STMT_FORC over a cursor): opens the cursor,
+    /// binds each fetched row to the record variable, and closes
+    /// the cursor when the loop ends.
+    ForCursor {
+        var: String,
+        cursor: String,
+        args: Vec<(Option<String>, Stmt)>,
+        body: Vec<PlpgsqlStmt>,
+    },
     /// v2.11: bare `RETURN` (PG19 PLPGSQL_STMT_RETURN with a NULL
     /// expression): ends a void function/procedure; in a SETOF
     /// function it returns the accumulated rows; in a scalar
@@ -4367,6 +4462,20 @@ pub enum PlpgsqlStmt {
     /// enclosing EXCEPTION handler (PG19 PLPGSQL_STMT_RAISE with no
     /// options).
     Reraise,
+}
+
+/// v2.12: a plpgsql FETCH/MOVE direction (PG19 `FetchDirection`).
+/// Counts ride separately (they are expressions in plpgsql).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlFetchDir {
+    Forward,
+    Backward,
+    ForwardAll,
+    BackwardAll,
+    Absolute,
+    Relative,
+    First,
+    Last,
 }
 
 /// v2.11: how a RAISE's SQLSTATE is determined at run time.
@@ -4449,12 +4558,32 @@ pub struct PlpgsqlDecl {
     pub alias_slot: Option<u32>,
     /// v2.11: a `CURSOR ... FOR query` declaration (held back at
     /// run time; the slot behaves as a NULL refcursor).
+    /// v2.12: cursor machinery is live; see `cursor_query`.
     pub is_cursor: bool,
     /// v2.11: an implicit declaration invented by the parser (a FOR
     /// loop variable, or the `found` variable). Implicit decls may
     /// share a name with a function argument (the argument wins in
     /// the CREATE-time rewrite map).
     pub implicit: bool,
+    /// v2.12: for a bound-cursor declaration, the declared query
+    /// (a `Stmt::Select`), with its parameter names rewritten to
+    /// extra `$N` slots past the decl vector by the CREATE-time
+    /// rewriter. `None` for plain refcursor variables.
+    pub cursor_query: Option<Box<Stmt>>,
+    /// v2.12: a bound cursor's declared parameters, in order:
+    /// (name, type name as written).
+    pub cursor_params: Vec<(String, String)>,
+    /// v2.12: scrollability of a bound cursor: `Some(true)` for
+    /// SCROLL, `Some(false)` for NO SCROLL, `None` when the
+    /// declaration did not say (PG defaults to NO SCROLL for
+    /// plpgsql cursors unless the query needs it — treated as
+    /// non-scroll here).
+    pub cursor_scroll: Option<bool>,
+    /// v2.12: the declaration used the CONSTANT keyword (an OPEN on
+    /// a constant refcursor whose value is already set is PG's
+    /// "variable is declared CONSTANT" error at OPEN time; the
+    /// constant_refcursor family).
+    pub is_constant: bool,
 }
 
 /// v1.01: sentinel for the OTHERS pseudo-condition (never a real
@@ -5577,13 +5706,16 @@ pub(crate) fn parse_plpgsql_decl(text: &str) -> Result<PlpgsqlDecl, SqlError> {
     let mut t = text.trim();
     // CONSTANT may precede the name (pl_gram.y allows both orders;
     // the post-type position is stripped with the type cleanup).
+    let mut is_constant = false;
     if let Some(r) = plpgsql_strip_kw(t, "constant") {
+        is_constant = true;
         t = r.trim_start();
     }
     let (name, rest) =
         split_ident(t).ok_or_else(|| syntax(format!("bad variable declaration: {}", t)))?;
     let mut rest = rest.trim();
     if let Some(r) = plpgsql_strip_kw(rest, "constant") {
+        is_constant = true;
         rest = r.trim_start();
     }
     // ALIAS FOR <target>.
@@ -5607,21 +5739,84 @@ pub(crate) fn parse_plpgsql_decl(text: &str) -> Result<PlpgsqlDecl, SqlError> {
             is_cursor: false,
             implicit: false,
             alias_slot: None,
+            cursor_query: None,
+            cursor_params: Vec::new(),
+            cursor_scroll: None,
+            is_constant: false,
         });
     }
-    // CURSOR declaration: `name CURSOR [(args)] FOR <query>` or
-    // `name CURSOR FOR <query>`; also plain `name refcursor` falls
-    // through to the ordinary path below.
-    if plpgsql_starts_with_kw(rest, "cursor") {
-        return Ok(PlpgsqlDecl {
-            name,
-            type_name: "refcursor".to_string(),
-            default: None,
-            alias_for: None,
-            is_cursor: true,
-            implicit: false,
-            alias_slot: None,
-        });
+    // CURSOR declaration (v2.12, full form): `name [SCROLL | NO
+    // SCROLL] CURSOR [(param type, ...)] FOR <query>`; also plain
+    // `name refcursor` falls through to the ordinary path below.
+    {
+        let mut r2 = rest;
+        let mut scroll: Option<bool> = None;
+        if plpgsql_starts_with_kw(r2, "scroll") {
+            scroll = Some(true);
+            r2 = plpgsql_strip_kw(r2, "scroll").unwrap_or("").trim_start();
+        } else if plpgsql_starts_with_kw(r2, "no") {
+            let after_no = plpgsql_strip_kw(r2, "no").unwrap_or("").trim_start();
+            if plpgsql_starts_with_kw(after_no, "scroll") {
+                scroll = Some(false);
+                r2 = plpgsql_strip_kw(after_no, "scroll")
+                    .unwrap_or("")
+                    .trim_start();
+            }
+        }
+        if plpgsql_starts_with_kw(r2, "cursor") {
+            let mut r3 = plpgsql_strip_kw(r2, "cursor")
+                .unwrap_or("")
+                .trim_start()
+                .to_string();
+            let mut cursor_params: Vec<(String, String)> = Vec::new();
+            if r3.starts_with('(') {
+                let close = plpgsql_matching_paren(&r3)
+                    .ok_or_else(|| syntax(format!("unbalanced cursor parameters: {}", t)))?;
+                let inside = r3[1..close].trim().to_string();
+                if !inside.is_empty() {
+                    for part in split_top_level_commas(&inside) {
+                        let part = part.trim();
+                        if part.is_empty() {
+                            continue;
+                        }
+                        let (pname, ptype) = split_ident(part)
+                            .ok_or_else(|| syntax(format!("bad cursor parameter: {}", part)))?;
+                        let ptype = ptype.trim().to_string();
+                        if ptype.is_empty() {
+                            return Err(syntax(format!(
+                                "cursor parameter \"{}\" needs a type",
+                                pname
+                            )));
+                        }
+                        cursor_params.push((pname, ptype));
+                    }
+                }
+                r3 = r3[close + 1..].trim_start().to_string();
+            }
+            let r3 = plpgsql_strip_kw(&r3, "for")
+                .ok_or_else(|| syntax(format!("cursor declaration needs FOR: {}", t)))?;
+            let query_text = r3.trim().trim_end_matches(';').trim();
+            let query = parse_statement(query_text).map_err(|e| SqlError {
+                message: format!("syntax error in cursor query: {}", e.message),
+                code: "42601",
+            })?;
+            if !matches!(query, Stmt::Select(_)) {
+                return Err(syntax("cursor query is not a SELECT".to_string()));
+            }
+            return Ok(PlpgsqlDecl {
+                name,
+                type_name: "refcursor".to_string(),
+                default: None,
+                alias_for: None,
+                is_cursor: true,
+                implicit: false,
+                alias_slot: None,
+                cursor_query: Some(Box::new(query)),
+                cursor_params,
+                cursor_scroll: scroll,
+                is_constant,
+            });
+        }
     }
     // Split off an initializer: `:= expr`, `= expr`, or
     // `DEFAULT expr` at top level.
@@ -5719,7 +5914,60 @@ pub(crate) fn parse_plpgsql_decl(text: &str) -> Result<PlpgsqlDecl, SqlError> {
         is_cursor: false,
         implicit: false,
         alias_slot: None,
+        cursor_query: None,
+        cursor_params: Vec::new(),
+        cursor_scroll: None,
+        is_constant,
     })
+}
+
+/// v2.12: byte index of the `)` matching the `(` at byte 0 of `s`
+/// (string literals, quoted identifiers, line comments, and dollar
+/// quotes skipped). Used for cursor parameter lists and OPEN /
+/// FOR-over-cursor argument lists.
+pub(crate) fn plpgsql_matching_paren(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    if b.first() != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\'' {
+                        if i + 1 < b.len() && b[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'-' if i + 1 < b.len() && b[i + 1] == b'-' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+                if depth == 0 {
+                    return Some(i - 1);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// v2.11: byte position of a top-level two-word phrase (`not null`)
@@ -5949,6 +6197,10 @@ pub(crate) fn ensure_loop_decl(decls: &mut Vec<PlpgsqlDecl>, var: &str, type_nam
         is_cursor: false,
         implicit: true,
         alias_slot: None,
+        cursor_query: None,
+        cursor_params: Vec::new(),
+        cursor_scroll: None,
+        is_constant: false,
     });
 }
 
@@ -6421,7 +6673,7 @@ pub(crate) fn parse_plpgsql_for(
             .to_string();
     }
     // Find LOOP: the source is the first LOOP-terminated prefix that
-    // classifies (range / EXECUTE / query).
+    // classifies (range / EXECUTE / query / cursor reference).
     let mut found: Option<(String, String)> = None;
     for lp in plpgsql_kw_positions(&rest, "loop") {
         let src = rest[..lp].trim().to_string();
@@ -6430,7 +6682,8 @@ pub(crate) fn parse_plpgsql_for(
         }
         let ok = plpgsql_top_level_dotdot(&src).is_some()
             || plpgsql_starts_with_kw(&src, "execute")
-            || parse_statement(&src).is_ok();
+            || parse_statement(&src).is_ok()
+            || parse_plpgsql_cursor_ref(&src, decls).is_some();
         if ok {
             found = Some((src, rest[lp + 4..].trim().to_string()));
             break;
@@ -6440,6 +6693,24 @@ pub(crate) fn parse_plpgsql_for(
         found.ok_or_else(|| syntax("FOR requires IN <query> LOOP".to_string()))?;
     let inner = plpgsql_strip_end_loop(&body_after)
         .ok_or_else(|| syntax("FOR loop without END LOOP".to_string()))?;
+    // v2.12: FOR over a cursor (PG19 PLPGSQL_STMT_FORC with a cursor
+    // source): `FOR r IN c[(args)] LOOP`. The cursor must be a
+    // declared bound cursor or a refcursor variable.
+    if let Some((cursor, args)) = parse_plpgsql_cursor_ref(&source, decls) {
+        if reverse {
+            return Err(syntax(
+                "FOR over a cursor does not support REVERSE".to_string(),
+            ));
+        }
+        ensure_loop_decl(decls, &var, "record");
+        let body = parse_plpgsql_stmt_list(inner, decls)?;
+        return Ok(PlpgsqlStmt::ForCursor {
+            var,
+            cursor,
+            args,
+            body,
+        });
+    }
     // Range form.
     if let Some(dp) = plpgsql_top_level_dotdot(&source) {
         let low_text = source[..dp].trim();
@@ -6516,6 +6787,36 @@ pub(crate) fn parse_plpgsql_for(
         body,
         dynamic: false,
     })
+}
+
+/// v2.12: classify a FOR-loop source as a cursor reference:
+/// `<name>` or `<name>(args)`. A FOR query in this grammar always
+/// starts with SELECT / WITH / VALUES / TABLE or a parenthesis, so
+/// a bare identifier source can only be a cursor variable —
+/// declared cursor, refcursor variable, or refcursor ARGUMENT
+/// (arguments are not in `decls` at parse time; the executor
+/// resolves the name and errors when it is neither). DECL-checking
+/// is therefore deliberately not done here.
+pub(crate) fn parse_plpgsql_cursor_ref(
+    src: &str,
+    decls: &[PlpgsqlDecl],
+) -> Option<(String, Vec<(Option<String>, Stmt)>)> {
+    let _ = decls;
+    let t = src.trim();
+    let (name, tail) = split_ident(t)?;
+    let tail = tail.trim();
+    if tail.is_empty() {
+        return Some((name, Vec::new()));
+    }
+    if tail.starts_with('(') {
+        let close = plpgsql_matching_paren(tail)?;
+        if !tail[close + 1..].trim().is_empty() {
+            return None;
+        }
+        let args = parse_plpgsql_cursor_args(&tail[1..close]).ok()?;
+        return Some((name, args));
+    }
+    None
 }
 
 /// v2.11: parse a `WHILE <cond> LOOP ... END LOOP` raw span.
@@ -6613,8 +6914,14 @@ pub(crate) fn plpgsql_validate_returns(
     handlers: &[PlpgsqlHandler],
     returns_set: bool,
     is_void: bool,
+    has_out: bool,
 ) -> Result<(), SqlError> {
-    fn walk(stmts: &[PlpgsqlStmt], returns_set: bool, is_void: bool) -> Result<(), SqlError> {
+    fn walk(
+        stmts: &[PlpgsqlStmt],
+        returns_set: bool,
+        is_void: bool,
+        has_out: bool,
+    ) -> Result<(), SqlError> {
         for s in stmts {
             match s {
                 PlpgsqlStmt::Return(_) if is_void => {
@@ -6630,10 +6937,30 @@ pub(crate) fn plpgsql_validate_returns(
                         code: "42601",
                     });
                 }
+                // v2.12 finishing (PG19 pl_gram.y make_return_stmt):
+                // with OUT parameters the result row is built by
+                // assigning the OUT variables; RETURN <expr> is a
+                // CREATE-time error (the f1 case in plpgsql.sql).
+                PlpgsqlStmt::Return(_) if has_out => {
+                    return Err(SqlError {
+                        message: "RETURN cannot have a parameter in function with OUT parameters"
+                            .to_string(),
+                        code: "42601",
+                    });
+                }
                 PlpgsqlStmt::ReturnNext(_) if !returns_set => {
                     return Err(SqlError {
                         message: "RETURN NEXT cannot be used in a non-SETOF function".to_string(),
                         code: "42601",
+                    });
+                }
+                // v2.12: bare RETURN NEXT appends the current output
+                // row; it needs output parameters (or a SETOF shape
+                // whose outputs are the table columns).
+                PlpgsqlStmt::ReturnNextBare if !returns_set && !has_out => {
+                    return Err(SqlError {
+                        message: "RETURN NEXT without a value is only supported for OUT-parameter functions".to_string(),
+                        code: "0A000",
                     });
                 }
                 // v2.11 fix (PG19 pl_gram.y make_return_stmt): a bare
@@ -6641,13 +6968,13 @@ pub(crate) fn plpgsql_validate_returns(
                 // functions; in a scalar function the expression is
                 // mandatory and its absence is a CREATE-time syntax
                 // error ("missing expression").
-                PlpgsqlStmt::ReturnBare if !returns_set && !is_void => {
+                PlpgsqlStmt::ReturnBare if !returns_set && !is_void && !has_out => {
                     return Err(SqlError {
                         message: "missing expression at or near \";\"".to_string(),
                         code: "42601",
                     });
                 }
-                PlpgsqlStmt::ReturnQuery(_) | PlpgsqlStmt::ReturnQueryExecute(_) => {
+                PlpgsqlStmt::ReturnQuery(_) | PlpgsqlStmt::ReturnQueryExecute { .. } => {
                     if !returns_set {
                         return Err(SqlError {
                             message: "RETURN QUERY cannot be used in a non-SETOF function"
@@ -6658,8 +6985,9 @@ pub(crate) fn plpgsql_validate_returns(
                 }
                 PlpgsqlStmt::ForQuery { body, .. }
                 | PlpgsqlStmt::ForRange { body, .. }
+                | PlpgsqlStmt::ForCursor { body, .. }
                 | PlpgsqlStmt::While { body, .. }
-                | PlpgsqlStmt::Loop { body } => walk(body, returns_set, is_void)?,
+                | PlpgsqlStmt::Loop { body } => walk(body, returns_set, is_void, has_out)?,
                 PlpgsqlStmt::If {
                     branches,
                     else_body,
@@ -6669,16 +6997,16 @@ pub(crate) fn plpgsql_validate_returns(
                     else_body,
                 } => {
                     for (_, b) in branches {
-                        walk(b, returns_set, is_void)?;
+                        walk(b, returns_set, is_void, has_out)?;
                     }
-                    walk(else_body, returns_set, is_void)?;
+                    walk(else_body, returns_set, is_void, has_out)?;
                 }
                 PlpgsqlStmt::Block {
                     stmts, handlers, ..
                 } => {
-                    walk(stmts, returns_set, is_void)?;
+                    walk(stmts, returns_set, is_void, has_out)?;
                     for h in handlers {
-                        walk(&h.stmts, returns_set, is_void)?;
+                        walk(&h.stmts, returns_set, is_void, has_out)?;
                     }
                 }
                 _ => {}
@@ -6686,9 +7014,9 @@ pub(crate) fn plpgsql_validate_returns(
         }
         Ok(())
     }
-    walk(stmts, returns_set, is_void)?;
+    walk(stmts, returns_set, is_void, has_out)?;
     for h in handlers {
-        walk(&h.stmts, returns_set, is_void)?;
+        walk(&h.stmts, returns_set, is_void, has_out)?;
     }
     Ok(())
 }
@@ -6832,6 +7160,25 @@ pub(crate) fn plpgsql_validate_vars(
                     )?;
                 }
                 PlpgsqlStmt::SelectInto { targets, .. } => check_targets(decls, labels, targets)?,
+                PlpgsqlStmt::Fetch {
+                    targets: Some(ts), ..
+                } => {
+                    check_targets(decls, labels, ts)?;
+                }
+                // v2.12: cursor variables are NOT checked here: a
+                // cursor may be a function argument (e.g. a refcursor
+                // parameter), which this validator cannot see. The
+                // executor resolves the name (or the $slot form the
+                // CREATE rewrite substitutes) and errors there.
+                PlpgsqlStmt::ForCursor { var, body, .. } => {
+                    if !declared(decls, var) {
+                        return Err(SqlError {
+                            message: format!("FOR loop variable \"{}\" is not declared", var),
+                            code: "42601",
+                        });
+                    }
+                    walk(body, decls, labels)?;
+                }
                 PlpgsqlStmt::Dml {
                     targets: Some(ts), ..
                 }
@@ -7126,6 +7473,356 @@ pub(crate) fn parse_plpgsql_execute(rest: &str) -> Result<PlpgsqlStmt, SqlError>
     })
 }
 
+/// v2.12: strip `--` line comments and `/* */` block comments
+/// everywhere in a plpgsql fragment (outside string literals).
+/// Used on OPEN / FOR argument lists, where the suite keeps a line
+/// comment inside the parentheses.
+pub(crate) fn plpgsql_strip_all_comments(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                out.push('\'');
+                i += 1;
+                while i < b.len() {
+                    out.push(b[i] as char);
+                    if b[i] == b'\'' {
+                        if i + 1 < b.len() && b[i + 1] == b'\'' {
+                            out.push('\'');
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'-' if i + 1 < b.len() && b[i + 1] == b'-' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                out.push(' ');
+            }
+            b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+                out.push(' ');
+            }
+            c => {
+                out.push(c as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// v2.12: parse a cursor argument list (the inside of the parens of
+/// `OPEN c(...)` / `FOR r IN c(...)`): a comma list of expressions,
+/// each optionally named (`name := expr` or `name => expr`, PG19
+/// pl_gram.y cursor argument forms). Values are stored as
+/// `SELECT <expr>` statements.
+pub(crate) fn parse_plpgsql_cursor_args(
+    inside: &str,
+) -> Result<Vec<(Option<String>, Stmt)>, SqlError> {
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let cleaned = plpgsql_strip_all_comments(inside);
+    let mut out = Vec::new();
+    if cleaned.trim().is_empty() {
+        return Ok(out);
+    }
+    for part in split_top_level_commas(&cleaned) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        // Named form: an identifier followed by := or =>.
+        let mut named: Option<(String, &str)> = None;
+        if let Some((id, tail)) = split_ident(part) {
+            let tail = tail.trim_start();
+            if let Some(x) = tail.strip_prefix(":=") {
+                named = Some((id, x.trim()));
+            } else if let Some(x) = tail.strip_prefix("=>") {
+                named = Some((id, x.trim()));
+            }
+        }
+        let (name, expr_text) = match named {
+            Some((n, x)) => (Some(n), x),
+            None => (None, part),
+        };
+        let stmt = parse_statement(&format!("SELECT {}", expr_text)).map_err(|e| SqlError {
+            message: format!("syntax error in cursor argument: {}", e.message),
+            code: "42601",
+        })?;
+        if !matches!(stmt, Stmt::Select(_)) {
+            return Err(syntax(
+                "cursor argument did not parse as an expression".to_string(),
+            ));
+        }
+        out.push((name, stmt));
+    }
+    Ok(out)
+}
+
+/// v2.12: parse an OPEN statement (the OPEN keyword already stripped):
+/// `OPEN <var>`, `OPEN <var>(args)`, and
+/// `OPEN <var> [[NO] SCROLL] FOR <query | EXECUTE ...>`.
+pub(crate) fn parse_plpgsql_open(rest: &str) -> Result<PlpgsqlStmt, SqlError> {
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let rest = rest.trim().trim_end_matches(';').trim();
+    let (var, r) =
+        split_ident(rest).ok_or_else(|| syntax("OPEN requires a cursor variable".to_string()))?;
+    let mut r = r.trim().to_string();
+    // Bound cursor with an argument list.
+    if r.starts_with('(') {
+        let close =
+            plpgsql_matching_paren(&r).ok_or_else(|| syntax("unbalanced OPEN arguments".into()))?;
+        let args = parse_plpgsql_cursor_args(&r[1..close])?;
+        if !r[close + 1..].trim().is_empty() {
+            return Err(syntax("junk after OPEN argument list".to_string()));
+        }
+        return Ok(PlpgsqlStmt::OpenBound { var, args });
+    }
+    // Optional [NO] SCROLL.
+    let mut scroll = false;
+    if plpgsql_starts_with_kw(&r, "scroll") {
+        scroll = true;
+        r = plpgsql_strip_kw(&r, "scroll")
+            .unwrap_or("")
+            .trim()
+            .to_string();
+    } else if plpgsql_starts_with_kw(&r, "no") {
+        let after = plpgsql_strip_kw(&r, "no").unwrap_or("").trim_start();
+        if plpgsql_starts_with_kw(after, "scroll") {
+            r = plpgsql_strip_kw(after, "scroll")
+                .unwrap_or("")
+                .trim()
+                .to_string();
+        }
+    }
+    if r.is_empty() {
+        return Ok(PlpgsqlStmt::OpenBound {
+            var,
+            args: Vec::new(),
+        });
+    }
+    let r2 = plpgsql_strip_kw(&r, "for")
+        .ok_or_else(|| syntax(format!("unsupported OPEN form: {}", r)))?;
+    let r2 = r2.trim();
+    if let Some(e) = plpgsql_strip_kw(r2, "execute") {
+        let e = e.trim();
+        // Split an optional USING list (top-level keyword).
+        let (expr_text, using) = match plpgsql_top_level_kw(e, "using") {
+            Some(up) => {
+                let mut using = Vec::new();
+                for part in split_top_level_commas(e[up + 5..].trim()) {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        continue;
+                    }
+                    let st =
+                        parse_statement(&format!("SELECT {}", part)).map_err(|er| SqlError {
+                            message: format!("syntax error in OPEN ... USING: {}", er.message),
+                            code: "42601",
+                        })?;
+                    if !matches!(st, Stmt::Select(_)) {
+                        return Err(syntax("OPEN USING item is not an expression".into()));
+                    }
+                    using.push(st);
+                }
+                (e[..up].trim(), using)
+            }
+            None => (e, Vec::new()),
+        };
+        let st = parse_statement(&format!("SELECT {}", expr_text)).map_err(|er| SqlError {
+            message: format!("syntax error in OPEN FOR EXECUTE: {}", er.message),
+            code: "42601",
+        })?;
+        if !matches!(st, Stmt::Select(_)) {
+            return Err(syntax("OPEN FOR EXECUTE is not an expression".into()));
+        }
+        return Ok(PlpgsqlStmt::OpenFor {
+            var,
+            scroll,
+            query: None,
+            dynamic: Some(Box::new(st)),
+            using,
+        });
+    }
+    let query = parse_statement(r2).map_err(|e| SqlError {
+        message: format!("syntax error in OPEN FOR query: {}", e.message),
+        code: "42601",
+    })?;
+    if !matches!(query, Stmt::Select(_)) {
+        return Err(syntax("OPEN FOR query is not a SELECT".to_string()));
+    }
+    Ok(PlpgsqlStmt::OpenFor {
+        var,
+        scroll,
+        query: Some(Box::new(query)),
+        dynamic: None,
+        using: Vec::new(),
+    })
+}
+
+/// v2.12: parse a FETCH or MOVE statement (keyword already stripped):
+/// `[direction] [FROM|IN] <var> [INTO <targets>]`. Directions mirror
+/// the SQL grammar (parser.rs parse_fetch_dir) except counts are
+/// arbitrary expressions, evaluated at run time.
+pub(crate) fn parse_plpgsql_fetch(rest: &str, is_move: bool) -> Result<PlpgsqlStmt, SqlError> {
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let rest = rest.trim().trim_end_matches(';').trim();
+    let mut r = rest.to_string();
+    let mut dir = PlFetchDir::Forward;
+    let mut count: Option<Box<Stmt>> = None;
+    // Direction keywords.
+    let mut need_count = false;
+    if plpgsql_starts_with_kw(&r, "next") {
+        r = plpgsql_strip_kw(&r, "next")
+            .unwrap_or("")
+            .trim()
+            .to_string();
+    } else if plpgsql_starts_with_kw(&r, "prior") {
+        dir = PlFetchDir::Backward;
+        r = plpgsql_strip_kw(&r, "prior")
+            .unwrap_or("")
+            .trim()
+            .to_string();
+    } else if plpgsql_starts_with_kw(&r, "first") {
+        dir = PlFetchDir::First;
+        r = plpgsql_strip_kw(&r, "first")
+            .unwrap_or("")
+            .trim()
+            .to_string();
+    } else if plpgsql_starts_with_kw(&r, "last") {
+        dir = PlFetchDir::Last;
+        r = plpgsql_strip_kw(&r, "last")
+            .unwrap_or("")
+            .trim()
+            .to_string();
+    } else if plpgsql_starts_with_kw(&r, "forward") || plpgsql_starts_with_kw(&r, "backward") {
+        let back = plpgsql_starts_with_kw(&r, "backward");
+        dir = if back {
+            PlFetchDir::Backward
+        } else {
+            PlFetchDir::Forward
+        };
+        r = plpgsql_strip_kw(&r, if back { "backward" } else { "forward" })
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        need_count = true; // optional count
+    } else if plpgsql_starts_with_kw(&r, "absolute") || plpgsql_starts_with_kw(&r, "relative") {
+        let abs = plpgsql_starts_with_kw(&r, "absolute");
+        dir = if abs {
+            PlFetchDir::Absolute
+        } else {
+            PlFetchDir::Relative
+        };
+        r = plpgsql_strip_kw(&r, if abs { "absolute" } else { "relative" })
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        need_count = true; // required count
+    }
+    if need_count {
+        // The count expression runs up to the FROM/IN keyword that
+        // introduces the cursor name (or, without one, it is the
+        // first top-level token sequence before the cursor name —
+        // the tests always write FROM/IN with a count, so the
+        // fallback splits at the last whitespace before INTO/end is
+        // not attempted; a bare ident tail means no count was given).
+        let sep = ["from", "in"]
+            .iter()
+            .filter_map(|kw| plpgsql_top_level_kw(&r, kw))
+            .min();
+        match sep {
+            Some(p) => {
+                let ctext = r[..p].trim();
+                if ctext.eq_ignore_ascii_case("all") {
+                    dir = match dir {
+                        PlFetchDir::Forward => PlFetchDir::ForwardAll,
+                        PlFetchDir::Backward => PlFetchDir::BackwardAll,
+                        d => d,
+                    };
+                } else if !ctext.is_empty() {
+                    let st =
+                        parse_statement(&format!("SELECT {}", ctext)).map_err(|e| SqlError {
+                            message: format!("syntax error in FETCH count: {}", e.message),
+                            code: "42601",
+                        })?;
+                    if !matches!(st, Stmt::Select(_)) {
+                        return Err(syntax("FETCH count is not an expression".into()));
+                    }
+                    count = Some(Box::new(st));
+                }
+                r = r[p..].trim().to_string();
+            }
+            None => {
+                // No FROM/IN: only legal when no count was written
+                // (FORWARD/BACKWARD bare); ABSOLUTE/RELATIVE require
+                // a count, which then is the whole remainder before
+                // the cursor name — not separable, so reject.
+                if matches!(dir, PlFetchDir::Absolute | PlFetchDir::Relative) {
+                    return Err(syntax(
+                        "FETCH ABSOLUTE/RELATIVE requires a count and a cursor".into(),
+                    ));
+                }
+            }
+        }
+    }
+    // Optional FROM / IN.
+    if plpgsql_starts_with_kw(&r, "from") {
+        r = plpgsql_strip_kw(&r, "from")
+            .unwrap_or("")
+            .trim()
+            .to_string();
+    } else if plpgsql_starts_with_kw(&r, "in") {
+        r = plpgsql_strip_kw(&r, "in").unwrap_or("").trim().to_string();
+    }
+    let (var, tail) =
+        split_ident(&r).ok_or_else(|| syntax("FETCH requires a cursor variable".to_string()))?;
+    let tail = tail.trim();
+    if is_move {
+        if !tail.is_empty() {
+            return Err(syntax(format!("junk after MOVE cursor: {}", tail)));
+        }
+        return Ok(PlpgsqlStmt::Move { var, dir, count });
+    }
+    let targets = if tail.is_empty() {
+        None
+    } else {
+        let t = plpgsql_strip_kw(tail, "into")
+            .ok_or_else(|| syntax(format!("junk after FETCH cursor: {}", tail)))?;
+        let mut ts = Vec::new();
+        for part in split_top_level_commas(t.trim()) {
+            ts.push(parse_pl_target(part)?);
+        }
+        Some(ts)
+    };
+    Ok(PlpgsqlStmt::Fetch {
+        var,
+        dir,
+        count,
+        targets,
+    })
+}
+
 /// v1.01/v2.11: parse one single-chunk statement of a plpgsql body.
 /// Compound statements (IF / FOR / WHILE / LOOP / CASE / blocks) are
 /// assembled by `parse_plpgsql_stmt_list` before this is called.
@@ -7158,21 +7855,44 @@ pub(crate) fn parse_plpgsql_stmt(text: &str) -> Result<PlpgsqlStmt, SqlError> {
             return Ok(PlpgsqlStmt::ReturnBare);
         } else if let Some(after) = plpgsql_strip_kw(r, "next") {
             if after.trim().is_empty() {
-                return Err(SqlError {
-                    message:
-                        "RETURN NEXT without a value is only supported for OUT-parameter functions"
-                            .to_string(),
-                    code: "0A000",
-                });
+                // v2.12: bare RETURN NEXT — legal for OUT-parameter /
+                // RETURNS TABLE functions; placement is validated in
+                // plpgsql_validate_returns (which knows the shape).
+                return Ok(PlpgsqlStmt::ReturnNextBare);
             }
             return parse_plpgsql_return_next(after);
         } else if let Some(after) = plpgsql_strip_kw(r, "query") {
             let q = after.trim();
             if let Some(e) = plpgsql_strip_kw(q, "execute") {
-                let st =
-                    parse_statement(&format!("SELECT {}", e.trim())).map_err(|_| unsupported(t))?;
+                let e = e.trim();
+                // v2.12: optional USING list binds $1.. in the
+                // dynamic command (return_dquery family).
+                let (expr_text, using) = match plpgsql_top_level_kw(e, "using") {
+                    Some(up) => {
+                        let mut using = Vec::new();
+                        for part in split_top_level_commas(e[up + 5..].trim()) {
+                            let part = part.trim();
+                            if part.is_empty() {
+                                continue;
+                            }
+                            let st = parse_statement(&format!("SELECT {}", part))
+                                .map_err(|_| unsupported(t))?;
+                            match st {
+                                Stmt::Select(_) => using.push(st),
+                                _ => return Err(unsupported(t)),
+                            }
+                        }
+                        (e[..up].trim(), using)
+                    }
+                    None => (e, Vec::new()),
+                };
+                let st = parse_statement(&format!("SELECT {}", expr_text))
+                    .map_err(|_| unsupported(t))?;
                 return match st {
-                    Stmt::Select(_) => Ok(PlpgsqlStmt::ReturnQueryExecute(Box::new(st))),
+                    Stmt::Select(_) => Ok(PlpgsqlStmt::ReturnQueryExecute {
+                        expr: Box::new(st),
+                        using,
+                    }),
                     _ => Err(unsupported(t)),
                 };
             }
@@ -7192,6 +7912,25 @@ pub(crate) fn parse_plpgsql_stmt(text: &str) -> Result<PlpgsqlStmt, SqlError> {
     // EXECUTE dynamic SQL.
     if let Some(rest) = plpgsql_strip_kw(t, "execute") {
         return parse_plpgsql_execute(rest);
+    }
+    // v2.12: cursor statements (OPEN / FETCH / MOVE / CLOSE).
+    if let Some(rest) = plpgsql_strip_kw(t, "open") {
+        return parse_plpgsql_open(rest);
+    }
+    if let Some(rest) = plpgsql_strip_kw(t, "fetch") {
+        return parse_plpgsql_fetch(rest, false);
+    }
+    if let Some(rest) = plpgsql_strip_kw(t, "move") {
+        return parse_plpgsql_fetch(rest, true);
+    }
+    if let Some(rest) = plpgsql_strip_kw(t, "close") {
+        let rest = rest.trim().trim_end_matches(';').trim();
+        let (var, tail) = split_ident(rest)
+            .ok_or_else(|| syntax("CLOSE requires a cursor variable".to_string()))?;
+        if !tail.trim().is_empty() {
+            return Err(syntax(format!("junk after CLOSE cursor: {}", tail)));
+        }
+        return Ok(PlpgsqlStmt::Close { var });
     }
     // PERFORM: a full query, or an expression.
     if let Some(rest) = plpgsql_strip_kw(t, "perform") {
@@ -7475,6 +8214,8 @@ pub fn parse_plpgsql_body(
     body: &str,
     returns_set: bool,
     is_void: bool,
+    has_out: bool,
+    arg_names: &[String],
 ) -> Result<PlpgsqlBody, SqlError> {
     let unsupported = |msg: String| SqlError {
         message: msg,
@@ -7529,10 +8270,36 @@ pub fn parse_plpgsql_body(
             is_cursor: false,
             implicit: true,
             alias_slot: None,
+            cursor_query: None,
+            cursor_params: Vec::new(),
+            cursor_scroll: None,
+            is_constant: false,
         });
     }
-    plpgsql_validate_returns(&stmts, &handlers, returns_set, is_void)?;
-    plpgsql_validate_vars(&decls, &stmts, &handlers, label.as_deref())?;
+    plpgsql_validate_returns(&stmts, &handlers, returns_set, is_void, has_out)?;
+    // v2.12: name validation also sees the function's argument
+    // names (assignment to an OUT/INOUT argument, FETCH into an
+    // argument, etc. are legal PG19); stub decls carry the names
+    // for validation only — the stored body keeps its own decls,
+    // and CREATE/rebuild inject the real alias declarations.
+    let mut vdecls = decls.clone();
+    for n in arg_names {
+        vdecls.push(PlpgsqlDecl {
+            name: n.clone(),
+            type_name: String::new(),
+            default: None,
+            alias_for: None,
+            is_cursor: false,
+            implicit: true,
+            alias_slot: None,
+            cursor_query: None,
+            cursor_params: Vec::new(),
+            cursor_scroll: None,
+            is_constant: false,
+        });
+    }
+    plpgsql_validate_vars(&vdecls, &stmts, &handlers, label.as_deref())?;
+    plpgsql_validate_cursor_args(&decls, &stmts, &handlers)?;
     // v1.03: a SETOF function returns its accumulated rows; no dummy
     // RETURN is appended (PG19 `add_dummy_return` only applies to
     // scalar functions).
@@ -7551,6 +8318,143 @@ pub fn parse_plpgsql_body(
         handlers,
         trailing_dummy,
     })
+}
+
+/// v2.12: PG19 pl_comp.c's parse-time checks for OPEN / FOR-over-
+/// cursor argument lists against the cursor's declared parameters:
+/// a parameter supplied twice is `value for parameter "%s" of
+/// cursor "%s" specified more than once`; a list that leaves some
+/// parameter unsupplied is `not enough arguments for cursor "%s"`
+/// (both 42601). Only lists that supply at least one argument are
+/// checked (an empty list is the executor's "arguments required"
+/// case, matching exec_stmt_open).
+pub(crate) fn plpgsql_validate_cursor_args(
+    decls: &[PlpgsqlDecl],
+    stmts: &[PlpgsqlStmt],
+    handlers: &[PlpgsqlHandler],
+) -> Result<(), SqlError> {
+    fn check(
+        decls: &[PlpgsqlDecl],
+        cursor: &str,
+        args: &[(Option<String>, Stmt)],
+    ) -> Result<(), SqlError> {
+        if args.is_empty() {
+            return Ok(());
+        }
+        let Some(d) = decls.iter().find(|d| d.name == cursor) else {
+            return Ok(());
+        };
+        if !d.is_cursor || d.cursor_params.is_empty() {
+            return Ok(());
+        }
+        let mut assigned: Vec<Option<String>> = vec![None; d.cursor_params.len()];
+        // PG19: a positional argument binds the parameter at its
+        // own ordinal position in the list (so `(param2 := 20, 21)`
+        // supplies parameter 2 twice — the namedparmcursor_test3
+        // case); a named argument binds by name.
+        for (pos, (name, _)) in args.iter().enumerate() {
+            let idx = match name {
+                Some(n) => {
+                    let Some(i) = d.cursor_params.iter().position(|(pn, _)| pn == n) else {
+                        return Err(SqlError {
+                            message: format!(
+                                "parameter \"{}\" of cursor \"{}\" does not exist",
+                                n, cursor
+                            ),
+                            code: "42601",
+                        });
+                    };
+                    i
+                }
+                None => pos,
+            };
+            if idx >= assigned.len() || assigned[idx].is_some() {
+                let pname = d
+                    .cursor_params
+                    .get(idx)
+                    .map(|(n, _)| n.clone())
+                    .unwrap_or_default();
+                return Err(SqlError {
+                    message: format!(
+                        "value for parameter \"{}\" of cursor \"{}\" specified more than once",
+                        pname, cursor
+                    ),
+                    code: "42601",
+                });
+            }
+            assigned[idx] = Some(String::new());
+        }
+        if assigned.iter().any(|a| a.is_none()) {
+            return Err(SqlError {
+                message: format!("not enough arguments for cursor \"{}\"", cursor),
+                code: "42601",
+            });
+        }
+        Ok(())
+    }
+    fn walk(decls: &[PlpgsqlDecl], stmts: &[PlpgsqlStmt]) -> Result<(), SqlError> {
+        for s in stmts {
+            match s {
+                PlpgsqlStmt::OpenBound { var, args } => check(decls, var, args)?,
+                PlpgsqlStmt::ForCursor {
+                    cursor, args, body, ..
+                } => {
+                    // v2.12 finishing (PG19 pl_gram.y FORC): a cursor
+                    // FOR loop needs a BOUND cursor variable — one
+                    // declared with `CURSOR ... FOR <query>`. A plain
+                    // refcursor variable (cursor_query None) is a
+                    // CREATE-time error (the forc_bad case). Names
+                    // not in `decls` (function arguments) keep the
+                    // lenient behavior of `check` below.
+                    if let Some(d) = decls.iter().find(|d| d.name == *cursor) {
+                        if d.cursor_query.is_none()
+                            && (d.is_cursor || d.type_name.eq_ignore_ascii_case("refcursor"))
+                        {
+                            return Err(SqlError {
+                                message: "cursor FOR loop must use a bound cursor variable"
+                                    .to_string(),
+                                code: "42601",
+                            });
+                        }
+                    }
+                    check(decls, cursor, args)?;
+                    walk(decls, body)?;
+                }
+                PlpgsqlStmt::ForQuery { body, .. }
+                | PlpgsqlStmt::ForRange { body, .. }
+                | PlpgsqlStmt::While { body, .. }
+                | PlpgsqlStmt::Loop { body } => walk(decls, body)?,
+                PlpgsqlStmt::If {
+                    branches,
+                    else_body,
+                }
+                | PlpgsqlStmt::Case {
+                    branches,
+                    else_body,
+                } => {
+                    for (_, b) in branches {
+                        walk(decls, b)?;
+                    }
+                    walk(decls, else_body)?;
+                }
+                PlpgsqlStmt::Block {
+                    stmts, handlers, ..
+                } => {
+                    walk(decls, stmts)?;
+                    for h in handlers {
+                        walk(decls, &h.stmts)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    walk(decls, stmts)?;
+    for h in handlers {
+        walk(decls, &h.stmts)?;
+    }
+    Ok(())
 }
 
 /// v1.00: parse a bounded trigger-function body (`RETURNS trigger`,
@@ -8104,6 +9008,12 @@ pub enum Stmt {
     DropFunction {
         name: String,
         arg_types: Vec<String>,
+        /// v2.12 finishing: per-argument mode codes as written in the
+        /// DROP list (ArgMode::code), parallel to `arg_types`;
+        /// u8::MAX where the statement wrote no mode keyword (PG19
+        /// treats a modeless entry as a wildcard when matching the
+        /// full argument list). Empty when `args_omitted`.
+        arg_modes: Vec<u8>,
         if_exists: bool,
         /// v0.87: PG19 CASCADE/RESTRICT (RESTRICT is the default).
         cascade: bool,

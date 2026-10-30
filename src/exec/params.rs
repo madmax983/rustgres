@@ -1312,7 +1312,27 @@ pub(crate) fn value_to_literal(v: &Option<Value>) -> Literal {
 pub(crate) fn subst_expr(e: &mut Expr, params: &[Option<Value>]) -> Result<(), ExecError> {
     match e {
         Expr::Param(p) => {
-            *e = Expr::Literal(param_literal(*p, params)?);
+            // v2.12: an array parameter substitutes as a CAST of its
+            // literal text to the array type, not as a bare text
+            // literal — expression consumers (array_length,
+            // subscripts, unnest, ANY) need the array VALUE, and the
+            // cast re-parses the literal (the engine's documented
+            // round-trip) with dims/lower bounds intact. PG binds
+            // parameters typed; every other value kind's literal
+            // already evaluates to its own type.
+            let idx = (*p as usize).saturating_sub(1);
+            match params.get(idx) {
+                Some(Some(Value::Array(a))) => {
+                    *e = Expr::Cast {
+                        expr: Box::new(Expr::Literal(Literal::Text(a.to_literal().into()))),
+                        to: ColType::Array(a.elem),
+                        written: None,
+                    };
+                }
+                _ => {
+                    *e = Expr::Literal(param_literal(*p, params)?);
+                }
+            }
         }
         Expr::Arith { left, right, .. }
         | Expr::And(left, right)

@@ -39,7 +39,9 @@ pub(crate) const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK16";
 /// v2.08: version 27 adds the per-index `nulls_not_distinct` byte.
 /// v26 checkpoints are refused; remove the data directory to start
 /// fresh.
-pub(crate) const CHKPT_VERSION: u32 = 27;
+/// v2.12: version 28 adds per-function `arg_modes`. v27 checkpoints
+/// are refused; remove the data directory to start fresh.
+pub(crate) const CHKPT_VERSION: u32 = 28;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -107,9 +109,11 @@ pub(crate) const CHKPT_VERSION: u32 = 27;
 /// v2.08: `RGSWAL30` — CreateIndex records carry `nulls_not_distinct`
 /// (trailing byte). Older logs (down to MIN_READABLE) still read;
 /// the field decodes as false.
-pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL30";
+/// v2.12: `RGSWAL31` — CreateFunction records carry `arg_modes`
+/// (trailing list). Older logs still read; modes decode as all-IN.
+pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL32";
 /// v1.80: the format version number in [`WAL_MAGIC`].
-pub(crate) const WAL_VERSION: u32 = 30;
+pub(crate) const WAL_VERSION: u32 = 32;
 /// v1.80: oldest WAL format this build can replay.
 pub(crate) const MIN_READABLE_WAL_VERSION: u32 = 20;
 pub(crate) const WAL_HEADER_LEN: u64 = 16;
@@ -905,6 +909,11 @@ impl Wal {
                 for (cn, ct) in &f.table_cols {
                     img.str(cn);
                     img.str(ct);
+                }
+                // v2.12 (checkpoint v28): argument modes.
+                img.u32(f.arg_modes.len() as u32);
+                for m in &f.arg_modes {
+                    img.u8(*m);
                 }
             }
         }
@@ -1757,12 +1766,20 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 let ct = d.str().map_err(|e| bad(&e))?;
                 table_cols.push((cn, ct));
             }
+            // v2.12 (checkpoint v28): argument modes.
+            let n_am = d.u32().map_err(|e| bad(&e))? as usize;
+            let mut arg_modes = Vec::with_capacity(n_am);
+            for _ in 0..n_am {
+                arg_modes.push(d.u8().map_err(|e| bad(&e))?);
+            }
             let (parsed, plpgsql) = crate::exec::rebuild_function_bodies(
                 lang,
                 &arg_names,
+                &arg_modes,
                 &body,
                 returns_set,
                 ret_type.eq_ignore_ascii_case("void"),
+                &table_cols,
             );
             overloads.push(crate::storage::FuncDef {
                 name: name.clone(),
@@ -1780,6 +1797,7 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 security_definer,
                 is_procedure,
                 table_cols,
+                arg_modes,
             });
         }
         eng.db.functions.insert(name, overloads);

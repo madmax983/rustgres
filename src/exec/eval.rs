@@ -3271,42 +3271,114 @@ pub(crate) fn resolve_function_overload(
     let overloads = eng.db.functions.get(name)?;
     let mut arity_match: Option<&crate::storage::FuncDef> = None;
     let mut plain_match: Option<&crate::storage::FuncDef> = None;
+    let mut variadic_match: Option<&crate::storage::FuncDef> = None;
     for fdef in overloads {
-        if fdef.arg_types.len() != arg_vals.len() {
+        // v2.12: arity is measured over INPUT arguments (OUT args
+        // are never supplied at call sites). A trailing VARIADIC
+        // input matches any call with at least (inputs - 1)
+        // arguments, packing the rest.
+        let inputs: Vec<usize> = (0..fdef.arg_types.len())
+            .filter(|i| fdef.arg_mode(*i).is_input())
+            .collect();
+        let has_variadic = inputs
+            .last()
+            .is_some_and(|i| fdef.arg_mode(*i) == crate::sql::ArgMode::Variadic);
+        let arity_ok = if has_variadic {
+            arg_vals.len() + 1 >= inputs.len()
+        } else {
+            inputs.len() == arg_vals.len()
+        };
+        if !arity_ok {
             continue;
         }
-        if arity_match.is_none() {
+        if has_variadic {
+            if variadic_match.is_none() {
+                variadic_match = Some(fdef);
+            }
+        } else if arity_match.is_none() {
             arity_match = Some(fdef);
         }
-        // v2.11: PG19 prefers a non-variadic candidate on conflict
-        // (a `variadic T[]` parameter packs the call arguments; it is
-        // only chosen when no plain candidate fits). Our variadic
-        // packing is not implemented, so in the fallback tier prefer
-        // the first candidate whose parameters are not array-typed
-        // over an array-typed one (e.g. pleast(numeric) must win over
-        // pleast(variadic numeric[]) for a scalar call).
-        if plain_match.is_none() && fdef.arg_types.iter().all(|t| !t.contains('[')) {
+        // v2.11: PG19 prefers a non-variadic candidate on conflict.
+        // (v2.12: variadic packing IS implemented now, so the plain
+        // tier is a non-variadic candidate whose parameters are not
+        // array-typed — pleast(numeric) still wins over
+        // pleast(variadic numeric[]) for a scalar call.)
+        if !has_variadic && plain_match.is_none() && fdef.arg_types.iter().all(|t| !t.contains('['))
+        {
             plain_match = Some(fdef);
         }
-        // Prefer exact type matches.
-        let exact = fdef
-            .arg_types
-            .iter()
-            .zip(arg_vals.iter())
-            .all(|(decl, val)| match value_op_type_name(val) {
-                Some(actual) => canon_func_type_name(decl) == canon_func_type_name(actual),
-                None => false,
-            });
-        if exact {
+        // Prefer exact type matches over the input positions.
+        let exact =
+            inputs
+                .iter()
+                .zip(arg_vals.iter())
+                .all(|(di, val)| match value_op_type_name(val) {
+                    Some(actual) => {
+                        canon_func_type_name(&fdef.arg_types[*di]) == canon_func_type_name(actual)
+                    }
+                    None => false,
+                });
+        if exact && !has_variadic {
             return Some(fdef.clone());
         }
     }
-    plain_match.or(arity_match).cloned()
+    plain_match.or(arity_match).or(variadic_match).cloned()
+}
+
+/// v2.12: does a call with `argc` arguments fit this definition's
+/// signature? Input arity (PG19 identity args), full declared
+/// arity (legacy shapes), or a VARIADIC signature whose fixed
+/// prefix fits.
+pub(crate) fn argc_matches(f: &crate::storage::FuncDef, argc: usize) -> bool {
+    let n_in = (0..f.arg_types.len())
+        .filter(|i| f.arg_mode(*i).is_input())
+        .count();
+    if n_in == argc || f.arg_types.len() == argc {
+        return true;
+    }
+    let has_var = (0..f.arg_types.len())
+        .filter(|i| f.arg_mode(*i).is_input())
+        .last()
+        .is_some_and(|i| f.arg_mode(i) == crate::sql::ArgMode::Variadic);
+    has_var && argc + 1 >= n_in
+}
+
+/// v2.12: find an overload by call-site argument COUNT for the
+/// type-inference / FROM-typing paths that cannot use value-based
+/// resolution. Preference: exact input-arity (PG19 identity args),
+/// then full declared arity (legacy shapes), then a VARIADIC
+/// overload whose fixed prefix fits.
+pub(crate) fn overload_for_argc(
+    eng: &Engine,
+    name: &str,
+    argc: usize,
+) -> Option<crate::storage::FuncDef> {
+    let ovs = eng.db.functions.get(name)?;
+    let n_in = |f: &crate::storage::FuncDef| {
+        (0..f.arg_types.len())
+            .filter(|i| f.arg_mode(*i).is_input())
+            .count()
+    };
+    for f in ovs {
+        if n_in(f) == argc {
+            return Some(f.clone());
+        }
+    }
+    for f in ovs {
+        if f.arg_types.len() == argc {
+            return Some(f.clone());
+        }
+    }
+    ovs.iter().find(|f| argc_matches(f, argc)).cloned()
 }
 
 /// v0.87: resolve a function by (name, declared argument type names) for
 /// DROP FUNCTION and CREATE OR REPLACE. Matches by arity and canonical
 /// type name, like PG19.
+/// v2.12: a candidate matches when its INPUT argument types equal
+/// the given list (the PG19 identity signature); a full-type-list
+/// match is also accepted for legacy callers that pass every
+/// declared type.
 pub(crate) fn find_function_by_signature(
     eng: &Engine,
     name: &str,
@@ -3314,12 +3386,18 @@ pub(crate) fn find_function_by_signature(
 ) -> Option<crate::storage::FuncDef> {
     let overloads = eng.db.functions.get(name)?;
     for fdef in overloads {
-        if fdef.arg_types.len() == arg_types.len()
-            && fdef
-                .arg_types
-                .iter()
-                .zip(arg_types.iter())
-                .all(|(a, b)| canon_func_type_name(a) == canon_func_type_name(b))
+        let inputs = fdef.input_arg_types();
+        let cand: &[String] = if inputs.len() == arg_types.len() {
+            &inputs
+        } else if fdef.arg_types.len() == arg_types.len() {
+            &fdef.arg_types
+        } else {
+            continue;
+        };
+        if cand
+            .iter()
+            .zip(arg_types.iter())
+            .all(|(a, b)| canon_func_type_name(a) == canon_func_type_name(b))
         {
             return Some(fdef.clone());
         }

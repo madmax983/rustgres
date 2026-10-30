@@ -19,7 +19,7 @@ Sections:
   C. UPDATE's old chunks are reaped by vacuum
   D. ROLLBACK of a DELETE restores chunks (regression guard)
   E. chunk deletions survive a restart (WAL-logged)
-  F. WAL magic is RGSWAL30 (v2.08: WAL 30 adds the nulls_not_distinct trailing byte to CreateIndex records (decode gated >= 30); v2.04: WAL 29 adds publication records (CreatePublication/DropPublication/AlterPublication, tags 31-33) + CreateFunction RETURNS TABLE columns (trailing, decode gated >= 29); v1.99: WAL 28 adds per-key collation/opclass lists to CreateIndex records (trailing, decode gated >= 28; magic bumped in lockstep -- recovery derives the decode version from the magic); v1.96: WAL 27 adds the rolreplication trailing byte to role records (decode gated >= 27); WAL 26: membership option bytes + rolinherit in role records; v1.94: tsvector/tsquery ColType+Value tags;
+  F. WAL magic is RGSWAL32 (v2.12 finishing: WAL 32 adds the arg_modes trailing list to DropFunction records (decode gated >= 32; older logs decode empty and replay uses the types-only key); v2.12: WAL 31 adds the arg_modes trailing list to CreateFunction records (decode gated >= 31; older logs decode modes as all-IN); v2.08: WAL 30 adds the nulls_not_distinct trailing byte to CreateIndex records (decode gated >= 30); v2.04: WAL 29 adds publication records (CreatePublication/DropPublication/AlterPublication, tags 31-33) + CreateFunction RETURNS TABLE columns (trailing, decode gated >= 29); v1.99: WAL 28 adds per-key collation/opclass lists to CreateIndex records (trailing, decode gated >= 28; magic bumped in lockstep -- recovery derives the decode version from the magic); v1.96: WAL 27 adds the rolreplication trailing byte to role records (decode gated >= 27); WAL 26: membership option bytes + rolinherit in role records; v1.94: tsvector/tsquery ColType+Value tags;
      v1.05: SetToastRelid record tag 28;
      v0.41: method codes in toast_info;
      v0.72: is_partitioned in checkpoint/WAL records;
@@ -299,7 +299,7 @@ def main():
         stop_server(proc)
     with open(os.path.join(data_dir, "wal.log"), "rb") as f:
         magic = f.read(8)
-    check("F1 WAL magic is RGSWAL30", magic == b"RGSWAL30")
+    check("F1 WAL magic is RGSWAL32", magic == b"RGSWAL32")
     shutil.rmtree(data_dir, ignore_errors=True)
 
     print(f"protocol_test39: {passed} passed, {failed} failed")

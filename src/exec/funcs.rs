@@ -585,6 +585,15 @@ pub(crate) fn coerce_to_type_name(
     if type_name.ends_with("[]") && matches!(v, Value::Array(_)) {
         return Ok(v.clone());
     }
+    // v2.12: refcursor values are portal names (text); pass through.
+    if type_name.eq_ignore_ascii_case("refcursor") {
+        return Ok(match v {
+            Value::Null => Value::Null,
+            Value::Text(s) => Value::Text(s.clone()),
+            Value::BpChar(s) => Value::Text(s.clone()),
+            other => other.clone(),
+        });
+    }
     eval_cast_named(q, v, type_name)
 }
 
@@ -614,13 +623,24 @@ pub(crate) fn run_func_body(
     // by the caller (Some only for volatile functions).
     pending: Option<Rc<RefCell<Vec<(String, u64, Row)>>>>,
 ) -> Result<SelectOut, ExecError> {
-    // Arity is checked by the caller; coerce each argument to the
-    // declared type (PG19 function call coercion, assignment cast).
-    let mut coerced = Vec::with_capacity(args.len());
-    for (v, t) in args.iter().zip(fdef.arg_types.iter()) {
+    // Arity is checked by the caller. v2.12: expand the supplied
+    // (input-only) values into the full declared argument vector:
+    // OUT slots start NULL, INOUT slots take the supplied value,
+    // and a trailing VARIADIC input packs the remaining supplied
+    // values into one array (PG19 fmgr / MakeVariadicFunctionCall
+    // semantics; the empty call packs an empty array). Then coerce
+    // each slot to its declared type (PG19 function call coercion,
+    // assignment cast).
+    let expanded = expand_call_args(fdef, args);
+    let mut coerced = Vec::with_capacity(expanded.len());
+    for (v, t) in expanded.iter().zip(fdef.arg_types.iter()) {
         coerced.push(coerce_func_arg(q, v, t)?);
     }
-    if fdef.strict && coerced.iter().any(|v| v == &Value::Null) {
+    if fdef.strict
+        && (0..fdef.arg_types.len())
+            .filter(|i| fdef.arg_mode(*i).is_input())
+            .any(|i| coerced.get(i) == Some(&Value::Null))
+    {
         // PG19: a STRICT function is not called on NULL input; the
         // scalar result is NULL. (For set-returning STRICT functions PG
         // returns zero rows; the scalar path below handles NULL.)
@@ -733,12 +753,83 @@ pub(crate) fn run_func_body(
         }
     }
     // CREATE guarantees a non-empty statement list (42P13 on empty).
-    last_out.ok_or_else(|| {
+    let mut out = last_out.ok_or_else(|| {
         exec_err(
             "XX000",
             format!("function \"{}\" has an empty parsed body", fdef.name),
         )
-    })
+    })?;
+    // v2.12: SQL-language bodies with output parameters: the final
+    // SELECT's row maps positionally onto the outputs (PG19: the
+    // result row IS the output tuple); RETURNS TABLE names/types
+    // come from the declaration.
+    if fdef.has_outputs() {
+        let cols = fdef_output_columns(&mut call_q, fdef)?;
+        out.columns = cols;
+        if !fdef.returns_set {
+            out.rows.truncate(1);
+        }
+    }
+    Ok(out)
+}
+
+/// v2.12: expand call-site values (which cover only the input
+/// parameters, in declaration order) into the full declared
+/// argument vector. OUT slots start NULL; a trailing VARIADIC input
+/// packs all remaining values into one array of the declared
+/// element type. If the caller already supplied the full vector
+/// (legacy internal callers), it passes through unchanged.
+pub(crate) fn expand_call_args(fdef: &crate::storage::FuncDef, args: &[Value]) -> Vec<Value> {
+    let n_in = (0..fdef.arg_types.len())
+        .filter(|i| fdef.arg_mode(*i).is_input())
+        .count();
+    // Expansion applies when the supplied values cover the input
+    // parameters: exactly for plain signatures, at-least-the-fixed-
+    // prefix for VARIADIC ones (the tail packs). Anything else is a
+    // legacy caller that already supplied the full declared vector.
+    let has_var = (0..fdef.arg_types.len())
+        .filter(|i| fdef.arg_mode(*i).is_input())
+        .last()
+        .is_some_and(|i| fdef.arg_mode(i) == crate::sql::ArgMode::Variadic);
+    let should_expand = if has_var {
+        args.len() + 1 >= n_in
+    } else {
+        args.len() == n_in
+    };
+    if !should_expand {
+        return args.to_vec();
+    }
+    let mut out: Vec<Value> = Vec::with_capacity(fdef.arg_types.len());
+    let mut src = args.iter();
+    for i in 0..fdef.arg_types.len() {
+        match fdef.arg_mode(i) {
+            crate::sql::ArgMode::Out => out.push(Value::Null),
+            crate::sql::ArgMode::Variadic => {
+                let rest: Vec<Value> = src.by_ref().cloned().collect();
+                out.push(pack_variadic_array(&fdef.arg_types[i], rest));
+            }
+            _ => out.push(src.next().cloned().unwrap_or(Value::Null)),
+        }
+    }
+    out
+}
+
+/// v2.12: build the array value for a VARIADIC parameter from the
+/// packed call arguments (element type = declared array type's
+/// element; empty input -> empty array with lower bound 1).
+pub(crate) fn pack_variadic_array(declared: &str, elems: Vec<Value>) -> Value {
+    let base = declared
+        .trim()
+        .strip_suffix("[]")
+        .unwrap_or(declared.trim());
+    let ct = crate::sql::coltype_by_name(base).unwrap_or(ColType::Text);
+    let n = elems.len();
+    Value::Array(Box::new(crate::storage::ArrayVal {
+        elem: crate::storage::ArrayElem::of(&ct),
+        dims: if n == 0 { Vec::new() } else { vec![n as i32] },
+        lower: vec![1],
+        elems,
+    }))
 }
 /// v1.39: run a DML statement nested inside another query level — a
 /// data-modifying CTE body or a function-body DML. Shared by
@@ -907,6 +998,68 @@ pub(crate) enum PlFlow {
 /// diagnostics, the last caught error (for GET STACKED DIAGNOSTICS
 /// and bare RAISE), and the block scope stack used to resolve
 /// shadowed variable names.
+/// v2.12: one output parameter of a function being executed:
+/// an OUT/INOUT argument (`arg_slot` = its params index) or a
+/// RETURNS TABLE column (`arg_slot` None — resolved by name
+/// through the body's decl slots).
+pub(crate) struct PlOutDef {
+    pub(crate) name: String,
+    pub(crate) type_name: String,
+    pub(crate) arg_slot: Option<usize>,
+}
+
+/// v2.12: the output parameter definitions of a function
+/// (OUT/INOUT arguments in declaration order, then RETURNS TABLE
+/// columns). Empty for ordinary functions.
+pub(crate) fn fdef_output_defs(fdef: &crate::storage::FuncDef) -> Vec<PlOutDef> {
+    let mut v = Vec::new();
+    for (i, t) in fdef.arg_types.iter().enumerate() {
+        if fdef.arg_mode(i).is_output() {
+            let name = fdef
+                .arg_names
+                .get(i)
+                .cloned()
+                .flatten()
+                .unwrap_or_else(|| t.clone());
+            v.push(PlOutDef {
+                name,
+                type_name: t.clone(),
+                arg_slot: Some(i),
+            });
+        }
+    }
+    for (cn, ct) in &fdef.table_cols {
+        v.push(PlOutDef {
+            name: cn.clone(),
+            type_name: ct.clone(),
+            arg_slot: None,
+        });
+    }
+    v
+}
+
+/// v2.12: the (name, type) result columns for a function's output
+/// parameters.
+pub(crate) fn fdef_output_columns(
+    q: &mut Q,
+    fdef: &crate::storage::FuncDef,
+) -> Result<Vec<(String, ColType)>, ExecError> {
+    let mut cols = Vec::new();
+    for o in fdef_output_defs(fdef) {
+        // Resolve like call_table_function's RETURNS TABLE branch:
+        // builtin names first, catalog types second, and opaque
+        // names (e.g. `name`, which this engine does not model as
+        // a ColType) degrade to Text rather than failing the call.
+        let ct = match crate::sql::coltype_by_name(&o.type_name) {
+            Ok(ct) => ct,
+            Err(_) => resolve_func_type_name(q.eng, q.snap, q.own, q.session, &o.type_name)
+                .unwrap_or(ColType::Text),
+        };
+        cols.push((o.name, ct));
+    }
+    Ok(cols)
+}
+
 pub(crate) struct PlpgsqlRun {
     /// Bound arguments followed by one slot per DECLAREd variable
     /// (`params[nargs + i]`). Named argument/variable references were
@@ -915,6 +1068,13 @@ pub(crate) struct PlpgsqlRun {
     pub(crate) nargs: usize,
     /// Accumulated `RETURN NEXT` rows (SETOF functions only).
     pub(crate) accum: Vec<Row>,
+    /// v2.12: output parameters of the function under execution
+    /// (see `fdef_output_defs`); empty for ordinary functions.
+    pub(crate) outputs: Vec<PlOutDef>,
+    /// v2.12: per-call unnamed-portal counter (PG numbers unnamed
+    /// portals per transaction; the suite's expectations only need
+    /// per-call-chain numbering starting at 1).
+    pub(crate) cursor_counter: u32,
     /// v2.11: record variables by name: the current row as
     /// (column name, value) pairs. The variable's param slot also
     /// holds the same row as a `Value::Record` so whole-record reads
@@ -939,6 +1099,8 @@ impl PlpgsqlRun {
             params,
             nargs,
             accum: Vec::new(),
+            outputs: Vec::new(),
+            cursor_counter: 0,
             recs: HashMap::new(),
             found: false,
             row_count: 0,
@@ -946,6 +1108,368 @@ impl PlpgsqlRun {
             scopes: Vec::new(),
         }
     }
+}
+
+/// v2.12: a materialized plpgsql portal (OPEN ... FOR / OPEN bound
+/// cursor): the query result plus the fetch position, mirroring
+/// the server's SQL-level cursor model (`server.rs` DECLARE:
+/// pos -1 = before first row, pos == len = after last row).
+pub(crate) struct PlPortal {
+    pub(crate) cols: Vec<(String, ColType)>,
+    pub(crate) rows: Vec<Row>,
+    pub(crate) pos: i64,
+    pub(crate) scroll: bool,
+}
+
+thread_local! {
+    /// v2.12: live plpgsql portals by name. Portals are per
+    /// connection; the server runs one connection per thread, so a
+    /// thread-local registry has exactly connection scope (the
+    /// same pattern as NOTICE_SINK / TRIGGER_DEPTH). The server
+    /// clears it at every transaction boundary and consults it for
+    /// SQL-level FETCH/MOVE/CLOSE of returned refcursors.
+    static PLPGSQL_PORTALS: RefCell<HashMap<String, PlPortal>> =
+        RefCell::new(HashMap::new());
+}
+
+/// v2.12: register (or replace) a plpgsql portal.
+pub(crate) fn pl_portal_put(name: String, portal: PlPortal) {
+    PLPGSQL_PORTALS.with(|m| {
+        m.borrow_mut().insert(name, portal);
+    });
+}
+
+/// v2.12: does a portal with this name exist?
+pub(crate) fn pl_portal_exists(name: &str) -> bool {
+    PLPGSQL_PORTALS.with(|m| m.borrow().contains_key(name))
+}
+
+/// v2.12: run `f` against the named portal, if it exists.
+pub(crate) fn pl_portal_with<R>(name: &str, f: impl FnOnce(&mut PlPortal) -> R) -> Option<R> {
+    PLPGSQL_PORTALS.with(|m| m.borrow_mut().get_mut(name).map(f))
+}
+
+/// v2.12: drop a portal; returns whether it existed.
+pub(crate) fn pl_portal_remove(name: &str) -> bool {
+    PLPGSQL_PORTALS.with(|m| m.borrow_mut().remove(name).is_some())
+}
+
+/// v2.12: drop every plpgsql portal (transaction end / abort).
+pub(crate) fn pl_portals_clear() {
+    PLPGSQL_PORTALS.with(|m| m.borrow_mut().clear());
+}
+
+/// v2.12: resolve a cursor statement's variable operand to its
+/// params slot. The CREATE rewrite substitutes `$n` for known
+/// names; anything else resolves by name.
+pub(crate) fn plpgsql_cursor_slot(
+    pb: &crate::sql::PlpgsqlBody,
+    run: &PlpgsqlRun,
+    var: &str,
+) -> Option<usize> {
+    if let Some(d) = var.strip_prefix('$') {
+        return d.parse::<usize>().ok().map(|n| n - 1);
+    }
+    plpgsql_slot(pb, run, var)
+}
+
+/// v2.12: the portal name a cursor variable currently holds
+/// (None when the variable is NULL / unset).
+pub(crate) fn plpgsql_cursor_name(
+    pb: &crate::sql::PlpgsqlBody,
+    run: &PlpgsqlRun,
+    var: &str,
+) -> Option<String> {
+    let slot = plpgsql_cursor_slot(pb, run, var)?;
+    match run.params.get(slot) {
+        Some(Some(Value::Text(s))) => Some(s.to_string()),
+        Some(Some(Value::BpChar(s))) => Some(s.to_string()),
+        _ => None,
+    }
+}
+
+/// v2.12: the display name of a cursor variable for error messages
+/// (the declaration's name when the operand is a `$n` slot).
+pub(crate) fn plpgsql_cursor_display(
+    pb: &crate::sql::PlpgsqlBody,
+    run: &PlpgsqlRun,
+    var: &str,
+) -> String {
+    if let Some(slot) = plpgsql_cursor_slot(pb, run, var) {
+        if let Some(d) = plpgsql_decl_for_slot(pb, run, slot) {
+            return d.name.clone();
+        }
+        if slot < run.nargs {
+            return format!("${}", slot + 1);
+        }
+    }
+    var.to_string()
+}
+
+/// v2.12: OPEN common tail: name resolution (PG19 exec_stmt_open —
+/// an existing name must not collide with a live portal, 42P03; a
+/// NULL variable takes a generated portal name, which a CONSTANT
+/// variable refuses, 22005), then portal registration.
+pub(crate) fn plpgsql_open_portal(
+    pb: &crate::sql::PlpgsqlBody,
+    run: &mut PlpgsqlRun,
+    var: &str,
+    scroll: bool,
+    out: SelectOut,
+) -> Result<String, ExecError> {
+    let slot = plpgsql_cursor_slot(pb, run, var).ok_or_else(|| {
+        exec_err(
+            "XX000",
+            format!("plpgsql cursor variable \"{}\" is not declared", var),
+        )
+    })?;
+    let existing = plpgsql_cursor_name(pb, run, var);
+    let name = match existing {
+        Some(n) => {
+            if pl_portal_exists(&n) {
+                return Err(exec_err(
+                    "42P03",
+                    format!("cursor \"{}\" already in use", n),
+                ));
+            }
+            n
+        }
+        None => {
+            let decl = plpgsql_decl_for_slot(pb, run, slot).cloned();
+            if decl.as_ref().is_some_and(|d| d.is_constant) {
+                return Err(exec_err(
+                    "22005",
+                    format!(
+                        "variable \"{}\" is declared CONSTANT",
+                        plpgsql_cursor_display(pb, run, var)
+                    ),
+                ));
+            }
+            run.cursor_counter += 1;
+            let n = format!("<unnamed portal {}>", run.cursor_counter);
+            if slot < run.params.len() {
+                run.params[slot] = Some(Value::Text(n.clone().into()));
+            }
+            n
+        }
+    };
+    pl_portal_put(
+        name.clone(),
+        PlPortal {
+            cols: out.columns,
+            rows: out.rows,
+            pos: -1,
+            scroll,
+        },
+    );
+    Ok(name)
+}
+
+/// v2.12: map a plpgsql fetch direction + evaluated count onto the
+/// SQL-level cursor-window direction.
+pub(crate) fn plpgsql_fetch_dir(
+    dir: &crate::sql::PlFetchDir,
+    count: Option<i64>,
+) -> crate::sql::FetchDir {
+    use crate::sql::FetchDir as F;
+    use crate::sql::PlFetchDir as D;
+    match dir {
+        D::Forward => F::Forward(count.or(Some(1))),
+        D::Backward => F::Backward(count.or(Some(1))),
+        D::ForwardAll => F::Forward(None),
+        D::BackwardAll => F::Backward(None),
+        D::Absolute => F::Absolute(count.unwrap_or(0)),
+        D::Relative => F::Relative(count.unwrap_or(0)),
+        D::First => F::First,
+        D::Last => F::Last,
+    }
+}
+
+/// v2.12: evaluate a FETCH/MOVE count expression (a SELECT-wrapped
+/// integer expression); NULL is 22004 for ABSOLUTE/RELATIVE
+/// (PG19 exec_stmt_fetch) and treated as 1 elsewhere.
+pub(crate) fn plpgsql_fetch_count(
+    q: &mut Q,
+    scopes: &[Scope],
+    count: &Option<Box<Stmt>>,
+    pb: &crate::sql::PlpgsqlBody,
+    run: &PlpgsqlRun,
+    null_is_error: bool,
+) -> Result<Option<i64>, ExecError> {
+    let Some(c) = count else {
+        return Ok(None);
+    };
+    let out = eval_plpgsql_query(q, scopes, c, pb, run)?;
+    match out.rows.first().and_then(|r| r.first()) {
+        Some(Value::Int(n)) => Ok(Some(*n)),
+        Some(Value::BigInt(n)) => Ok(Some(*n)),
+        Some(Value::SmallInt(n)) => Ok(Some(*n as i64)),
+        _ => {
+            if null_is_error {
+                Err(exec_err(
+                    "22004",
+                    "relative or absolute cursor position is null".to_string(),
+                ))
+            } else {
+                Ok(Some(1))
+            }
+        }
+    }
+}
+
+/// v2.12: FETCH / MOVE against a plpgsql portal. Returns the
+/// window (columns, first-row Option, rows processed) — the caller
+/// assigns the first row for FETCH ... INTO and sets diagnostics
+/// from the processed count (PG19 exec_stmt_fetch: FOUND =
+/// processed != 0, ROW_COUNT = processed).
+pub(crate) fn plpgsql_fetch_move(
+    pb: &crate::sql::PlpgsqlBody,
+    run: &PlpgsqlRun,
+    var: &str,
+    dir: &crate::sql::PlFetchDir,
+    count: Option<i64>,
+) -> Result<(Vec<(String, ColType)>, Option<Row>, i64), ExecError> {
+    use crate::sql::PlFetchDir as D;
+    let name = plpgsql_cursor_name(pb, run, var).ok_or_else(|| {
+        exec_err(
+            "22004",
+            format!(
+                "cursor variable \"{}\" is null",
+                plpgsql_cursor_display(pb, run, var)
+            ),
+        )
+    })?;
+    let fdir = plpgsql_fetch_dir(dir, count);
+    let res = pl_portal_with(&name, |p| {
+        // PG19: backward movement on a NO SCROLL cursor is 55000.
+        let goes_backward = matches!(dir, D::Backward | D::BackwardAll)
+            || (matches!(dir, D::Relative) && count.unwrap_or(0) < 0);
+        if goes_backward && !p.scroll {
+            return Err(exec_err(
+                "55000",
+                "cursor can only scan forward".to_string(),
+            ));
+        }
+        let (start, end, new_pos) = crate::server::cursor_window(&fdir, p.pos, p.rows.len());
+        p.pos = new_pos;
+        let first = if end > start {
+            p.rows.get(start).cloned()
+        } else {
+            None
+        };
+        Ok((p.cols.clone(), first, (end - start) as i64))
+    });
+    match res {
+        Some(r) => r,
+        None => Err(exec_err(
+            "34000",
+            format!("cursor \"{}\" does not exist", name),
+        )),
+    }
+}
+
+/// v2.12: OPEN for a bound (declared) cursor: bind the supplied
+/// arguments to the cursor's parameters (positional args bind by
+/// ordinal position, named by name — the CREATE-time check already
+/// rejected duplicates and unknown names; a params-bearing cursor
+/// opened with NO arguments is PG19's 42601 "arguments required
+/// for cursor", and arguments for a parameterless cursor are
+/// "arguments given for cursor without arguments"), evaluate the
+/// cursor query with the parameters in their extra slots, and
+/// register the portal.
+pub(crate) fn plpgsql_open_bound(
+    q: &mut Q,
+    scopes: &[Scope],
+    pb: &crate::sql::PlpgsqlBody,
+    run: &mut PlpgsqlRun,
+    var: &str,
+    args: &[(Option<String>, Stmt)],
+) -> Result<(), ExecError> {
+    let slot = plpgsql_cursor_slot(pb, run, var).ok_or_else(|| {
+        exec_err(
+            "XX000",
+            format!("plpgsql cursor variable \"{}\" is not declared", var),
+        )
+    })?;
+    let decl = plpgsql_decl_for_slot(pb, run, slot)
+        .filter(|d| d.is_cursor)
+        .cloned()
+        .ok_or_else(|| {
+            exec_err(
+                "XX000",
+                format!(
+                    "plpgsql variable \"{}\" is not a declared cursor",
+                    plpgsql_cursor_display(pb, run, var)
+                ),
+            )
+        })?;
+    let disp = decl.name.clone();
+    if decl.cursor_params.is_empty() && !args.is_empty() {
+        return Err(exec_err(
+            "42601",
+            format!("arguments given for cursor \"{}\" without arguments", disp),
+        ));
+    }
+    if !decl.cursor_params.is_empty() && args.is_empty() {
+        return Err(exec_err(
+            "42601",
+            format!("arguments required for cursor \"{}\"", disp),
+        ));
+    }
+    // Evaluate the argument expressions against the CURRENT run,
+    // then evaluate the cursor query with the values in the extra
+    // slots (a shallow run sharing the parameter vector, extended).
+    let mut ext_params: Vec<Option<Value>> = run.params.clone();
+    ext_params.resize(run.nargs + pb.decls.len(), None);
+    for (j, (pn, pty)) in decl.cursor_params.iter().enumerate() {
+        let mut val = Value::Null;
+        for (pos, (an, aexpr)) in args.iter().enumerate() {
+            let hit = match an {
+                Some(n) => n == pn,
+                None => pos == j,
+            };
+            if hit {
+                let out = eval_plpgsql_query(q, scopes, aexpr, pb, run)?;
+                val = out
+                    .rows
+                    .first()
+                    .and_then(|r| r.first().cloned())
+                    .unwrap_or(Value::Null);
+                break;
+            }
+        }
+        let val = coerce_to_type_name(q, &val, pty)?;
+        ext_params.push(Some(val));
+    }
+    let query = decl
+        .cursor_query
+        .clone()
+        .ok_or_else(|| exec_err("XX000", format!("cursor \"{}\" has no query", disp)))?;
+    let ext_run = PlpgsqlRun::new(ext_params, run.nargs);
+    let out = eval_plpgsql_query(q, scopes, &query, pb, &ext_run)?;
+    plpgsql_open_portal(pb, run, var, decl.cursor_scroll.unwrap_or(false), out)?;
+    Ok(())
+}
+
+/// v2.12: snapshot the current output-parameter row (OUT/INOUT
+/// argument slots + RETURNS TABLE variable slots), each cell
+/// coerced to its declared output type.
+pub(crate) fn plpgsql_output_row(
+    q: &mut Q,
+    pb: &crate::sql::PlpgsqlBody,
+    run: &PlpgsqlRun,
+) -> Result<Row, ExecError> {
+    let mut cells = Vec::with_capacity(run.outputs.len());
+    for o in &run.outputs {
+        let v = match o.arg_slot {
+            Some(i) => run.params.get(i).cloned().flatten().unwrap_or(Value::Null),
+            None => plpgsql_slot(pb, run, &o.name)
+                .and_then(|s| run.params.get(s).cloned().flatten())
+                .unwrap_or(Value::Null),
+        };
+        cells.push(coerce_to_type_name(q, &v, &o.type_name)?);
+    }
+    Ok(Row::new(cells))
 }
 
 /// v1.03: evaluate a `SELECT <expr>` plpgsql fragment (RETURN, RETURN
@@ -1869,6 +2393,21 @@ pub(crate) fn append_next_rows(
     out: SelectOut,
     ret_type: &str,
 ) -> Result<(), ExecError> {
+    // v2.12: with output parameters, each produced row maps
+    // positionally onto the outputs (RETURN QUERY supplies the
+    // output tuple directly).
+    if !run.outputs.is_empty() {
+        let tys: Vec<String> = run.outputs.iter().map(|o| o.type_name.clone()).collect();
+        for row in out.rows {
+            let mut cells = Vec::with_capacity(tys.len());
+            for (i, t) in tys.iter().enumerate() {
+                let v = row.get(i).cloned().unwrap_or(Value::Null);
+                cells.push(coerce_to_type_name(q, &v, t)?);
+            }
+            run.accum.push(Row::new(cells));
+        }
+        return Ok(());
+    }
     for row in out.rows {
         let v = row.first().cloned().unwrap_or(Value::Null);
         let v = coerce_to_type_name(q, &v, ret_type)?;
@@ -2263,15 +2802,91 @@ pub(crate) fn run_plpgsql_stmts(
                 let out = run_plpgsql_select(q, scopes, sel, pb, run, "RETURN NEXT")?;
                 append_next_rows(q, run, out, ret_type)?;
             }
+            S::ReturnNextBare => {
+                // v2.12: bare RETURN NEXT appends the current output
+                // parameter row (parse-validated: only for functions
+                // with output parameters).
+                let row = plpgsql_output_row(q, pb, run)?;
+                run.accum.push(row);
+            }
             S::ReturnQuery(query) => {
                 let out = eval_plpgsql_query(q, scopes, query, pb, run)?;
                 append_next_rows(q, run, out, ret_type)?;
             }
-            S::ReturnQueryExecute(expr) => {
-                let (out, _) = plpgsql_exec_dynamic(q, scopes, expr, &[], pb, run)?;
+            S::ReturnQueryExecute { expr, using } => {
+                let (out, _) = plpgsql_exec_dynamic(q, scopes, expr, using, pb, run)?;
                 append_next_rows(q, run, out, ret_type)?;
             }
-            S::ForQuery { .. } | S::ForRange { .. } => {
+            S::OpenBound { var, args } => {
+                plpgsql_open_bound(q, scopes, pb, run, var, args)?;
+            }
+            S::OpenFor {
+                var,
+                scroll,
+                query,
+                dynamic,
+                using,
+            } => {
+                let out = match (query, dynamic) {
+                    (Some(sel), _) => eval_plpgsql_query(q, scopes, sel, pb, run)?,
+                    (None, Some(expr)) => plpgsql_exec_dynamic(q, scopes, expr, using, pb, run)?.0,
+                    (None, None) => {
+                        return Err(exec_err(
+                            "XX000",
+                            "OPEN ... FOR has neither a query nor a dynamic string".to_string(),
+                        ));
+                    }
+                };
+                plpgsql_open_portal(pb, run, var, *scroll, out)?;
+            }
+            S::Fetch {
+                var,
+                dir,
+                count,
+                targets,
+            } => {
+                let null_err = matches!(
+                    dir,
+                    crate::sql::PlFetchDir::Absolute | crate::sql::PlFetchDir::Relative
+                );
+                let cnt = plpgsql_fetch_count(q, scopes, count, pb, run, null_err)?;
+                let (cols, first, processed) = plpgsql_fetch_move(pb, run, var, dir, cnt)?;
+                if let Some(targets) = targets {
+                    let out = SelectOut {
+                        columns: cols,
+                        rows: first.into_iter().collect(),
+                    };
+                    plpgsql_assign_into(q, pb, run, targets, &out)?;
+                }
+                plpgsql_set_diag(pb, run, processed != 0, processed);
+            }
+            S::Move { var, dir, count } => {
+                let null_err = matches!(
+                    dir,
+                    crate::sql::PlFetchDir::Absolute | crate::sql::PlFetchDir::Relative
+                );
+                let cnt = plpgsql_fetch_count(q, scopes, count, pb, run, null_err)?;
+                let (_, _, processed) = plpgsql_fetch_move(pb, run, var, dir, cnt)?;
+                plpgsql_set_diag(pb, run, processed != 0, processed);
+            }
+            S::Close { var } => {
+                let name = plpgsql_cursor_name(pb, run, var).ok_or_else(|| {
+                    exec_err(
+                        "22004",
+                        format!(
+                            "cursor variable \"{}\" is null",
+                            plpgsql_cursor_display(pb, run, var)
+                        ),
+                    )
+                })?;
+                if !pl_portal_remove(&name) {
+                    return Err(exec_err(
+                        "34000",
+                        format!("cursor \"{}\" does not exist", name),
+                    ));
+                }
+            }
+            S::ForQuery { .. } | S::ForRange { .. } | S::ForCursor { .. } => {
                 match run_plpgsql_for(q, scopes, s, pb, run, ret_type, fname)? {
                     PlFlow::Continue => {}
                     other => return Ok(other),
@@ -2575,6 +3190,87 @@ pub(crate) fn run_plpgsql_for(
             plpgsql_set_diag(pb, run, seen, if seen { 1 } else { 0 });
             Ok(PlFlow::Continue)
         }
+        S::ForCursor {
+            var,
+            cursor,
+            args,
+            body,
+        } => {
+            // v2.12: FOR var IN cursor[(args)] LOOP (PG19
+            // exec_stmt_forc): open the cursor (bound form when it
+            // is a declared cursor, plain refcursor open otherwise),
+            // fetch one row per iteration into the record variable,
+            // and close the cursor when the loop ends — including
+            // early RETURN/EXIT paths (PG closes on loop exit).
+            let slot = plpgsql_cursor_slot(pb, run, cursor);
+            let is_bound = slot
+                .and_then(|s| plpgsql_decl_for_slot(pb, run, s))
+                .is_some_and(|d| d.is_cursor);
+            if is_bound {
+                plpgsql_open_bound(q, scopes, pb, run, cursor, args)?;
+            } else {
+                // A refcursor variable holding an already-open
+                // portal, or NULL (PG: opening a null refcursor
+                // variable in FOR is an error at fetch time —
+                // 22004 via the fetch path below).
+                if !args.is_empty() {
+                    return Err(exec_err(
+                        "42601",
+                        format!(
+                            "arguments given for cursor \"{}\" without arguments",
+                            plpgsql_cursor_display(pb, run, cursor)
+                        ),
+                    ));
+                }
+            }
+            let name = plpgsql_cursor_name(pb, run, cursor);
+            let mut seen = false;
+            let mut result = Ok(PlFlow::Continue);
+            'outer: loop {
+                let fetched = if name.is_some() {
+                    plpgsql_fetch_move(pb, run, cursor, &crate::sql::PlFetchDir::Forward, Some(1))
+                } else {
+                    // Unopened refcursor variable: PG raises the
+                    // null-variable error on the implicit FETCH.
+                    result = Err(exec_err(
+                        "22004",
+                        format!(
+                            "cursor variable \"{}\" is null",
+                            plpgsql_cursor_display(pb, run, cursor)
+                        ),
+                    ));
+                    break 'outer;
+                };
+                let (cols, first, processed) = match fetched {
+                    Ok(f) => f,
+                    Err(e) => {
+                        result = Err(e);
+                        break 'outer;
+                    }
+                };
+                if processed == 0 {
+                    break 'outer;
+                }
+                seen = true;
+                let colnames: Vec<String> = cols.iter().map(|(n, _)| n.clone()).collect();
+                plpgsql_bind_record(pb, run, var, &colnames, first.as_ref());
+                match loop_step(run_plpgsql_stmts(
+                    q, scopes, body, pb, run, ret_type, fname,
+                )?)? {
+                    LoopStep::Next => {}
+                    LoopStep::Break => break 'outer,
+                    LoopStep::Done(f) => {
+                        result = Ok(f);
+                        break 'outer;
+                    }
+                }
+            }
+            if let Some(n) = &name {
+                pl_portal_remove(n);
+            }
+            plpgsql_set_diag(pb, run, seen, if seen { 1 } else { 0 });
+            result
+        }
         _ => unreachable!("run_plpgsql_for called on a non-FOR statement"),
     }
 }
@@ -2626,6 +3322,14 @@ pub(crate) fn plpgsql_setof_result(
     fdef: &crate::storage::FuncDef,
     run: PlpgsqlRun,
 ) -> Result<SelectOut, ExecError> {
+    // v2.12: output parameters define the result columns.
+    if fdef.has_outputs() {
+        let cols = fdef_output_columns(q, fdef)?;
+        return Ok(SelectOut {
+            columns: cols,
+            rows: run.accum,
+        });
+    }
     let coltype = resolve_func_type_name(q.eng, q.snap, q.own, q.session, &fdef.ret_type)?;
     Ok(SelectOut {
         columns: vec![(fdef.name.clone(), coltype)],
@@ -2693,6 +3397,9 @@ pub(crate) fn run_plpgsql_body(
     };
     let nargs = params.len();
     let mut run = PlpgsqlRun::new(params.to_vec(), nargs);
+    // v2.12: output parameters shape RETURN NEXT / bare RETURN /
+    // fall-off results for this call.
+    run.outputs = fdef_output_defs(fdef);
     run.params
         .extend(std::iter::repeat(None).take(pb.decls.len()));
     init_plpgsql_decls(&mut call_q, scopes, pb, &mut run)?;
@@ -2732,13 +3439,39 @@ pub(crate) fn run_plpgsql_body(
         }
     };
     match flow {
-        PlFlow::Return(out) => Ok(out),
+        PlFlow::Return(out) => {
+            // v2.12: RETURN <expr> in a non-SETOF function with
+            // output parameters: a row of exactly the output width
+            // is the output tuple; otherwise fall back to the
+            // output snapshot (the common `RETURN <single out>`
+            // shape has width 1 == outputs width 1).
+            if !fdef.returns_set && fdef.has_outputs() {
+                let n_out = run.outputs.len();
+                if out.rows.len() == 1 && out.rows[0].len() == n_out {
+                    let cols = fdef_output_columns(&mut call_q, fdef)?;
+                    return Ok(SelectOut {
+                        columns: cols,
+                        rows: out.rows,
+                    });
+                }
+            }
+            Ok(out)
+        }
         PlFlow::ReturnBare => {
             // v2.11: bare RETURN — SETOF returns what accumulated;
             // anything else returns the NULL datum (PG19
             // exec_stmt_return with a NULL expression).
+            // v2.12: with output parameters, bare RETURN yields the
+            // current output row (PG19: the outputs ARE the result).
             if fdef.returns_set {
                 plpgsql_setof_result(&mut call_q, fdef, run)
+            } else if fdef.has_outputs() {
+                let cols = fdef_output_columns(&mut call_q, fdef)?;
+                let row = plpgsql_output_row(&mut call_q, pb, &run)?;
+                Ok(SelectOut {
+                    columns: cols,
+                    rows: vec![row],
+                })
             } else {
                 plpgsql_null_row_result(&mut call_q, fdef)
             }
@@ -2763,6 +3496,25 @@ pub(crate) fn plpgsql_falloff_result(
     run: PlpgsqlRun,
 ) -> Result<SelectOut, ExecError> {
     if !fdef.returns_set {
+        // v2.12: falling off the end of a function WITH output
+        // parameters returns the current output row (PG19). Only
+        // OUT/INOUT arguments can appear here — RETURNS TABLE
+        // implies SETOF — so every output resolves by arg slot.
+        if fdef.has_outputs() {
+            let cols = fdef_output_columns(call_q, fdef)?;
+            let mut cells = Vec::with_capacity(run.outputs.len());
+            for o in &run.outputs {
+                let v = match o.arg_slot {
+                    Some(i) => run.params.get(i).cloned().flatten().unwrap_or(Value::Null),
+                    None => Value::Null,
+                };
+                cells.push(coerce_to_type_name(call_q, &v, &o.type_name)?);
+            }
+            return Ok(SelectOut {
+                columns: cols,
+                rows: vec![Row::new(cells)],
+            });
+        }
         if fdef.ret_type.eq_ignore_ascii_case("void")
             || fdef.ret_type.eq_ignore_ascii_case("trigger")
         {
@@ -2823,6 +3575,31 @@ pub(crate) fn call_user_function(
         // STRICT-on-NULL short-circuit from run_func_body.
         return Ok(Value::Null);
     }
+    // v2.12: output parameters in scalar context: one output is
+    // the value itself; several form a record (PG19: the function
+    // returns the composite of its outputs).
+    if fdef.has_outputs() {
+        if out.rows.len() != 1 {
+            return Err(exec_err(
+                "42601",
+                format!(
+                    "function \"{}\" must return exactly one row in scalar context",
+                    fdef.name
+                ),
+            ));
+        }
+        let row = &out.rows[0];
+        if out.columns.len() == 1 {
+            return coerce_to_type_name(q, &row[0], &fdef_output_defs(fdef)[0].type_name);
+        }
+        let fields: Vec<(String, Value)> = out
+            .columns
+            .iter()
+            .map(|(n, _)| n.clone())
+            .zip(row.iter().cloned())
+            .collect();
+        return Ok(Value::Record(fields));
+    }
     if out.rows.len() != 1 || out.columns.len() != 1 {
         return Err(exec_err(
             "42601",
@@ -2859,6 +3636,13 @@ pub(crate) fn call_table_function(
         return Ok((vec![], vec![], vec![]));
     }
     if !fdef.returns_set {
+        // v2.12: a scalar function with output parameters yields
+        // its single output row under the output columns.
+        if fdef.has_outputs() {
+            let names: Vec<String> = out.columns.iter().map(|(n, _)| n.clone()).collect();
+            let types: Vec<ColType> = out.columns.iter().map(|(_, t)| t.clone()).collect();
+            return Ok((names, types, out.rows));
+        }
         // Scalar function in FROM: PG19 expands a composite result into
         // columns; a non-composite scalar becomes one column.
         if out.rows.len() != 1 || out.columns.len() != 1 {
@@ -13294,12 +14078,9 @@ pub(crate) fn func_result_type(
                 });
             }
             // v0.87: resolve overload by arity for type inference.
-            if let Some(fdef) = eng
-                .db
-                .functions
-                .get(name)
-                .and_then(|ovs| ovs.iter().find(|f| f.arg_types.len() == args.len()))
-            {
+            // v2.12: mode-aware (input arity / variadic) via the
+            // shared helper.
+            if let Some(fdef) = crate::exec::overload_for_argc(eng, name, args.len()) {
                 // v1.38: resolve via the shared helper so named types,
                 // shells, and the cstring pseudo-type type-check (the
                 // old ad-hoc builtin/table checks 42883'd them).
