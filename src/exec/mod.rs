@@ -43,10 +43,10 @@ pub(crate) use crate::sql::{
     FrameExclusion, FromItem, IndexColSpec, InsertIndirection, InsertTarget, InsertValue,
     IsolationLevel, JoinKind, JsonOp, JsonTableSpec, JtBehavior, JtColumn, Literal, MergeAction,
     MergeWhen, OnConflict, OrderTerm, OrderedSetAgg, PolicyCmd, QuantKind, QuantOp, RaiseLevel,
-    SelectItem, SelectStmt, SequenceOpts, SerialKind, SetOpKind, SetOpRoot, SqlError, Stmt,
-    TableDef, TrigCond, TrigForSource, TrigIntoTarget, TriggerBody, TriggerBodyStmt, TriggerDef,
-    TriggerTiming, UniqueDef, WindowFrame, WindowFunc, collect_col_refs, collect_table_refs,
-    parse_statement, parse_trigger_body, trig_event, validate_constraint_expr,
+    RowsFromPart, SelectItem, SelectStmt, SequenceOpts, SerialKind, SetOpKind, SetOpRoot, SqlError,
+    Stmt, TableDef, TrigCond, TrigForSource, TrigIntoTarget, TriggerBody, TriggerBodyStmt,
+    TriggerDef, TriggerTiming, UniqueDef, WindowFrame, WindowFunc, collect_col_refs,
+    collect_table_refs, parse_statement, parse_trigger_body, trig_event, validate_constraint_expr,
 };
 pub(crate) use crate::storage::index_visible;
 pub(crate) use crate::storage::{
@@ -316,6 +316,9 @@ mod v211_tests;
 #[cfg(test)]
 #[path = "test_mods/v212_tests.rs"]
 mod v212_tests;
+#[cfg(test)]
+#[path = "test_mods/v213_tests.rs"]
+mod v213_tests;
 #[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;

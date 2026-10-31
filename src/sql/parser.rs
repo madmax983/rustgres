@@ -1106,6 +1106,28 @@ impl Parser {
             "regclass" => Ok(ColType::Regclass),
             "pg_lsn" => Ok(ColType::PgLsn), // v0.64
             "xid" => Ok(ColType::Xid),      // v1.17
+            // v2.13: PG's internal array type names (`_int4` is the
+            // int4[] type, pg_type typarray naming) — they appear in
+            // column definition lists (`AS x(ia _int4)`) and casts.
+            "_int4" | "_int" | "_integer" => Ok(ColType::Array(crate::storage::ArrayElem::Int)),
+            "_int8" | "_bigint" => Ok(ColType::Array(crate::storage::ArrayElem::BigInt)),
+            "_int2" | "_smallint" => Ok(ColType::Array(crate::storage::ArrayElem::SmallInt)),
+            "_text" => Ok(ColType::Array(crate::storage::ArrayElem::Text)),
+            "_bool" | "_boolean" => Ok(ColType::Array(crate::storage::ArrayElem::Bool)),
+            "_float8" => Ok(ColType::Array(crate::storage::ArrayElem::Float)),
+            "_float4" => Ok(ColType::Array(crate::storage::ArrayElem::Float4)),
+            "_varchar" | "_bpchar" | "_char" | "_character" => {
+                Ok(ColType::Array(crate::storage::ArrayElem::Text))
+            }
+            "_name" => Ok(ColType::Array(crate::storage::ArrayElem::Text)),
+            "_date" => Ok(ColType::Array(crate::storage::ArrayElem::Date)),
+            "_timestamp" => Ok(ColType::Array(crate::storage::ArrayElem::Timestamp)),
+            "_timestamptz" => Ok(ColType::Array(crate::storage::ArrayElem::Timestamptz)),
+            "_numeric" | "_decimal" => Ok(ColType::Array(crate::storage::ArrayElem::Numeric)),
+            "_uuid" => Ok(ColType::Array(crate::storage::ArrayElem::Uuid)),
+            "_json" | "_jsonb" => Ok(ColType::Array(crate::storage::ArrayElem::Text)),
+            "_bytea" => Ok(ColType::Array(crate::storage::ArrayElem::Bytea)),
+            "_interval" => Ok(ColType::Array(crate::storage::ArrayElem::Interval)),
             // v0.81: not a builtin — treat as a (possibly) named composite
             // type; the name is resolved against the type catalog at
             // execution time (42704 if undefined).
@@ -13476,6 +13498,16 @@ impl Parser {
                 }
             }
             let name = self.expect_ident()?;
+            // v2.13: `FROM ROWS FROM (f(...) [AS (coldefs)], ...)`
+            // (PG19 gram.y func_table). `rows` is unreserved, so this
+            // fires only on the exact `rows FROM (` token shape; a
+            // table named `rows` still parses below.
+            if name == "rows"
+                && matches!(self.peek(), Token::Ident(s) if s == "from")
+                && matches!(self.peek2(), Token::LParen)
+            {
+                return self.parse_rows_from(lateral);
+            }
             // v0.9: schema-qualified names, so the information_schema
             // catalog views are reachable (`FROM information_schema.tables`).
             let name = if *self.peek() == Token::Dot {
@@ -13521,6 +13553,9 @@ impl Parser {
                     }
                 }
                 self.expect(Token::RParen, "')'")?;
+                // v2.13: PG19 gram.y func_table — WITH ORDINALITY
+                // precedes the alias clause.
+                let ordinality = self.parse_opt_ordinality()?;
                 // v1.84: `func(...) AS (a int, b text)` — a column
                 // definition list with no table alias (PG19
                 // func_table); parse_alias_opt would choke on the
@@ -13544,6 +13579,8 @@ impl Parser {
                     col_defs,
                     lateral,
                     json_table: None,
+                    ordinality,
+                    rows_from: Vec::new(),
                 });
             }
             let alias = self.parse_alias_opt()?;
@@ -13560,6 +13597,112 @@ impl Parser {
                 only,
             })
         }
+    }
+
+    /// v2.13: PG19 gram.y opt_ordinality — `WITH ORDINALITY` after a
+    /// function table item (or a ROWS FROM list), before the alias
+    /// clause.
+    pub(crate) fn parse_opt_ordinality(&mut self) -> Result<bool, SqlError> {
+        if self.eat_keyword("with") {
+            self.expect_keyword("ordinality")?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// v2.13: the argument list of a FROM-clause function call; the
+    /// opening '(' is already consumed and the closing ')' is
+    /// consumed here. Named-argument syntax works like the generic
+    /// call path (v1.85).
+    pub(crate) fn parse_from_func_args(&mut self) -> Result<Vec<Expr>, SqlError> {
+        let mut args = Vec::new();
+        if *self.peek() != Token::RParen {
+            loop {
+                if matches!(self.peek(), Token::Ident(_)) && matches!(self.peek2(), Token::FatArrow)
+                {
+                    let arg_name = self.expect_ident()?;
+                    self.next(); // consume '=>'
+                    let val = self.parse_or()?;
+                    args.push(Expr::NamedArg {
+                        name: arg_name,
+                        expr: Box::new(val),
+                    });
+                } else {
+                    args.push(self.parse_or()?);
+                }
+                if *self.peek() == Token::Comma {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(Token::RParen, "')'")?;
+        Ok(args)
+    }
+
+    /// v2.13: `ROWS FROM (f(...) [AS (coldefs)], ...)` — PG19 gram.y
+    /// func_table / rowsfrom_item / opt_col_def_list. Entered with
+    /// the current token at `from` (the leading `rows` ident was
+    /// consumed by the caller). Per-part decorations are limited to
+    /// `AS (typed coldefs)` by the grammar; the list as a whole then
+    /// takes opt_ordinality and a func_alias_clause, exactly like a
+    /// single function item.
+    pub(crate) fn parse_rows_from(&mut self, lateral: bool) -> Result<FromItem, SqlError> {
+        self.next(); // 'from'
+        self.next(); // '('
+        let mut parts = Vec::new();
+        loop {
+            let pname = self.expect_ident()?;
+            let pname = if *self.peek() == Token::Dot {
+                self.next();
+                format!("{}.{}", pname, self.expect_ident()?)
+            } else {
+                pname
+            };
+            self.expect(Token::LParen, "'('")?;
+            let pargs = self.parse_from_func_args()?;
+            let mut paliases = Vec::new();
+            let mut pdefs = Vec::new();
+            if self.eat_keyword("as") {
+                let (aliases, defs) = self.parse_col_defs_or_aliases()?;
+                paliases = aliases;
+                pdefs = defs;
+            }
+            parts.push(RowsFromPart {
+                name: pname,
+                args: pargs,
+                col_aliases: paliases,
+                col_defs: pdefs,
+            });
+            if *self.peek() == Token::Comma {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        self.expect(Token::RParen, "')'")?;
+        let ordinality = self.parse_opt_ordinality()?;
+        let save_as = self.pos;
+        let alias = if self.eat_keyword("as") && *self.peek() == Token::LParen {
+            None
+        } else {
+            self.pos = save_as;
+            self.parse_alias_opt()?
+        };
+        let (col_aliases, col_defs) = self.parse_col_defs_or_aliases()?;
+        Ok(FromItem::Function {
+            name: "rows_from".to_string(),
+            args: Vec::new(),
+            alias,
+            col_aliases,
+            col_defs,
+            lateral,
+            json_table: None,
+            ordinality,
+            rows_from: parts,
+        })
     }
 
     /// v1.89: `JSON_TABLE(doc, path [AS name] [PASSING ...]
@@ -13653,6 +13796,8 @@ impl Parser {
             col_aliases,
             col_defs: Vec::new(),
             lateral: true,
+            ordinality: false,
+            rows_from: Vec::new(),
             json_table: Some(Box::new(JsonTableSpec {
                 path_name,
                 columns,

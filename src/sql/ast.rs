@@ -1887,6 +1887,18 @@ impl JsonTableSpec {
     }
 }
 
+/// v2.13: one function entry of a `ROWS FROM(...)` list (PG19
+/// gram.y rowsfrom_item): a function call plus its optional
+/// per-function column definition list (`AS (name type, ...)` —
+/// the only decoration the rowsfrom grammar allows).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowsFromPart {
+    pub name: String,
+    pub args: Vec<Expr>,
+    pub col_aliases: Vec<String>,
+    pub col_defs: Vec<(String, ColType, Option<String>)>,
+}
+
 /// A FROM source (v0.6).
 #[derive(Clone, Debug, PartialEq)]
 pub enum FromItem {
@@ -1948,6 +1960,17 @@ pub enum FromItem {
         /// then holds [doc, path-text, vars]. None for every other
         /// table function.
         json_table: Option<Box<JsonTableSpec>>,
+        /// v2.13: `WITH ORDINALITY` (PG19 gram.y func_table
+        /// opt_ordinality, written before the alias clause): appends
+        /// a bigint `ordinality` column (1-based) after the function's
+        /// columns.
+        ordinality: bool,
+        /// v2.13: `ROWS FROM (f(...) [AS (coldefs)], ...)` — the
+        /// zipped function list (PG19 gram.y rowsfrom_list). Empty
+        /// for a plain single function item, which uses `name`/`args`
+        /// directly; when non-empty, `name`/`args` are unused and
+        /// each part carries its own optional column definition list.
+        rows_from: Vec<RowsFromPart>,
     },
     Join {
         left: Box<FromItem>,
@@ -10023,9 +10046,16 @@ pub(crate) fn max_param_from(f: &FromItem) -> usize {
         // v0.32: table-function args may hold $n parameters.
         // v1.89: JSON_TABLE DEFAULT-behavior expressions may too.
         FromItem::Function {
-            args, json_table, ..
+            args,
+            json_table,
+            rows_from,
+            ..
         } => {
             let mut m = args.iter().map(max_param_expr).max().unwrap_or(0);
+            // v2.13: ROWS FROM parts carry their own argument lists.
+            for part in rows_from {
+                m = m.max(part.args.iter().map(max_param_expr).max().unwrap_or(0));
+            }
             if let Some(spec) = json_table {
                 fn cols_max(cols: &[JtColumn], m: &mut usize) {
                     for c in cols {

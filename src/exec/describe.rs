@@ -484,6 +484,8 @@ pub(crate) fn from_schema_item(
             col_aliases,
             col_defs,
             json_table,
+            ordinality,
+            rows_from,
             ..
         } => {
             let left: Vec<QCol> = out.iter().flatten().cloned().collect();
@@ -499,6 +501,8 @@ pub(crate) fn from_schema_item(
                 col_defs,
                 json_table.as_deref(),
                 &left,
+                *ordinality,
+                rows_from,
             )?;
             out.push(cols);
             Ok(())
@@ -589,7 +593,15 @@ pub(crate) fn from_schema_item(
                     col_defs,
                     lateral,
                     json_table,
-                } if *lateral || (is_comma && function_args_lateral(args, &lflat)) => {
+                    ordinality,
+                    rows_from,
+                } if *lateral
+                    || (is_comma
+                        && (function_args_lateral(args, &lflat)
+                            || rows_from
+                                .iter()
+                                .any(|part| function_args_lateral(&part.args, &lflat)))) =>
+                {
                     Some(LateralRight::Func {
                         name: name.as_str(),
                         args: args.as_slice(),
@@ -597,6 +609,8 @@ pub(crate) fn from_schema_item(
                         col_aliases: fca.as_slice(),
                         col_defs: col_defs.as_slice(),
                         json_table: json_table.as_deref(),
+                        ordinality: *ordinality,
+                        rows_from: rows_from.as_slice(),
                     })
                 }
                 FromItem::Derived {

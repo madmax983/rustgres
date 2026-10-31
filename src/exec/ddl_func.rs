@@ -424,6 +424,13 @@ pub(crate) fn parse_sql_func_body(
     args: &[crate::sql::FuncArg],
     ret_type: &str,
     returns_set: bool,
+    table_cols: &[(String, String)],
+    // v2.13: run the declared-rowtype final-statement check. True
+    // only for LANGUAGE sql bodies — PG19 never applies
+    // check_sql_fn_retval to plpgsql, whose single-RETURN bodies
+    // also flow through here via the v0.97 desugar (their one
+    // expression IS the whole result value).
+    check_rowtype: bool,
 ) -> Result<Vec<Stmt>, ExecError> {
     let arg_names: Vec<Option<String>> = args.iter().map(|a| a.name.clone()).collect();
     let mut stmts = Vec::new();
@@ -497,12 +504,37 @@ pub(crate) fn parse_sql_func_body(
     if !final_returns_rows {
         return Err(sql_func_final_42p13(ret_type));
     }
+    // v2.13: PG19 check_sql_fn_retval, composite case — when the
+    // expected result tupdesc is known at validate time (OUT/INOUT
+    // parameters, RETURNS TABLE columns, or a named composite /
+    // table rowtype return), the final statement must match it
+    // column-by-column. A bare RECORD return with no outputs has a
+    // NULL rettupdesc in fmgr_sql_validator and skips this check
+    // entirely (any column count is accepted at CREATE).
+    let expected_fields: Option<Vec<String>> = if !check_rowtype {
+        None
+    } else {
+        let mut outs: Vec<String> = args
+            .iter()
+            .filter(|a| a.mode.is_output())
+            .map(|a| a.type_name.clone())
+            .collect();
+        outs.extend(table_cols.iter().map(|(_, t)| t.clone()));
+        if !outs.is_empty() {
+            Some(outs)
+        } else {
+            named_rowtype_field_type_names(eng, snap, own, session, ret_type)
+        }
+    };
+    if let Some(fields) = &expected_fields {
+        check_final_against_tupdesc(eng, snap, own, session, last, args, ret_type, fields)?;
+    }
     // PG19 check_sql_fn_retval, scalar case: the final statement must
     // return exactly one column. Enforced here only when the column
     // count is syntactically unambiguous (plain SELECT, no `*`,
     // no set operations; DML RETURNING list with no `*`); ambiguous
     // shapes defer to the existing call-time check.
-    if !returns_set {
+    if !returns_set && expected_fields.is_none() && !ret_type.eq_ignore_ascii_case("record") {
         let unambiguous_count = match last {
             Stmt::Select(sel) => {
                 let unambiguous = sel.set_op.is_none()
@@ -574,6 +606,227 @@ pub(crate) fn parse_sql_func_body(
         }
     }
     Ok(stmts)
+}
+
+/// v2.13: PG19 `check_sql_fn_retval` with a known rettupdesc — the
+/// detail phrase for a column whose type cannot be coerced to the
+/// expected field type.
+pub(crate) fn sql_func_column_42p13(
+    ret_type: &str,
+    actual_type: &str,
+    expected_type: &str,
+    col: usize,
+) -> ExecError {
+    exec_err_detail(
+        "42P13",
+        format!(
+            "return type mismatch in function declared to return {}",
+            ret_type
+        ),
+        format!(
+            "Final statement returns {} instead of {} at column {}.",
+            actual_type, expected_type, col
+        ),
+    )
+}
+
+/// v2.13: the field type names of a named composite / table rowtype
+/// return type, for PG19 `check_sql_fn_retval`'s composite case.
+/// None for scalar, RECORD, VOID, domain-over-composite (PG treats
+/// those through the scalar path), and unresolvable names.
+pub(crate) fn named_rowtype_field_type_names(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    ret_type: &str,
+) -> Option<Vec<String>> {
+    if ret_type.eq_ignore_ascii_case("record") || ret_type.eq_ignore_ascii_case("void") {
+        return None;
+    }
+    if let Ok(ct) = crate::sql::coltype_by_name(ret_type) {
+        let _ = ct;
+        return None; // builtin scalar
+    }
+    if let Some(st) = eng.db.types.get(ret_type) {
+        if st.domain.is_some() {
+            return None;
+        }
+        if let Some(fields) = &st.composite {
+            return Some(
+                fields
+                    .iter()
+                    .map(|(_, ct, _)| ct.sql_name().to_string())
+                    .collect(),
+            );
+        }
+        return None;
+    }
+    if let Some(t) = eng.db.find_table(ret_type, snap, &[own], session) {
+        return Some(
+            t.columns
+                .iter()
+                .map(|(_, ct)| ct.sql_name().to_string())
+                .collect(),
+        );
+    }
+    None
+}
+
+/// v2.13: PG19 `check_sql_fn_retval` composite case (see
+/// `parse_sql_func_body`): the final statement's unambiguous column
+/// count must equal the expected field count, and each column must
+/// admit an assignment cast to its field type. A single
+/// composite/record-typed column satisfies any field count (PG's
+/// whole-tuple result provision). Fails open whenever a shape is
+/// not statically decidable.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_final_against_tupdesc(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    last: &Stmt,
+    args: &[crate::sql::FuncArg],
+    ret_type: &str,
+    fields: &[String],
+) -> Result<(), ExecError> {
+    // Unambiguous output items of the final statement, if any.
+    let items: &[crate::sql::SelectItem] = match last {
+        Stmt::Select(sel) => {
+            if sel.set_op.is_some()
+                || sel.items.iter().any(|i| {
+                    matches!(
+                        i,
+                        crate::sql::SelectItem::All | crate::sql::SelectItem::AllOf(_)
+                    )
+                })
+            {
+                return Ok(());
+            }
+            &sel.items
+        }
+        Stmt::Insert { returning, .. }
+        | Stmt::Update { returning, .. }
+        | Stmt::Delete { returning, .. }
+        | Stmt::Merge { returning, .. } => {
+            if returning.iter().any(|i| {
+                matches!(
+                    i,
+                    crate::sql::SelectItem::All | crate::sql::SelectItem::AllOf(_)
+                )
+            }) {
+                return Ok(());
+            }
+            returning
+        }
+        _ => return Ok(()),
+    };
+    if items.len() != fields.len() {
+        // PG's whole-tuple provision: one composite/record column
+        // is the result, whatever the field count.
+        if items.len() == 1 {
+            if let Stmt::Select(sel) = last {
+                if sel.with.is_empty() {
+                    if let crate::sql::SelectItem::Expr { expr, .. } = &items[0] {
+                        // A bare $n whose declared type is the result
+                        // rowtype itself (or any composite/record) is
+                        // the whole tuple (the row_image shape).
+                        if let Expr::Param(n) = expr {
+                            if let Some(a) = args.get(*n as usize - 1) {
+                                let is_tuple = a.type_name.eq_ignore_ascii_case(ret_type)
+                                    || a.type_name.eq_ignore_ascii_case("record")
+                                    || matches!(
+                                        resolve_func_type_name(
+                                            eng,
+                                            snap,
+                                            own,
+                                            session,
+                                            &a.type_name
+                                        ),
+                                        Ok(ColType::Composite | ColType::Record)
+                                    );
+                                if is_tuple {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        let mut typed = expr.clone();
+                        if substitute_func_params(&mut typed, args, eng, snap, own, session) {
+                            if let Ok(schemas) =
+                                from_schemas(eng, snap, own, session, &sel.from, &[], &[], &[], &[])
+                            {
+                                let refs: Vec<&[QCol]> =
+                                    schemas.iter().map(Vec::as_slice).collect();
+                                if let Ok(ct) =
+                                    expr_type(eng, snap, own, session, &refs, &[], &[], &typed)
+                                {
+                                    if matches!(ct, ColType::Composite | ColType::Record) {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let detail = if items.len() > fields.len() {
+            "Final statement returns too many columns."
+        } else {
+            "Final statement returns too few columns."
+        };
+        return Err(exec_err_detail(
+            "42P13",
+            format!(
+                "return type mismatch in function declared to return {}",
+                ret_type
+            ),
+            detail,
+        ));
+    }
+    // Per-column assignment coercion, SELECT finals only (DML
+    // RETURNING type checks defer to call time, as before).
+    let Stmt::Select(sel) = last else {
+        return Ok(());
+    };
+    if !sel.with.is_empty() {
+        return Ok(());
+    }
+    let schemas = match from_schemas(eng, snap, own, session, &sel.from, &[], &[], &[], &[]) {
+        Ok(s) => s,
+        Err(_) => return Ok(()),
+    };
+    let refs: Vec<&[QCol]> = schemas.iter().map(Vec::as_slice).collect();
+    for (i, item) in items.iter().enumerate() {
+        let crate::sql::SelectItem::Expr { expr, .. } = item else {
+            continue;
+        };
+        let dst = match resolve_func_type_name(eng, snap, own, session, &fields[i]) {
+            Ok(crate::storage::ColType::Composite) | Err(_) => continue,
+            Ok(ct) => ct,
+        };
+        let mut typed = expr.clone();
+        if !substitute_func_params(&mut typed, args, eng, snap, own, session) {
+            continue;
+        }
+        let src = match expr_type(eng, snap, own, session, &refs, &[], &[], &typed) {
+            Ok(ct) => ct,
+            Err(_) => continue,
+        };
+        if matches!(src, ColType::Composite | ColType::Record) {
+            continue;
+        }
+        if !can_assignment_coerce(&src, &dst) {
+            return Err(sql_func_column_42p13(
+                ret_type,
+                &src.sql_name(),
+                &dst.sql_name(),
+                i + 1,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// v1.34: PG19 `check_sql_fn_retval` / `coerce_fn_result_column` for a
@@ -1319,6 +1572,8 @@ pub(crate) fn exec_create_function(
             args,
             ret_type,
             returns_set,
+            table_cols,
+            lang == crate::sql::FuncLang::Sql,
         )?);
     } else if lang == crate::sql::FuncLang::Internal {
         // v0.86: validate the internal symbol at CREATE (like PG's
@@ -1387,6 +1642,30 @@ pub(crate) fn exec_create_function(
                     name
                 ),
             ));
+        }
+        // v2.13: PG19 pg_proc.c ProcedureCreate — OR REPLACE cannot
+        // rename an input parameter, nor drop its name (adding a
+        // name where none existed is allowed).
+        if or_replace {
+            let old_inputs: Vec<Option<&str>> = (0..p.arg_types.len())
+                .filter(|i| p.arg_mode(*i).is_input())
+                .map(|i| p.arg_names.get(i).and_then(|n| n.as_deref()))
+                .collect();
+            let new_inputs: Vec<Option<&str>> = args
+                .iter()
+                .filter(|a| a.mode.is_input())
+                .map(|a| a.name.as_deref())
+                .collect();
+            for (j, old) in old_inputs.iter().enumerate() {
+                if let Some(old_name) = old {
+                    if new_inputs.get(j).copied().flatten() != Some(*old_name) {
+                        return Err(exec_err(
+                            "42P13",
+                            format!("cannot change name of input parameter \"{}\"", old_name),
+                        ));
+                    }
+                }
+            }
         }
     }
     let def = crate::storage::FuncDef {

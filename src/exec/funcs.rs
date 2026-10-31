@@ -1015,12 +1015,15 @@ pub(crate) fn fdef_output_defs(fdef: &crate::storage::FuncDef) -> Vec<PlOutDef> 
     let mut v = Vec::new();
     for (i, t) in fdef.arg_types.iter().enumerate() {
         if fdef.arg_mode(i).is_output() {
+            // v2.13: PG19 funcapi.c names an unnamed output
+            // parameter `column{output ordinal}` (rngfuncr's
+            // unnamed `out text` is `column2`), not its type name.
             let name = fdef
                 .arg_names
                 .get(i)
                 .cloned()
                 .flatten()
-                .unwrap_or_else(|| t.clone());
+                .unwrap_or_else(|| format!("column{}", v.len() + 1));
             v.push(PlOutDef {
                 name,
                 type_name: t.clone(),
@@ -1091,6 +1094,11 @@ pub(crate) struct PlpgsqlRun {
     /// v2.11: decl-index lists of the nested blocks currently
     /// executing (innermost last), for shadowed name resolution.
     pub(crate) scopes: Vec<Vec<usize>>,
+    /// v2.13: output columns of the first whole-row RETURN QUERY
+    /// (SETOF record/composite functions: the accumulated rows are
+    /// field-shaped, so the result columns come from the query
+    /// that produced them, not from the `record` return type).
+    pub(crate) setof_cols: Option<Vec<(String, ColType)>>,
 }
 
 impl PlpgsqlRun {
@@ -1106,6 +1114,7 @@ impl PlpgsqlRun {
             row_count: 0,
             last_error: None,
             scopes: Vec::new(),
+            setof_cols: None,
         }
     }
 }
@@ -2392,6 +2401,7 @@ pub(crate) fn append_next_rows(
     run: &mut PlpgsqlRun,
     out: SelectOut,
     ret_type: &str,
+    whole_row: bool,
 ) -> Result<(), ExecError> {
     // v2.12: with output parameters, each produced row maps
     // positionally onto the outputs (RETURN QUERY supplies the
@@ -2405,6 +2415,41 @@ pub(crate) fn append_next_rows(
                 cells.push(coerce_to_type_name(q, &v, t)?);
             }
             run.accum.push(Row::new(cells));
+        }
+        return Ok(());
+    }
+    // v2.13: RETURN QUERY in a SETOF record / named-composite
+    // function appends each query row whole (PG19 coerces the row
+    // to the result tupdesc; the FROM layer coerces again to the
+    // caller's column definition list). A single-column row keeps
+    // the scalar path.
+    if whole_row {
+        if run.setof_cols.is_none() {
+            run.setof_cols = Some(out.columns.clone());
+        }
+        let fields = if ret_type.eq_ignore_ascii_case("record") {
+            None
+        } else {
+            func_rowtype_fields(q, ret_type).ok()
+        };
+        for row in out.rows {
+            let cells: Vec<Value> = row.iter().cloned().collect();
+            if cells.len() <= 1 {
+                let v = cells.into_iter().next().unwrap_or(Value::Null);
+                let v = coerce_to_type_name(q, &v, ret_type)?;
+                run.accum.push(Row::new(vec![v]));
+            } else if let Some((_, ftys)) = &fields {
+                let mut coerced = Vec::with_capacity(cells.len());
+                for (i, v) in cells.into_iter().enumerate() {
+                    match ftys.get(i) {
+                        Some(t) => coerced.push(super::dml::coerce_value(v, t, "")?),
+                        None => coerced.push(v),
+                    }
+                }
+                run.accum.push(Row::new(coerced));
+            } else {
+                run.accum.push(Row::new(cells));
+            }
         }
         return Ok(());
     }
@@ -2800,7 +2845,7 @@ pub(crate) fn run_plpgsql_stmts(
                 // function's return type and append to the result set
                 // without ending the function.
                 let out = run_plpgsql_select(q, scopes, sel, pb, run, "RETURN NEXT")?;
-                append_next_rows(q, run, out, ret_type)?;
+                append_next_rows(q, run, out, ret_type, false)?;
             }
             S::ReturnNextBare => {
                 // v2.12: bare RETURN NEXT appends the current output
@@ -2811,11 +2856,11 @@ pub(crate) fn run_plpgsql_stmts(
             }
             S::ReturnQuery(query) => {
                 let out = eval_plpgsql_query(q, scopes, query, pb, run)?;
-                append_next_rows(q, run, out, ret_type)?;
+                append_next_rows(q, run, out, ret_type, true)?;
             }
             S::ReturnQueryExecute { expr, using } => {
                 let (out, _) = plpgsql_exec_dynamic(q, scopes, expr, using, pb, run)?;
-                append_next_rows(q, run, out, ret_type)?;
+                append_next_rows(q, run, out, ret_type, true)?;
             }
             S::OpenBound { var, args } => {
                 plpgsql_open_bound(q, scopes, pb, run, var, args)?;
@@ -3330,6 +3375,27 @@ pub(crate) fn plpgsql_setof_result(
             rows: run.accum,
         });
     }
+    // v2.13: SETOF record / named composite — the columns are the
+    // accumulated rows' shape (the first RETURN QUERY's output, or
+    // the declared rowtype's fields), never a `record` pseudo-type
+    // lookup.
+    if fdef.ret_type.eq_ignore_ascii_case("record") {
+        let cols = run
+            .setof_cols
+            .clone()
+            .unwrap_or_else(|| vec![(fdef.name.clone(), ColType::Record)]);
+        return Ok(SelectOut {
+            columns: cols,
+            rows: run.accum,
+        });
+    }
+    if let Ok((names, types)) = func_rowtype_fields(q, &fdef.ret_type) {
+        let cols: Vec<(String, ColType)> = names.into_iter().zip(types).collect();
+        return Ok(SelectOut {
+            columns: cols,
+            rows: run.accum,
+        });
+    }
     let coltype = resolve_func_type_name(q.eng, q.snap, q.own, q.session, &fdef.ret_type)?;
     Ok(SelectOut {
         columns: vec![(fdef.name.clone(), coltype)],
@@ -3614,15 +3680,55 @@ pub(crate) fn call_user_function(
     coerce_to_type_name(q, &out.rows[0][0], &fdef.ret_type)
 }
 
+/// v2.13: coerce FROM-result cells positionally to an expected
+/// field list (a column definition list or a declared rowtype).
+/// Cells already of the right type pass through untouched.
+pub(crate) fn coerce_from_cells(
+    cells: Vec<Value>,
+    types: &[ColType],
+    names: &[String],
+) -> Result<Vec<Value>, ExecError> {
+    let mut out = Vec::with_capacity(cells.len());
+    for (i, c) in cells.into_iter().enumerate() {
+        match types.get(i) {
+            Some(t) => {
+                let r = super::dml::coerce_value(
+                    c.clone(),
+                    t,
+                    names.get(i).map(|s| s.as_str()).unwrap_or(""),
+                );
+                match r {
+                    Ok(v) => out.push(v),
+                    // PG19 assignment coercion to text is universal:
+                    // any value converts through its output function
+                    // (the rowsecurity rls_f shape — a text[] body
+                    // result lands in a text column as its rendering).
+                    Err(_) if *t == ColType::Text && c != Value::Null => {
+                        out.push(Value::text(c.to_text().unwrap_or_default()));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            None => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
 /// v0.86: table-function call (FROM f(...)). Returns
 /// (column names, column types, rows). A scalar function returning a
 /// composite/table rowtype expands to its fields (PG19); a
 /// set-returning function returns its rows directly.
+/// v2.13: `col_defs` is the call site's column definition list for a
+/// RECORD-returning function (the resolver validated that it may
+/// appear); it names/types the result and the produced values are
+/// coerced to it positionally, like PG's caller-supplied tupdesc.
 pub(crate) fn call_table_function(
     q: &mut Q,
     scopes: &[Scope],
     fdef: &crate::storage::FuncDef,
     args: &[Value],
+    col_defs: &[(String, ColType, Option<String>)],
 ) -> Result<(Vec<String>, Vec<ColType>, Vec<Row>), ExecError> {
     if fdef.lang == crate::sql::FuncLang::Internal {
         return Err(exec_err(
@@ -3635,13 +3741,93 @@ pub(crate) fn call_table_function(
         // STRICT-on-NULL: zero rows.
         return Ok((vec![], vec![], vec![]));
     }
+    // v2.13: the expected field list for a rowtype-shaped result:
+    // the caller's column definition list for RECORD returns, else
+    // the declared rowtype's fields for a named composite return.
+    // (Output-parameter functions are shaped by their own branch
+    // below and never consult this.)
+    let rowtype_fields: Option<(Vec<String>, Vec<ColType>)> =
+        if fdef.ret_type.eq_ignore_ascii_case("record") && !col_defs.is_empty() {
+            Some((
+                col_defs.iter().map(|(n, _, _)| n.clone()).collect(),
+                col_defs.iter().map(|(_, t, _)| t.clone()).collect(),
+            ))
+        } else if !fdef.ret_type.eq_ignore_ascii_case("record")
+            && !fdef.has_outputs()
+            && func_rowtype_fields(q, &fdef.ret_type).is_ok()
+        {
+            Some(func_rowtype_fields(q, &fdef.ret_type)?)
+        } else {
+            None
+        };
+    // v2.13: shape produced rows against a rowtype field list: a
+    // single Record cell per row expands to its fields; field-shaped
+    // rows coerce positionally. Returns None when the produced shape
+    // is not rowtype-shaped at all.
+    let shape_rowtype = |rows_in: Vec<Row>| -> Result<Option<Vec<Row>>, ExecError> {
+        let Some((names, types)) = &rowtype_fields else {
+            return Ok(None);
+        };
+        let mut shaped = Vec::with_capacity(rows_in.len());
+        for r in rows_in {
+            let cells: Vec<Value> = r.iter().cloned().collect();
+            let cells = if cells.len() == 1 {
+                match &cells[0] {
+                    Value::Record(fs) => fs.iter().map(|(_, v)| v.clone()).collect(),
+                    Value::Null => vec![Value::Null; names.len()],
+                    _ => cells,
+                }
+            } else {
+                cells
+            };
+            if cells.len() != names.len() {
+                if fdef.ret_type.eq_ignore_ascii_case("record") && !col_defs.is_empty() {
+                    return Err(exec_err(
+                        "42804",
+                        "function return row and query-specified return row do not match"
+                            .to_string(),
+                    ));
+                }
+                return Ok(None);
+            }
+            shaped.push(Row::new(coerce_from_cells(cells, types, names)?));
+        }
+        Ok(Some(shaped))
+    };
     if !fdef.returns_set {
         // v2.12: a scalar function with output parameters yields
         // its single output row under the output columns.
+        // v2.13: the output names/types come from the declaration
+        // (an unnamed OUT is `column{ordinal}`), not the body.
         if fdef.has_outputs() {
-            let names: Vec<String> = out.columns.iter().map(|(n, _)| n.clone()).collect();
-            let types: Vec<ColType> = out.columns.iter().map(|(_, t)| t.clone()).collect();
-            return Ok((names, types, out.rows));
+            let defs = fdef_output_defs(fdef);
+            let names: Vec<String> = defs.iter().map(|o| o.name.clone()).collect();
+            let types: Vec<ColType> = defs
+                .iter()
+                .map(|o| crate::sql::coltype_by_name(&o.type_name).unwrap_or(ColType::Text))
+                .collect();
+            if out.columns.len() == names.len() {
+                return Ok((names, types, out.rows));
+            }
+            let names2: Vec<String> = out.columns.iter().map(|(n, _)| n.clone()).collect();
+            let types2: Vec<ColType> = out.columns.iter().map(|(_, t)| t.clone()).collect();
+            return Ok((names2, types2, out.rows));
+        }
+        // v2.13: a scalar RECORD / named-composite function whose
+        // body returns the fields as columns (PG's whole-tuple
+        // result), or one Record value.
+        if let Some(shaped) = shape_rowtype(out.rows.clone())? {
+            if out.rows.len() != 1 {
+                return Err(exec_err(
+                    "42601",
+                    format!(
+                        "function \"{}\" must return exactly one row in FROM",
+                        fdef.name
+                    ),
+                ));
+            }
+            let (names, types) = rowtype_fields.clone().unwrap();
+            return Ok((names, types, shaped));
         }
         // Scalar function in FROM: PG19 expands a composite result into
         // columns; a non-composite scalar becomes one column.
@@ -3678,6 +3864,25 @@ pub(crate) fn call_table_function(
             .map(|(_, t)| crate::sql::coltype_by_name(t).unwrap_or(ColType::Text))
             .collect();
         return Ok((names, types, out.rows));
+    }
+    // v2.13: SETOF with output parameters — names/types from the
+    // declaration when the produced shape matches.
+    if fdef.has_outputs() {
+        let defs = fdef_output_defs(fdef);
+        if defs.len() == out.columns.len() {
+            let names: Vec<String> = defs.iter().map(|o| o.name.clone()).collect();
+            let types: Vec<ColType> = defs
+                .iter()
+                .map(|o| crate::sql::coltype_by_name(&o.type_name).unwrap_or(ColType::Text))
+                .collect();
+            return Ok((names, types, out.rows));
+        }
+    }
+    // v2.13: SETOF RECORD with a column definition list, or SETOF
+    // named composite — the declared rowtype names/types the rows.
+    if let Some(shaped) = shape_rowtype(out.rows.clone())? {
+        let (names, types) = rowtype_fields.clone().unwrap();
+        return Ok((names, types, shaped));
     }
     let names: Vec<String> = out.columns.iter().map(|(n, _)| n.clone()).collect();
     let types: Vec<ColType> = out.columns.iter().map(|(_, t)| t.clone()).collect();
@@ -6838,10 +7043,23 @@ pub(crate) fn populate_fields(
         let jsv = pairs.iter().find(|(k, _)| k == &f.name).map(|(_, v)| v);
         out.push(match jsv {
             // Missing key: keep the base value; with no base the
-            // field is processed with a JSON null and lands NULL.
+            // field lands NULL — but a DOMAIN field's constraints
+            // still run on that NULL (PG19 populate_composite
+            // checks NOT NULL domains for absent keys too, the
+            // jsrec_i_not_null shape; v2.13 — this was masked in
+            // v2.12 by the 42703 projection failure above it).
             None => match base_val {
                 Some(b) => b.clone(),
-                None => Value::Null,
+                None => {
+                    let is_domain = f.named.as_ref().is_some_and(|n| {
+                        q.eng.db.types.get(n).is_some_and(|st| st.domain.is_some())
+                    });
+                    if is_domain {
+                        populate_typed(q, f, None, &JsonbVal::Null)?
+                    } else {
+                        Value::Null
+                    }
+                }
             },
             // v1.96 finishing pass: an explicit JSON null still
             // runs a DOMAIN field's constraint checks (PG19
@@ -6893,6 +7111,14 @@ pub(crate) fn populate_typed_inner(
     base: Option<&Value>,
     jsv: &JsonbVal,
 ) -> Result<Value, ExecError> {
+    // v2.13: a JSON null populates to a NULL datum for every field
+    // type (PG19 populate_record_field: null is null, never fed to
+    // the type's input function); the wrapper's domain check then
+    // rejects it for NOT NULL domains with 23502, instead of the
+    // old 22P02 from trying to parse the text "null" as the type.
+    if matches!(jsv, JsonbVal::Null) {
+        return Ok(Value::Null);
+    }
     // v1.96 finishing pass: a field whose declared type is a
     // DOMAIN rides the Composite marker (see ddl_types), but it
     // populates as the domain's base type; the wrapper applies

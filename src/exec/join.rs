@@ -874,12 +874,21 @@ pub(crate) fn table_function_col_types(
 /// when present, else the function name; explicit column aliases win;
 /// multi-column functions keep their OUT names unless aliased
 /// positionally).
-pub(crate) fn function_item_schema(
+/// v2.13: `function_item_schema` with PG19's naming rule made
+/// explicit: the table-alias-as-column-name rule
+/// (chooseScalarFunctionAlias) applies only to a default-named
+/// scalar result. When the column names are authoritative — a
+/// column definition list, OUT parameters, a named composite's
+/// fields, a populate field list — the alias never renames them
+/// (only positional column aliases do).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn function_item_schema_auth(
     name: &str,
     col_names: &[String],
     col_types: &[ColType],
     alias: &Option<String>,
     col_aliases: &[String],
+    authoritative: bool,
 ) -> Result<Vec<QCol>, ExecError> {
     let qual = alias.clone().unwrap_or_else(|| name.to_string());
     // PG 19 arity rule for column aliases (more aliases than
@@ -898,7 +907,13 @@ pub(crate) fn function_item_schema(
             let col_name = col_aliases
                 .get(i)
                 .cloned()
-                .or_else(|| if ncols == 1 { alias.clone() } else { None })
+                .or_else(|| {
+                    if ncols == 1 && !authoritative {
+                        alias.clone()
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or_else(|| cn.clone());
             QCol {
                 qual: qual.clone(),
@@ -911,22 +926,123 @@ pub(crate) fn function_item_schema(
         .collect())
 }
 
-/// v0.46: evaluate one function FROM item against `scopes`: argument
-/// expressions, then the table function, then schema and rows. The
-/// caller chooses the scope chain — the outer query's scopes for the
-/// uncorrelated case, one accumulated input row per call for implicit
-/// LATERAL.
+/// v2.13: PG19 parse_relation.c column-definition-list errors
+/// (all ERRCODE_SYNTAX_ERROR = 42601).
+pub(crate) fn coldef_required_err() -> ExecError {
+    exec_err(
+        "42601",
+        "a column definition list is required for functions returning \"record\"".to_string(),
+    )
+}
+pub(crate) fn coldef_redundant_out_err() -> ExecError {
+    exec_err(
+        "42601",
+        "a column definition list is redundant for a function with OUT parameters".to_string(),
+    )
+}
+pub(crate) fn coldef_redundant_composite_err() -> ExecError {
+    exec_err(
+        "42601",
+        "a column definition list is redundant for a function returning a named composite type"
+            .to_string(),
+    )
+}
+pub(crate) fn coldef_only_record_err() -> ExecError {
+    exec_err(
+        "42601",
+        "a column definition list is only allowed for functions returning \"record\"".to_string(),
+    )
+}
+
+/// v2.13: is this return type name a named composite (a CREATE
+/// TYPE composite or a table rowtype)? Domains over composites are
+/// scalar-class in PG's coldef rules, as are builtin scalars and
+/// the RECORD pseudo-type itself.
+pub(crate) fn is_named_composite_ret(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    ret_type: &str,
+) -> bool {
+    if ret_type.eq_ignore_ascii_case("record") {
+        return false;
+    }
+    if let Some(st) = eng.db.types.get(ret_type) {
+        return st.composite.is_some() && st.domain.is_none();
+    }
+    eng.db.find_table(ret_type, snap, &[own], session).is_some()
+}
+
+/// v2.13: validate a call-site column definition list against a
+/// user function's result class (PG19 parse_relation.c
+/// addRangeTableEntryForFunction). Also enforces the
+/// required-list rule for RECORD returns without outputs.
+pub(crate) fn validate_coldef_for_fdef(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    fdef: &crate::storage::FuncDef,
+    col_defs: &[(String, ColType, Option<String>)],
+) -> Result<(), ExecError> {
+    if !col_defs.is_empty() {
+        if fdef.has_outputs() {
+            return Err(coldef_redundant_out_err());
+        }
+        if fdef.ret_type.eq_ignore_ascii_case("record") {
+            return Ok(());
+        }
+        if is_named_composite_ret(eng, snap, own, session, &fdef.ret_type) {
+            return Err(coldef_redundant_composite_err());
+        }
+        return Err(coldef_only_record_err());
+    }
+    if fdef.ret_type.eq_ignore_ascii_case("record") && !fdef.has_outputs() {
+        return Err(coldef_required_err());
+    }
+    Ok(())
+}
+
+/// v2.13: builtin result classes for the coldef rules: functions
+/// whose PG definition carries OUT parameters (their coldef is
+/// redundant) vs plain scalar/setof-scalar returns (coldef is only
+/// allowed for RECORD).
+pub(crate) fn validate_coldef_for_builtin(
+    name: &str,
+    col_defs: &[(String, ColType, Option<String>)],
+) -> Result<(), ExecError> {
+    if col_defs.is_empty() {
+        return Ok(());
+    }
+    if matches!(
+        name,
+        "pg_input_error_info"
+            | "pg_get_keywords"
+            | "json_each"
+            | "json_each_text"
+            | "jsonb_each"
+            | "jsonb_each_text"
+            | "pg_get_publication_tables"
+    ) {
+        return Err(coldef_redundant_out_err());
+    }
+    Err(coldef_only_record_err())
+}
+
+/// v2.13: resolve and evaluate ONE set-returning-function call of a
+/// FROM item (also one part of a ROWS FROM list): returns
+/// (column names, column types, rows, names-are-authoritative).
+/// Column definition list validation lives here so the executor
+/// and (through srf_static_schema) the Describe path agree.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn eval_function_item(
+pub(crate) fn eval_srf_call(
     q: &mut Q,
     scopes: &[Scope],
     name: &str,
     args: &[Expr],
-    alias: &Option<String>,
-    col_aliases: &[String],
     col_defs: &[(String, ColType, Option<String>)],
-    json_table: Option<&JsonTableSpec>,
-) -> Result<(Vec<QCol>, Vec<QRow>), ExecError> {
+) -> Result<(Vec<String>, Vec<ColType>, Vec<Row>, bool), ExecError> {
     // v1.85: named arguments in FROM-clause function items resolve
     // like everywhere else.
     let resolved_args;
@@ -940,65 +1056,63 @@ pub(crate) fn eval_function_item(
     for a in args {
         arg_vals.push(eval_expr(q, scopes, a)?);
     }
-    // v1.89: JSON_TABLE — its own evaluator over the jsonpath engine.
-    if name == "json_table" {
-        let spec = json_table.ok_or_else(|| {
-            exec_err(
-                "XX000",
-                "json_table FROM item without a COLUMNS tree".to_string(),
-            )
-        })?;
-        return super::jsontable::eval_json_table(
-            q,
-            scopes,
-            spec,
-            args,
-            &arg_vals,
-            alias,
-            col_aliases,
-        );
-    }
     // v2.04: pg_get_publication_tables reads the publication
     // catalog directly (its rows depend on catalog state, not on a
     // generic table-function evaluation).
     if name == "pg_get_publication_tables" {
+        validate_coldef_for_builtin(name, col_defs)?;
         let rows = pg_get_publication_tables_rows(&q.eng.db, q.snap, q.own, q.session, &arg_vals)?;
         let nargs = arg_vals.len();
-        return finish_function_item(
-            name,
-            alias,
-            col_aliases,
-            &gpt_col_names(nargs),
-            &gpt_col_types(nargs),
-            rows,
-        );
+        return Ok((gpt_col_names(nargs), gpt_col_types(nargs), rows, true));
     }
     // v1.84: record-returning json functions resolve their row type
     // from the call site (base argument shape or column definitions),
     // before generic table-function dispatch.
     if is_json_record_function(name) {
-        return eval_json_record_table_function(
-            q,
-            scopes,
-            name,
-            args,
-            &arg_vals,
-            alias,
-            col_aliases,
-            col_defs,
-        );
+        let (names, types, rows) =
+            eval_json_record_table_function(q, scopes, name, args, &arg_vals, col_defs)?;
+        return Ok((names, types, rows, true));
+    }
+    // v2.13: multi-argument unnest() — PG19 parse_clause.c expands
+    // it into one unnest per argument, zipped like ROWS FROM.
+    if name == "unnest" && args.len() > 1 {
+        if !col_defs.is_empty() {
+            return Err(exec_err(
+                "42601",
+                "UNNEST() with multiple arguments cannot have a column definition list".to_string(),
+            ));
+        }
+        return eval_multi_unnest(q, scopes, args, &arg_vals);
     }
     // v0.86: user-defined functions in FROM (scalar composite-returning
     // functions expand to their fields; SETOF returns rows).
     // v0.87: resolve the best overload by (name, arg count, arg types).
     if let Some(fdef) = resolve_function_overload(q.eng, name, &arg_vals) {
-        let (col_names, col_types, rows) = call_table_function(q, scopes, &fdef, &arg_vals)?;
-        return finish_function_item(name, alias, col_aliases, &col_names, &col_types, rows);
+        validate_coldef_for_fdef(q.eng, q.snap, q.own, q.session, &fdef, col_defs)?;
+        let (mut col_names, mut col_types, rows) =
+            call_table_function(q, scopes, &fdef, &arg_vals, col_defs)?;
+        // v2.13: a plain scalar result is named for the function and
+        // typed by the declaration (PG's chooseScalarFunctionAlias
+        // input), whatever the body's SELECT aliases say.
+        let plain_scalar = !fdef.returns_set
+            && !fdef.has_outputs()
+            && !fdef.ret_type.eq_ignore_ascii_case("record")
+            && !is_named_composite_ret(q.eng, q.snap, q.own, q.session, &fdef.ret_type);
+        if plain_scalar && col_names.len() == 1 {
+            col_names = vec![name.to_string()];
+            if let Ok(ct) = crate::sql::coltype_by_name(&fdef.ret_type) {
+                col_types = vec![ct];
+            }
+        }
+        let authoritative = !plain_scalar;
+        return Ok((col_names, col_types, rows, authoritative));
     }
+    validate_coldef_for_builtin(name, col_defs)?;
     // v1.87: pg_input_error_info resolves user-defined types against
     // the live catalog (domains, composites, aclitem, reg*).
     let (col_names, row_vals) = if name == "pg_input_error_info" && arg_vals.len() == 2 {
-        pg_input_error_info_catalog(q, &arg_vals)?
+        let (n, r) = pg_input_error_info_catalog(q, &arg_vals)?;
+        (n, r)
     } else {
         eval_table_function(name, &arg_vals)?
     };
@@ -1061,15 +1175,308 @@ pub(crate) fn eval_function_item(
     } else {
         table_function_col_types(name, &arg_vals)?
     };
-    let schema = function_item_schema(name, &col_names, &col_types, alias, col_aliases)?;
-    let rows = row_vals
-        .into_iter()
-        .map(|cells| QRow {
-            cells: Row::new(cells),
-            prov: Vec::new(),
-        })
-        .collect();
-    Ok((schema, rows))
+    let authoritative = is_json_expansion_srf(name) || name == "pg_input_error_info";
+    let rows: Vec<Row> = row_vals.into_iter().map(Row::new).collect();
+    Ok((col_names, col_types, rows, authoritative))
+}
+
+/// v2.13: multi-argument unnest(), zipped (PG19's transform of
+/// `unnest(a, b, ...)` into separate unnests combined like ROWS
+/// FROM: max length, NULL padding).
+pub(crate) fn eval_multi_unnest(
+    q: &mut Q,
+    scopes: &[Scope],
+    args: &[Expr],
+    arg_vals: &[Value],
+) -> Result<(Vec<String>, Vec<ColType>, Vec<Row>, bool), ExecError> {
+    let mut all_names: Vec<String> = Vec::new();
+    let mut all_types: Vec<ColType> = Vec::new();
+    // Column-major values: one Vec<Value> per output column.
+    let mut columns: Vec<Vec<Value>> = Vec::new();
+    for (a, v) in args.iter().zip(arg_vals.iter()) {
+        let (names, types, rows) = unnest_one_column_set(q, scopes, a, v)?;
+        let ncols = names.len();
+        all_names.extend(names);
+        all_types.extend(types);
+        let mut cols: Vec<Vec<Value>> = vec![Vec::new(); ncols];
+        for r in &rows {
+            for (i, c) in cols.iter_mut().enumerate() {
+                c.push(r.get(i).cloned().unwrap_or(Value::Null));
+            }
+        }
+        columns.extend(cols);
+    }
+    let nrows = columns.iter().map(|c| c.len()).max().unwrap_or(0);
+    let mut rows = Vec::with_capacity(nrows);
+    for i in 0..nrows {
+        rows.push(Row::new(
+            columns
+                .iter()
+                .map(|c| c.get(i).cloned().unwrap_or(Value::Null))
+                .collect(),
+        ));
+    }
+    Ok((all_names, all_types, rows, false))
+}
+
+/// v2.13: one argument of a multi-arg unnest: (names, types, rows).
+/// A composite-element array expands to the element's fields; a
+/// tsvector expands to its three OUT columns; anything else is one
+/// column named `unnest`.
+pub(crate) fn unnest_one_column_set(
+    q: &mut Q,
+    scopes: &[Scope],
+    arg: &Expr,
+    val: &Value,
+) -> Result<(Vec<String>, Vec<ColType>, Vec<Row>), ExecError> {
+    if matches!(val, Value::TsVector(_)) {
+        let (_, rows) = eval_table_function("unnest", std::slice::from_ref(val))?;
+        return Ok((
+            vec![
+                "lexeme".to_string(),
+                "positions".to_string(),
+                "weights".to_string(),
+            ],
+            vec![
+                ColType::Text,
+                ColType::Array(crate::storage::ArrayElem::SmallInt),
+                ColType::Array(crate::storage::ArrayElem::Text),
+            ],
+            rows.into_iter().map(Row::new).collect(),
+        ));
+    }
+    if let Some(fields) = unnest_record_elem_fields(q.eng, q.snap, q.own, q.session, arg) {
+        let (names, types): (Vec<String>, Vec<ColType>) = fields.into_iter().unzip();
+        let mut rows = Vec::new();
+        if let Value::Array(a) = val {
+            for e in &a.elems {
+                match e {
+                    Value::Record(fs) => rows.push(Row::new(
+                        names
+                            .iter()
+                            .map(|n| {
+                                fs.iter()
+                                    .find(|(fn_, _)| fn_ == n)
+                                    .map(|(_, v)| v.clone())
+                                    .unwrap_or(Value::Null)
+                            })
+                            .collect(),
+                    )),
+                    _ => rows.push(Row::new(vec![Value::Null; names.len()])),
+                }
+            }
+        }
+        return Ok((names, types, rows));
+    }
+    let ty = match val {
+        Value::Array(a) => elem_scalar_type(a.elem),
+        Value::Null => {
+            let schemas: Vec<&[QCol]> = scopes.iter().map(|s| s.schema).collect();
+            match expr_type(
+                &mut *q.eng,
+                q.snap,
+                q.own,
+                q.session,
+                &schemas,
+                &[],
+                &[],
+                arg,
+            ) {
+                Ok(ColType::Array(e)) => elem_scalar_type(e),
+                _ => ColType::Text,
+            }
+        }
+        other => return Err(func_arg_err("unnest", other)),
+    };
+    let (_, rows) = eval_table_function("unnest", std::slice::from_ref(val))?;
+    Ok((
+        vec!["unnest".to_string()],
+        vec![ty],
+        rows.into_iter().map(Row::new).collect(),
+    ))
+}
+
+/// v2.13: append the WITH ORDINALITY column (bigint, 1-based,
+/// named `ordinality`) to a resolved function result.
+pub(crate) fn apply_ordinality(
+    names: &mut Vec<String>,
+    types: &mut Vec<ColType>,
+    rows: &mut [Row],
+) {
+    names.push("ordinality".to_string());
+    types.push(ColType::BigInt);
+    for (i, r) in rows.iter_mut().enumerate() {
+        let mut cells: Vec<Value> = r.iter().cloned().collect();
+        cells.push(Value::BigInt(i as i64 + 1));
+        *r = Row::new(cells);
+    }
+}
+
+/// v2.13: evaluate a ROWS FROM(...) item: each part resolves like a
+/// single function call; the parts zip (max row count, NULL
+/// padding). The top-level column definition list rules are PG19
+/// parse_clause.c's: multiple functions -> 42601, WITH ORDINALITY
+/// + coldef -> 42601, per-part + top-level -> 42601.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn eval_rows_from_item(
+    q: &mut Q,
+    scopes: &[Scope],
+    parts: &[RowsFromPart],
+    alias: &Option<String>,
+    col_aliases: &[String],
+    col_defs: &[(String, ColType, Option<String>)],
+    ordinality: bool,
+) -> Result<(Vec<QCol>, Vec<QRow>), ExecError> {
+    let mut top_defs: &[(String, ColType, Option<String>)] = &[];
+    if !col_defs.is_empty() {
+        if parts.len() != 1 {
+            return Err(exec_err(
+                "42601",
+                "ROWS FROM() with multiple functions cannot have a column definition list"
+                    .to_string(),
+            ));
+        }
+        if ordinality {
+            return Err(exec_err(
+                "42601",
+                "WITH ORDINALITY cannot be used with a column definition list".to_string(),
+            ));
+        }
+        if !parts[0].col_defs.is_empty() {
+            return Err(exec_err(
+                "42601",
+                "multiple column definition lists are not allowed for the same function"
+                    .to_string(),
+            ));
+        }
+        top_defs = col_defs;
+    }
+    let mut all_names: Vec<String> = Vec::new();
+    let mut all_types: Vec<ColType> = Vec::new();
+    let mut part_rows: Vec<Vec<Row>> = Vec::with_capacity(parts.len());
+    let mut widths: Vec<usize> = Vec::with_capacity(parts.len());
+    for (i, part) in parts.iter().enumerate() {
+        let defs = if i == 0 && !top_defs.is_empty() {
+            top_defs
+        } else {
+            &part.col_defs
+        };
+        let (names, types, rows, _auth) = eval_srf_call(q, scopes, &part.name, &part.args, defs)?;
+        widths.push(names.len());
+        all_names.extend(names);
+        all_types.extend(types);
+        part_rows.push(rows);
+    }
+    let nrows = part_rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    let mut rows: Vec<Row> = Vec::with_capacity(nrows);
+    for i in 0..nrows {
+        let mut cells: Vec<Value> = Vec::with_capacity(all_names.len());
+        for (pi, pr) in part_rows.iter().enumerate() {
+            match pr.get(i) {
+                Some(r) => cells.extend(r.iter().cloned()),
+                None => {
+                    // Pad with NULLs for this part's column count.
+                    cells.extend(std::iter::repeat_n(Value::Null, widths[pi]));
+                }
+            }
+        }
+        rows.push(Row::new(cells));
+    }
+    if ordinality {
+        apply_ordinality(&mut all_names, &mut all_types, &mut rows);
+    }
+    finish_function_item_auth(
+        "rows_from",
+        alias,
+        col_aliases,
+        &all_names,
+        &all_types,
+        rows,
+        true,
+    )
+}
+
+/// v0.46: evaluate one function FROM item against `scopes`: argument
+/// expressions, then the table function, then schema and rows. The
+/// caller chooses the scope chain — the outer query's scopes for the
+/// uncorrelated case, one accumulated input row per call for implicit
+/// LATERAL.
+/// v2.13: WITH ORDINALITY and ROWS FROM(...) route through the
+/// shared SRF resolver (eval_srf_call) so every FROM shape follows
+/// the same column-definition-list rules.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn eval_function_item(
+    q: &mut Q,
+    scopes: &[Scope],
+    name: &str,
+    args: &[Expr],
+    alias: &Option<String>,
+    col_aliases: &[String],
+    col_defs: &[(String, ColType, Option<String>)],
+    json_table: Option<&JsonTableSpec>,
+    ordinality: bool,
+    rows_from: &[RowsFromPart],
+) -> Result<(Vec<QCol>, Vec<QRow>), ExecError> {
+    if !rows_from.is_empty() {
+        return eval_rows_from_item(
+            q,
+            scopes,
+            rows_from,
+            alias,
+            col_aliases,
+            col_defs,
+            ordinality,
+        );
+    }
+    // v1.89: JSON_TABLE — its own evaluator over the jsonpath engine.
+    if name == "json_table" {
+        let resolved_args;
+        let args: &[Expr] = if args.iter().any(|a| matches!(a, Expr::NamedArg { .. })) {
+            resolved_args = resolve_named_args(q.eng, name, args)?;
+            &resolved_args
+        } else {
+            args
+        };
+        let mut arg_vals = Vec::with_capacity(args.len());
+        for a in args {
+            arg_vals.push(eval_expr(q, scopes, a)?);
+        }
+        let spec = json_table.ok_or_else(|| {
+            exec_err(
+                "XX000",
+                "json_table FROM item without a COLUMNS tree".to_string(),
+            )
+        })?;
+        return super::jsontable::eval_json_table(
+            q,
+            scopes,
+            spec,
+            args,
+            &arg_vals,
+            alias,
+            col_aliases,
+        );
+    }
+    if ordinality && !col_defs.is_empty() {
+        return Err(exec_err(
+            "42601",
+            "WITH ORDINALITY cannot be used with a column definition list".to_string(),
+        ));
+    }
+    let (mut col_names, mut col_types, mut rows, authoritative) =
+        eval_srf_call(q, scopes, name, args, col_defs)?;
+    if ordinality {
+        apply_ordinality(&mut col_names, &mut col_types, &mut rows);
+    }
+    finish_function_item_auth(
+        name,
+        alias,
+        col_aliases,
+        &col_names,
+        &col_types,
+        rows,
+        authoritative,
+    )
 }
 
 /// v1.84: evaluate a record-returning json function FROM item
@@ -1085,10 +1492,8 @@ pub(crate) fn eval_json_record_table_function(
     name: &str,
     args: &[Expr],
     arg_vals: &[Value],
-    alias: &Option<String>,
-    col_aliases: &[String],
     col_defs: &[(String, ColType, Option<String>)],
-) -> Result<(Vec<QCol>, Vec<QRow>), ExecError> {
+) -> Result<(Vec<String>, Vec<ColType>, Vec<Row>), ExecError> {
     let is_set = name.ends_with("recordset");
     let is_populate = name.contains("populate");
     let want_args = if is_populate { 2 } else { 1 };
@@ -1177,7 +1582,7 @@ pub(crate) fn eval_json_record_table_function(
                 .collect();
             rows.push(Row::new(cells));
         }
-        return finish_function_item(name, alias, col_aliases, &col_names, &col_types, rows);
+        return Ok((col_names, col_types, rows));
     }
     let tree = populate_doc_tree(name, doc_val)?
         .ok_or_else(|| exec_err("22023", "cannot call populate_composite on a scalar"))?;
@@ -1220,7 +1625,7 @@ pub(crate) fn eval_json_record_table_function(
             }
         }
     }
-    finish_function_item(name, alias, col_aliases, &col_names, &col_types, rows)
+    Ok((col_names, col_types, rows))
 }
 
 /// v1.84: the statically determinable field types of a populate
@@ -1252,15 +1657,26 @@ pub(crate) fn static_base_field_types(
 
 /// v0.86: finish a user-defined function FROM item: build the output
 /// schema (PG 19 column-alias arity rules) and wrap the rows.
-pub(crate) fn finish_function_item(
+/// v2.13: finish_function_item with authoritative column names
+/// (see function_item_schema_auth).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_function_item_auth(
     name: &str,
     alias: &Option<String>,
     col_aliases: &[String],
     col_names: &[String],
     col_types: &[ColType],
     rows: Vec<Row>,
+    authoritative: bool,
 ) -> Result<(Vec<QCol>, Vec<QRow>), ExecError> {
-    let schema = function_item_schema(name, col_names, col_types, alias, col_aliases)?;
+    let schema = function_item_schema_auth(
+        name,
+        col_names,
+        col_types,
+        alias,
+        col_aliases,
+        authoritative,
+    )?;
     let rows = rows
         .into_iter()
         .map(|cells| QRow {
@@ -1335,10 +1751,17 @@ pub(crate) fn lateral_is_correlated(
         })
     };
     match right {
-        LateralRight::Func { args, .. } => {
+        LateralRight::Func {
+            args, rows_from, ..
+        } => {
             let mut refs = Vec::new();
             for a in *args {
                 collect_column_refs(a, &mut refs);
+            }
+            for part in *rows_from {
+                for a in &part.args {
+                    collect_column_refs(a, &mut refs);
+                }
             }
             hits_lateral(&refs)
         }
@@ -1383,6 +1806,10 @@ pub(crate) enum LateralRight<'a> {
         col_defs: &'a [(String, ColType, Option<String>)],
         /// v1.89: the JSON_TABLE COLUMNS tree (name == "json_table").
         json_table: Option<&'a JsonTableSpec>,
+        /// v2.13: WITH ORDINALITY on the function item.
+        ordinality: bool,
+        /// v2.13: ROWS FROM parts (empty for a plain function).
+        rows_from: &'a [RowsFromPart],
     },
     Derived {
         sub: &'a SelectStmt,
@@ -1421,6 +1848,8 @@ pub(crate) fn lateral_right_schema(
             col_aliases,
             col_defs,
             json_table,
+            ordinality,
+            rows_from,
         } => lateral_function_schema(
             eng,
             snap,
@@ -1435,6 +1864,8 @@ pub(crate) fn lateral_right_schema(
             // v1.10: arg type inference sees the innermost scope (the
             // immediate left input), as before.
             scope_schemas.last().copied().unwrap_or(&[]),
+            *ordinality,
+            rows_from,
         ),
         LateralRight::Derived {
             sub,
@@ -1866,6 +2297,8 @@ pub(crate) fn eval_lateral_right(
             col_aliases,
             col_defs,
             json_table,
+            ordinality,
+            rows_from,
         } => {
             let (_, frows) = eval_function_item(
                 q,
@@ -1876,6 +2309,8 @@ pub(crate) fn eval_lateral_right(
                 col_aliases,
                 col_defs,
                 *json_table,
+                *ordinality,
+                rows_from,
             )?;
             Ok(frows)
         }
@@ -2065,40 +2500,107 @@ fn unnest_arg_field_type(
         .map(|(_, t, _)| t)
 }
 
-/// v0.46: output schema of a table function in an implicit-LATERAL
-/// position, inferred statically from the argument *types* against the
-/// left input's schema. Row values aren't available (and must not
-/// matter): like a declared return type, the schema is fixed per query,
-/// so an empty left input still yields the right schema. Only
-/// `generate_series` has a type-dependent schema — the same
-/// int4/int8/numeric resolution as `table_function_col_types`; every
-/// other table function is all-text. Shared by the executor and the
-/// Describe path so wire OIDs agree with execution.
+/// v2.13: the static (names, types) of a named rowtype return —
+/// a table's columns or a CREATE TYPE composite's fields. None
+/// when the name is neither.
+pub(crate) fn static_rowtype_fields(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    ret_type: &str,
+) -> Option<(Vec<String>, Vec<ColType>)> {
+    if let Some(t) = eng.db.find_table(ret_type, snap, &[own], session) {
+        return Some((
+            t.columns.iter().map(|(n, _)| n.clone()).collect(),
+            t.columns.iter().map(|(_, c)| c.clone()).collect(),
+        ));
+    }
+    if let Some(st) = eng.db.types.get(ret_type) {
+        if let Some(fields) = &st.composite {
+            return Some((
+                fields.iter().map(|(n, _, _)| n.clone()).collect(),
+                fields.iter().map(|(_, c, _)| c.clone()).collect(),
+            ));
+        }
+    }
+    None
+}
+
+/// v2.13: static output columns of one unnest() argument (the
+/// Describe-side counterpart of unnest_one_column_set).
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn unnest_static_cols(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    arg: &Expr,
+    left: &[QCol],
+) -> Result<(Vec<String>, Vec<ColType>), ExecError> {
+    // v1.92: an array of a named composite expands to the
+    // composite's columns.
+    if let Some(fields) = unnest_record_elem_fields(eng, snap, own, session, arg) {
+        return Ok(fields.into_iter().unzip());
+    }
+    // v1.94: unnest(tsvector) — PG tsvector_unnest's OUT columns
+    // (lexeme text, positions int2[], weights text[]).
+    let ts_arg = matches!(
+        unnest_arg_field_type(eng, snap, own, session, arg),
+        Some(ColType::TsVector)
+    ) || matches!(
+        expr_type(eng, snap, own, session, &[left], &[], &[], arg),
+        Ok(ColType::TsVector)
+    );
+    if ts_arg {
+        return Ok((
+            vec![
+                "lexeme".to_string(),
+                "positions".to_string(),
+                "weights".to_string(),
+            ],
+            vec![
+                ColType::Text,
+                ColType::Array(crate::storage::ArrayElem::SmallInt),
+                ColType::Array(crate::storage::ArrayElem::Text),
+            ],
+        ));
+    }
+    let schemas = [left];
+    // v1.92: a field-access argument's type comes from the field
+    // definition (expr_type returns the record pseudo-type for
+    // field access).
+    let ty = match unnest_arg_field_type(eng, snap, own, session, arg) {
+        Some(ColType::Array(e)) => elem_scalar_type(e),
+        _ => match expr_type(eng, snap, own, session, &schemas, &[], &[], arg)? {
+            ColType::Array(e) => elem_scalar_type(e),
+            ColType::Text if matches!(arg, Expr::Literal(_)) => ColType::Text,
+            other => {
+                return Err(exec_err(
+                    "42883",
+                    format!("function unnest({}) does not exist", other.sql_name()),
+                ));
+            }
+        },
+    };
+    Ok((vec!["unnest".to_string()], vec![ty]))
+}
+
+/// v2.13: the static schema of ONE SRF call (the Describe-side
+/// counterpart of eval_srf_call): (names, types, authoritative).
+/// Column definition list validation is shared with the executor
+/// so both paths raise the same errors.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn lateral_function_schema(
+pub(crate) fn srf_static_schema(
     eng: &Engine,
     snap: &Snapshot,
     own: u64,
     session: u64,
     name: &str,
     args: &[Expr],
-    alias: &Option<String>,
-    col_aliases: &[String],
     col_defs: &[(String, ColType, Option<String>)],
-    json_table: Option<&JsonTableSpec>,
     left: &[QCol],
-) -> Result<Vec<QCol>, ExecError> {
-    // v1.89: JSON_TABLE's schema comes from its COLUMNS tree.
-    if name == "json_table" {
-        let spec = json_table.ok_or_else(|| {
-            exec_err(
-                "XX000",
-                "json_table FROM item without a COLUMNS tree".to_string(),
-            )
-        })?;
-        return super::jsontable::jt_schema(eng, snap, own, session, spec, alias, col_aliases);
-    }
+) -> Result<(Vec<String>, Vec<ColType>, bool), ExecError> {
     // v1.84: record-returning json functions: static schema from the
     // column definition list or the populate base's named type.
     if is_json_record_function(name) {
@@ -2115,95 +2617,89 @@ pub(crate) fn lateral_function_schema(
                     exec_err("42704", format!("type \"{type_name}\" does not exist"))
                 })?,
                 _ => {
-                    return Err(exec_err(
-                        "42601",
-                        "a column definition list is required for functions returning \"record\"",
-                    ));
+                    return Err(coldef_required_err());
                 }
             }
         } else {
-            return Err(exec_err(
-                "42601",
-                "a column definition list is required for functions returning \"record\"",
-            ));
+            return Err(coldef_required_err());
         };
         let (names, types): (Vec<String>, Vec<ColType>) = fields.into_iter().unzip();
-        return function_item_schema(name, &names, &types, alias, col_aliases);
+        return Ok((names, types, true));
     }
-    // v0.86: user-defined functions in FROM (Describe path). A scalar
-    // function returning a table rowtype expands to the table's columns.
+    // v2.13: multi-argument unnest() expands per argument.
+    if name == "unnest" && args.len() > 1 {
+        if !col_defs.is_empty() {
+            return Err(exec_err(
+                "42601",
+                "UNNEST() with multiple arguments cannot have a column definition list".to_string(),
+            ));
+        }
+        let mut names = Vec::new();
+        let mut types = Vec::new();
+        for a in args {
+            let (n, t) = unnest_static_cols(eng, snap, own, session, a, left)?;
+            names.extend(n);
+            types.extend(t);
+        }
+        return Ok((names, types, false));
+    }
+    // v0.86: user-defined functions in FROM (Describe path).
     // v0.87: resolve overload by arity for the describe path.
     if let Some(fdef) = crate::exec::overload_for_argc(eng, name, args.len()) {
-        if let Some(t) = eng.db.find_table(&fdef.ret_type, snap, &[own], session) {
-            let mut cols = Vec::with_capacity(t.columns.len());
-            for (idx, (cn, ct)) in t.columns.iter().enumerate() {
-                cols.push(QCol {
-                    qual: alias.clone().unwrap_or_else(|| name.to_string()),
-                    name: cn.clone(),
-                    ty: ct.clone(),
-                    hidden: false,
-                    src_ord: idx as u32,
-                });
-            }
-            return Ok(cols);
-        }
-        // v2.12: output parameters (OUT/INOUT args) name and
-        // type the FROM result columns (any return shape).
-        if fdef.has_outputs() && fdef.table_cols.is_empty() {
+        validate_coldef_for_fdef(eng, snap, own, session, &fdef, col_defs)?;
+        // v2.12: output parameters (OUT/INOUT args, RETURNS TABLE
+        // columns) name and type the FROM result columns.
+        if fdef.has_outputs() {
             let defs = crate::exec::fdef_output_defs(&fdef);
             let names: Vec<String> = defs.iter().map(|o| o.name.clone()).collect();
             let tys: Vec<ColType> = defs
                 .iter()
                 .map(|o| crate::sql::coltype_by_name(&o.type_name).unwrap_or(ColType::Text))
                 .collect();
-            return function_item_schema(name, &names, &tys, alias, col_aliases);
+            return Ok((names, tys, true));
         }
-        // v1.03: RETURNS SETOF <scalar> — a single column named for the
-        // function (PG names the output column after the function).
-        if fdef.returns_set {
-            if let Ok(ct) = crate::sql::coltype_by_name(&fdef.ret_type) {
-                return function_item_schema(name, &[name.to_string()], &[ct], alias, col_aliases);
-            }
-            // v2.04: RETURNS TABLE (record + setof) — PG names the
-            // output from the DECLARED column list when present.
-            if fdef.ret_type == "record" && !fdef.table_cols.is_empty() {
-                let names: Vec<String> = fdef.table_cols.iter().map(|(n, _)| n.clone()).collect();
-                let tys: Vec<ColType> = fdef
-                    .table_cols
-                    .iter()
-                    .map(|(_, t)| crate::sql::coltype_by_name(t).unwrap_or(ColType::Text))
-                    .collect();
-                return function_item_schema(name, &names, &tys, alias, col_aliases);
-            }
-            if fdef.ret_type == "record" {
-                if let Some(parsed) = &fdef.parsed {
-                    if let Some(crate::sql::Stmt::Select(sel)) = parsed.last() {
-                        let cols = crate::exec::describe::describe_select(
-                            eng,
-                            snap,
-                            own,
-                            session,
-                            sel,
-                            &[],
-                            &[left],
-                        )?;
-                        let names: Vec<String> = cols.iter().map(|(n, _)| n.clone()).collect();
-                        let tys: Vec<ColType> = cols.iter().map(|(_, t)| t.clone()).collect();
-                        return function_item_schema(name, &names, &tys, alias, col_aliases);
-                    }
-                }
-            }
+        // A scalar or SETOF function returning a named composite /
+        // table rowtype expands to the rowtype's fields.
+        if let Some((names, tys)) = static_rowtype_fields(eng, snap, own, session, &fdef.ret_type) {
+            return Ok((names, tys, true));
         }
+        // v2.13: RECORD return with a column definition list — the
+        // list names/types the result (validate_coldef_for_fdef
+        // already enforced that the list exists).
+        if fdef.ret_type.eq_ignore_ascii_case("record") && !col_defs.is_empty() {
+            return Ok((
+                col_defs.iter().map(|(n, _, _)| n.clone()).collect(),
+                col_defs.iter().map(|(_, t, _)| t.clone()).collect(),
+                true,
+            ));
+        }
+        // RETURNS SETOF <scalar> or a plain scalar function — a
+        // single column named for the function (PG names the output
+        // column after the function), typed by the declaration.
+        if let Ok(ct) = crate::sql::coltype_by_name(&fdef.ret_type) {
+            return Ok((vec![name.to_string()], vec![ct], false));
+        }
+        // Unresolvable return type (e.g. a shell type): fall through
+        // to the builtin tables, which will 42883 honestly.
     }
     // v2.04: pg_get_publication_tables (static schema by arity).
     if name == "pg_get_publication_tables" {
-        return function_item_schema(
-            name,
-            &gpt_col_names(args.len()),
-            &gpt_col_types(args.len()),
-            alias,
-            col_aliases,
-        );
+        validate_coldef_for_builtin(name, col_defs)?;
+        return Ok((gpt_col_names(args.len()), gpt_col_types(args.len()), true));
+    }
+    validate_coldef_for_builtin(name, col_defs)?;
+    // v2.13: single-argument unnest — names AND types come from the
+    // argument's element shape (record elements and tsvector
+    // expand to several columns, all named by PG's OUT list).
+    if name == "unnest" {
+        if args.len() != 1 {
+            return Err(exec_err(
+                "42883",
+                "function unnest() does not exist".to_string(),
+            ));
+        }
+        let (names, types) = unnest_static_cols(eng, snap, own, session, &args[0], left)?;
+        return Ok((names, types, false));
     }
     let out_names = table_function_col_names(name)?;
     let col_types: Vec<ColType> = if name == "generate_series" {
@@ -2220,71 +2716,116 @@ pub(crate) fn lateral_function_schema(
             ColType::Int
         };
         vec![ty]
-    } else if name == "unnest" {
-        // v0.79: setof the array's element type (a text literal coerces
-        // to text[], like PG's unknown literal).
-        if args.len() != 1 {
-            return Err(exec_err(
-                "42883",
-                "function unnest() does not exist".to_string(),
-            ));
-        }
-        // v1.92: an array of a named composite expands to the
-        // composite's columns.
-        if let Some(fields) = unnest_record_elem_fields(eng, snap, own, session, &args[0]) {
-            let (names, types): (Vec<String>, Vec<ColType>) = fields.into_iter().unzip();
-            return function_item_schema(name, &names, &types, alias, col_aliases);
-        }
-        // v1.94: unnest(tsvector) — PG tsvector_unnest's OUT columns
-        // (lexeme text, positions int2[], weights text[]).
-        let ts_arg = matches!(
-            unnest_arg_field_type(eng, snap, own, session, &args[0]),
-            Some(ColType::TsVector)
-        ) || matches!(
-            expr_type(eng, snap, own, session, &[left], &[], &[], &args[0]),
-            Ok(ColType::TsVector)
-        );
-        if ts_arg {
-            let names: Vec<String> = ["lexeme", "positions", "weights"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-            return function_item_schema(
-                name,
-                &names,
-                &[
-                    ColType::Text,
-                    ColType::Array(crate::storage::ArrayElem::SmallInt),
-                    ColType::Array(crate::storage::ArrayElem::Text),
-                ],
-                alias,
-                col_aliases,
-            );
-        }
-        let schemas = [left];
-        // v1.92: a field-access argument's type comes from the
-        // field definition (expr_type returns the record
-        // pseudo-type for field access).
-        let ty = match unnest_arg_field_type(eng, snap, own, session, &args[0]) {
-            Some(ColType::Array(e)) => elem_scalar_type(e),
-            _ => match expr_type(eng, snap, own, session, &schemas, &[], &[], &args[0])? {
-                ColType::Array(e) => elem_scalar_type(e),
-                ColType::Text if matches!(args[0], Expr::Literal(_)) => ColType::Text,
-                other => {
-                    return Err(exec_err(
-                        "42883",
-                        format!("function unnest({}) does not exist", other.sql_name()),
-                    ));
-                }
-            },
-        };
-        vec![ty]
     } else if is_json_expansion_srf(name) {
         json_srf_col_types(name)
     } else {
         vec![ColType::Text; out_names.len()]
     };
-    function_item_schema(name, &out_names, &col_types, alias, col_aliases)
+    let authoritative = is_json_expansion_srf(name) || name == "pg_input_error_info";
+    Ok((out_names, col_types, authoritative))
+}
+
+/// v0.46: output schema of a table function in an implicit-LATERAL
+/// position, inferred statically from the argument *types* against the
+/// left input's schema. Row values aren't available (and must not
+/// matter): like a declared return type, the schema is fixed per query,
+/// so an empty left input still yields the right schema. Only
+/// `generate_series` has a type-dependent schema — the same
+/// int4/int8/numeric resolution as `table_function_col_types`; every
+/// other table function is all-text. Shared by the executor and the
+/// Describe path so wire OIDs agree with execution.
+/// v2.13: WITH ORDINALITY appends the bigint `ordinality` column;
+/// ROWS FROM(...) concatenates its parts' static schemas under the
+/// same top-level coldef rules as the executor.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lateral_function_schema(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    name: &str,
+    args: &[Expr],
+    alias: &Option<String>,
+    col_aliases: &[String],
+    col_defs: &[(String, ColType, Option<String>)],
+    json_table: Option<&JsonTableSpec>,
+    left: &[QCol],
+    ordinality: bool,
+    rows_from: &[RowsFromPart],
+) -> Result<Vec<QCol>, ExecError> {
+    // v1.89: JSON_TABLE's schema comes from its COLUMNS tree.
+    if name == "json_table" {
+        let spec = json_table.ok_or_else(|| {
+            exec_err(
+                "XX000",
+                "json_table FROM item without a COLUMNS tree".to_string(),
+            )
+        })?;
+        return super::jsontable::jt_schema(eng, snap, own, session, spec, alias, col_aliases);
+    }
+    // v2.13: ROWS FROM(...) — per-part static schemas concatenated.
+    if !rows_from.is_empty() {
+        let mut top_defs: &[(String, ColType, Option<String>)] = &[];
+        if !col_defs.is_empty() {
+            if rows_from.len() != 1 {
+                return Err(exec_err(
+                    "42601",
+                    "ROWS FROM() with multiple functions cannot have a column definition list"
+                        .to_string(),
+                ));
+            }
+            if ordinality {
+                return Err(exec_err(
+                    "42601",
+                    "WITH ORDINALITY cannot be used with a column definition list".to_string(),
+                ));
+            }
+            if !rows_from[0].col_defs.is_empty() {
+                return Err(exec_err(
+                    "42601",
+                    "multiple column definition lists are not allowed for the same function"
+                        .to_string(),
+                ));
+            }
+            top_defs = col_defs;
+        }
+        let mut names: Vec<String> = Vec::new();
+        let mut types: Vec<ColType> = Vec::new();
+        for (i, part) in rows_from.iter().enumerate() {
+            let defs = if i == 0 && !top_defs.is_empty() {
+                top_defs
+            } else {
+                &part.col_defs
+            };
+            let (n, t, _auth) =
+                srf_static_schema(eng, snap, own, session, &part.name, &part.args, defs, left)?;
+            names.extend(
+                n.into_iter()
+                    .enumerate()
+                    .map(|(i, nm)| part.col_aliases.get(i).cloned().unwrap_or(nm)),
+            );
+            types.extend(t);
+        }
+        if ordinality {
+            names.push("ordinality".to_string());
+            types.push(ColType::BigInt);
+        }
+        return function_item_schema_auth("rows_from", &names, &types, alias, col_aliases, true);
+    }
+    if ordinality && !col_defs.is_empty() {
+        return Err(exec_err(
+            "42601",
+            "WITH ORDINALITY cannot be used with a column definition list".to_string(),
+        ));
+    }
+    let (mut names, mut types, authoritative) =
+        srf_static_schema(eng, snap, own, session, name, args, col_defs, left)?;
+    if ordinality {
+        names.push("ordinality".to_string());
+        types.push(ColType::BigInt);
+    }
+    function_item_schema_auth(name, &names, &types, alias, col_aliases, authoritative)
 }
 
 /// v0.89: apply the statement-local UPDATE overlay to base-table scan
@@ -3179,6 +3720,8 @@ pub(crate) fn build_source(
             col_aliases,
             col_defs,
             json_table,
+            ordinality,
+            rows_from,
             ..
         } => eval_function_item(
             q,
@@ -3189,6 +3732,8 @@ pub(crate) fn build_source(
             col_aliases,
             col_defs,
             json_table.as_deref(),
+            *ordinality,
+            rows_from,
         ),
         FromItem::Derived {
             sub,
@@ -3377,7 +3922,15 @@ pub(crate) fn build_source(
                     col_defs,
                     lateral,
                     json_table,
-                } if *lateral || (is_comma && function_args_lateral(args, &lschema0)) => {
+                    ordinality,
+                    rows_from,
+                } if *lateral
+                    || (is_comma
+                        && (function_args_lateral(args, &lschema0)
+                            || rows_from
+                                .iter()
+                                .any(|part| function_args_lateral(&part.args, &lschema0)))) =>
+                {
                     Some(LateralRight::Func {
                         name: name.as_str(),
                         args: args.as_slice(),
@@ -3385,6 +3938,8 @@ pub(crate) fn build_source(
                         col_aliases: col_aliases.as_slice(),
                         col_defs: col_defs.as_slice(),
                         json_table: json_table.as_deref(),
+                        ordinality: *ordinality,
+                        rows_from: rows_from.as_slice(),
                     })
                 }
                 FromItem::Derived {

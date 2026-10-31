@@ -211,13 +211,20 @@ fn select_final_from_table_column() {
 fn select_final_fail_open_shapes_still_create() {
     let mut eng = engine();
     setup(&mut eng);
-    // Composite declared return type: the existing call-time
-    // `eval_cast_named` path applies (v1.34's fail-open rule).
-    run(
+    // Composite declared return type: v1.34's fail-open rule is
+    // superseded in v2.13 — PG19 check_sql_fn_retval checks the
+    // final statement's column COUNT against the declared rowtype
+    // (t135 has 3 fields; the final SELECT returns 1), so CREATE
+    // now fails with 42P13 like PG.
+    let e = err_of(
         &mut eng,
         "CREATE FUNCTION f() RETURNS t135 LANGUAGE sql AS 'SELECT a FROM t135';",
-    )
-    .unwrap();
+    );
+    assert_eq!(e.code, "42P13");
+    assert_eq!(
+        e.detail.as_deref(),
+        Some("Final statement returns too few columns.")
+    );
     // `*` shapes defer to the call-time arity/coercion check.
     run(
         &mut eng,
