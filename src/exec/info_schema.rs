@@ -612,3 +612,220 @@ pub(crate) fn info_table_privileges_scan_schema_rtg() -> Vec<QCol> {
     .map(|(n, ty)| info_qcol("information_schema.role_table_grants", n, ty))
     .collect()
 }
+
+// ---------------------------------------------------------------------------
+// v2.14: information_schema.triggers (PG19 information_schema.sql).
+// One row per (trigger, event) for INSERT/DELETE/UPDATE events
+// (TRUNCATE intentionally omitted, as in PG), including the
+// partition-clone rows PG exposes. action_order is the rank over
+// (schema, table, event, row/statement, before/after/instead)
+// ordered by trigger name; action_condition / action_statement are
+// carved out of the pg_get_triggerdef text like PG's view does.
+// ---------------------------------------------------------------------------
+
+pub(crate) fn info_triggers_schema() -> Vec<QCol> {
+    [
+        ("trigger_catalog", ColType::Text),
+        ("trigger_schema", ColType::Text),
+        ("trigger_name", ColType::Text),
+        ("event_manipulation", ColType::Text),
+        ("event_object_catalog", ColType::Text),
+        ("event_object_schema", ColType::Text),
+        ("event_object_table", ColType::Text),
+        ("action_order", ColType::Int),
+        ("action_condition", ColType::Text),
+        ("action_statement", ColType::Text),
+        ("action_orientation", ColType::Text),
+        ("action_timing", ColType::Text),
+        ("action_reference_old_table", ColType::Text),
+        ("action_reference_new_table", ColType::Text),
+        ("action_reference_old_row", ColType::Text),
+        ("action_reference_new_row", ColType::Text),
+        ("created", ColType::Text),
+    ]
+    .into_iter()
+    .map(|(n, ty)| info_qcol("information_schema.triggers", n, ty))
+    .collect()
+}
+
+pub(crate) fn info_triggers_scan(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = info_triggers_schema();
+    // (table, trigger) sources: own defs on tables and views, plus
+    // clone rows on partition descendants.
+    let mut src: Vec<(String, crate::sql::TriggerDef)> = Vec::new();
+    let mut names: Vec<String> = db
+        .tables
+        .iter()
+        .filter(|(_, vs)| {
+            vs.iter()
+                .any(|t| crate::storage::table_visible(t, snap, &[own]))
+        })
+        .map(|(n, _)| n.clone())
+        .collect();
+    names.sort();
+    fn descendants_of(
+        db: &Database,
+        snap: &Snapshot,
+        own: u64,
+        session: u64,
+        root: &str,
+        out: &mut Vec<String>,
+        depth: usize,
+    ) {
+        if depth > 32 {
+            return;
+        }
+        if let Some(t) = db.find_table(root, snap, &[own], session) {
+            if let Some(pi) = &t.partition {
+                for c in &pi.children {
+                    out.push(c.clone());
+                    descendants_of(db, snap, own, session, c, out, depth + 1);
+                }
+            }
+        }
+    }
+    for tn in &names {
+        let Some(t) = db.find_table(tn, snap, &[own], session) else {
+            continue;
+        };
+        for tr in &t.triggers {
+            src.push((tn.clone(), tr.clone()));
+        }
+        if t.partition.is_some() && !t.triggers.is_empty() {
+            let mut desc = Vec::new();
+            descendants_of(db, snap, own, session, tn, &mut desc, 0);
+            desc.sort();
+            desc.dedup();
+            for d in desc {
+                if &d == tn {
+                    continue;
+                }
+                for tr in &t.triggers {
+                    src.push((d.clone(), tr.clone()));
+                }
+            }
+        }
+    }
+    let mut vnames: Vec<String> = db
+        .views
+        .iter()
+        .filter(|(_, vs)| {
+            vs.iter()
+                .any(|v| crate::storage::view_visible(v, snap, own))
+        })
+        .map(|(n, _)| n.clone())
+        .collect();
+    vnames.sort();
+    for vn in &vnames {
+        if let Some(v) = db.find_view(vn, snap, own) {
+            for tr in &v.triggers {
+                src.push((vn.clone(), tr.clone()));
+            }
+        }
+    }
+    // Expand to (table, trigger, event) and compute action_order.
+    #[derive(Clone)]
+    struct EvRow {
+        table: String,
+        tr: crate::sql::TriggerDef,
+        event: &'static str,
+        tgtype: i64,
+    }
+    let mut evs: Vec<EvRow> = Vec::new();
+    for (tn, tr) in &src {
+        let tgtype = crate::exec::catalog::trigger_tgtype(tr);
+        for (bit, nm) in [
+            (crate::sql::trig_event::INSERT, "INSERT"),
+            (crate::sql::trig_event::DELETE, "DELETE"),
+            (crate::sql::trig_event::UPDATE, "UPDATE"),
+        ] {
+            if tr.events & bit != 0 {
+                evs.push(EvRow {
+                    table: tn.clone(),
+                    tr: tr.clone(),
+                    event: nm,
+                    tgtype,
+                });
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    for ev in &evs {
+        // Rank within the PG partition key, ordered by tgname.
+        let mut group: Vec<&str> = evs
+            .iter()
+            .filter(|o| {
+                o.table == ev.table
+                    && o.event == ev.event
+                    && (o.tgtype & 1) == (ev.tgtype & 1)
+                    && (o.tgtype & 66) == (ev.tgtype & 66)
+            })
+            .map(|o| o.tr.name.as_str())
+            .collect();
+        group.sort();
+        group.dedup();
+        let order = group.iter().position(|n| *n == ev.tr.name).unwrap_or(0) as i64 + 1;
+        let deftext = crate::exec::catalog::trigger_def_text(&ev.table, &ev.tr);
+        let condition = ev.tr.when_expr.as_ref().map(|_| {
+            // Carve the WHEN (...) body out of the def text like
+            // PG's regexp over pg_get_triggerdef.
+            let start = deftext.find("WHEN (").map(|i| i + 6);
+            let end = deftext.find(") EXECUTE FUNCTION");
+            match (start, end) {
+                (Some(a), Some(b)) if b > a => deftext[a..b].to_string(),
+                _ => String::new(),
+            }
+        });
+        let statement = deftext
+            .find("EXECUTE FUNCTION")
+            .map(|i| deftext[i..].to_string())
+            .unwrap_or_default();
+        let orientation = if ev.tr.for_each_row {
+            "ROW"
+        } else {
+            "STATEMENT"
+        };
+        let timing = match ev.tr.timing {
+            crate::sql::TriggerTiming::Before => "BEFORE",
+            crate::sql::TriggerTiming::After => "AFTER",
+            crate::sql::TriggerTiming::InsteadOf => "INSTEAD OF",
+        };
+        rows.push(QRow {
+            cells: Row::new(vec![
+                Value::text("rustgres"),
+                Value::text("public"),
+                Value::text(ev.tr.name.clone()),
+                Value::text(ev.event),
+                Value::text("rustgres"),
+                Value::text("public"),
+                Value::text(ev.table.clone()),
+                Value::Int(order),
+                match condition {
+                    Some(c) => Value::text(c),
+                    None => Value::Null,
+                },
+                Value::text(statement),
+                Value::text(orientation),
+                Value::text(timing),
+                match &ev.tr.old_table {
+                    Some(n) => Value::text(n.clone()),
+                    None => Value::Null,
+                },
+                match &ev.tr.new_table {
+                    Some(n) => Value::text(n.clone()),
+                    None => Value::Null,
+                },
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]),
+            prov: Vec::new(),
+        });
+    }
+    (schema, rows)
+}

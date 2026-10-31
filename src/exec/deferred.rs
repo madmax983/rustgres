@@ -445,6 +445,7 @@ fn fire_queued_trigger(
         event: e.event,
         args: tr.args.clone(),
         relid: ft.oid as i64,
+        for_each_row: tr.for_each_row,
     };
     fire_one_trigger(
         eng,

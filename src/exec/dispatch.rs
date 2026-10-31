@@ -13,12 +13,125 @@ pub fn execute(eng: &mut Engine, ctx: &mut StmtCtx, stmt: &Stmt) -> Result<ExecR
     // outer statement's notices.
     let sink = std::rc::Rc::new(RefCell::new(Vec::new()));
     let prev = NOTICE_SINK.with(|s| s.borrow_mut().replace(sink.clone()));
-    let r = execute_inner(eng, ctx, stmt);
+    // v2.14: statement-level trigger hooks for DML (PG19
+    // ExecBS/ExecAS queues). BEFORE fires before the statement —
+    // including for zero-row statements — and AFTER only on success.
+    // The hook is a no-op unless the target relation actually has
+    // statement triggers for the event.
+    let hook = dml_stmt_hook(eng, ctx, stmt);
+    // v2.14: track the DML target as "in use" for the statement's
+    // duration (ALTER TABLE ATTACH/DETACH on it from inside a
+    // trigger body is an error in PG).
+    let dml_rel = match stmt {
+        Stmt::Insert { table, .. } | Stmt::Update { table, .. } | Stmt::Delete { table, .. } => {
+            Some(table.clone())
+        }
+        Stmt::Truncate { tables, .. } => tables.first().cloned(),
+        _ => None,
+    };
+    if let Some(r) = &dml_rel {
+        crate::exec::partition::active_dml_push(r);
+    }
+    let r = match &hook {
+        Some((rel, event, set_cols)) => {
+            crate::exec::partition::stmt_images_reset();
+            let pre = crate::exec::partition::fire_statement_triggers(
+                eng,
+                ctx,
+                rel,
+                *event,
+                crate::sql::TriggerTiming::Before,
+                set_cols.as_deref(),
+                None,
+            );
+            match pre {
+                Ok(()) => {
+                    let r0 = execute_inner(eng, ctx, stmt);
+                    match r0 {
+                        Ok(v) => {
+                            let root_cols: Vec<(String, crate::storage::ColType)> = match eng
+                                .db
+                                .find_table(rel, ctx.snap, &ctx.all_xids, ctx.session)
+                            {
+                                Some(t) => t.columns.clone(),
+                                None => Vec::new(),
+                            };
+                            let capture = crate::exec::partition::stmt_images_take_pub(
+                                eng, ctx, rel, &root_cols,
+                            );
+                            match crate::exec::partition::fire_statement_triggers(
+                                eng,
+                                ctx,
+                                rel,
+                                *event,
+                                crate::sql::TriggerTiming::After,
+                                set_cols.as_deref(),
+                                capture.as_ref(),
+                            ) {
+                                Ok(()) => Ok(v),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                Err(e) => Err(e),
+            }
+        }
+        None => execute_inner(eng, ctx, stmt),
+    };
+    if dml_rel.is_some() {
+        crate::exec::partition::active_dml_pop();
+    }
     NOTICE_SINK.with(|s| {
         *s.borrow_mut() = prev;
     });
     ctx.notices.extend(sink.borrow_mut().drain(..));
     r
+}
+
+/// v2.14: for INSERT/UPDATE/DELETE/TRUNCATE statements whose target
+/// relation has statement-level triggers, the (relation, event,
+/// SET-column list) the dispatch hook needs; None otherwise.
+fn dml_stmt_hook(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    stmt: &Stmt,
+) -> Option<(String, u8, Option<Vec<String>>)> {
+    use crate::sql::trig_event;
+    let (rel, event, set_cols): (&str, u8, Option<Vec<String>>) = match stmt {
+        Stmt::Insert { table, .. } => (table, trig_event::INSERT, None),
+        Stmt::Update { table, sets, .. } => (
+            table,
+            trig_event::UPDATE,
+            Some(sets.iter().map(|(n, _)| n.clone()).collect()),
+        ),
+        Stmt::Delete { table, .. } => (table, trig_event::DELETE, None),
+        Stmt::Truncate { tables, .. } => {
+            // Bounded: hook the first table only (the suite's
+            // TRUNCATE triggers are single-table).
+            (tables.first()?, trig_event::TRUNCATE, None)
+        }
+        _ => return None,
+    };
+    let has = crate::exec::partition::has_statement_triggers(
+        eng,
+        ctx,
+        rel,
+        crate::sql::TriggerTiming::Before,
+        event,
+    ) || crate::exec::partition::has_statement_triggers(
+        eng,
+        ctx,
+        rel,
+        crate::sql::TriggerTiming::After,
+        event,
+    );
+    if has {
+        Some((rel.to_string(), event, set_cols))
+    } else {
+        None
+    }
 }
 
 /// v1.02: `execute` inner — the statement dispatch. Split out so the
@@ -505,6 +618,9 @@ pub(crate) fn execute_inner(
             constr_rel,
             update_cols,
             has_transition,
+            or_replace,
+            old_table,
+            new_table,
         } => exec_create_trigger(
             eng,
             ctx,
@@ -523,7 +639,45 @@ pub(crate) fn execute_inner(
             constr_rel.clone(),
             update_cols.clone(),
             *has_transition,
+            *or_replace,
+            old_table.clone(),
+            new_table.clone(),
         ),
+        Stmt::CommentOnTrigger { name, table } => {
+            // v2.14: PG19 validates the trigger exists (42704); the
+            // comment itself is not stored.
+            let on_table = eng
+                .db
+                .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+                .map(|t| t.triggers.iter().any(|t| &t.name == name))
+                .unwrap_or(false);
+            let on_view = crate::exec::views::view_triggers(eng, ctx, table)
+                .iter()
+                .any(|t| &t.name == name);
+            if !on_table && !on_view {
+                let rel_exists = eng
+                    .db
+                    .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+                    .is_some()
+                    || eng.db.find_view(table, ctx.snap, ctx.own).is_some();
+                if !rel_exists {
+                    return Err(exec_err(
+                        "42P01",
+                        format!("relation \"{}\" does not exist", table),
+                    ));
+                }
+                return Err(exec_err(
+                    "42704",
+                    format!(
+                        "trigger \"{}\" for relation \"{}\" does not exist",
+                        name, table
+                    ),
+                ));
+            }
+            Ok(ExecResult::Command {
+                tag: "COMMENT".to_string(),
+            })
+        }
         Stmt::AlterTriggerRename {
             name,
             table,

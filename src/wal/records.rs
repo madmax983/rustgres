@@ -196,11 +196,22 @@ pub enum WalRecord {
         /// v1.95 (RGSWAL25): view options.
         security_invoker: bool,
         check_option: bool,
+        /// v2.14 (RGSWAL33): the view's triggers, encoded with
+        /// sql::encode_triggers; empty on RGSWAL32- images.
+        triggers: String,
         xmin: u64,
     },
     DropView {
         name: String,
         xmax: u64,
+    },
+    /// v2.14 (RGSWAL33): a view's trigger list changed (CREATE /
+    /// DROP / ALTER TRIGGER on a view). Carries the full new list,
+    /// encoded with sql::encode_triggers.
+    AlterViewTriggers {
+        name: String,
+        triggers: String,
+        xmin: u64,
     },
     CreateSequence {
         name: String,

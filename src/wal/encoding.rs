@@ -553,6 +553,11 @@ impl Enc {
                 self.u8(16);
                 return;
             }
+            // v2.14: regproc; tag appends after v1.94's.
+            ColType::Regproc => {
+                self.u8(36);
+                return;
+            }
             // v0.57: name; tag appends after v0.37's.
             ColType::Name => {
                 self.u8(17);
@@ -1083,6 +1088,7 @@ impl Enc {
                 owner,
                 security_invoker,
                 check_option,
+                triggers,
                 xmin,
             } => {
                 self.u8(8);
@@ -1101,11 +1107,24 @@ impl Enc {
                 // v1.95 (RGSWAL25): view options, last.
                 self.u8(*security_invoker as u8);
                 self.u8(*check_option as u8);
+                // v2.14 (RGSWAL33): view triggers, last (the
+                // encoder always writes the current WAL version).
+                self.str(triggers);
             }
             WalRecord::DropView { name, xmax } => {
                 self.u8(9);
                 self.str(name);
                 self.u64(*xmax);
+            }
+            WalRecord::AlterViewTriggers {
+                name,
+                triggers,
+                xmin,
+            } => {
+                self.u8(34);
+                self.str(name);
+                self.str(triggers);
+                self.u64(*xmin);
             }
             WalRecord::CreateSequence { name, seq, xmin } => {
                 self.u8(10);
@@ -1872,6 +1891,8 @@ impl<'a> Dec<'a> {
             // v1.94: tsvector / tsquery (WAL v24+ only).
             34 => Ok(ColType::TsVector),
             35 => Ok(ColType::TsQuery),
+            // v2.14: regproc.
+            36 => Ok(ColType::Regproc),
             // v0.78: array, then the PG array OID identifying the
             // element type.
             22 => {
@@ -2421,6 +2442,12 @@ impl<'a> Dec<'a> {
                 } else {
                     (false, false)
                 };
+                // v2.14 (RGSWAL33): trailing view triggers.
+                let triggers = if self.wal_version >= 33 {
+                    self.str()?
+                } else {
+                    String::new()
+                };
                 Ok(WalRecord::CreateView {
                     name,
                     query,
@@ -2429,6 +2456,7 @@ impl<'a> Dec<'a> {
                     owner,
                     security_invoker,
                     check_option,
+                    triggers,
                     xmin,
                 })
             }
@@ -2793,6 +2821,16 @@ impl<'a> Dec<'a> {
                 let name = self.str()?;
                 let xmax = self.u64()?;
                 Ok(WalRecord::DropPublication { name, xmax })
+            }
+            34 => {
+                let name = self.str()?;
+                let triggers = self.str()?;
+                let xmin = self.u64()?;
+                Ok(WalRecord::AlterViewTriggers {
+                    name,
+                    triggers,
+                    xmin,
+                })
             }
             t => Err(self.err(&format!("unknown record tag {}", t))),
         }

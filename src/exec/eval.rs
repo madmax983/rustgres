@@ -1653,6 +1653,10 @@ pub(crate) fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, 
             if *to == ColType::Regclass {
                 return eval_regclass_cast(q, &v);
             }
+            // v2.14: regproc cast needs catalog lookup (OID -> name).
+            if *to == ColType::Regproc {
+                return eval_regproc_cast(q, &v);
+            }
             // v1.96: an array-to-array cast runs the ELEMENT cast
             // function; PG checks EXECUTE on it (REVOKE ALL ON
             // FUNCTION int8(integer) FROM PUBLIC denies the cast).
@@ -2783,6 +2787,7 @@ pub(crate) fn subplan_inner_is_base_table(q: &Q, name: &str) -> bool {
         || name == "information_schema.column_privileges"
         || name == "information_schema.enabled_roles"
         || name == "information_schema.applicable_roles"
+        || name == "information_schema.triggers"
     {
         return false;
     }

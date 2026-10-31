@@ -4844,6 +4844,7 @@ fn auto_vacuum(engine: &mut Engine, writes: &[WriteOp]) {
             | WriteOp::LargeObjects { .. }
             | WriteOp::DbOwner { .. }
             | WriteOp::ViewState { .. }
+            | WriteOp::ViewTriggers { .. }
             // v0.22: temp tables are single-version; their DDL leaves
             // no dead versions to reap. Shell types likewise.
             | WriteOp::CreateTempTable { .. }

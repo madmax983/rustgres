@@ -41,7 +41,9 @@ pub(crate) const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK16";
 /// fresh.
 /// v2.12: version 28 adds per-function `arg_modes`. v27 checkpoints
 /// are refused; remove the data directory to start fresh.
-pub(crate) const CHKPT_VERSION: u32 = 28;
+/// v2.14: version 29 adds per-view `triggers`. v28 checkpoints are
+/// refused; remove the data directory to start fresh.
+pub(crate) const CHKPT_VERSION: u32 = 29;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -111,9 +113,11 @@ pub(crate) const CHKPT_VERSION: u32 = 28;
 /// the field decodes as false.
 /// v2.12: `RGSWAL31` — CreateFunction records carry `arg_modes`
 /// (trailing list). Older logs still read; modes decode as all-IN.
-pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL32";
+pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL33";
 /// v1.80: the format version number in [`WAL_MAGIC`].
-pub(crate) const WAL_VERSION: u32 = 32;
+/// v2.14: version 33 — CreateView records carry view triggers
+/// (trailing string). Older logs still read; triggers decode empty.
+pub(crate) const WAL_VERSION: u32 = 33;
 /// v1.80: oldest WAL format this build can replay.
 pub(crate) const MIN_READABLE_WAL_VERSION: u32 = 20;
 pub(crate) const WAL_HEADER_LEN: u64 = 16;
@@ -618,6 +622,8 @@ impl Wal {
                 v_body.acl_list(&v.acl.iter().map(WalAcl::of).collect::<Vec<_>>());
                 v_body.u8(v.matview as u8);
                 v_body.u8(v.populated as u8);
+                // v2.14 (checkpoint v29): view triggers.
+                v_body.str(&crate::sql::encode_triggers(&v.triggers));
                 n_views += 1;
             }
         }
@@ -1450,6 +1456,9 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
             .collect();
         let matview = d.u8().map_err(|e| bad(&e))? != 0;
         let populated = d.u8().map_err(|e| bad(&e))? != 0;
+        // v2.14 (checkpoint v29): view triggers.
+        let trig_str = d.str().map_err(|e| bad(&e))?;
+        let triggers = crate::sql::decode_triggers(&trig_str).map_err(|e| bad(&e))?;
         eng.db
             .views
             .entry(name.clone())
@@ -1466,6 +1475,7 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 acl,
                 matview,
                 populated,
+                triggers,
             });
     }
     // v0.9: sequences, with their current values.

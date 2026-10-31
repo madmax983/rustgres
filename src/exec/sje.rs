@@ -1386,6 +1386,7 @@ pub(crate) fn plan_from_item(
                 || name == "information_schema.column_privileges"
                 || name == "information_schema.enabled_roles"
                 || name == "information_schema.applicable_roles"
+                || name == "information_schema.triggers"
             {
                 return Ok(PlanNode::SeqScan {
                     table: name.clone(),

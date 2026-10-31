@@ -1376,6 +1376,8 @@ pub(crate) fn fire_before_insert_triggers(
             .filter(|tr| {
                 tr.timing == TriggerTiming::Before
                     && tr.for_each_row
+                    && tr.fires()
+                    && !tr.has_transition
                     && (tr.events & trig_event::INSERT) != 0
             })
             .cloned()
@@ -1419,6 +1421,7 @@ pub(crate) fn fire_before_insert_triggers(
                     .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
                     .map(|t| t.oid as i64)
                     .unwrap_or(0),
+                for_each_row: tr.for_each_row,
             };
             if !trigger_when_matches(
                 eng,
@@ -1453,6 +1456,9 @@ pub(crate) struct TrigCtx {
     pub args: Vec<String>,
     /// v2.09: OID of the firing table (NEW.tableoid / TG_RELID).
     pub relid: i64,
+    /// v2.14: FOR EACH ROW (TG_LEVEL) — false for statement-level
+    /// firings.
+    pub for_each_row: bool,
 }
 
 impl TrigCtx {
@@ -1468,6 +1474,15 @@ impl TrigCtx {
         match self.timing {
             TriggerTiming::Before => "BEFORE",
             TriggerTiming::After => "AFTER",
+            TriggerTiming::InsteadOf => "INSTEAD OF",
+        }
+    }
+    /// v2.14: TG_LEVEL text.
+    pub(crate) fn level_name(&self) -> &'static str {
+        if self.for_each_row {
+            "ROW"
+        } else {
+            "STATEMENT"
         }
     }
 }
@@ -2179,7 +2194,7 @@ fn rewrite_ref_expr(
                     "tg_table_schema" => push(Value::text("public".to_string()), slots),
                     "tg_when" => push(Value::text(tctx.when_name().to_string()), slots),
                     "tg_op" => push(Value::text(tctx.op_name().to_string()), slots),
-                    "tg_level" => push(Value::text("ROW".to_string()), slots),
+                    "tg_level" => push(Value::text(tctx.level_name().to_string()), slots),
                     "tg_nargs" => push(Value::Int(tctx.args.len() as i64), slots),
                     "tg_relid" => push(Value::Int(tctx.relid), slots),
                     _ => e.clone(),
@@ -2533,7 +2548,7 @@ pub(crate) fn eval_trigger_expr(
             "tg_table_schema" => Some(Value::text("public".to_string())),
             "tg_when" => Some(Value::text(tctx.when_name().to_string())),
             "tg_op" => Some(Value::text(tctx.op_name().to_string())),
-            "tg_level" => Some(Value::text("ROW".to_string())),
+            "tg_level" => Some(Value::text(tctx.level_name().to_string())),
             "tg_nargs" => Some(Value::Int(tctx.args.len() as i64)),
             "tg_relid" => Some(Value::Int(tctx.relid)),
             _ => None,
@@ -2793,13 +2808,10 @@ pub(crate) fn fire_after_row_triggers(
     pairs: &[(Option<Row>, Option<Row>)],
     set_cols: Option<&[String]>,
 ) -> Result<(), ExecError> {
+    stmt_images_push(leaf, cols, pairs);
     let defs = trigger_defs_for_leaf(eng, ctx, leaf);
     for (def_table, tr) in &defs {
-        if tr.timing != TriggerTiming::After
-            || !tr.for_each_row
-            || !tr.enforced
-            || tr.has_transition
-        {
+        if tr.timing != TriggerTiming::After || !tr.for_each_row || !tr.enforced || !tr.fires() {
             continue;
         }
         if (tr.events & event) == 0 {
@@ -2833,11 +2845,20 @@ pub(crate) fn fire_after_row_triggers(
                 .find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session)
                 .map(|t| t.oid as i64)
                 .unwrap_or(0),
+            for_each_row: tr.for_each_row,
         };
+        // v2.14: transition tables are materialized once per
+        // (trigger, statement) and visible to every row firing.
+        let installed = if tr.has_transition {
+            install_transition_tables(eng, ctx, cols, pairs, tr)?
+        } else {
+            Vec::new()
+        };
+        let mut fire_res: Result<(), ExecError> = Ok(());
         for (old, new) in pairs {
             let old_ref = old.as_ref().map(|r| &r[..]);
             let new_ref = new.as_ref().map(|r| &r[..]);
-            if !trigger_when_matches(
+            let m = match trigger_when_matches(
                 eng,
                 ctx,
                 &tctx,
@@ -2845,7 +2866,14 @@ pub(crate) fn fire_after_row_triggers(
                 new_ref,
                 old_ref,
                 tr.when_expr.as_ref(),
-            )? {
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    fire_res = Err(e);
+                    break;
+                }
+            };
+            if !m {
                 continue;
             }
             if tr.is_constraint && trig_mode_deferred(eng, ctx.session, def_table, tr) {
@@ -2861,8 +2889,13 @@ pub(crate) fn fire_after_row_triggers(
                 );
                 continue;
             }
-            fire_one_trigger(eng, ctx, &tctx, tr, cols, new_ref, old_ref)?;
+            if let Err(e) = fire_one_trigger(eng, ctx, &tctx, tr, cols, new_ref, old_ref) {
+                fire_res = Err(e);
+                break;
+            }
         }
+        drop_transition_tables(eng, ctx, installed);
+        fire_res?;
     }
     Ok(())
 }
@@ -2875,6 +2908,7 @@ pub(crate) fn leaf_has_before_triggers(eng: &Engine, ctx: &StmtCtx, leaf: &str, 
         tr.timing == TriggerTiming::Before
             && tr.for_each_row
             && tr.enforced
+            && tr.fires()
             && !tr.has_transition
             && (tr.events & event) != 0
     })
@@ -2901,12 +2935,24 @@ pub(crate) fn fire_before_update_triggers(
         if tr.timing != TriggerTiming::Before
             || !tr.for_each_row
             || !tr.enforced
+            || !tr.fires()
             || tr.has_transition
             || (tr.events & trig_event::UPDATE) == 0
         {
             continue;
         }
         if !tr.update_cols.is_empty() && !tr.update_cols.iter().any(|c| set_cols.contains(c)) {
+            continue;
+        }
+        // v2.14: PG's built-in suppress_redundant_updates_trigger():
+        // return NULL (skip the row) when NEW equals OLD in every
+        // column, else NEW unchanged (trigger.c builtin body).
+        if tr.function == "suppress_redundant_updates_trigger"
+            && find_function_by_signature(eng, &tr.function, &[]).is_none()
+        {
+            if old_row.len() == cur.len() && old_row.iter().zip(cur.iter()).all(|(a, b)| a == b) {
+                return Ok(None);
+            }
             continue;
         }
         let tctx = TrigCtx {
@@ -2920,6 +2966,7 @@ pub(crate) fn fire_before_update_triggers(
                 .find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session)
                 .map(|t| t.oid as i64)
                 .unwrap_or(0),
+            for_each_row: tr.for_each_row,
         };
         if !trigger_when_matches(
             eng,
@@ -2967,6 +3014,7 @@ pub(crate) fn fire_before_delete_triggers(
         if tr.timing != TriggerTiming::Before
             || !tr.for_each_row
             || !tr.enforced
+            || !tr.fires()
             || tr.has_transition
             || (tr.events & trig_event::DELETE) == 0
         {
@@ -2983,6 +3031,7 @@ pub(crate) fn fire_before_delete_triggers(
                 .find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session)
                 .map(|t| t.oid as i64)
                 .unwrap_or(0),
+            for_each_row: tr.for_each_row,
         };
         if !trigger_when_matches(
             eng,
@@ -4612,7 +4661,7 @@ fn subst_tg_vars(e: &Expr, tctx: &TrigCtx) -> Expr {
             "tg_table_schema" => lit("public"),
             "tg_when" => lit(tctx.when_name()),
             "tg_op" => lit(tctx.op_name()),
-            "tg_level" => lit("ROW"),
+            "tg_level" => lit(tctx.level_name()),
             "tg_nargs" => Expr::Literal(crate::sql::Literal::Int(tctx.args.len() as i64)),
             "tg_relid" => Expr::Literal(crate::sql::Literal::Int(tctx.relid)),
             _ => e.clone(),
@@ -4731,4 +4780,364 @@ fn subst_tg_vars(e: &Expr, tctx: &TrigCtx) -> Expr {
         },
         other => other.clone(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// v2.14: statement-level triggers, transition tables, INSTEAD OF support.
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// v2.14: row images of the DML statement currently executing
+    /// (accumulated by fire_after_row_triggers per leaf), consumed by
+    /// the AFTER STATEMENT hook to materialize transition tables.
+    /// One (leaf table, cols, pairs) entry per touched leaf.
+    static STMT_IMAGES: std::cell::RefCell<
+        Vec<(String, Vec<(String, ColType)>, Vec<(Option<Row>, Option<Row>)>)>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// v2.14: relations with a DML statement currently executing on
+    /// this thread (PG's "being used by active queries in this
+    /// session" for ALTER TABLE ... ATTACH/DETACH PARTITION issued
+    /// from inside a trigger body).
+    static ACTIVE_DML: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn active_dml_push(rel: &str) {
+    ACTIVE_DML.with(|a| a.borrow_mut().push(rel.to_string()));
+}
+
+pub(crate) fn active_dml_pop() {
+    ACTIVE_DML.with(|a| {
+        a.borrow_mut().pop();
+    });
+}
+
+pub(crate) fn active_dml_contains(rel: &str) -> bool {
+    ACTIVE_DML.with(|a| a.borrow().iter().any(|r| r == rel))
+}
+
+/// v2.14: reset the statement-image capture (called by the dispatch
+/// hook before a DML statement runs).
+pub(crate) fn stmt_images_reset() {
+    STMT_IMAGES.with(|s| s.borrow_mut().clear());
+}
+
+/// v2.14: accumulate one leaf's row images into the capture.
+fn stmt_images_push(leaf: &str, cols: &[(String, ColType)], pairs: &[(Option<Row>, Option<Row>)]) {
+    if pairs.is_empty() {
+        return;
+    }
+    STMT_IMAGES.with(|s| {
+        let mut b = s.borrow_mut();
+        if let Some(e) = b.iter_mut().find(|e| e.0 == leaf) {
+            e.2.extend(pairs.iter().cloned());
+        } else {
+            b.push((leaf.to_string(), cols.to_vec(), pairs.to_vec()));
+        }
+    });
+}
+
+/// v2.14: take the captured images for the statement that targeted
+/// `rel`, unioned across every touched leaf (PG fires a partitioned
+/// parent's statement trigger once with the full transition set).
+/// Pairs are re-projected onto `root_cols` by column name (leaves of
+/// one statement share the root's columns; inheritance children with
+/// a different order are aligned by name, missing columns read as
+/// NULL). None when nothing was captured.
+pub(crate) fn stmt_images_take_pub(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    rel: &str,
+    root_cols: &[(String, ColType)],
+) -> Option<(Vec<(String, ColType)>, Vec<(Option<Row>, Option<Row>)>)> {
+    let all = STMT_IMAGES.with(|s| std::mem::take(&mut *s.borrow_mut()));
+    // Only the target relation's own subtree counts: a data-
+    // modifying CTE's inner statement captures its own images (PG
+    // fires its statement triggers separately), so entries from
+    // unrelated relations in the same outer statement are dropped.
+    let entries: Vec<_> = all
+        .into_iter()
+        .filter(|(leaf, _, _)| leaf_belongs_to(eng, ctx, leaf, rel))
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+    let out_cols: Vec<(String, ColType)> = if root_cols.is_empty() {
+        entries[0].1.clone()
+    } else {
+        root_cols.to_vec()
+    };
+    let mut pairs: Vec<(Option<Row>, Option<Row>)> = Vec::new();
+    for (_, cols, ps) in &entries {
+        if *cols == out_cols {
+            pairs.extend(ps.iter().cloned());
+            continue;
+        }
+        let idx: Vec<Option<usize>> = out_cols
+            .iter()
+            .map(|(n, _)| cols.iter().position(|(cn, _)| cn == n))
+            .collect();
+        for (o, n) in ps {
+            let proj = |r: &Option<Row>| -> Option<Row> {
+                r.as_ref().map(|row| {
+                    Row::new(
+                        idx.iter()
+                            .map(|i| match i {
+                                Some(j) => row[*j].clone(),
+                                None => Value::Null,
+                            })
+                            .collect(),
+                    )
+                })
+            };
+            pairs.push((proj(o), proj(n)));
+        }
+    }
+    Some((out_cols, pairs))
+}
+
+/// v2.14: is `leaf` the relation `rel` itself, a partition
+/// descendant of it, or an inheritance descendant of it?
+fn leaf_belongs_to(eng: &Engine, ctx: &StmtCtx, leaf: &str, rel: &str) -> bool {
+    if leaf == rel {
+        return true;
+    }
+    let mut cur = leaf.to_string();
+    for _ in 0..64 {
+        let Some(t) = eng
+            .db
+            .find_table(&cur, ctx.snap, &ctx.all_xids, ctx.session)
+        else {
+            return false;
+        };
+        if let Some(pi) = &t.partition {
+            if let Some(p) = &pi.parent {
+                if p == rel {
+                    return true;
+                }
+                cur = p.clone();
+                continue;
+            }
+        }
+        if t.inherits.iter().any(|p| p == rel) {
+            return true;
+        }
+        match t.inherits.first() {
+            Some(p) => {
+                cur = p.clone();
+            }
+            None => return false,
+        }
+    }
+    false
+}
+
+/// v2.14: every trigger definition stored on a relation itself plus
+/// its partitioned ancestors (walking PartitionInfo.parent links),
+/// plus view triggers when the relation is a view. Returns
+/// (defining relation, definition) pairs, own first.
+pub(crate) fn relation_trigger_defs(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    rel: &str,
+) -> Vec<(String, TriggerDef)> {
+    let mut out = Vec::new();
+    if let Some(t) = eng.db.find_table(rel, ctx.snap, &ctx.all_xids, ctx.session) {
+        for tr in &t.triggers {
+            out.push((rel.to_string(), tr.clone()));
+        }
+        let mut parent = t.partition.as_ref().and_then(|p| p.parent.clone());
+        let mut guard = 0;
+        while let Some(pname) = parent {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(pt) = eng
+                .db
+                .find_table(&pname, ctx.snap, &ctx.all_xids, ctx.session)
+            else {
+                break;
+            };
+            for tr in &pt.triggers {
+                out.push((pname.clone(), tr.clone()));
+            }
+            parent = pt.partition.as_ref().and_then(|p| p.parent.clone());
+        }
+        return out;
+    }
+    for tr in crate::exec::views::view_triggers(eng, ctx, rel) {
+        out.push((rel.to_string(), tr));
+    }
+    out
+}
+
+/// v2.14: does the relation have any statement-level trigger for
+/// (timing, event)? Cheap gate for the dispatch hook.
+pub(crate) fn has_statement_triggers(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    rel: &str,
+    timing: TriggerTiming,
+    event: u8,
+) -> bool {
+    relation_trigger_defs(eng, ctx, rel).iter().any(|(_, tr)| {
+        tr.timing == timing
+            && !tr.for_each_row
+            && tr.fires()
+            && tr.enforced
+            && (tr.events & event) != 0
+    })
+}
+
+/// v2.14: materialize a trigger's REFERENCING transition tables as
+/// session temp tables populated with the statement's row images.
+/// Returns the installed names (drop with drop_transition_tables).
+/// A name colliding with an existing temp table shadows it for the
+/// duration (the previous table is restored on drop).
+pub(crate) fn install_transition_tables(
+    eng: &mut Engine,
+    ctx: &StmtCtx,
+    cols: &[(String, ColType)],
+    pairs: &[(Option<Row>, Option<Row>)],
+    tr: &TriggerDef,
+) -> Result<Vec<(String, Option<crate::storage::Table>)>, ExecError> {
+    let mut installed = Vec::new();
+    let mk =
+        |eng: &mut Engine, name: &str, rows: Vec<Row>| -> (String, Option<crate::storage::Table>) {
+            let mut t = crate::storage::Table::new(cols.to_vec(), ctx.own);
+            t.owner = ctx.role.to_string();
+            for r in rows {
+                let id = eng.alloc_row_id();
+                t.rows.push(crate::storage::RowVersion {
+                    id,
+                    values: r,
+                    xmin: ctx.own,
+                    xmax: 0,
+                    toast: Vec::new(),
+                });
+            }
+            let prev = eng
+                .db
+                .temp_tables
+                .entry(ctx.session)
+                .or_default()
+                .insert(name.to_string(), t);
+            (name.to_string(), prev)
+        };
+    if let Some(n) = &tr.old_table {
+        let rows: Vec<Row> = pairs.iter().filter_map(|(o, _)| o.clone()).collect();
+        installed.push(mk(eng, n, rows));
+    }
+    if let Some(n) = &tr.new_table {
+        let rows: Vec<Row> = pairs.iter().filter_map(|(_, n)| n.clone()).collect();
+        installed.push(mk(eng, n, rows));
+    }
+    Ok(installed)
+}
+
+/// v2.14: remove transition tables installed by
+/// install_transition_tables, restoring any shadowed temp table.
+pub(crate) fn drop_transition_tables(
+    eng: &mut Engine,
+    ctx: &StmtCtx,
+    installed: Vec<(String, Option<crate::storage::Table>)>,
+) {
+    for (name, prev) in installed {
+        if let Some(tmps) = eng.db.temp_tables.get_mut(&ctx.session) {
+            match prev {
+                Some(t) => {
+                    tmps.insert(name, t);
+                }
+                None => {
+                    tmps.remove(&name);
+                }
+            }
+        }
+    }
+}
+
+/// v2.14: fire the BEFORE/AFTER STATEMENT triggers of a relation for
+/// one event (PG19 ExecBS/ExecAS trigger queues: once per statement,
+/// including zero-row statements). `set_cols` is the UPDATE
+/// statement's SET list (UPDATE OF matching); `capture` carries the
+/// statement's row images for AFTER transition-table triggers.
+pub(crate) fn fire_statement_triggers(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    rel: &str,
+    event: u8,
+    timing: TriggerTiming,
+    set_cols: Option<&[String]>,
+    capture: Option<&(Vec<(String, ColType)>, Vec<(Option<Row>, Option<Row>)>)>,
+) -> Result<(), ExecError> {
+    let defs = relation_trigger_defs(eng, ctx, rel);
+    // Relation columns (for WHEN evaluation and body scope). For
+    // views, the view's output columns (NEW/OLD are all-NULL for
+    // statement triggers, but their fields must resolve).
+    let cols: Vec<(String, ColType)> =
+        match eng.db.find_table(rel, ctx.snap, &ctx.all_xids, ctx.session) {
+            Some(t) => t.columns.clone(),
+            None => crate::exec::dml::view_columns_of(eng, ctx, rel)
+                .unwrap_or_else(|_| capture.map(|(c, _)| c.clone()).unwrap_or_default()),
+        };
+    let relid = eng
+        .db
+        .find_table(rel, ctx.snap, &ctx.all_xids, ctx.session)
+        .map(|t| t.oid as i64)
+        .unwrap_or(0);
+    for (def_table, tr) in &defs {
+        let _ = def_table;
+        if tr.timing != timing
+            || tr.for_each_row
+            || !tr.fires()
+            || !tr.enforced
+            || (tr.events & event) == 0
+        {
+            continue;
+        }
+        if event == trig_event::UPDATE && !tr.update_cols.is_empty() {
+            match set_cols {
+                Some(sc) => {
+                    if !tr.update_cols.iter().any(|c| sc.contains(c)) {
+                        continue;
+                    }
+                }
+                None => continue,
+            }
+        }
+        let tctx = TrigCtx {
+            name: tr.name.clone(),
+            table: rel.to_string(),
+            timing: tr.timing,
+            event,
+            args: tr.args.clone(),
+            relid,
+            for_each_row: false,
+        };
+        if !trigger_when_matches(eng, ctx, &tctx, &cols, None, None, tr.when_expr.as_ref())? {
+            continue;
+        }
+        // Deferred constraint triggers are ROW-only in PG; statement
+        // triggers fire immediately.
+        let installed = if tr.has_transition {
+            match capture {
+                Some((ccols, pairs)) => install_transition_tables(eng, ctx, ccols, pairs, tr)?,
+                // PG always materializes the transition relation for
+                // a statement trigger that names one — empty when the
+                // statement touched no rows (or its images were not
+                // captured, e.g. ON CONFLICT / CTE inner DML paths).
+                None => install_transition_tables(eng, ctx, &cols, &[], tr)?,
+            }
+        } else {
+            Vec::new()
+        };
+        let r = fire_one_trigger(eng, ctx, &tctx, tr, &cols, None, None);
+        drop_transition_tables(eng, ctx, installed);
+        r?;
+    }
+    Ok(())
 }

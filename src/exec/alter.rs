@@ -1188,6 +1188,10 @@ pub(crate) fn exec_alter_one(
         AlterAction::OwnerTo { new_owner } => alter_owner_to(eng, ctx, name, new_owner),
         // v1.95: ROW LEVEL SECURITY toggles (PG19 ATExecSetRowSecurity /
         // ATExecForceNoForceRowSecurity via the shared alter_swap).
+        // v2.14: {ENABLE|DISABLE} [ALWAYS|REPLICA] TRIGGER.
+        AlterAction::SetTriggerEnabled { name: tname, mode } => {
+            alter_set_trigger_enabled(eng, ctx, name, tname.as_deref(), *mode, only)
+        }
         AlterAction::EnableRowSecurity => alter_set_rls(eng, ctx, name, Some(true), None),
         AlterAction::DisableRowSecurity => alter_set_rls(eng, ctx, name, Some(false), None),
         AlterAction::ForceRowSecurity => alter_set_rls(eng, ctx, name, None, Some(true)),
@@ -1204,6 +1208,19 @@ pub(crate) fn exec_alter_one(
         AlterAction::SetRelOptions { options } => alter_set_reloptions(eng, ctx, name, options),
         // v0.69: implemented below (attach_partition).
         AlterAction::AttachPartition { child, bound } => {
+            // v2.14 PG19: a partitioned table under an active DML
+            // statement in this session cannot be altered (the
+            // tab_part_attach case: ATTACH from a statement trigger
+            // body of an INSERT into the same table).
+            if crate::exec::partition::active_dml_contains(name) {
+                return Err(exec_err(
+                    "55000",
+                    format!(
+                        "cannot ALTER TABLE \"{}\" because it is being used by active queries in this session",
+                        name
+                    ),
+                ));
+            }
             attach_partition(eng, ctx, name, child, bound)
         }
         // v2.06: DETACH PARTITION (PG19 ATExecDetachPartition).
@@ -4365,4 +4382,112 @@ pub(crate) fn alter_add_unique_using_index(
     Ok(ExecResult::Command {
         tag: "ALTER TABLE".to_string(),
     })
+}
+
+/// v2.14: ALTER TABLE name {ENABLE|DISABLE} [ALWAYS|REPLICA] TRIGGER
+/// {name|ALL|USER} (PG19 EnableDisableTrigger). Stored TriggerDefs
+/// are all user triggers, so ALL and USER both mean every def on the
+/// relation. A trigger inherited from a partitioned/inheritance
+/// parent is toggled on the ancestor that stores it (this engine
+/// keeps one def per trigger on the defining relation; PG stores
+/// per-partition clones toggled by tgparentid — the parent-addressed
+/// cases behave identically).
+pub(crate) fn alter_set_trigger_enabled(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    tname: Option<&str>,
+    mode: u8,
+    _only: bool,
+) -> Result<ExecResult, ExecError> {
+    // Views carry their triggers on ViewDef.
+    if eng
+        .db
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+        .is_none()
+        && eng.db.find_view(name, ctx.snap, ctx.own).is_some()
+    {
+        let mut triggers = crate::exec::views::view_triggers(eng, ctx, name);
+        match tname {
+            None => {
+                for t in triggers.iter_mut() {
+                    t.tgenabled = mode;
+                }
+            }
+            Some(tn) => {
+                if !triggers.iter().any(|t| t.name == tn) {
+                    return Err(exec_err(
+                        "42704",
+                        format!(
+                            "trigger \"{}\" for relation \"{}\" does not exist",
+                            tn, name
+                        ),
+                    ));
+                }
+                for t in triggers.iter_mut() {
+                    if t.name == tn {
+                        t.tgenabled = mode;
+                    }
+                }
+            }
+        }
+        crate::exec::views::mutate_view_triggers(eng, ctx, name, triggers)?;
+        return Ok(ExecResult::Command {
+            tag: "ALTER TABLE".to_string(),
+        });
+    }
+    let prev = eng
+        .db
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
+        .clone();
+    // Direct hit on this relation (or ALL/USER).
+    let direct = match tname {
+        None => true,
+        Some(tn) => prev.triggers.iter().any(|t| t.name == tn),
+    };
+    if direct {
+        let mut next = prev.clone();
+        for t in next.triggers.iter_mut() {
+            if tname.is_none() || t.name == tname.unwrap() {
+                t.tgenabled = mode;
+            }
+        }
+        commit_table_version(eng, ctx, name, prev, next);
+        return Ok(ExecResult::Command {
+            tag: "ALTER TABLE".to_string(),
+        });
+    }
+    // Inherited trigger: toggle the storing ancestor's def.
+    let tn = tname.unwrap();
+    let mut ancestor = prev.partition.as_ref().and_then(|p| p.parent.clone());
+    while let Some(a) = ancestor {
+        let Some(at) = eng
+            .db
+            .find_table(&a, ctx.snap, &ctx.all_xids, ctx.session)
+            .cloned()
+        else {
+            break;
+        };
+        if at.triggers.iter().any(|t| t.name == tn) {
+            let mut next = at.clone();
+            for t in next.triggers.iter_mut() {
+                if t.name == tn {
+                    t.tgenabled = mode;
+                }
+            }
+            commit_table_version(eng, ctx, &a, at, next);
+            return Ok(ExecResult::Command {
+                tag: "ALTER TABLE".to_string(),
+            });
+        }
+        ancestor = at.partition.as_ref().and_then(|p| p.parent.clone());
+    }
+    Err(exec_err(
+        "42704",
+        format!(
+            "trigger \"{}\" for relation \"{}\" does not exist",
+            tn, name
+        ),
+    ))
 }

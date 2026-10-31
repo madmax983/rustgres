@@ -356,6 +356,7 @@ pub(crate) fn dummy_value_of(ty: &ColType) -> Value {
         ColType::Uuid => Value::Uuid([0; 16]),
         ColType::PgLsn => Value::PgLsn(1),
         ColType::Regclass => Value::text("x"),
+        ColType::Regproc => Value::text("x"),
         ColType::Xid => Value::Int(1),
         ColType::Tid => Value::Tid(0, 0), // v1.40
         ColType::Record | ColType::Composite => Value::Record(vec![]),
@@ -2244,7 +2245,43 @@ pub(crate) fn exec_create_trigger(
     constr_rel: Option<String>,
     update_cols: Vec<String>,
     has_transition: bool,
+    or_replace: bool,
+    old_table: Option<String>,
+    new_table: Option<String>,
 ) -> Result<ExecResult, ExecError> {
+    // v2.14 PG19 gram.y: OR REPLACE is rejected for CONSTRAINT
+    // triggers in the grammar itself.
+    if or_replace && is_constraint {
+        return Err(exec_err(
+            "0A000",
+            "CREATE OR REPLACE CONSTRAINT TRIGGER is not supported".to_string(),
+        ));
+    }
+    // v2.14: the target may be a VIEW (INSTEAD OF row triggers and
+    // BEFORE/AFTER statement triggers live on ViewDef.triggers).
+    let is_view = eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+        .is_none()
+        && eng.db.find_view(table, ctx.snap, ctx.own).is_some();
+    if is_view {
+        return exec_create_trigger_on_view(
+            eng,
+            ctx,
+            name,
+            table,
+            timing,
+            events,
+            for_each_row,
+            function,
+            args,
+            when,
+            or_replace,
+            old_table,
+            new_table,
+            &update_cols,
+        );
+    }
     // v0.11: creating a trigger needs table ownership (like ALTER).
     require_table_owner(eng, ctx, table)?;
     let prev = eng
@@ -2252,8 +2289,13 @@ pub(crate) fn exec_create_trigger(
         .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?
         .clone();
-    // PG19: duplicate trigger names on one table are 42723.
-    if prev.triggers.iter().any(|t| t.name == name) {
+    // v2.14 PG19 trigger.c: INSTEAD OF on a table is 42809.
+    if timing == crate::sql::TriggerTiming::InsteadOf {
+        return Err(exec_err("42809", format!("\"{}\" is a table", table)));
+    }
+    // PG19: duplicate trigger names on one table are 42723
+    // (OR REPLACE replaces instead).
+    if !or_replace && prev.triggers.iter().any(|t| t.name == name) {
         return Err(exec_err(
             "42723",
             format!(
@@ -2261,6 +2303,84 @@ pub(crate) fn exec_create_trigger(
                 name, table
             ),
         ));
+    }
+    // v2.14 PG19 trigger.c partition-clone rules: a trigger that
+    // exists on an ancestor is a read-only clone on this relation —
+    // OR REPLACE of it directly is an error, and a plain CREATE
+    // collides with it. Creating on a partitioned table also fails
+    // when a descendant already owns a trigger of the same name.
+    // Only ROW triggers are cloned to partitions (PG: statement
+    // triggers never propagate, so they neither collide with nor
+    // are blocked by an ancestor's same-named trigger).
+    let ancestor_has = for_each_row && {
+        let mut has = false;
+        let mut cur = prev.partition.as_ref().and_then(|pi| pi.parent.clone());
+        let mut guard = 0;
+        while let Some(pn) = cur {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            match eng.db.find_table(&pn, ctx.snap, &ctx.all_xids, ctx.session) {
+                Some(pt) => {
+                    if pt.triggers.iter().any(|t| t.name == name && t.for_each_row) {
+                        has = true;
+                    }
+                    cur = pt.partition.as_ref().and_then(|pi| pi.parent.clone());
+                }
+                None => break,
+            }
+        }
+        has
+    };
+    if or_replace {
+        if ancestor_has && !prev.triggers.iter().any(|t| t.name == name) {
+            return Err(exec_err(
+                "42710",
+                format!(
+                    "trigger \"{}\" for relation \"{}\" is an internal or a child trigger",
+                    name, table
+                ),
+            ));
+        }
+    } else {
+        if ancestor_has {
+            return Err(exec_err(
+                "42723",
+                format!(
+                    "trigger \"{}\" for relation \"{}\" already exists",
+                    name, table
+                ),
+            ));
+        }
+        // Descendants owning a same-named trigger block creation on
+        // the ancestor (PG errors naming the child relation).
+        let mut stack: Vec<String> = prev
+            .partition
+            .as_ref()
+            .map(|pi| pi.children.clone())
+            .unwrap_or_default();
+        let mut seen = 0usize;
+        while let Some(cn) = stack.pop() {
+            seen += 1;
+            if seen > 4096 {
+                break;
+            }
+            if let Some(ct) = eng.db.find_table(&cn, ctx.snap, &ctx.all_xids, ctx.session) {
+                if for_each_row && ct.triggers.iter().any(|t| t.name == name && t.for_each_row) {
+                    return Err(exec_err(
+                        "42710",
+                        format!(
+                            "trigger \"{}\" for relation \"{}\" already exists",
+                            name, cn
+                        ),
+                    ));
+                }
+                if let Some(pi) = &ct.partition {
+                    stack.extend(pi.children.iter().cloned());
+                }
+            }
+        }
     }
     // v2.09: the FROM referenced table of a constraint trigger must
     // exist (PG19 CreateTrigger checks the constrrel relation).
@@ -2367,15 +2487,22 @@ pub(crate) fn exec_create_trigger(
     }
     // The function must exist and be a trigger function (PG19:
     // `RETURNS trigger`). Trigger functions take no arguments.
-    let fdef = find_function_by_signature(eng, function, &[])
-        .ok_or_else(|| exec_err("42883", format!("function {}() does not exist", function)))?;
-    if !fdef.ret_type.eq_ignore_ascii_case("trigger") {
-        return Err(exec_err(
-            "42P17",
-            format!("function \"{}\" must return type \"trigger\"", function),
-        ));
+    // v2.14: PG's built-in suppress_redundant_updates_trigger() is
+    // accepted without a user definition (executor special-case).
+    if function != "suppress_redundant_updates_trigger" {
+        let fdef = find_function_by_signature(eng, function, &[])
+            .ok_or_else(|| exec_err("42883", format!("function {}() does not exist", function)))?;
+        if !fdef.ret_type.eq_ignore_ascii_case("trigger") {
+            return Err(exec_err(
+                "42P17",
+                format!("function \"{}\" must return type \"trigger\"", function),
+            ));
+        }
     }
     let mut next = prev.clone();
+    if or_replace {
+        next.triggers.retain(|t| t.name != name);
+    }
     next.triggers.push(crate::sql::TriggerDef {
         name: name.to_string(),
         timing,
@@ -2391,8 +2518,122 @@ pub(crate) fn exec_create_trigger(
         update_cols,
         when_expr: when,
         has_transition,
+        old_table,
+        new_table,
+        tgenabled: b'O',
     });
     commit_table_version(eng, ctx, table, prev, next);
+    Ok(ExecResult::Command {
+        tag: "CREATE TRIGGER".to_string(),
+    })
+}
+
+/// v2.14: CREATE TRIGGER on a view (PG19 trigger.c view branch):
+/// INSTEAD OF triggers must be FOR EACH ROW with no WHEN and no
+/// column list; BEFORE/AFTER triggers on views must be FOR EACH
+/// STATEMENT; TRUNCATE triggers are refused. Stored on the view
+/// (see ViewDef.triggers).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn exec_create_trigger_on_view(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    table: &str,
+    timing: crate::sql::TriggerTiming,
+    events: u8,
+    for_each_row: bool,
+    function: &str,
+    args: &[String],
+    when: Option<crate::sql::Expr>,
+    or_replace: bool,
+    old_table: Option<String>,
+    new_table: Option<String>,
+    update_cols: &[String],
+) -> Result<ExecResult, ExecError> {
+    use crate::sql::TriggerTiming;
+    // PG19 trigger.c: triggers on views cannot have transition
+    // tables (any timing, any level).
+    if old_table.is_some() || new_table.is_some() {
+        return Err(exec_err("42809", format!("\"{}\" is a view", table)));
+    }
+    if timing == TriggerTiming::InsteadOf {
+        // PG19 trigger.c: INSTEAD OF triggers cannot have column lists.
+        if !update_cols.is_empty() {
+            return Err(exec_err(
+                "0A000",
+                "INSTEAD OF triggers cannot have column lists".to_string(),
+            ));
+        }
+        if !for_each_row {
+            return Err(exec_err(
+                "0A000",
+                "INSTEAD OF triggers must be FOR EACH ROW".to_string(),
+            ));
+        }
+        if when.is_some() {
+            return Err(exec_err(
+                "0A000",
+                "INSTEAD OF triggers cannot have WHEN conditions".to_string(),
+            ));
+        }
+    } else if for_each_row {
+        return Err(exec_err("42809", format!("\"{}\" is a view", table)));
+    }
+    if events & crate::sql::trig_event::TRUNCATE != 0 {
+        return Err(exec_err("42809", format!("\"{}\" is a view", table)));
+    }
+    if when.is_some() && timing != TriggerTiming::InsteadOf && !for_each_row {
+        // Statement-level WHEN on a view trigger: same 42P17 family
+        // as tables (checked against row-var references in PG).
+        let w = when.as_ref().unwrap();
+        if expr_refs_rowvar(w, "old") || expr_refs_rowvar(w, "new") {
+            return Err(exec_err(
+                "42P17",
+                "statement trigger's WHEN condition cannot reference column values".to_string(),
+            ));
+        }
+    }
+    let fdef = find_function_by_signature(eng, function, &[])
+        .ok_or_else(|| exec_err("42883", format!("function {}() does not exist", function)))?;
+    if !fdef.ret_type.eq_ignore_ascii_case("trigger") {
+        return Err(exec_err(
+            "42P17",
+            format!("function \"{}\" must return type \"trigger\"", function),
+        ));
+    }
+    let mut triggers = crate::exec::views::view_triggers(eng, ctx, table);
+    if triggers.iter().any(|t| t.name == name) {
+        if !or_replace {
+            return Err(exec_err(
+                "42723",
+                format!(
+                    "trigger \"{}\" for relation \"{}\" already exists",
+                    name, table
+                ),
+            ));
+        }
+        triggers.retain(|t| t.name != name);
+    }
+    triggers.push(crate::sql::TriggerDef {
+        name: name.to_string(),
+        timing,
+        events,
+        for_each_row,
+        function: function.to_string(),
+        args: args.to_vec(),
+        is_constraint: false,
+        deferrable: false,
+        initially_deferred: false,
+        enforced: true,
+        constr_rel: None,
+        update_cols: Vec::new(),
+        when_expr: when,
+        has_transition: old_table.is_some() || new_table.is_some(),
+        old_table,
+        new_table,
+        tgenabled: b'O',
+    });
+    crate::exec::views::mutate_view_triggers(eng, ctx, table, triggers)?;
     Ok(ExecResult::Command {
         tag: "CREATE TRIGGER".to_string(),
     })
@@ -2444,6 +2685,42 @@ pub(crate) fn exec_alter_trigger_rename(
     table: &str,
     new_name: &str,
 ) -> Result<ExecResult, ExecError> {
+    // v2.14: triggers on views rename through the view list.
+    if eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+        .is_none()
+        && eng.db.find_view(table, ctx.snap, ctx.own).is_some()
+    {
+        let mut triggers = crate::exec::views::view_triggers(eng, ctx, table);
+        if !triggers.iter().any(|t| t.name == name) {
+            return Err(exec_err(
+                "42704",
+                format!(
+                    "trigger \"{}\" for relation \"{}\" does not exist",
+                    name, table
+                ),
+            ));
+        }
+        if triggers.iter().any(|t| t.name == new_name) {
+            return Err(exec_err(
+                "42723",
+                format!(
+                    "trigger \"{}\" for relation \"{}\" already exists",
+                    new_name, table
+                ),
+            ));
+        }
+        for t in triggers.iter_mut() {
+            if t.name == name {
+                t.name = new_name.to_string();
+            }
+        }
+        crate::exec::views::mutate_view_triggers(eng, ctx, table, triggers)?;
+        return Ok(ExecResult::Command {
+            tag: "ALTER TRIGGER".to_string(),
+        });
+    }
     require_table_owner(eng, ctx, table)?;
     let prev = eng
         .db
@@ -2544,6 +2821,38 @@ pub(crate) fn exec_drop_trigger(
     if_exists: bool,
     cascade: bool,
 ) -> Result<ExecResult, ExecError> {
+    // v2.14: DROP TRIGGER on a view.
+    if eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+        .is_none()
+        && eng.db.find_view(table, ctx.snap, ctx.own).is_some()
+    {
+        let mut triggers = crate::exec::views::view_triggers(eng, ctx, table);
+        if !triggers.iter().any(|t| t.name == name) {
+            if !if_exists {
+                return Err(exec_err(
+                    "42704",
+                    format!(
+                        "trigger \"{}\" for relation \"{}\" does not exist",
+                        name, table
+                    ),
+                ));
+            }
+            ctx.notices.push(format!(
+                "trigger \"{}\" for relation \"{}\" does not exist, skipping",
+                name, table
+            ));
+            return Ok(ExecResult::Command {
+                tag: "DROP TRIGGER".to_string(),
+            });
+        }
+        triggers.retain(|t| t.name != name);
+        crate::exec::views::mutate_view_triggers(eng, ctx, table, triggers)?;
+        return Ok(ExecResult::Command {
+            tag: "DROP TRIGGER".to_string(),
+        });
+    }
     require_table_owner(eng, ctx, table)?;
     let prev = eng
         .db

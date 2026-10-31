@@ -64,6 +64,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
         | WalRecord::DropIndex { xmax: xmin, .. }
         | WalRecord::AlterTable { xmin, .. }
         | WalRecord::CreateView { xmin, .. }
+        | WalRecord::AlterViewTriggers { xmin, .. }
         | WalRecord::DropView { xmax: xmin, .. }
         | WalRecord::CreateSequence { xmin, .. }
         | WalRecord::DropSequence { xmax: xmin, .. }
@@ -990,6 +991,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             owner,
             security_invoker,
             check_option,
+            triggers,
             xmin,
         } => {
             eng.db
@@ -1009,6 +1011,9 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     owner: owner.clone(),
                     security_invoker: *security_invoker,
                     check_option: *check_option,
+                    // v2.14: view triggers ride the record (RGSWAL33).
+                    triggers: crate::sql::decode_triggers(triggers)
+                        .unwrap_or_default(),
                 });
         }
         WalRecord::DropView { name, xmax } => {
@@ -1020,6 +1025,30 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             {
                 Some(v) => v.dropped_xmax = *xmax,
                 None => eprintln!("WAL replay: skipping DropView \"{}\": no live view", name),
+            }
+        }
+        WalRecord::AlterViewTriggers { name, triggers, .. } => {
+            match crate::sql::decode_triggers(triggers) {
+                Ok(list) => {
+                    match eng
+                        .db
+                        .views
+                        .get_mut(name)
+                        .and_then(|vs| vs.iter_mut().find(|v| v.dropped_xmax == 0))
+                    {
+                        Some(v) => v.triggers = list,
+                        None => eprintln!(
+                            "WAL replay: skipping AlterViewTriggers \"{}\": no live view",
+                            name
+                        ),
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "WAL replay: skipping AlterViewTriggers \"{}\": {}",
+                        name, e
+                    );
+                }
             }
         }
         WalRecord::CreateSequence { name, seq, xmin } => {
@@ -1525,6 +1554,26 @@ pub fn records_for_commit(
                     owner: ours.owner.clone(),
                     security_invoker: ours.security_invoker,
                     check_option: ours.check_option,
+                    triggers: crate::sql::encode_triggers(&ours.triggers),
+                    xmin: own,
+                });
+            }
+            WriteOp::ViewTriggers { name, .. } => {
+                // v2.14: emit the view's CURRENT trigger list (the
+                // in-place mutation is already applied to the live
+                // version at conversion time).
+                let Some(cur) = eng
+                    .db
+                    .views
+                    .get(name)
+                    .and_then(|vs| vs.iter().find(|v| v.dropped_xmax == 0))
+                else {
+                    i += 1;
+                    continue;
+                };
+                out.push(WalRecord::AlterViewTriggers {
+                    name: name.clone(),
+                    triggers: crate::sql::encode_triggers(&cur.triggers),
                     xmin: own,
                 });
             }

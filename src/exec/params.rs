@@ -932,6 +932,7 @@ pub(crate) fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<V
         }
         // v0.37: regclass input not supported via binary protocol.
         ColType::Regclass => Err(bad("invalid input syntax for type regclass".into())),
+        ColType::Regproc => Err(bad("invalid input syntax for type regproc".into())),
         // v0.73: record input is not supported (no composite input
         // function); json accepts its text form.
         ColType::Record => Err(bad("invalid input syntax for type record".into())),
@@ -1524,6 +1525,7 @@ pub(crate) fn dummy_value(t: &ColType) -> Value {
         }),
         ColType::Uuid => Value::Uuid([0; 16]),
         ColType::Regclass => Value::Text("".into()),
+        ColType::Regproc => Value::Text("".into()),
         ColType::Name => Value::text(""),  // v0.57
         ColType::PgLsn => Value::PgLsn(0), // v0.64
         // v1.17: xids are carried as Value::Int.

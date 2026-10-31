@@ -1969,6 +1969,631 @@ pub(crate) fn assign_insert_indirection(
     }
 }
 
+// ---------------------------------------------------------------------------
+// v2.14: INSTEAD OF triggers on views (PG19 nodeModifyTable.c
+// ExecIRInsertTriggers / ExecIRUpdateTriggers / ExecIRDeleteTriggers).
+// DML on a view with INSTEAD OF row triggers fires the trigger once
+// per proposed/affected view row instead of touching storage; the
+// trigger's returned row (NEW for INSERT/UPDATE, OLD for DELETE)
+// counts toward the command tag and feeds RETURNING, and a NULL
+// return skips the row.
+// ---------------------------------------------------------------------------
+
+/// The view's INSTEAD OF triggers for one event (enabled only).
+pub(crate) fn instead_triggers_for(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    view: &str,
+    event: u8,
+) -> Vec<TriggerDef> {
+    crate::exec::views::view_triggers(eng, ctx, view)
+        .into_iter()
+        .filter(|tr| {
+            tr.timing == TriggerTiming::InsteadOf
+                && tr.for_each_row
+                && tr.fires()
+                && (tr.events & event) != 0
+        })
+        .collect()
+}
+
+/// The view's output columns (name, type), with CREATE VIEW column
+/// aliases applied.
+pub(crate) fn view_columns_of(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    view: &str,
+) -> Result<Vec<(String, ColType)>, ExecError> {
+    let v = eng
+        .db
+        .find_view(view, ctx.snap, ctx.own)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", view)))?
+        .clone();
+    let stmt = crate::sql::parse_statement(&v.query).map_err(sql_err)?;
+    let sel = match stmt {
+        Stmt::Select(s) => s,
+        _ => return Err(exec_err("XX000", "view query is not a SELECT".to_string())),
+    };
+    let mut cols = describe_select(eng, ctx.snap, ctx.own, ctx.session, &sel, &[], &[])?;
+    for (i, a) in v.col_aliases.iter().enumerate() {
+        if i < cols.len() {
+            cols[i].0 = a.clone();
+        }
+    }
+    Ok(cols)
+}
+
+/// All rows of a view (its query evaluated in this statement).
+pub(crate) fn view_scan_all(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    view: &str,
+) -> Result<Vec<Row>, ExecError> {
+    let v = eng
+        .db
+        .find_view(view, ctx.snap, ctx.own)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", view)))?
+        .clone();
+    let stmt = crate::sql::parse_statement(&v.query).map_err(sql_err)?;
+    let sel = match stmt {
+        Stmt::Select(s) => s,
+        _ => return Err(exec_err("XX000", "view query is not a SELECT".to_string())),
+    };
+    let mut lock_ids = Vec::new();
+    let mut q = Q {
+        eng: &mut *eng,
+        snap: ctx.snap,
+        own: ctx.own,
+        all_xids: ctx.all_xids.clone(),
+        session: ctx.session,
+        role: ctx.role,
+        read_only: true,
+        depth: 0,
+        lock_ids: &mut lock_ids,
+        ctes: Vec::new(),
+        wctx: None,
+        srf_vals: Vec::new(),
+        priv_scopes: Vec::new(),
+        priv_role_override: None,
+        hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+        immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+        plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
+        hashed_in: Rc::new(RefCell::new(Vec::new())),
+        pending_updates: None,
+        write: None,
+    };
+    let out = run_select(&mut q, &sel, &[])?;
+    Ok(out.rows)
+}
+
+/// Fire one INSTEAD OF trigger for one row pair.
+pub(crate) fn fire_instead_of_trigger(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    view: &str,
+    cols: &[(String, ColType)],
+    tr: &TriggerDef,
+    event: u8,
+    new_row: Option<&[Value]>,
+    old_row: Option<&[Value]>,
+) -> Result<Option<Vec<Value>>, ExecError> {
+    let fdef = find_function_by_signature(eng, &tr.function, &[]).ok_or_else(|| {
+        exec_err(
+            "42883",
+            format!("function {}() does not exist", tr.function),
+        )
+    })?;
+    let body = parse_trigger_body(&fdef.body).map_err(|e| {
+        exec_err(
+            e.code,
+            format!("invalid trigger function body: {}", e.message),
+        )
+    })?;
+    let tctx = TrigCtx {
+        name: tr.name.clone(),
+        table: view.to_string(),
+        timing: tr.timing,
+        event,
+        args: tr.args.clone(),
+        relid: 0,
+        for_each_row: true,
+    };
+    exec_trigger_body(eng, ctx, &tctx, cols, new_row, old_row, &body)
+}
+
+/// Fire the INSTEAD OF trigger chain for one row pair; the row
+/// threads through each trigger (PG fires them in name order —
+/// creation order here, as elsewhere in this engine).
+pub(crate) fn fire_instead_chain(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    view: &str,
+    cols: &[(String, ColType)],
+    defs: &[TriggerDef],
+    event: u8,
+    new_row: Option<Vec<Value>>,
+    old_row: Option<Vec<Value>>,
+) -> Result<Option<Vec<Value>>, ExecError> {
+    let mut cur_new = new_row;
+    let mut cur_old = old_row;
+    for tr in defs {
+        let r = fire_instead_of_trigger(
+            eng,
+            ctx,
+            view,
+            cols,
+            tr,
+            event,
+            cur_new.as_deref(),
+            cur_old.as_deref(),
+        )?;
+        match r {
+            None => return Ok(None),
+            Some(row) => {
+                if event == trig_event::DELETE {
+                    cur_old = Some(row);
+                } else {
+                    cur_new = Some(row);
+                }
+            }
+        }
+    }
+    if event == trig_event::DELETE {
+        Ok(cur_old)
+    } else {
+        Ok(cur_new)
+    }
+}
+
+/// QCols for a view's columns (RETURNING / WHERE evaluation scope).
+fn view_qcols(view: &str, cols: &[(String, ColType)]) -> Vec<QCol> {
+    cols.iter()
+        .enumerate()
+        .map(|(i, (n, ty))| QCol {
+            qual: view.to_string(),
+            name: n.clone(),
+            ty: *ty,
+            hidden: false,
+            src_ord: i as u32,
+        })
+        .collect()
+}
+
+/// Evaluate a DML expression (WHERE / SET / RETURNING) over one
+/// view row.
+fn eval_over_view_row(
+    eng: &mut Engine,
+    ctx: &StmtCtx,
+    view: &str,
+    cols: &[(String, ColType)],
+    row: &[Value],
+    expr: &Expr,
+) -> Result<Value, ExecError> {
+    let qc = view_qcols(view, cols);
+    let prov = vec![RowProv {
+        qual: view.to_string(),
+        table: view.to_string(),
+        row_id: u64::MAX,
+    }];
+    eval_dml_expr(
+        eng,
+        ctx.snap,
+        ctx.own,
+        ctx.session,
+        ctx.role,
+        &[(&qc, row)],
+        Some(&prov),
+        expr,
+        &[],
+        None,
+        None,
+    )
+}
+
+/// The RETURNING projection over one view row.
+fn returning_over_view_row(
+    eng: &mut Engine,
+    ctx: &StmtCtx,
+    view: &str,
+    cols: &[(String, ColType)],
+    row: &[Value],
+    returning: &[SelectItem],
+) -> Result<Vec<Value>, ExecError> {
+    let qc = view_qcols(view, cols);
+    let prov = vec![RowProv {
+        qual: view.to_string(),
+        table: view.to_string(),
+        row_id: u64::MAX,
+    }];
+    project_returning(
+        eng,
+        ctx.snap,
+        ctx.own,
+        ctx.session,
+        ctx.role,
+        &[(&qc, row)],
+        &prov,
+        returning,
+        &[],
+        None,
+    )
+}
+
+/// RETURNING output columns for a view DML, plus the RETURNING
+/// list with Star/AllOf expanded to plain column expressions
+/// v2.14: WITH CHECK OPTION enforcement for INSTEAD OF view DML
+/// (PG19 ExecWithCheckOptions runs before the row is accepted):
+/// when the target view carries a check option, the row produced
+/// by the trigger chain must satisfy the view query's WHERE.
+/// Only the view's own qual is evaluated (LOCAL semantics; the
+/// stored flag does not record cascaded-ness).
+fn enforce_view_check_option(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    view: &str,
+    cols: &[(String, ColType)],
+    row: &[Value],
+) -> Result<(), ExecError> {
+    let has_check = eng
+        .db
+        .find_view(view, ctx.snap, ctx.own)
+        .map(|v| v.check_option)
+        .unwrap_or(false);
+    if !has_check {
+        return Ok(());
+    }
+    let query = eng
+        .db
+        .find_view(view, ctx.snap, ctx.own)
+        .map(|v| v.query.clone())
+        .unwrap_or_default();
+    let stmt = crate::sql::parse_statement(&query).map_err(sql_err)?;
+    let Stmt::Select(sel) = stmt else {
+        return Ok(());
+    };
+    let Some(w) = &sel.where_ else {
+        return Ok(());
+    };
+    let v = eval_over_view_row(eng, ctx, view, cols, &Row::new(row.to_vec()), w)?;
+    if v != Value::Bool(true) {
+        return Err(exec_err(
+            "44000",
+            format!("new row violates check option for view \"{}\"", view),
+        ));
+    }
+    Ok(())
+}
+
+/// (project_returning only evaluates Expr items).
+fn view_returning_cols(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    view: &str,
+    cols: &[(String, ColType)],
+    returning: &[SelectItem],
+) -> (Vec<(String, ColType)>, Vec<SelectItem>) {
+    if returning.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut expanded: Vec<SelectItem> = Vec::new();
+    for item in returning {
+        match item {
+            SelectItem::All => {
+                for (n, _) in cols {
+                    expanded.push(SelectItem::Expr {
+                        expr: Expr::Column {
+                            table: Some(view.to_string()),
+                            name: n.clone(),
+                        },
+                        alias: None,
+                    });
+                }
+            }
+            SelectItem::AllOf(q) if q == view => {
+                for (n, _) in cols {
+                    expanded.push(SelectItem::Expr {
+                        expr: Expr::Column {
+                            table: Some(view.to_string()),
+                            name: n.clone(),
+                        },
+                        alias: None,
+                    });
+                }
+            }
+            other => expanded.push(other.clone()),
+        }
+    }
+    let qc = view_qcols(view, cols);
+    let refs: Vec<&[QCol]> = vec![&qc];
+    let mut out = Vec::new();
+    for item in &expanded {
+        if let SelectItem::Expr { expr, alias } = item {
+            let ty = expr_type(eng, ctx.snap, ctx.own, ctx.session, &refs, &[], &[], expr)
+                .unwrap_or(ColType::Text);
+            let name = alias.clone().unwrap_or_else(|| expr_col_name(expr));
+            out.push((name, ty));
+        }
+    }
+    (out, expanded)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn exec_insert_into_view(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    view: &str,
+    columns: &Option<Vec<InsertTarget>>,
+    rows: &[Vec<InsertValue>],
+    select: &Option<SelectStmt>,
+    with: &[CteDef],
+    returning: &[SelectItem],
+) -> Result<ExecResult, ExecError> {
+    let defs = instead_triggers_for(eng, ctx, view, trig_event::INSERT);
+    let cols = view_columns_of(eng, ctx, view)?;
+    // Build the proposed rows against the view's columns.
+    let mut proposed: Vec<Vec<Value>> = Vec::new();
+    if let Some(sel) = select {
+        let mut lock_ids = Vec::new();
+        let mut q = Q {
+            eng: &mut *eng,
+            snap: ctx.snap,
+            own: ctx.own,
+            all_xids: ctx.all_xids.clone(),
+            session: ctx.session,
+            role: ctx.role,
+            read_only: false,
+            depth: 0,
+            lock_ids: &mut lock_ids,
+            ctes: Vec::new(),
+            wctx: None,
+            srf_vals: Vec::new(),
+            priv_scopes: Vec::new(),
+            priv_role_override: None,
+            hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+            immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+            plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
+            hashed_in: Rc::new(RefCell::new(Vec::new())),
+            pending_updates: None,
+            write: Some(qwrite_from_ctx(
+                &mut *ctx.writes,
+                ctx.write_xid,
+                ctx.level,
+                ctx.default_toast_compression,
+            )),
+        };
+        let _ = with;
+        let out = run_select(&mut q, sel, &[])?;
+        for r in out.rows {
+            let mut vals: Vec<Value> = r[..].to_vec();
+            vals.resize(cols.len(), Value::Null);
+            proposed.push(vals);
+        }
+    } else {
+        // Target positions (explicit list or positional).
+        let targets: Vec<usize> = match columns {
+            Some(tgts) => {
+                let mut v = Vec::with_capacity(tgts.len());
+                for t in tgts {
+                    let idx = cols.iter().position(|(c, _)| c == &t.name).ok_or_else(|| {
+                        exec_err(
+                            "42703",
+                            format!(
+                                "column \"{}\" of relation \"{}\" does not exist",
+                                t.name, view
+                            ),
+                        )
+                    })?;
+                    v.push(idx);
+                }
+                v
+            }
+            None => (0..cols.len()).collect(),
+        };
+        let mut lock_ids = Vec::new();
+        let mut q = Q {
+            eng: &mut *eng,
+            snap: ctx.snap,
+            own: ctx.own,
+            all_xids: ctx.all_xids.clone(),
+            session: ctx.session,
+            role: ctx.role,
+            read_only: false,
+            depth: 0,
+            lock_ids: &mut lock_ids,
+            ctes: Vec::new(),
+            wctx: None,
+            srf_vals: Vec::new(),
+            priv_scopes: Vec::new(),
+            priv_role_override: None,
+            hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+            immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+            plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
+            hashed_in: Rc::new(RefCell::new(Vec::new())),
+            pending_updates: None,
+            write: None,
+        };
+        for row in rows {
+            if row.len() > targets.len() {
+                return Err(exec_err(
+                    "42601",
+                    "INSERT has more expressions than target columns".to_string(),
+                ));
+            }
+            let mut vals = vec![Value::Null; cols.len()];
+            for (v, &ci) in row.iter().zip(targets.iter()) {
+                let (_, ctype) = &cols[ci];
+                vals[ci] = match v {
+                    InsertValue::Lit(l) => coerce_literal(l, ctype, &cols[ci].0)?,
+                    InsertValue::Param(n) => {
+                        return Err(exec_err("42P02", format!("there is no parameter ${}", n)));
+                    }
+                    InsertValue::Expr(e) => {
+                        let val = eval_expr(&mut q, &[], e)?;
+                        coerce_value(val, ctype, &cols[ci].0)?
+                    }
+                    InsertValue::Default => Value::Null,
+                };
+            }
+            proposed.push(vals);
+        }
+    }
+    let (rcols, returning_x) = view_returning_cols(eng, ctx, view, &cols, returning);
+    let mut out_rows: Vec<Row> = Vec::new();
+    let mut count = 0usize;
+    for vals in proposed {
+        let r = fire_instead_chain(
+            eng,
+            ctx,
+            view,
+            &cols,
+            &defs,
+            trig_event::INSERT,
+            Some(vals),
+            None,
+        )?;
+        if let Some(final_row) = r {
+            enforce_view_check_option(eng, ctx, view, &cols, &final_row)?;
+            count += 1;
+            if !returning.is_empty() {
+                let vals =
+                    returning_over_view_row(eng, ctx, view, &cols, &final_row, &returning_x)?;
+                out_rows.push(Row::new(vals));
+            }
+        }
+    }
+    Ok(ExecResult::Dml {
+        tag: format!("INSERT 0 {}", count),
+        columns: rcols,
+        rows: out_rows,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn exec_update_view(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    view: &str,
+    sets: &[(String, Expr)],
+    from: &[FromItem],
+    where_: &Option<Expr>,
+    returning: &[SelectItem],
+) -> Result<ExecResult, ExecError> {
+    if !from.is_empty() {
+        return Err(exec_err(
+            "0A000",
+            "UPDATE on a view with INSTEAD OF triggers does not support FROM yet".to_string(),
+        ));
+    }
+    let defs = instead_triggers_for(eng, ctx, view, trig_event::UPDATE);
+    let cols = view_columns_of(eng, ctx, view)?;
+    let all = view_scan_all(eng, ctx, view)?;
+    let (rcols, returning_x) = view_returning_cols(eng, ctx, view, &cols, returning);
+    let mut out_rows: Vec<Row> = Vec::new();
+    let mut count = 0usize;
+    for row in all {
+        let old: Vec<Value> = row[..].to_vec();
+        if let Some(w) = where_ {
+            let v = eval_over_view_row(eng, ctx, view, &cols, &old, w)?;
+            if !matches!(v, Value::Bool(true)) {
+                continue;
+            }
+        }
+        let mut new = old.clone();
+        for (cname, e) in sets {
+            let idx = cols.iter().position(|(c, _)| c == cname).ok_or_else(|| {
+                exec_err(
+                    "42703",
+                    format!(
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        cname, view
+                    ),
+                )
+            })?;
+            let v = eval_over_view_row(eng, ctx, view, &cols, &old, e)?;
+            new[idx] = coerce_value(v, &cols[idx].1, cname)?;
+        }
+        let r = fire_instead_chain(
+            eng,
+            ctx,
+            view,
+            &cols,
+            &defs,
+            trig_event::UPDATE,
+            Some(new),
+            Some(old),
+        )?;
+        if let Some(final_row) = r {
+            enforce_view_check_option(eng, ctx, view, &cols, &final_row)?;
+            count += 1;
+            if !returning.is_empty() {
+                let vals =
+                    returning_over_view_row(eng, ctx, view, &cols, &final_row, &returning_x)?;
+                out_rows.push(Row::new(vals));
+            }
+        }
+    }
+    Ok(ExecResult::Dml {
+        tag: format!("UPDATE {}", count),
+        columns: rcols,
+        rows: out_rows,
+    })
+}
+
+pub(crate) fn exec_delete_view(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    view: &str,
+    using: &[FromItem],
+    where_: &Option<Expr>,
+    returning: &[SelectItem],
+) -> Result<ExecResult, ExecError> {
+    if !using.is_empty() {
+        return Err(exec_err(
+            "0A000",
+            "DELETE on a view with INSTEAD OF triggers does not support USING yet".to_string(),
+        ));
+    }
+    let defs = instead_triggers_for(eng, ctx, view, trig_event::DELETE);
+    let cols = view_columns_of(eng, ctx, view)?;
+    let all = view_scan_all(eng, ctx, view)?;
+    let (rcols, returning_x) = view_returning_cols(eng, ctx, view, &cols, returning);
+    let mut out_rows: Vec<Row> = Vec::new();
+    let mut count = 0usize;
+    for row in all {
+        let old: Vec<Value> = row[..].to_vec();
+        if let Some(w) = where_ {
+            let v = eval_over_view_row(eng, ctx, view, &cols, &old, w)?;
+            if !matches!(v, Value::Bool(true)) {
+                continue;
+            }
+        }
+        let r = fire_instead_chain(
+            eng,
+            ctx,
+            view,
+            &cols,
+            &defs,
+            trig_event::DELETE,
+            None,
+            Some(old),
+        )?;
+        if let Some(final_row) = r {
+            enforce_view_check_option(eng, ctx, view, &cols, &final_row)?;
+            count += 1;
+            if !returning.is_empty() {
+                let vals =
+                    returning_over_view_row(eng, ctx, view, &cols, &final_row, &returning_x)?;
+                out_rows.push(Row::new(vals));
+            }
+        }
+    }
+    Ok(ExecResult::Dml {
+        tag: format!("DELETE {}", count),
+        columns: rcols,
+        rows: out_rows,
+    })
+}
+
 pub(crate) fn exec_insert(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -1980,6 +2605,15 @@ pub(crate) fn exec_insert(
     on_conflict: &Option<OnConflict>,
     returning: &[SelectItem],
 ) -> Result<ExecResult, ExecError> {
+    // v2.14: INSERT into a view with INSTEAD OF triggers.
+    if eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+        .is_none()
+        && !instead_triggers_for(eng, ctx, table, trig_event::INSERT).is_empty()
+    {
+        return exec_insert_into_view(eng, ctx, table, columns, rows, select, with, returning);
+    }
     // v0.11: INSERT needs INSERT privilege on the table — or, with an
     // explicit column list, on each listed column (like PostgreSQL).
     // v0.84: privilege checks apply to the root column of each target
@@ -3715,6 +4349,15 @@ pub(crate) fn exec_update(
     with: &[CteDef],
     returning: &[SelectItem],
 ) -> Result<ExecResult, ExecError> {
+    // v2.14: UPDATE on a view with INSTEAD OF triggers.
+    if eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+        .is_none()
+        && !instead_triggers_for(eng, ctx, table, trig_event::UPDATE).is_empty()
+    {
+        return exec_update_view(eng, ctx, table, sets, from, where_, returning);
+    }
     // v0.11: UPDATE needs UPDATE on each SET column — a table-level
     // grant or a column-level grant (like PostgreSQL).
     require_column_privs(
@@ -4813,6 +5456,15 @@ pub(crate) fn exec_delete(
     with: &[CteDef],
     returning: &[SelectItem],
 ) -> Result<ExecResult, ExecError> {
+    // v2.14: DELETE on a view with INSTEAD OF triggers.
+    if eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+        .is_none()
+        && !instead_triggers_for(eng, ctx, table, trig_event::DELETE).is_empty()
+    {
+        return exec_delete_view(eng, ctx, table, using, where_, returning);
+    }
     // v0.11: DELETE needs DELETE privilege on the table.
     require_table_priv(eng, ctx, table, crate::storage::PRIV_DELETE, "DELETE")?;
     // v2.02: replica-identity guard (see exec_update; partitioned
@@ -5846,9 +6498,32 @@ pub(crate) fn drop_one_table(
             format!("cannot drop table {} because {} depends on it", name, first),
         ));
     }
-    // CASCADE: drop dependent views and FKs first.
-    for v in &dep_views {
-        drop_view_internal(eng, ctx, v)?;
+    // CASCADE: drop dependent views and FKs first. PG's cascade
+    // is transitive: a view depending on a dropped view goes too
+    // (v2.14; the updatable_views check-option section chains
+    // base_tbl -> rw_view1 -> rw_view2).
+    {
+        let mut stack: Vec<String> = dep_views.clone();
+        let mut seen: std::collections::HashSet<String> = dep_views.iter().cloned().collect();
+        let mut ordered: Vec<String> = Vec::new();
+        while let Some(v) = stack.pop() {
+            ordered.push(v.clone());
+            for (vname, vs) in &eng.db.views {
+                if seen.contains(vname) {
+                    continue;
+                }
+                if vs.iter().any(|vd| {
+                    crate::storage::view_visible(vd, ctx.snap, ctx.own)
+                        && vd.deps.iter().any(|d| d == &v)
+                }) {
+                    seen.insert(vname.clone());
+                    stack.push(vname.clone());
+                }
+            }
+        }
+        for v in &ordered {
+            drop_view_internal(eng, ctx, v)?;
+        }
     }
     for (tname, fk_name) in &dep_fks {
         // The referencing table may itself have been dropped by an

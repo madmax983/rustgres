@@ -9,6 +9,21 @@ pub(crate) fn exec_create(
     def: &TableDef,
     temp: bool,
 ) -> Result<ExecResult, ExecError> {
+    // v2.14 PG19: CREATE TABLE ... PARTITION OF on a relation under
+    // an active DML statement in this session is an error (the
+    // tab_part_create case: the partition is created from a
+    // statement trigger body of an INSERT into the parent).
+    if let Some(parent) = def.partition.as_ref().and_then(|p| p.parent.as_ref()) {
+        if crate::exec::partition::active_dml_contains(parent) {
+            return Err(exec_err(
+                "55000",
+                format!(
+                    "cannot CREATE TABLE .. PARTITION OF \\\"{}\\\" because it is being used by active queries in this session",
+                    parent
+                ),
+            ));
+        }
+    }
     // v2.03: generation expressions are validated at CREATE (PG19
     // cookDefault): immutable, own non-generated columns only.
     validate_generated_columns(eng, def)?;

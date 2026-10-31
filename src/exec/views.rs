@@ -134,6 +134,16 @@ pub(crate) fn exec_create_view(
         };
         run_select(&mut q, &select, &[])?;
     }
+    // v2.14: OR REPLACE VIEW keeps the old view's triggers (PG19:
+    // triggers are independent catalog objects bound to the relation).
+    let kept_triggers = if existing {
+        eng.db
+            .find_view(name, ctx.snap, ctx.own)
+            .map(|v| v.triggers.clone())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     if existing {
         // OR REPLACE: drop the old definition first (same statement).
         drop_view_internal(eng, ctx, name)?;
@@ -151,6 +161,7 @@ pub(crate) fn exec_create_view(
         acl: Vec::new(),
         matview,
         populated: with_data || !matview,
+        triggers: kept_triggers,
     };
     eng.db.views.entry(name.to_string()).or_default().push(def);
     note_obj_schema(eng, ctx, name, name);
@@ -220,6 +231,45 @@ pub(crate) fn exec_drop_view(
 
 /// Drop a view by name, logging WriteOp::DropView. Used by DROP VIEW and
 /// by CASCADE paths from DROP TABLE / DROP COLUMN.
+/// v2.14: mutate a view's trigger list in place (transactional via
+/// WriteOp::ViewTriggers; durable via WalRecord::AlterViewTriggers
+/// and checkpoint v29). Returns the previous list.
+pub(crate) fn mutate_view_triggers(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    new_triggers: Vec<crate::sql::TriggerDef>,
+) -> Result<Vec<crate::sql::TriggerDef>, ExecError> {
+    let prev = eng
+        .db
+        .find_view(name, ctx.snap, ctx.own)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
+        .triggers
+        .clone();
+    eng.db
+        .find_view_mut(name, ctx.snap, ctx.own)
+        .expect("view still present")
+        .triggers = new_triggers;
+    ctx.writes.push(WriteOp::ViewTriggers {
+        name: name.to_string(),
+        prev_triggers: prev.clone(),
+    });
+    Ok(prev)
+}
+
+/// v2.14: the triggers stored on a view (empty when the relation is
+/// a table or does not exist).
+pub(crate) fn view_triggers(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    name: &str,
+) -> Vec<crate::sql::TriggerDef> {
+    eng.db
+        .find_view(name, ctx.snap, ctx.own)
+        .map(|v| v.triggers.clone())
+        .unwrap_or_default()
+}
+
 pub(crate) fn drop_view_internal(
     eng: &mut Engine,
     ctx: &mut StmtCtx,

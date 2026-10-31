@@ -1104,6 +1104,7 @@ impl Parser {
             }
             "uuid" => Ok(ColType::Uuid),
             "regclass" => Ok(ColType::Regclass),
+            "regproc" => Ok(ColType::Regproc),
             "pg_lsn" => Ok(ColType::PgLsn), // v0.64
             "xid" => Ok(ColType::Xid),      // v1.17
             // v2.13: PG's internal array type names (`_int4` is the
@@ -1296,6 +1297,11 @@ impl Parser {
                 if matches!(self.peek(), Token::Ident(s) if s == "function") {
                     return self.parse_create_function(true);
                 }
+                // v2.14: CREATE OR REPLACE TRIGGER (PG19 gram.y
+                // opt_or_replace on CreateTrigStmt).
+                if matches!(self.peek(), Token::Ident(s) if s == "trigger") {
+                    return self.parse_create_trigger(true);
+                }
                 return Err(err(
                     "syntax error: OR REPLACE is only supported for CREATE FUNCTION".to_string(),
                 ));
@@ -1312,7 +1318,7 @@ impl Parser {
         }
         // v1.00: CREATE [CONSTRAINT] TRIGGER (bounded).
         if matches!(self.peek(), Token::Ident(s) if s == "trigger") {
-            return self.parse_create_trigger();
+            return self.parse_create_trigger(false);
         }
         // v2.09: CREATE CONSTRAINT TRIGGER — the CONSTRAINT keyword
         // comes first (PG19 gram.y CreateTrigStmt second production);
@@ -1321,7 +1327,7 @@ impl Parser {
         if matches!(self.peek(), Token::Ident(s) if s == "constraint")
             && matches!(self.peek2(), Token::Ident(s) if s == "trigger")
         {
-            return self.parse_create_trigger();
+            return self.parse_create_trigger(false);
         }
         // v1.95: CREATE POLICY name ON table ... (PG19).
         if matches!(self.peek(), Token::Ident(s) if s == "policy") {
@@ -2776,13 +2782,46 @@ impl Parser {
             return Ok(AlterAction::OfType { type_name: base });
         }
         // v1.95: ALTER TABLE t {ENABLE|DISABLE|FORCE} ROW LEVEL SECURITY.
+        // v2.14: ALTER TABLE t {ENABLE|DISABLE} [ALWAYS|REPLICA]
+        // TRIGGER {name|ALL|USER} (PG19 AT_EnableTrig family).
         if self.eat_keyword("enable") {
+            let mode = if self.eat_keyword("always") {
+                Some(b'A')
+            } else if self.eat_keyword("replica") {
+                Some(b'R')
+            } else {
+                None
+            };
+            if mode.is_some() || matches!(self.peek(), Token::Ident(s) if s == "trigger") {
+                self.expect_keyword("trigger")?;
+                let name = if self.eat_keyword("all") || self.eat_keyword("user") {
+                    None
+                } else {
+                    Some(self.expect_ident()?)
+                };
+                return Ok(AlterAction::SetTriggerEnabled {
+                    name,
+                    mode: mode.unwrap_or(b'O'),
+                });
+            }
             self.expect_keyword("row")?;
             self.expect_keyword("level")?;
             self.expect_keyword("security")?;
             return Ok(AlterAction::EnableRowSecurity);
         }
         if self.eat_keyword("disable") {
+            // PG19 has no DISABLE ALWAYS/REPLICA TRIGGER, but accept
+            // the words leniently as a plain disable.
+            let _ = self.eat_keyword("always") || self.eat_keyword("replica");
+            if matches!(self.peek(), Token::Ident(s) if s == "trigger") {
+                self.expect_keyword("trigger")?;
+                let name = if self.eat_keyword("all") || self.eat_keyword("user") {
+                    None
+                } else {
+                    Some(self.expect_ident()?)
+                };
+                return Ok(AlterAction::SetTriggerEnabled { name, mode: b'D' });
+            }
             self.expect_keyword("row")?;
             self.expect_keyword("level")?;
             self.expect_keyword("security")?;
@@ -4085,7 +4124,7 @@ impl Parser {
     /// CONSTRAINT TRIGGER name AFTER event [OR ...] ON table
     /// [FROM reftable] ConstraintAttributeSpec FOR EACH ROW
     /// [WHEN (...)] EXECUTE ...` (AFTER + ROW only, per gram.y).
-    pub(crate) fn parse_create_trigger(&mut self) -> Result<Stmt, SqlError> {
+    pub(crate) fn parse_create_trigger(&mut self, or_replace: bool) -> Result<Stmt, SqlError> {
         // CONSTRAINT (if present) precedes TRIGGER in the constraint
         // form and follows it in no form; accept it in either spot.
         let mut is_constraint = self.eat_keyword("constraint");
@@ -4100,10 +4139,7 @@ impl Parser {
             TriggerTiming::After
         } else if self.eat_keyword("instead") {
             self.expect_keyword("of")?;
-            return Err(SqlError {
-                message: "INSTEAD OF triggers are not supported".to_string(),
-                code: "0A000",
-            });
+            TriggerTiming::InsteadOf
         } else {
             return Err(err(
                 "syntax error: expected BEFORE, AFTER, or INSTEAD OF".to_string()
@@ -4214,26 +4250,25 @@ impl Parser {
                 "syntax error: INITIALLY DEFERRED requires DEFERRABLE".to_string()
             ));
         }
-        // REFERENCING clause (transition tables): parsed and
-        // discarded — transition tables are a recorded hold-back.
+        // REFERENCING clause (transition tables): v2.14 captures the
+        // OLD/NEW TABLE names for materialization at fire time.
+        let mut old_table: Option<String> = None;
+        let mut new_table: Option<String> = None;
         let has_transition = self.eat_keyword("referencing");
         if has_transition {
             loop {
-                let _old = self.eat_keyword("old");
-                if !_old && !self.eat_keyword("new") {
+                let is_old = self.eat_keyword("old");
+                if !is_old && !self.eat_keyword("new") {
                     break;
                 }
                 self.expect_keyword("table")?;
-                if self.eat_keyword("as") {
-                    let _ = self.expect_ident()?;
+                self.eat_keyword("as");
+                let tname = self.expect_ident()?;
+                if is_old {
+                    old_table = Some(tname);
                 } else {
-                    let _ = self.expect_ident()?;
+                    new_table = Some(tname);
                 }
-                if !matches!(self.peek(), Token::Ident(_)) {
-                    break;
-                }
-                // Another OLD/NEW TABLE item follows only if the next
-                // token is OLD or NEW; FOR/WHEN terminate the clause.
                 if !(matches!(self.peek(), Token::Ident(s) if s == "old" || s == "new")) {
                     break;
                 }
@@ -4248,14 +4283,19 @@ impl Parser {
         } else {
             None
         };
-        self.expect_keyword("for")?;
-        self.expect_keyword("each")?;
-        let for_each_row = if self.eat_keyword("row") {
-            true
-        } else if self.eat_keyword("statement") {
-            false
+        // PG19 gram.y TriggerForSpec: the whole FOR clause is
+        // optional (default STATEMENT), and EACH is optional too.
+        let for_each_row = if self.eat_keyword("for") {
+            self.eat_keyword("each");
+            if self.eat_keyword("row") {
+                true
+            } else if self.eat_keyword("statement") {
+                false
+            } else {
+                return Err(err("syntax error: expected ROW or STATEMENT".to_string()));
+            }
         } else {
-            return Err(err("syntax error: expected ROW or STATEMENT".to_string()));
+            false
         };
         if is_constraint && !for_each_row {
             return Err(err(
@@ -4314,6 +4354,9 @@ impl Parser {
             constr_rel,
             update_cols,
             has_transition,
+            or_replace,
+            old_table,
+            new_table,
         })
     }
 
@@ -4975,6 +5018,28 @@ impl Parser {
     /// Other COMMENT ON targets stay 42601 (pre-v2.04 behavior).
     pub(crate) fn parse_comment(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("on")?;
+        // v2.14: COMMENT ON TRIGGER name ON table IS ...
+        if matches!(self.peek(), Token::Ident(s) if s == "trigger") {
+            self.next();
+            let name = self.expect_ident()?;
+            self.expect_keyword("on")?;
+            let table = self.parse_table_name()?;
+            self.expect_keyword("is")?;
+            match self.peek().clone() {
+                Token::Str(_) => {
+                    self.next();
+                }
+                Token::Ident(s) if s == "null" => {
+                    self.next();
+                }
+                _ => {
+                    return Err(err(
+                        "syntax error: expected string literal or NULL".to_string()
+                    ));
+                }
+            }
+            return Ok(Stmt::CommentOnTrigger { name, table });
+        }
         self.expect_keyword("publication")?;
         let name = self.expect_ident()?;
         self.expect_keyword("is")?;
@@ -7775,7 +7840,14 @@ impl Parser {
         }
         // `[NOT] BETWEEN low AND high`, `[NOT] LIKE pat`,
         // `[NOT] ILIKE pat`, `[NOT] IN (subquery)`.
-        let neg = self.eat_keyword("not");
+        // v2.14: only consume NOT when a negatable operator follows
+        // (PG b_expr lookahead) — otherwise the NOT belongs to the
+        // surrounding context, e.g. `DEFAULT true NOT NULL` in a
+        // column definition, where NOT NULL is a column constraint.
+        let neg = matches!(self.peek(), Token::Ident(s) if s == "not")
+            && matches!(self.peek2(), Token::Ident(s2)
+                if s2 == "between" || s2 == "like" || s2 == "ilike" || s2 == "in" || s2 == "similar")
+            && self.eat_keyword("not");
         if self.eat_keyword("between") {
             let low = self.parse_bitor()?;
             self.expect_keyword("and")?;
@@ -17864,50 +17936,245 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
     // col*) (when expr|-))
     out.push_str(" (triggers");
     for tr in &t.triggers {
-        out.push_str(" (");
-        sexpr_escape(&tr.name, &mut out);
-        out.push_str(match tr.timing {
-            crate::sql::TriggerTiming::Before => " b ",
-            crate::sql::TriggerTiming::After => " a ",
-        });
-        out.push_str(&tr.events.to_string());
-        out.push_str(if tr.for_each_row { " 1 " } else { " 0 " });
-        sexpr_escape(&tr.function, &mut out);
-        out.push(' ');
-        out.push_str(&tr.args.len().to_string());
-        for a in &tr.args {
-            out.push(' ');
-            sexpr_escape(a, &mut out);
-        }
-        out.push_str(" (tattrs ");
-        out.push_str(if tr.is_constraint { "1" } else { "0" });
-        out.push(' ');
-        out.push_str(if tr.deferrable { "1" } else { "0" });
-        out.push(' ');
-        out.push_str(if tr.initially_deferred { "1" } else { "0" });
-        out.push(' ');
-        out.push_str(if tr.enforced { "1" } else { "0" });
-        out.push(' ');
-        out.push_str(if tr.has_transition { "1" } else { "0" });
-        out.push_str(") ");
-        match &tr.constr_rel {
-            Some(r) => sexpr_escape(r, &mut out),
-            None => out.push('-'),
-        }
-        out.push_str(" (updcols");
-        for c in &tr.update_cols {
-            out.push(' ');
-            sexpr_escape(c, &mut out);
-        }
-        out.push_str(") (when ");
-        match &tr.when_expr {
-            Some(e) => encode_expr_inner(e, &mut out),
-            None => out.push('-'),
-        }
-        out.push_str("))");
+        encode_one_trigger(tr, &mut out);
     }
     out.push_str("))");
     out
+}
+
+/// v2.14: encode one trigger definition in the constraints-codec
+/// s-expr shape (shared by the table codec and the view-trigger
+/// string used by WAL CreateView / checkpoints).
+pub(crate) fn encode_one_trigger(tr: &TriggerDef, out: &mut String) {
+    out.push_str(" (");
+    sexpr_escape(&tr.name, out);
+    out.push_str(match tr.timing {
+        crate::sql::TriggerTiming::Before => " b ",
+        crate::sql::TriggerTiming::After => " a ",
+        crate::sql::TriggerTiming::InsteadOf => " i ",
+    });
+    out.push_str(&tr.events.to_string());
+    out.push_str(if tr.for_each_row { " 1 " } else { " 0 " });
+    sexpr_escape(&tr.function, out);
+    out.push(' ');
+    out.push_str(&tr.args.len().to_string());
+    for a in &tr.args {
+        out.push(' ');
+        sexpr_escape(a, out);
+    }
+    out.push_str(" (tattrs ");
+    out.push_str(if tr.is_constraint { "1" } else { "0" });
+    out.push(' ');
+    out.push_str(if tr.deferrable { "1" } else { "0" });
+    out.push(' ');
+    out.push_str(if tr.initially_deferred { "1" } else { "0" });
+    out.push(' ');
+    out.push_str(if tr.enforced { "1" } else { "0" });
+    out.push(' ');
+    out.push_str(if tr.has_transition { "1" } else { "0" });
+    // v2.14: 6th tattrs slot — the tgenabled mode char (pre-v2.14
+    // encodings have five bits and decode as 'O').
+    out.push(' ');
+    out.push(tr.tgenabled as char);
+    out.push_str(") ");
+    match &tr.constr_rel {
+        Some(r) => sexpr_escape(r, out),
+        None => out.push('-'),
+    }
+    out.push_str(" (updcols");
+    for c in &tr.update_cols {
+        out.push(' ');
+        sexpr_escape(c, out);
+    }
+    out.push_str(") (when ");
+    match &tr.when_expr {
+        Some(e) => encode_expr_inner(e, out),
+        None => out.push('-'),
+    }
+    // v2.14: trailing optional transition-table names group
+    // (absent in pre-v2.14 encodings).
+    out.push_str(") (trans ");
+    match &tr.old_table {
+        Some(r) => sexpr_escape(r, out),
+        None => out.push('-'),
+    }
+    out.push(' ');
+    match &tr.new_table {
+        Some(r) => sexpr_escape(r, out),
+        None => out.push('-'),
+    }
+    out.push_str("))");
+}
+
+/// v2.14: encode a trigger list as a standalone `(triggers ...)`
+/// string (view triggers in WAL CreateView / checkpoint records).
+pub fn encode_triggers(triggers: &[TriggerDef]) -> String {
+    let mut out = String::from("(triggers");
+    for tr in triggers {
+        encode_one_trigger(tr, &mut out);
+    }
+    out.push(')');
+    out
+}
+
+/// v2.14: decode a standalone `(triggers ...)` string produced by
+/// `encode_triggers` (empty input decodes to no triggers).
+pub fn decode_triggers(s: &str) -> Result<Vec<TriggerDef>, String> {
+    if s.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut p = SexprParser::new(s);
+    p.open()?;
+    if p.atom()? != "triggers" {
+        return Err("bad triggers head".into());
+    }
+    let mut out = Vec::new();
+    while !sexpr_is_close(&mut p) {
+        out.push(decode_one_trigger(&mut p)?);
+    }
+    p.close()?;
+    Ok(out)
+}
+
+/// v2.14: decode one trigger entry (the caller has positioned the
+/// parser at the entry's opening paren).
+pub(crate) fn decode_one_trigger(p: &mut SexprParser) -> Result<TriggerDef, String> {
+    p.open()?;
+    let name = p.atom()?;
+    let timing = match p.atom()?.as_str() {
+        "b" => TriggerTiming::Before,
+        "a" => TriggerTiming::After,
+        "i" => TriggerTiming::InsteadOf,
+        o => return Err(format!("bad trigger timing {}", o)),
+    };
+    let events: u8 = p
+        .atom()?
+        .parse()
+        .map_err(|_| "bad trigger events".to_string())?;
+    let for_each_row = match p.atom()?.as_str() {
+        "1" => true,
+        "0" => false,
+        o => return Err(format!("bad trigger row flag {}", o)),
+    };
+    let function = p.atom()?;
+    let nargs: usize = p
+        .atom()?
+        .parse()
+        .map_err(|_| "bad trigger nargs".to_string())?;
+    let mut args = Vec::new();
+    for _ in 0..nargs {
+        args.push(p.atom()?);
+    }
+    p.open()?;
+    if p.atom()? != "tattrs" {
+        return Err("bad tattrs head".into());
+    }
+    let bit = |p: &mut SexprParser| -> Result<bool, String> {
+        match p.atom()?.as_str() {
+            "1" => Ok(true),
+            "0" => Ok(false),
+            o => Err(format!("bad tattrs bit {}", o)),
+        }
+    };
+    let is_constraint = bit(p)?;
+    let deferrable = bit(p)?;
+    let initially_deferred = bit(p)?;
+    let enforced = bit(p)?;
+    p.ws();
+    let has_transition = if p.chars.peek() == Some(&')') {
+        false
+    } else {
+        bit(p)?
+    };
+    p.ws();
+    let tgenabled = if p.chars.peek() == Some(&')') {
+        b'O'
+    } else {
+        match p.atom()?.as_str() {
+            "O" => b'O',
+            "A" => b'A',
+            "R" => b'R',
+            "D" => b'D',
+            // Early v2.14 encodings wrote a bit here.
+            "1" => b'O',
+            "0" => b'D',
+            o => return Err(format!("bad tgenabled {}", o)),
+        }
+    };
+    p.close()?;
+    p.ws();
+    let constr_rel = if p.chars.peek() == Some(&'-') {
+        p.chars.next();
+        None
+    } else {
+        Some(p.atom()?)
+    };
+    p.open()?;
+    if p.atom()? != "updcols" {
+        return Err("bad updcols head".into());
+    }
+    let mut update_cols = Vec::new();
+    while !sexpr_is_close(p) {
+        update_cols.push(p.atom()?);
+    }
+    p.close()?;
+    p.open()?;
+    if p.atom()? != "when" {
+        return Err("bad trigger when head".into());
+    }
+    p.ws();
+    let when_expr = if p.chars.peek() == Some(&'-') {
+        p.chars.next();
+        None
+    } else {
+        Some(p.expr()?)
+    };
+    p.close()?;
+    p.ws();
+    let (old_table, new_table) = if p.chars.peek() == Some(&')') {
+        (None, None)
+    } else {
+        p.open()?;
+        if p.atom()? != "trans" {
+            return Err("bad trigger trans head".into());
+        }
+        p.ws();
+        let ot = if p.chars.peek() == Some(&'-') {
+            p.chars.next();
+            None
+        } else {
+            Some(p.atom()?)
+        };
+        p.ws();
+        let nt = if p.chars.peek() == Some(&'-') {
+            p.chars.next();
+            None
+        } else {
+            Some(p.atom()?)
+        };
+        p.close()?;
+        (ot, nt)
+    };
+    p.close()?;
+    Ok(TriggerDef {
+        name,
+        timing,
+        events,
+        for_each_row,
+        function,
+        args,
+        is_constraint,
+        deferrable,
+        initially_deferred,
+        enforced,
+        constr_rel,
+        update_cols,
+        when_expr,
+        has_transition,
+        old_table,
+        new_table,
+        tgenabled,
+    })
 }
 
 /// Decoded v0.9 table constraint metadata (WAL replay / checkpoints).
@@ -18370,100 +18637,7 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
             }
             "triggers" => {
                 while !sexpr_is_close(&mut p) {
-                    p.open()?;
-                    let name = p.atom()?;
-                    let timing = match p.atom()?.as_str() {
-                        "b" => TriggerTiming::Before,
-                        "a" => TriggerTiming::After,
-                        o => return Err(format!("bad trigger timing {}", o)),
-                    };
-                    let events: u8 = p
-                        .atom()?
-                        .parse()
-                        .map_err(|_| "bad trigger events".to_string())?;
-                    let for_each_row = match p.atom()?.as_str() {
-                        "1" => true,
-                        "0" => false,
-                        o => return Err(format!("bad trigger row flag {}", o)),
-                    };
-                    let function = p.atom()?;
-                    let nargs: usize = p
-                        .atom()?
-                        .parse()
-                        .map_err(|_| "bad trigger nargs".to_string())?;
-                    let mut args = Vec::new();
-                    for _ in 0..nargs {
-                        args.push(p.atom()?);
-                    }
-                    p.open()?;
-                    if p.atom()? != "tattrs" {
-                        return Err("bad tattrs head".into());
-                    }
-                    let bit = |p: &mut SexprParser| -> Result<bool, String> {
-                        match p.atom()?.as_str() {
-                            "1" => Ok(true),
-                            "0" => Ok(false),
-                            o => Err(format!("bad tattrs bit {}", o)),
-                        }
-                    };
-                    let is_constraint = bit(&mut p)?;
-                    let deferrable = bit(&mut p)?;
-                    let initially_deferred = bit(&mut p)?;
-                    let enforced = bit(&mut p)?;
-                    // Optional 5th bit (has_transition); encodings
-                    // written before it existed close right here.
-                    p.ws();
-                    let has_transition = if p.chars.peek() == Some(&')') {
-                        false
-                    } else {
-                        bit(&mut p)?
-                    };
-                    p.close()?;
-                    p.ws();
-                    let constr_rel = if p.chars.peek() == Some(&'-') {
-                        p.chars.next();
-                        None
-                    } else {
-                        Some(p.atom()?)
-                    };
-                    p.open()?;
-                    if p.atom()? != "updcols" {
-                        return Err("bad updcols head".into());
-                    }
-                    let mut update_cols = Vec::new();
-                    while !sexpr_is_close(&mut p) {
-                        update_cols.push(p.atom()?);
-                    }
-                    p.close()?;
-                    p.open()?;
-                    if p.atom()? != "when" {
-                        return Err("bad trigger when head".into());
-                    }
-                    p.ws();
-                    let when_expr = if p.chars.peek() == Some(&'-') {
-                        p.chars.next();
-                        None
-                    } else {
-                        Some(p.expr()?)
-                    };
-                    p.close()?;
-                    p.close()?;
-                    triggers.push(TriggerDef {
-                        name,
-                        timing,
-                        events,
-                        for_each_row,
-                        function,
-                        args,
-                        is_constraint,
-                        deferrable,
-                        initially_deferred,
-                        enforced,
-                        constr_rel,
-                        update_cols,
-                        when_expr,
-                        has_transition,
-                    });
+                    triggers.push(decode_one_trigger(&mut p)?);
                 }
                 p.close()?;
             }

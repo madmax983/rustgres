@@ -3597,6 +3597,7 @@ pub(crate) fn coltype_typ_string(ct: &ColType) -> String {
         ColType::Bit => "bit".into(),
         ColType::Uuid => "uuid".into(),
         ColType::Regclass => "regclass".into(),
+        ColType::Regproc => "regproc".into(),
         ColType::Name => "name".into(),
         ColType::PgLsn => "pg_lsn".into(),
         ColType::Xid => "xid".into(),

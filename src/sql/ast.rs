@@ -2607,6 +2607,17 @@ pub enum AlterAction {
     ValidateConstraint {
         name: String,
     },
+    /// v2.14: `ALTER TABLE name {ENABLE|DISABLE} [ALWAYS|REPLICA]
+    /// TRIGGER {name|ALL|USER}` (PG19 AT_EnableTrig/AT_DisableTrig
+    /// family). `name` None means ALL (USER collapses to ALL: this
+    /// engine has no internal/user trigger distinction beyond FK
+    /// triggers, which are not stored TriggerDefs). `enable` selects
+    /// the direction; ALWAYS/REPLICA modes collapse to plain enable.
+    SetTriggerEnabled {
+        name: Option<String>,
+        /// Resulting pg_trigger.tgenabled: b'O' | b'A' | b'R' | b'D'.
+        mode: u8,
+    },
     AddConstraint {
         check: Option<CheckDef>,
         unique: Option<UniqueDef>,
@@ -8590,6 +8601,9 @@ pub struct IndexColSpec {
 pub enum TriggerTiming {
     Before,
     After,
+    /// v2.14: INSTEAD OF (views only, FOR EACH ROW only; PG19
+    /// `TRIGGER_TYPE_INSTEAD`).
+    InsteadOf,
 }
 
 /// v1.00: trigger event bitmask (PG19 `TRIGGER_INSERT` etc., simplified
@@ -8651,6 +8665,25 @@ pub struct TriggerDef {
     /// discarded it) and evaluated per row at fire time with OLD/NEW
     /// in scope. Persisted through the constraints codec.
     pub when_expr: Option<Expr>,
+    /// v2.14: REFERENCING OLD TABLE AS <name> (PG19 tgnewtable/
+    /// tg_oldtable names). The transition relation is materialized as
+    /// a session temp table for the duration of firing.
+    pub old_table: Option<String>,
+    /// v2.14: REFERENCING NEW TABLE AS <name>.
+    pub new_table: Option<String>,
+    /// v2.14: ALTER TABLE … {ENABLE|DISABLE} TRIGGER state (PG19
+    /// tgenabled): b'O' origin (default), b'A' always, b'R' replica,
+    /// b'D' disabled.
+    pub tgenabled: u8,
+}
+
+impl TriggerDef {
+    /// v2.14: does the trigger fire in an origin-mode session?
+    /// (PG19: 'O' and 'A' fire; 'R' fires only in replica mode and
+    /// 'D' never — this engine's sessions are always origin mode.)
+    pub fn fires(&self) -> bool {
+        self.tgenabled == b'O' || self.tgenabled == b'A'
+    }
 }
 
 /// v1.00: one statement of a bounded trigger-function body
@@ -9081,6 +9114,20 @@ pub enum Stmt {
         update_cols: Vec<String>,
         /// v2.09: REFERENCING transition tables were declared.
         has_transition: bool,
+        /// v2.14: CREATE OR REPLACE TRIGGER (PG19 opt_or_replace;
+        /// constraint triggers reject it in the executor, per gram.y).
+        or_replace: bool,
+        /// v2.14: REFERENCING OLD/NEW TABLE names.
+        old_table: Option<String>,
+        new_table: Option<String>,
+    },
+    /// v2.14: `COMMENT ON TRIGGER name ON table IS ...` — comments
+    /// are not stored; the statement is a catalog no-op returning
+    /// the COMMENT tag (PG19 stores it in pg_description, which this
+    /// engine does not materialize for triggers).
+    CommentOnTrigger {
+        name: String,
+        table: String,
     },
     /// v2.09: `ALTER TRIGGER name ON table RENAME TO new_name`
     /// (PG19 RenameStmt OBJECT_TRIGGER).

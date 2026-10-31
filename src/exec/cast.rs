@@ -2198,6 +2198,8 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
         // v0.37: regclass is handled in eval_expr (needs catalog access).
         // This arm is unreachable but required for exhaustiveness.
         ColType::Regclass => Err(cast_err(v, "regclass")),
+        // v2.14: regproc is handled in eval_expr (needs catalog access).
+        ColType::Regproc => Err(cast_err(v, "regproc")),
         // v0.57: casts to `name` go through namein (name.c, PG19):
         // text/bpchar input is silently truncated at 63 bytes; any
         // other source goes through its text form first. Total: never
@@ -2281,5 +2283,52 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
         // target (named casts resolve against the type catalog before
         // reaching it); nothing casts here.
         ColType::Composite => Err(exec_err("42846", "cannot cast to composite type here")),
+    }
+}
+
+/// v2.14: regproc display (PG19 regprocout): the function's name.
+/// User-function OIDs follow the pg_trigger scan scheme (40000 +
+/// name-sorted index); builtin trigger functions carry real OIDs.
+pub(crate) fn regproc_display(q: &Q, oid: u32) -> String {
+    if oid == 1291 {
+        return "suppress_redundant_updates_trigger".to_string();
+    }
+    if oid >= 40000 {
+        let mut names: Vec<&String> = q.eng.db.functions.keys().collect();
+        names.sort();
+        if let Some(n) = names.get((oid - 40000) as usize) {
+            return n.to_string();
+        }
+    }
+    oid.to_string()
+}
+
+/// v2.14: `CAST(x AS regproc)`, like PG19's regprocin: a number is
+/// taken as the OID directly; a name must resolve to a function
+/// (42883 otherwise). The value is represented by its display text.
+pub(crate) fn eval_regproc_cast(q: &mut Q, v: &Value) -> Result<Value, ExecError> {
+    match v {
+        Value::Null => Ok(Value::Null),
+        Value::Int(i) => Ok(Value::text(regproc_display(q, *i as u32))),
+        Value::BigInt(i) => Ok(Value::text(regproc_display(q, *i as u32))),
+        Value::SmallInt(i) => Ok(Value::text(regproc_display(q, *i as u32))),
+        Value::Text(s) => {
+            let name = s.trim_matches('"');
+            if q.eng.db.functions.contains_key(name) || name == "suppress_redundant_updates_trigger"
+            {
+                Ok(Value::text(name.to_string()))
+            } else if name.chars().all(|c| c.is_ascii_digit()) {
+                Ok(Value::text(regproc_display(
+                    q,
+                    name.parse::<u32>().unwrap_or(0),
+                )))
+            } else {
+                Err(exec_err(
+                    "42883",
+                    format!("function \"{}\" does not exist", name),
+                ))
+            }
+        }
+        other => Err(cast_err(other, "regproc")),
     }
 }

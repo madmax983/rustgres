@@ -5402,6 +5402,7 @@ pub(crate) fn pg_typlen_align(ty: &ColType) -> (i32, usize) {
         ColType::Uuid => (16, 1),       // uuid: 16/'c'
         ColType::Name => (64, 1),       // name: 64/'c'
         ColType::Regclass => (4, 4),    // regclass: 4/'i'
+        ColType::Regproc => (4, 4),     // regproc: 4/'i' (v2.14)
         ColType::Xid => (4, 4),         // xid: 4/'i'
         ColType::PgLsn => (8, 8),       // pg_lsn: 8/'d'
         ColType::Tid => (6, 2),         // tid: 6/'s'

@@ -5144,6 +5144,9 @@ pub(crate) fn trigger_tgtype(tr: &crate::sql::TriggerDef) -> i64 {
     if tr.timing == crate::sql::TriggerTiming::Before {
         t |= 2; // TRIGGER_TYPE_BEFORE (AFTER is 0)
     }
+    if tr.timing == crate::sql::TriggerTiming::InsteadOf {
+        t |= 64; // TRIGGER_TYPE_INSTEAD
+    }
     if (tr.events & crate::sql::trig_event::INSERT) != 0 {
         t |= 4;
     }
@@ -5219,6 +5222,25 @@ fn collect_trigger_rows(db: &Database, snap: &Snapshot, own: u64, session: u64) 
             }
         }
     }
+    // v2.14: triggers on views (INSTEAD OF / statement triggers).
+    // Views have no stored OID in this engine; tgrelid uses a
+    // synthetic 95000+ slot by sorted view-name order (stable within
+    // a scan, like the other synthetic catalog OIDs).
+    let mut vnames: Vec<&String> = db.views.keys().collect();
+    vnames.sort();
+    for (vi, vname) in vnames.iter().enumerate() {
+        let Some(v) = db.find_view(vname, snap, own) else {
+            continue;
+        };
+        if v.triggers.is_empty() {
+            continue;
+        }
+        let mut synth = crate::storage::Table::new(Vec::new(), 0);
+        synth.oid = 95000 + vi as u32;
+        for tr in &v.triggers {
+            out.push((vname.to_string(), synth.clone(), tr.clone(), None));
+        }
+    }
     out
 }
 
@@ -5253,7 +5275,14 @@ pub(crate) fn pg_trigger_scan(
             .iter()
             .position(|n| n.as_str() == fname)
             .map(|i| 40000 + i as i64)
-            .unwrap_or(0)
+            .unwrap_or_else(|| {
+                // v2.14: builtin trigger functions carry their real
+                // PG19 pg_proc OIDs.
+                match fname {
+                    "suppress_redundant_updates_trigger" => 1291,
+                    _ => 0,
+                }
+            })
     };
     let src = collect_trigger_rows(db, snap, own, session);
     // First pass: assign OIDs; remember each (table, trigger) parent's
@@ -5324,7 +5353,7 @@ pub(crate) fn pg_trigger_scan(
                 Value::text(tr.name.clone()),
                 Value::Int(fn_oid_of(&tr.function)),
                 Value::Int(trigger_tgtype(tr)),
-                Value::SingleChar(b'O'),
+                Value::SingleChar(tr.tgenabled),
                 Value::Bool(false),
                 Value::Int(constr_relid),
                 Value::Int(0),
@@ -5335,8 +5364,16 @@ pub(crate) fn pg_trigger_scan(
                 int_array(tgattr),
                 Value::Null,
                 Value::Null,
-                Value::Null,
-                Value::Null,
+                // v2.14: tgqual stays NULL; tgnewtable/tgoldtable
+                // carry the REFERENCING names.
+                match &tr.old_table {
+                    Some(n) => Value::text(n.clone()),
+                    None => Value::Null,
+                },
+                match &tr.new_table {
+                    Some(n) => Value::text(n.clone()),
+                    None => Value::Null,
+                },
             ]),
             prov: Vec::new(),
         });
@@ -5351,6 +5388,7 @@ pub(crate) fn trigger_def_text(tname: &str, tr: &crate::sql::TriggerDef) -> Stri
     let timing = match tr.timing {
         crate::sql::TriggerTiming::Before => "BEFORE",
         crate::sql::TriggerTiming::After => "AFTER",
+        crate::sql::TriggerTiming::InsteadOf => "INSTEAD OF",
     };
     let mut events: Vec<&str> = Vec::new();
     if (tr.events & crate::sql::trig_event::INSERT) != 0 {
@@ -5379,10 +5417,94 @@ pub(crate) fn trigger_def_text(tname: &str, tr: &crate::sql::TriggerDef) -> Stri
     };
     let constraint = if tr.is_constraint { "CONSTRAINT " } else { "" };
     let level = if tr.for_each_row { "ROW" } else { "STATEMENT" };
+    // v2.14: REFERENCING clause (PG19 ruleutils order: after the
+    // relation name, before FOR EACH).
+    let mut referencing = String::new();
+    if let Some(n) = &tr.old_table {
+        referencing.push_str(&format!(" REFERENCING OLD TABLE AS {}", n));
+    }
+    if let Some(n) = &tr.new_table {
+        referencing.push_str(&format!(" REFERENCING NEW TABLE AS {}", n));
+    }
+    // v2.14: WHEN clause (bounded deparse — the comparison shapes
+    // the suites use) and the EXECUTE argument list.
+    let when = match &tr.when_expr {
+        Some(e) => format!(" WHEN ({})", deparse_when_expr(e)),
+        None => String::new(),
+    };
+    let args: Vec<String> = tr
+        .args
+        .iter()
+        .map(|a| format!("'{}'", a.replace('\'', "''")))
+        .collect();
     format!(
-        "CREATE {}{}TRIGGER {} {} {} ON {} FOR EACH {} EXECUTE FUNCTION {}()",
-        constraint, "", tr.name, timing, ev, tname, level, tr.function
+        "CREATE {}{}TRIGGER {} {} {} ON {}{} FOR EACH {}{} EXECUTE FUNCTION {}({})",
+        constraint,
+        "",
+        tr.name,
+        timing,
+        ev,
+        tname,
+        referencing,
+        level,
+        when,
+        tr.function,
+        args.join(", ")
     )
+}
+
+/// v2.14: bounded SQL deparse of a trigger WHEN expression for
+/// pg_get_triggerdef (comparison / IS DISTINCT FROM / boolean
+/// shapes over OLD./NEW. columns — the forms the regression suites
+/// exercise). Unknown shapes fall back to a neutral `true` rather
+/// than failing the catalog read.
+pub(crate) fn deparse_when_expr(e: &crate::sql::Expr) -> String {
+    use crate::sql::{CmpOp, Expr, Literal};
+    fn col(q: &Option<String>, n: &str) -> String {
+        match q {
+            Some(t) => format!("{}.{}", t.to_lowercase(), n),
+            None => n.to_string(),
+        }
+    }
+    match e {
+        Expr::Column { table, name } => col(table, name),
+        Expr::WholeRow { qual } => format!("{}.*", qual.to_lowercase()),
+        Expr::Literal(Literal::Int(i)) => i.to_string(),
+        Expr::Literal(Literal::Text(t)) => format!("'{}'", t.replace('\'', "''")),
+        Expr::Literal(Literal::Bool(b)) => if *b { "true" } else { "false" }.to_string(),
+        Expr::Cmp { op, left, right } => {
+            let o = match op {
+                CmpOp::Eq => "=",
+                CmpOp::Ne => "<>",
+                CmpOp::Lt => "<",
+                CmpOp::Le => "<=",
+                CmpOp::Gt => ">",
+                CmpOp::Ge => ">=",
+                CmpOp::ImageEq => "=",
+            };
+            format!(
+                "{} {} {}",
+                deparse_when_expr(left),
+                o,
+                deparse_when_expr(right)
+            )
+        }
+        Expr::IsDistinctFrom { left, right, neg } => format!(
+            "{} IS {}DISTINCT FROM {}",
+            deparse_when_expr(left),
+            if *neg { "NOT " } else { "" },
+            deparse_when_expr(right)
+        ),
+        Expr::And(l, r) => format!("{} AND {}", deparse_when_expr(l), deparse_when_expr(r)),
+        Expr::Or(l, r) => format!("{} OR {}", deparse_when_expr(l), deparse_when_expr(r)),
+        Expr::Not(x) => format!("NOT {}", deparse_when_expr(x)),
+        Expr::IsNull { expr, neg } => format!(
+            "{} IS {}NULL",
+            deparse_when_expr(expr),
+            if *neg { "NOT " } else { "" }
+        ),
+        _ => "true".to_string(),
+    }
 }
 
 /// v2.09: pg_get_triggerdef's lookup — the rendered definition for

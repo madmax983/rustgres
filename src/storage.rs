@@ -70,6 +70,10 @@ pub enum ColType {
     // v0.37: PG's regclass type (OID 2205) — an OID that displays as
     // the relation name. Used for pg_class.reltoastrelid::regclass.
     Regclass, // OID 2205
+    // v2.14: PG's regproc type (OID 24) — a function OID that
+    // displays as the function name. Values are represented by
+    // their display text, like regclass.
+    Regproc, // OID 24
     // v0.57: PG's `name` internal identifier type (OID 19,
     // NAMEDATALEN-1 = 63 bytes). Values are stored as text truncated
     // to 63 bytes on input (PG19 namein); comparison is plain byte
@@ -421,6 +425,8 @@ impl ArrayElem {
             ColType::Numeric(..) => ArrayElem::Numeric,
             ColType::Uuid => ArrayElem::Uuid,
             ColType::Regclass => ArrayElem::Regclass,
+            // v2.14: regproc[] is not representable yet; degrade.
+            ColType::Regproc => ArrayElem::Record,
             ColType::Json => ArrayElem::Json,
             // v1.83: jsonb[] (PG _jsonb, OID 3807) is not supported;
             // array-of-jsonb degrades to the json element kind.
@@ -666,6 +672,7 @@ impl ColType {
             ColType::Bit => 1560,         // BIT (v1.39)
             ColType::Uuid => 2950,        // UUID
             ColType::Regclass => 2205,    // REGCLASS (v0.37)
+            ColType::Regproc => 24,       // REGPROC (v2.14)
             ColType::Name => 19,          // NAME (v0.57)
             ColType::Record => 2249,      // RECORD (v0.73)
             // v0.81: named composite; PG uses the rowtype OID, we use record's.
@@ -736,6 +743,7 @@ impl ColType {
             ColType::Xid => "xid",      // v1.17
             ColType::Tid => "tid",      // v1.40
             ColType::Regclass => "regclass",
+            ColType::Regproc => "regproc",
             ColType::Name => "name",
             ColType::Record => "record", // v0.73
             // v0.81: resolved to the actual name at execution time.
@@ -801,6 +809,7 @@ impl ColType {
             ColType::Xid => "xid",      // v1.17
             ColType::Tid => "tid",      // v1.40
             ColType::Regclass => "regclass",
+            ColType::Regproc => "regproc",
             ColType::Name => "name",
             ColType::Record => "record", // v0.73
             // v0.81: resolved to the actual name at execution time.
@@ -6208,6 +6217,12 @@ pub struct ViewDef {
     /// v1.96: a matview created WITH NO DATA reads empty until a
     /// REFRESH flips this.
     pub populated: bool,
+    /// v2.14: triggers defined ON this view (INSTEAD OF row triggers
+    /// and BEFORE/AFTER statement triggers; PG19 pg_trigger rows with
+    /// tgrelid = the view). Tables carry theirs on Table.triggers;
+    /// views version independently, so theirs ride here (WAL
+    /// RGSWAL33 CreateView trailing field, checkpoint v29).
+    pub triggers: Vec<crate::sql::TriggerDef>,
 }
 
 /// A sequence (v0.9). Bounds and parameters are transactional DDL;
@@ -8467,6 +8482,13 @@ pub enum WriteOp {
         /// v1.96: previous owner (empty = leave owner unchanged).
         prev_owner: String,
     },
+    /// v2.14: a view's trigger list changed in place (CREATE / DROP /
+    /// ALTER TRIGGER on a view). Undo restores the previous list;
+    /// the commit conversion emits WalRecord::AlterViewTriggers.
+    ViewTriggers {
+        name: String,
+        prev_triggers: Vec<crate::sql::TriggerDef>,
+    },
     // --- v1.05: the lazy toast-table safety net links the new toast
     // table OID onto the main table (`pg_class.reltoastrelid`). The
     // link is a catalog mutation: it is staged as a write op so
@@ -9057,6 +9079,16 @@ pub fn undo_write_op(eng: &mut Engine, owns: &[u64], op: &WriteOp) {
                     if !prev_owner.is_empty() {
                         v.owner = prev_owner.clone();
                     }
+                }
+            }
+        }
+        WriteOp::ViewTriggers {
+            name,
+            prev_triggers,
+        } => {
+            if let Some(vs) = eng.db.views.get_mut(name) {
+                for v in vs.iter_mut() {
+                    v.triggers = prev_triggers.clone();
                 }
             }
         }

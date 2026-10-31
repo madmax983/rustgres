@@ -2981,6 +2981,18 @@ pub(crate) fn build_source(
                     .collect();
                 return Ok((apply_aliases(schema)?, rows));
             }
+            // v2.14: information_schema.triggers.
+            if name == "information_schema.triggers" {
+                let (schema, rows) = info_triggers_scan(&q.eng.db, q.snap, q.own, q.session);
+                let schema: Vec<QCol> = schema
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                return Ok((apply_aliases(schema)?, rows));
+            }
             // v0.98: information_schema.sequences.
             if name == "information_schema.sequences" {
                 let (schema, rows) = info_sequences_scan(&q.eng.db, q.snap, q.own);
