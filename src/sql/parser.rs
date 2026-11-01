@@ -1107,6 +1107,8 @@ impl Parser {
             "regproc" => Ok(ColType::Regproc),
             "pg_lsn" => Ok(ColType::PgLsn), // v0.64
             "xid" => Ok(ColType::Xid),      // v1.17
+            "oid" => Ok(ColType::Oid),      // v2.15
+            "inet" => Ok(ColType::Inet),    // v2.15
             // v2.13: PG's internal array type names (`_int4` is the
             // int4[] type, pg_type typarray naming) — they appear in
             // column definition lists (`AS x(ia _int4)`) and casts.
@@ -1135,8 +1137,15 @@ impl Parser {
             _ => Ok(ColType::Composite),
         }?;
         // v0.81: the composite name, if this was not a builtin.
+        // v2.15: `oid` is the one builtin that still reports its
+        // name: a CAST to oid must stay on the named path because
+        // eval_cast_named resolves regclass display names through
+        // the catalog ('t'::regclass::oid), which the typed
+        // numeric-only cast cannot do.
         let composite_name = if base == ColType::Composite {
             Some(name)
+        } else if base == ColType::Oid {
+            Some("oid".to_string())
         } else {
             None
         };
@@ -1231,6 +1240,8 @@ impl Parser {
                 | "regclass"
                 | "pg_lsn" // v0.64
                 | "xid" // v1.17
+                | "oid" // v2.15
+                | "inet" // v2.15
                 | "int4range" // v1.88
                 | "int8range"
                 | "numrange"
@@ -1271,10 +1282,18 @@ impl Parser {
             if self.eat_keyword("authorization") {
                 authorization = Some(self.expect_ident()?);
             }
+            // v2.15: schema elements — a run of CREATE ... statements
+            // belonging to the new schema (gram.y CreateSchemaStmt).
+            let mut elements = Vec::new();
+            while matches!(self.peek(), Token::Ident(s) if s == "create") {
+                self.next(); // 'create'
+                elements.push(self.parse_create()?);
+            }
             return Ok(Stmt::CreateSchema {
                 name,
                 if_not_exists,
                 authorization,
+                elements,
             });
         }
         // v1.96: CREATE AGGREGATE name (args) (sfunc = f, stype = t [, ...]).
@@ -2211,7 +2230,9 @@ impl Parser {
     /// `reftable [(refcol [, ...])] [ON DELETE action] [ON UPDATE action]`,
     /// after the REFERENCES keyword.
     pub(crate) fn parse_fk_tail(&mut self) -> Result<ParsedFkTail, SqlError> {
-        let ref_table = self.expect_ident()?;
+        // v2.15: the referenced table may be schema-qualified
+        // (REFERENCES fkpart7.pkpart).
+        let ref_table = self.parse_table_name()?;
         let mut ref_cols = Vec::new();
         if *self.peek() == Token::LParen {
             ref_cols = self.parse_col_name_list()?;
@@ -2230,12 +2251,33 @@ impl Parser {
                 ));
             }
         }
+        let mut on_delete_cols: Option<Vec<String>> = None;
+        let mut on_update_cols: Option<Vec<String>> = None;
         loop {
             if self.eat_keyword("on") {
                 if self.eat_keyword("delete") {
-                    on_delete = self.parse_fk_action()?;
+                    let (a, c) = self.parse_fk_action()?;
+                    on_delete = a;
+                    on_delete_cols = c;
                 } else if self.eat_keyword("update") {
-                    on_update = self.parse_fk_action()?;
+                    let (a, c) = self.parse_fk_action()?;
+                    // PG19 gram.y key_update: a column list is only
+                    // supported for ON DELETE actions (0A000).
+                    if c.is_some() {
+                        let which = match a {
+                            FkAction::SetNull => "SET NULL",
+                            _ => "SET DEFAULT",
+                        };
+                        return Err(SqlError {
+                            message: format!(
+                                "a column list with {} is only supported for ON DELETE actions",
+                                which
+                            ),
+                            code: "0A000",
+                        });
+                    }
+                    on_update = a;
+                    on_update_cols = c;
                 } else {
                     return Err(err(
                         "syntax error: expected DELETE or UPDATE after ON".to_string()
@@ -2341,6 +2383,8 @@ impl Parser {
             ref_cols,
             on_delete,
             on_update,
+            on_delete_cols,
+            on_update_cols,
             match_full,
             deferrable,
             initially_deferred,
@@ -2469,24 +2513,33 @@ impl Parser {
         Ok((not_valid, enforced))
     }
 
-    pub(crate) fn parse_fk_action(&mut self) -> Result<FkAction, SqlError> {
+    /// v2.15: an FK action, plus the optional SET NULL/DEFAULT
+    /// column list (PG19 gram.y: `SET NULL (column_list)` /
+    /// `SET DEFAULT (column_list)` may follow either action).
+    pub(crate) fn parse_fk_action(&mut self) -> Result<(FkAction, Option<Vec<String>>), SqlError> {
         if self.eat_keyword("cascade") {
-            Ok(FkAction::Cascade)
+            Ok((FkAction::Cascade, None))
         } else if self.eat_keyword("restrict") {
-            Ok(FkAction::Restrict)
+            Ok((FkAction::Restrict, None))
         } else if self.eat_keyword("set") {
-            if self.eat_keyword("null") {
-                Ok(FkAction::SetNull)
+            let act = if self.eat_keyword("null") {
+                FkAction::SetNull
             } else if self.eat_keyword("default") {
-                Ok(FkAction::SetDefault)
+                FkAction::SetDefault
             } else {
-                Err(err(
+                return Err(err(
                     "syntax error: expected NULL or DEFAULT after SET".to_string()
-                ))
-            }
+                ));
+            };
+            let cols = if *self.peek() == Token::LParen {
+                Some(self.parse_col_name_list()?)
+            } else {
+                None
+            };
+            Ok((act, cols))
         } else if self.eat_keyword("no") {
             self.expect_keyword("action")?;
-            Ok(FkAction::Restrict)
+            Ok((FkAction::Restrict, None))
         } else {
             Err(err(
                 "syntax error: expected CASCADE, RESTRICT, SET NULL, SET DEFAULT or NO ACTION"
@@ -5039,6 +5092,28 @@ impl Parser {
                 }
             }
             return Ok(Stmt::CommentOnTrigger { name, table });
+        }
+        // v2.15: COMMENT ON CONSTRAINT name ON table IS ...
+        if matches!(self.peek(), Token::Ident(s) if s == "constraint") {
+            self.next();
+            let name = self.expect_ident()?;
+            self.expect_keyword("on")?;
+            let table = self.parse_table_name()?;
+            self.expect_keyword("is")?;
+            match self.peek().clone() {
+                Token::Str(_) => {
+                    self.next();
+                }
+                Token::Ident(s) if s == "null" => {
+                    self.next();
+                }
+                _ => {
+                    return Err(err(
+                        "syntax error: expected string literal or NULL".to_string()
+                    ));
+                }
+            }
+            return Ok(Stmt::CommentOnConstraint { name, table });
         }
         self.expect_keyword("publication")?;
         let name = self.expect_ident()?;
@@ -11783,7 +11858,8 @@ impl Parser {
     }
 
     pub(crate) fn parse_update(&mut self) -> Result<Stmt, SqlError> {
-        let table = self.expect_ident()?;
+        // v2.15: schema-qualified target (UPDATE fkpart10.tbl1 ...).
+        let table = self.parse_table_name()?;
         // v0.76: `UPDATE t AS x` / `UPDATE t x` (PG's alias clause).
         let alias = self.parse_alias_opt()?;
         self.expect_keyword("set")?;
@@ -17714,6 +17790,8 @@ pub(crate) fn coltype_by_name(name: &str) -> Result<ColType, String> {
         "bytea" => ColType::Bytea,
         "bit" => ColType::Bit, // v1.39
         "uuid" => ColType::Uuid,
+        "oid" => ColType::Oid,
+        "inet" => ColType::Inet,
         o => return Err(format!("bad column type {}", o)),
     })
 }
@@ -17874,7 +17952,33 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
         out.push_str(if f.enforced { "1" } else { "0" });
         out.push(' ');
         out.push_str(if f.not_valid { "1" } else { "0" });
-        out.push_str("))");
+        out.push(')');
+        // v2.15: optional (actcols (del ...) (upd ...)) section with
+        // the SET NULL/DEFAULT column lists (- = no list).
+        if f.on_delete_cols.is_some() || f.on_update_cols.is_some() {
+            out.push_str(" (actcols (del");
+            match &f.on_delete_cols {
+                None => out.push_str(" -"),
+                Some(cols) => {
+                    for c in cols {
+                        out.push(' ');
+                        sexpr_escape(c, &mut out);
+                    }
+                }
+            }
+            out.push_str(") (upd");
+            match &f.on_update_cols {
+                None => out.push_str(" -"),
+                Some(cols) => {
+                    for c in cols {
+                        out.push(' ');
+                        sexpr_escape(c, &mut out);
+                    }
+                }
+            }
+            out.push_str("))");
+        }
+        out.push(')');
     }
     out.push_str(")");
     // v1.95: RLS flags + policies, trailing sections. Older decoders
@@ -18486,6 +18590,31 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
             fk_not_valid = bit(&mut p)?;
             p.close()?;
         }
+        // v2.15: optional (actcols (del ...) (upd ...)) section.
+        let (mut on_delete_cols, mut on_update_cols) = (None, None);
+        if !sexpr_is_close(&mut p) {
+            p.open()?;
+            if p.atom()? != "actcols" {
+                return Err("bad fk actcols head".into());
+            }
+            let read_list = |p: &mut SexprParser| -> Result<Option<Vec<String>>, String> {
+                p.open()?;
+                let _head = p.atom()?;
+                let mut items = Vec::new();
+                while !sexpr_is_close(p) {
+                    items.push(p.atom()?);
+                }
+                p.close()?;
+                if items.len() == 1 && items[0] == "-" {
+                    Ok(None)
+                } else {
+                    Ok(Some(items))
+                }
+            };
+            on_delete_cols = read_list(&mut p)?;
+            on_update_cols = read_list(&mut p)?;
+            p.close()?;
+        }
         p.close()?;
         fks.push(FkDef {
             name,
@@ -18494,6 +18623,8 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
             ref_cols,
             on_delete,
             on_update,
+            on_delete_cols,
+            on_update_cols,
             match_full,
             deferrable,
             initially_deferred,

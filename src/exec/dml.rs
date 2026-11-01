@@ -3287,9 +3287,12 @@ pub(crate) fn exec_insert(
                 check_insert_unique(eng, table, &built, ctx.snap, &ctx.all_xids, ctx.session)?;
             }
         }
-        // v0.9: child-side foreign keys. Rows inserted earlier in the same
-        // statement are visible to later rows (self-references).
-        for (i, values) in built.iter().enumerate() {
+        // v0.9: child-side foreign keys. v2.15: PG queues RI checks
+        // to end of statement, so ALL rows of this statement are
+        // visible to every row's check — including the row itself
+        // and rows after it (self-referencing multi-row INSERTs
+        // like (0,0),(1,1) satisfy their own FKs).
+        for values in built.iter() {
             check_fk_child_row(
                 eng,
                 ctx.snap,
@@ -3298,7 +3301,7 @@ pub(crate) fn exec_insert(
                 &meta,
                 table,
                 values,
-                &built[..i],
+                &built,
                 None,
             )?;
         }
@@ -4877,32 +4880,6 @@ pub(crate) fn exec_update(
                 moves.push((leaf.clone(), *id, *xmax, dst, Row::new(new_dst)));
             }
         }
-        // v0.9: child-side FK checks for the new rows, per destination
-        // leaf. Self-references see the statement's own new versions;
-        // each row's old version is excluded from the parent scan.
-        for (dst, new_rows) in &new_by_dst {
-            let dst_meta = {
-                let dt = eng
-                    .db
-                    .find_table(dst, ctx.snap, &ctx.all_xids, ctx.session)
-                    .expect("destination leaf visible; engine lock held throughout");
-                TableMeta::of(dt)
-            };
-            let self_new: Vec<Row> = new_rows.iter().map(|(_, nv)| nv.clone()).collect();
-            for (rid, nv) in new_rows {
-                check_fk_child_row(
-                    eng,
-                    ctx.snap,
-                    ctx.own,
-                    ctx.session,
-                    &dst_meta,
-                    dst,
-                    nv,
-                    &self_new,
-                    Some(*rid),
-                )?;
-            }
-        }
         // v0.9: parent-side FK actions (RESTRICT / CASCADE / SET NULL /
         // SET DEFAULT), planned before any mutation. Grouped by the leaf
         // holding the old version; moves plan their delete side.
@@ -4942,6 +4919,47 @@ pub(crate) fn exec_update(
                     changed,
                     0,
                     &mut cascade,
+                )?;
+            }
+        }
+        // v0.9: child-side FK checks for the new rows, per destination
+        // leaf. Self-references see the statement's own new versions;
+        // each row's old version is excluded from the parent scan.
+        // v2.15: the checks run AFTER parent-side planning and judge
+        // each row's FINAL image (primary update composed with any
+        // RI cascade update targeting it) — a self-referential
+        // ON UPDATE CASCADE row is only consistent in its final
+        // image (bug #6268 shape: SET a=123 moves b along).
+        for (dst, new_rows) in &new_by_dst {
+            let dst_meta = {
+                let dt = eng
+                    .db
+                    .find_table(dst, ctx.snap, &ctx.all_xids, ctx.session)
+                    .expect("destination leaf visible; engine lock held throughout");
+                TableMeta::of(dt)
+            };
+            let self_new: Vec<Row> = new_rows
+                .iter()
+                .map(|(rid, nv)| {
+                    cascade
+                        .planned_values(dst, *rid)
+                        .unwrap_or_else(|| nv.clone())
+                })
+                .collect();
+            for (rid, nv) in new_rows {
+                let fin = cascade
+                    .planned_values(dst, *rid)
+                    .unwrap_or_else(|| nv.clone());
+                check_fk_child_row(
+                    eng,
+                    ctx.snap,
+                    ctx.own,
+                    ctx.session,
+                    &dst_meta,
+                    dst,
+                    &fin,
+                    &self_new,
+                    Some(*rid),
                 )?;
             }
         }
@@ -4998,14 +5016,40 @@ pub(crate) fn exec_update(
                     .push((*id, *xmax, nv.clone()));
             }
             for (t, id, xmax, nv) in &cascade.updates {
-                by_table
-                    .entry(t.as_str())
-                    .or_default()
-                    .push((*id, *xmax, nv.clone()));
+                // v2.15: a cascade update on a row that is itself a
+                // primary target REPLACES the primary image in this
+                // check — the pair (primary (123,0), cascade
+                // (123,123)) is one row's final image, not two rows
+                // colliding on the unique key.
+                let rows = by_table.entry(t.as_str()).or_default();
+                if let Some(e) = rows.iter_mut().find(|(i, _, _)| i == id) {
+                    *e = (*id, *xmax, nv.clone());
+                } else {
+                    rows.push((*id, *xmax, nv.clone()));
+                }
             }
             for (t, p) in &by_table {
                 check_update_unique_pairs(eng, t, p, ctx.snap, &ctx.all_xids, ctx.session)?;
             }
+        }
+        // v2.15: fold cascade updates that target primary rows
+        // into the plan itself — applying both would write two
+        // live versions of the row (the primary image and the
+        // cascade image). The plan entry's final image IS the
+        // cascade image; the cascade keeps only non-primary rows.
+        {
+            let mut rest = Vec::new();
+            for (t, id, xmax, nv) in std::mem::take(&mut cascade.updates) {
+                if let Some(e) = plan
+                    .iter_mut()
+                    .find(|(dst, rid, _, _)| *dst == t && *rid == id)
+                {
+                    e.3 = nv;
+                } else {
+                    rest.push((t, id, xmax, nv));
+                }
+            }
+            cascade.updates = rest;
         }
         // Apply the cascade after the unique checks pass.
         apply_fk_cascade(eng, ctx, cascade)?;
@@ -5801,6 +5845,13 @@ pub(crate) fn exec_delete(
         // v0.9: parent-side FK actions for the deleted rows, grouped by
         // the leaf holding each row (v0.70).
         let mut cascade = FkCascade::default();
+        // v2.15: the statement's own targets are already dead for RI
+        // purposes (a self-referencing row deleted together with its
+        // parent must not block the delete).
+        cascade.stmt_deletes = plan
+            .iter()
+            .map(|(leaf, id, _, _, _, _)| (leaf.clone(), *id))
+            .collect();
         {
             let mut by_leaf: std::collections::HashMap<&str, Vec<(u64, Row, Option<Row>)>> =
                 std::collections::HashMap::new();
@@ -6272,7 +6323,16 @@ pub(crate) fn exec_drop(
     // is itself being dropped by this statement do not block (PG19
     // performMultipleDeletions resolves dependencies across the
     // whole DROP list; alter_table check_fk_presence / attbl+atref).
-    let stmt_set: std::collections::HashSet<String> = names.iter().cloned().collect();
+    // v2.15: the set closes over partition trees — a listed
+    // partitioned table's descendants are dropped with it, so FKs
+    // held by those descendants (e.g. clones an ATTACH merged in)
+    // are internal to the statement too.
+    let mut stmt_set: std::collections::HashSet<String> = names.iter().cloned().collect();
+    for name in names {
+        for d in crate::exec::alter::partition_descendants(eng, ctx, name) {
+            stmt_set.insert(d);
+        }
+    }
     for name in names {
         if dropped.contains(name) {
             continue;

@@ -847,6 +847,113 @@ pub(crate) fn attach_partition(
             }
         }
     }
+    // v2.15: PG19 ATExecAttachPartition merges the parent's FK
+    // constraints into the child tree. A matching NOT VALID clone
+    // is validated against the child's existing rows (a violation
+    // aborts the attach with 23503) and becomes validated; a
+    // missing constraint is cloned onto the child (validated the
+    // same way when the parent's constraint is validated). The
+    // pre-fix code did neither, so a child carrying a violating
+    // row attached silently and the FK stayed NOT VALID forever.
+    let mut fk_flips: Vec<(String, String)> = Vec::new(); // (table, fk name)
+    let mut fk_clones: Vec<(String, FkDef)> = Vec::new(); // (table, fk)
+    {
+        let parent_t = eng
+            .db
+            .find_table(parent_name, ctx.snap, &ctx.all_xids, ctx.session)
+            .expect("parent resolved above")
+            .clone();
+        let mut tree: Vec<String> = vec![child_name.to_string()];
+        tree.extend(crate::exec::alter::partition_descendants(
+            eng, ctx, child_name,
+        ));
+        let same_fk = |a: &FkDef, b: &FkDef| {
+            a.cols == b.cols
+                && a.ref_table == b.ref_table
+                && (a.ref_cols == b.ref_cols || a.ref_cols.is_empty() || b.ref_cols.is_empty())
+        };
+        for pfk in &parent_t.fks {
+            for tname in &tree {
+                let Some(tt) = eng
+                    .db
+                    .find_table(tname, ctx.snap, &ctx.all_xids, ctx.session)
+                    .cloned()
+                else {
+                    continue;
+                };
+                match tt.fks.iter().find(|cf| same_fk(cf, pfk)) {
+                    Some(cfk) => {
+                        if cfk.not_valid && !pfk.not_valid {
+                            // Validate this table's rows against
+                            // the clone, then mark it validated.
+                            let meta = {
+                                let mut m = TableMeta::of(&tt);
+                                m.fks = vec![cfk.clone()];
+                                m
+                            };
+                            let rows: Vec<Row> = tt
+                                .rows
+                                .iter()
+                                .filter(|rv| row_visible(rv, ctx.snap, &ctx.all_xids))
+                                .map(|rv| rv.values.clone())
+                                .collect();
+                            for values in &rows {
+                                check_fk_child_row(
+                                    eng,
+                                    ctx.snap,
+                                    ctx.own,
+                                    ctx.session,
+                                    &meta,
+                                    tname,
+                                    values,
+                                    &[],
+                                    None,
+                                )?;
+                            }
+                            fk_flips.push((tname.clone(), cfk.name.clone()));
+                        }
+                    }
+                    None => {
+                        let mut clone = pfk.clone();
+                        clone.name = format!("{}_{}_fkey", tname, pfk.cols.join("_"));
+                        let mut n = 1;
+                        while tt.fks.iter().any(|f| f.name == clone.name) {
+                            n += 1;
+                            clone.name = format!("{}_{}_fkey{}", tname, pfk.cols.join("_"), n);
+                        }
+                        if !pfk.not_valid {
+                            let meta = {
+                                let mut m = TableMeta::of(&tt);
+                                m.fks = vec![clone.clone()];
+                                m
+                            };
+                            let rows: Vec<Row> = tt
+                                .rows
+                                .iter()
+                                .filter(|rv| row_visible(rv, ctx.snap, &ctx.all_xids))
+                                .map(|rv| rv.values.clone())
+                                .collect();
+                            for values in &rows {
+                                check_fk_child_row(
+                                    eng,
+                                    ctx.snap,
+                                    ctx.own,
+                                    ctx.session,
+                                    &meta,
+                                    tname,
+                                    values,
+                                    &[],
+                                    None,
+                                )?;
+                            }
+                            clone.not_valid = false;
+                        }
+                        fk_clones.push((tname.clone(), clone));
+                    }
+                }
+            }
+        }
+    }
     // Set the child's partition info — versioned, so ROLLBACK undoes it.
     // v0.70: an already-partitioned child keeps its own method, key,
     // and children (it becomes a sub-partitioned intermediate); only
@@ -881,7 +988,47 @@ pub(crate) fn attach_partition(
         .clone();
     let mut next = prev.clone();
     next.partition = Some(cinfo);
+    // v2.15: the child's own FK flips/clones from the merge above
+    // ride its new version; descendants get their own versions.
+    for (tname, fname) in &fk_flips {
+        if tname == child_name {
+            if let Some(f) = next.fks.iter_mut().find(|f| &f.name == fname) {
+                f.not_valid = false;
+            }
+        }
+    }
+    for (tname, clone) in &fk_clones {
+        if tname == child_name {
+            next.fks.push(clone.clone());
+        }
+    }
     commit_table_version(eng, ctx, child_name, prev, next);
+    for (tname, fname) in &fk_flips {
+        if tname != child_name {
+            let p = eng
+                .db
+                .find_table(tname, ctx.snap, &ctx.all_xids, ctx.session)
+                .expect("descendant still visible")
+                .clone();
+            let mut n = p.clone();
+            if let Some(f) = n.fks.iter_mut().find(|f| &f.name == fname) {
+                f.not_valid = false;
+            }
+            commit_table_version(eng, ctx, tname, p, n);
+        }
+    }
+    for (tname, clone) in &fk_clones {
+        if tname != child_name {
+            let p = eng
+                .db
+                .find_table(tname, ctx.snap, &ctx.all_xids, ctx.session)
+                .expect("descendant still visible")
+                .clone();
+            let mut n = p.clone();
+            n.fks.push(clone.clone());
+            commit_table_version(eng, ctx, tname, p, n);
+        }
+    }
     // Link into the parent's children — versioned, so ROLLBACK undoes it.
     parent_link_child(eng, ctx, parent_name, child_name, true);
     Ok(ExecResult::Command {
@@ -4280,6 +4427,106 @@ pub(crate) fn create_table_from_def(
 /// Validate a foreign-key definition: the referenced table exists, the
 /// referenced columns resolve, and they form the parent's primary key or
 /// a unique constraint (SQLSTATE 42830, like Postgres).
+/// v2.15: PG19's FK type-compatibility predicate (tablecmds.c
+/// ATAddForeignKeyConstraint): every referencing/referenced column
+/// pair needs an equality operator — the PK column's btree
+/// opfamily must carry one for the (domain-stripped) FK type, or
+/// both types must implicitly coerce to the opclass input type.
+/// The scalar rules encode PG's opfamily memberships and implicit
+/// promotions for the builtin families the engine models; a named
+/// (composite) FK type instead needs a registered IMPLICIT cast
+/// to the referenced type (PG's can_coerce_type path).
+pub(crate) fn fk_types_compatible(eng: &Engine, child: &Table, fk: &FkDef, parent: &Table) -> bool {
+    let parent_meta = TableMeta::of(parent);
+    let Ok(ref_cols) = fk_ref_cols(&parent_meta, fk) else {
+        return true; // resolution errors are reported elsewhere
+    };
+    use crate::storage::ColType as CT;
+    // Effective type of one column: (scalar type, named type).
+    // Domains resolve to their base type (PG getBaseType).
+    let eff = |t: &Table, idx: usize| -> (CT, Option<String>) {
+        if let Some(Some(d)) = t.domain_types.get(idx) {
+            if let Some(st) = eng.db.types.get(d) {
+                if let Some(dom) = &st.domain {
+                    return (dom.base.clone(), None);
+                }
+            }
+        }
+        if let Some(Some(n)) = t.composite_types.get(idx) {
+            return (CT::Composite, Some(n.clone()));
+        }
+        (t.columns[idx].1.clone(), None)
+    };
+    let int_fam = |t: &CT| matches!(t, CT::SmallInt | CT::Int | CT::BigInt);
+    let text_fam = |t: &CT| matches!(t, CT::Text | CT::Varchar(_) | CT::Char(_) | CT::Name);
+    let float_fam = |t: &CT| matches!(t, CT::Float | CT::Float4);
+    let compatible = |ct: &CT, cn: &Option<String>, pt: &CT, pn: &Option<String>| -> bool {
+        if let (Some(a), Some(b)) = (cn, pn) {
+            return a == b;
+        }
+        if let Some(a) = cn {
+            // Named FK type: needs an implicit cast to the
+            // referenced column's type (PG can_coerce_type).
+            // Cast keys keep the spelling used at CREATE CAST,
+            // so resolve the target name back to a ColType.
+            return eng.db.casts.iter().any(|((src, dst), c)| {
+                src == a
+                    && c.context == crate::sql::CastContext::Implicit
+                    && crate::sql::coltype_by_name(dst).ok().as_ref() == Some(pt)
+            });
+        }
+        if pn.is_some() {
+            return false;
+        }
+        if ct == pt {
+            return true;
+        }
+        if int_fam(ct) && int_fam(pt) {
+            return true;
+        }
+        // Promotions on the FK side (implicit coercion to the
+        // referenced type): int-family into numeric or float,
+        // numeric into float — never the reverse.
+        if int_fam(ct) && matches!(pt, CT::Numeric(_)) {
+            return true;
+        }
+        if (int_fam(ct) || matches!(ct, CT::Numeric(_))) && float_fam(pt) {
+            return true;
+        }
+        if text_fam(ct) && text_fam(pt) {
+            return true;
+        }
+        // (No text<->integer cross-family allowance: the
+        // comment_test_child case in alter_table is text->text at
+        // CREATE time; the 42804 surfaces when the parent column
+        // is rebuilt to int, exactly like fk_1_2's int->text
+        // rejection at ADD time.)
+        // oid and the integer family are binary-coercible both
+        // ways (pg_cast.dat: castfunc 0, context 'i').
+        if (matches!(ct, CT::Oid) && int_fam(pt)) || (int_fam(ct) && matches!(pt, CT::Oid)) {
+            return true;
+        }
+        if float_fam(ct) && float_fam(pt) {
+            return true;
+        }
+        false
+    };
+    for (cc, rc) in fk.cols.iter().zip(ref_cols.iter()) {
+        let Some(ci) = child.column_index(cc) else {
+            return true; // missing columns are reported elsewhere
+        };
+        let Some(pi) = parent.column_index(rc) else {
+            return true;
+        };
+        let (ct, cn) = eff(child, ci);
+        let (pt, pn) = eff(parent, pi);
+        if !compatible(&ct, &cn, &pt, &pn) {
+            return false;
+        }
+    }
+    true
+}
+
 pub(crate) fn validate_fk_def(
     eng: &Engine,
     ctx: &StmtCtx,
@@ -4331,6 +4578,26 @@ pub(crate) fn validate_fk_def(
     } else {
         fk.ref_cols.clone()
     };
+    // v2.15: SET NULL/DEFAULT column lists must name FK columns
+    // (PG19 tablecmds.c validateFkOnDeleteSetColumns: 42703).
+    for (verb, list) in [
+        ("ON DELETE", &fk.on_delete_cols),
+        ("ON UPDATE", &fk.on_update_cols),
+    ] {
+        if let Some(names) = list {
+            for n in names {
+                if !fk.cols.contains(n) {
+                    return Err(exec_err(
+                        "42703",
+                        format!(
+                            "column \"{}\" referenced in {} SET action must be part of foreign key",
+                            n, verb
+                        ),
+                    ));
+                }
+            }
+        }
+    }
     if fk.cols.len() != ref_cols.len() {
         return Err(exec_err(
             "42830",
@@ -4351,14 +4618,31 @@ pub(crate) fn validate_fk_def(
             ));
         }
     }
+    // v2.15: FK column types must be compatible (42804).
+    if !fk_types_compatible(eng, child, fk, parent) {
+        return Err(exec_err(
+            "42804",
+            format!(
+                "foreign key constraint \"{}\" cannot be implemented",
+                fk.name
+            ),
+        ));
+    }
     // v2.07: PG19 (tablecmds.c) refuses an FK whose referenced key is
     // backed ONLY by a deferrable (INITIALLY DEFERRED) unique/PK
     // constraint — 55000. A DEFERRABLE INITIALLY IMMEDIATE constraint
     // is immediate (indimmediate) and can be referenced, as can any
     // other immediate unique constraint/index over the same columns.
     let deferred_only = |u: &UniqueDef| u.deferrable && u.initially_deferred;
-    let pk_match = parent.pkey.as_ref().filter(|pk| pk.cols == ref_cols);
-    let uq_match = parent.uniques.iter().find(|u| u.cols == ref_cols);
+    // v2.15: PG matches the referenced columns against a unique
+    // constraint by column SET, not by list order (the suite's
+    // "index and FK order differ" case: PRIMARY KEY (ptest2, ptest1)
+    // referenced as (ptest1, ptest2)). The FK's own pairing of child
+    // to referenced columns stays positional as written.
+    let same_key =
+        |cols: &[String]| cols.len() == ref_cols.len() && cols.iter().all(|c| ref_cols.contains(c));
+    let pk_match = parent.pkey.as_ref().filter(|pk| same_key(&pk.cols));
+    let uq_match = parent.uniques.iter().find(|u| same_key(&u.cols));
     // A backing index of a deferred-only constraint does not count
     // (PG's indimmediate is false for it); other indexes do.
     let parent_is_child = parent
@@ -4372,12 +4656,19 @@ pub(crate) fn validate_fk_def(
         .filter(|u| deferred_only(u))
         .map(|u| constraint_index_name(&fk.ref_table, &u.name, parent_is_child))
         .collect();
-    let idx_match = eng.db.indexes.values().any(|idx| {
-        idx.def.table == fk.ref_table
-            && idx.def.unique
-            && idx.def.col_names == ref_cols
-            && !deferred_backing.contains(&idx.def.name)
-    });
+    // v2.15: scan only indexes VISIBLE to this statement — the raw
+    // global map also holds dropped indexes (kept for rollback),
+    // and a dropped table's PK index leaking into a same-named new
+    // table's FK validation silently accepted bad FKs.
+    let idx_match = eng
+        .db
+        .visible_indexes_for(&fk.ref_table, ctx.snap, &ctx.all_xids, ctx.session)
+        .iter()
+        .any(|idx| {
+            idx.def.unique
+                && same_key(&idx.def.col_names)
+                && !deferred_backing.contains(&idx.def.name)
+        });
     let is_key = pk_match.is_some_and(|pk| !deferred_only(pk))
         || uq_match.is_some_and(|u| !deferred_only(u))
         // v0.75: a standalone unique index also satisfies the FK

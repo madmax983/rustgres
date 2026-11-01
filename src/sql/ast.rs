@@ -2370,6 +2370,14 @@ pub struct FkDef {
     pub ref_cols: Vec<String>,
     pub on_delete: FkAction,
     pub on_update: FkAction,
+    /// v2.15: ON DELETE SET NULL/DEFAULT (col, ...) column list
+    /// (PG19 pg_constraint.confdelsetcols): when present, only the
+    /// listed FK columns are set; `None` = all FK columns.
+    pub on_delete_cols: Option<Vec<String>>,
+    /// v2.15: ON UPDATE SET NULL/DEFAULT (col, ...) column list
+    /// (confupdatsetcols — PG19 gram.y spells it for UPDATE too via
+    /// the same fk action production; stored symmetrically).
+    pub on_update_cols: Option<Vec<String>>,
     /// v2.06: MATCH FULL (any NULL in the key fails unless ALL are NULL).
     /// MATCH PARTIAL is parsed and treated as SIMPLE (see scope.md).
     pub match_full: bool,
@@ -2970,6 +2978,9 @@ pub(crate) struct ParsedFkTail {
     pub(crate) ref_cols: Vec<String>,
     pub(crate) on_delete: FkAction,
     pub(crate) on_update: FkAction,
+    /// v2.15: SET NULL/DEFAULT column lists from the actions.
+    pub(crate) on_delete_cols: Option<Vec<String>>,
+    pub(crate) on_update_cols: Option<Vec<String>>,
     /// v2.06: MATCH FULL seen (MATCH PARTIAL/SIMPLE leave this false).
     pub(crate) match_full: bool,
     /// v2.06: ConstraintAttributeSpec results.
@@ -2991,6 +3002,8 @@ impl ParsedFkTail {
             ref_cols: self.ref_cols,
             on_delete: self.on_delete,
             on_update: self.on_update,
+            on_delete_cols: self.on_delete_cols,
+            on_update_cols: self.on_update_cols,
             match_full: self.match_full,
             deferrable: self.deferrable,
             initially_deferred: self.initially_deferred,
@@ -3452,6 +3465,8 @@ pub(crate) fn build_table_def(
                                 ref_cols: tail.ref_cols.clone(),
                                 on_delete: tail.on_delete,
                                 on_update: tail.on_update,
+                                on_delete_cols: tail.on_delete_cols.clone(),
+                                on_update_cols: tail.on_update_cols.clone(),
                                 match_full: tail.match_full,
                                 deferrable: tail.deferrable,
                                 initially_deferred: tail.initially_deferred,
@@ -3603,6 +3618,8 @@ pub(crate) fn build_table_def(
                         ref_cols: tail.ref_cols.clone(),
                         on_delete: tail.on_delete,
                         on_update: tail.on_update,
+                        on_delete_cols: tail.on_delete_cols.clone(),
+                        on_update_cols: tail.on_update_cols.clone(),
                         match_full: tail.match_full,
                         deferrable: tail.deferrable,
                         initially_deferred: tail.initially_deferred,
@@ -9129,6 +9146,12 @@ pub enum Stmt {
         name: String,
         table: String,
     },
+    /// v2.15: `COMMENT ON CONSTRAINT name ON table IS ...` — same
+    /// no-op-with-validation treatment as CommentOnTrigger.
+    CommentOnConstraint {
+        name: String,
+        table: String,
+    },
     /// v2.09: `ALTER TRIGGER name ON table RENAME TO new_name`
     /// (PG19 RenameStmt OBJECT_TRIGGER).
     AlterTriggerRename {
@@ -9316,10 +9339,14 @@ pub enum Stmt {
     /// ON kind TO/FROM roles. kind: 'r' tables, 'S' sequences,
     /// 'f' functions/routines, 'T' types, 'n' schemas, 'l' large objects.
     /// v1.96: CREATE SCHEMA [IF NOT EXISTS] name [AUTHORIZATION role].
+    /// v2.15: schema elements (PG19 CreateSchemaStmt's element list —
+    /// CREATE TABLE/VIEW/INDEX/SEQUENCE statements executed inside
+    /// the new schema).
     CreateSchema {
         name: String,
         if_not_exists: bool,
         authorization: Option<String>,
+        elements: Vec<Stmt>,
     },
     /// v2.02: CREATE PUBLICATION name [FOR ALL TABLES [EXCEPT (...)] |
     /// FOR TABLE t [(cols)] [, ...] | FOR TABLES IN SCHEMA s [, ...]]

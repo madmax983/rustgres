@@ -558,6 +558,16 @@ impl Enc {
                 self.u8(36);
                 return;
             }
+            // v2.15: oid; tag appends after v2.14's.
+            ColType::Oid => {
+                self.u8(37);
+                return;
+            }
+            // v2.15: inet; tag appends after oid's.
+            ColType::Inet => {
+                self.u8(38);
+                return;
+            }
             // v0.57: name; tag appends after v0.37's.
             ColType::Name => {
                 self.u8(17);
@@ -1893,6 +1903,8 @@ impl<'a> Dec<'a> {
             35 => Ok(ColType::TsQuery),
             // v2.14: regproc.
             36 => Ok(ColType::Regproc),
+            37 => Ok(ColType::Oid),
+            38 => Ok(ColType::Inet),
             // v0.78: array, then the PG array OID identifying the
             // element type.
             22 => {

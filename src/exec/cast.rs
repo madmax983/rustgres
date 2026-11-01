@@ -1726,6 +1726,37 @@ pub(crate) fn eval_cast_composite_inner(
     Ok(Value::Record(out))
 }
 
+/// v2.15: PG inet_in, reduced to validation + canonical form:
+/// parse `addr[/prefix]`, render with the full-length prefix omitted
+/// (inet_out). IPv6 rendering follows std's canonical form, which
+/// matches PG's compressed lowercase form for ordinary inputs.
+/// Returns the offending input on error.
+pub(crate) fn parse_inet(s: &str) -> Result<String, String> {
+    let (addr, prefix) = match s.split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (s, None),
+    };
+    let ip: std::net::IpAddr = addr.trim().parse().map_err(|_| s.to_string())?;
+    let bits: i64 = match ip {
+        std::net::IpAddr::V4(_) => 32,
+        std::net::IpAddr::V6(_) => 128,
+    };
+    let pfx: Option<i64> = match prefix {
+        Some(p) => {
+            let n: i64 = p.trim().parse().map_err(|_| s.to_string())?;
+            if !(0..=bits).contains(&n) {
+                return Err(s.to_string());
+            }
+            Some(n)
+        }
+        None => None,
+    };
+    match pfx {
+        Some(n) if n != bits => Ok(format!("{}/{}", ip, n)),
+        _ => Ok(ip.to_string()),
+    }
+}
+
 pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
     if v == &Value::Null {
         return Ok(Value::Null);
@@ -1914,6 +1945,43 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
                 _ => {}
             }
             return Err(exec_err("42846", "cannot cast to xid"));
+        }
+        // v2.15: cast to oid (PG's oidin: unsigned decimal text, or
+        // an integer widened; values are carried as Value::Int).
+        ColType::Oid => {
+            if let Value::Int(i) = v {
+                return Ok(Value::Int(*i));
+            }
+            if let Value::Text(t) = v {
+                let s = t.to_string();
+                let n = s.trim().parse::<u32>().map_err(|_| {
+                    exec_err(
+                        "22P02",
+                        format!("invalid input syntax for type oid: \"{s}\""),
+                    )
+                })?;
+                return Ok(Value::Int(n as i64));
+            }
+            match v {
+                Value::SmallInt(s) => return Ok(Value::Int(*s as i64)),
+                Value::BigInt(b) => return Ok(Value::Int(*b)),
+                _ => {}
+            }
+            return Err(exec_err("42846", "cannot cast to oid"));
+        }
+        // v2.15: cast to inet (PG inet_in on the text form).
+        ColType::Inet => {
+            let t = text_value_of(&[v]);
+            if let Value::Text(s) = &t {
+                return match parse_inet(s.trim()) {
+                    Ok(c) => Ok(Value::text(c)),
+                    Err(m) => Err(exec_err(
+                        "22P02",
+                        format!("invalid input syntax for type inet: \"{m}\""),
+                    )),
+                };
+            }
+            return Err(exec_err("42846", "cannot cast to inet"));
         }
         // v0.35: explicit casts to character(n) / varchar(n): silent
         // truncation of any excess, blank-padding for char. A bpchar

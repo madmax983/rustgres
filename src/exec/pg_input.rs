@@ -3601,6 +3601,8 @@ pub(crate) fn coltype_typ_string(ct: &ColType) -> String {
         ColType::Name => "name".into(),
         ColType::PgLsn => "pg_lsn".into(),
         ColType::Xid => "xid".into(),
+        ColType::Oid => "oid".into(),
+        ColType::Inet => "inet".into(),
         ColType::Tid => "tid".into(),
         ColType::Json => "json".into(),
         ColType::Jsonb => "jsonb".into(),

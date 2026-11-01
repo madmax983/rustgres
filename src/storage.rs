@@ -74,6 +74,14 @@ pub enum ColType {
     // displays as the function name. Values are represented by
     // their display text, like regclass.
     Regproc, // OID 24
+    // v2.15: PG's `oid` type (OID 26) — an unsigned 32-bit object
+    // identifier; values carried as Value::Int like Xid.
+    Oid, // OID 26
+    // v2.15: PG's `inet` type (OID 869) — an IPv4/IPv6 host
+    // address with optional prefix; values carried as Value::Text
+    // holding the canonical inet_out form (full-length prefix
+    // omitted), so equality is exact on canonical text.
+    Inet, // OID 869
     // v0.57: PG's `name` internal identifier type (OID 19,
     // NAMEDATALEN-1 = 63 bytes). Values are stored as text truncated
     // to 63 bytes on input (PG19 namein); comparison is plain byte
@@ -427,6 +435,8 @@ impl ArrayElem {
             ColType::Regclass => ArrayElem::Regclass,
             // v2.14: regproc[] is not representable yet; degrade.
             ColType::Regproc => ArrayElem::Record,
+            ColType::Oid => ArrayElem::Int,
+            ColType::Inet => ArrayElem::Text,
             ColType::Json => ArrayElem::Json,
             // v1.83: jsonb[] (PG _jsonb, OID 3807) is not supported;
             // array-of-jsonb degrades to the json element kind.
@@ -673,6 +683,8 @@ impl ColType {
             ColType::Uuid => 2950,        // UUID
             ColType::Regclass => 2205,    // REGCLASS (v0.37)
             ColType::Regproc => 24,       // REGPROC (v2.14)
+            ColType::Oid => 26,           // OID (v2.15)
+            ColType::Inet => 869,         // INET (v2.15)
             ColType::Name => 19,          // NAME (v0.57)
             ColType::Record => 2249,      // RECORD (v0.73)
             // v0.81: named composite; PG uses the rowtype OID, we use record's.
@@ -744,6 +756,8 @@ impl ColType {
             ColType::Tid => "tid",      // v1.40
             ColType::Regclass => "regclass",
             ColType::Regproc => "regproc",
+            ColType::Oid => "oid",   // v2.15
+            ColType::Inet => "inet", // v2.15
             ColType::Name => "name",
             ColType::Record => "record", // v0.73
             // v0.81: resolved to the actual name at execution time.
@@ -810,6 +824,8 @@ impl ColType {
             ColType::Tid => "tid",      // v1.40
             ColType::Regclass => "regclass",
             ColType::Regproc => "regproc",
+            ColType::Oid => "oid",   // v2.15
+            ColType::Inet => "inet", // v2.15
             ColType::Name => "name",
             ColType::Record => "record", // v0.73
             // v0.81: resolved to the actual name at execution time.

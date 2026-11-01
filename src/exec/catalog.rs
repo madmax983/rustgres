@@ -5378,7 +5378,315 @@ pub(crate) fn pg_trigger_scan(
             prov: Vec::new(),
         });
     }
+    // v2.15: RI (foreign key) triggers. PG creates four internal
+    // AFTER ROW triggers per enforced FK (trigger.c
+    // CreateTrigStmt for RI): on the child, RI_FKey_check_ins
+    // (tgtype 5) and RI_FKey_check_upd (17), named
+    // RI_ConstraintTrigger_c_<conoid>; on the referenced table,
+    // the action triggers (tgtype 9 DELETE, 17 UPDATE), named
+    // RI_ConstraintTrigger_a_<conoid>. NOT ENFORCED FKs have none
+    // (dropping enforcement drops the triggers). Partition clones
+    // of the FK (stored on each leaf) emit their own rows, with
+    // the parent side landing on every leaf of a partitioned
+    // referenced table as PG does.
+    {
+        // PG19 pg_proc OIDs of the RI trigger functions.
+        fn ri_fnoid(action: crate::sql::FkAction, is_update: bool) -> i64 {
+            use crate::sql::FkAction::*;
+            match (action, is_update) {
+                (Restrict, false) => 1654, // noaction_del (RESTRICT uses its own pair in PG; suites do not read tgfoid)
+                (Restrict, true) => 1655,
+                (Cascade, false) => 1646,
+                (Cascade, true) => 1647,
+                (SetNull, false) => 1650,
+                (SetNull, true) => 1651,
+                (SetDefault, false) => 1652,
+                (SetDefault, true) => 1653,
+            }
+        }
+        let mut tnames: Vec<&String> = db.tables.keys().collect();
+        tnames.sort();
+        if let Some(tmps) = db.temp_tables.get(&session) {
+            let mut tt: Vec<&String> = tmps.keys().collect();
+            tt.sort();
+            tnames.extend(tt);
+        }
+        let mut next_oid = 30000 + src.len() as i64;
+        // (child table, conname, side+tgtype) -> oid, for tgparentid.
+        let mut ri_oid_of: std::collections::HashMap<(String, String, i64), i64> =
+            std::collections::HashMap::new();
+        for tname in &tnames {
+            let Some(t) = db.find_table(tname, snap, &[own], session) else {
+                continue;
+            };
+            for fk in &t.fks {
+                if !fk.enforced {
+                    continue;
+                }
+                let Some(con_oid) = con_map.get(&(t.oid as i64, fk.name.clone())).copied() else {
+                    continue;
+                };
+                let Some(rt) = db.find_table(&fk.ref_table, snap, &[own], session) else {
+                    continue;
+                };
+                // Tables receiving the parent-side (a_) triggers:
+                // the referenced table plus, when partitioned, its
+                // descendant leaves.
+                let mut parent_tables: Vec<(String, i64)> =
+                    vec![(fk.ref_table.clone(), rt.oid as i64)];
+                if rt.partition.is_some() {
+                    let mut desc = Vec::new();
+                    // reuse the descendants walk via partition tree
+                    let mut stack: Vec<String> = rt
+                        .partition
+                        .as_ref()
+                        .map(|p| p.children.clone())
+                        .unwrap_or_default();
+                    while let Some(cn) = stack.pop() {
+                        if let Some(ct) = db.find_table(&cn, snap, &[own], session) {
+                            desc.push((cn.clone(), ct.oid as i64));
+                            if let Some(cp) = &ct.partition {
+                                stack.extend(cp.children.iter().cloned());
+                            }
+                        }
+                    }
+                    desc.sort();
+                    desc.dedup();
+                    parent_tables.extend(desc);
+                }
+                let is_clone = t.partition.as_ref().is_some_and(|p| p.parent.is_some());
+                // The root ancestor table (walk the parent chain).
+                let parent_root = {
+                    let mut cur = tname.to_string();
+                    let mut root = None;
+                    for _ in 0..32 {
+                        match db
+                            .find_table(&cur, snap, &[own], session)
+                            .and_then(|ct| ct.partition.as_ref())
+                            .and_then(|p| p.parent.clone())
+                        {
+                            Some(par) => {
+                                root = Some(par.clone());
+                                cur = par;
+                            }
+                            None => break,
+                        }
+                    }
+                    root
+                };
+                let emit =
+                    |rows: &mut Vec<QRow>,
+                     next_oid: &mut i64,
+                     ri_oid_of: &mut std::collections::HashMap<(String, String, i64), i64>,
+                     relid: i64,
+                     relname: &str,
+                     suffix: char,
+                     tgtype: i64,
+                     tgfoid: i64,
+                     constr_relid: i64| {
+                        let oid = *next_oid;
+                        *next_oid += 1;
+                        let tgparentid = if is_clone && suffix == 'c' {
+                            parent_root
+                                .as_ref()
+                                .and_then(|root| {
+                                    ri_oid_of
+                                        .get(&(root.clone(), fk.name.clone(), tgtype))
+                                        .copied()
+                                })
+                                .unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        if !is_clone && suffix == 'c' {
+                            ri_oid_of.insert((relname.to_string(), fk.name.clone(), tgtype), oid);
+                        }
+                        rows.push(QRow {
+                            cells: Row::new(vec![
+                                Value::Int(oid),
+                                Value::Int(relid),
+                                Value::Int(tgparentid),
+                                Value::text(format!("RI_ConstraintTrigger_{}_{}", suffix, con_oid)),
+                                Value::Int(tgfoid),
+                                Value::Int(tgtype),
+                                Value::SingleChar(b'O'),
+                                Value::Bool(true),
+                                Value::Int(constr_relid),
+                                Value::Int(0),
+                                Value::Int(con_oid),
+                                Value::Bool(fk.deferrable),
+                                Value::Bool(fk.initially_deferred),
+                                Value::Int(0),
+                                int_array(Vec::new()),
+                                Value::Null,
+                                Value::Null,
+                                Value::Null,
+                                Value::Null,
+                            ]),
+                            prov: Vec::new(),
+                        });
+                    };
+                // Child side: check_ins (5), check_upd (17).
+                emit(
+                    &mut rows,
+                    &mut next_oid,
+                    &mut ri_oid_of,
+                    t.oid as i64,
+                    tname,
+                    'c',
+                    5,
+                    1644,
+                    rt.oid as i64,
+                );
+                emit(
+                    &mut rows,
+                    &mut next_oid,
+                    &mut ri_oid_of,
+                    t.oid as i64,
+                    tname,
+                    'c',
+                    17,
+                    1645,
+                    rt.oid as i64,
+                );
+                // Parent side on each referenced table/leaf.
+                for (pname, poid) in &parent_tables {
+                    let _ = pname;
+                    emit(
+                        &mut rows,
+                        &mut next_oid,
+                        &mut ri_oid_of,
+                        *poid,
+                        pname,
+                        'a',
+                        9,
+                        ri_fnoid(fk.on_delete, false),
+                        t.oid as i64,
+                    );
+                    emit(
+                        &mut rows,
+                        &mut next_oid,
+                        &mut ri_oid_of,
+                        *poid,
+                        pname,
+                        'a',
+                        17,
+                        ri_fnoid(fk.on_update, true),
+                        t.oid as i64,
+                    );
+                }
+            }
+        }
+    }
     (schema, rows)
+}
+
+/// v2.15: pg_get_constraintdef(oid) — render one constraint's
+/// definition from the virtual pg_constraint rows (PG19 ruleutils.c
+/// get_constraintdef). Unknown OID yields None (PG returns NULL).
+/// The engine conflates NO ACTION with RESTRICT in FkAction, so a
+/// Restrict action renders as nothing (PG prints nothing for the
+/// far more common unspecified NO ACTION).
+pub(crate) fn pg_constraintdef_for_oid(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    oid: i64,
+) -> Option<String> {
+    let (_, rows) = pg_constraint_scan(db, snap, own, session);
+    let mut hit: Option<(String, u8, i64)> = None;
+    for r in &rows {
+        if let (Value::Int(o), Value::Text(cn), Value::SingleChar(ct), Value::Int(relid)) =
+            (&r.cells[0], &r.cells[1], &r.cells[3], &r.cells[8])
+        {
+            if *o == oid {
+                hit = Some((cn.to_string(), *ct, *relid));
+                break;
+            }
+        }
+    }
+    let (cname, contype, relid) = hit?;
+    // Find the owning table by OID.
+    let mut names: Vec<&String> = db.tables.keys().collect();
+    names.sort();
+    if let Some(tmps) = db.temp_tables.get(&session) {
+        let mut tn: Vec<&String> = tmps.keys().collect();
+        tn.sort();
+        names.extend(tn);
+    }
+    let t = names.iter().find_map(|n| {
+        db.find_table(n, snap, &[own], session)
+            .filter(|t| t.oid as i64 == relid)
+    })?;
+    let action_str = |a: crate::sql::FkAction, cols: &Option<Vec<String>>| -> String {
+        use crate::sql::FkAction::*;
+        let base = match a {
+            Restrict => return String::new(),
+            Cascade => "CASCADE".to_string(),
+            SetNull => "SET NULL".to_string(),
+            SetDefault => "SET DEFAULT".to_string(),
+        };
+        match cols {
+            Some(cs) => format!("{} ({})", base, cs.join(", ")),
+            None => base,
+        }
+    };
+    match contype {
+        b'p' => {
+            let pk = t.pkey.as_ref().filter(|p| p.name == cname)?;
+            Some(format!("PRIMARY KEY ({})", pk.cols.join(", ")))
+        }
+        b'u' => {
+            let u = t.uniques.iter().find(|u| u.name == cname)?;
+            let nnd = if u.nulls_not_distinct {
+                " NULLS NOT DISTINCT"
+            } else {
+                ""
+            };
+            Some(format!("UNIQUE{} ({})", nnd, u.cols.join(", ")))
+        }
+        b'c' => {
+            let c = t
+                .checks
+                .iter()
+                .find(|c| c.name == cname && c.kind == crate::sql::CheckKind::Check)?;
+            Some(format!(
+                "CHECK ({})",
+                crate::exec::publication::deparse_filter(&c.expr)
+            ))
+        }
+        b'n' => Some("NOT NULL".to_string()),
+        b'f' => {
+            let f = t.fks.iter().find(|f| f.name == cname)?;
+            let ref_cols = if f.ref_cols.is_empty() {
+                db.find_table(&f.ref_table, snap, &[own], session)
+                    .and_then(|pt| pt.pkey.as_ref().map(|p| p.cols.clone()))
+                    .unwrap_or_default()
+            } else {
+                f.ref_cols.clone()
+            };
+            let mut s = format!(
+                "FOREIGN KEY ({}) REFERENCES {}({})",
+                f.cols.join(", "),
+                f.ref_table,
+                ref_cols.join(", ")
+            );
+            if f.match_full {
+                s.push_str(" MATCH FULL");
+            }
+            let del = action_str(f.on_delete, &f.on_delete_cols);
+            if !del.is_empty() {
+                s.push_str(&format!(" ON DELETE {}", del));
+            }
+            let upd = action_str(f.on_update, &f.on_update_cols);
+            if !upd.is_empty() {
+                s.push_str(&format!(" ON UPDATE {}", upd));
+            }
+            Some(s)
+        }
+        _ => None,
+    }
 }
 
 /// v2.09: render a CREATE TRIGGER definition for one stored trigger

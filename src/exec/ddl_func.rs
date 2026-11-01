@@ -358,6 +358,8 @@ pub(crate) fn dummy_value_of(ty: &ColType) -> Value {
         ColType::Regclass => Value::text("x"),
         ColType::Regproc => Value::text("x"),
         ColType::Xid => Value::Int(1),
+        ColType::Oid => Value::Int(1),
+        ColType::Inet => Value::text("0.0.0.0"),
         ColType::Tid => Value::Tid(0, 0), // v1.40
         ColType::Record | ColType::Composite => Value::Record(vec![]),
         ColType::Array(elem) => Value::Array(Box::new(crate::storage::ArrayVal {

@@ -140,6 +140,27 @@ pub(crate) fn exec_create(
         for d in eff_def.defaults.iter().flatten() {
             if let crate::sql::DefaultExpr::Expr(e) = d {
                 check_expr_cast_usages(eng, ctx, e)?;
+                // v2.15: PG19's dependency recording for stored
+                // expressions rejects constants of type regrole /
+                // regdatabase (dependency.c find_expr_references,
+                // 0A000) — e.g. DEFAULT 'x'::regrole.
+                let mut bad: Option<String> = None;
+                crate::exec::eval::walk_expr(e, &mut |x| {
+                    if let crate::sql::Expr::CastNamed { expr, name } = x {
+                        let n = name.rsplit('.').next().unwrap_or(name).to_ascii_lowercase();
+                        if (n == "regrole" || n == "regdatabase")
+                            && matches!(expr.as_ref(), crate::sql::Expr::Literal(_))
+                        {
+                            bad = Some(n);
+                        }
+                    }
+                });
+                if let Some(n) = bad {
+                    return Err(exec_err(
+                        "0A000",
+                        format!("constant of the type {} cannot be used here", n),
+                    ));
+                }
             }
         }
         if let Some(p) = &eff_def.partition {

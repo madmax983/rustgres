@@ -974,6 +974,32 @@ pub(crate) fn fks_referencing(
     session: u64,
     parent: &str,
 ) -> Vec<(String, FkDef)> {
+    // v2.15: an FK referencing a partitioned ROOT also governs rows
+    // deleted/updated through any of its leaves: the DELETE/UPDATE
+    // planners call plan_fk_cascade per leaf, and the FK clones
+    // stored on child partitions keep ref_table = the root's name,
+    // so a plain name equality missed every partitioned parent
+    // (parted_self_fk deleted referenced rows without a check).
+    let parent_ancestors: Vec<String> = {
+        let mut v = vec![parent.to_string()];
+        let mut cur = parent.to_string();
+        for _ in 0..32 {
+            match eng
+                .db
+                .find_table(&cur, snap, &[own], session)
+                .and_then(|t| t.partition.as_ref())
+                .and_then(|p| p.parent.clone())
+            {
+                Some(par) => {
+                    v.push(par.clone());
+                    cur = par;
+                }
+                None => break,
+            }
+        }
+        v
+    };
+    let hits = |fk: &FkDef| parent_ancestors.iter().any(|a| a == &fk.ref_table);
     let mut out = Vec::new();
     for (name, versions) in &eng.db.tables {
         if let Some(t) = versions
@@ -981,7 +1007,7 @@ pub(crate) fn fks_referencing(
             .find(|t| crate::storage::table_visible(t, snap, &[own]))
         {
             for fk in &t.fks {
-                if fk.ref_table == parent {
+                if hits(fk) {
                     out.push((name.clone(), fk.clone()));
                 }
             }
@@ -991,7 +1017,7 @@ pub(crate) fn fks_referencing(
     if let Some(tmps) = eng.db.temp_tables.get(&session) {
         for (name, t) in tmps {
             for fk in &t.fks {
-                if fk.ref_table == parent {
+                if hits(fk) {
                     out.push((name.clone(), fk.clone()));
                 }
             }
@@ -1007,11 +1033,22 @@ pub(crate) struct FkCascade {
     pub(crate) deletes: Vec<(String, u64, u64)>,
     /// (table, row id, prev xmax, new values) to update.
     pub(crate) updates: Vec<(String, u64, u64, Row)>,
+    /// v2.15: rows the statement itself is deleting (a DELETE's
+    /// primary targets). RI checks must not count them as live
+    /// references — PG's RI queries run on the current command's
+    /// snapshot, where a row deleted earlier in the same command
+    /// is already invisible — but they are not part of `deletes`
+    /// (the statement applies them itself, not the cascade).
+    pub(crate) stmt_deletes: Vec<(String, u64)>,
 }
 
 impl FkCascade {
     pub(crate) fn is_planned_delete(&self, table: &str, id: u64) -> bool {
         self.deletes.iter().any(|(t, i, _)| t == table && *i == id)
+            || self
+                .stmt_deletes
+                .iter()
+                .any(|(t, i)| t == table && *i == id)
     }
 
     /// The values a previously planned action will leave in this
@@ -1167,10 +1204,27 @@ pub(crate) fn plan_fk_cascade(
                 // image, not the table image. The pre-fix blanket
                 // `contains` skip applied only the first FK's action
                 // and left the row referencing the dead key.
-                let base: Vec<Value> = out
-                    .planned_values(&child_table, cid)
-                    .map(|r| r.to_vec())
-                    .unwrap_or_else(|| cvalues.to_vec());
+                // v2.15: a SELF-referencing row that is itself one
+                // of this call's primary changes composes from its
+                // own NEW image — otherwise ON UPDATE CASCADE on
+                // `SET a = 123` planned the child image (0, 123),
+                // reverting the very key change being cascaded
+                // (bug #6268 shape).
+                let primary_new: Option<&Row> = if child_table == parent_table {
+                    changed
+                        .iter()
+                        .find(|(id, _, _)| *id == cid)
+                        .and_then(|(_, _, nv)| nv.as_ref())
+                } else {
+                    None
+                };
+                let base: Vec<Value> = match primary_new {
+                    Some(nv) => nv.to_vec(),
+                    None => out
+                        .planned_values(&child_table, cid)
+                        .map(|r| r.to_vec())
+                        .unwrap_or_else(|| cvalues.to_vec()),
+                };
                 let base_row = Row::new(base.clone());
                 match act {
                     FkAction::Restrict => {
@@ -1246,7 +1300,15 @@ pub(crate) fn plan_fk_cascade(
                                 &nv,
                                 &[],
                                 Some(cid),
-                                Some((parent_table, nk.as_slice())),
+                                // v2.15: the prevalidation key is the
+                                // FK's referenced table (the ROOT for
+                                // a partitioned parent) — callers group
+                                // `changed` by leaf, so parent_table
+                                // here is a leaf name the FK never
+                                // references, and the pv match missed,
+                                // failing cascades into partitioned
+                                // children with a phantom 23503.
+                                Some((fk.ref_table.as_str(), nk.as_slice())),
                             )?;
                             let nv = Row::new(nv);
                             out.upsert_update(&child_table, cid, cxmax, nv.clone());
@@ -1287,7 +1349,25 @@ pub(crate) fn plan_fk_cascade(
                         check_write_conflict(eng, cxmax, level)?;
                         check_row_lock(eng, &child_table, cid, own)?;
                         let mut nv = base.to_vec();
-                        for &ci in &child_pos {
+                        // v2.15: a SET NULL/DEFAULT column list
+                        // restricts the columns actually set (PG19
+                        // confdelsetcols/confupdsetcols); unlisted FK
+                        // columns keep their values.
+                        let list_cols = if new_values.is_some() {
+                            &fk.on_update_cols
+                        } else {
+                            &fk.on_delete_cols
+                        };
+                        let set_pos: Vec<usize> = match list_cols {
+                            Some(names) => child_pos
+                                .iter()
+                                .zip(fk.cols.iter())
+                                .filter(|(_, cn)| names.contains(cn))
+                                .map(|(&ci, _)| ci)
+                                .collect(),
+                            None => child_pos.clone(),
+                        };
+                        for &ci in &set_pos {
                             nv[ci] = match act {
                                 FkAction::SetNull => Value::Null,
                                 _ => {
@@ -1362,6 +1442,96 @@ pub(crate) fn plan_fk_cascade(
     Ok(())
 }
 
+/// v2.15: the leaf a cascaded update's new image belongs to. For a
+/// row in a partition leaf, route the new image from the tree root;
+/// a non-partitioned table (or a root) keeps the row in place.
+fn cascade_dest_leaf(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table: &str,
+    values: &[Value],
+) -> Result<(String, Row), ExecError> {
+    let leaf = eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?
+        .clone();
+    let Some(pinfo) = &leaf.partition else {
+        return Ok((table.to_string(), Row::new(values.to_vec())));
+    };
+    if pinfo.parent.is_none() {
+        return Ok((table.to_string(), Row::new(values.to_vec())));
+    }
+    // Walk to the tree root.
+    let mut root = table.to_string();
+    for _ in 0..10_000 {
+        let t = eng
+            .db
+            .find_table(&root, ctx.snap, &ctx.all_xids, ctx.session)
+            .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", root)))?;
+        match t.partition.as_ref().and_then(|p| p.parent.clone()) {
+            Some(p) => root = p,
+            None => break,
+        }
+    }
+    let root_t = eng
+        .db
+        .find_table(&root, ctx.snap, &ctx.all_xids, ctx.session)
+        .expect("root resolved above")
+        .clone();
+    let root_pinfo = root_t.partition.clone().expect("root is partitioned");
+    let root_row =
+        crate::exec::partition::remap_row_to_parent(&leaf.columns, &root_t.columns, values);
+    let dest = match crate::exec::partition::find_partition_leaf(
+        eng,
+        ctx,
+        &root,
+        &root_pinfo,
+        &root_t.columns,
+        &root_row,
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            // If the new image still fits THIS leaf's bound, the
+            // row stays (routing can only fail spuriously when the
+            // tree is in a state PG never produces mid-suite, e.g.
+            // same-named trees from earlier schema sections); a
+            // genuine no-fit keeps PG's 23514.
+            let key = crate::exec::partition::eval_table_part_key(
+                eng,
+                ctx,
+                &root,
+                &root_pinfo,
+                &root_t.columns,
+                &root_row,
+            )?;
+            let fits = leaf
+                .partition
+                .as_ref()
+                .and_then(|p| p.bound.as_ref())
+                .is_some_and(|b| {
+                    crate::exec::partition::bound_contains(&root_pinfo.method, b, &key)
+                });
+            if fits {
+                table.to_string()
+            } else {
+                return Err(e);
+            }
+        }
+    };
+    if dest == table {
+        return Ok((table.to_string(), Row::new(values.to_vec())));
+    }
+    let dest_t = eng
+        .db
+        .find_table(&dest, ctx.snap, &ctx.all_xids, ctx.session)
+        .expect("destination leaf visible")
+        .clone();
+    let dest_row =
+        crate::exec::partition::remap_row_to_parent(&root_t.columns, &dest_t.columns, &root_row);
+    Ok((dest, Row::new(dest_row)))
+}
+
 /// Apply a planned FK cascade: deletes then updates, with index
 /// maintenance and write logging, like exec_update/exec_delete do.
 pub(crate) fn apply_fk_cascade(
@@ -1385,13 +1555,24 @@ pub(crate) fn apply_fk_cascade(
             prev_xmax: *prev_xmax,
         });
     }
+    // v2.15: a cascaded update whose new key falls outside the
+    // row's leaf bound MOVES the row to the routed leaf (PG row
+    // movement for RI actions — fkpart6/fkpart13 shapes). Resolve
+    // every update's destination leaf before mutating anything.
+    let mut dests: Vec<(String, Row)> = Vec::with_capacity(out.updates.len());
+    for (table, _, _, new_values) in &out.updates {
+        let dest = cascade_dest_leaf(eng, ctx, table, new_values)?;
+        dests.push(dest);
+    }
     // Updates = delete old version + insert new version.
     let mut new_ids = Vec::with_capacity(out.updates.len());
     for _ in 0..out.updates.len() {
         new_ids.push(eng.alloc_row_id());
     }
     let mut indexed: Vec<(String, u64, Row)> = Vec::with_capacity(out.updates.len());
-    for ((table, old_id, prev_xmax, new_values), new_id) in out.updates.iter().zip(new_ids) {
+    for (((table, old_id, prev_xmax, _), (dest, dest_values)), new_id) in
+        out.updates.iter().zip(dests.iter()).zip(new_ids)
+    {
         let t = eng
             .db
             .find_table_mut(table, ctx.snap, &ctx.all_xids, ctx.session)
@@ -1403,16 +1584,40 @@ pub(crate) fn apply_fk_cascade(
         // logical decoder needs them); values never change in place.
         let old_values = t.rows[pos].values.clone();
         t.rows[pos].xmax = ctx.write_xid;
-        let new_values = new_values.clone();
-        t.push_version(RowVersion::plain(new_id, new_values.clone(), ctx.write_xid));
-        ctx.writes.push(WriteOp::UpdateRow {
-            table: table.clone(),
-            old_id: *old_id,
-            new_id,
-            prev_xmax: *prev_xmax,
-            old_values,
-        });
-        indexed.push((table.clone(), new_id, new_values));
+        if dest == table {
+            let new_values = dest_values.clone();
+            t.push_version(RowVersion::plain(new_id, new_values.clone(), ctx.write_xid));
+            ctx.writes.push(WriteOp::UpdateRow {
+                table: table.clone(),
+                old_id: *old_id,
+                new_id,
+                prev_xmax: *prev_xmax,
+                old_values,
+            });
+            indexed.push((table.clone(), new_id, new_values));
+        } else {
+            // Row movement: delete from the source leaf, insert
+            // into the destination leaf.
+            ctx.writes.push(WriteOp::DeleteRow {
+                table: table.clone(),
+                row_id: *old_id,
+                prev_xmax: *prev_xmax,
+            });
+            let dt = eng
+                .db
+                .find_table_mut(dest, ctx.snap, &ctx.all_xids, ctx.session)
+                .expect("destination leaf visible; engine lock held throughout");
+            dt.push_version(RowVersion::plain(
+                new_id,
+                dest_values.clone(),
+                ctx.write_xid,
+            ));
+            ctx.writes.push(WriteOp::InsertRow {
+                table: dest.clone(),
+                row_id: new_id,
+            });
+            indexed.push((dest.clone(), new_id, dest_values.clone()));
+        }
     }
     for (table, new_id, new_values) in &indexed {
         eng.db

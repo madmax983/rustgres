@@ -1032,6 +1032,52 @@ pub(crate) fn exec_alter_one(
                 .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
                 .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
                 .clone();
+            // v2.15: an FK (or unique) constraint can be validated too
+            // (PG19 ATExecValidateConstraint handles every constraint
+            // kind); the pre-v2.15 arm only searched CHECKs, so a
+            // NOT VALID FK could never become valid (42704).
+            if let Some(fk) = t.fks.iter().find(|f| &f.name == con).cloned() {
+                if fk.not_valid {
+                    validate_fk_rows(eng, ctx, &t, name, &fk)?;
+                    let mut next = t.clone();
+                    for f in next.fks.iter_mut() {
+                        if &f.name == con {
+                            f.not_valid = false;
+                        }
+                    }
+                    alter_swap(eng, ctx, name, None, next, None)?;
+                }
+                // PG validates the partition clones too (matched by
+                // name, or by FK shape for per-leaf-named clones).
+                let children: Vec<String> = t
+                    .partition
+                    .as_ref()
+                    .map(|p| p.children.clone())
+                    .unwrap_or_default();
+                for child in &children {
+                    let child_con: Option<String> = eng
+                        .db
+                        .find_table(child, ctx.snap, &ctx.all_xids, ctx.session)
+                        .and_then(|ct| {
+                            ct.fks
+                                .iter()
+                                .find(|f| {
+                                    &f.name == con
+                                        || (f.cols == fk.cols
+                                            && f.ref_table == fk.ref_table
+                                            && f.ref_cols == fk.ref_cols)
+                                })
+                                .map(|f| f.name.clone())
+                        });
+                    if let Some(child_con) = child_con {
+                        let child_action = AlterAction::ValidateConstraint { name: child_con };
+                        exec_alter(eng, ctx, child, std::slice::from_ref(&child_action))?;
+                    }
+                }
+                return Ok(ExecResult::Command {
+                    tag: "ALTER TABLE".to_string(),
+                });
+            }
             let Some(cd) = t.checks.iter().find(|c| &c.name == con).cloned() else {
                 return Err(exec_err(
                     "42704",
@@ -1133,6 +1179,33 @@ pub(crate) fn exec_alter_one(
             })
         }
         AlterAction::DropConstraint { name: con, cascade } => {
+            // v2.15: PG19 refuses to drop an FK constraint while
+            // deferred events for it are pending in this
+            // transaction (55000, naming the leaf that holds the
+            // event — the fkpart8 case).
+            {
+                let is_fk = eng
+                    .db
+                    .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                    .is_some_and(|t| t.fks.iter().any(|f| f.name == *con));
+                if is_fk {
+                    if let Some(holder) =
+                        crate::exec::deferred::pending_fk_event_table(eng, ctx.session, con)
+                    {
+                        let mut tree = partition_descendants(eng, ctx, name);
+                        tree.push(name.to_string());
+                        if tree.iter().any(|t| t == &holder) {
+                            return Err(exec_err(
+                                "55000",
+                                format!(
+                                    "cannot ALTER TABLE \"{}\" because it has pending trigger events",
+                                    holder
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
             let res = alter_drop_constraint(eng, ctx, name, con, *cascade);
             // v0.70: propagate DROP CONSTRAINT to partitions.
             if res.is_ok() {
@@ -1253,17 +1326,42 @@ pub(crate) fn exec_alter_one(
                     .and_then(|t| t.partition.as_ref())
                     .map(|p| p.children.clone())
                     .unwrap_or_default();
+                // v2.15: clones of an FK added to a partitioned root
+                // carry per-leaf names ({leaf}_..._fkey), so a child
+                // may hold the clone under a DIFFERENT name; PG links
+                // them by conparentid and alters all of them. Match
+                // by name first, else by FK shape (cols, ref table,
+                // ref cols) against the root's constraint.
+                let root_fk = eng
+                    .db
+                    .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                    .and_then(|t| t.fks.iter().find(|f| &f.name == con).cloned());
                 for child in &children {
                     if eng.db.is_temp_table(ctx.session, child) {
                         continue;
                     }
-                    let has = eng
+                    let child_con: Option<String> = eng
                         .db
                         .find_table(child, ctx.snap, &ctx.all_xids, ctx.session)
-                        .is_some_and(|t| table_has_constraint(t, con));
-                    if has {
+                        .and_then(|t| {
+                            if table_has_constraint(t, con) {
+                                Some(con.clone())
+                            } else if let Some(rf) = &root_fk {
+                                t.fks
+                                    .iter()
+                                    .find(|f| {
+                                        f.cols == rf.cols
+                                            && f.ref_table == rf.ref_table
+                                            && f.ref_cols == rf.ref_cols
+                                    })
+                                    .map(|f| f.name.clone())
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some(child_con) = child_con {
                         let child_action = AlterAction::AlterConstraint {
-                            name: con.clone(),
+                            name: child_con,
                             deferrable: *deferrable,
                             initially_deferred: *initially_deferred,
                             enforced: *enforced,
@@ -1320,6 +1418,11 @@ pub(crate) fn alter_of_type(
         .db
         .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
+    // PG19 ATExecAlterOfType: a table with inheritance parents
+    // cannot become a typed table (42809).
+    if !t.inherits.is_empty() {
+        return Err(exec_err("42809", "typed tables cannot inherit".to_string()));
+    }
     let matches = t.columns.len() == fields.len()
         && t.columns
             .iter()
@@ -1418,6 +1521,28 @@ pub(crate) fn alter_column_type_ext(
                 format!("column \"{}\" of relation \"{}\" does not exist", col, name),
             )
         })?;
+    // v2.15: PG19 resolves the target type (typenameTypeId) — an
+    // unknown named type is 42704, not a Composite placeholder.
+    // (The pre-fix code recorded the name and silently retyped the
+    // column, corrupting later FK validation against the table.)
+    if let Some(n) = named_type {
+        let base = n
+            .rsplit('.')
+            .next()
+            .unwrap_or(n)
+            .trim()
+            .trim_end_matches("[]")
+            .split('(')
+            .next()
+            .unwrap_or(n)
+            .trim();
+        if crate::sql::coltype_by_name(base).is_err() && !eng.db.types.contains_key(base) {
+            return Err(exec_err(
+                "42704",
+                format!("type \"{}\" does not exist", base),
+            ));
+        }
+    }
     // v1.96 finishing pass: typed tables cannot change column
     // types (the OF type owns the column definitions).
     if !bypass_typed && eng.db.typed_tables.contains_key(name) {
@@ -1445,7 +1570,20 @@ pub(crate) fn alter_column_type_ext(
     // directly is a documented narrowing.)
     {
         if let Some(p) = &t.partition {
-            if p.parent.is_none() && p.key.iter().any(|k| k.col == idx && k.expr.is_none()) {
+            // v2.15: columns referenced by a partition-key
+            // EXPRESSION count too (RANGE (a, (a+b+1)) guards b).
+            let key_hit = p.key.iter().any(|k| {
+                if k.expr.is_none() {
+                    k.col == idx
+                } else if let Some(e) = &k.expr {
+                    let mut refs = Vec::new();
+                    crate::sql::collect_col_refs(e, &mut refs);
+                    refs.iter().any(|(_, n)| n == col)
+                } else {
+                    false
+                }
+            });
+            if p.parent.is_none() && key_hit {
                 return Err(exec_err(
                     "0A000",
                     format!(
@@ -1472,8 +1610,12 @@ pub(crate) fn alter_column_type_ext(
                     // partition parent (whose column order may
                     // differ — at_part_2 stores (b, a)).
                     let is_key = p.key.iter().any(|k| {
-                        if k.expr.is_some() {
-                            return false;
+                        if let Some(e) = &k.expr {
+                            // v2.15: expression key entries guard
+                            // every column they reference.
+                            let mut refs = Vec::new();
+                            crate::sql::collect_col_refs(e, &mut refs);
+                            return refs.iter().any(|(_, n)| n == col);
                         }
                         let key_col_name = if p.is_partitioned {
                             dt.columns.get(k.col).map(|(cn, _)| cn.clone())
@@ -1585,6 +1727,63 @@ pub(crate) fn alter_column_type_ext(
         },
         None => false,
     };
+    // v2.15: PG19 recreates the FK constraints over an altered
+    // column, re-running the type-compatibility check (42804) —
+    // e.g. comment_test_child (text) referencing comment_test.id
+    // errors when id is altered back to int. Check both directions
+    // against the prospective table image.
+    {
+        let incompatible = |fk: &FkDef| {
+            exec_err(
+                "42804",
+                format!(
+                    "foreign key constraint \"{}\" cannot be implemented",
+                    fk.name
+                ),
+            )
+        };
+        // This table as the referencing (child) side.
+        for fk in &next.fks {
+            if fk.cols.iter().any(|c| c == col) {
+                if let Some(parent) =
+                    eng.db
+                        .find_table(&fk.ref_table, ctx.snap, &ctx.all_xids, ctx.session)
+                {
+                    if !crate::exec::partition::fk_types_compatible(eng, &next, fk, parent) {
+                        return Err(incompatible(fk));
+                    }
+                }
+            }
+        }
+        // This table as the referenced (parent) side.
+        let mut tnames: Vec<String> = eng.db.tables.keys().cloned().collect();
+        if let Some(tm) = eng.db.temp_tables.get(&ctx.session) {
+            tnames.extend(tm.keys().cloned());
+        }
+        for tname in &tnames {
+            let Some(ct) = eng
+                .db
+                .find_table(tname, ctx.snap, &ctx.all_xids, ctx.session)
+            else {
+                continue;
+            };
+            for fk in &ct.fks {
+                if fk.ref_table != name {
+                    continue;
+                }
+                let meta = TableMeta::of(&next);
+                let Ok(ref_cols) = crate::exec::constraint::fk_ref_cols(&meta, fk) else {
+                    continue;
+                };
+                if !ref_cols.iter().any(|c| c == col) {
+                    continue;
+                }
+                if !crate::exec::partition::fk_types_compatible(eng, ct, fk, &next) {
+                    return Err(incompatible(fk));
+                }
+            }
+        }
+    }
     // v1.96 finishing pass: PG19 rewrites the table — the USING
     // expression (or the assignment cast) is applied to every live
     // row and the rewritten rows are revalidated against the new
@@ -3094,6 +3293,25 @@ pub(crate) fn alter_add_constraint(
             ));
         }
         validate_fk_def(eng, ctx, name, f)?;
+        // v2.15: PG validates existing rows at ADD time unless the
+        // constraint is NOT VALID or NOT ENFORCED (the pre-v2.15
+        // code skipped the scan entirely, so an instant MATCH FULL
+        // violation sailed through). Partitioned children hold the
+        // rows in their leaves — validate every descendant too.
+        if !f.not_valid && f.enforced {
+            let mut targets = vec![name.to_string()];
+            targets.extend(partition_descendants(eng, ctx, name));
+            for tgt in &targets {
+                let Some(tt) = eng
+                    .db
+                    .find_table(tgt, ctx.snap, &ctx.all_xids, ctx.session)
+                    .cloned()
+                else {
+                    continue;
+                };
+                validate_fk_rows(eng, ctx, &tt, tgt, f)?;
+            }
+        }
         next.fks.push(f.clone());
     }
     alter_swap(eng, ctx, name, None, next, None)?;

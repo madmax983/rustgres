@@ -840,6 +840,23 @@ pub(crate) fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<V
                 .map(|w| Value::Int(w as i64))
                 .map_err(|_| bad(format!("\"{}\"", s)))
         }
+        // v2.15: oid parameters parse like xid (PG's oidin is an
+        // unsigned decimal read).
+        ColType::Oid => {
+            let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
+            s.trim()
+                .parse::<u32>()
+                .map(|w| Value::Int(w as i64))
+                .map_err(|_| bad(format!("\"{}\"", s)))
+        }
+        // v2.15: inet parameters go through inet_in validation.
+        ColType::Inet => {
+            let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
+            match crate::exec::cast::parse_inet(s.trim()) {
+                Ok(c) => Ok(Value::text(c)),
+                Err(m) => Err(bad(format!("\"{}\"", m))),
+            }
+        }
         ColType::Float => {
             let s = std::str::from_utf8(bytes).map_err(|_| bad("not valid UTF-8".into()))?;
             s.trim()
@@ -1530,6 +1547,8 @@ pub(crate) fn dummy_value(t: &ColType) -> Value {
         ColType::PgLsn => Value::PgLsn(0), // v0.64
         // v1.17: xids are carried as Value::Int.
         ColType::Xid => Value::Int(0),
+        ColType::Oid => Value::Int(0),
+        ColType::Inet => Value::text("0.0.0.0"),
         ColType::Tid => Value::Tid(0, 0), // v1.40
         // v0.73: records never appear as parameter types in practice;
         // the empty record is the honest dummy.

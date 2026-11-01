@@ -4731,6 +4731,22 @@ pub(crate) fn eval_func(
             format!("trigger with OID {} does not exist", oid),
         ));
     }
+    // v2.15: pg_get_constraintdef(oid[, pretty]) — PG returns NULL
+    // for an unknown OID (rules.sql proves pg_get_constraintdef(0)).
+    if name == "pg_get_constraintdef" && !args.is_empty() {
+        let v = eval_expr(q, scopes, &args[0])?;
+        let Value::Int(oid) = v else {
+            return Ok(Value::Null);
+        };
+        return Ok(
+            match crate::exec::catalog::pg_constraintdef_for_oid(
+                &q.eng.db, q.snap, q.own, q.session, oid,
+            ) {
+                Some(text) => Value::text(text),
+                None => Value::Null,
+            },
+        );
+    }
     // v2.09/v2.10: pg_trigger_depth() — the live trigger call depth
     // (trigger.c's counter, thread-local here); 0 outside a trigger.
     if name == "pg_trigger_depth" && args.is_empty() {
@@ -5404,6 +5420,8 @@ pub(crate) fn pg_typlen_align(ty: &ColType) -> (i32, usize) {
         ColType::Regclass => (4, 4),    // regclass: 4/'i'
         ColType::Regproc => (4, 4),     // regproc: 4/'i' (v2.14)
         ColType::Xid => (4, 4),         // xid: 4/'i'
+        ColType::Oid => (4, 4),         // oid: 4/'i' (v2.15)
+        ColType::Inet => (-1, 4),       // inet: varlena (v2.15)
         ColType::PgLsn => (8, 8),       // pg_lsn: 8/'d'
         ColType::Tid => (6, 2),         // tid: 6/'s'
         // v1.88: ranges are varlena; int/num/date align 'i',
@@ -14207,7 +14225,7 @@ pub(crate) fn func_result_type(
         // v2.04: catalog description helpers used by the publication
         // suite (pg_get_expr deparses our stored filter text form).
         "pg_get_expr" | "pg_describe_object" | "obj_description" | "shobj_description"
-        | "pg_get_triggerdef" => Ok(ColType::Text),
+        | "pg_get_triggerdef" | "pg_get_constraintdef" => Ok(ColType::Text),
         // v2.09: pg_trigger_depth() is int.
         "pg_trigger_depth" => Ok(ColType::Int),
         // v1.96: large-object family result types.

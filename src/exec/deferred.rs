@@ -873,3 +873,27 @@ pub(crate) fn exec_set_constraints(
         tag: "SET CONSTRAINTS".to_string(),
     })
 }
+
+/// v2.15: the table holding a pending deferred FK event for
+/// constraint `fk_name`, if any (PG19's pending after-trigger
+/// events check behind ATExecDropConstraint's 55000).
+pub(crate) fn pending_fk_event_table(eng: &Engine, session: u64, fk_name: &str) -> Option<String> {
+    let map = eng.deferred_fk.borrow();
+    let st = map.get(&session)?;
+    for p in &st.queue {
+        match p {
+            PendingFk::Child {
+                child, fk_name: n, ..
+            } if n == fk_name => {
+                return Some(child.clone());
+            }
+            PendingFk::Parent {
+                child, fk_name: n, ..
+            } if n == fk_name => {
+                return Some(child.clone());
+            }
+            _ => {}
+        }
+    }
+    None
+}

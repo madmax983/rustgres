@@ -193,12 +193,20 @@ fn pub_covers(eng: &Engine, p: &Publication, table: &str) -> bool {
         return true;
     }
     if !p.schemas.is_empty() {
-        let schema = eng
-            .db
-            .obj_schema
-            .get(table)
-            .map(|s| s.as_str())
-            .unwrap_or("public");
+        // v2.15: obj_schema is keyed by the name as written at CREATE
+        // time, which may be schema-qualified (CREATE TABLE s.t);
+        // callers here pass the base name, so fall back to a
+        // base-name scan when the direct lookup misses.
+        let schema = match eng.db.obj_schema.get(table) {
+            Some(s) => Some(s.as_str()),
+            None => eng
+                .db
+                .obj_schema
+                .iter()
+                .find(|(k, _)| base_name(k).eq_ignore_ascii_case(table))
+                .map(|(_, s)| s.as_str()),
+        };
+        let schema = schema.unwrap_or("public");
         if p.schemas.iter().any(|s| s.eq_ignore_ascii_case(schema)) {
             return true;
         }
