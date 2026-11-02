@@ -2,6 +2,72 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `validate_fk_rows` rebuilds a one-FK `TableMeta` clone on every existing row — baseline — 2026-11-02
+
+v2.15 added existing-row validation to `ALTER TABLE ... ADD CONSTRAINT
+... FOREIGN KEY` (the migration shape of adding an FK to an
+already-populated table): `validate_fk_rows` (`src/exec/alter.rs`)
+scans every visible row of the table being altered and runs
+`check_fk_child_row` against each one. No prior Bolt harness exercised
+this call path — `profile_fk_insert.py` covers the ordinary per-row FK
+check on *new* INSERT/UPDATE rows into an already-constrained table,
+never the one-time bulk scan ADD CONSTRAINT runs over *existing* rows,
+which is a different call path (`src/exec/alter.rs`, not the
+INSERT/UPDATE executor).
+
+New harness, `benches/profile_fk_addconstraint.py` (same self-contained
+launch-under-valgrind pattern as `profile_fk_insert.py`): populates a
+parent table and a child table (no FK yet), then profiles the single
+`ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ...` statement that
+adds the FK and validates it against the child's existing rows.
+`--variant notvalid` adds the same FK `NOT VALID`, which skips the
+scan entirely — a control that isolates the scan's share of `Ir` by
+subtraction.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`), parent table fixed at 1500 rows:
+
+| child rows (N) | `enforced` Ir | `notvalid` Ir | scan share |
+|---|---|---|---|
+| 500  | 451,625,405   | 184,840,114 | 59.1% |
+| 1000 | 1,247,131,368 | 236,014,371 | 81.1% |
+| 2000 | 2,840,440,296 | 340,398,196 | 88.0% |
+
+The validation scan is 59-88% of the statement's profile — comfortably
+over the 5%-of-profile relevance bar — dominated by
+`fk_parent_key_exists`'s inherent linear scan of the parent table (the
+same un-indexed-lookup cost `profile_fk_insert.py`'s baseline found;
+`fk_parent_key_exists` was already fixed in the #64 round to stop
+*cloning* the parent table per check, but the scan itself is inherent
+to the current lookup, which has no way to consult the referenced
+column's backing unique/PK index instead of a linear `Table::rows`
+walk — out of scope here, a bigger structural change to how FK checks
+look up the parent key, flagged for a future round / human decision).
+
+Inside that scan subtree, `validate_fk_rows` itself has a smaller,
+concrete per-row inefficiency: for every row of the table, it clones a
+full `TableMeta` (`let mut one = meta.clone()`) just to override its
+`fks` field to a single-element vec containing the one FK under
+validation — a value that is identical on every iteration of the loop
+(the FK being validated doesn't change row to row), rebuilt from
+scratch anyway. `TableMeta` carries the table's full column list, every
+CHECK constraint's `Expr` AST, generated-column expressions, defaults,
+etc., so this is a real (if secondary, since the parent-table scan
+dominates) avoidable allocation on top of the Vec<Row> collection
+already built once outside the loop.
+
+**Reproduce**:
+```bash
+cargo build
+python3 benches/profile_fk_addconstraint.py --tool callgrind --child-rows 2000 --variant enforced
+python3 benches/profile_fk_addconstraint.py --tool callgrind --child-rows 2000 --variant notvalid
+python3 benches/profile_fk_addconstraint.py --tool dhat --child-rows 2000 --variant enforced
+```
+
+Baseline profile committed:
+`benches/profiles/callgrind.out.fkaddconstraint-base-n{500,1000,2000}-2026-11-02`,
+`benches/profiles/dhat.out.fkaddconstraint-base-n2000-2026-11-02`.
+
 ## Bolt: row-level trigger firing overhead (INSERT/UPDATE) — negative result — 2026-11-01
 
 No prior Bolt round had profiled the row-level trigger machinery
