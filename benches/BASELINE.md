@@ -2,6 +2,118 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: row-level trigger firing overhead (INSERT/UPDATE) — negative result — 2026-11-01
+
+No prior Bolt round had profiled the row-level trigger machinery
+(`src/exec/partition.rs`, landed across v1.00-v2.14: `fire_before_insert_triggers`,
+`fire_before_update_triggers`, `fire_before_delete_triggers`,
+`fire_after_row_triggers`). Two new harnesses, `benches/profile_trigger_insert.py`
+and `benches/profile_trigger_update.py` (self-contained, same pattern as
+`profile_fk_insert.py`): a `BEFORE INSERT FOR EACH ROW` trigger
+(`NEW.val := upper(NEW.val); NEW.stamp := 'seen'`) firing on a single
+multi-row `INSERT`, and a `BEFORE UPDATE FOR EACH ROW` trigger
+(`NEW.cnt := OLD.cnt + 1`) firing on a single whole-table `UPDATE` —
+both ordinary audit/validation trigger shapes. Each harness has a
+`--variant notrig` control (same workload, no trigger) to isolate the
+trigger-firing subtree's share of `Ir` by subtraction, the same
+technique `profile_fk_insert.py` used for the `nofk` control.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`), current HEAD (v2.14), 2000 rows:
+
+| workload | `trig` Ir | `notrig` Ir | delta (trigger subtree) |
+|---|---|---|---|
+| INSERT, 1 BEFORE ROW trigger | 310,840,844 | 187,870,771 | 122,970,073 (**39.55%**) |
+| UPDATE, 1 BEFORE ROW trigger | 1,007,770,700 | 760,226,152 | 247,544,548 (**24.57%**) |
+
+Both comfortably clear the 5%-of-profile bar for "worth investigating
+further" — trigger firing is a real, substantial cost, not noise.
+
+**Hypotheses investigated and falsified** (both implemented, measured,
+and reverted — no net diff in this commit):
+
+1. **INSERT path**: `fire_before_insert_triggers` already resolves
+   each trigger's function and parses its plpgsql body once before
+   the per-row loop (good), but inside the loop it rebuilds a fresh
+   `TrigCtx` *per row per trigger* — `tr.name.clone()`,
+   `table.to_string()`, `tr.args.clone()`, plus a redundant
+   `eng.db.find_table(table, ...)` call to recompute `relid`, even
+   though every one of those fields is invariant across all rows of
+   the single INSERT statement this function handles in one call.
+   Hoisting the `TrigCtx` (and the `relid` lookup) to build once per
+   trigger before the row loop:
+   - Callgrind, 2000 rows: `Ir` 310,840,844 → 300,991,101 (**-3.24%**
+     of the whole workload; the `notrig` control was unchanged at
+     187,864,608, confirming the saving is isolated to the trigger
+     path). Below the 5% floor.
+   - DHAT, 2000 rows: 163,748 → 159,751 blocks (**-2.44%**),
+     11,824,825 → 11,780,935 bytes (**-0.37%**). Below the 10% floor
+     on both counts.
+2. **UPDATE/DELETE path**: `fire_before_update_triggers` /
+   `fire_before_delete_triggers` are called once per *row* from the
+   UPDATE/DELETE executor's per-row loop in `src/exec/dml.rs`
+   (already correctly gated to skip entirely when no leaf has a
+   BEFORE trigger, and already deduplicated *which leaves* get
+   checked — see the v2.10 comments at dml.rs around the `bt_leaves`
+   `HashSet`). But for every row on a trigger-bearing leaf, the
+   caller re-fetches `t.columns.clone()` from the catalog from
+   scratch, even though a leaf's column list cannot change mid-
+   statement. Caching each distinct leaf's columns once (built from
+   the same `bt_leaves` set the dedup pass already computes) instead
+   of re-cloning per row:
+   - Callgrind, 2000 rows (UPDATE): `Ir` 1,007,770,700 → 1,005,252,850
+     (**-0.25%**). Noise-level; nowhere near the floor.
+   - DHAT, 2000 rows (UPDATE): 340,493 → 332,499 blocks (**-2.35%**),
+     43,208,373 → 42,952,725 bytes (**-0.59%**). Below the 10% floor.
+   - The same clone-in-the-row-loop pattern exists in the DELETE
+     sibling (`fire_before_delete_triggers`'s caller) and was fixed
+     identically for symmetry, with the same below-floor result (not
+     separately re-measured — it is the `UPDATE` table's `columns`
+     clone, same code shape, same table schema size).
+
+**Why the subtree is large but no single hotspot clears the floor**:
+the 24-40% trigger-subtree cost from the table above is real but
+diffuse — it is almost entirely the *inherent* work of evaluating a
+plpgsql trigger body per row (`exec_trigger_stmts`, `eval_trigger_expr`,
+`eval_expr`, `eval_func`/`eval_str_func` for `upper()`) plus the MVCC
+machinery every `find_table`/row lookup already pays throughout the
+engine (`row_visible`/`table_visible`'s `owns.contains(..)` /
+`snap.active.contains(..)` scans), not a concentrated avoidable
+clone or allocation. Flat-profile self-cost for every
+trigger-dispatch function (`fire_before_insert_triggers`,
+`fire_before_update_triggers`, `exec_trigger_stmts`,
+`eval_trigger_expr`, `trigger_when_matches`) sums to well under 3% of
+total `Ir` in both workloads; the rest of the 24-40% subtree is spent
+inside generic, already-shared machinery (plpgsql expression
+evaluation, catalog lookup, allocator) that isn't trigger-specific
+code to fix.
+
+No fix shipped (`git diff` against the parent commit is empty except
+for this file and the two new harnesses). Recording this so a future
+round doesn't re-spend a profiling cycle re-deriving the same two
+hypotheses against a similar trigger shape. A genuine win here would
+need a bigger structural change — e.g. having the UPDATE/DELETE
+planner carry the old row's values forward from its initial scan
+instead of re-deriving them via a second `find_table`/`row_pos` per
+row, or a per-statement trigger-function-body cache keyed by
+`(table, trigger)` shared across the INSERT/UPDATE/DELETE firing
+paths — both out of scope for a single-round fix (ask-before:
+architectural change to the executor's per-row data flow).
+
+Full writeup: https://github.com/madmax983/rustgres/issues/65
+
+**Reproduce**:
+```bash
+cargo build
+python3 benches/profile_trigger_insert.py --tool callgrind --rows 2000 --variant trig
+python3 benches/profile_trigger_insert.py --tool callgrind --rows 2000 --variant notrig
+python3 benches/profile_trigger_update.py --tool callgrind --rows 2000 --variant trig
+python3 benches/profile_trigger_update.py --tool callgrind --rows 2000 --variant notrig
+# DHAT: swap --tool callgrind for --tool dhat on any of the above.
+```
+
+Profiles committed: `benches/profiles/{callgrind,dhat}.out.trig{insert,update}-base-n2000-2026-11-01`.
+
 ## Bolt: `fk_parent_key_exists` deep-clones the referenced table on every child-row FK check — fix — 2026-10-27
 
 Fixes the target identified in the baseline entry immediately below
