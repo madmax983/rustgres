@@ -231,18 +231,24 @@ def main():
         # propagated to the new partition tripped a debug_assert and
         # killed the connection. The propagated ALTERs below must all
         # succeed without dropping the connection.
+        # v2.16 reshaped the scenario to PG19's ATTACH rule: a
+        # partition may contain ONLY the parent's columns
+        # (tablecmds.c ATExecAttachPartition, 42804; the original
+        # extra key column "c" is now an error in PG19). The child
+        # keeps the stress factors that matter here: different
+        # column ORDER than the parent and stricter NOT NULL.
         stmts = [
             "create table p73_p (a int, b int) partition by range (a)",
-            "create table p73_c (c text, a int not null, b int not null)"
-            " partition by list (c)",
+            "create table p73_c (b int not null, a int not null)"
+            " partition by range (b)",
             "alter table p73_p attach partition p73_c"
             " for values from (1) to (10)",
             "alter table p73_p add d int, add e int",
             "alter table p73_p drop e",
             "create table p73_cab partition of p73_c"
-            " for values in ('a', 'b') partition by range (c)",
+            " for values from (5) to (10) partition by list (a)",
             "create table p73_ca partition of p73_cab"
-            " for values from ('a') to ('b')",
+            " for values in (2)",
         ]
         for stmt in stmts:
             st, tag, rows, _d = run(s, stmt)
@@ -254,7 +260,7 @@ def main():
             f"st={st} tag={tag}",
         )
         st, tag, rows, _d = run(
-            s, "insert into p73_ca values ('a', 2, 7)"
+            s, "insert into p73_ca values (7, 2)"
         )
         check(st == "ok" and tag == "INSERT 0 1", "leaf still writable",
               f"st={st} tag={tag}")

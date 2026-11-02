@@ -673,6 +673,59 @@ pub(crate) fn attach_partition(
         }
         (child.columns.clone(), child.partition.clone())
     };
+    // v2.16: PG19 ATExecAttachPartition preconditions.
+    require_table_owner(eng, ctx, child_name)?;
+    {
+        let child = eng
+            .db
+            .find_table(child_name, ctx.snap, &ctx.all_xids, ctx.session)
+            .expect("child resolved above");
+        if eng.db.typed_tables.contains_key(child_name) {
+            return Err(exec_err(
+                "42809",
+                "cannot attach a typed table as partition".to_string(),
+            ));
+        }
+        if !child.inherits.is_empty() {
+            return Err(exec_err(
+                "42809",
+                "cannot attach inheritance child as partition".to_string(),
+            ));
+        }
+        // Bound form must match the parent's strategy (PG19
+        // transformPartitionBound, 42P16).
+        let form_ok = match (&pinfo.method, bound_def) {
+            (_, PartBoundDef::Default) => true,
+            (crate::storage::PartMethod::List, PartBoundDef::List(_)) => true,
+            (crate::storage::PartMethod::Range, PartBoundDef::Range { .. }) => true,
+            (crate::storage::PartMethod::Hash, PartBoundDef::Hash { .. }) => true,
+            _ => false,
+        };
+        if !form_ok {
+            let kind = match pinfo.method {
+                crate::storage::PartMethod::List => "list",
+                crate::storage::PartMethod::Range => "range",
+                crate::storage::PartMethod::Hash => "hash",
+            };
+            return Err(exec_err(
+                "42P16",
+                format!("invalid bound specification for a {} partition", kind),
+            ));
+        }
+        // Extra child columns are rejected (42804); missing ones
+        // are caught by the compatibility loop below.
+        for (cname, _) in &child.columns {
+            if !parent_cols.iter().any(|(n, _)| n == cname) {
+                return Err(exec_err(
+                    "42804",
+                    format!(
+                        "table \"{}\" contains column \"{}\" not found in parent \"{}\"",
+                        child_name, cname, parent_name
+                    ),
+                ));
+            }
+        }
+    }
     // v1.97: PG19 rejects circular partition attachment
     // ("circular inheritance not allowed", 42P16): the table being
     // attached must not be an ancestor of the parent in the
@@ -770,6 +823,35 @@ pub(crate) fn attach_partition(
                         ));
                     }
                 }
+            }
+        }
+        // v2.16: PG19 merge rule — a parent constraint cannot
+        // merge into a child copy marked NO INHERIT (42P17,
+        // "conflicts with non-inherited constraint on child").
+        for cc in &child_t.checks {
+            if !cc.no_inherit {
+                continue;
+            }
+            let mut refs: Vec<(Option<String>, String)> = Vec::new();
+            crate::sql::collect_col_refs(&cc.expr, &mut refs);
+            let conflicts = match cc.kind {
+                crate::sql::CheckKind::NotNull => refs.iter().any(|(_, r)| {
+                    parent_t
+                        .columns
+                        .iter()
+                        .position(|(n, _)| n == r)
+                        .is_some_and(|pi| parent_t.not_null.get(pi) == Some(&true))
+                }),
+                crate::sql::CheckKind::Check => parent_t.checks.iter().any(|pc| pc.name == cc.name),
+            };
+            if conflicts {
+                return Err(exec_err(
+                    "42P17",
+                    format!(
+                        "constraint \"{}\" conflicts with non-inherited constraint on child table \"{}\"",
+                        cc.name, child_name
+                    ),
+                ));
             }
         }
     }
@@ -1176,10 +1258,19 @@ pub(crate) fn alter_inherit(
                         format!("child table is missing column \"{}\"", pname),
                     )
                 })?;
+            // v2.16: compare the VALUES of the type slots, not the
+            // Option returned by Vec::get — ADD COLUMN does not grow
+            // composite_types/domain_types/domain_elem, so a short
+            // vec (missing slot = plain column) must compare equal
+            // to an explicit None/false entry (the atacc3 INHERIT
+            // failure after drop/re-add column).
             let same_type = ctype == ptype
-                && child.composite_types.get(ci) == parent.composite_types.get(pi)
-                && child.domain_types.get(ci) == parent.domain_types.get(pi)
-                && child.domain_elem.get(ci) == parent.domain_elem.get(pi);
+                && child.composite_types.get(ci).cloned().flatten()
+                    == parent.composite_types.get(pi).cloned().flatten()
+                && child.domain_types.get(ci).cloned().flatten()
+                    == parent.domain_types.get(pi).cloned().flatten()
+                && child.domain_elem.get(ci).copied().unwrap_or(false)
+                    == parent.domain_elem.get(pi).copied().unwrap_or(false);
             if !same_type {
                 return Err(exec_err(
                     "42804",
@@ -1188,6 +1279,45 @@ pub(crate) fn alter_inherit(
                         child_name, pname
                     ),
                 ));
+            }
+            // v2.16 finishing pass: PG19 MergeAttributesIntoExisting —
+            // a column must be generated in the child if and only if it
+            // is generated in the parent, and of the same kind (the
+            // CREATE merge has enforced this since the run-2 fix round;
+            // ALTER ... INHERIT silently accepted the mismatch, which
+            // the generated_stored/virtual gtest_normal_child sections
+            // expose once CREATE-side conflicts error correctly).
+            let pgen = parent.gen_cols.get(pi).cloned().unwrap_or(None);
+            let cgen = child.gen_cols.get(ci).cloned().unwrap_or(None);
+            match (&cgen, &pgen) {
+                (None, Some(_)) => {
+                    return Err(exec_err(
+                        "42804",
+                        format!(
+                            "column \"{}\" in child table must be a generated column",
+                            pname
+                        ),
+                    ));
+                }
+                (Some(_), None) => {
+                    return Err(exec_err(
+                        "42804",
+                        format!(
+                            "column \"{}\" in child table must not be a generated column",
+                            pname
+                        ),
+                    ));
+                }
+                (Some((_, cs)), Some((_, ps))) if cs != ps => {
+                    return Err(exec_err(
+                        "42804",
+                        format!(
+                            "column \"{}\" inherits from generated column of different kind",
+                            pname
+                        ),
+                    ));
+                }
+                _ => {}
             }
             // v1.97: a parent NOT NULL backed by a NO INHERIT
             // constraint does not merge into the child (PG19), so
@@ -3864,6 +3994,19 @@ pub(crate) fn create_table_from_def(
             }
         }
         let mut merged = TableDef::empty();
+        // v2.16: generation metadata carried alongside the merge
+        // (TableDef merging does not track gen_cols): a column
+        // inherited with differing generation KINDS is a 42804
+        // conflict (PG19 MergeChildAttribute); differing generation
+        // EXPRESSIONS are a 42P16 conflict unless the child's own
+        // column definition resolves them (PG19's bogus-marker
+        // pass in DefineRelation).
+        let mut merged_gen: Vec<Option<(crate::sql::Expr, bool)>> = Vec::new();
+        // v2.16 finishing pass: effective per-column storage carried
+        // alongside the merge for the same reason (PG19
+        // MergeChildAttribute storage conflicts, 42804).
+        let mut merged_storage: Vec<u8> = Vec::new();
+        let mut gen_expr_conflict: Option<String> = None;
         merged.inherits = like_def.inherits.clone();
         let mut seen_parents: Vec<String> = Vec::new();
         // v0.96: columns whose inherited defaults conflict across
@@ -3946,6 +4089,47 @@ pub(crate) fn create_table_from_def(
                             format!("column \"{}\" has a type conflict", col),
                         ));
                     }
+                    // v2.16: generation conflicts across parents
+                    // (PG19 MergeChildAttribute / DefineRelation).
+                    let pgen = parent.gen_cols.get(i).cloned().unwrap_or(None);
+                    match (&merged_gen[pos], &pgen) {
+                        (a, b) if a.is_some() != b.is_some() => {
+                            return Err(exec_err(
+                                "42804",
+                                format!("inherited column \"{}\" has a generation conflict", col),
+                            ));
+                        }
+                        (Some((ea, sa)), Some((eb, sb))) => {
+                            if sa != sb {
+                                return Err(exec_err(
+                                    "42804",
+                                    format!(
+                                        "inherited column \"{}\" has a generation conflict",
+                                        col
+                                    ),
+                                ));
+                            }
+                            if ea != eb && gen_expr_conflict.is_none() {
+                                gen_expr_conflict = Some(col.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                    // v2.16 finishing pass: storage conflicts across
+                    // parents (PG19 MergeChildAttribute, 42804) — the
+                    // create_table_like inh_error1 case (ctlt1.a MAIN
+                    // versus ctlt4.a EXTENDED).
+                    if let Some(ps) = parent.col_storage.get(i).copied() {
+                        if merged_storage[pos] != ps {
+                            return Err(exec_err(
+                                "42804",
+                                format!(
+                                    "inherited column \"{}\" has a storage parameter conflict",
+                                    col
+                                ),
+                            ));
+                        }
+                    }
                     // NOT NULL accumulates across parents.
                     if parent.not_null.get(i).copied().unwrap_or(false) {
                         merged.not_null[pos] = true;
@@ -3991,8 +4175,21 @@ pub(crate) fn create_table_from_def(
                 merged.serial.push(None);
                 merged.compression.push(None);
                 merged.storage.push(None);
+                merged_gen.push(parent.gen_cols.get(i).cloned().unwrap_or(None));
+                merged_storage.push(
+                    parent
+                        .col_storage
+                        .get(i)
+                        .copied()
+                        .unwrap_or_else(|| ty.default_toast_storage()),
+                );
             }
-            merged.checks.extend(parent.checks.iter().cloned());
+            // v2.16: NO INHERIT constraints do not propagate to
+            // children (PG19 connoinherit) — neither CHECKs nor
+            // not-null constraint entries.
+            merged
+                .checks
+                .extend(parent.checks.iter().filter(|c| !c.no_inherit).cloned());
         }
         // The child's own columns; a child column with the same name as
         // an inherited one merges into the inherited position (PG19
@@ -4017,6 +4214,35 @@ pub(crate) fn create_table_from_def(
                     format!("column \"{}\" has a type conflict", col),
                 ));
             }
+            // v2.16: the child's own column vs the inherited
+            // generation kind (PG19 MergeChildAttribute, 42804).
+            {
+                let lgen = like_def.gen_cols.get(i).cloned().unwrap_or(None);
+                let mgen = &merged_gen[pos];
+                let kind_diff = match (mgen, &lgen) {
+                    (None, None) => false,
+                    (Some((_, s1)), Some((_, s2))) => s1 != s2,
+                    _ => true,
+                };
+                if kind_diff {
+                    return Err(exec_err(
+                        "42804",
+                        format!("inherited column \"{}\" has a generation conflict", col),
+                    ));
+                }
+            }
+            // v2.16 finishing pass: the child's own specified storage
+            // (own STORAGE clause or LIKE ... INCLUDING STORAGE) must
+            // match the inherited storage (PG19 MergeChildAttribute,
+            // 42804) — the create_table_like inh_error2 case.
+            if let Some(s) = like_def.storage.get(i).copied().flatten() {
+                if merged_storage[pos] != s {
+                    return Err(exec_err(
+                        "42804",
+                        format!("column \"{}\" has a storage parameter conflict", col),
+                    ));
+                }
+            }
             // The local column refines the inherited slot: NOT NULL
             // accumulates, and local default/serial/storage settings win.
             if like_def.not_null.get(i).copied().unwrap_or(false) {
@@ -4034,7 +4260,25 @@ pub(crate) fn create_table_from_def(
             if let Some(s) = like_def.storage.get(i).and_then(|s| s.clone()) {
                 merged.storage[pos] = Some(s);
             }
+            // v2.16: the child's own generation expression resolves
+            // an inherited generation-expression conflict (PG19).
+            if like_def.gen_cols.get(i).is_some_and(|g| g.is_some())
+                && gen_expr_conflict.as_deref() == Some(col.as_str())
+            {
+                gen_expr_conflict = None;
+            }
             local_merged[i] = true;
+        }
+        // v2.16: unresolved inherited generation-expression
+        // conflict (PG19 DefineRelation, 42P16).
+        if let Some(col) = &gen_expr_conflict {
+            return Err(exec_err(
+                "42P16",
+                format!(
+                    "column \"{}\" inherits conflicting generation expressions",
+                    col
+                ),
+            ));
         }
         for (i, (col, ty)) in like_def.columns.iter().enumerate() {
             if local_merged[i] {

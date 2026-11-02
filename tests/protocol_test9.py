@@ -423,11 +423,15 @@ def test_views():
         t, r, e = c.q("SELECT * FROM aliased")
         check("column aliases", c.last_columns == ["x", "y"] and r == [["1", "x"]], f"{c.last_columns} {r}")
 
-        # OR REPLACE.
-        t, r, e = c.q("CREATE OR REPLACE VIEW v AS SELECT a FROM t WHERE a = 3")
+        # OR REPLACE. (v2.16: PG19 forbids dropping a view column
+        # via OR REPLACE — "cannot drop columns from view", 42P16 —
+        # so the replacement keeps (a, b) and changes the filter;
+        # the old one-column form encoded the engine's pre-v2.16
+        # unchecked behavior.)
+        t, r, e = c.q("CREATE OR REPLACE VIEW v AS SELECT a, b FROM t WHERE a = 3")
         check("or replace", t == ["CREATE VIEW"], f"{t} {e}")
         t, r, e = c.q("SELECT * FROM v")
-        check("replaced view", r == [["3"]], f"{r} {e}")
+        check("replaced view", r == [["3", "z"]], f"{r} {e}")
 
         # DROP VIEW.
         t, r, e = c.q("DROP VIEW v2")

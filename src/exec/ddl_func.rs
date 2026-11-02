@@ -21,7 +21,48 @@ pub(crate) fn exec_alter_function(
     volatility: crate::sql::FuncVolatility,
     owner: Option<&str>,
     security: Option<bool>,
+    set_schema: Option<&str>,
 ) -> Result<ExecResult, ExecError> {
+    // v2.16: ALTER FUNCTION name(args) SET SCHEMA s (PG19
+    // AlterObjectSchemaStmt). Functions are keyed by their
+    // as-written (possibly qualified) name; a qualified name
+    // renames its key prefix, an unqualified name gains the
+    // qualified key as its new home (calls written with the new
+    // qualification resolve; bare calls keep working through the
+    // catalog's base-name fallbacks where they exist).
+    if let Some(schema) = set_schema {
+        if !eng.db.schemas.iter().any(|s| s == schema) {
+            return Err(exec_err(
+                "3F000",
+                format!("schema \"{}\" does not exist", schema),
+            ));
+        }
+        if !eng.db.functions.contains_key(name) && !eng.db.aggregates.contains_key(name) {
+            return Err(exec_err(
+                "42883",
+                format!("function {}() does not exist", name),
+            ));
+        }
+        let base = name.rsplit('.').next().unwrap_or(name);
+        let new_key = format!("{}.{}", schema, base);
+        if new_key != name {
+            if let Some(defs) = eng.db.functions.remove(name) {
+                eng.db.functions.insert(new_key.clone(), defs);
+            }
+            if let Some(def) = eng.db.aggregates.remove(name) {
+                eng.db.aggregates.insert(new_key.clone(), def);
+            }
+            if let Some(o) = eng.db.fn_owners.remove(name) {
+                eng.db.fn_owners.insert(new_key.clone(), o);
+            }
+            crate::exec::alter::set_obj_schema_to(eng, ctx, &new_key, schema);
+        } else {
+            crate::exec::alter::set_obj_schema_to(eng, ctx, name, schema);
+        }
+        return Ok(ExecResult::Command {
+            tag: "ALTER FUNCTION".to_string(),
+        });
+    }
     // v1.96: ALTER FUNCTION ... OWNER TO — reassign fn_owners
     // (must be current owner or superuser; new owner must exist).
     if let Some(new_owner) = owner {

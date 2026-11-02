@@ -34,6 +34,101 @@ pub(crate) fn err_undefined(msg: impl Into<String>) -> SqlError {
     }
 }
 
+/// v2.16: PG19 system column names (heap.c SystemAttributeByName:
+/// ctid, xmin, cmin, xmax, cmax, tableoid). A user column with one
+/// of these names is 42701 at CREATE TABLE / ADD COLUMN time.
+/// v2.16: PG19 format_type_be-style display name for the types the
+/// COLLATE / STORAGE validity messages name (parse_type.c /
+/// tablecmds.c error strings).
+pub(crate) fn col_type_pg_name(t: &ColType, named: Option<&str>) -> String {
+    use ColType::*;
+    match t {
+        Int => "integer".to_string(),
+        BigInt => "bigint".to_string(),
+        SmallInt => "smallint".to_string(),
+        Float => "double precision".to_string(),
+        Float4 => "real".to_string(),
+        Numeric(_) => "numeric".to_string(),
+        Text => "text".to_string(),
+        Char(_) => "character".to_string(),
+        Varchar(_) => "character varying".to_string(),
+        Bool => "boolean".to_string(),
+        Date => "date".to_string(),
+        Timestamp => "timestamp without time zone".to_string(),
+        Timestamptz => "timestamp with time zone".to_string(),
+        Time => "time without time zone".to_string(),
+        TimeTz => "time with time zone".to_string(),
+        Interval => "interval".to_string(),
+        Bytea => "bytea".to_string(),
+        Uuid => "uuid".to_string(),
+        Name => "name".to_string(),
+        Array(e) => format!("{}[]", array_elem_pg_name(e)),
+        _ => named
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "text".to_string()),
+    }
+}
+
+/// v2.16: display name for an array element type.
+pub(crate) fn array_elem_pg_name(e: &crate::storage::ArrayElem) -> String {
+    use crate::storage::ArrayElem::*;
+    match e {
+        Text => "text".to_string(),
+        Varchar => "character varying".to_string(),
+        Char => "character".to_string(),
+        Name => "name".to_string(),
+        Int => "integer".to_string(),
+        BigInt => "bigint".to_string(),
+        SmallInt => "smallint".to_string(),
+        Bool => "boolean".to_string(),
+        _ => "text".to_string(),
+    }
+}
+
+/// v2.16: does the type carry a collation in PG19 (typcollation)?
+/// Named types (domains/composites) are allowed through: a domain
+/// over a collatable base is collatable, and the parse layer cannot
+/// resolve the name here.
+pub(crate) fn col_type_collatable(t: &ColType, named: Option<&str>) -> bool {
+    use ColType::*;
+    if named.is_some() {
+        return true;
+    }
+    match t {
+        Text | Varchar(_) | Char(_) | Name => true,
+        Array(e) => matches!(
+            e,
+            crate::storage::ArrayElem::Text
+                | crate::storage::ArrayElem::Varchar
+                | crate::storage::ArrayElem::Char
+                | crate::storage::ArrayElem::Name
+        ),
+        _ => false,
+    }
+}
+
+/// v2.16: is the type TOAST-aware in PG19 (typstorage != 'p')?
+/// Named types are allowed through (domains over varlena bases are
+/// toastable; the parse layer cannot resolve the name here).
+pub(crate) fn col_type_toastable(t: &ColType, named: Option<&str>) -> bool {
+    use ColType::*;
+    if named.is_some() {
+        return true;
+    }
+    match t {
+        Text | Varchar(_) | Char(_) | Numeric(_) | Bytea | Json | Jsonb | Composite => true,
+        Array(_) => true,
+        _ => false,
+    }
+}
+
+pub(crate) fn is_system_column_name(name: &str) -> bool {
+    matches!(
+        name,
+        "ctid" | "xmin" | "cmin" | "xmax" | "cmax" | "tableoid"
+    )
+}
+
 /// A parse-time 42701 (duplicate_column), like Postgres.
 pub(crate) fn err_duplicate(msg: impl Into<String>) -> SqlError {
     SqlError {
@@ -2437,6 +2532,8 @@ pub struct TableDef {
     /// v2.03: generated columns, parallel to `columns`
     /// (`Some((expr, stored))`).
     pub gen_cols: Vec<Option<(Expr, bool)>>,
+    /// v2.16: CREATE UNLOGGED TABLE (PG19 relpersistence 'u').
+    pub unlogged: bool,
     /// v0.69: declarative partitioning (`None` = ordinary table).
     pub partition: Option<PartitionDef>,
     /// v0.72: `LIKE` clauses, expanded at exec. PG19 option defaults
@@ -2584,6 +2681,9 @@ pub enum RangeBoundDef {
 pub enum AlterAction {
     AddColumn {
         name: String,
+        /// v2.16: `ADD COLUMN IF NOT EXISTS` (PG19) — an existing
+        /// column is a NOTICE-level skip instead of 42701.
+        if_not_exists: bool,
         col_type: ColType,
         /// v1.96: the declared named (domain/composite) type, if any —
         /// drives the PG19 type-USAGE check at ADD COLUMN time.
@@ -2608,6 +2708,8 @@ pub enum AlterAction {
     DropColumn {
         name: String,
         cascade: bool,
+        /// v2.16: `DROP COLUMN IF EXISTS` (PG19).
+        if_exists: bool,
     },
     /// v1.97: `ALTER TABLE name VALIDATE CONSTRAINT cname` (PG19) —
     /// validates existing rows against a NOT VALID constraint and
@@ -2637,6 +2739,56 @@ pub enum AlterAction {
     DropConstraint {
         name: String,
         cascade: bool,
+        /// v2.16: `DROP CONSTRAINT IF EXISTS` (PG19).
+        if_exists: bool,
+    },
+    /// v2.16: `ALTER TABLE name RENAME CONSTRAINT old TO new`
+    /// (PG19 RenameStmt OBJECT_TABCONSTRAINT).
+    RenameConstraint {
+        old: String,
+        new: String,
+    },
+    /// v2.16: `ALTER TABLE name SET SCHEMA new_schema` (PG19
+    /// AlterObjectSchemaStmt). The engine is single-namespace:
+    /// a qualified written name renames its storage-key prefix,
+    /// an unqualified name only updates the obj_schema attribution
+    /// (plus the find_table schema fallback).
+    SetSchema {
+        schema: String,
+    },
+    /// v2.16: `ALTER TABLE name SET {LOGGED|UNLOGGED}` (PG19
+    /// AT_SetRelPersistence). Persistence is not modeled (no WAL
+    /// replay distinction for table data), so this is validated
+    /// and accepted.
+    SetLogged {
+        logged: bool,
+    },
+    /// v2.16: `ALTER TABLE name CLUSTER ON index_name` /
+    /// `SET WITHOUT CLUSTER` (PG19). The mark is recorded in
+    /// Database::cluster_marks (runtime-only, like v1.96).
+    ClusterOn {
+        index: Option<String>,
+    },
+    /// v2.16: `ALTER TABLE name ALTER COLUMN c SET STATISTICS n`
+    /// (PG19 AT_SetStatistics; -1 = planner default). Statistics
+    /// are not consumed by the planner; validated + accepted.
+    AlterColumnSetStatistics {
+        name: String,
+        target: i32,
+    },
+    /// v2.16: `ALTER COLUMN c SET (opt = val, ...)` /
+    /// `RESET (opt, ...)` (PG19 AT_SetOptions / AT_ResetOptions
+    /// for per-column reloptions like n_distinct). Accepted after
+    /// column validation; the values are not modeled.
+    AlterColumnSetOptions {
+        name: String,
+        options: Vec<(String, String)>,
+        reset: bool,
+    },
+    /// v2.16: `ALTER TABLE name RESET (opt, ...)` (PG19
+    /// AT_ResetRelOptions). Companion to SetRelOptions.
+    ResetRelOptions {
+        options: Vec<String>,
     },
     AlterColumnSetDefault {
         name: String,
@@ -2782,6 +2934,23 @@ pub enum ReplicaKind {
     Full,
     Nothing,
     Index,
+}
+
+/// v2.16: ALTER INDEX actions (PG19). Statistics targets,
+/// reloptions and tablespace are catalog facts this engine does
+/// not consume; they are validated and accepted. ATTACH PARTITION
+/// links a child index to a partitioned parent index — the
+/// engine's index registry is flat per table, so the link is
+/// validated (both indexes exist, child's table is a partition
+/// of the parent's table when that is recorded) and accepted.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AlterIndexAction {
+    RenameTo { new_name: String },
+    SetStatistics { column: u32, target: i32 },
+    SetOptions { options: Vec<(String, String)> },
+    ResetOptions { options: Vec<String> },
+    SetTablespace { tablespace: String },
+    AttachPartition { child: String },
 }
 
 /// v0.9: CREATE / ALTER SEQUENCE options. `None` = keep current value
@@ -2934,7 +3103,7 @@ pub(crate) enum ColCon {
     /// v2.07: column PRIMARY KEY with ConstraintAttributeSpec results.
     PKey(Option<String>, bool, bool),
     Default(DefaultExpr),
-    Check(Option<String>, Expr, bool, bool),
+    Check(Option<String>, Expr, bool, bool, bool),
     References {
         name: Option<String>,
         tail: ParsedFkTail,
@@ -2957,7 +3126,8 @@ pub(crate) enum ParsedTableCon {
     Unique(Option<String>, Vec<String>, bool, bool, bool),
     /// v2.07: `UNIQUE USING INDEX name` (ALTER ADD form).
     UniqueUsingIndex(Option<String>, String),
-    Check(Option<String>, Expr, bool, bool),
+    /// v2.16: plus NO INHERIT (gram.y ConstraintAttributeSpec).
+    Check(Option<String>, Expr, bool, bool, bool),
     Fk {
         name: Option<String>,
         cols: Vec<String>,
@@ -3053,6 +3223,7 @@ impl TableDef {
             deferred_not_null: Vec::new(),
             of_type: None,
             gen_cols: Vec::new(),
+            unlogged: false,
         }
     }
 }
@@ -3252,6 +3423,8 @@ pub(crate) fn def_add_check(
     // parents; the existence check is deferred to exec, which
     // validates against the merged column list (see def_add_pkey).
     defer_col_check: bool,
+    // v2.16: NO INHERIT from the attribute tail (table-level form).
+    no_inherit: bool,
 ) -> Result<(), SqlError> {
     let cname = match &name {
         Some(n) => {
@@ -3281,7 +3454,7 @@ pub(crate) fn def_add_check(
         expr: e,
         not_valid,
         kind: CheckKind::Check,
-        no_inherit: false,
+        no_inherit,
         enforced,
     });
     Ok(())
@@ -3445,7 +3618,7 @@ pub(crate) fn build_table_def(
                             *idf,
                         )?,
                         ColCon::Default(d) => def.defaults[i] = Some(d.clone()),
-                        ColCon::Check(n, e, nv, enf) => def_add_check(
+                        ColCon::Check(n, e, nv, enf, noinh) => def_add_check(
                             table,
                             &mut def,
                             n.clone(),
@@ -3454,6 +3627,7 @@ pub(crate) fn build_table_def(
                             *nv,
                             *enf,
                             !inherits.is_empty(),
+                            *noinh,
                         )?,
                         ColCon::References { name: n, tail } => def_add_fk(
                             table,
@@ -3511,7 +3685,7 @@ pub(crate) fn build_table_def(
                         *nnd,
                     )?
                 }
-                ParsedTableCon::Check(n, e, nv, enf) => def_add_check(
+                ParsedTableCon::Check(n, e, nv, enf, noinh) => def_add_check(
                     table,
                     &mut def,
                     n.clone(),
@@ -3520,6 +3694,7 @@ pub(crate) fn build_table_def(
                     *nv,
                     *enf,
                     !inherits.is_empty(),
+                    *noinh,
                 )?,
                 // v0.76: `CONSTRAINT name NOT NULL col` in CREATE TABLE —
                 // PG doesn't allow this syntax here, but we accept it by
@@ -9048,6 +9223,9 @@ pub enum Stmt {
         /// v2.09: `SECURITY DEFINER` (Some(true)) / `SECURITY
         /// INVOKER` (Some(false)) action; None for other actions.
         security: Option<bool>,
+        /// v2.16: `SET SCHEMA new_schema` action (PG19
+        /// AlterObjectSchemaStmt); None for other actions.
+        set_schema: Option<String>,
     },
     // --- v0.86: CREATE FUNCTION (bounded): SQL-language and internal
     // functions, plus bounded plpgsql (v0.97: single-RETURN bodies
@@ -9151,6 +9329,32 @@ pub enum Stmt {
     CommentOnConstraint {
         name: String,
         table: String,
+    },
+    /// v2.16: `COMMENT ON <object> ... IS 'text' | NULL` for the
+    /// general object family (PG19 gram.y CommentStmt). `target` is
+    /// the object-kind keyword as written (table, index, column,
+    /// view, sequence, type, domain, function, aggregate, role,
+    /// statistics, collation, ...); `name` is the object name as
+    /// written (for COLUMN: the table; for FUNCTION/AGGREGATE the
+    /// name without its argument list); `sub` carries the column
+    /// name (COLUMN), the relation (RULE), the domain (CONSTRAINT
+    /// ON DOMAIN), or the argument-type list text
+    /// (FUNCTION/AGGREGATE). Comments are validated against the
+    /// catalog where the engine models the object and otherwise
+    /// accepted as a catalog no-op (pg_description is not
+    /// materialized; same precedent as CommentOnTrigger).
+    CommentOn {
+        target: String,
+        name: String,
+        sub: Option<String>,
+        comment: Option<String>,
+    },
+    /// v2.16: `ALTER INDEX [IF EXISTS] name <action>` (PG19
+    /// AlterTableStmt with OBJECT_INDEX / RenameStmt).
+    AlterIndex {
+        name: String,
+        if_exists: bool,
+        action: AlterIndexAction,
     },
     /// v2.09: `ALTER TRIGGER name ON table RENAME TO new_name`
     /// (PG19 RenameStmt OBJECT_TRIGGER).

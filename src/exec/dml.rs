@@ -1631,6 +1631,7 @@ pub(crate) fn exec_create_table_as(
         deferred_not_null: Vec::new(),
         of_type: None,
         gen_cols: vec![None; ncols],
+        unlogged: false,
     };
     // CTAS definitions never carry constraints; the effective def is discarded.
     let _ = create_table_from_def(eng, ctx, name, &def, temp)?;
@@ -6518,6 +6519,49 @@ pub(crate) fn drop_one_table(
             }
         }
     };
+    // v2.16: PG19 — inheritance children depend on their parent:
+    // without CASCADE the drop is refused (2BP01); with CASCADE
+    // the whole inheritance subtree is dropped.
+    {
+        let base = name.rsplit('.').next().unwrap_or(name);
+        let mut inh_children: Vec<String> = Vec::new();
+        for k in eng.db.tables.keys() {
+            // Children dropped by this same statement are not
+            // blockers (PG performMultipleDeletions semantics,
+            // like the FK scan below).
+            if k == name || dropped.contains(k) || stmt_set.contains(k) {
+                continue;
+            }
+            if let Some(t) = eng.db.find_table(k, ctx.snap, &ctx.all_xids, ctx.session) {
+                if t.inherits
+                    .iter()
+                    .any(|p| p == name || p.rsplit('.').next().unwrap_or(p) == base)
+                {
+                    inh_children.push(k.clone());
+                }
+            }
+        }
+        if !inh_children.is_empty() {
+            if !cascade {
+                return Err(exec_err(
+                    "2BP01",
+                    format!(
+                        "cannot drop table {} because {} depends on it",
+                        name, inh_children[0]
+                    ),
+                ));
+            }
+            for child in &inh_children {
+                // v2.16: diamond inheritance — a child reachable
+                // from two parents in the cascade may already be
+                // dropped by an earlier sibling's recursion.
+                if dropped.contains(child) {
+                    continue;
+                }
+                drop_one_table(eng, ctx, child, false, true, dropped, stmt_set)?;
+            }
+        }
+    }
     // Dependency scan: FKs from other tables, and views.
     // v2.05: a referencing table that this same statement drops
     // (named in the list, or a partition child already dropped by

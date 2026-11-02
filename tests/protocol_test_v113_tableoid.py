@@ -8,7 +8,7 @@ Covers (simple protocol):
 - `pg_size_pretty(8192)` -> '8192 bytes'
 - `pg_size_pretty(10240)` -> '10 kB'
 - plain table tableoid::regclass -> own table name
-- user column named tableoid shadows the system column
+- a column named tableoid is rejected as a system column name (42701, PG19 heap.c)
 
 Extended protocol:
 - Parse/Describe of tableoid query reports correct field count.
@@ -171,12 +171,12 @@ def main():
         check("plain table tableoid::regclass -> own name",
               err is None and rows == [("plain_t",)], (nf, rows, tag, err))
 
-        # --- user column named tableoid shadows the system column ---
-        q(s, "create table shadow_t (tableoid text)")
-        q(s, "insert into shadow_t values ('mine')")
-        nf, rows, tag, err = q(s, "select tableoid from shadow_t;")
-        check("user tableoid column shadows system column",
-              err is None and rows == [("mine",)], (nf, rows, tag, err))
+        # --- a column named tableoid is a system column name ---
+        # v2.16: PG19 heap.c CheckAttributeNames rejects it (42701);
+        # the pre-v2.16 suite asserted the old shadowing behavior.
+        nf, rows, tag, err = q(s, "create table shadow_t (tableoid text)")
+        check("column named tableoid rejected -> 42701",
+              err == "42701", (nf, rows, tag, err))
 
         # --- pg_size_pretty ---
         nf, rows, tag, err = q(s, "select pg_size_pretty(8192);")

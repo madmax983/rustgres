@@ -262,6 +262,93 @@ impl Parser {
         Ok(options)
     }
 
+    /// v2.16: lenient reloption list `(name [= value], ...)`: names
+    /// may be dotted (`toast.autovacuum_enabled`), the `=` and the
+    /// value are both optional (RESET form carries bare names).
+    /// Returns (name, value) pairs with "" for a bare name.
+    /// v2.16: RESET (...) option names — PG19 allows bare (possibly
+    /// dotted) names only; a value is a syntax error.
+    pub(crate) fn parse_reloption_names_strict(&mut self) -> Result<Vec<String>, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let mut names = Vec::new();
+        loop {
+            let mut name = self.expect_ident()?;
+            while *self.peek() == Token::Dot {
+                self.next();
+                name.push('.');
+                name.push_str(&self.expect_ident()?);
+            }
+            if *self.peek() == Token::Eq {
+                return Err(err("syntax error: RESET options take no value".to_string()));
+            }
+            names.push(name);
+            if *self.peek() == Token::Comma {
+                self.next();
+                continue;
+            }
+            break;
+        }
+        self.expect(Token::RParen, "')'")?;
+        Ok(names)
+    }
+
+    pub(crate) fn parse_reloptions_lenient(&mut self) -> Result<Vec<(String, String)>, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let mut options = Vec::new();
+        loop {
+            let mut name = self.expect_ident()?;
+            while *self.peek() == Token::Dot {
+                self.next();
+                name.push('.');
+                name.push_str(&self.expect_ident()?);
+            }
+            let val = if *self.peek() == Token::Eq {
+                self.next();
+                // A value may itself be signed (fillfactor etc. are
+                // not, but SET (x = -1) shapes exist for GUC-like
+                // options).
+                if *self.peek() == Token::Minus {
+                    self.next();
+                    format!("-{}", self.expect_reloption_value()?)
+                } else {
+                    self.expect_reloption_value()?
+                }
+            } else {
+                String::new()
+            };
+            options.push((name, val));
+            if *self.peek() == Token::Comma {
+                self.next();
+                continue;
+            }
+            break;
+        }
+        self.expect(Token::RParen, "')'")?;
+        Ok(options)
+    }
+
+    /// v2.16: a possibly-negative integer literal (SET STATISTICS).
+    pub(crate) fn parse_signed_i64(&mut self) -> Result<i64, SqlError> {
+        let neg = if *self.peek() == Token::Minus {
+            self.next();
+            true
+        } else {
+            false
+        };
+        match self.next() {
+            Token::Number(s) => {
+                let v: i64 = s
+                    .parse()
+                    .map_err(|_| err("syntax error: bad integer".to_string()))?;
+                Ok(if neg { -v } else { v })
+            }
+            other => Err(err(format!(
+                "syntax error: expected integer, found {:?}",
+                other
+            ))),
+        }
+    }
+
     pub(crate) fn expect_reloption_value(&mut self) -> Result<String, SqlError> {
         match self.next() {
             Token::Ident(s) | Token::QIdent(s) | Token::Number(s) | Token::Str(s) => Ok(s),
@@ -661,6 +748,7 @@ impl Parser {
             // --- v0.9: ALTER TABLE / ALTER SEQUENCE
             "alter" => match self.peek() {
                 Token::Ident(s) if s == "table" => self.parse_alter(),
+                Token::Ident(s) if s == "index" => self.parse_alter_index(),
                 Token::Ident(s) if s == "view" => self.parse_alter_view(false),
                 Token::Ident(s) if s == "materialized" => self.parse_alter_view(true),
                 Token::Ident(s) if s == "sequence" => self.parse_alter_sequence(),
@@ -895,6 +983,12 @@ impl Parser {
             // in column definitions; casts keep the plain mapping).
             "smallserial" => Ok(ColType::SmallInt),
             "bigserial" => Ok(ColType::BigInt),
+            // v2.16: the numeric serial aliases (PG19 gram.y
+            // Typename: serial2/serial4/serial8 are the internal
+            // type-name spellings of the same pseudo-types).
+            "serial2" => Ok(ColType::SmallInt),
+            "serial4" => Ok(ColType::Int),
+            "serial8" => Ok(ColType::BigInt),
             // v0.35: character types carry their typmod, like PG19
             // (anychar_typmodin): a single positive length; anything else
             // is 22023. `varchar` without a length is unlimited (None);
@@ -1210,6 +1304,9 @@ impl Parser {
                 | "serial"
                 | "smallserial"
                 | "bigserial"
+                | "serial2"
+                | "serial4"
+                | "serial8"
                 | "real"
                 | "float4"
                 | "float8"
@@ -1597,6 +1694,8 @@ impl Parser {
             let _ = self.eat_keyword("temporary") || self.eat_keyword("temp");
             false
         };
+        // v2.16: CREATE UNLOGGED TABLE (PG19).
+        let unlogged = !temp && self.eat_keyword("unlogged");
         self.expect_keyword("table")?;
         // v0.48: CTAS accepts IF NOT EXISTS (PG19 CreateStmt).
         let if_not_exists = if self.eat_keyword("if") {
@@ -1626,6 +1725,7 @@ impl Parser {
             let base = tname.rsplit('.').next().unwrap_or(&tname).to_string();
             let mut def = TableDef::empty();
             def.of_type = Some(base);
+            def.unlogged = unlogged;
             return Ok(Stmt::CreateTable { name, def, temp });
         }
         // v0.48: `CREATE TABLE name AS <query>` (CTAS) versus the
@@ -1688,6 +1788,7 @@ impl Parser {
             }
         }
         let mut def = build_table_def(&name, items, &inherits)?;
+        def.unlogged = unlogged;
         def.inherits = inherits;
         // v0.72: `WITH (storage_parameter = value, ...)` (PG19
         // reloptions). Parsed into the def; exec validates the
@@ -1704,12 +1805,20 @@ impl Parser {
                 parent: None,
                 bound: None,
             });
-            // v1.97: PG19 — not-null constraints on partitioned
-            // tables cannot be NO INHERIT.
-            if def.checks.iter().any(|c| c.no_inherit) {
-                return Err(err(
-                    "not-null constraints on partitioned tables cannot be NO INHERIT".to_string(),
-                ));
+            // v1.97/v2.16: PG19 parse_utilcmd — NOT NULL
+            // constraints on partitioned tables cannot be NO
+            // INHERIT (0A000). Plain CHECKs are a different rule
+            // (StoreRelCheck 42P16), enforced at exec.
+            if def
+                .checks
+                .iter()
+                .any(|c| c.no_inherit && c.kind == crate::sql::CheckKind::NotNull)
+            {
+                return Err(SqlError {
+                    message: "not-null constraints on partitioned tables cannot be NO INHERIT"
+                        .to_string(),
+                    code: "0A000",
+                });
             }
         }
         Ok(Stmt::CreateTable { name, def, temp })
@@ -1762,6 +1871,7 @@ impl Parser {
             deferred_not_null: Vec::new(),
             of_type: None,
             gen_cols: Vec::new(),
+            unlogged: false,
         };
         Ok(Stmt::CreateTable { name, def, temp })
     }
@@ -1985,6 +2095,14 @@ impl Parser {
     /// `name type [column constraints...]`.
     pub(crate) fn parse_column_def(&mut self) -> Result<ParsedColDef, SqlError> {
         let name = self.expect_ident()?;
+        // v2.16: PG19 heap.c — a column named like a system column
+        // is 42701 (both CREATE TABLE and ADD COLUMN parse here).
+        if crate::sql::is_system_column_name(&name) {
+            return Err(err_duplicate(format!(
+                "column name \"{}\" conflicts with a system column name",
+                name
+            )));
+        }
         // v0.65: detect the serial pseudo-types from the raw type name
         // before it resolves to a plain ColType (the marker drives
         // backing-sequence creation in exec).
@@ -1993,6 +2111,10 @@ impl Parser {
                 "serial" => Some(SerialKind::Serial),
                 "smallserial" => Some(SerialKind::SmallSerial),
                 "bigserial" => Some(SerialKind::BigSerial),
+                // v2.16: numeric serial aliases (see parse_col_type).
+                "serial2" => Some(SerialKind::SmallSerial),
+                "serial4" => Some(SerialKind::Serial),
+                "serial8" => Some(SerialKind::BigSerial),
                 _ => None,
             },
             _ => None,
@@ -2011,6 +2133,64 @@ impl Parser {
         } else {
             None
         };
+        // v2.16: PG19 ColConstraint grammar also allows COLLATE
+        // <name> and STORAGE <mode> between the type and the
+        // constraints proper. Neither is modeled (no collation or
+        // per-column storage state), but PG's validity rules are
+        // enforced: COLLATE on an uncollatable type is 42804
+        // (parse_type.c) and a non-PLAIN storage mode on a
+        // non-toastable type is 0A000 (tablecmds.c
+        // checkStorageMode, shared by CREATE and ALTER).
+        let mut collate_seen = false;
+        let mut storage_mode: Option<String> = None;
+        while let Token::Ident(s) = self.peek().clone() {
+            match s.as_str() {
+                "collate" => {
+                    self.next();
+                    collate_seen = true;
+                    // Collation name may be qualified or quoted.
+                    let _ = self.parse_table_name()?;
+                }
+                "storage" => {
+                    self.next();
+                    storage_mode = Some(self.expect_ident()?);
+                }
+                _ => break,
+            }
+        }
+        if collate_seen && !col_type_collatable(&col_type, composite_name.as_deref()) {
+            return Err(SqlError {
+                message: format!(
+                    "collations are not supported by type {}",
+                    col_type_pg_name(&col_type, composite_name.as_deref())
+                ),
+                code: "42804",
+            });
+        }
+        if let Some(mode) = &storage_mode {
+            let m = mode.to_ascii_lowercase();
+            if !matches!(
+                m.as_str(),
+                "plain" | "extended" | "external" | "main" | "default"
+            ) {
+                return Err(SqlError {
+                    message: format!("invalid storage type \"{}\"", mode),
+                    code: "22023",
+                });
+            }
+            if m != "plain"
+                && m != "default"
+                && !col_type_toastable(&col_type, composite_name.as_deref())
+            {
+                return Err(SqlError {
+                    message: format!(
+                        "column data type {} can only have storage PLAIN",
+                        col_type_pg_name(&col_type, composite_name.as_deref())
+                    ),
+                    code: "0A000",
+                });
+            }
+        }
         // v0.41: PG19 `opt_column_compression` sits between the type
         // name and the column constraints.
         let compression = if self.eat_keyword("compression") {
@@ -2059,8 +2239,8 @@ impl Parser {
                 let e = self.parse_or()?;
                 self.expect(Token::RParen, "')'")?;
                 validate_constraint_expr(&e, "CHECK")?;
-                let (nv, enf) = self.parse_check_attrs()?;
-                cons.push(ColCon::Check(cname, e, nv, enf));
+                let (nv, enf, noinh) = self.parse_check_attrs_full()?;
+                cons.push(ColCon::Check(cname, e, nv, enf, noinh));
             } else if self.eat_keyword("references") {
                 let tail = self.parse_fk_tail()?;
                 cons.push(ColCon::References { name: cname, tail });
@@ -2160,8 +2340,8 @@ impl Parser {
             let e = self.parse_or()?;
             self.expect(Token::RParen, "')'")?;
             validate_constraint_expr(&e, "CHECK")?;
-            let (nv, enf) = self.parse_check_attrs()?;
-            Ok(ParsedTableCon::Check(cname, e, nv, enf))
+            let (nv, enf, noinh) = self.parse_check_attrs_full()?;
+            Ok(ParsedTableCon::Check(cname, e, nv, enf, noinh))
         } else if self.eat_keyword("foreign") {
             self.expect_keyword("key")?;
             let cols = self.parse_col_name_list()?;
@@ -2487,12 +2667,13 @@ impl Parser {
         Ok((deferrable, initially_deferred))
     }
 
-    /// v2.06: trailing CHECK-constraint attributes (PG19
-    /// ConstraintAttributeSpec subset): NOT VALID and [NOT] ENFORCED,
-    /// in any order. Returns (not_valid, enforced).
-    pub(crate) fn parse_check_attrs(&mut self) -> Result<(bool, bool), SqlError> {
+    /// v2.16: full CHECK attribute tail: NOT VALID / [NOT] ENFORCED /
+    /// NO INHERIT in any order. Returns (not_valid, enforced,
+    /// no_inherit).
+    pub(crate) fn parse_check_attrs_full(&mut self) -> Result<(bool, bool, bool), SqlError> {
         let mut not_valid = false;
         let mut enforced = true;
+        let mut no_inherit = false;
         loop {
             if self.eat_keyword("not") {
                 if self.eat_keyword("valid") {
@@ -2504,13 +2685,16 @@ impl Parser {
                         "syntax error: expected VALID or ENFORCED after NOT".to_string()
                     ));
                 }
+            } else if self.eat_keyword("no") {
+                self.expect_keyword("inherit")?;
+                no_inherit = true;
             } else if self.eat_keyword("enforced") {
                 enforced = true;
             } else {
                 break;
             }
         }
-        Ok((not_valid, enforced))
+        Ok((not_valid, enforced, no_inherit))
     }
 
     /// v2.15: an FK action, plus the optional SET NULL/DEFAULT
@@ -2584,6 +2768,67 @@ impl Parser {
             actions,
             if_exists,
             only,
+        })
+    }
+
+    /// v2.16: `ALTER INDEX [IF EXISTS] name <action>` (PG19):
+    /// RENAME TO / ALTER COLUMN n SET STATISTICS t /
+    /// SET (reloptions) / RESET (names) / SET TABLESPACE ts /
+    /// ATTACH PARTITION child.
+    pub(crate) fn parse_alter_index(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("index")?;
+        let if_exists = if self.eat_keyword("if") {
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_table_name()?;
+        let action = if self.eat_keyword("rename") {
+            self.expect_keyword("to")?;
+            AlterIndexAction::RenameTo {
+                new_name: self.expect_ident()?,
+            }
+        } else if self.eat_keyword("alter") {
+            self.eat_keyword("column");
+            let column = self.expect_u32()?;
+            self.expect_keyword("set")?;
+            self.expect_keyword("statistics")?;
+            let target = self.parse_signed_i64()?;
+            AlterIndexAction::SetStatistics {
+                column,
+                target: target as i32,
+            }
+        } else if self.eat_keyword("set") {
+            if *self.peek() == Token::LParen {
+                AlterIndexAction::SetOptions {
+                    options: self.parse_reloptions_lenient()?,
+                }
+            } else {
+                self.expect_keyword("tablespace")?;
+                AlterIndexAction::SetTablespace {
+                    tablespace: self.expect_ident()?,
+                }
+            }
+        } else if self.eat_keyword("reset") {
+            AlterIndexAction::ResetOptions {
+                options: self.parse_reloption_names_strict()?,
+            }
+        } else if self.eat_keyword("attach") {
+            self.expect_keyword("partition")?;
+            AlterIndexAction::AttachPartition {
+                child: self.parse_table_name()?,
+            }
+        } else {
+            return Err(err(
+                "syntax error: expected RENAME, ALTER COLUMN, SET, RESET or ATTACH in ALTER INDEX"
+                    .to_string(),
+            ));
+        };
+        Ok(Stmt::AlterIndex {
+            name,
+            if_exists,
+            action,
         })
     }
 
@@ -2916,9 +3161,44 @@ impl Parser {
             });
         }
         // v0.37: ALTER TABLE name SET (opt = val, ...) — reloptions.
+        // v2.16: SET SCHEMA / SET LOGGED / SET UNLOGGED /
+        // SET WITHOUT CLUSTER / SET WITHOUT OIDS (PG19).
         if self.eat_keyword("set") {
-            let options = self.parse_reloptions()?;
+            if self.eat_keyword("schema") {
+                let schema = self.expect_ident()?;
+                return Ok(AlterAction::SetSchema { schema });
+            }
+            if self.eat_keyword("logged") {
+                return Ok(AlterAction::SetLogged { logged: true });
+            }
+            if self.eat_keyword("unlogged") {
+                return Ok(AlterAction::SetLogged { logged: false });
+            }
+            if self.eat_keyword("without") {
+                if self.eat_keyword("cluster") {
+                    return Ok(AlterAction::ClusterOn { index: None });
+                }
+                self.expect_keyword("oids")?;
+                // PG19: SET WITHOUT OIDS is a no-op when the table
+                // has no oid column (always true here — oid is not
+                // a system column in this engine).
+                return Ok(AlterAction::SetRelOptions {
+                    options: Vec::new(),
+                });
+            }
+            let options = self.parse_reloptions_lenient()?;
             return Ok(AlterAction::SetRelOptions { options });
+        }
+        // v2.16: ALTER TABLE name RESET (opt, ...) (PG19).
+        if self.eat_keyword("reset") {
+            let options = self.parse_reloption_names_strict()?;
+            return Ok(AlterAction::ResetRelOptions { options });
+        }
+        // v2.16: ALTER TABLE name CLUSTER ON index_name (PG19).
+        if self.eat_keyword("cluster") {
+            self.expect_keyword("on")?;
+            let index = self.expect_ident()?;
+            return Ok(AlterAction::ClusterOn { index: Some(index) });
         }
         // v1.97: ALTER TABLE name VALIDATE CONSTRAINT cname (PG19).
         if self.eat_keyword("validate") {
@@ -2932,6 +3212,14 @@ impl Parser {
                 return self.parse_alter_add_constraint();
             }
             self.eat_keyword("column");
+            // v2.16: ADD [COLUMN] IF NOT EXISTS col type (PG19).
+            let if_not_exists = if self.eat_keyword("if") {
+                self.expect_keyword("not")?;
+                self.expect_keyword("exists")?;
+                true
+            } else {
+                false
+            };
             let col = self.parse_column_def()?;
             let mut not_null = false;
             let mut default = None;
@@ -2982,13 +3270,13 @@ impl Parser {
                             code: "0A000",
                         });
                     }
-                    ColCon::Check(n, e, nv, enf) => checks.push(CheckDef {
+                    ColCon::Check(n, e, nv, enf, noinh) => checks.push(CheckDef {
                         name: n
                             .unwrap_or_else(|| format!("{}_check_{}", col.name, checks.len() + 1)),
                         expr: e,
                         not_valid: nv,
                         kind: CheckKind::Check,
-                        no_inherit: false,
+                        no_inherit: noinh,
                         enforced: enf,
                     }),
                     ColCon::References { name: n, tail } => fks.push(tail.into_fk(
@@ -2999,6 +3287,7 @@ impl Parser {
             }
             return Ok(AlterAction::AddColumn {
                 name: col.name,
+                if_not_exists,
                 col_type: col.col_type,
                 named_type: col.composite_name,
                 bit_typmod: col.bit_typmod,
@@ -3013,20 +3302,34 @@ impl Parser {
             });
         }
         if self.eat_keyword("drop") {
+            // v2.16: DROP CONSTRAINT IF EXISTS / DROP [COLUMN]
+            // IF EXISTS / DROP IF EXISTS (PG19).
+            let parse_if_exists = |p: &mut Self| -> Result<bool, SqlError> {
+                if p.eat_keyword("if") {
+                    p.expect_keyword("exists")?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            };
             if self.eat_keyword("constraint") {
+                let if_exists = parse_if_exists(self)?;
                 let cname = self.expect_ident()?;
                 let cascade = self.parse_cascade_opt()?;
                 return Ok(AlterAction::DropConstraint {
                     name: cname,
                     cascade,
+                    if_exists,
                 });
             }
             self.eat_keyword("column");
+            let if_exists = parse_if_exists(self)?;
             let cname = self.expect_ident()?;
             let cascade = self.parse_cascade_opt()?;
             return Ok(AlterAction::DropColumn {
                 name: cname,
                 cascade,
+                if_exists,
             });
         }
         if self.eat_keyword("alter") {
@@ -3130,6 +3433,24 @@ impl Parser {
                     self.expect_keyword("null")?;
                     return Ok(AlterAction::AlterColumnSetNotNull { name: cname });
                 }
+                // v2.16: ALTER COLUMN c SET STATISTICS n (PG19).
+                if self.eat_keyword("statistics") {
+                    let target = self.parse_signed_i64()?;
+                    return Ok(AlterAction::AlterColumnSetStatistics {
+                        name: cname,
+                        target: target as i32,
+                    });
+                }
+                // v2.16: ALTER COLUMN c SET (opt = val, ...) (PG19
+                // per-column reloptions, e.g. n_distinct).
+                if *self.peek() == Token::LParen {
+                    let options = self.parse_reloptions_lenient()?;
+                    return Ok(AlterAction::AlterColumnSetOptions {
+                        name: cname,
+                        options,
+                        reset: false,
+                    });
+                }
                 // v0.37: ALTER COLUMN c SET STORAGE mode
                 if self.eat_keyword("storage") {
                     let mode = self.expect_ident()?;
@@ -3190,11 +3511,27 @@ impl Parser {
                 self.expect_keyword("default")?;
                 return Ok(AlterAction::AlterColumnDropDefault { name: cname });
             }
+            // v2.16: ALTER COLUMN c RESET (opt, ...) (PG19).
+            if self.eat_keyword("reset") {
+                let options = self.parse_reloptions_lenient()?;
+                return Ok(AlterAction::AlterColumnSetOptions {
+                    name: cname,
+                    options,
+                    reset: true,
+                });
+            }
             return Err(err(
                 "syntax error: expected SET DEFAULT or DROP DEFAULT".to_string()
             ));
         }
         if self.eat_keyword("rename") {
+            // v2.16: RENAME CONSTRAINT old TO new (PG19).
+            if self.eat_keyword("constraint") {
+                let old = self.expect_ident()?;
+                self.expect_keyword("to")?;
+                let new = self.expect_ident()?;
+                return Ok(AlterAction::RenameConstraint { old, new });
+            }
             if self.eat_keyword("column") {
                 let old = self.expect_ident()?;
                 self.expect_keyword("to")?;
@@ -3274,13 +3611,13 @@ impl Parser {
                 fk: None,
                 notnull: None,
             }),
-            ParsedTableCon::Check(name, e, nv, enf) => Ok(AlterAction::AddConstraint {
+            ParsedTableCon::Check(name, e, nv, enf, noinh) => Ok(AlterAction::AddConstraint {
                 check: Some(CheckDef {
                     name: name.unwrap_or_default(),
                     expr: e,
                     not_valid: nv,
                     kind: CheckKind::Check,
-                    no_inherit: false,
+                    no_inherit: noinh,
                     enforced: enf,
                 }),
                 unique: None,
@@ -5098,6 +5435,18 @@ impl Parser {
             self.next();
             let name = self.expect_ident()?;
             self.expect_keyword("on")?;
+            // v2.16: COMMENT ON CONSTRAINT name ON DOMAIN dom IS ...
+            if matches!(self.peek(), Token::Ident(s) if s == "domain") {
+                self.next();
+                let dom = self.parse_table_name()?;
+                let comment = self.parse_comment_text()?;
+                return Ok(Stmt::CommentOn {
+                    target: "constraint".to_string(),
+                    name,
+                    sub: Some(dom),
+                    comment,
+                });
+            }
             let table = self.parse_table_name()?;
             self.expect_keyword("is")?;
             match self.peek().clone() {
@@ -5114,6 +5463,12 @@ impl Parser {
                 }
             }
             return Ok(Stmt::CommentOnConstraint { name, table });
+        }
+        // v2.16: the general COMMENT ON family (PG19 CommentStmt) —
+        // everything except TRIGGER / CONSTRAINT / PUBLICATION,
+        // which keep their dedicated branches above.
+        if let Some(stmt) = self.try_parse_comment_generic()? {
+            return Ok(stmt);
         }
         self.expect_keyword("publication")?;
         let name = self.expect_ident()?;
@@ -5134,6 +5489,184 @@ impl Parser {
             }
         };
         Ok(Stmt::CommentPublication { name, comment })
+    }
+
+    /// v2.16: `IS 'text' | NULL` tail of a COMMENT ON statement.
+    pub(crate) fn parse_comment_text(&mut self) -> Result<Option<String>, SqlError> {
+        self.expect_keyword("is")?;
+        match self.next() {
+            Token::Str(v) => Ok(Some(v)),
+            Token::Ident(s) if s == "null" => Ok(None),
+            _ => Err(err(
+                "syntax error: expected string literal or NULL".to_string()
+            )),
+        }
+    }
+
+    /// v2.16: COMMENT ON for the general object family. Returns
+    /// Ok(None) (consuming nothing) when the next token does not
+    /// start a target this branch handles, so the PUBLICATION
+    /// branch above can proceed.
+    pub(crate) fn try_parse_comment_generic(&mut self) -> Result<Option<Stmt>, SqlError> {
+        let first = match self.peek().clone() {
+            Token::Ident(s) => s,
+            _ => return Ok(None),
+        };
+        let simple = [
+            "table",
+            "index",
+            "column",
+            "view",
+            "sequence",
+            "type",
+            "domain",
+            "role",
+            "statistics",
+            "collation",
+            "conversion",
+            "schema",
+            "database",
+            "server",
+            "subscription",
+            "extension",
+            "language",
+            "policy",
+        ];
+        let target: String;
+        if simple.contains(&first.as_str()) {
+            self.next();
+            target = first.clone();
+        } else if first == "materialized" {
+            self.next();
+            self.expect_keyword("view")?;
+            target = "view".to_string();
+        } else if first == "event" {
+            self.next();
+            self.expect_keyword("trigger")?;
+            target = "event_trigger".to_string();
+        } else if first == "foreign" {
+            self.next();
+            if self.eat_keyword("table") {
+                target = "foreign_table".to_string();
+            } else {
+                self.expect_keyword("data")?;
+                self.expect_keyword("wrapper")?;
+                target = "fdw".to_string();
+            }
+        } else if first == "text" {
+            self.next();
+            self.expect_keyword("search")?;
+            let kind = self.expect_ident()?;
+            target = format!("text_search_{}", kind);
+        } else if first == "large" {
+            self.next();
+            self.expect_keyword("object")?;
+            target = "large_object".to_string();
+        } else if first == "function" || first == "procedure" || first == "aggregate" {
+            self.next();
+            target = first.clone();
+            let name = self.parse_table_name()?;
+            // Optional argument list: capture its raw token text.
+            let mut sub = None;
+            if *self.peek() == Token::LParen {
+                self.next();
+                let mut depth = 1i32;
+                let mut parts: Vec<String> = Vec::new();
+                while depth > 0 {
+                    match self.next() {
+                        Token::LParen => {
+                            depth += 1;
+                            parts.push("(".to_string());
+                        }
+                        Token::RParen => {
+                            depth -= 1;
+                            if depth > 0 {
+                                parts.push(")".to_string());
+                            }
+                        }
+                        Token::Ident(s) | Token::QIdent(s) | Token::Number(s) => parts.push(s),
+                        Token::Comma => parts.push(",".to_string()),
+                        Token::Star => parts.push("*".to_string()),
+                        _ => {}
+                    }
+                }
+                sub = Some(parts.join(" "));
+            }
+            let comment = self.parse_comment_text()?;
+            return Ok(Some(Stmt::CommentOn {
+                target,
+                name,
+                sub,
+                comment,
+            }));
+        } else if first == "rule" {
+            self.next();
+            let name = self.expect_ident()?;
+            self.expect_keyword("on")?;
+            let table = self.parse_table_name()?;
+            let comment = self.parse_comment_text()?;
+            return Ok(Some(Stmt::CommentOn {
+                target: "rule".to_string(),
+                name,
+                sub: Some(table),
+                comment,
+            }));
+        } else if first == "constraint" {
+            // Handled by the dedicated branch above; unreachable.
+            return Ok(None);
+        } else {
+            return Ok(None);
+        }
+        // Targets whose name is a single (possibly qualified) name.
+        if target == "large_object" {
+            // LARGE OBJECT <oid>: a number (psql variables are
+            // substituted by the harness before we see them).
+            let name = match self.next() {
+                Token::Number(n) => n,
+                Token::Ident(s) | Token::QIdent(s) => s,
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected large object OID, found {:?}",
+                        other
+                    )));
+                }
+            };
+            let comment = self.parse_comment_text()?;
+            return Ok(Some(Stmt::CommentOn {
+                target,
+                name,
+                sub: None,
+                comment,
+            }));
+        }
+        if target == "column" {
+            // COLUMN table.column (the table may be qualified):
+            // split the dotted name at its LAST dot.
+            let dotted = self.parse_table_name()?;
+            let (table, col) = match dotted.rsplit_once('.') {
+                Some((t, c)) => (t.to_string(), c.to_string()),
+                None => {
+                    return Err(err(
+                        "syntax error: expected table.column in COMMENT ON COLUMN".to_string(),
+                    ));
+                }
+            };
+            let comment = self.parse_comment_text()?;
+            return Ok(Some(Stmt::CommentOn {
+                target,
+                name: table,
+                sub: Some(col),
+                comment,
+            }));
+        }
+        let name = self.parse_table_name()?;
+        let comment = self.parse_comment_text()?;
+        Ok(Some(Stmt::CommentOn {
+            target,
+            name,
+            sub: None,
+            comment,
+        }))
     }
 
     /// v2.02: `ALTER PUBLICATION name ...`.
@@ -6633,6 +7166,7 @@ impl Parser {
                     volatility: FuncVolatility::Volatile,
                     owner: Some(new_owner),
                     security: None,
+                    set_schema: None,
                 });
             }
             return Err(err(
@@ -6684,6 +7218,20 @@ impl Parser {
                 volatility: FuncVolatility::Volatile,
                 owner: Some(new_owner),
                 security: None,
+                set_schema: None,
+            });
+        }
+        // v2.16: ALTER FUNCTION name(args) SET SCHEMA new_schema.
+        if self.eat_keyword("set") {
+            self.expect_keyword("schema")?;
+            let schema = self.expect_ident()?;
+            return Ok(Stmt::AlterFunction {
+                name,
+                arg_types,
+                volatility: FuncVolatility::Volatile,
+                owner: None,
+                security: None,
+                set_schema: Some(schema),
             });
         }
         // v2.09: SECURITY DEFINER|INVOKER (PG19 AlterFunctionStmt).
@@ -6703,6 +7251,7 @@ impl Parser {
                 volatility: FuncVolatility::Volatile,
                 owner: None,
                 security: Some(definer),
+                set_schema: None,
             });
         }
         let volatility = if self.eat_keyword("immutable") {
@@ -6725,6 +7274,7 @@ impl Parser {
             volatility,
             owner: None,
             security: None,
+            set_schema: None,
         })
     }
 
@@ -11858,6 +12408,8 @@ impl Parser {
     }
 
     pub(crate) fn parse_update(&mut self) -> Result<Stmt, SqlError> {
+        // v2.16: UPDATE ONLY t — consumed like DELETE's ONLY.
+        let _only = self.eat_keyword("only");
         // v2.15: schema-qualified target (UPDATE fkpart10.tbl1 ...).
         let table = self.parse_table_name()?;
         // v0.76: `UPDATE t AS x` / `UPDATE t x` (PG's alias clause).
@@ -12073,7 +12625,18 @@ impl Parser {
 
     pub(crate) fn parse_delete(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("from")?;
+        // v2.16: DELETE FROM ONLY t / FROM (t) — ONLY restricts to
+        // the named table; this engine's DELETE already scans only
+        // the target table's own rows, so it is consumed.
+        let _only = self.eat_keyword("only");
+        let paren = *self.peek() == Token::LParen;
+        if paren {
+            self.next();
+        }
         let table = self.expect_ident()?;
+        if paren {
+            self.expect(Token::RParen, "')'")?;
+        }
         // v0.65: `DELETE FROM t AS dt` / `DELETE FROM t dt` (PG's alias
         // clause; the alias becomes the visible qualifier).
         let alias = self.parse_alias_opt()?;

@@ -290,11 +290,13 @@ fn v113_tableoid_group_by_plain() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0], vec!["gp1".to_string(), "2".to_string()]);
     assert_eq!(rows[1], vec!["gp2".to_string(), "1".to_string()]);
-    // A user column named tableoid shadows the system column (PG19).
-    run(&mut eng, "CREATE TABLE st (tableoid text);").unwrap();
-    run(&mut eng, "INSERT INTO st VALUES ('mine');").unwrap();
-    let r = run(&mut eng, "SELECT tableoid FROM st;").unwrap();
-    assert_eq!(rows_of(r)[0][0], "mine");
+    // v2.16 correction: PG19 heap.c CheckAttributeNames forbids
+    // creating a column with a system column name (42701) — the
+    // pre-v2.16 "user column shadows the system column" behavior
+    // asserted here was wrong; the vendored alter_table suite
+    // expects the error.
+    let err = run(&mut eng, "CREATE TABLE st (tableoid text);").unwrap_err();
+    assert_eq!(err.code, "42701");
 }
 
 /// v1.13: `pg_size_pretty(bigint)` formatting (PG19 misc.c thresholds).
@@ -439,11 +441,10 @@ fn v117_xmin_ambiguous_and_shadowed() {
     run(&mut eng, "INSERT INTO xa VALUES (1);").unwrap();
     let err = run(&mut eng, "SELECT xmin FROM xa p, xa q;").unwrap_err();
     assert_eq!(err.code, "42702");
-    // A user column named xmin shadows the system column.
-    run(&mut eng, "CREATE TABLE xsh (xmin int);").unwrap();
-    run(&mut eng, "INSERT INTO xsh VALUES (42);").unwrap();
-    let r = run(&mut eng, "SELECT xmin FROM xsh;").unwrap();
-    assert_eq!(rows_of(r), vec![vec!["42".to_string()]]);
+    // v2.16 correction: as with tableoid above, PG19 forbids a
+    // user column named xmin (42701, heap.c CheckAttributeNames).
+    let err = run(&mut eng, "CREATE TABLE xsh (xmin int);").unwrap_err();
+    assert_eq!(err.code, "42701");
 }
 
 /// v1.17: `xmax` reflects the deleting transaction — after DELETE,

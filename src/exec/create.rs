@@ -26,7 +26,29 @@ pub(crate) fn exec_create(
     }
     // v2.03: generation expressions are validated at CREATE (PG19
     // cookDefault): immutable, own non-generated columns only.
-    validate_generated_columns(eng, def)?;
+    // v2.16: with INHERITS, PG validates against the MERGED column
+    // set — a child's own generation expression may reference
+    // inherited columns (the gtest1_y conflict-resolution form).
+    if def.inherits.is_empty() {
+        validate_generated_columns(eng, def)?;
+    } else {
+        let mut ext = def.clone();
+        for parent_name in &def.inherits {
+            if let Some(parent) =
+                eng.db
+                    .find_table(parent_name, ctx.snap, &ctx.all_xids, ctx.session)
+            {
+                for (i, (cn, ct)) in parent.columns.iter().enumerate() {
+                    if !ext.columns.iter().any(|(n, _)| n.eq_ignore_ascii_case(cn)) {
+                        ext.columns.push((cn.clone(), ct.clone()));
+                        ext.gen_cols
+                            .push(parent.gen_cols.get(i).cloned().unwrap_or(None));
+                    }
+                }
+            }
+        }
+        validate_generated_columns(eng, &ext)?;
+    }
     // v1.96 finishing pass: PG19 schema guards for CREATE TABLE:
     // system catalog tables need allow_system_table_mods, and a
     // TEMP table cannot be explicitly placed in a non-temp schema.
@@ -43,6 +65,26 @@ pub(crate) fn exec_create(
                 "cannot create temporary relation in non-temporary schema".to_string(),
             ));
         }
+        // v2.16: PG19 namespace.c — an UNLOGGED relation in a
+        // temporary schema is rejected (42P16 "only temporary
+        // relations may be created in temporary schemas"): its
+        // persistence is neither temp nor permanent-in-place.
+        // (A plain CREATE TABLE pg_temp.x is implicitly temp in
+        // PG and passes in this engine as a literal-named table.)
+        if !temp && schema == "pg_temp" && def.unlogged {
+            return Err(exec_err(
+                "42P16",
+                "only temporary relations may be created in temporary schemas".to_string(),
+            ));
+        }
+    }
+    // v2.16: PG19 DefineRelation — partitioned tables cannot be
+    // unlogged (0A000).
+    if def.unlogged && def.partition.as_ref().is_some_and(|p| p.parent.is_none()) {
+        return Err(exec_err(
+            "0A000",
+            "partitioned tables cannot be unlogged".to_string(),
+        ));
     }
     // v1.96: typed tables (`CREATE TABLE name OF type`) — expand the
     // composite type's fields into the column list (USAGE on the
@@ -100,7 +142,64 @@ pub(crate) fn exec_create(
     // v0.70: use the effective definition (PARTITION OF inherits the
     // parent's constraints into the cloned def) for the backing indexes,
     // so inherited PRIMARY KEY / UNIQUE constraints get their indexes.
+    // v2.16: PG19 AddRelationNewConstraints — a local CHECK whose
+    // name matches an INHERITED constraint: identical definitions
+    // merge, except a NO INHERIT local def is 42P17; a different
+    // definition is 42710.
+    if !def.inherits.is_empty() {
+        for lc in def.checks.iter().filter(|c| !c.name.is_empty()) {
+            for parent_name in &def.inherits {
+                let Some(parent) =
+                    eng.db
+                        .find_table(parent_name, ctx.snap, &ctx.all_xids, ctx.session)
+                else {
+                    continue;
+                };
+                for pc in parent.checks.iter().filter(|c| c.name == lc.name) {
+                    if format!("{:?}", pc.expr) == format!("{:?}", lc.expr) {
+                        if lc.no_inherit {
+                            return Err(exec_err(
+                                "42P17",
+                                format!(
+                                    "constraint \"{}\" conflicts with inherited constraint on relation \"{}\"",
+                                    lc.name, name
+                                ),
+                            ));
+                        }
+                    } else {
+                        return Err(exec_err(
+                            "42710",
+                            format!(
+                                "constraint \"{}\" for relation \"{}\" already exists",
+                                lc.name, name
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
     let eff_def = create_table_from_def(eng, ctx, name, def, temp)?;
+    // v2.16: PG19 StoreRelCheck — NO INHERIT constraints cannot
+    // land on a partitioned table (42P16), whether written inline
+    // or copied in via LIKE. Checked on the created table (the
+    // statement abort rolls the creation back).
+    if let Some(created) = eng
+        .db
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+    {
+        if created.partition.as_ref().is_some_and(|p| p.is_partitioned)
+            && created.checks.iter().any(|c| c.no_inherit)
+        {
+            return Err(exec_err(
+                "42P16",
+                format!(
+                    "cannot add NO INHERIT constraint to partitioned table \"{}\"",
+                    name
+                ),
+            ));
+        }
+    }
     if let Some(tname) = &typed_of {
         eng.db.typed_tables.insert(name.to_string(), tname.clone());
     }
@@ -185,6 +284,11 @@ pub(crate) fn exec_create(
         for u in &eff_def.uniques {
             create_constraint_index(eng, ctx, name, &u.name, &u.cols, true, u.nulls_not_distinct)?;
         }
+    }
+    // v2.16: record UNLOGGED creations for the SET LOGGED /
+    // SET UNLOGGED prep checks.
+    if def.unlogged && !temp {
+        eng.db.unlogged_tables.insert(name.to_string());
     }
     Ok(ExecResult::Command {
         tag: "CREATE TABLE".to_string(),

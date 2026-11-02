@@ -55,6 +55,57 @@ pub(crate) fn exec_create_view(
     };
     // v1.96: USAGE on cast targets in the view query (PG19).
     check_select_cast_usages(eng, ctx, &select)?;
+    // v2.16: PG19 checkViewColumns — OR REPLACE may append columns
+    // but cannot drop them, rename them, or change a column's type
+    // (incl. typmod) or collation (all 42P16). Lenient when either
+    // side's output shape cannot be described.
+    if existing && or_replace {
+        if let Some(old_view) = eng.db.find_view(name, ctx.snap, ctx.own).cloned() {
+            if let Ok(old_stmt) = parse_statement(&old_view.query) {
+                if let Stmt::Select(old_select) = old_stmt {
+                    let described = (
+                        describe_select(eng, ctx.snap, ctx.own, ctx.session, &old_select, &[], &[]),
+                        describe_select(eng, ctx.snap, ctx.own, ctx.session, &select, &[], &[]),
+                    );
+                    if let (Ok(mut old_cols), Ok(mut new_cols)) = described {
+                        for (i, a) in old_view.col_aliases.iter().enumerate() {
+                            if let Some(c) = old_cols.get_mut(i) {
+                                c.0 = a.clone();
+                            }
+                        }
+                        for (i, a) in col_aliases.iter().enumerate() {
+                            if let Some(c) = new_cols.get_mut(i) {
+                                c.0 = a.clone();
+                            }
+                        }
+                        if new_cols.len() < old_cols.len() {
+                            return Err(exec_err(
+                                "42P16",
+                                "cannot drop columns from view".to_string(),
+                            ));
+                        }
+                        for (oc, nc) in old_cols.iter().zip(new_cols.iter()) {
+                            if oc.0 != nc.0 {
+                                return Err(exec_err(
+                                    "42P16",
+                                    format!(
+                                        "cannot change name of view column \"{}\" to \"{}\"",
+                                        oc.0, nc.0
+                                    ),
+                                ));
+                            }
+                            if oc.1 != nc.1 {
+                                return Err(exec_err(
+                                    "42P16",
+                                    format!("cannot change data type of view column \"{}\"", oc.0),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     // v1.97: PG19 createas.c — more column names than the query
     // produces is a syntax error ("too many column names were
     // specified", 42601). Lenient when the output shape cannot be

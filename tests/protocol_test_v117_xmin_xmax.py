@@ -9,7 +9,7 @@ Covers (simple protocol):
 - qualified `a.xmin` / `b.xmin` across different tables pick their own
   range's row
 - unqualified `xmin` over a join -> 42702 ambiguous (like PG19)
-- user column named xmin shadows the system column
+- a column named xmin is rejected as a system column name (42701, PG19 heap.c)
 - `SELECT 123::xid` casts, and `xmax` after DELETE stays 0 for survivors
 
 Extended protocol:
@@ -188,12 +188,12 @@ def main():
         nf, oids, rows, tag, err = q(s, "select xmin from savepoints a, savepoints b limit 1;")
         check("unqualified xmin ambiguous -> 42702", err == "42702", (rows, err))
 
-        # --- user column named xmin shadows the system column ---
-        q(s, "create table shadow_x (xmin int)")
-        q(s, "insert into shadow_x values (42)")
-        nf, oids, rows, tag, err = q(s, "select xmin from shadow_x;")
-        check("user xmin column shadows system column",
-              err is None and rows == [("42",)] and oids == [23], (rows, oids, err))
+        # --- a column named xmin is a system column name ---
+        # v2.16: PG19 heap.c CheckAttributeNames rejects it (42701);
+        # the pre-v2.16 suite asserted the old shadowing behavior.
+        nf, oids, rows, tag, err = q(s, "create table shadow_x (xmin int)")
+        check("column named xmin rejected -> 42701",
+              err == "42701", (rows, oids, err))
 
         # --- xid cast ---
         nf, oids, rows, tag, err = q(s, "select 123::xid;")

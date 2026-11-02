@@ -6111,6 +6111,10 @@ pub struct Database {
     /// pg_type; deliberately not WAL/checkpoint persisted (a restart
     /// forgets them, which only narrows DDL acceptance).
     pub cluster_marks: std::collections::HashMap<String, String>,
+    /// v2.16: names of UNLOGGED tables (PG19 relpersistence 'u'),
+    /// runtime state like cluster_marks; drives the ALTER TABLE
+    /// SET LOGGED / SET UNLOGGED prep checks.
+    pub unlogged_tables: std::collections::HashSet<String>,
     pub typed_tables: std::collections::HashMap<String, String>,
     /// v2.02: publications by name (CREATE PUBLICATION), consulted by
     /// the replica-identity guard (CheckCmdReplicaIdentity).
@@ -6348,6 +6352,7 @@ impl Database {
             schema_owners: std::collections::HashMap::default(),
             obj_schema: std::collections::HashMap::default(),
             cluster_marks: std::collections::HashMap::default(),
+            unlogged_tables: std::collections::HashSet::default(),
             typed_tables: std::collections::HashMap::default(),
             publications: HashMap::default(),
             schema_acls: HashMap::default(),
@@ -6432,9 +6437,23 @@ impl Database {
 
     /// First view version with `name` visible to (`snap`, `own`).
     pub fn find_view(&self, name: &str, snap: &Snapshot, own: u64) -> Option<&ViewDef> {
-        self.views
+        if let Some(v) = self
+            .views
             .get(name)
             .and_then(|vs| vs.iter().find(|v| view_visible(v, snap, own)))
+        {
+            return Some(v);
+        }
+        // v2.16: schema fallback (see find_table).
+        if let Some((sch, base)) = name.rsplit_once('.') {
+            if self.obj_schema.get(base).map(|s| s.as_str()) == Some(sch) {
+                return self
+                    .views
+                    .get(base)
+                    .and_then(|vs| vs.iter().find(|v| view_visible(v, snap, own)));
+            }
+        }
+        None
     }
 
     /// Mutable variant of [`Database::find_view`].
@@ -6475,9 +6494,26 @@ impl Database {
         if let Some(t) = self.temp_tables.get(&session).and_then(|m| m.get(name)) {
             return Some(t);
         }
-        self.tables
+        if let Some(t) = self
+            .tables
             .get(name)
             .and_then(|vs| vs.iter().find(|t| table_visible(t, snap, owns)))
+        {
+            return Some(t);
+        }
+        // v2.16: schema fallback — a qualified reference `s.t` to a
+        // table stored under its bare name whose obj_schema
+        // attribution is exactly `s` (ALTER TABLE SET SCHEMA on an
+        // unqualified name, or CREATE SCHEMA elements stored bare).
+        if let Some((sch, base)) = name.rsplit_once('.') {
+            if self.obj_schema.get(base).map(|s| s.as_str()) == Some(sch) {
+                return self
+                    .tables
+                    .get(base)
+                    .and_then(|vs| vs.iter().find(|t| table_visible(t, snap, owns)));
+            }
+        }
+        None
     }
 
     /// Mutable variant of [`Database::find_table`].
@@ -6496,8 +6532,21 @@ impl Database {
         {
             return Some(t);
         }
+        // v2.16: schema fallback (see find_table) — resolve the
+        // storage key first so only one mutable borrow is live.
+        let key: String = if self.tables.contains_key(name) {
+            name.to_string()
+        } else if let Some((sch, base)) = name.rsplit_once('.') {
+            if self.obj_schema.get(base).map(|s| s.as_str()) == Some(sch) {
+                base.to_string()
+            } else {
+                name.to_string()
+            }
+        } else {
+            name.to_string()
+        };
         self.tables
-            .get_mut(name)
+            .get_mut(&key)
             .and_then(|vs| vs.iter_mut().find(|t| table_visible(t, snap, owns)))
     }
 

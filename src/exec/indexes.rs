@@ -407,6 +407,44 @@ pub(crate) fn exec_create_index(
 ) -> Result<ExecResult, ExecError> {
     // v0.11: indexing a table needs its owner (or a superuser).
     require_table_owner(eng, ctx, table)?;
+    // v2.16: PG19 ComputeIndexAttrs — COLLATE on an index element
+    // whose column type has no collation is 42804 (parse_type.c
+    // rule, same as column definitions).
+    {
+        if let Some(t) = eng
+            .db
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+        {
+            for c in columns.iter() {
+                if c.collate.is_none() {
+                    continue;
+                }
+                if let Some(col_name) = &c.name {
+                    if let Some((_, ct)) = t.columns.iter().find(|(n, _)| n == col_name) {
+                        let named = t
+                            .composite_types
+                            .get(
+                                t.columns
+                                    .iter()
+                                    .position(|(n, _)| n == col_name)
+                                    .unwrap_or(0),
+                            )
+                            .cloned()
+                            .flatten();
+                        if !crate::sql::col_type_collatable(ct, named.as_deref()) {
+                            return Err(exec_err(
+                                "42804",
+                                format!(
+                                    "collations are not supported by type {}",
+                                    crate::sql::col_type_pg_name(ct, named.as_deref())
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
     // v1.96: USAGE on cast targets inside index expressions and the
     // predicate (PG19 parse-time type check).
     for c in columns.iter() {
@@ -726,6 +764,266 @@ pub(crate) fn exec_create_index(
     }
     Ok(ExecResult::Command {
         tag: "CREATE INDEX".to_string(),
+    })
+}
+
+/// v2.16: `ALTER INDEX [IF EXISTS] name <action>` (PG19).
+/// RENAME is a real registry rename (Drop+Create WriteOp pair);
+/// a same-named UNIQUE/PK constraint on the index's table renames
+/// with it (PG keeps them in lockstep). Statistics targets,
+/// reloptions, tablespace and ATTACH PARTITION are validated and
+/// accepted — the planner consumes none of them, and the index
+/// registry is flat per table (no parent-index linkage is kept).
+
+/// v2.16: validate ALTER INDEX reloptions (shared SET / RESET).
+fn validate_index_reloptions(pairs: &[(String, String)]) -> Result<(), ExecError> {
+    for (opt, val) in pairs {
+        let kind = pg_reloption_kind(opt).or(match opt.as_str() {
+            "fastupdate" | "deduplicate_items" => Some("bool"),
+            "gin_pending_list_limit" => Some("int"),
+            _ => None,
+        });
+        match kind {
+            Some("bool") => {
+                if !val.is_empty() && parse_reloption_bool(val).is_none() {
+                    return Err(exec_err(
+                        "22023",
+                        format!(
+                            "invalid value for boolean reloption \"{}\": \"{}\"",
+                            opt, val
+                        ),
+                    ));
+                }
+            }
+            Some("int") => {
+                if !val.is_empty() && val.parse::<i64>().is_err() {
+                    return Err(exec_err(
+                        "22023",
+                        format!(
+                            "invalid value for integer reloption \"{}\": \"{}\"",
+                            opt, val
+                        ),
+                    ));
+                }
+            }
+            Some(_) => {
+                if !val.is_empty() && val.parse::<f64>().is_err() {
+                    return Err(exec_err(
+                        "22023",
+                        format!("invalid value for real reloption \"{}\": \"{}\"", opt, val),
+                    ));
+                }
+            }
+            None => {
+                return Err(exec_err(
+                    "22023",
+                    format!("unrecognized parameter \"{}\"", opt),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn exec_alter_index(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    if_exists: bool,
+    action: &crate::sql::AlterIndexAction,
+) -> Result<ExecResult, ExecError> {
+    use crate::sql::AlterIndexAction;
+    let found = eng
+        .db
+        .find_index(name, ctx.snap, &ctx.all_xids)
+        .cloned()
+        .or_else(|| {
+            eng.db
+                .temp_indexes
+                .get(&ctx.session)
+                .and_then(|m| m.get(name))
+                .cloned()
+        });
+    let Some(ix) = found else {
+        if if_exists {
+            return Ok(ExecResult::Command {
+                tag: "ALTER INDEX".to_string(),
+            });
+        }
+        return Err(exec_err(
+            "42P01",
+            format!("relation \"{}\" does not exist", name),
+        ));
+    };
+    match action {
+        AlterIndexAction::RenameTo { new_name } => {
+            // v2.16: PG19 ownership — renaming an index requires
+            // owning it (the parent table's owner), 42501 otherwise.
+            if let Some(parent) =
+                eng.db
+                    .find_table(&ix.def.table, ctx.snap, &ctx.all_xids, ctx.session)
+            {
+                if parent.owner != ctx.role
+                    && !crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own)
+                {
+                    return Err(exec_err(
+                        "42501",
+                        format!("must be owner of index {}", name),
+                    ));
+                }
+            }
+            if new_name != name {
+                let clash = eng
+                    .db
+                    .find_index(new_name, ctx.snap, &ctx.all_xids)
+                    .is_some()
+                    || eng
+                        .db
+                        .find_table(new_name, ctx.snap, &ctx.all_xids, ctx.session)
+                        .is_some()
+                    || eng.db.find_view(new_name, ctx.snap, ctx.own).is_some();
+                if clash {
+                    return Err(exec_err(
+                        "42P07",
+                        format!("relation \"{}\" already exists", new_name),
+                    ));
+                }
+                // Constraint lockstep: rename a same-named UNIQUE /
+                // PK constraint on the index's table first (the
+                // table swap), then the index itself.
+                let table = ix.def.table.clone();
+                if let Some(t) = eng
+                    .db
+                    .find_table(&table, ctx.snap, &ctx.all_xids, ctx.session)
+                    .cloned()
+                {
+                    let backed = t.uniques.iter().any(|u| &u.name == name)
+                        || t.pkey.as_ref().is_some_and(|p| &p.name == name);
+                    if backed {
+                        let mut next = t.clone();
+                        for u in next.uniques.iter_mut() {
+                            if &u.name == name {
+                                u.name = new_name.clone();
+                            }
+                        }
+                        if let Some(p) = next.pkey.as_mut() {
+                            if &p.name == name {
+                                p.name = new_name.clone();
+                            }
+                        }
+                        alter_swap(eng, ctx, &table, None, next, None)?;
+                    }
+                }
+                rename_index_internal(eng, ctx, name, new_name)?;
+                for v in eng.db.cluster_marks.values_mut() {
+                    if v == name {
+                        *v = new_name.clone();
+                    }
+                }
+            }
+        }
+        AlterIndexAction::SetStatistics { column, target } => {
+            // PG19 ATExecSetStatistics on an index: only expression
+            // columns carry a statistics target.
+            if *column == 0 {
+                return Err(exec_err(
+                    "42601",
+                    "column number must be in range from 1 to 32767".to_string(),
+                ));
+            }
+            if *target < -1 || *target > 10000 {
+                return Err(exec_err(
+                    "22023",
+                    format!("statistics target {} is out of range", target),
+                ));
+            }
+            let ncols = ix.def.col_names.len() as u32;
+            if *column > ncols {
+                return Err(exec_err(
+                    "42703",
+                    format!(
+                        "column number {} of relation \"{}\" does not exist",
+                        column, name
+                    ),
+                ));
+            }
+            let ci = (*column as usize) - 1;
+            if ix.def.exprs.get(ci).cloned().flatten().is_none() {
+                return Err(exec_err(
+                    "0A000",
+                    format!(
+                        "cannot alter statistics on non-expression column \"{}\" of index \"{}\"",
+                        ix.def.col_names.get(ci).cloned().unwrap_or_default(),
+                        name
+                    ),
+                ));
+            }
+        }
+        AlterIndexAction::SetOptions { options } => {
+            validate_index_reloptions(options)?;
+        }
+        AlterIndexAction::ResetOptions { options } => {
+            let pairs: Vec<(String, String)> =
+                options.iter().map(|o| (o.clone(), String::new())).collect();
+            validate_index_reloptions(&pairs)?;
+        }
+        AlterIndexAction::SetTablespace { .. } => {
+            // Tablespaces are not modeled as storage locations in
+            // this engine; accepted (PG validates the tablespace
+            // exists — the built-in pg_default/pg_global and any
+            // CREATE TABLESPACE name are not tracked for indexes).
+        }
+        AlterIndexAction::AttachPartition { child } => {
+            let child_found = eng.db.find_index(child, ctx.snap, &ctx.all_xids).is_some()
+                || eng
+                    .db
+                    .temp_indexes
+                    .get(&ctx.session)
+                    .is_some_and(|m| m.contains_key(child));
+            if !child_found {
+                return Err(exec_err(
+                    "42P01",
+                    format!("relation \"{}\" does not exist", child),
+                ));
+            }
+            // v2.16: PG19 AttachPartitionIndex — when the parent
+            // index backs a constraint, the child index must back
+            // a corresponding constraint on its own table (55000).
+            {
+                let constraint_backed = |tbl: &str, idx: &str| {
+                    eng.db
+                        .find_table(tbl, ctx.snap, &ctx.all_xids, ctx.session)
+                        .is_some_and(|t| {
+                            t.pkey.as_ref().is_some_and(|p| p.name == idx)
+                                || t.uniques.iter().any(|u| u.name == idx)
+                        })
+                };
+                let child_tbl = eng
+                    .db
+                    .find_index(child, ctx.snap, &ctx.all_xids)
+                    .map(|ci| ci.def.table.clone());
+                if constraint_backed(&ix.def.table, name)
+                    && child_tbl
+                        .as_ref()
+                        .is_some_and(|ct| !constraint_backed(ct, child))
+                {
+                    return Err(exec_err(
+                        "55000",
+                        format!(
+                            "cannot attach index \"{}\" as a partition of index \"{}\"",
+                            child, name
+                        ),
+                    ));
+                }
+            }
+            // The child's table should be a partition of the
+            // parent index's table when partition linkage is
+            // recorded; the flat registry keeps no index linkage,
+            // so existence is the enforceable part here.
+        }
+    }
+    Ok(ExecResult::Command {
+        tag: "ALTER INDEX".to_string(),
     })
 }
 

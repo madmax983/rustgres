@@ -1524,6 +1524,30 @@ pub(crate) fn exec_alter_publication(
     // Captured for the statement undo log (v2.02): every successful
     // mutation below records the pre-statement entry.
     let prev_pub = eng.db.publications.get(name).cloned();
+    // v2.16: PG19 publicationcmds — a publication containing
+    // TABLES IN SCHEMA elements cannot carry per-table column
+    // lists (22023), whether the schemas were already there or
+    // arrive in the same ADD/SET.
+    if action == 'a' || action == 's' {
+        let has_schemas = if action == 's' {
+            !schemas.is_empty()
+        } else {
+            !schemas.is_empty() || prev_pub.as_ref().is_some_and(|p| !p.schemas.is_empty())
+        };
+        if has_schemas {
+            for (tbl, cols, _) in table_specs {
+                if cols.is_some() {
+                    return Err(exec_err(
+                        "22023",
+                        format!(
+                            "cannot use column list for relation \"{}\" in publication \"{}\"",
+                            tbl, name
+                        ),
+                    ));
+                }
+            }
+        }
+    }
     // v2.05 (PG19 AlterPublication / CheckAlterPublication /
     // AlterPublicationOwner_internal): ownership + superuser gates.
     pub_require_owner(eng, ctx, name)?;

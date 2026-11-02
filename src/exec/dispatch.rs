@@ -524,6 +524,7 @@ pub(crate) fn execute_inner(
             volatility,
             owner,
             security,
+            set_schema,
         } => exec_alter_function(
             eng,
             ctx,
@@ -532,7 +533,21 @@ pub(crate) fn execute_inner(
             *volatility,
             owner.as_deref(),
             *security,
+            set_schema.as_deref(),
         ),
+        // --- v2.16: ALTER INDEX ---
+        Stmt::AlterIndex {
+            name,
+            if_exists,
+            action,
+        } => exec_alter_index(eng, ctx, name, *if_exists, action),
+        // --- v2.16: COMMENT ON <general object> ---
+        Stmt::CommentOn {
+            target,
+            name,
+            sub,
+            comment,
+        } => exec_comment_on(eng, ctx, target, name, sub.as_deref(), comment.as_deref()),
         // --- v0.86: user-defined functions and operators ---
         Stmt::CreateFunction {
             name,

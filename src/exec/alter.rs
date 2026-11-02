@@ -149,7 +149,8 @@ pub(crate) fn pg_reloption_kind(opt: &str) -> Option<&'static str> {
         .unwrap_or(opt)
         .to_ascii_lowercase();
     Some(match base.as_str() {
-        "autovacuum_enabled" | "vacuum_truncate" | "user_catalog_table" => "bool",
+        "autovacuum_enabled" | "vacuum_truncate" | "user_catalog_table" | "security_barrier"
+        | "security_invoker" => "bool",
         "autovacuum_vacuum_threshold"
         | "autovacuum_analyze_threshold"
         | "autovacuum_vacuum_cost_limit"
@@ -771,6 +772,7 @@ pub(crate) fn exec_alter_one(
     match action {
         AlterAction::AddColumn {
             name: col,
+            if_not_exists,
             col_type,
             named_type,
             bit_typmod,
@@ -783,6 +785,20 @@ pub(crate) fn exec_alter_one(
             pkey,
             fks,
         } => {
+            // v2.16: ADD COLUMN IF NOT EXISTS — an existing column
+            // is a NOTICE-level skip of the whole action (PG19
+            // ATExecAddColumn, the if_not_exists path).
+            if *if_not_exists {
+                let exists = eng
+                    .db
+                    .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                    .is_some_and(|t| t.columns.iter().any(|(cn, _)| cn == col));
+                if exists {
+                    return Ok(ExecResult::Command {
+                        tag: "ALTER TABLE".to_string(),
+                    });
+                }
+            }
             // v1.97: PG19 ATExecAddColumn — ONLY with inheritance /
             // partition children would put them out of step.
             if only && !rename_descendants(eng, ctx, name).is_empty() {
@@ -838,6 +854,7 @@ pub(crate) fn exec_alter_one(
                     // Construct the action anew (we have the parts).
                     let child_action = AlterAction::AddColumn {
                         name: col.clone(),
+                        if_not_exists: *if_not_exists,
                         col_type: *col_type,
                         named_type: named_type.clone(),
                         bit_typmod: *bit_typmod,
@@ -903,7 +920,24 @@ pub(crate) fn exec_alter_one(
             res
         }
         AlterAction::OfType { type_name } => alter_of_type(eng, ctx, name, type_name),
-        AlterAction::DropColumn { name: col, cascade } => {
+        AlterAction::DropColumn {
+            name: col,
+            cascade,
+            if_exists,
+        } => {
+            // v2.16: DROP COLUMN IF EXISTS — a missing column is a
+            // NOTICE-level skip (PG19).
+            if *if_exists {
+                let exists = eng
+                    .db
+                    .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                    .is_some_and(|t| t.columns.iter().any(|(cn, _)| cn == col));
+                if !exists {
+                    return Ok(ExecResult::Command {
+                        tag: "ALTER TABLE".to_string(),
+                    });
+                }
+            }
             let res = alter_drop_column(eng, ctx, name, col, *cascade);
             // v0.69: propagate DROP COLUMN to partitions.
             if res.is_ok() {
@@ -1087,6 +1121,14 @@ pub(crate) fn exec_alter_one(
                     ),
                 ));
             };
+            // PG19 ATExecValidateConstraint: a NOT ENFORCED
+            // constraint can never be validated (55000).
+            if !cd.enforced {
+                return Err(exec_err(
+                    "55000",
+                    "cannot validate NOT ENFORCED constraint".to_string(),
+                ));
+            }
             if cd.not_valid {
                 let rows: Vec<Row> = t
                     .rows
@@ -1173,12 +1215,53 @@ pub(crate) fn exec_alter_one(
                     }
                 }
                 alter_swap(eng, ctx, name, None, next, None)?;
+                // v2.16: PG19 validates the whole hierarchy — the
+                // copies on inheritance descendants and partition
+                // children are validated too (the error names the
+                // relation holding the violating row, e.g. attmp6
+                // under attmp3). A NO INHERIT check has no
+                // descendant copies, so nothing is found for it.
+                let mut desc: Vec<String> = inheritance_descendants(&eng.db, name);
+                if let Some(p) = t.partition.as_ref() {
+                    for ch in &p.children {
+                        if !desc.contains(ch) {
+                            desc.push(ch.clone());
+                        }
+                    }
+                }
+                for dname in desc {
+                    let has = eng
+                        .db
+                        .find_table(&dname, ctx.snap, &ctx.all_xids, ctx.session)
+                        .is_some_and(|dt| dt.checks.iter().any(|c| &c.name == con && c.not_valid));
+                    if has {
+                        let child_action = AlterAction::ValidateConstraint { name: con.clone() };
+                        exec_alter(eng, ctx, &dname, std::slice::from_ref(&child_action))?;
+                    }
+                }
             }
             Ok(ExecResult::Command {
                 tag: "ALTER TABLE".to_string(),
             })
         }
-        AlterAction::DropConstraint { name: con, cascade } => {
+        AlterAction::DropConstraint {
+            name: con,
+            cascade,
+            if_exists,
+        } => {
+            // v2.16: DROP CONSTRAINT IF EXISTS — a missing
+            // constraint is a NOTICE-level skip (PG19).
+            if *if_exists {
+                let exists = eng
+                    .db
+                    .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                    .is_some_and(|t| table_has_constraint(t, con));
+                if !exists {
+                    return Ok(ExecResult::Command {
+                        tag: "ALTER TABLE".to_string(),
+                    });
+                }
+            }
             // v2.15: PG19 refuses to drop an FK constraint while
             // deferred events for it are pending in this
             // transaction (55000, naming the leaf that holds the
@@ -1227,6 +1310,7 @@ pub(crate) fn exec_alter_one(
                     let child_action = AlterAction::DropConstraint {
                         name: con.clone(),
                         cascade: *cascade,
+                        if_exists: false,
                     };
                     exec_alter(eng, ctx, child, std::slice::from_ref(&child_action))?;
                 }
@@ -1257,6 +1341,314 @@ pub(crate) fn exec_alter_one(
             alter_rename_column_ext(eng, ctx, name, old, new, only, true)
         }
         AlterAction::RenameTo { new_name } => alter_rename_to(eng, ctx, name, new_name),
+        AlterAction::RenameConstraint { old, new } => {
+            let res = alter_rename_constraint(eng, ctx, name, old, new, only);
+            // v2.16: propagate to partition children carrying the
+            // same constraint name (PG19 renames the constraint on
+            // every partition of the tree).
+            if res.is_ok() && !only {
+                let children: Vec<String> = eng
+                    .db
+                    .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                    .and_then(|t| t.partition.as_ref())
+                    .map(|p| p.children.clone())
+                    .unwrap_or_default();
+                for child in &children {
+                    if eng.db.is_temp_table(ctx.session, child) {
+                        continue;
+                    }
+                    let has = eng
+                        .db
+                        .find_table(child, ctx.snap, &ctx.all_xids, ctx.session)
+                        .is_some_and(|t| table_has_constraint(t, old));
+                    if has {
+                        let child_action = AlterAction::RenameConstraint {
+                            old: old.clone(),
+                            new: new.clone(),
+                        };
+                        exec_alter(eng, ctx, child, std::slice::from_ref(&child_action))?;
+                    }
+                }
+            }
+            res
+        }
+        AlterAction::SetSchema { schema } => alter_set_schema(eng, ctx, name, schema),
+        AlterAction::SetLogged { logged } => {
+            // v2.16: PG19 ATExecSetRelPersistence +
+            // ATPrepChangePersistence, with persistence tracked in
+            // db.unlogged_tables: partitioned tables reject the
+            // action outright (42809, ATSimplePermissions); temp
+            // tables are 42P16; an already-matching state is a
+            // silent no-op (checks skipped); SET UNLOGGED refuses
+            // published tables (55000) and tables referenced by a
+            // permanent table's FK (42P16); SET LOGGED refuses
+            // tables whose own FKs reference unlogged tables
+            // (42P16). Self-referencing FKs are ignored.
+            let base = name.rsplit('.').next().unwrap_or(name);
+            if eng.db.is_temp_table(ctx.session, name) {
+                return Err(exec_err(
+                    "42P16",
+                    format!(
+                        "cannot change logged status of table \"{}\" because it is temporary",
+                        name
+                    ),
+                ));
+            }
+            let t = eng
+                .db
+                .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
+                .clone();
+            if t.partition.as_ref().is_some_and(|p| p.is_partitioned) {
+                return Err(exec_err(
+                    "42809",
+                    format!(
+                        "ALTER action {} cannot be performed on relation \"{}\"",
+                        if *logged {
+                            "SET LOGGED"
+                        } else {
+                            "SET UNLOGGED"
+                        },
+                        name
+                    ),
+                ));
+            }
+            let is_unlogged =
+                eng.db.unlogged_tables.contains(name) || eng.db.unlogged_tables.contains(base);
+            if is_unlogged == !*logged {
+                // Already in the target state: PG returns early.
+            } else if *logged {
+                for fk in &t.fks {
+                    let target = fk.ref_table.rsplit('.').next().unwrap_or(&fk.ref_table);
+                    if target == base {
+                        continue;
+                    }
+                    if eng.db.unlogged_tables.contains(target)
+                        || eng.db.unlogged_tables.contains(&fk.ref_table)
+                    {
+                        return Err(exec_err(
+                            "42P16",
+                            format!(
+                                "could not change table \"{}\" to logged because it references unlogged table \"{}\"",
+                                name, fk.ref_table
+                            ),
+                        ));
+                    }
+                }
+                eng.db.unlogged_tables.remove(name);
+                eng.db.unlogged_tables.remove(base);
+            } else {
+                // SET UNLOGGED: publication membership first.
+                let mut in_pub = false;
+                let mut in_except = false;
+                for p in eng.db.publications.values() {
+                    if p.except_tables.iter().any(|x| x == base || x == name) {
+                        in_except = true;
+                    }
+                    if p.all_tables || p.tables.iter().any(|x| x == base || x == name) {
+                        in_pub = true;
+                    }
+                }
+                if in_except {
+                    return Err(exec_err(
+                        "55000",
+                        format!(
+                            "cannot change table \"{}\" to unlogged because it is referenced by a publication",
+                            name
+                        ),
+                    ));
+                }
+                if in_pub {
+                    return Err(exec_err(
+                        "55000",
+                        format!(
+                            "cannot change table \"{}\" to unlogged because it is part of a publication",
+                            name
+                        ),
+                    ));
+                }
+                // Incoming FKs from permanent tables block the flip.
+                let all_names: Vec<String> = eng.db.tables.keys().cloned().collect();
+                for other_name in &all_names {
+                    if other_name == name {
+                        continue;
+                    }
+                    let Some(other) =
+                        eng.db
+                            .find_table(other_name, ctx.snap, &ctx.all_xids, ctx.session)
+                    else {
+                        continue;
+                    };
+                    if eng.db.unlogged_tables.contains(other_name) {
+                        continue;
+                    }
+                    for fk in &other.fks {
+                        let target = fk.ref_table.rsplit('.').next().unwrap_or(&fk.ref_table);
+                        if target == base {
+                            return Err(exec_err(
+                                "42P16",
+                                format!(
+                                    "could not change table \"{}\" to unlogged because it references logged table \"{}\"",
+                                    name, other_name
+                                ),
+                            ));
+                        }
+                    }
+                }
+                eng.db.unlogged_tables.insert(name.to_string());
+            }
+            Ok(ExecResult::Command {
+                tag: "ALTER TABLE".to_string(),
+            })
+        }
+        AlterAction::ClusterOn { index } => {
+            // v2.16: PG19 ATSimplePermissions — CLUSTER ON / SET
+            // WITHOUT CLUSTER do not apply to partitioned tables
+            // (42809).
+            {
+                let t = eng
+                    .db
+                    .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                    .ok_or_else(|| {
+                        exec_err("42P01", format!("relation \"{}\" does not exist", name))
+                    })?;
+                if t.partition.as_ref().is_some_and(|p| p.is_partitioned) {
+                    let action_name = if index.is_some() {
+                        "CLUSTER ON"
+                    } else {
+                        "SET WITHOUT CLUSTER"
+                    };
+                    return Err(exec_err(
+                        "42809",
+                        format!(
+                            "ALTER action {} cannot be performed on relation \"{}\"",
+                            action_name, name
+                        ),
+                    ));
+                }
+            }
+            // v2.16: CLUSTER state lives in cluster_marks
+            // (runtime-only pg_class.indisclustered analogue).
+            match index {
+                Some(idx) => {
+                    let ix = eng
+                        .db
+                        .find_index(idx, ctx.snap, &ctx.all_xids)
+                        .ok_or_else(|| {
+                            exec_err("42P01", format!("index \"{}\" does not exist", idx))
+                        })?;
+                    // The index's stored table key may be the bare
+                    // name while this statement addressed the table
+                    // schema-qualified (or vice versa) — the
+                    // single-namespace keying wart; compare base
+                    // names as well as the exact key.
+                    if ix.def.table != name
+                        && ix.def.table.rsplit('.').next() != name.rsplit('.').next()
+                    {
+                        return Err(exec_err(
+                            "42P01",
+                            format!("index \"{}\" for table \"{}\" does not exist", idx, name),
+                        ));
+                    }
+                    eng.db.cluster_marks.insert(name.to_string(), idx.clone());
+                }
+                None => {
+                    eng.db.cluster_marks.remove(name);
+                }
+            }
+            Ok(ExecResult::Command {
+                tag: "ALTER TABLE".to_string(),
+            })
+        }
+        AlterAction::AlterColumnSetStatistics { name: col, target } => {
+            // v2.16: PG19 AT_SetStatistics: the column must exist;
+            // the target must be in [-1, 10000] (22023 otherwise,
+            // reloptions.c / tablecmds.c bounds).
+            let t = eng
+                .db
+                .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                .ok_or_else(|| {
+                    exec_err("42P01", format!("relation \"{}\" does not exist", name))
+                })?;
+            if !t.columns.iter().any(|(cn, _)| cn == col) {
+                return Err(exec_err(
+                    "42703",
+                    format!("column \"{}\" of relation \"{}\" does not exist", col, name),
+                ));
+            }
+            if *target < -1 || *target > 10000 {
+                return Err(exec_err(
+                    "22023",
+                    format!("statistics target {} is out of range", target),
+                ));
+            }
+            Ok(ExecResult::Command {
+                tag: "ALTER TABLE".to_string(),
+            })
+        }
+        AlterAction::AlterColumnSetOptions {
+            name: col, options, ..
+        } => {
+            // v2.16: per-column reloptions (n_distinct,
+            // n_distinct_inherited): validated, not modeled.
+            let t = eng
+                .db
+                .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                .ok_or_else(|| {
+                    exec_err("42P01", format!("relation \"{}\" does not exist", name))
+                })?;
+            if !t.columns.iter().any(|(cn, _)| cn == col) {
+                return Err(exec_err(
+                    "42703",
+                    format!("column \"{}\" of relation \"{}\" does not exist", col, name),
+                ));
+            }
+            for (opt, val) in options {
+                match opt.as_str() {
+                    "n_distinct" | "n_distinct_inherited" => {
+                        if !val.is_empty() && val.parse::<f64>().is_err() {
+                            return Err(exec_err(
+                                "22023",
+                                format!("invalid value for \"{}\": \"{}\"", opt, val),
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(exec_err(
+                            "22023",
+                            format!("unrecognized parameter \"{}\"", opt),
+                        ));
+                    }
+                }
+            }
+            Ok(ExecResult::Command {
+                tag: "ALTER TABLE".to_string(),
+            })
+        }
+        AlterAction::ResetRelOptions { options } => {
+            // v2.16: RESET (opt, ...): the table must exist and
+            // every named option must be a known reloption.
+            let _t = eng
+                .db
+                .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                .ok_or_else(|| {
+                    exec_err("42P01", format!("relation \"{}\" does not exist", name))
+                })?;
+            for opt in options {
+                if !opt.eq_ignore_ascii_case("toast_tuple_target")
+                    && !opt.eq_ignore_ascii_case("parallel_workers")
+                    && pg_reloption_kind(opt).is_none()
+                {
+                    return Err(exec_err(
+                        "22023",
+                        format!("unrecognized parameter \"{}\"", opt),
+                    ));
+                }
+            }
+            Ok(ExecResult::Command {
+                tag: "ALTER TABLE".to_string(),
+            })
+        }
         // v0.11
         AlterAction::OwnerTo { new_owner } => alter_owner_to(eng, ctx, name, new_owner),
         // v1.95: ROW LEVEL SECURITY toggles (PG19 ATExecSetRowSecurity /
@@ -2695,6 +3087,19 @@ pub(crate) fn alter_drop_column_ext(
     if next.col_compression.len() > ci {
         next.col_compression.remove(ci);
     }
+    // v2.16: keep the composite/domain type slots parallel too —
+    // leaving them long misaligned every later column, which
+    // alter_inherit's type comparison reads as a type mismatch
+    // (the atacc3 drop/re-add column INHERIT failure).
+    if next.composite_types.len() > ci {
+        next.composite_types.remove(ci);
+    }
+    if next.domain_types.len() > ci {
+        next.domain_types.remove(ci);
+    }
+    if next.domain_elem.len() > ci {
+        next.domain_elem.remove(ci);
+    }
     // v1.80: shift partition key positions like the index positions.
     // A partitioned table's own key is in its own column space. A leaf's
     // key is a copy of its parent's (parent column space, never consulted
@@ -2910,6 +3315,19 @@ pub(crate) fn alter_add_constraint(
         .db
         .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?;
+    // v2.16: PG19 StoreRelCheck (heap.c) — a NO INHERIT constraint
+    // cannot be added to a partitioned table (42P16).
+    if let Some(c) = check {
+        if c.no_inherit && t.partition.as_ref().is_some_and(|p| p.is_partitioned) {
+            return Err(exec_err(
+                "42P16",
+                format!(
+                    "cannot add NO INHERIT constraint to partitioned table \"{}\"",
+                    name
+                ),
+            ));
+        }
+    }
     // v1.97: PG19 verifyNotNullPKCompatible — a NOT VALID
     // not-null constraint on a primary-key column, on the table
     // or any of its partitions, blocks ADD PRIMARY KEY (55000).
@@ -2987,7 +3405,14 @@ pub(crate) fn alter_add_constraint(
         }
         if let Some(c) = check.as_mut() {
             if c.name.is_empty() {
-                let base = format!("{}_check", name);
+                // PG19 names an unnamed CHECK <table>_<firstcol>_check
+                // (the CREATE path's def_add_check already does).
+                let mut refs: Vec<(Option<String>, String)> = Vec::new();
+                crate::sql::collect_col_refs(&c.expr, &mut refs);
+                let base = match refs.first() {
+                    Some((_, col)) => format!("{}_{}_check", name, col),
+                    None => format!("{}_check", name),
+                };
                 let mut cand = base.clone();
                 let mut k = 1;
                 while taken(&cand) {
@@ -3057,8 +3482,10 @@ pub(crate) fn alter_add_constraint(
                     .map(|u| u.name == cname && !same_unique(u))
                     .unwrap_or(false);
             if dup {
+                // PG19 AddConstraint name collision is
+                // ERRCODE_DUPLICATE_OBJECT (42710).
                 return Err(exec_err(
-                    "42P16",
+                    "42710",
                     format!(
                         "constraint \"{}\" for relation \"{}\" already exists",
                         cname, name
@@ -3171,27 +3598,33 @@ pub(crate) fn alter_add_constraint(
                 ));
             }
         }
-        // Existing rows must satisfy the new CHECK.
-        let mut probe = next.clone();
-        probe.checks.push(c.clone());
-        let probe_meta = TableMeta::of(&probe);
-        let old_rows: Vec<Row> = t
-            .rows
-            .iter()
-            .filter(|r| row_visible(r, ctx.snap, &ctx.all_xids))
-            .map(|r| r.values.clone())
-            .collect();
-        for values in &old_rows {
-            check_row_constraints(
-                eng,
-                ctx.snap,
-                ctx.own,
-                ctx.session,
-                ctx.role,
-                &probe_meta,
-                name,
-                values,
-            )?;
+        // Existing rows must satisfy the new CHECK — unless it is
+        // NOT VALID or NOT ENFORCED (v2.16: PG19 ATAddConstraint
+        // skips the initial scan for both; the pre-v2.16 code
+        // validated unconditionally, so ADD ... CHECK ... NOT
+        // VALID failed 23514 on violating rows).
+        if !c.not_valid && c.enforced {
+            let mut probe = next.clone();
+            probe.checks.push(c.clone());
+            let probe_meta = TableMeta::of(&probe);
+            let old_rows: Vec<Row> = t
+                .rows
+                .iter()
+                .filter(|r| row_visible(r, ctx.snap, &ctx.all_xids))
+                .map(|r| r.values.clone())
+                .collect();
+            for values in &old_rows {
+                check_row_constraints(
+                    eng,
+                    ctx.snap,
+                    ctx.own,
+                    ctx.session,
+                    ctx.role,
+                    &probe_meta,
+                    name,
+                    values,
+                )?;
+            }
         }
         next.checks.push(c.clone());
     }
@@ -4057,11 +4490,73 @@ pub(crate) fn alter_rename_to(
             format!("relation \"{}\" already exists", new_name),
         ));
     }
-    let t = eng
+    let t = match eng
         .db
         .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
-        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
-        .clone();
+        .cloned()
+    {
+        Some(t) => t,
+        None => {
+            // v2.16: ALTER TABLE also addresses views and indexes
+            // in PG19 (RenameRelation works on any relation kind).
+            if let Some(v) = eng.db.find_view(name, ctx.snap, ctx.own).cloned() {
+                let mut def = v;
+                drop_view_internal(eng, ctx, name)?;
+                def.created_xmin = ctx.write_xid;
+                def.dropped_xmax = 0;
+                eng.db
+                    .views
+                    .entry(new_name.to_string())
+                    .or_default()
+                    .push(def);
+                note_obj_schema(eng, ctx, new_name, new_name);
+                ctx.writes.push(WriteOp::CreateView {
+                    name: new_name.to_string(),
+                });
+                // Dependent views' deps lists follow the rename
+                // (the same treatment table renames get above).
+                let view_names: Vec<String> = eng.db.views.keys().cloned().collect();
+                for vname in view_names {
+                    if let Some(vs) = eng.db.views.get_mut(&vname) {
+                        for v in vs.iter_mut() {
+                            for d in &mut v.deps {
+                                if d == name {
+                                    *d = new_name.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+                return Ok(ExecResult::Command {
+                    tag: "ALTER TABLE".to_string(),
+                });
+            }
+            if eng.db.find_index(name, ctx.snap, &ctx.all_xids).is_some()
+                || eng
+                    .db
+                    .temp_indexes
+                    .get(&ctx.session)
+                    .is_some_and(|m| m.contains_key(name))
+            {
+                exec_alter_index(
+                    eng,
+                    ctx,
+                    name,
+                    false,
+                    &crate::sql::AlterIndexAction::RenameTo {
+                        new_name: new_name.to_string(),
+                    },
+                )?;
+                return Ok(ExecResult::Command {
+                    tag: "ALTER TABLE".to_string(),
+                });
+            }
+            return Err(exec_err(
+                "42P01",
+                format!("relation \"{}\" does not exist", name),
+            ));
+        }
+    };
     // v0.77: a temp-table rename is session-local — never rewrite other
     // tables' FKs, view deps, or global indexes, which belong to the
     // permanent catalog (a shadowed same-named permanent table's
@@ -4132,6 +4627,587 @@ pub(crate) fn alter_rename_to(
             }
         }
     }
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// v2.16: RENAME CONSTRAINT / SET SCHEMA / index rename helpers
+// ---------------------------------------------------------------------------
+
+/// v2.16: rename an index in the registry (global or session temp),
+/// logging the Drop+Create WriteOp pair so undo and WAL replay see
+/// the same shape the DROP COLUMN rebuild uses. The caller has
+/// already validated existence.
+pub(crate) fn rename_index_internal(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    old: &str,
+    new: &str,
+) -> Result<(), ExecError> {
+    // Session temp index first (temp tables own session-local indexes).
+    let temp_hit = eng
+        .db
+        .temp_indexes
+        .get(&ctx.session)
+        .and_then(|m| m.get(old))
+        .cloned();
+    if let Some(ix) = temp_hit {
+        if let Some(m) = eng.db.temp_indexes.get_mut(&ctx.session) {
+            m.remove(old);
+        }
+        ctx.writes.push(WriteOp::DropTempIndex {
+            session: ctx.session,
+            name: old.to_string(),
+            index: ix.clone(),
+        });
+        let mut nix = ix;
+        nix.def.name = new.to_string();
+        nix.def.created_xmin = ctx.own;
+        nix.def.dropped_xmax = 0;
+        eng.db
+            .temp_indexes
+            .entry(ctx.session)
+            .or_default()
+            .insert(new.to_string(), nix);
+        ctx.writes.push(WriteOp::CreateTempIndex {
+            session: ctx.session,
+            name: new.to_string(),
+        });
+        return Ok(());
+    }
+    let ix = eng
+        .db
+        .find_index(old, ctx.snap, &ctx.all_xids)
+        .ok_or_else(|| exec_err("42P01", format!("index \"{}\" does not exist", old)))?
+        .clone();
+    eng.db
+        .find_index_mut(old, ctx.snap, &ctx.all_xids)
+        .expect("index still present")
+        .def
+        .dropped_xmax = ctx.own;
+    ctx.writes.push(WriteOp::DropIndex {
+        name: old.to_string(),
+        index: ix.clone(),
+    });
+    let mut nix = ix;
+    nix.def.name = new.to_string();
+    nix.def.created_xmin = ctx.own;
+    nix.def.dropped_xmax = 0;
+    eng.db.indexes.insert(new.to_string(), nix);
+    ctx.writes.push(WriteOp::CreateIndex {
+        name: new.to_string(),
+    });
+    Ok(())
+}
+
+/// v2.16: `ALTER TABLE t RENAME CONSTRAINT old TO new` (PG19
+/// RenameConstraint). Renames the constraint in whichever catalog
+/// list carries it (checks incl. NOT NULL checks, uniques, pkey,
+/// FKs) and renames a same-named backing index with it (PG keeps
+/// constraint and backing index names in lockstep). A missing
+/// constraint is 42704; a name already taken on the table is 42710.
+/// Does table `t` carry a constraint whose definition matches the
+/// one named `old` on `src` (same kind, same payload)? Used to tell
+/// an inherited copy from an independent same-named constraint.
+fn constraint_def_matches(src: &Table, t: &Table, old: &str) -> bool {
+    if let Some(c) = src.checks.iter().find(|c| &c.name == old) {
+        return t.checks.iter().any(|x| &x.name == old && x.expr == c.expr);
+    }
+    if let Some(u) = src.uniques.iter().find(|u| &u.name == old) {
+        return t.uniques.iter().any(|x| &x.name == old && x.cols == u.cols);
+    }
+    if src.pkey.as_ref().is_some_and(|p| &p.name == old) {
+        return t.pkey.as_ref().is_some_and(|p| &p.name == old);
+    }
+    if let Some(f) = src.fks.iter().find(|f| &f.name == old) {
+        return t
+            .fks
+            .iter()
+            .any(|x| &x.name == old && x.ref_table == f.ref_table && x.cols == f.cols);
+    }
+    false
+}
+
+/// All transitive inheritance ancestors of `table`.
+fn inheritance_ancestors(db: &Database, table: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut stack: Vec<String> = db
+        .tables
+        .get(table)
+        .and_then(|vs| vs.last())
+        .map(|t| t.inherits.clone())
+        .unwrap_or_default();
+    while let Some(p) = stack.pop() {
+        if out.contains(&p) {
+            continue;
+        }
+        if let Some(pt) = db.tables.get(&p).and_then(|vs| vs.last()) {
+            stack.extend(pt.inherits.iter().cloned());
+        }
+        out.push(p);
+    }
+    out
+}
+
+/// All transitive inheritance descendants of `table`.
+fn inheritance_descendants(db: &Database, table: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut frontier: Vec<String> = vec![table.to_string()];
+    while let Some(cur) = frontier.pop() {
+        for (k, vs) in db.tables.iter() {
+            if vs
+                .last()
+                .is_some_and(|t| t.inherits.iter().any(|p| p == &cur))
+                && !out.contains(k)
+                && k != table
+            {
+                out.push(k.clone());
+                frontier.push(k.clone());
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn alter_rename_constraint(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    old: &str,
+    new: &str,
+    only: bool,
+) -> Result<ExecResult, ExecError> {
+    // PG19 RenameConstraint locality rules (42P16): a constraint
+    // that exists on this table only as an inherited copy cannot be
+    // renamed here; with ONLY, a constraint that also lives on
+    // inheritance children cannot be renamed on the parent alone.
+    {
+        let t_owned = eng
+            .db
+            .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+            .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
+            .clone();
+        if table_has_constraint(&t_owned, old) {
+            for anc in inheritance_ancestors(&eng.db, name) {
+                if let Some(at) = eng.db.tables.get(&anc).and_then(|vs| vs.last()) {
+                    if table_has_constraint(at, old) && constraint_def_matches(at, &t_owned, old) {
+                        return Err(exec_err(
+                            "42P16",
+                            format!("cannot rename inherited constraint \"{}\"", old),
+                        ));
+                    }
+                }
+            }
+            if only {
+                for desc in inheritance_descendants(&eng.db, name) {
+                    if let Some(dt) = eng.db.tables.get(&desc).and_then(|vs| vs.last()) {
+                        if table_has_constraint(dt, old)
+                            && constraint_def_matches(&t_owned, dt, old)
+                        {
+                            return Err(exec_err(
+                                "42P16",
+                                format!(
+                                    "inherited constraint \"{}\" must be renamed in child tables too",
+                                    old
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let t = eng
+        .db
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
+        .clone();
+    if !table_has_constraint(&t, old) {
+        return Err(exec_err(
+            "42704",
+            format!(
+                "constraint \"{}\" for relation \"{}\" does not exist",
+                old, name
+            ),
+        ));
+    }
+    if old != new && table_has_constraint(&t, new) {
+        return Err(exec_err(
+            "42710",
+            format!(
+                "constraint \"{}\" for relation \"{}\" already exists",
+                new, name
+            ),
+        ));
+    }
+    let mut next = t.clone();
+    for c in next.checks.iter_mut() {
+        if c.name == old {
+            c.name = new.to_string();
+        }
+    }
+    for u in next.uniques.iter_mut() {
+        if u.name == old {
+            u.name = new.to_string();
+        }
+    }
+    if let Some(p) = next.pkey.as_mut() {
+        if p.name == old {
+            p.name = new.to_string();
+        }
+    }
+    for f in next.fks.iter_mut() {
+        if f.name == old {
+            f.name = new.to_string();
+        }
+    }
+    alter_swap(eng, ctx, name, None, next, None)?;
+    // Backing-index lockstep rename (unique / pkey indexes only:
+    // their index name equals the constraint name in this engine).
+    let backed =
+        t.uniques.iter().any(|u| u.name == old) || t.pkey.as_ref().is_some_and(|p| p.name == old);
+    if backed && old != new {
+        let has_ix = eng.db.find_index(old, ctx.snap, &ctx.all_xids).is_some()
+            || eng
+                .db
+                .temp_indexes
+                .get(&ctx.session)
+                .is_some_and(|m| m.contains_key(old));
+        if has_ix {
+            rename_index_internal(eng, ctx, old, new)?;
+        }
+    }
+    // v2.16: inheritance descendants carry their own copies of the
+    // constraint (PG19 renames the constraint on the whole tree;
+    // exec_alter's own recursion does not carry this action).
+    if old != new {
+        for child in inheritance_descendants(&eng.db, name) {
+            let Some(ct) = eng
+                .db
+                .find_table(&child, ctx.snap, &ctx.all_xids, ctx.session)
+                .cloned()
+            else {
+                continue;
+            };
+            if !table_has_constraint(&ct, old) {
+                continue;
+            }
+            let child_backed = ct.uniques.iter().any(|u| u.name == old)
+                || ct.pkey.as_ref().is_some_and(|p| p.name == old);
+            let mut cnext = ct;
+            for c in cnext.checks.iter_mut() {
+                if c.name == old {
+                    c.name = new.to_string();
+                }
+            }
+            for u in cnext.uniques.iter_mut() {
+                if u.name == old {
+                    u.name = new.to_string();
+                }
+            }
+            if let Some(p) = cnext.pkey.as_mut() {
+                if p.name == old {
+                    p.name = new.to_string();
+                }
+            }
+            for f in cnext.fks.iter_mut() {
+                if f.name == old {
+                    f.name = new.to_string();
+                }
+            }
+            alter_swap(eng, ctx, &child, None, cnext, None)?;
+            if child_backed {
+                let ix_here = eng
+                    .db
+                    .find_index(old, ctx.snap, &ctx.all_xids)
+                    .is_some_and(|ix| ix.def.table == child);
+                if ix_here {
+                    rename_index_internal(eng, ctx, old, new)?;
+                }
+            }
+        }
+    }
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
+/// v2.16: `COMMENT ON <object> ... IS ...` for the general object
+/// family (PG19 CommentStmt). The comment text is not stored
+/// (pg_description is not materialized — the v2.14 CommentOnTrigger
+/// precedent); the object is validated against the catalogs the
+/// engine models, with PG's error codes, and object kinds with no
+/// catalog here (collations, conversions, text search, event
+/// triggers, rules, statistics, large objects, subscriptions,
+/// foreign wrappers/servers) are accepted as catalog no-ops.
+pub(crate) fn exec_comment_on(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    target: &str,
+    name: &str,
+    sub: Option<&str>,
+    // The comment text itself: validated by the parser, not
+    // stored (see the fn doc).
+    _comment: Option<&str>,
+) -> Result<ExecResult, ExecError> {
+    let rel_missing = || exec_err("42P01", format!("relation \"{}\" does not exist", name));
+    match target {
+        "table" | "foreign_table" => {
+            if eng
+                .db
+                .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                .is_none()
+                && eng.db.find_view(name, ctx.snap, ctx.own).is_none()
+            {
+                return Err(rel_missing());
+            }
+        }
+        "view" => {
+            if eng.db.find_view(name, ctx.snap, ctx.own).is_none()
+                && eng
+                    .db
+                    .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                    .is_none()
+            {
+                return Err(rel_missing());
+            }
+        }
+        "index" => {
+            if eng.db.find_index(name, ctx.snap, &ctx.all_xids).is_none()
+                && !eng
+                    .db
+                    .temp_indexes
+                    .get(&ctx.session)
+                    .is_some_and(|m| m.contains_key(name))
+            {
+                return Err(rel_missing());
+            }
+        }
+        "column" => {
+            let t = eng
+                .db
+                .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                .ok_or_else(rel_missing)?;
+            let col = sub.unwrap_or_default();
+            // A composite TYPE's fields are also commentable via
+            // COMMENT ON COLUMN type.field in PG; table columns are
+            // the modeled case, type fields fall through below.
+            if !t.columns.iter().any(|(cn, _)| cn == col) {
+                let type_fields_ok = eng
+                    .db
+                    .types
+                    .get(name)
+                    .and_then(|st| st.composite.as_ref())
+                    .is_some_and(|fields| fields.iter().any(|(f, _, _)| f == col));
+                if !type_fields_ok {
+                    return Err(exec_err(
+                        "42703",
+                        format!("column \"{}\" of relation \"{}\" does not exist", col, name),
+                    ));
+                }
+            }
+        }
+        "sequence" => {
+            if eng.db.find_sequence(name, ctx.snap, ctx.own).is_none() {
+                return Err(rel_missing());
+            }
+        }
+        "type" => {
+            let known = eng.db.types.contains_key(name)
+                || eng
+                    .db
+                    .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                    .is_some()
+                || crate::sql::coltype_by_name(name).is_ok();
+            if !known {
+                return Err(exec_err(
+                    "42704",
+                    format!("type \"{}\" does not exist", name),
+                ));
+            }
+        }
+        "domain" => {
+            let is_domain = eng.db.types.get(name).is_some_and(|st| st.domain.is_some());
+            if !is_domain {
+                return Err(exec_err(
+                    "42704",
+                    format!("type \"{}\" does not exist", name),
+                ));
+            }
+        }
+        "constraint" => {
+            // COMMENT ON CONSTRAINT name ON DOMAIN dom: validate
+            // the domain and the named check on it.
+            let dom_name = sub.unwrap_or_default();
+            let dom = eng.db.types.get(dom_name).and_then(|st| st.domain.as_ref());
+            let Some(dom) = dom else {
+                return Err(exec_err(
+                    "42704",
+                    format!("type \"{}\" does not exist", dom_name),
+                ));
+            };
+            if !dom.checks.iter().any(|c| &c.name == name) {
+                return Err(exec_err(
+                    "42704",
+                    format!(
+                        "constraint \"{}\" for domain \"{}\" does not exist",
+                        name, dom_name
+                    ),
+                ));
+            }
+        }
+        "function" | "procedure" => {
+            let known = eng.db.functions.contains_key(name)
+                || eng
+                    .db
+                    .functions
+                    .keys()
+                    .any(|k| k.rsplit('.').next() == Some(name));
+            if !known {
+                return Err(exec_err(
+                    "42883",
+                    format!("function \"{}\" does not exist", name),
+                ));
+            }
+        }
+        "aggregate" => {
+            let known = eng.db.aggregates.contains_key(name)
+                || eng
+                    .db
+                    .aggregates
+                    .keys()
+                    .any(|k| k.rsplit('.').next() == Some(name));
+            if !known {
+                return Err(exec_err(
+                    "42883",
+                    format!("aggregate \"{}\" does not exist", name),
+                ));
+            }
+        }
+        "role" => {
+            if eng.db.find_role(name, ctx.snap, ctx.own).is_none() {
+                return Err(exec_err(
+                    "42704",
+                    format!("role \"{}\" does not exist", name),
+                ));
+            }
+            // v2.16: PG19 comment.c — commenting on a role requires
+            // superuser, being the role itself, or holding the ADMIN
+            // option on it (creators get that implicitly at CREATE
+            // ROLE); otherwise 42501.
+            let is_super = crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own);
+            if !is_super && ctx.role != name {
+                let has_admin = eng
+                    .db
+                    .find_role(ctx.role, ctx.snap, ctx.own)
+                    .is_some_and(|r| r.memberships.iter().any(|m| m.role == name && m.admin));
+                if !has_admin {
+                    return Err(exec_err("42501", "permission denied".to_string()));
+                }
+            }
+        }
+        "schema" => {
+            if !eng.db.schemas.iter().any(|s| s == name) {
+                return Err(exec_err(
+                    "3F000",
+                    format!("schema \"{}\" does not exist", name),
+                ));
+            }
+        }
+        _ => {
+            // statistics, collation, conversion, database, server,
+            // subscription, extension, language, policy,
+            // event_trigger, fdw, rule, large_object,
+            // text_search_*: no catalog modeled — accept.
+        }
+    }
+    Ok(ExecResult::Command {
+        tag: "COMMENT".to_string(),
+    })
+}
+
+/// v2.16: set an object's schema attribution to an explicit schema
+/// (transactional, mirroring note_obj_schema's WriteOp pattern).
+pub(crate) fn set_obj_schema_to(eng: &mut Engine, ctx: &mut StmtCtx, key: &str, schema: &str) {
+    if eng.db.obj_schema.get(key) != Some(&schema.to_string()) {
+        let prev = eng.db.obj_schema.clone();
+        eng.db
+            .obj_schema
+            .insert(key.to_string(), schema.to_string());
+        ctx.writes.push(WriteOp::ObjSchemaSet { prev });
+    }
+}
+
+/// v2.16: `ALTER TABLE t SET SCHEMA s` (PG19 AlterObjectSchemaStmt).
+/// Single-namespace engine: a qualified written name renames its
+/// storage-key prefix (alter1.t1 -> alter2.t1, via the RENAME TO
+/// machinery so FK references, view deps and index table fields
+/// follow); an unqualified name keeps its key and only updates the
+/// obj_schema attribution (find_table's schema fallback then
+/// resolves `s.t` to it). The target schema must exist (3F000).
+/// Views addressed through ALTER TABLE take the same path on the
+/// views map.
+pub(crate) fn alter_set_schema(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    schema: &str,
+) -> Result<ExecResult, ExecError> {
+    if !eng.db.schemas.iter().any(|s| s == schema) {
+        return Err(exec_err(
+            "3F000",
+            format!("schema \"{}\" does not exist", schema),
+        ));
+    }
+    let is_table = eng
+        .db
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+        .is_some();
+    if !is_table {
+        // View path: rename the views-map key when qualified, else
+        // attribution only.
+        if eng.db.find_view(name, ctx.snap, ctx.own).is_none() {
+            return Err(exec_err(
+                "42P01",
+                format!("relation \"{}\" does not exist", name),
+            ));
+        }
+        if let Some((_, base)) = name.rsplit_once('.') {
+            let new_key = format!("{}.{}", schema, base);
+            if new_key != name {
+                if eng.db.views.contains_key(&new_key) {
+                    return Err(exec_err(
+                        "42P07",
+                        format!("relation \"{}\" already exists", new_key),
+                    ));
+                }
+                if let Some(vs) = eng.db.views.remove(name) {
+                    eng.db.views.insert(new_key.clone(), vs);
+                }
+                set_obj_schema_to(eng, ctx, &new_key, schema);
+                return Ok(ExecResult::Command {
+                    tag: "ALTER TABLE".to_string(),
+                });
+            }
+        }
+        set_obj_schema_to(eng, ctx, name, schema);
+        return Ok(ExecResult::Command {
+            tag: "ALTER TABLE".to_string(),
+        });
+    }
+    if let Some((_, base)) = name.rsplit_once('.') {
+        let new_key = format!("{}.{}", schema, base);
+        if new_key != name {
+            alter_rename_to(eng, ctx, name, &new_key)?;
+            set_obj_schema_to(eng, ctx, &new_key, schema);
+            return Ok(ExecResult::Command {
+                tag: "ALTER TABLE".to_string(),
+            });
+        }
+    }
+    set_obj_schema_to(eng, ctx, name, schema);
     Ok(ExecResult::Command {
         tag: "ALTER TABLE".to_string(),
     })
@@ -4301,6 +5377,29 @@ pub(crate) fn alter_alter_constraint(
                 let cd_now = cd.clone();
                 if cd_now.kind == crate::sql::CheckKind::Check {
                     validate_check_rows(eng, ctx, &t, name, &cd_now)?;
+                    // v2.16: PG19 ATExecAlterConstraintEnforcedness
+                    // validates the whole inheritance subtree; a
+                    // violation in a descendant blocks the flip and
+                    // names that relation (23514).
+                    let descendants = inheritance_descendants(&eng.db, name);
+                    for dname in &descendants {
+                        let Some(dt) = eng
+                            .db
+                            .find_table(dname, ctx.snap, &ctx.all_xids, ctx.session)
+                            .cloned()
+                        else {
+                            continue;
+                        };
+                        if let Some(dcd) = dt
+                            .checks
+                            .iter()
+                            .find(|c| c.name == con && c.kind == crate::sql::CheckKind::Check)
+                            .cloned()
+                        {
+                            // Names the descendant relation itself.
+                            validate_check_rows(eng, ctx, &dt, dname, &dcd)?;
+                        }
+                    }
                 }
                 cd.not_valid = false;
             }
