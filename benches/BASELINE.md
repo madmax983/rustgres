@@ -2,6 +2,82 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `validate_fk_rows` rebuilds a one-FK `TableMeta` clone on every existing row — fix — 2026-11-02
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec/alter.rs`: `validate_fk_rows` built `let mut one =
+meta.clone(); one.fks = vec![fk.clone()];` **inside** the per-row
+loop, even though `one` is identical on every iteration — the FK
+being validated (`fk`) and the table's metadata (`meta`) are both
+loop-invariant; only `values` (the row itself) changes. Hoisted the
+clone-and-override to run once before the loop, matching the already-
+hoisted `rows: Vec<Row>` collection two lines above it. Behavior
+unchanged: `one` is `&`-borrowed by `check_fk_child_row` on every call,
+same as before.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_fk_addconstraint.py --variant enforced
+--child-rows {500,1000,2000}`), same workload, same machine, same
+session.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`), total `Ir`:
+
+| child rows (N) | before | after | delta |
+|---|---|---|---|
+| 500  | 451,625,405   | 444,123,708   | -1.66% |
+| 1000 | 1,247,131,368 | 1,232,251,798 | -1.19% |
+| 2000 | 2,840,440,296 | 2,810,665,763 | -1.05% |
+
+The `notvalid` control (same workload, FK added `NOT VALID`, so
+`validate_fk_rows` is never called) is unchanged by the fix at every
+size (184,849,473 / 236,005,805 / 340,393,163 vs. the baseline's
+184,840,114 / 236,014,371 / 340,398,196 — noise-level), confirming the
+saving is isolated to the validation-scan path.
+
+The `Ir` delta alone (-1.05% to -1.66%) is below the 5% floor — as
+expected, since the baseline entry already showed the dominant cost in
+this subtree is `fk_parent_key_exists`'s inherent parent-table scan,
+not this clone. But DHAT clears its own floor independently:
+
+DHAT (N=2000, same workload):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total bytes allocated | 20,585,480 | 17,587,714 | **-14.57%** |
+| Total blocks allocated | 239,215    | 197,222    | **-17.56%** |
+
+Both comfortably clear the ≥10% allocation-reduction floor (one floor
+is enough to ship), driven by `TableMeta`'s column list, CHECK-
+constraint `Expr` trees, generated-column expressions, and defaults
+all being deep-cloned 2000 times instead of once — the same
+"loop-invariant value rebuilt per row" shape as prior rounds (e.g.
+#64's parent-table clone), just caught by the allocation floor instead
+of the instruction floor this time.
+
+`cargo test --all-features`: 1228/1228 passed, unchanged. `cargo fmt
+--all -- --check`: clean. `cargo clippy --all-targets --all-features
+-- -D warnings`: 1138 errors on both the pre-fix and post-fix tree
+(same pre-existing toolchain/lint-version mismatch noted throughout
+this file, confirmed via `git stash`/`git stash pop`); zero net new.
+
+Before/after profiles committed:
+`benches/profiles/{callgrind,dhat}.out.fkaddconstraint-{base,after}-n{500,1000,2000}-2026-11-02`
+(dhat only at N=2000; callgrind `after` only at the three sizes shown).
+
+**Reproduce**: check out the parent (baseline) commit, `cargo build`,
+run the baseline-entry commands below; check out this commit,
+`cargo build`, run them again.
+```bash
+python3 benches/profile_fk_addconstraint.py --tool callgrind --child-rows 2000 --variant enforced
+python3 benches/profile_fk_addconstraint.py --tool dhat --child-rows 2000 --variant enforced
+```
+
 ## Bolt: `validate_fk_rows` rebuilds a one-FK `TableMeta` clone on every existing row — baseline — 2026-11-02
 
 v2.15 added existing-row validation to `ALTER TABLE ... ADD CONSTRAINT

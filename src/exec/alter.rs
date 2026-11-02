@@ -4151,7 +4151,10 @@ fn validate_fk_rows(
     table: &str,
     fk: &FkDef,
 ) -> Result<(), ExecError> {
-    let meta = TableMeta::of(t);
+    let mut one = TableMeta::of(t);
+    // Single-FK check: judge only this constraint. Invariant across
+    // every row, so built once rather than per row.
+    one.fks = vec![fk.clone()];
     let rows: Vec<Row> = t
         .rows
         .iter()
@@ -4159,10 +4162,6 @@ fn validate_fk_rows(
         .map(|rv| rv.values.clone())
         .collect();
     for values in &rows {
-        // Single-FK check with the flag forced on: build a one-FK
-        // meta so check_fk_child_row judges only this constraint.
-        let mut one = meta.clone();
-        one.fks = vec![fk.clone()];
         check_fk_child_row(
             eng,
             ctx.snap,
