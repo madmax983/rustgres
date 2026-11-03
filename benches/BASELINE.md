@@ -2,6 +2,123 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `seq_nextval`'s per-row `seq_advanced` membership check allocates a throwaway `String` — negative result — 2026-11-03
+
+No prior Bolt round had profiled `src/exec/seq.rs`'s `seq_nextval` (the
+backing function for `SERIAL`/`IDENTITY` column defaults and direct
+`nextval()` calls) under a realistic bulk-insert shape. New harness,
+`benches/profile_serial_insert.py` (self-contained launch-under-valgrind
+pattern, same as `profile_fk_addconstraint.py`): a single multi-thousand-
+row `INSERT INTO t(name) SELECT ... FROM generate_series(...)` into a
+table whose `id SERIAL PRIMARY KEY` is omitted from the column list, so
+every row's DEFAULT fires one `seq_nextval` call. `--variant explicit`
+is the control: the identical statement shape with `id INT PRIMARY KEY`
+and an explicit value per row, so zero `nextval` calls — same row
+count, same column count, same `INSERT ... SELECT` machinery, isolating
+`nextval`'s share by subtraction.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`), 20,000 rows:
+
+| variant | Ir |
+|---|---|
+| `serial` (nextval every row) | 2,111,357,651 |
+| `explicit` (no nextval) | 1,907,141,328 |
+
+The `nextval`-attributable delta is 204,216,323 `Ir`, **9.67%** of the
+`serial` workload — comfortably over the 5%-of-profile relevance bar.
+
+DHAT, same 20,000-row workload:
+
+| variant | total bytes | total blocks |
+|---|---|---|
+| `serial` | 109,319,249 | 647,465 |
+| `explicit` | 74,629,579 | 627,441 |
+
+Reading `src/exec/seq.rs`'s `seq_nextval` (and the structurally
+identical `seq_setval` and the `ALTER SEQUENCE ... RESTART` branch of
+`exec_alter_sequence`) turned up a concrete per-call inefficiency: all
+three end with
+
+```rust
+if !eng.seq_advanced.contains(&name.to_string()) {
+    eng.seq_advanced.push(name.to_string());
+}
+```
+
+`seq_advanced: Vec<String>` is drained once per *statement* (by
+`server.rs`, into a single `WriteOp::SeqAdvance` WAL marker), so across
+a 20,000-row batch INSERT this membership check runs 20,000 times but
+is only ever `true` (the push only happens) on the first row — the
+other 19,999 calls allocate a throwaway `String` via `name.to_string()`
+purely to compare it against the Vec's contents, then drop it
+unconditionally. **Hypothesis**: replacing the allocating
+`.contains(&name.to_string())` with a non-allocating
+`.iter().any(|s| s.as_str() == name)` removes one wasted heap
+allocation per row on the `serial` path (and per call generally on the
+`setval`/`RESTART` paths), with the owning `.to_string()` on the `push`
+line retained (unavoidable — the Vec stores owned `String`s, and the
+push only happens once per distinct sequence per statement).
+
+### Change tested
+
+```rust
+if !eng.seq_advanced.iter().any(|s| s.as_str() == name) {
+    eng.seq_advanced.push(name.to_string());
+}
+```
+applied identically to all three call sites (`seq_nextval`,
+`seq_setval`, `exec_alter_sequence`'s RESTART branch).
+
+### Measurement (change applied)
+
+Same harness, same machine, same session:
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Callgrind Ir (`serial`, 20k rows) | 2,111,357,766 | 2,099,292,145 | -0.57% |
+| DHAT total bytes (`serial`, 20k rows) | 109,319,249 | 108,939,249 | -0.35% |
+| DHAT total blocks (`serial`, 20k rows) | 647,465 | 627,465 | **-3.09%** |
+
+The block count drops by exactly 20,000 — one allocation removed per
+row, precisely as hypothesized — confirming the mechanism is real and
+isolated to the targeted call sites. But none of the three counters
+clear their floor (5% `Ir`, 10% DHAT bytes, 10% DHAT blocks): the
+`String` being elided is tiny (a handful of bytes for a short sequence
+name) against a 20,000-row `INSERT ... SELECT` workload whose total
+cost is dominated by the inherent per-row `Value`/`Row`/`QRow`/`OutRow`
+construction, catalog `Scope` lookups, and (for the `serial` variant
+specifically) one additional legitimate `WriteOp::SeqAdvance` log
+entry per *statement* whose own `Vec<WriteOp>` capacity growth,
+amortized over the 20,000-row insert, accounts for nearly all of the
+`serial`/`explicit` byte-count gap seen above (a one-time
+capacity-doubling artifact of Rust's geometric `Vec` growth crossing
+one extra threshold because of that one extra necessary element — not
+a per-row cost, and not something to "fix": the marker itself is
+required for commit-time WAL correctness).
+
+`cargo test --all-features`: 1239/1239 passed with the change applied
+(no behavior change — same owned `String` is pushed in the same
+cases). `cargo fmt --all -- --check`: clean.
+
+Per the impact floor, the change was reverted (this commit carries only
+the new harness and this writeup; `git diff` against the parent commit
+touches no `.rs` file). Recording this so a future round doesn't
+re-spend a profiling cycle rediscovering the same `seq_advanced`
+allocation under the same or a similar sequence-heavy workload.
+
+**Reproduce**:
+```bash
+cargo build
+python3 benches/profile_serial_insert.py --tool callgrind --rows 20000 --variant serial
+python3 benches/profile_serial_insert.py --tool callgrind --rows 20000 --variant explicit
+python3 benches/profile_serial_insert.py --tool dhat --rows 20000 --variant serial
+python3 benches/profile_serial_insert.py --tool dhat --rows 20000 --variant explicit
+```
+
+Baseline profiles committed:
+`benches/profiles/{callgrind,dhat}.out.serialinsert-{serial,explicit}-n20000-2026-11-03`.
+
 ## Bolt: `validate_fk_rows` rebuilds a one-FK `TableMeta` clone on every existing row — fix — 2026-11-02
 
 Fixes the target identified in the baseline entry immediately below
