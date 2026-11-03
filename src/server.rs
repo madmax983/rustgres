@@ -4432,7 +4432,10 @@ fn run_statement(
             // warning), PG does not analyze it either.
             if *analyze && !vac_skipped {
                 let a = Stmt::Analyze {
-                    table: table.clone(),
+                    tables: table
+                        .clone()
+                        .map(|t| vec![(t, Vec::new())])
+                        .unwrap_or_default(),
                 };
                 let (_, notices) = autocommit_execute(
                     engine,

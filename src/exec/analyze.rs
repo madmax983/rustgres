@@ -506,7 +506,7 @@ pub(crate) fn exec_analyze_core(
     own: u64,
     session: u64,
     role: &str,
-    table: &Option<String>,
+    tables: &[(String, Vec<String>)],
     notices: &mut Vec<String>,
 ) -> Result<(), ExecError> {
     // v0.11: ANALYZE requires ownership (or superuser), like PostgreSQL.
@@ -521,8 +521,38 @@ pub(crate) fn exec_analyze_core(
             })
             .unwrap_or(false)
     };
-    let names: Vec<String> = match table {
-        Some(n) => {
+    // v2.17: validate ANALYZE column lists (PG19 vacuum.c: a named
+    // column must exist - 42703 - and must not repeat - 42701).
+    for (tname, cols) in tables {
+        if cols.is_empty() {
+            continue;
+        }
+        let Some(t) = eng.db.find_table(tname, snap, &[own], session) else {
+            continue;
+        };
+        let mut seen: Vec<String> = Vec::new();
+        for c in cols {
+            let cl = c.to_lowercase();
+            if seen.contains(&cl) {
+                return Err(exec_err(
+                    "42701",
+                    format!(
+                        "column \"{}\" of relation \"{}\" appears more than once",
+                        c, tname
+                    ),
+                ));
+            }
+            seen.push(cl);
+            if !t.columns.iter().any(|(cn, _)| cn.eq_ignore_ascii_case(c)) {
+                return Err(exec_err(
+                    "42703",
+                    format!("column \"{}\" of relation \"{}\" does not exist", c, tname),
+                ));
+            }
+        }
+    }
+    let names: Vec<String> = match tables {
+        [(n, _)] => {
             if eng.db.find_table(n, snap, &[own], session).is_none() {
                 return Err(exec_err(
                     "42P01",
@@ -539,9 +569,30 @@ pub(crate) fn exec_analyze_core(
             }
             vec![n.clone()]
         }
+        [..] if !tables.is_empty() => {
+            // v2.17: multiple named tables (PG19 ANALYZE t1, t2).
+            let mut out = Vec::new();
+            for (n, _) in tables {
+                if eng.db.find_table(n, snap, &[own], session).is_none() {
+                    return Err(exec_err(
+                        "42P01",
+                        format!("relation \"{}\" does not exist", n),
+                    ));
+                }
+                if is_owner(eng, n) {
+                    out.push(n.clone());
+                } else {
+                    notices.push(format!(
+                        "permission denied to analyze \"{}\", skipping it",
+                        n
+                    ));
+                }
+            }
+            out
+        }
         // No table named: analyze the tables this role owns (like PG,
         // which only touches tables the user may maintain).
-        None => eng
+        _ => eng
             .db
             .tables
             .keys()
@@ -553,7 +604,9 @@ pub(crate) fn exec_analyze_core(
     // and stored without write ops.
     for n in names {
         let stats = analyze_table(&eng.db, &n, snap, own, session);
-        eng.db.stats.insert(n, stats);
+        eng.db.stats.insert(n.clone(), stats);
+        // v2.17: build extended statistics for objects on this table.
+        extstats::build_ext_stats_for_table(eng, snap, own, session, &n);
     }
     Ok(())
 }
@@ -563,7 +616,7 @@ pub(crate) fn exec_analyze_core(
 pub(crate) fn exec_analyze(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
-    table: &Option<String>,
+    tables: &[(String, Vec<String>)],
 ) -> Result<ExecResult, ExecError> {
     exec_analyze_core(
         eng,
@@ -571,7 +624,7 @@ pub(crate) fn exec_analyze(
         ctx.own,
         ctx.session,
         ctx.role,
-        table,
+        tables,
         &mut ctx.notices,
     )?;
     Ok(ExecResult::Command {

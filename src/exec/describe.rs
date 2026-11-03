@@ -243,6 +243,32 @@ pub(crate) fn from_schema_item(
                 out.push(apply_aliases(schema)?);
                 return Ok(());
             }
+            // v2.17: extended-statistics catalogs are virtual.
+            if matches!(
+                name.as_str(),
+                "pg_statistic_ext"
+                    | "pg_statistic_ext_data"
+                    | "pg_stats_ext"
+                    | "pg_stats_ext_exprs"
+            ) && eng.db.find_table(name, snap, &[own], session).is_none()
+            {
+                let base_schema = match name.as_str() {
+                    "pg_statistic_ext" => pg_statistic_ext_schema(),
+                    "pg_statistic_ext_data" => pg_statistic_ext_data_schema(),
+                    "pg_stats_ext" => pg_stats_ext_schema(),
+                    _ => pg_stats_ext_exprs_schema(),
+                };
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let schema: Vec<QCol> = base_schema
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                out.push(apply_aliases(schema)?);
+                return Ok(());
+            }
             // v0.37: pg_class is virtual too (TOAST introspection).
             if name == "pg_class" && eng.db.find_table(name, snap, &[own], session).is_none() {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());

@@ -573,7 +573,9 @@ def t_explain():
         check("explain subquery scan", "Index Scan using idx_a_id on a" in plan, plan)
 
         _, _, codes = c.q("EXPLAIN ANALYZE SELECT 1")
-        check("explain analyze -> 0A000", codes == ["0A000"], f"{codes}")
+        # v2.17: bare EXPLAIN ANALYZE is legal PG19 (gram.y ExplainStmt);
+        # the pre-v2.17 expectation of 0A000 encoded the stub.
+        check("explain analyze ok", codes == [], f"{codes}")
 
         # v1.99: EXPLAIN of DML is supported (PG19 ExplainableStmt);
         # it plans without writing.

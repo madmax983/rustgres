@@ -82,6 +82,7 @@ mod eval;
 mod explain;
 mod explain_dml;
 mod explain_nodes;
+mod extstats;
 mod from;
 mod funcs;
 mod indexes;
@@ -326,6 +327,9 @@ mod v214_tests;
 #[path = "test_mods/v216_tests.rs"]
 mod v216_tests;
 #[cfg(test)]
+#[path = "test_mods/v217_tests.rs"]
+mod v217_tests;
+#[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;
 
@@ -351,6 +355,7 @@ pub(crate) use eval::*;
 pub(crate) use explain::*;
 pub(crate) use explain_dml::*;
 pub(crate) use explain_nodes::*;
+pub(crate) use extstats::*;
 pub(crate) use from::*;
 pub(crate) use funcs::*;
 pub(crate) use indexes::*;

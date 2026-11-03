@@ -253,7 +253,12 @@ pub(crate) fn execute_inner(
             if_exists,
             names,
             cascade,
-        } => exec_drop(eng, ctx, names, *if_exists, *cascade),
+        } => {
+            for n in names {
+                extstats::drop_stats_for_table(&mut eng.db, n);
+            }
+            exec_drop(eng, ctx, names, *if_exists, *cascade)
+        }
         // --- v0.9: constraints / ALTER / views / sequences
         Stmt::AlterTable {
             name,
@@ -451,10 +456,13 @@ pub(crate) fn execute_inner(
             opts,
         } => exec_alter_sequence(eng, ctx, name, *if_exists, opts),
         Stmt::DropSequence { names, if_exists } => exec_drop_sequence(eng, ctx, names, *if_exists),
-        // v0.75: CREATE STATISTICS is a validated no-op.
-        Stmt::CreateStatistics => Ok(ExecResult::Command {
-            tag: "CREATE STATISTICS".to_string(),
-        }),
+        // v2.17: CREATE STATISTICS (extended statistics, modeled).
+        Stmt::CreateStatistics { schema, name, auto_name, if_not_exists, kinds, items, table } =>
+            extstats::exec_create_statistics(eng, ctx, schema, name, *auto_name, *if_not_exists, kinds, items, table),
+        Stmt::DropStatistics { names, if_exists, cascade } =>
+            extstats::exec_drop_statistics(eng, ctx, names, *if_exists, *cascade),
+        Stmt::AlterStatistics { schema, name, if_exists, action } =>
+            extstats::exec_alter_statistics(eng, ctx, schema, name, *if_exists, action),
         // --- v0.22: bounded CREATE TYPE ---
         Stmt::CreateType {
             name,
@@ -1005,7 +1013,7 @@ pub(crate) fn execute_inner(
                 exec_explain(eng, ctx, stmt, *costs, opts.verbose)
             }
         }
-        Stmt::Analyze { table } => exec_analyze(eng, ctx, table),
+        Stmt::Analyze { tables } => exec_analyze(eng, ctx, tables),
         Stmt::Update {
             table,
             alias,

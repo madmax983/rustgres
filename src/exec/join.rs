@@ -3153,6 +3153,38 @@ pub(crate) fn build_source(
                 let (_, rows) = pg_stats_scan(&q.eng.db);
                 return Ok((apply_aliases(schema)?, rows));
             }
+            // v2.17: extended-statistics catalogs are virtual.
+            if matches!(
+                name.as_str(),
+                "pg_statistic_ext"
+                    | "pg_statistic_ext_data"
+                    | "pg_stats_ext"
+                    | "pg_stats_ext_exprs"
+            ) && q
+                .eng
+                .db
+                .find_table(name, q.snap, &q.all_xids, q.session)
+                .is_none()
+            {
+                let (raw_schema, rows) = match name.as_str() {
+                    "pg_statistic_ext" => {
+                        pg_statistic_ext_scan(&q.eng.db, q.snap, q.own, q.session)
+                    }
+                    "pg_statistic_ext_data" => pg_statistic_ext_data_scan(&q.eng.db),
+                    "pg_stats_ext" => {
+                        pg_stats_ext_scan(&q.eng.db, q.snap, q.own, q.session, q.role)
+                    }
+                    _ => pg_stats_ext_exprs_scan(&q.eng.db, q.snap, q.own, q.session, q.role),
+                };
+                let schema: Vec<QCol> = raw_schema
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                return Ok((apply_aliases(schema)?, rows));
+            }
             // v0.37: pg_class is virtual too (TOAST introspection).
             if name == "pg_class"
                 && q.eng

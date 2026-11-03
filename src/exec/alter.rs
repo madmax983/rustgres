@@ -5116,8 +5116,23 @@ pub(crate) fn exec_comment_on(
                 ));
             }
         }
+        // v2.17: COMMENT ON STATISTICS checks the modeled registry.
+        "statistics" => {
+            let (sch, nm) = extstats::split_qname(name);
+            let found = eng
+                .db
+                .ext_stats
+                .iter()
+                .any(|o| o.name == nm && sch.as_ref().is_none_or(|s| &o.schema == s));
+            if !found {
+                return Err(exec_err(
+                    "42P01",
+                    format!("statistics object \"{}\" does not exist", nm),
+                ));
+            }
+        }
         _ => {
-            // statistics, collation, conversion, database, server,
+            // collation, conversion, database, server,
             // subscription, extension, language, policy,
             // event_trigger, fdw, rule, large_object,
             // text_search_*: no catalog modeled — accept.

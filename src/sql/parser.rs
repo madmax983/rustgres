@@ -479,13 +479,49 @@ impl Parser {
                 // v1.08: COSTS defaults true (Postgres behavior); an explicit
                 // COSTS OFF/FALSE/0 omits the `(rows=N)` estimates.
                 let mut costs = true;
-                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("analyze")) {
-                    return Err(SqlError {
-                        message: "unsupported: bare EXPLAIN ANALYZE (use EXPLAIN (ANALYZE, ...))"
-                            .to_string(),
-                        code: "0A000",
-                    });
+                // v2.17: bare EXPLAIN options (PG19 gram.y ExplainStmt
+                // also accepts the unparenthesized option words, e.g.
+                // EXPLAIN ANALYZE / EXPLAIN VERBOSE). Consumed here and
+                // folded into the same flags as the parenthesized form.
+                let mut bare_opts = ExplainOpts::default();
+                let mut bare_analyze = false;
+                let mut bare_costs = true;
+                while matches!(self.peek(), Token::Ident(s) if ["analyze","verbose","buffers","wal","timing","summary","settings","memory","costs"].iter().any(|k| s.eq_ignore_ascii_case(k)))
+                {
+                    let w = match self.next() {
+                        Token::Ident(s) => s.to_lowercase(),
+                        _ => unreachable!(),
+                    };
+                    // Optional boolean value.
+                    let mut val = true;
+                    if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("on") || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("off"))
+                    {
+                        let v = match self.next() {
+                            Token::Ident(s) => s,
+                            _ => unreachable!(),
+                        };
+                        val = v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on");
+                    }
+                    match w.as_str() {
+                        "analyze" => bare_analyze = val,
+                        "costs" => bare_costs = val,
+                        "verbose" => bare_opts.verbose = val,
+                        "buffers" => bare_opts.buffers = val,
+                        "wal" => bare_opts.wal = val,
+                        "timing" => bare_opts.timing = val,
+                        "summary" => bare_opts.summary = val,
+                        "settings" => bare_opts.settings = val,
+                        "memory" => bare_opts.memory = val,
+                        _ => {}
+                    }
                 }
+                if bare_analyze {
+                    analyze = true;
+                }
+                if !bare_costs {
+                    costs = false;
+                }
+                let _ = bare_opts;
                 // v1.45: EXPLAIN (option, ...) — full PG19 option set, parsed
                 // and validated per gram.y ExplainStmt/utility_option_list
                 // and explain_state.c ParseExplainOptionList. Only ANALYZE
@@ -735,20 +771,43 @@ impl Parser {
                 }
             }
             "analyze" => {
-                // ANALYZE [table]
-                let table = match self.peek() {
-                    Token::EOF => None,
-                    Token::Ident(_) | Token::QIdent(_) => Some(self.expect_ident()?),
+                // v2.17: ANALYZE [table [(cols)] [, ...]] (PG19 forms).
+                let mut tables: Vec<(String, Vec<String>)> = Vec::new();
+                match self.peek() {
+                    Token::EOF | Token::Semi => {}
+                    Token::Ident(_) | Token::QIdent(_) => loop {
+                        let tname = self.parse_table_name()?;
+                        let mut cols: Vec<String> = Vec::new();
+                        if *self.peek() == Token::LParen {
+                            self.next();
+                            loop {
+                                match self.next() {
+                                    Token::Ident(c) | Token::QIdent(c) => cols.push(c),
+                                    Token::Comma => {}
+                                    Token::RParen => break,
+                                    Token::EOF => break,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        tables.push((tname, cols));
+                        if *self.peek() == Token::Comma {
+                            self.next();
+                        } else {
+                            break;
+                        }
+                    },
                     other => {
                         return Err(err(format!("syntax error: unexpected {:?}", other)));
                     }
-                };
-                Ok(Stmt::Analyze { table })
+                }
+                Ok(Stmt::Analyze { tables })
             }
             // --- v0.9: ALTER TABLE / ALTER SEQUENCE
             "alter" => match self.peek() {
                 Token::Ident(s) if s == "table" => self.parse_alter(),
                 Token::Ident(s) if s == "index" => self.parse_alter_index(),
+                Token::Ident(s) if s == "statistics" => self.parse_alter_statistics(),
                 Token::Ident(s) if s == "view" => self.parse_alter_view(false),
                 Token::Ident(s) if s == "materialized" => self.parse_alter_view(true),
                 Token::Ident(s) if s == "sequence" => self.parse_alter_sequence(),
@@ -1624,63 +1683,115 @@ impl Parser {
         if matches!(self.peek(), Token::Ident(s) if s == "cast") {
             return self.parse_create_cast();
         }
-        // v0.75: CREATE STATISTICS [IF NOT EXISTS] name [(kinds)] ON
-        // cols FROM table. Accepted as a no-op (statistics are not used
-        // by the planner); the syntax is validated.
+        // v2.17: CREATE STATISTICS [IF NOT EXISTS] name [(kinds)] ON
+        // items FROM table - full PG19 CreateStatsStmt grammar. Items
+        // are column names or arbitrary expressions; each is parsed as
+        // an expression and its source text retained for deparse.
         if matches!(self.peek(), Token::Ident(s) if s == "statistics") {
             self.next(); // 'statistics'
-            if self.eat_keyword("if") {
+            let if_not_exists = if self.eat_keyword("if") {
                 self.expect_keyword("not")?;
                 self.expect_keyword("exists")?;
-            }
-            let _name = self.expect_ident()?;
-            // Optional `(dependencies)` / `(ndistinct)` / etc.
-            if *self.peek() == Token::LParen {
-                self.next();
-                let mut depth = 1;
-                while depth > 0 {
-                    match self.next() {
-                        Token::LParen => depth += 1,
-                        Token::RParen => depth -= 1,
-                        Token::EOF => {
-                            return Err(err(
-                                "syntax error: unterminated CREATE STATISTICS".to_string()
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            self.expect_keyword("on")?;
-            // Column list: either `(a, b)` or bare `a, b`.
-            if *self.peek() == Token::LParen {
-                self.next();
-                let mut cdepth = 1;
-                while cdepth > 0 {
-                    match self.next() {
-                        Token::LParen => cdepth += 1,
-                        Token::RParen => cdepth -= 1,
-                        Token::EOF => {
-                            return Err(err(
-                                "syntax error: unterminated CREATE STATISTICS".to_string()
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
+                true
             } else {
-                // Bare column list: `a, b, ...` until `from`.
-                loop {
-                    self.expect_ident()?;
-                    if matches!(self.peek(), Token::Ident(s) if s == "from") {
-                        break;
+                false
+            };
+            // v2.17: the name is optional (PG auto-names from the
+            // table + attribute names). Kinds may precede ON when the
+            // name is omitted: CREATE STATISTICS (ndistinct) ON ...
+            let mut kinds: Vec<char> = Vec::new();
+            let mut parse_kinds = |p: &mut Self| -> Result<(), SqlError> {
+                if *p.peek() == Token::LParen {
+                    // Distinguish a kinds list from an item list: kinds
+                    // parens contain only bare identifiers/commas and
+                    // are followed by ON.
+                    let save = p.pos;
+                    p.next();
+                    let mut ks: Vec<char> = Vec::new();
+                    let mut valid = true;
+                    loop {
+                        match p.next() {
+                            Token::Ident(k) => ks.push(match k.to_lowercase().as_str() {
+                                "ndistinct" => 'd',
+                                "dependencies" => 'f',
+                                "mcv" => 'm',
+                                _ => '?',
+                            }),
+                            Token::Comma => {}
+                            Token::RParen => break,
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
                     }
-                    self.expect(Token::Comma, "','")?;
+                    if valid && matches!(p.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("on"))
+                    {
+                        kinds = ks;
+                    } else {
+                        p.pos = save;
+                    }
+                }
+                Ok(())
+            };
+            let (schema, name, auto_name) = if *self.peek() == Token::LParen
+                || matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("on"))
+            {
+                parse_kinds(self)?;
+                (None, String::new(), true)
+            } else {
+                let qname = self.parse_table_name()?;
+                let (sc, nm) = match qname.split_once('.') {
+                    Some((s, n)) => (Some(s.to_string()), n.to_string()),
+                    None => (None, qname),
+                };
+                parse_kinds(self)?;
+                (sc, nm, false)
+            };
+            self.expect_keyword("on")?;
+            let mut items: Vec<String> = Vec::new();
+            loop {
+                let start = self.pos;
+                let _e = self.parse_or()?;
+                items.push(tokens_to_sql(&self.tokens[start..self.pos]));
+                if *self.peek() == Token::Comma {
+                    self.next();
+                } else {
+                    break;
                 }
             }
             self.expect_keyword("from")?;
-            let _table = self.expect_ident()?;
-            return Ok(Stmt::CreateStatistics);
+            let table = self.parse_table_name()?;
+            let name = if auto_name {
+                // PG ChooseExtendedStatisticsName: <table>_<att...>_stats
+                // with expression attributes named "expr".
+                let mut nm = table.rsplit('.').next().unwrap_or(&table).to_string();
+                for it in &items {
+                    let part = if it
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '"')
+                    {
+                        it.trim_matches('"').to_string()
+                    } else {
+                        "expr".to_string()
+                    };
+                    nm.push('_');
+                    nm.push_str(&part);
+                }
+                nm.push_str("_stats");
+                nm
+            } else {
+                name
+            };
+            return Ok(Stmt::CreateStatistics {
+                schema,
+                name,
+                auto_name,
+                if_not_exists,
+                kinds,
+                items,
+                table,
+            });
         }
         // v0.14: CREATE [ { TEMPORARY | TEMP } | { GLOBAL | LOCAL } ] TABLE.
         // v0.21: TEMP tables drop any existing table with the same name
@@ -2272,15 +2383,13 @@ impl Parser {
                 self.expect(Token::LParen, "'('")?;
                 let e = self.parse_or()?;
                 self.expect(Token::RParen, "')'")?;
+                // PG19: GENERATED ALWAYS AS (expr) with no STORED /
+                // VIRTUAL keyword defaults to VIRTUAL.
                 let stored = if self.eat_keyword("stored") {
                     true
-                } else if self.eat_keyword("virtual") {
-                    false
                 } else {
-                    return Err(err(
-                        "syntax error: expected STORED or VIRTUAL after generated expression"
-                            .to_string(),
-                    ));
+                    let _ = self.eat_keyword("virtual");
+                    false
                 };
                 cons.push(ColCon::Generated { expr: e, stored });
             } else {
@@ -2775,6 +2884,61 @@ impl Parser {
     /// RENAME TO / ALTER COLUMN n SET STATISTICS t /
     /// SET (reloptions) / RESET (names) / SET TABLESPACE ts /
     /// ATTACH PARTITION child.
+
+    /// v2.17: ALTER STATISTICS [IF EXISTS] name RENAME TO n |
+    /// OWNER TO r | SET SCHEMA s | SET STATISTICS [-1|n] (PG19).
+    pub(crate) fn parse_alter_statistics(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("statistics")?;
+        let if_exists = if self.eat_keyword("if") {
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        let qname = self.parse_table_name()?;
+        let (schema, name) = match qname.split_once('.') {
+            Some((s, n)) => (Some(s.to_string()), n.to_string()),
+            None => (None, qname),
+        };
+        let action = if self.eat_keyword("rename") {
+            self.expect_keyword("to")?;
+            AlterStatisticsAction::RenameTo {
+                new_name: self.expect_ident()?,
+            }
+        } else if self.eat_keyword("owner") {
+            self.expect_keyword("to")?;
+            AlterStatisticsAction::OwnerTo {
+                owner: self.expect_ident()?,
+            }
+        } else if self.eat_keyword("set") {
+            if self.eat_keyword("schema") {
+                AlterStatisticsAction::SetSchema {
+                    schema: self.expect_ident()?,
+                }
+            } else {
+                self.expect_keyword("statistics")?;
+                if self.eat_keyword("default") {
+                    AlterStatisticsAction::SetStatistics { target: None }
+                } else {
+                    let t = self.parse_signed_i64()?;
+                    AlterStatisticsAction::SetStatistics {
+                        target: Some(t as i32),
+                    }
+                }
+            }
+        } else {
+            return Err(err(
+                "syntax error: expected RENAME, OWNER or SET in ALTER STATISTICS".to_string(),
+            ));
+        };
+        Ok(Stmt::AlterStatistics {
+            schema,
+            name,
+            if_exists,
+            action,
+        })
+    }
+
     pub(crate) fn parse_alter_index(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("index")?;
         let if_exists = if self.eat_keyword("if") {
@@ -14294,6 +14458,13 @@ impl Parser {
                     rows_from: Vec::new(),
                 });
             }
+            // v2.17: `FROM tbl*` — the inheritance-expansion star
+            // (PG19 relation_expr). The engine's table scans already
+            // treat a parent name as the relation itself in this
+            // bounded model, so the star is consumed and not recorded.
+            if *self.peek() == Token::Star {
+                self.next();
+            }
             let alias = self.parse_alias_opt()?;
             // v0.20: `FROM tbl [AS] x (a, b, c)` — optional column aliases.
             let col_aliases = self.parse_col_alias_list()?;
@@ -14874,6 +15045,34 @@ impl Parser {
     }
 
     pub(crate) fn parse_drop(&mut self) -> Result<Stmt, SqlError> {
+        // v2.17: DROP STATISTICS [IF EXISTS] name [, ...] [CASCADE|RESTRICT].
+        if self.eat_keyword("statistics") {
+            let if_exists = if self.eat_keyword("if") {
+                self.expect_keyword("exists")?;
+                true
+            } else {
+                false
+            };
+            let mut names = Vec::new();
+            loop {
+                let q = self.parse_table_name()?;
+                names.push(match q.split_once('.') {
+                    Some((s, n)) => (Some(s.to_string()), n.to_string()),
+                    None => (None, q),
+                });
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.next();
+            }
+            let cascade = self.parse_cascade_opt()?;
+            return Ok(Stmt::DropStatistics {
+                names,
+                if_exists,
+                cascade,
+            });
+        }
+
         // v1.96: DROP CAST [IF EXISTS] (source AS target)
         // [CASCADE|RESTRICT].
         if self.eat_keyword("cast") {
@@ -15909,8 +16108,14 @@ impl Parser {
             return Ok(GrantObject::Language(name));
         }
         if self.eat_keyword("schema") {
-            let name = self.expect_ident()?;
-            return Ok(GrantObject::Schema(name));
+            // v2.17: GRANT ... ON SCHEMA s1, s2, ... (PG19 GrantStmt
+            // accepts a name list).
+            let mut names = vec![self.expect_ident()?];
+            while matches!(self.peek(), Token::Comma) {
+                self.next();
+                names.push(self.expect_ident()?);
+            }
+            return Ok(GrantObject::Schema(names));
         }
         if self.eat_keyword("type") {
             let name = self.parse_table_name()?;

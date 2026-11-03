@@ -205,9 +205,16 @@ def main():
         r = c.do_sql("SELECT EXISTS(SELECT 1)")
         check("F1 exists colname", r["err"] is None and r["hdr"] == ["exists"])
 
-        # G. CREATE STATISTICS no-op.
+        # G. CREATE STATISTICS (v2.17: modeled; PG19 statscmds.c
+        # rejects unknown columns with 42703 - the pre-v2.17 no-op
+        # stub accepted any column list).
         r = c.do_sql("CREATE STATISTICS st77 (ndistinct) ON a, b FROM j77a")
-        check("G1 create statistics", r["err"] is None)
+        check("G1 create statistics bad cols -> 42703",
+              r["err"] is not None and "C42703" in r["err"])
+        r = c.do_sql("CREATE TABLE j77c(x int, y int)")
+        check("G1b create table", r["err"] is None)
+        r = c.do_sql("CREATE STATISTICS st77 (ndistinct) ON x, y FROM j77c")
+        check("G1c create statistics", r["err"] is None)
 
         # H. VACUUM (ANALYZE).
         r = c.do_sql("VACUUM (ANALYZE) j77a")

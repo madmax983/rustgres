@@ -1811,81 +1811,83 @@ pub(crate) fn exec_grant_revoke(
         }
         // v1.96: GRANT ON SCHEMA — validated no-op (single namespace;
         // USAGE/CREATE are not enforced per-schema).
-        GrantObject::Schema(sname) => {
-            if !eng.db.schemas.iter().any(|s| s == sname) {
-                return Err(exec_err(
-                    "3F000",
-                    format!("schema \"{}\" does not exist", sname),
-                ));
-            }
-            // v1.96: real schema ACLs (were a validated no-op).
-            // Bits: USAGE = PRIV_USAGE, CREATE = PRIV_REFERENCES.
-            let mut bits = 0u32;
-            for s in privs {
-                bits |= match s.priv_ {
-                    crate::sql::Privilege::All => {
-                        crate::storage::PRIV_USAGE | crate::storage::PRIV_REFERENCES
-                    }
-                    crate::sql::Privilege::Usage => crate::storage::PRIV_USAGE,
-                    crate::sql::Privilege::Create => crate::storage::PRIV_REFERENCES,
-                    _ => {
-                        return Err(exec_err(
-                            "0A000",
-                            format!("invalid privilege {:?} for schema", s.priv_),
-                        ));
-                    }
-                };
-            }
-            let owner = eng
-                .db
-                .schema_owners
-                .get(sname)
-                .cloned()
-                .unwrap_or_else(|| eng.db.db_owner.clone());
-            let prev = eng.db.schemas.clone();
-            let prev_owners = eng.db.schema_owners.clone();
-            let prev_acls = eng.db.schema_acls.clone();
-            let mut entries = eng.db.schema_acls.get(sname).cloned().unwrap_or_default();
-            let groups =
-                select_grantor_groups(eng, ctx, &owner, &entries, bits, granted_by, revoke)?;
-            {
-                let actor = grantor_actor_name(ctx, granted_by);
-                let closure = crate::storage::role_closure(&eng.db, &actor, ctx.snap, ctx.own);
-                let mut actor_any = actor == owner;
-                if let Some(es) = eng.db.schema_acls.get(sname) {
-                    for e in es {
-                        if e.role == "public" || closure.iter().any(|n| n == &e.role) {
-                            actor_any = true;
+        GrantObject::Schema(snames) => {
+            for sname in snames {
+                if !eng.db.schemas.iter().any(|s| s == sname) {
+                    return Err(exec_err(
+                        "3F000",
+                        format!("schema \"{}\" does not exist", sname),
+                    ));
+                }
+                // v1.96: real schema ACLs (were a validated no-op).
+                // Bits: USAGE = PRIV_USAGE, CREATE = PRIV_REFERENCES.
+                let mut bits = 0u32;
+                for s in privs {
+                    bits |= match s.priv_ {
+                        crate::sql::Privilege::All => {
+                            crate::storage::PRIV_USAGE | crate::storage::PRIV_REFERENCES
+                        }
+                        crate::sql::Privilege::Usage => crate::storage::PRIV_USAGE,
+                        crate::sql::Privilege::Create => crate::storage::PRIV_REFERENCES,
+                        _ => {
+                            return Err(exec_err(
+                                "0A000",
+                                format!("invalid privilege {:?} for schema", s.priv_),
+                            ));
+                        }
+                    };
+                }
+                let owner = eng
+                    .db
+                    .schema_owners
+                    .get(sname)
+                    .cloned()
+                    .unwrap_or_else(|| eng.db.db_owner.clone());
+                let prev = eng.db.schemas.clone();
+                let prev_owners = eng.db.schema_owners.clone();
+                let prev_acls = eng.db.schema_acls.clone();
+                let mut entries = eng.db.schema_acls.get(sname).cloned().unwrap_or_default();
+                let groups =
+                    select_grantor_groups(eng, ctx, &owner, &entries, bits, granted_by, revoke)?;
+                {
+                    let actor = grantor_actor_name(ctx, granted_by);
+                    let closure = crate::storage::role_closure(&eng.db, &actor, ctx.snap, ctx.own);
+                    let mut actor_any = actor == owner;
+                    if let Some(es) = eng.db.schema_acls.get(sname) {
+                        for e in es {
+                            if e.role == "public" || closure.iter().any(|n| n == &e.role) {
+                                actor_any = true;
+                            }
                         }
                     }
+                    // pg_read/write_all_data hold USAGE on every schema.
+                    if bits & crate::storage::PRIV_USAGE != 0
+                        && closure
+                            .iter()
+                            .any(|n| n == "pg_read_all_data" || n == "pg_write_all_data")
+                    {
+                        actor_any = true;
+                    }
+                    check_stranger_grantor(&groups, actor_any, "schema", sname)?;
                 }
-                // pg_read/write_all_data hold USAGE on every schema.
-                if bits & crate::storage::PRIV_USAGE != 0
-                    && closure
-                        .iter()
-                        .any(|n| n == "pg_read_all_data" || n == "pg_write_all_data")
-                {
-                    actor_any = true;
-                }
-                check_stranger_grantor(&groups, actor_any, "schema", sname)?;
+                apply_acl_delta(
+                    &mut entries,
+                    grantees_in,
+                    &groups,
+                    revoke,
+                    false,
+                    grant_option,
+                    grant_option_for,
+                    cascade,
+                    &owner,
+                )?;
+                eng.db.schema_acls.insert(sname.clone(), entries);
+                ctx.writes.push(WriteOp::SchemaSet {
+                    prev,
+                    prev_owners,
+                    prev_acls,
+                });
             }
-            apply_acl_delta(
-                &mut entries,
-                grantees_in,
-                &groups,
-                revoke,
-                false,
-                grant_option,
-                grant_option_for,
-                cascade,
-                &owner,
-            )?;
-            eng.db.schema_acls.insert(sname.clone(), entries);
-            ctx.writes.push(WriteOp::SchemaSet {
-                prev,
-                prev_owners,
-                prev_acls,
-            });
             return Ok(ExecResult::Command {
                 tag: if revoke { "REVOKE" } else { "GRANT" }.to_string(),
             });

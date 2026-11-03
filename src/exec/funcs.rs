@@ -2509,7 +2509,7 @@ pub(crate) fn run_plpgsql_stmts(
                 // are discarded. ANALYZE has a direct core entry;
                 // GRANT/REVOKE forms run through the generic utility
                 // path (v1.96).
-                if let crate::sql::Stmt::Analyze { table } = u {
+                if let crate::sql::Stmt::Analyze { tables } = u {
                     let mut dummy_notices = Vec::new();
                     exec_analyze_core(
                         &mut *q.eng,
@@ -2517,7 +2517,7 @@ pub(crate) fn run_plpgsql_stmts(
                         q.own,
                         q.session,
                         q.role,
-                        table,
+                        tables,
                         &mut dummy_notices,
                     )?;
                 } else {
@@ -4733,6 +4733,27 @@ pub(crate) fn eval_func(
     }
     // v2.15: pg_get_constraintdef(oid[, pretty]) — PG returns NULL
     // for an unknown OID (rules.sql proves pg_get_constraintdef(0)).
+    // v2.17: pg_get_statisticsobjdef(oid) / pg_statistics_obj_is_visible(oid).
+    if name == "pg_get_statisticsobjdef" && !args.is_empty() {
+        let v = eval_expr(q, scopes, &args[0])?;
+        let Value::Int(oid) = v else {
+            return Ok(Value::Null);
+        };
+        return Ok(match statisticsobjdef(&q.eng.db, oid) {
+            Some(d) => Value::text(d.as_str()),
+            None => Value::Null,
+        });
+    }
+    if name == "pg_statistics_obj_is_visible" && !args.is_empty() {
+        let v = eval_expr(q, scopes, &args[0])?;
+        let Value::Int(oid) = v else {
+            return Ok(Value::Bool(false));
+        };
+        let vis = q.eng.db.ext_stats.iter().any(|o| {
+            o.oid as i64 == oid && (o.schema == "public" || o.schema.starts_with("pg_temp"))
+        });
+        return Ok(Value::Bool(vis));
+    }
     if name == "pg_get_constraintdef" && !args.is_empty() {
         let v = eval_expr(q, scopes, &args[0])?;
         let Value::Int(oid) = v else {
@@ -5785,6 +5806,8 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         "__sqljson_exists" => n == 4,
         // v0.32: regexp set-returning functions (PG 19).
         "regexp_matches" => (2..=3).contains(&n),
+        // v2.17: regexp_match (scalar, first match) shares the SRF core.
+        "regexp_match" => (2..=3).contains(&n),
         "regexp_split_to_table" => (2..=3).contains(&n),
         // v0.46: generate_series(int,int[,int]) / (bigint,bigint[,bigint])
         // / (numeric,numeric[,numeric]) — PG19 int.c, int8.c, numeric.c.
@@ -6105,6 +6128,7 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         | "regexp_split_to_array"
         // v0.32: regexp_matches (scalar context = first match row).
         | "regexp_matches"
+        | "regexp_match"
         | "pg_overlaps"
         | "similar_to"
         | "substring_similar"
@@ -10519,6 +10543,24 @@ pub(crate) fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecErr
             let rows = regexp_matches_rows(vals)?;
             Ok(rows.into_iter().next().unwrap_or(Value::Null))
         }
+        "regexp_match" => {
+            // v2.17: regexp_match(string, pattern [, flags]) — the
+            // first match's capture array, or NULL (PG19 regexp_match:
+            // like regexp_matches without 'g', returning one row).
+            // PG rejects the 'g' flag for regexp_match (22023).
+            if vals.len() > 2 {
+                if let Value::Text(f) = &vals[2] {
+                    if f.contains('g') {
+                        return Err(exec_err(
+                            "22023",
+                            "invalid regular expression option: \"g\"".to_string(),
+                        ));
+                    }
+                }
+            }
+            let rows = regexp_matches_rows(vals)?;
+            Ok(rows.into_iter().next().unwrap_or(Value::Null))
+        }
         "overlay" => {
             // overlay(s, replacement, start [, len]); omitted len defaults
             // to length(replacement). 1-based start; start < 1 is clamped.
@@ -14012,9 +14054,8 @@ pub(crate) fn func_result_type(
         "regexp_count" | "regexp_instr" => Ok(ColType::Int),
         // v0.80: `GROUPING(...)` returns integer (int4), like PG19.
         "grouping" => Ok(ColType::Int),
-        "regexp_substr" | "regexp_replace" | "regexp_split_to_array" | "regexp_matches" => {
-            Ok(ColType::Text)
-        }
+        "regexp_substr" | "regexp_replace" | "regexp_split_to_array" | "regexp_matches"
+        | "regexp_match" => Ok(ColType::Text),
         // v0.95: `parse_ident` returns `text[]` (PG19).
         "parse_ident" => Ok(ColType::Array(crate::storage::ArrayElem::Text)),
         "pg_overlaps" => Ok(ColType::Bool),
@@ -14225,7 +14266,9 @@ pub(crate) fn func_result_type(
         // v2.04: catalog description helpers used by the publication
         // suite (pg_get_expr deparses our stored filter text form).
         "pg_get_expr" | "pg_describe_object" | "obj_description" | "shobj_description"
-        | "pg_get_triggerdef" | "pg_get_constraintdef" => Ok(ColType::Text),
+        | "pg_get_triggerdef" | "pg_get_constraintdef" | "pg_get_statisticsobjdef" => Ok(ColType::Text),
+        // v2.17: pg_statistics_obj_is_visible(oid) -> boolean.
+        "pg_statistics_obj_is_visible" => Ok(ColType::Bool),
         // v2.09: pg_trigger_depth() is int.
         "pg_trigger_depth" => Ok(ColType::Int),
         // v1.96: large-object family result types.

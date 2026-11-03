@@ -6025,6 +6025,12 @@ pub struct Database {
     /// ANALYZE statistics by table name (v0.8). Updated non-transactionally
     /// by ANALYZE, like PostgreSQL; never WAL-logged, rebuilt by ANALYZE.
     pub stats: HashMap<String, TableStats, FxBuildHasher>,
+    /// v2.17: extended-statistics objects (CREATE STATISTICS). Like
+    /// `stats`, kept in a non-transactional side registry: the objects
+    /// are DDL in PG, but this engine's precedent for analyzer state
+    /// (and casts) is an in-memory map; WAL/checkpoint durability is a
+    /// recorded hold-back. Keyed by (schema, name).
+    pub ext_stats: Vec<ExtStatObj>,
     /// Shell types by name (v0.22, bounded — see `ShellType`). Types are
     /// database-global and transactional via the statement undo log
     /// (`WriteOp::CreateType` / `WriteOp::DropType`). v0.82: type DDL is
@@ -6337,6 +6343,7 @@ impl Database {
             tables: HashMap::default(),
             indexes: HashMap::default(),
             stats: HashMap::default(),
+            ext_stats: Vec::new(),
             views: HashMap::default(),
             sequences: HashMap::default(),
             roles: HashMap::default(),
@@ -7224,7 +7231,57 @@ pub struct ColStats {
     pub hist_bounds: Vec<Value>,
 }
 
-/// Per-table statistics from ANALYZE (v0.8).
+/// v2.17: one item of a CREATE STATISTICS definition: a plain column
+/// (attnum, 1-based) or an expression (source text + parsed form).
+#[derive(Clone, Debug)]
+pub enum ExtStatItem {
+    Column(u16),
+    Expr(String, crate::sql::Expr),
+}
+
+/// v2.17: built multivariate data for one statistics object
+/// (pg_statistic_ext_data payload, text-rendered forms plus the raw
+/// MCV rows the pg_stats_ext view aggregates).
+#[derive(Clone, Debug, Default)]
+pub struct ExtStatData {
+    pub built: bool,
+    /// pg_ndistinct text: {"1, 2": 4, ...} keyed by attnum list.
+    pub ndistinct: Option<String>,
+    /// pg_dependencies text: [{"attributes": [1], "dependency": 2, "degree": 1.000000}]
+    pub dependencies: Option<String>,
+    /// MCV items: (values per item incl. NULLs as None, frequency, base_frequency)
+    pub mcv: Vec<(Vec<Option<Value>>, f64, f64)>,
+    /// Per-expression single-column stats, parallel to the Expr items:
+    /// (null_frac, n_distinct, mcv (value, freq) rendered pairs)
+    pub expr_stats: Vec<ExtExprStat>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ExtExprStat {
+    pub null_frac: f64,
+    pub avg_width: i32,
+    pub n_distinct: f64,
+    pub mcv: Vec<(Value, f64)>,
+}
+
+/// v2.17: a CREATE STATISTICS object (pg_statistic_ext row + data).
+#[derive(Clone, Debug)]
+pub struct ExtStatObj {
+    pub oid: u32,
+    pub name: String,
+    pub schema: String,
+    pub owner: String,
+    /// As-written table reference (may be schema-qualified).
+    pub table: String,
+    pub items: Vec<ExtStatItem>,
+    /// Item source texts as written (deparse for pg_get_statisticsobjdef).
+    pub item_texts: Vec<String>,
+    /// Kind letters: 'd' ndistinct, 'f' dependencies, 'm' mcv.
+    pub kinds: Vec<char>,
+    pub stattarget: Option<i32>,
+    pub data: ExtStatData,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct TableStats {
     /// Estimated live row count.
