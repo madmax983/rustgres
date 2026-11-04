@@ -3882,6 +3882,7 @@ pub(crate) fn vx_select(
             CteBody::Dml(d) => {
                 let mut writes = Vec::new();
                 let ctx = StmtCtx {
+                    privs_suppressed: false,
                     snap: q.snap,
                     own: q.own,
                     write_xid: q.own,

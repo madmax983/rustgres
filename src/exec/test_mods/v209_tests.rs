@@ -25,6 +25,7 @@ fn run_full(eng: &mut Engine, sql: &str) -> (Result<ExecResult, ExecError>, Vec<
     let snap = eng.take_snapshot();
     let mut writes = Vec::new();
     let mut ctx = StmtCtx {
+        privs_suppressed: false,
         snap: &snap,
         own: xid,
         write_xid: xid,
@@ -66,6 +67,7 @@ fn flush_noticed(eng: &mut Engine) -> (Result<(), ExecError>, Vec<String>) {
     let snap = eng.take_snapshot();
     let mut writes = Vec::new();
     let mut ctx = StmtCtx {
+        privs_suppressed: false,
         snap: &snap,
         own: xid,
         write_xid: xid,

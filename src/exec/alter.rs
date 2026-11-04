@@ -702,6 +702,31 @@ pub(crate) fn exec_alter_stmt(
         .is_some();
     if !is_table {
         let is_view = eng.db.find_view(name, ctx.snap, ctx.own).is_some();
+        // v2.18: ALTER VIEW ALTER COLUMN SET/DROP DEFAULT.
+        if is_view
+            && !actions.is_empty()
+            && actions.iter().all(|a| {
+                matches!(
+                    a,
+                    AlterAction::AlterColumnSetDefault { .. }
+                        | AlterAction::AlterColumnDropDefault { .. }
+                )
+            })
+        {
+            return exec_alter_view_column_default(eng, ctx, name, actions);
+        }
+        // v2.18: ALTER VIEW SET/RESET (reloptions) (PG19 view.c).
+        if is_view
+            && !actions.is_empty()
+            && actions.iter().all(|a| {
+                matches!(
+                    a,
+                    AlterAction::SetRelOptions { .. } | AlterAction::ResetRelOptions { .. }
+                )
+            })
+        {
+            return exec_alter_view_reloptions(eng, ctx, name, actions);
+        }
         if is_view
             && !actions.is_empty()
             && actions

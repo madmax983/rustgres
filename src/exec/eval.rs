@@ -2788,6 +2788,7 @@ pub(crate) fn subplan_inner_is_base_table(q: &Q, name: &str) -> bool {
         || name == "information_schema.enabled_roles"
         || name == "information_schema.applicable_roles"
         || name == "information_schema.triggers"
+        || name == "information_schema.views"
     {
         return false;
     }

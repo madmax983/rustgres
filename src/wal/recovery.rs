@@ -1014,6 +1014,11 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     // v2.14: view triggers ride the record (RGSWAL33).
                     triggers: crate::sql::decode_triggers(triggers)
                         .unwrap_or_default(),
+                    // v2.18: column ACL/defaults are checkpoint-only
+                    // state (the v1.96 ViewState pattern); a freshly
+                    // created view has neither.
+                    col_acl: Vec::new(),
+                    col_defaults: Vec::new(),
                 });
         }
         WalRecord::DropView { name, xmax } => {

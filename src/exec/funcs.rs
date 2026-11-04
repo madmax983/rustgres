@@ -877,6 +877,7 @@ pub(crate) fn run_nested_dml(
         }
     }
     let mut dml_ctx = StmtCtx {
+        privs_suppressed: false,
         snap: call_q.snap,
         own: call_q.own,
         write_xid: w.write_xid,
@@ -928,6 +929,7 @@ pub(crate) fn run_func_utility(
         ));
     };
     let mut ctx = StmtCtx {
+        privs_suppressed: false,
         snap: call_q.snap,
         own: call_q.own,
         write_xid: w.write_xid,
@@ -2034,6 +2036,7 @@ pub(crate) fn exec_plpgsql_stmt(
         }
     }
     let mut ctx = StmtCtx {
+        privs_suppressed: false,
         snap: q.snap,
         own: q.own,
         write_xid: w.write_xid,
@@ -5022,6 +5025,19 @@ pub(crate) fn eval_func(
         check_builtin_arity(name, &vals)?;
         return eval_pg_relation_size(q, &vals);
     }
+    // v2.18: updatability introspection needs engine access.
+    if name == "pg_relation_is_updatable" || name == "pg_column_is_updatable" {
+        let mut vals = Vec::with_capacity(args.len());
+        for a in args {
+            vals.push(eval_expr(q, scopes, a)?);
+        }
+        check_builtin_arity(name, &vals)?;
+        return if name == "pg_relation_is_updatable" {
+            eval_pg_relation_is_updatable(q, &vals)
+        } else {
+            eval_pg_column_is_updatable(q, &vals)
+        };
+    }
     // v1.13: pg_size_pretty(bigint) -> text (PG19 misc.c).
     if name == "pg_size_pretty" {
         let mut vals = Vec::with_capacity(args.len());
@@ -5695,6 +5711,165 @@ pub(crate) fn eval_pg_relation_size(q: &mut Q, vals: &[Value]) -> Result<Value, 
     Ok(Value::BigInt(pg_heap_page_count(t, &lens) as i64))
 }
 
+/// v2.18: relation resolution for the updatability introspection
+/// functions (PG19 misc.c pg_relation_is_updatable /
+/// pg_column_is_updatable). Accepts a regclass display value, a
+/// relation name, or an OID; views resolve through the
+/// deterministic name-hash OID (see eval_regclass_cast). An
+/// unresolvable OID yields None (PG returns 0 / false, no error).
+enum UpdRel {
+    Table(String),
+    View(String),
+}
+
+fn resolve_upd_rel(q: &Q, v: &Value) -> Option<UpdRel> {
+    let db = &q.eng.db;
+    let by_oid = |oid: u32| -> Option<UpdRel> {
+        for (tname, vs) in &db.tables {
+            if vs
+                .iter()
+                .any(|t| t.oid == oid && crate::storage::table_visible(t, q.snap, &q.all_xids))
+            {
+                return Some(UpdRel::Table(tname.clone()));
+            }
+        }
+        for (name, vs) in &db.views {
+            if vs
+                .iter()
+                .any(|x| crate::storage::view_visible(x, q.snap, q.own))
+                && crate::exec::catalog::name_oid(name) == oid
+            {
+                return Some(UpdRel::View(name.clone()));
+            }
+        }
+        None
+    };
+    match v {
+        Value::Int(i) => by_oid(*i as u32),
+        Value::BigInt(i) => by_oid(*i as u32),
+        Value::SmallInt(i) => by_oid(*i as u32),
+        Value::Text(s) => {
+            let base = s.rsplit('.').next().unwrap_or(s);
+            if !base.is_empty() && base.bytes().all(|b| b.is_ascii_digit()) {
+                return by_oid(base.parse::<u32>().unwrap_or(0));
+            }
+            if db
+                .find_table(base, q.snap, &q.all_xids, q.session)
+                .is_some()
+            {
+                return Some(UpdRel::Table(base.to_string()));
+            }
+            if db.find_view(base, q.snap, q.own).is_some() {
+                return Some(UpdRel::View(base.to_string()));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn upd_bool(v: &Value) -> bool {
+    matches!(v, Value::Bool(true))
+}
+
+/// v2.18: `pg_relation_is_updatable(regclass, bool) -> int4` —
+/// the event bitmask (UPDATE=4, INSERT=8, DELETE=16 in CMD
+/// numbering), per PG19 relation_is_updatable.
+pub(crate) fn eval_pg_relation_is_updatable(q: &mut Q, vals: &[Value]) -> Result<Value, ExecError> {
+    if vals.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let incl_trig = upd_bool(&vals[1]);
+    match resolve_upd_rel(q, &vals[0]) {
+        None => Ok(Value::Int(0)),
+        Some(UpdRel::Table(_)) => Ok(Value::Int(28)),
+        Some(UpdRel::View(name)) => {
+            let (ins, upd, del) =
+                crate::exec::viewdml::view_updatable_events(q.eng, q.snap, q.own, q.session, &name);
+            let mut m: i64 = 0;
+            if upd {
+                m |= 4;
+            }
+            if ins {
+                m |= 8;
+            }
+            if del {
+                m |= 16;
+            }
+            if incl_trig {
+                if let Some(v) = q.eng.db.find_view(&name, q.snap, q.own) {
+                    for t in &v.triggers {
+                        if t.timing == crate::sql::TriggerTiming::InsteadOf && t.for_each_row {
+                            if t.events & crate::sql::trig_event::INSERT != 0 {
+                                m |= 8;
+                            }
+                            if t.events & crate::sql::trig_event::UPDATE != 0 {
+                                m |= 4;
+                            }
+                            if t.events & crate::sql::trig_event::DELETE != 0 {
+                                m |= 16;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Value::Int(m))
+        }
+    }
+}
+
+/// v2.18: `pg_column_is_updatable(regclass, smallint, bool) ->
+/// bool` — per PG19 pg_column_is_updatable (recursive through
+/// view bases; an INSTEAD OF UPDATE trigger makes every column
+/// updatable when include_triggers is set).
+pub(crate) fn eval_pg_column_is_updatable(q: &mut Q, vals: &[Value]) -> Result<Value, ExecError> {
+    if vals.iter().any(|v| matches!(v, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let attno: i64 = match &vals[1] {
+        Value::SmallInt(i) => *i as i64,
+        Value::Int(i) => *i as i64,
+        Value::BigInt(i) => *i,
+        _ => return Ok(Value::Bool(false)),
+    };
+    let incl_trig = upd_bool(&vals[2]);
+    match resolve_upd_rel(q, &vals[0]) {
+        None => Ok(Value::Bool(false)),
+        Some(UpdRel::Table(name)) => {
+            let n = q
+                .eng
+                .db
+                .find_table(&name, q.snap, &q.all_xids, q.session)
+                .map(|t| t.columns.len() as i64)
+                .unwrap_or(0);
+            Ok(Value::Bool(attno >= 1 && attno <= n))
+        }
+        Some(UpdRel::View(name)) => {
+            if incl_trig {
+                if let Some(v) = q.eng.db.find_view(&name, q.snap, q.own) {
+                    let has_upd_trig = v.triggers.iter().any(|t| {
+                        t.timing == crate::sql::TriggerTiming::InsteadOf
+                            && t.for_each_row
+                            && t.events & crate::sql::trig_event::UPDATE != 0
+                    });
+                    if has_upd_trig {
+                        return Ok(Value::Bool(true));
+                    }
+                }
+            }
+            let cols =
+                crate::exec::viewdml::view_columns_of_db(q.eng, q.snap, q.own, q.session, &name)
+                    .unwrap_or_default();
+            let Some((cn, _)) = cols.get((attno - 1) as usize) else {
+                return Ok(Value::Bool(false));
+            };
+            Ok(Value::Bool(crate::exec::viewdml::view_col_updatable(
+                q.eng, q.snap, q.own, q.session, &name, cn,
+            )))
+        }
+    }
+}
+
 /// v1.13: `pg_size_pretty(bigint) -> text` — PG19's human-readable size
 /// formatting (src/backend/utils/adt/misc.c). Thresholds are 10 * 1024^n;
 /// the displayed value is the integer division, like PG.
@@ -5824,6 +5999,9 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         // v0.37: TOAST introspection functions.
         "pg_column_compression" => n == 1,
         "pg_relation_size" => n == 1 || n == 2,
+        // v2.18: updatability introspection (PG19 misc.c).
+        "pg_relation_is_updatable" => n == 2,
+        "pg_column_is_updatable" => n == 3,
         // v1.13: pg_size_pretty(bigint) -> text (PG19 misc.c).
         "pg_size_pretty" => n == 1,
         "pg_overlaps" => n == 4,
@@ -14049,6 +14227,9 @@ pub(crate) fn func_result_type(
         // v0.37: TOAST introspection functions.
         "pg_column_compression" => Ok(ColType::Text),
         "pg_relation_size" => Ok(ColType::BigInt),
+        // v2.18: updatability introspection (PG19 misc.c).
+        "pg_relation_is_updatable" => Ok(ColType::Int),
+        "pg_column_is_updatable" => Ok(ColType::Bool),
         // v1.13: pg_size_pretty(bigint) -> text.
         "pg_size_pretty" => Ok(ColType::Text),
         "regexp_count" | "regexp_instr" => Ok(ColType::Int),

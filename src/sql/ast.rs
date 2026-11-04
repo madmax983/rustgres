@@ -9126,7 +9126,8 @@ pub enum Stmt {
         or_replace: bool,
         // v1.95: WITH (security_invoker = ...) / trailing CHECK OPTION.
         security_invoker: bool,
-        check_option: bool,
+        // v2.18: tri-state (was a bool through v2.17).
+        check_option: crate::storage::CheckOption,
         // v1.96: CREATE MATERIALIZED VIEW (+ WITH NO DATA).
         matview: bool,
         with_data: bool,

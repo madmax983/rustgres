@@ -121,6 +121,14 @@ pub struct StmtCtx<'a> {
     /// v0.11: authenticated role executing this statement (lowercased).
     /// Owners, grants, and privilege checks all key off this.
     pub role: &'a str,
+    /// v2.18: while an auto-updatable-view DML rewrite executes its
+    /// translated base statement, base-object privilege checks are
+    /// suppressed: PG checks the CALLER against the view and the
+    /// view OWNER against the base (viewdml::check_view_dml_privs
+    /// performs both explicitly). Trigger/function bodies firing
+    /// inside the window inherit the suppression (a known
+    /// simplification of PG's per-object definer contexts).
+    pub privs_suppressed: bool,
     /// v0.17: statement runs read-only — sequence advances (nextval,
     /// setval) fail with 25006. Set by the server from the effective
     /// transaction mode.

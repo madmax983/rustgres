@@ -22,6 +22,7 @@ fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
     let snap = eng.take_snapshot();
     let mut writes = Vec::new();
     let mut ctx = StmtCtx {
+        privs_suppressed: false,
         snap: &snap,
         own: xid,
         write_xid: xid,
@@ -51,6 +52,7 @@ fn run_collect(eng: &mut Engine, sql: &str) -> (Result<ExecResult, ExecError>, V
     let snap = eng.take_snapshot();
     let mut writes = Vec::new();
     let mut ctx = StmtCtx {
+        privs_suppressed: false,
         snap: &snap,
         own: xid,
         write_xid: xid,

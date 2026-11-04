@@ -17,6 +17,7 @@ fn run_as(eng: &mut Engine, sql: &str, role: &str) -> Result<ExecResult, ExecErr
     let snap = eng.take_snapshot();
     let mut writes = Vec::new();
     let mut ctx = StmtCtx {
+        privs_suppressed: false,
         snap: &snap,
         own: 9,
         write_xid: 9,
@@ -515,10 +516,10 @@ fn v195_view_options_parse_and_store() {
     .unwrap();
     let v1 = eng.db.find_view("v1", &eng.take_snapshot(), 9).unwrap();
     assert!(v1.security_invoker);
-    assert!(!v1.check_option);
+    assert!(!v1.check_option.present());
     let v2 = eng.db.find_view("v2", &eng.take_snapshot(), 9).unwrap();
     assert!(!v2.security_invoker);
-    assert!(v2.check_option);
+    assert!(v2.check_option.present());
     assert!(
         v2.query.to_ascii_lowercase().ends_with("a > 0"),
         "{}",

@@ -120,6 +120,23 @@ pub(crate) fn exec_merge(
     with: &[CteDef],
 ) -> Result<ExecResult, ExecError> {
     let qual = alias.as_deref().unwrap_or(table).to_string();
+    // --- v2.18: MERGE into an auto-updatable view — translate the
+    // target references onto the base relation and recurse (PG19
+    // rewriteTargetView for CMD_MERGE). Views with INSTEAD OF
+    // triggers keep the pre-v2.18 gate below (a partial trigger set
+    // is PG's 0A000 "cannot merge into view" shape; a full set is
+    // not implemented).
+    if eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+        .is_none()
+        && is_plain_view(eng, ctx, table)
+        && [trig_event::INSERT, trig_event::UPDATE, trig_event::DELETE]
+            .iter()
+            .all(|ev| instead_triggers_for(eng, ctx, table, *ev).is_empty())
+    {
+        return exec_merge_auto_view(eng, ctx, table, alias, source, on, whens, returning, with);
+    }
     // --- static validation: target, clause shapes ----------------------
     let (meta, partitioned, pinfo, unique_defs, target_oid, tdef) = {
         let t = merge_target_table(eng, ctx, table)?;

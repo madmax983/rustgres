@@ -151,6 +151,19 @@ pub(crate) fn from_schema_item(
                 out.push(apply_aliases(schema)?);
                 return Ok(());
             }
+            // v2.18: information_schema.views.
+            if name == "information_schema.views" {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let schema: Vec<QCol> = info_views_schema()
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                out.push(apply_aliases(schema)?);
+                return Ok(());
+            }
             // v2.14: information_schema.triggers.
             if name == "information_schema.triggers" {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());

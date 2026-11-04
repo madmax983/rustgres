@@ -3013,6 +3013,37 @@ impl Parser {
             let new = self.expect_ident()?;
             return Ok(Stmt::AlterViewRenameColumn { name, old, new });
         }
+        // v2.18: ALTER VIEW name ALTER COLUMN c SET/DROP DEFAULT
+        // (PG19 AT_AlterColumnDefault on the view).
+        if matches!(self.peek(), Token::Ident(k) if k == "alter") {
+            let action = self.parse_alter_action()?;
+            return Ok(Stmt::AlterTable {
+                name: tname,
+                actions: vec![action],
+                if_exists: false,
+                only: false,
+            });
+        }
+        // v2.18: ALTER VIEW name SET (reloptions) / RESET (names)
+        // (PG19 routes these through AlterTableStmt on the view).
+        if self.eat_keyword("set") {
+            let options = self.parse_reloptions_lenient()?;
+            return Ok(Stmt::AlterTable {
+                name: tname,
+                actions: vec![AlterAction::SetRelOptions { options }],
+                if_exists: false,
+                only: false,
+            });
+        }
+        if self.eat_keyword("reset") {
+            let options = self.parse_reloption_names_strict()?;
+            return Ok(Stmt::AlterTable {
+                name: tname,
+                actions: vec![AlterAction::ResetRelOptions { options }],
+                if_exists: false,
+                only: false,
+            });
+        }
         Err(err(
             "syntax error: expected RENAME COLUMN in ALTER VIEW".to_string()
         ))
@@ -16917,8 +16948,9 @@ pub(crate) fn try_split_create_view(text: &str) -> Option<Result<Stmt, SqlError>
     }
     // v1.95: WITH (option [= value] [, ...]) before AS: PG19 view
     // options security_barrier / security_invoker / check_option.
+    // v2.18: check_option is tri-state (local / cascaded flavors).
     let mut security_invoker = false;
-    let mut check_option = false;
+    let mut check_option = crate::storage::CheckOption::None;
     if let Some(r) = match_kw(rest, "with") {
         let r2 = skip_ws_comments(r);
         if r2.starts_with('(') {
@@ -16941,6 +16973,28 @@ pub(crate) fn try_split_create_view(text: &str) -> Option<Result<Stmt, SqlError>
                     Some((a, b)) => (a.trim().to_string(), Some(b.trim().to_string())),
                     None => (part.clone(), None),
                 };
+                // v2.18: check_option takes the string values
+                // local/cascaded (PG19 view.c check_option reloption),
+                // not a boolean.
+                if oname == "check_option" {
+                    check_option = match oval.as_deref() {
+                        None | Some("cascaded") => crate::storage::CheckOption::Cascaded,
+                        Some("local") => crate::storage::CheckOption::Local,
+                        Some("true") | Some("on") | Some("yes") | Some("1") => {
+                            crate::storage::CheckOption::Cascaded
+                        }
+                        Some("false") | Some("off") | Some("no") | Some("0") => {
+                            crate::storage::CheckOption::None
+                        }
+                        Some(v) => {
+                            return Some(Err(err(format!(
+                                "invalid value for view option \"{}\": \"{}\"",
+                                oname, v
+                            ))));
+                        }
+                    };
+                    continue;
+                }
                 let truthy = match oval.as_deref() {
                     None => true,
                     Some("true") | Some("on") | Some("yes") | Some("1") => true,
@@ -16955,7 +17009,6 @@ pub(crate) fn try_split_create_view(text: &str) -> Option<Result<Stmt, SqlError>
                 match oname.as_str() {
                     "security_invoker" => security_invoker = truthy,
                     "security_barrier" => {}
-                    "check_option" => check_option = true,
                     _ => {
                         return Some(Err(err(format!("unrecognized parameter \"{}\"", oname))));
                     }
@@ -16970,15 +17023,21 @@ pub(crate) fn try_split_create_view(text: &str) -> Option<Result<Stmt, SqlError>
     // the view, not the query (PG19 ViewStmt.check_option).
     {
         let lower = query.to_ascii_lowercase();
-        for pat in [
-            "with local check option",
-            "with cascaded check option",
-            "with check option",
+        for (pat, flavor) in [
+            (
+                "with local check option",
+                crate::storage::CheckOption::Local,
+            ),
+            (
+                "with cascaded check option",
+                crate::storage::CheckOption::Cascaded,
+            ),
+            ("with check option", crate::storage::CheckOption::Cascaded),
         ] {
             if lower.ends_with(pat) {
                 query.truncate(query.len() - pat.len());
                 query = query.trim_end().to_string();
-                check_option = true;
+                check_option = flavor;
                 break;
             }
         }
@@ -18903,6 +18962,67 @@ pub fn decode_triggers(s: &str) -> Result<Vec<TriggerDef>, String> {
     let mut out = Vec::new();
     while !sexpr_is_close(&mut p) {
         out.push(decode_one_trigger(&mut p)?);
+    }
+    p.close()?;
+    Ok(out)
+}
+
+/// v2.18: encode a view's per-column defaults (ALTER VIEW ...
+/// ALTER COLUMN c SET DEFAULT) as `(view-defaults <entry>...)`
+/// where each entry is `-` (none) or an `encode_default` form.
+pub fn encode_view_defaults(defs: &[Option<DefaultExpr>]) -> String {
+    let mut out = String::from("(view-defaults");
+    for d in defs {
+        match d {
+            None => out.push_str(" -"),
+            Some(d) => {
+                out.push(' ');
+                encode_default(d, &mut out);
+            }
+        }
+    }
+    out.push(')');
+    out
+}
+
+/// v2.18: decode a `(view-defaults ...)` string produced by
+/// `encode_view_defaults` (empty input decodes to no defaults).
+pub fn decode_view_defaults(s: &str) -> Result<Vec<Option<DefaultExpr>>, String> {
+    if s.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut p = SexprParser::new(s);
+    p.open()?;
+    if p.atom()? != "view-defaults" {
+        return Err("bad view-defaults head".into());
+    }
+    let mut out = Vec::new();
+    while !sexpr_is_close(&mut p) {
+        p.ws();
+        if p.chars.peek() == Some(&'-') {
+            p.chars.next();
+            out.push(None);
+            continue;
+        }
+        p.open()?;
+        let head = p.atom()?;
+        let d = match head.as_str() {
+            "default-lit" => {
+                p.open()?;
+                let lit_head = p.atom()?;
+                if lit_head != "lit" {
+                    return Err(format!("bad default-lit head {}", lit_head));
+                }
+                let lit = p.literal()?;
+                p.close()?;
+                DefaultExpr::Lit(lit)
+            }
+            "default-nextval" => DefaultExpr::Nextval(p.atom()?),
+            "default-expr" => DefaultExpr::Expr(p.expr()?),
+            o => return Err(format!("bad default head {}", o)),
+        };
+        p.close()?;
+        out.push(Some(d));
     }
     p.close()?;
     Ok(out)

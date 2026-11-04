@@ -1989,6 +1989,42 @@ pub(crate) fn exec_grant_revoke(
                         )?;
                         let prev_acl = v.acl.clone();
                         let prev_populated = v.populated;
+                        // v2.18: precompute the column-grant work
+                        // (needs &Engine) before taking the mutable
+                        // view borrow below.
+                        let mut col_work: Vec<(Vec<(String, u32)>, Vec<String>)> = Vec::new();
+                        if !col_specs.is_empty() {
+                            let vcols =
+                                view_columns_of_db(eng, ctx.snap, ctx.own, ctx.session, name)
+                                    .unwrap_or_default();
+                            for cs in &col_specs {
+                                let spec_bits = match cs.priv_ {
+                                    Privilege::All => {
+                                        crate::storage::PRIV_SELECT
+                                            | crate::storage::PRIV_INSERT
+                                            | crate::storage::PRIV_UPDATE
+                                            | crate::storage::PRIV_REFERENCES
+                                    }
+                                    Privilege::Select
+                                    | Privilege::Insert
+                                    | Privilege::Update
+                                    | Privilege::References => cs.priv_.bits(),
+                                    _ => continue,
+                                };
+                                let cgroups = select_grantor_groups(
+                                    eng, ctx, &v.owner, &v.acl, spec_bits, granted_by, revoke,
+                                )?;
+                                let cols: Vec<String> = cs
+                                    .columns
+                                    .iter()
+                                    .filter(|c| vcols.iter().any(|x| &x.0 == *c))
+                                    .cloned()
+                                    .collect();
+                                if !cols.is_empty() {
+                                    col_work.push((cgroups, cols));
+                                }
+                            }
+                        }
                         let live = eng
                             .db
                             .find_view_mut(name, ctx.snap, ctx.own)
@@ -2004,11 +2040,33 @@ pub(crate) fn exec_grant_revoke(
                             cascade,
                             &v.owner,
                         )?;
+                        // v2.18: column-level grants on the view
+                        // (GRANT UPDATE (bb, cc) ON view) land in
+                        // the view's col_acl (PG19 ExecGrant_Relation
+                        // treats views as relations here). Through
+                        // v2.17 they were silently dropped.
+                        for (cgroups, cols) in &col_work {
+                            let acl_now = live.acl.clone();
+                            apply_col_acl_delta(
+                                &mut live.col_acl,
+                                &acl_now,
+                                grantees,
+                                cgroups,
+                                cols,
+                                revoke,
+                                grant_option,
+                                grant_option_for,
+                                cascade,
+                                &v.owner,
+                            )?;
+                        }
                         ctx.writes.push(WriteOp::ViewState {
                             name: name.clone(),
                             prev_acl,
                             prev_populated,
                             prev_owner: String::new(),
+                            prev_col_acl: v.col_acl.clone(),
+                            prev_col_defaults: v.col_defaults.clone(),
                         });
                         continue;
                     }
@@ -3630,6 +3688,8 @@ pub(crate) fn exec_reassign_owned(
             prev_acl: v.acl.clone(),
             prev_populated: v.populated,
             prev_owner: v.owner.clone(),
+            prev_col_acl: v.col_acl.clone(),
+            prev_col_defaults: v.col_defaults.clone(),
         });
     }
     Ok(ExecResult::Command {
@@ -3832,6 +3892,8 @@ pub(crate) fn exec_drop_owned(
                         prev_acl,
                         prev_populated,
                         prev_owner: String::new(),
+                        prev_col_acl: v.col_acl.clone(),
+                        prev_col_defaults: v.col_defaults.clone(),
                     });
                 }
             }

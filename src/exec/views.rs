@@ -15,7 +15,7 @@ pub(crate) fn exec_create_view(
     col_aliases: &[String],
     or_replace: bool,
     security_invoker: bool,
-    check_option: bool,
+    check_option: crate::storage::CheckOption,
     matview: bool,
     with_data: bool,
 ) -> Result<ExecResult, ExecError> {
@@ -122,14 +122,56 @@ pub(crate) fn exec_create_view(
     }
     let mut deps = Vec::new();
     collect_table_refs(&select, &mut deps);
+    // v2.18: collect_table_refs cannot tell a CTE name from a
+    // relation name (it is a purely syntactic walk in the parser):
+    // a view query's WITH names are bindings, not dependencies.
+    // Drop them from the dep list (they would otherwise fail the
+    // existence check below — "relation \"t\" does not exist" for
+    // CREATE VIEW ... AS WITH t AS (...) SELECT * FROM t — and
+    // pollute DROP ... CASCADE dependency tracking).
+    {
+        fn cte_names(sel: &SelectStmt, out: &mut std::collections::HashSet<String>) {
+            for c in &sel.with {
+                out.insert(c.name.clone());
+                match &c.body {
+                    CteBody::Simple(body) => cte_names(body, out),
+                    CteBody::Union { left, right, .. } => {
+                        cte_names(left, out);
+                        cte_names(right, out);
+                    }
+                    CteBody::Dml(_) => {}
+                }
+            }
+            fn from_ctes(item: &FromItem, out: &mut std::collections::HashSet<String>) {
+                match item {
+                    FromItem::Derived { sub, .. } => cte_names(sub, out),
+                    FromItem::Join { left, right, .. } => {
+                        from_ctes(left, out);
+                        from_ctes(right, out);
+                    }
+                    _ => {}
+                }
+            }
+            for item in &sel.from {
+                from_ctes(item, &mut *out);
+            }
+        }
+        let mut names = std::collections::HashSet::new();
+        cte_names(&select, &mut names);
+        if !names.is_empty() {
+            deps.retain(|d| !names.contains(d));
+        }
+    }
     // Every referenced relation must exist (as a table or view).
+    // v2.18: a sequence is also a legal view source in PG19.
     for d in &deps {
         let is_table = eng
             .db
             .find_table(d, ctx.snap, &ctx.all_xids, ctx.session)
             .is_some();
         let is_view = eng.db.find_view(d, ctx.snap, ctx.own).is_some();
-        if !is_table && !is_view {
+        let is_seq = eng.db.sequences.contains_key(d.as_str());
+        if !is_table && !is_view && !is_seq {
             return Err(exec_err(
                 "42P01",
                 format!("relation \"{}\" does not exist", d),
@@ -195,6 +237,15 @@ pub(crate) fn exec_create_view(
     } else {
         Vec::new()
     };
+    // v2.18: same keep-across-replace for column ACL + defaults.
+    let (kept_col_acl, kept_col_defaults) = if existing {
+        eng.db
+            .find_view(name, ctx.snap, ctx.own)
+            .map(|v| (v.col_acl.clone(), v.col_defaults.clone()))
+            .unwrap_or_default()
+    } else {
+        (Vec::new(), Vec::new())
+    };
     if existing {
         // OR REPLACE: drop the old definition first (same statement).
         drop_view_internal(eng, ctx, name)?;
@@ -213,6 +264,11 @@ pub(crate) fn exec_create_view(
         matview,
         populated: with_data || !matview,
         triggers: kept_triggers,
+        // v2.18: OR REPLACE keeps the existing view's column ACL
+        // and defaults (PG preserves pg_attribute defaults across
+        // CREATE OR REPLACE VIEW when columns are compatible).
+        col_acl: kept_col_acl,
+        col_defaults: kept_col_defaults,
     };
     eng.db.views.entry(name.to_string()).or_default().push(def);
     note_obj_schema(eng, ctx, name, name);
@@ -463,6 +519,8 @@ pub(crate) fn exec_refresh_matview(
         prev_acl,
         prev_populated,
         prev_owner: String::new(),
+        prev_col_acl: v.col_acl.clone(),
+        prev_col_defaults: v.col_defaults.clone(),
     });
     Ok(ExecResult::Command {
         tag: "REFRESH MATERIALIZED VIEW".to_string(),
@@ -507,6 +565,146 @@ pub(crate) fn view_output_names(
         .enumerate()
         .map(|(i, (cn, _))| view.col_aliases.get(i).cloned().unwrap_or(cn))
         .collect())
+}
+
+/// v2.18: mutate a view's definition in place (same DropView +
+/// CreateView write-op pattern as replace_view_def).
+pub(crate) fn mutate_view_def(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    f: impl FnOnce(&mut ViewDef),
+) -> Result<(), ExecError> {
+    let mut def = eng
+        .db
+        .find_view(name, ctx.snap, ctx.own)
+        .ok_or_else(|| exec_err("42P01", format!("view \"{}\" does not exist", name)))?
+        .clone();
+    f(&mut def);
+    drop_view_internal(eng, ctx, name)?;
+    def.created_xmin = ctx.write_xid;
+    def.dropped_xmax = 0;
+    eng.db.views.entry(name.to_string()).or_default().push(def);
+    ctx.writes.push(WriteOp::CreateView {
+        name: name.to_string(),
+    });
+    Ok(())
+}
+
+/// v2.18: ALTER VIEW SET/RESET (reloptions) for the view options
+/// this engine models (PG19 view.c: check_option, security_invoker;
+/// security_barrier is accepted and carried as a no-op, matching
+/// CREATE VIEW's treatment).
+pub(crate) fn exec_alter_view_reloptions(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    actions: &[AlterAction],
+) -> Result<ExecResult, ExecError> {
+    require_view_owner(eng, ctx, name)?;
+    for action in actions {
+        match action {
+            AlterAction::SetRelOptions { options } => {
+                for (opt, val) in options {
+                    match opt.as_str() {
+                        "check_option" => {
+                            let flavor = match val.to_ascii_lowercase().as_str() {
+                                "local" => crate::storage::CheckOption::Local,
+                                "cascaded" => crate::storage::CheckOption::Cascaded,
+                                other => {
+                                    return Err(exec_err(
+                                        "22023",
+                                        format!(
+                                            "invalid value for view option \"check_option\": \"{}\"",
+                                            other
+                                        ),
+                                    ));
+                                }
+                            };
+                            mutate_view_def(eng, ctx, name, |d| d.check_option = flavor)?;
+                        }
+                        "security_invoker" => {
+                            let on = matches!(
+                                val.to_ascii_lowercase().as_str(),
+                                "true" | "on" | "yes" | "1"
+                            );
+                            mutate_view_def(eng, ctx, name, |d| d.security_invoker = on)?;
+                        }
+                        "security_barrier" => {}
+                        other => {
+                            return Err(exec_err(
+                                "22023",
+                                format!("unrecognized parameter \"{}\"", other),
+                            ));
+                        }
+                    }
+                }
+            }
+            AlterAction::ResetRelOptions { options } => {
+                for opt in options {
+                    match opt.as_str() {
+                        "check_option" => {
+                            mutate_view_def(eng, ctx, name, |d| {
+                                d.check_option = crate::storage::CheckOption::None
+                            })?;
+                        }
+                        "security_invoker" => {
+                            mutate_view_def(eng, ctx, name, |d| d.security_invoker = false)?;
+                        }
+                        "security_barrier" => {}
+                        other => {
+                            return Err(exec_err(
+                                "22023",
+                                format!("unrecognized parameter \"{}\"", other),
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    Ok(ExecResult::Command {
+        tag: "ALTER VIEW".to_string(),
+    })
+}
+
+/// v2.18: ALTER VIEW name ALTER COLUMN c SET/DROP DEFAULT
+/// (PG19 stores view column defaults in pg_attrdef; they apply to
+/// INSERT / MERGE-INSERT rows written through the view).
+pub(crate) fn exec_alter_view_column_default(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    actions: &[AlterAction],
+) -> Result<ExecResult, ExecError> {
+    require_view_owner(eng, ctx, name)?;
+    let cols = view_columns_of_db(eng, ctx.snap, ctx.own, ctx.session, name)?;
+    let ncols = cols.len();
+    for action in actions {
+        let (col, val) = match action {
+            AlterAction::AlterColumnSetDefault { name: c, default } => {
+                (c.clone(), Some(default.clone()))
+            }
+            AlterAction::AlterColumnDropDefault { name: c } => (c.clone(), None),
+            _ => unreachable!(),
+        };
+        let idx = cols.iter().position(|(n, _)| n == &col).ok_or_else(|| {
+            exec_err(
+                "42703",
+                format!("column \"{}\" of relation \"{}\" does not exist", col, name),
+            )
+        })?;
+        mutate_view_def(eng, ctx, name, |d| {
+            if d.col_defaults.len() < ncols {
+                d.col_defaults.resize(ncols, None);
+            }
+            d.col_defaults[idx] = val;
+        })?;
+    }
+    Ok(ExecResult::Command {
+        tag: "ALTER VIEW".to_string(),
+    })
 }
 
 /// Replace a view's definition in place (new query text and/or new

@@ -1864,6 +1864,20 @@ pub(crate) fn eval_grouped(
                 check_builtin_arity(name, &vals)?;
                 return eval_pg_relation_size(q, &vals);
             }
+            if name == "pg_relation_is_updatable" || name == "pg_column_is_updatable" {
+                let mut vals = Vec::with_capacity(args.len());
+                for a in args {
+                    let v =
+                        eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, a)?;
+                    vals.push(v);
+                }
+                check_builtin_arity(name, &vals)?;
+                return if name == "pg_relation_is_updatable" {
+                    eval_pg_relation_is_updatable(q, &vals)
+                } else {
+                    eval_pg_column_is_updatable(q, &vals)
+                };
+            }
             // v1.90: SQL/JSON constructors in grouped context — their
             // arguments may contain aggregates (JSON_OBJECT over
             // JSON_OBJECTAGG), so they evaluate through eval_grouped.

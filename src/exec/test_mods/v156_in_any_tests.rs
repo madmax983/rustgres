@@ -226,6 +226,7 @@ fn v156_qualify_recurses_composites() {
     let snap0 = eng.take_snapshot();
     let mut writes = Vec::new();
     let mut sctx = StmtCtx {
+        privs_suppressed: false,
         snap: &snap0,
         own: 9,
         write_xid: 9,

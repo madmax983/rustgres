@@ -6213,6 +6213,45 @@ pub struct ReplSlot {
     pub active: bool,
 }
 
+/// v2.18: a view's WITH CHECK OPTION flavor (PG19
+/// ViewStmt.check_option / pg_class relcheckoption: 'c' cascaded,
+/// 'l' local). See ViewDef.check_option for the persisted encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CheckOption {
+    #[default]
+    None,
+    Local,
+    Cascaded,
+}
+
+impl CheckOption {
+    pub fn present(self) -> bool {
+        !matches!(self, CheckOption::None)
+    }
+    pub fn to_u8(self) -> u8 {
+        match self {
+            CheckOption::None => 0,
+            CheckOption::Cascaded => 1,
+            CheckOption::Local => 2,
+        }
+    }
+    pub fn from_u8(b: u8) -> CheckOption {
+        match b {
+            0 => CheckOption::None,
+            2 => CheckOption::Local,
+            _ => CheckOption::Cascaded,
+        }
+    }
+    /// PG19 information_schema.views.check_option rendering.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckOption::None => "NONE",
+            CheckOption::Local => "LOCAL",
+            CheckOption::Cascaded => "CASCADED",
+        }
+    }
+}
+
 /// A view definition (v0.9): the raw SELECT text plus dependency names.
 #[derive(Clone, Debug)]
 pub struct ViewDef {
@@ -6234,7 +6273,13 @@ pub struct ViewDef {
     /// catalog fidelity.)
     pub security_invoker: bool,
     /// v1.95: WITH [LOCAL|CASCADED] CHECK OPTION present.
-    pub check_option: bool,
+    /// v2.18: tri-state (the v1.95 bool could not distinguish LOCAL
+    /// from CASCADED, which the updatable_views suite tests
+    /// distinctly). Encoded as one byte everywhere it is persisted:
+    /// 0 = none, 1 = cascaded, 2 = local — the legacy bool byte
+    /// (1 = present) decodes as Cascaded, which is PG's default
+    /// flavor for an unspecified check option.
+    pub check_option: CheckOption,
     /// v1.96: view ACL (GRANT SELECT/INSERT/... ON view). No default
     /// PUBLIC access for views in PG.
     pub acl: Vec<AclEntry>,
@@ -6249,6 +6294,15 @@ pub struct ViewDef {
     /// views version independently, so theirs ride here (WAL
     /// RGSWAL33 CreateView trailing field, checkpoint v29).
     pub triggers: Vec<crate::sql::TriggerDef>,
+    /// v2.18 (checkpoint v30): column-level GRANTs on the view
+    /// (GRANT UPDATE (bb) ON view). Checkpoint-only state, like
+    /// `acl` (the v1.96 ViewState pattern).
+    pub col_acl: Vec<ColAclEntry>,
+    /// v2.18 (checkpoint v30): per-column defaults set by ALTER
+    /// VIEW ... ALTER COLUMN c SET DEFAULT (PG stores these in
+    /// pg_attrdef on the view); position-parallel to the view's
+    /// output columns, empty = none set. Checkpoint-only.
+    pub col_defaults: Vec<Option<crate::sql::DefaultExpr>>,
 }
 
 /// A sequence (v0.9). Bounds and parameters are transactional DDL;
@@ -8603,6 +8657,10 @@ pub enum WriteOp {
         prev_populated: bool,
         /// v1.96: previous owner (empty = leave owner unchanged).
         prev_owner: String,
+        /// v2.18: previous column ACL / column defaults (undo for
+        /// GRANT (cols) ON view and ALTER VIEW SET DEFAULT).
+        prev_col_acl: Vec<ColAclEntry>,
+        prev_col_defaults: Vec<Option<crate::sql::DefaultExpr>>,
     },
     /// v2.14: a view's trigger list changed in place (CREATE / DROP /
     /// ALTER TRIGGER on a view). Undo restores the previous list;
@@ -9193,11 +9251,15 @@ pub fn undo_write_op(eng: &mut Engine, owns: &[u64], op: &WriteOp) {
             prev_acl,
             prev_populated,
             prev_owner,
+            prev_col_acl,
+            prev_col_defaults,
         } => {
             if let Some(vs) = eng.db.views.get_mut(name) {
                 for v in vs.iter_mut() {
                     v.acl = prev_acl.clone();
                     v.populated = *prev_populated;
+                    v.col_acl = prev_col_acl.clone();
+                    v.col_defaults = prev_col_defaults.clone();
                     if !prev_owner.is_empty() {
                         v.owner = prev_owner.clone();
                     }

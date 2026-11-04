@@ -43,7 +43,10 @@ pub(crate) const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK16";
 /// are refused; remove the data directory to start fresh.
 /// v2.14: version 29 adds per-view `triggers`. v28 checkpoints are
 /// refused; remove the data directory to start fresh.
-pub(crate) const CHKPT_VERSION: u32 = 29;
+/// v2.18: version 30 adds per-view `col_acl` + `col_defaults`.
+/// v29 checkpoints are refused; remove the data directory to
+/// start fresh.
+pub(crate) const CHKPT_VERSION: u32 = 30;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -617,13 +620,16 @@ impl Wal {
                 v_body.str(&v.owner);
                 // v1.95 (checkpoint v21): view options.
                 v_body.u8(v.security_invoker as u8);
-                v_body.u8(v.check_option as u8);
+                v_body.u8(v.check_option.to_u8());
                 // v1.96 (checkpoint v22): acl + matview state.
                 v_body.acl_list(&v.acl.iter().map(WalAcl::of).collect::<Vec<_>>());
                 v_body.u8(v.matview as u8);
                 v_body.u8(v.populated as u8);
                 // v2.14 (checkpoint v29): view triggers.
                 v_body.str(&crate::sql::encode_triggers(&v.triggers));
+                // v2.18 (checkpoint v30): view column ACL + defaults.
+                v_body.col_acl_list(&v.col_acl.iter().map(WalColAcl::of).collect::<Vec<_>>());
+                v_body.str(&crate::sql::encode_view_defaults(&v.col_defaults));
                 n_views += 1;
             }
         }
@@ -1446,7 +1452,7 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         let owner = d.str().map_err(|e| bad(&e))?;
         // v1.95 (checkpoint v21): view options.
         let security_invoker = d.u8().map_err(|e| bad(&e))? != 0;
-        let check_option = d.u8().map_err(|e| bad(&e))? != 0;
+        let check_option = crate::storage::CheckOption::from_u8(d.u8().map_err(|e| bad(&e))?);
         // v1.96 (checkpoint v22): acl + matview state.
         let acl: Vec<crate::storage::AclEntry> = d
             .acl_list()
@@ -1459,6 +1465,15 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         // v2.14 (checkpoint v29): view triggers.
         let trig_str = d.str().map_err(|e| bad(&e))?;
         let triggers = crate::sql::decode_triggers(&trig_str).map_err(|e| bad(&e))?;
+        // v2.18 (checkpoint v30): view column ACL + defaults.
+        let col_acl: Vec<crate::storage::ColAclEntry> = d
+            .col_acl_list()
+            .map_err(|e| bad(&e))?
+            .into_iter()
+            .map(WalColAcl::into_entry)
+            .collect();
+        let defs_str = d.str().map_err(|e| bad(&e))?;
+        let col_defaults = crate::sql::decode_view_defaults(&defs_str).map_err(|e| bad(&e))?;
         eng.db
             .views
             .entry(name.clone())
@@ -1476,6 +1491,8 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 matview,
                 populated,
                 triggers,
+                col_acl,
+                col_defaults,
             });
     }
     // v0.9: sequences, with their current values.

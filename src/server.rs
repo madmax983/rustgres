@@ -1519,6 +1519,7 @@ fn copy_to_fetch(
             t.all_xids()
         );
         let mut ctx = StmtCtx {
+            privs_suppressed: false,
             snap: &snap,
             own: xid,
             write_xid,
@@ -1544,6 +1545,7 @@ fn copy_to_fetch(
         let mut writes: Vec<WriteOp> = Vec::new();
         let result = {
             let mut ctx = StmtCtx {
+                privs_suppressed: false,
                 snap: &snap,
                 own: xid,
                 write_xid: xid,
@@ -1671,6 +1673,7 @@ fn copy_from_ingest(
         let r = {
             let write_xid = t.write_xid();
             let mut ctx = StmtCtx {
+                privs_suppressed: false,
                 snap: &snap,
                 own: xid,
                 write_xid,
@@ -1696,6 +1699,7 @@ fn copy_from_ingest(
         let mut writes: Vec<WriteOp> = Vec::new();
         let r = {
             let mut ctx = StmtCtx {
+                privs_suppressed: false,
                 snap: &snap,
                 own: xid,
                 write_xid: xid,
@@ -1718,6 +1722,7 @@ fn copy_from_ingest(
                 // fire deferred FK checks before the WAL commit.
                 {
                     let mut ctx = StmtCtx {
+                        privs_suppressed: false,
                         snap: &snap,
                         own: xid,
                         write_xid: xid,
@@ -4603,6 +4608,7 @@ fn txn_execute(
     let result = {
         let write_xid = t.write_xid();
         let mut ctx = StmtCtx {
+            privs_suppressed: false,
             snap: &snap,
             own: xid,
             write_xid,
@@ -4667,6 +4673,7 @@ fn autocommit_execute(
     let mut writes: Vec<WriteOp> = Vec::new();
     let (result, mut notices) = {
         let mut ctx = StmtCtx {
+            privs_suppressed: false,
             snap: &snap,
             own: xid,
             write_xid: xid,
@@ -4710,6 +4717,7 @@ fn autocommit_execute(
     // its deferred FK checks now (cascades append to `writes`).
     {
         let mut ctx = StmtCtx {
+            privs_suppressed: false,
             snap: &snap,
             own: xid,
             write_xid: xid,
@@ -5000,6 +5008,7 @@ fn commit_taken_txn(
         let (snap, xid, level) = stmt_snapshot(&mut guard, Some(&mut t));
         let write_xid = t.write_xid();
         let mut ctx = StmtCtx {
+            privs_suppressed: false,
             snap: &snap,
             own: xid,
             write_xid,

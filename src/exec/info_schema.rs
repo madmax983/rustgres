@@ -3,6 +3,10 @@
 use super::*;
 
 pub(crate) fn info_columns_schema() -> Vec<QCol> {
+    // v2.18: the full PG19 information_schema.columns column set
+    // (44 columns, information_schema.sql order). Through v2.17
+    // only the first 8 existed, so every query naming is_updatable
+    // (or any later column) failed 42703 and SELECT * mismatched.
     [
         ("table_catalog", ColType::Text),
         ("table_schema", ColType::Text),
@@ -12,6 +16,42 @@ pub(crate) fn info_columns_schema() -> Vec<QCol> {
         ("column_default", ColType::Text),
         ("is_nullable", ColType::Text),
         ("data_type", ColType::Text),
+        ("character_maximum_length", ColType::Int),
+        ("character_octet_length", ColType::Int),
+        ("numeric_precision", ColType::Int),
+        ("numeric_precision_radix", ColType::Int),
+        ("numeric_scale", ColType::Int),
+        ("datetime_precision", ColType::Int),
+        ("interval_type", ColType::Text),
+        ("interval_precision", ColType::Int),
+        ("character_set_catalog", ColType::Text),
+        ("character_set_schema", ColType::Text),
+        ("character_set_name", ColType::Text),
+        ("collation_catalog", ColType::Text),
+        ("collation_schema", ColType::Text),
+        ("collation_name", ColType::Text),
+        ("domain_catalog", ColType::Text),
+        ("domain_schema", ColType::Text),
+        ("domain_name", ColType::Text),
+        ("udt_catalog", ColType::Text),
+        ("udt_schema", ColType::Text),
+        ("udt_name", ColType::Text),
+        ("scope_catalog", ColType::Text),
+        ("scope_schema", ColType::Text),
+        ("scope_name", ColType::Text),
+        ("maximum_cardinality", ColType::Int),
+        ("dtd_identifier", ColType::Text),
+        ("is_self_referencing", ColType::Text),
+        ("is_identity", ColType::Text),
+        ("identity_generation", ColType::Text),
+        ("identity_start", ColType::Text),
+        ("identity_increment", ColType::Text),
+        ("identity_maximum", ColType::Text),
+        ("identity_minimum", ColType::Text),
+        ("identity_cycle", ColType::Text),
+        ("is_generated", ColType::Text),
+        ("generation_expression", ColType::Text),
+        ("is_updatable", ColType::Text),
     ]
     .into_iter()
     .map(|(n, ty)| QCol {
@@ -25,11 +65,112 @@ pub(crate) fn info_columns_schema() -> Vec<QCol> {
     .collect()
 }
 
-pub(crate) fn info_columns_scan(
-    db: &Database,
+/// One information_schema.columns row: the 8 historically modeled
+/// values, the PG tail columns as NULL/'NO' (except the ones the
+/// caller supplies), in schema order.
+#[allow(clippy::too_many_arguments)]
+fn info_column_row(
+    table: &str,
+    column: &str,
+    ordinal: i64,
+    default: Value,
+    nullable: &str,
+    data_type: &str,
+    is_updatable: &str,
+) -> QRow {
+    let t = |v: &str| Value::text(v);
+    QRow {
+        cells: Row::new(vec![
+            t("rustgres"),
+            t("public"),
+            t(table),
+            t(column),
+            Value::Int(ordinal),
+            default,
+            t(nullable),
+            t(data_type),
+            Value::Null, // character_maximum_length
+            Value::Null, // character_octet_length
+            Value::Null, // numeric_precision
+            Value::Null, // numeric_precision_radix
+            Value::Null, // numeric_scale
+            Value::Null, // datetime_precision
+            Value::Null, // interval_type
+            Value::Null, // interval_precision
+            Value::Null, // character_set_*
+            Value::Null,
+            Value::Null,
+            Value::Null, // collation_*
+            Value::Null,
+            Value::Null,
+            Value::Null, // domain_*
+            Value::Null,
+            Value::Null,
+            t("rustgres"),   // udt_catalog
+            t("pg_catalog"), // udt_schema
+            Value::Null,     // udt_name
+            Value::Null,     // scope_*
+            Value::Null,
+            Value::Null,
+            Value::Null, // maximum_cardinality
+            t(column),   // dtd_identifier (PG: the column's own name-ish id)
+            t("NO"),     // is_self_referencing
+            t("NO"),     // is_identity
+            Value::Null, // identity_generation
+            Value::Null, // identity_start
+            Value::Null, // identity_increment
+            Value::Null, // identity_maximum
+            Value::Null, // identity_minimum
+            Value::Null, // identity_cycle
+            t("NEVER"),  // is_generated
+            Value::Null, // generation_expression
+            t(is_updatable),
+        ]),
+        prov: Vec::new(),
+    }
+}
+
+/// The pseudo-columns of a view whose single FROM item is a
+/// sequence (PG19 sequence relation shape), or None.
+fn sequence_view_columns(
+    eng: &Engine,
     snap: &Snapshot,
     own: u64,
+    view: &str,
+) -> Option<Vec<(String, ColType)>> {
+    let v = eng.db.find_view(view, snap, own)?;
+    let stmt = crate::sql::parse_statement(&v.query).ok()?;
+    let sel = match stmt {
+        crate::sql::Stmt::Select(s) => s,
+        _ => return None,
+    };
+    if sel.from.len() != 1 {
+        return None;
+    }
+    let name = match &sel.from[0] {
+        crate::sql::FromItem::Table { name, .. } => name,
+        _ => return None,
+    };
+    let seq = eng.db.find_sequence(name, snap, own)?;
+    let last_ty = match seq.seq_type {
+        crate::sql::SeqType::SmallInt => ColType::SmallInt,
+        crate::sql::SeqType::Integer => ColType::Int,
+        crate::sql::SeqType::BigInt => ColType::BigInt,
+    };
+    Some(vec![
+        ("last_value".to_string(), last_ty),
+        ("log_cnt".to_string(), ColType::Int),
+        ("is_called".to_string(), ColType::Bool),
+    ])
+}
+
+pub(crate) fn info_columns_scan(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
 ) -> (Vec<QCol>, Vec<QRow>) {
+    let db = &eng.db;
     let schema = info_columns_schema();
     let mut rows = Vec::new();
     let mut tables: Vec<(String, Table)> = db
@@ -55,32 +196,75 @@ pub(crate) fn info_columns_scan(
                 Some(d) => Value::text(format!("{:?}", d)),
                 None => Value::Null,
             };
-            rows.push(QRow {
-                cells: Row::new(vec![
-                    Value::text("rustgres"),
-                    Value::text("public"),
-                    Value::text(tn.as_str()),
-                    Value::text(cn.as_str()),
-                    // v1.44: PG19 information_schema.columns defines
-                    // ordinal_position as CAST(a.attnum AS
-                    // cardinal_number) — the attnum gap survives
-                    // DROP COLUMN (PG never reuses attnums), so this is
-                    // NOT the dense column position. Same
-                    // .get(i)-with-dense-fallback idiom as v1.41's
-                    // pg_attribute.attnum.
-                    Value::Int(t.attnums.get(i).copied().unwrap_or(i as i16 + 1) as i64),
-                    default,
-                    Value::text(if t.not_null[i] { "NO" } else { "YES" }),
-                    Value::text(format!("{:?}", ty)),
-                ]),
-                prov: Vec::new(),
-            });
+            rows.push(info_column_row(
+                &tn,
+                cn,
+                // v1.44: ordinal_position is PG's attnum (gaps
+                // survive DROP COLUMN), not the dense position.
+                t.attnums.get(i).copied().unwrap_or(i as i16 + 1) as i64,
+                default,
+                if t.not_null[i] { "NO" } else { "YES" },
+                &format!("{:?}", ty),
+                "YES",
+            ));
+        }
+    }
+    // v2.18: view columns (PG19 includes relkind 'v'), with
+    // per-column is_updatable from the auto-updatable analysis.
+    let mut vnames: Vec<String> = db
+        .views
+        .iter()
+        .filter(|(_, vs)| {
+            vs.iter()
+                .any(|v| crate::storage::view_visible(v, snap, own))
+        })
+        .map(|(n, _)| n.clone())
+        .collect();
+    vnames.sort();
+    for vn in vnames {
+        // A view over a sequence: describe_select cannot expand
+        // the sequence's pseudo-columns (it errors), but
+        // information_schema still lists them (PG19: last_value /
+        // log_cnt / is_called, none updatable).
+        let cols = match view_columns_of_db(eng, snap, own, session, &vn) {
+            Ok(c) if !c.is_empty() => c,
+            _ => match sequence_view_columns(eng, snap, own, &vn) {
+                Some(c) => c,
+                None => continue,
+            },
+        };
+        for (i, (cn, ty)) in cols.iter().enumerate() {
+            // PG19 pg_column_is_updatable recurses to the base table.
+            let upd = view_col_updatable(eng, snap, own, session, &vn, cn);
+            // v2.18: view column defaults render like table
+            // defaults (the same Debug-form approximation).
+            let vdef = db
+                .views
+                .get(&vn)
+                .and_then(|vs| {
+                    vs.iter()
+                        .find(|v| crate::storage::view_visible(v, snap, own))
+                })
+                .and_then(|v| v.col_defaults.get(i).cloned())
+                .unwrap_or(None);
+            let vdefault = match &vdef {
+                Some(d) => Value::text(format!("{:?}", d)),
+                None => Value::Null,
+            };
+            rows.push(info_column_row(
+                &vn,
+                cn,
+                i as i64 + 1,
+                vdefault,
+                "YES",
+                &format!("{:?}", ty),
+                if upd { "YES" } else { "NO" },
+            ));
         }
     }
     (schema, rows)
 }
 
-// ---------------------------------------------------------------------------
 // v0.98: information_schema.sequences (virtual). PG19's information_schema
 // sequences view: sequence_catalog, sequence_schema, sequence_name,
 // data_type, numeric_precision, numeric_precision_radix, numeric_scale,
@@ -167,11 +351,22 @@ pub(crate) fn info_sequences_scan(
 // ============================================================================
 
 pub(crate) fn info_tables_schema() -> Vec<QCol> {
+    // v2.18: the full PG19 information_schema.tables column set
+    // (12 columns). Through v2.17 only the first 4 existed, so
+    // is_insertable_into queries failed 42703.
     [
         ("table_catalog", ColType::Text),
         ("table_schema", ColType::Text),
         ("table_name", ColType::Text),
         ("table_type", ColType::Text),
+        ("self_referencing_column_name", ColType::Text),
+        ("reference_generation", ColType::Text),
+        ("user_defined_type_catalog", ColType::Text),
+        ("user_defined_type_schema", ColType::Text),
+        ("user_defined_type_name", ColType::Text),
+        ("is_insertable_into", ColType::Text),
+        ("is_typed", ColType::Text),
+        ("commit_action", ColType::Text),
     ]
     .into_iter()
     .map(|(n, ty)| QCol {
@@ -185,7 +380,53 @@ pub(crate) fn info_tables_schema() -> Vec<QCol> {
     .collect()
 }
 
-pub(crate) fn info_tables_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec<QCol>, Vec<QRow>) {
+/// PG19 pg_relation_is_updatable(oid, false) for a view, as the
+/// (is_updatable, is_insertable_into) pair information_schema
+/// renders: is_updatable requires the UPDATE+DELETE bits (an
+/// auto-updatable shape with at least one updatable column);
+/// is_insertable_into requires the INSERT bit (the same
+/// condition here). INSTEAD OF triggers do NOT count (they
+/// surface in information_schema.views.is_trigger_*).
+fn view_is_updatable_pair(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    name: &str,
+) -> (bool, bool) {
+    // PG19 relation_is_updatable recurses through view bases: the
+    // pair is (UPDATE bit && DELETE bit, INSERT bit).
+    let (ins, upd, del) = view_updatable_events(eng, snap, own, session, name);
+    (upd && del, ins)
+}
+
+fn info_table_row(name: &str, table_type: &str, insertable: bool) -> QRow {
+    QRow {
+        cells: Row::new(vec![
+            Value::text("rustgres"),
+            Value::text("public"),
+            Value::text(name),
+            Value::text(table_type),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::text(if insertable { "YES" } else { "NO" }),
+            Value::text("NO"),
+            Value::Null,
+        ]),
+        prov: Vec::new(),
+    }
+}
+
+pub(crate) fn info_tables_scan(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> (Vec<QCol>, Vec<QRow>) {
+    let db = &eng.db;
     let schema = info_tables_schema();
     let mut rows = Vec::new();
     let mut names: Vec<String> = db
@@ -199,15 +440,7 @@ pub(crate) fn info_tables_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec
         .collect();
     names.sort();
     for tn in names {
-        rows.push(QRow {
-            cells: Row::new(vec![
-                Value::text("rustgres"),
-                Value::text("public"),
-                Value::text(tn),
-                Value::text("BASE TABLE"),
-            ]),
-            prov: Vec::new(),
-        });
+        rows.push(info_table_row(&tn, "BASE TABLE", true));
     }
     let mut vnames: Vec<String> = db
         .views
@@ -220,18 +453,106 @@ pub(crate) fn info_tables_scan(db: &Database, snap: &Snapshot, own: u64) -> (Vec
         .collect();
     vnames.sort();
     for vn in vnames {
+        let (_, ins) = view_is_updatable_pair(eng, snap, own, session, &vn);
+        rows.push(info_table_row(&vn, "VIEW", ins));
+    }
+    (schema, rows)
+}
+
+// ---------------------------------------------------------------------------
+// v2.18: information_schema.views (virtual). PG19 columns:
+// table_catalog, table_schema, table_name, view_definition,
+// check_option, is_updatable, is_insertable_into,
+// is_trigger_updatable, is_trigger_deletable,
+// is_trigger_insertable_into. The view did not exist at all
+// through v2.17 (every query failed 42P01).
+// ---------------------------------------------------------------------------
+
+pub(crate) fn info_views_schema() -> Vec<QCol> {
+    [
+        ("table_catalog", ColType::Text),
+        ("table_schema", ColType::Text),
+        ("table_name", ColType::Text),
+        ("view_definition", ColType::Text),
+        ("check_option", ColType::Text),
+        ("is_updatable", ColType::Text),
+        ("is_insertable_into", ColType::Text),
+        ("is_trigger_updatable", ColType::Text),
+        ("is_trigger_deletable", ColType::Text),
+        ("is_trigger_insertable_into", ColType::Text),
+    ]
+    .into_iter()
+    .map(|(n, ty)| QCol {
+        qual: "information_schema.views".to_string(),
+        name: n.to_string(),
+        ty,
+
+        hidden: false,
+        src_ord: 0,
+    })
+    .collect()
+}
+
+pub(crate) fn info_views_scan(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> (Vec<QCol>, Vec<QRow>) {
+    let db = &eng.db;
+    let schema = info_views_schema();
+    let mut rows = Vec::new();
+    let mut vnames: Vec<String> = db
+        .views
+        .iter()
+        .filter(|(_, vs)| {
+            vs.iter()
+                .any(|v| crate::storage::view_visible(v, snap, own))
+        })
+        .map(|(n, _)| n.clone())
+        .collect();
+    vnames.sort();
+    for vn in vnames {
+        let Some(v) = db.views.get(&vn).and_then(|vs| {
+            vs.iter()
+                .find(|v| crate::storage::view_visible(v, snap, own))
+        }) else {
+            continue;
+        };
+        if v.matview {
+            continue;
+        }
+        let (upd, ins) = view_is_updatable_pair(eng, snap, own, session, &vn);
+        let has_instead = |ev: u8| {
+            v.triggers.iter().any(|t| {
+                t.timing == crate::sql::TriggerTiming::InsteadOf
+                    && t.for_each_row
+                    && (t.events & ev) != 0
+            })
+        };
+        let yn = |b: bool| Value::text(if b { "YES" } else { "NO" });
         rows.push(QRow {
             cells: Row::new(vec![
                 Value::text("rustgres"),
                 Value::text("public"),
-                Value::text(vn),
-                Value::text("VIEW"),
+                Value::text(vn.as_str()),
+                // PG renders pg_get_viewdef (a deparse); we carry
+                // the stored query text — identical for the simple
+                // shapes, a known text gap for exotic ones.
+                Value::text(v.query.clone()),
+                Value::text(v.check_option.as_str()),
+                yn(upd),
+                yn(ins),
+                yn(has_instead(crate::sql::trig_event::UPDATE)),
+                yn(has_instead(crate::sql::trig_event::DELETE)),
+                yn(has_instead(crate::sql::trig_event::INSERT)),
             ]),
             prov: Vec::new(),
         });
     }
     (schema, rows)
 }
+
 // ========================================================================
 
 // ---------------------------------------------------------------------------

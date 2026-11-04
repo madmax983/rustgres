@@ -2238,7 +2238,7 @@ fn enforce_view_check_option(
     let has_check = eng
         .db
         .find_view(view, ctx.snap, ctx.own)
-        .map(|v| v.check_option)
+        .map(|v| v.check_option.present())
         .unwrap_or(false);
     if !has_check {
         return Ok(());
@@ -2615,6 +2615,26 @@ pub(crate) fn exec_insert(
     {
         return exec_insert_into_view(eng, ctx, table, columns, rows, select, with, returning);
     }
+    // v2.18: INSERT into an auto-updatable view (rewrite onto the
+    // base relation; see exec/viewdml.rs).
+    if eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+        .is_none()
+        && is_plain_view(eng, ctx, table)
+    {
+        return exec_insert_auto_view(
+            eng,
+            ctx,
+            table,
+            columns,
+            rows,
+            select,
+            with,
+            on_conflict,
+            returning,
+        );
+    }
     // v0.11: INSERT needs INSERT privilege on the table — or, with an
     // explicit column list, on each listed column (like PostgreSQL).
     // v0.84: privilege checks apply to the root column of each target
@@ -2683,9 +2703,11 @@ pub(crate) fn exec_insert(
                         "ON CONFLICT DO SELECT requires a RETURNING clause",
                     ));
                 }
-                if *for_update {
+                if *for_update && !ctx.privs_suppressed {
                     // PG19: DO SELECT FOR UPDATE requires UPDATE on
-                    // the table or on at least one column.
+                    // the table or on at least one column. (Skipped
+                    // for translated view DML: the caller was checked
+                    // against the VIEW by the view privilege walk.)
                     let t = eng
                         .db
                         .find_table(table, ctx.snap, &ctx.all_xids, ctx.session);
@@ -4362,6 +4384,15 @@ pub(crate) fn exec_update(
     {
         return exec_update_view(eng, ctx, table, sets, from, where_, returning);
     }
+    // v2.18: UPDATE on an auto-updatable view.
+    if eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+        .is_none()
+        && is_plain_view(eng, ctx, table)
+    {
+        return exec_update_auto_view(eng, ctx, table, alias, sets, from, where_, with, returning);
+    }
     // v0.11: UPDATE needs UPDATE on each SET column — a table-level
     // grant or a column-level grant (like PostgreSQL).
     require_column_privs(
@@ -5509,6 +5540,15 @@ pub(crate) fn exec_delete(
         && !instead_triggers_for(eng, ctx, table, trig_event::DELETE).is_empty()
     {
         return exec_delete_view(eng, ctx, table, using, where_, returning);
+    }
+    // v2.18: DELETE on an auto-updatable view.
+    if eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+        .is_none()
+        && is_plain_view(eng, ctx, table)
+    {
+        return exec_delete_auto_view(eng, ctx, table, alias, using, where_, with, returning);
     }
     // v0.11: DELETE needs DELETE privilege on the table.
     require_table_priv(eng, ctx, table, crate::storage::PRIV_DELETE, "DELETE")?;

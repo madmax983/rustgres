@@ -80,6 +80,7 @@ fn run_stmt(eng: &mut Engine, stmt: &Stmt) -> Result<ExecResult, ExecError> {
     let snap = eng.take_snapshot();
     let mut writes = Vec::new();
     let mut ctx = StmtCtx {
+        privs_suppressed: false,
         snap: &snap,
         own: 9,
         write_xid: 9,
@@ -682,6 +683,7 @@ fn for_update_locks_and_conflicts() {
     let snap = eng.take_snapshot();
     let mut writes = Vec::new();
     let mut ctx = StmtCtx {
+        privs_suppressed: false,
         snap: &snap,
         own: x1,
         write_xid: x1,
@@ -701,6 +703,7 @@ fn for_update_locks_and_conflicts() {
     let snap2 = eng.take_snapshot();
     let mut writes2 = Vec::new();
     let mut ctx2 = StmtCtx {
+        privs_suppressed: false,
         snap: &snap2,
         own: x2,
         write_xid: x2,

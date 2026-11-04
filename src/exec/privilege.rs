@@ -29,6 +29,9 @@ pub(crate) fn require_table_priv(
     privs: u32,
     priv_name: &str,
 ) -> Result<(), ExecError> {
+    if ctx.privs_suppressed {
+        return Ok(());
+    }
     if let Some(t) = eng
         .db
         .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
@@ -58,6 +61,9 @@ pub(crate) fn require_column_privs(
     privs: u32,
     priv_name: &str,
 ) -> Result<(), ExecError> {
+    if ctx.privs_suppressed {
+        return Ok(());
+    }
     if let Some(t) = eng
         .db
         .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
@@ -518,6 +524,9 @@ pub(crate) fn check_dml_read_cols(
     exprs: &[&crate::sql::Expr],
     exempt: &[String],
 ) -> Result<(), ExecError> {
+    if ctx.privs_suppressed {
+        return Ok(());
+    }
     if crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own) {
         return Ok(());
     }

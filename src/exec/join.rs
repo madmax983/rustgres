@@ -773,6 +773,13 @@ pub(crate) fn combine_join_pair(l: &QRow, r: &QRow, layout: &JoinLayout, kind: J
 /// an implicit-LATERAL join, where PG still reports the function's
 /// columns with zero rows.
 pub(crate) fn table_function_col_names(name: &str) -> Result<Vec<String>, ExecError> {
+    // v2.18: updatability introspection may arrive schema-qualified.
+    {
+        let base = name.rsplit('.').next().unwrap_or(name);
+        if base == "pg_relation_is_updatable" || base == "pg_column_is_updatable" {
+            return Ok(vec![base.to_string()]);
+        }
+    }
     match name {
         "regexp_split_to_table" | "generate_series" => Ok(vec![name.to_string()]),
         // v0.79: unnest's single output column is named for the function.
@@ -781,6 +788,9 @@ pub(crate) fn table_function_col_names(name: &str) -> Result<Vec<String>, ExecEr
         // with the text[] value (PG19: a scalar function in FROM is a
         // one-row table).
         "parse_ident" => Ok(vec![name.to_string()]),
+        // v2.18: the updatability introspection functions are
+        // scalar; in FROM they yield one row like parse_ident.
+        "pg_relation_is_updatable" | "pg_column_is_updatable" => Ok(vec![name.to_string()]),
         "pg_input_error_info" => Ok(["message", "detail", "hint", "sql_error_code"]
             .iter()
             .map(|s| s.to_string())
@@ -830,6 +840,16 @@ pub(crate) fn table_function_col_types(
     name: &str,
     vals: &[Value],
 ) -> Result<Vec<ColType>, ExecError> {
+    // v2.18: updatability introspection may arrive schema-qualified.
+    {
+        let base = name.rsplit('.').next().unwrap_or(name);
+        if base == "pg_relation_is_updatable" {
+            return Ok(vec![ColType::Int]);
+        }
+        if base == "pg_column_is_updatable" {
+            return Ok(vec![ColType::Bool]);
+        }
+    }
     match name {
         "regexp_split_to_table" => Ok(vec![ColType::Text]),
         "pg_input_error_info" => Ok(vec![ColType::Text; 4]),
@@ -848,6 +868,9 @@ pub(crate) fn table_function_col_types(
         | "jsonb_object_keys" => Ok(json_srf_col_types(name)),
         // v0.99: parse_ident returns text[] (see eval_str_func).
         "parse_ident" => Ok(vec![ColType::Array(crate::storage::ArrayElem::Text)]),
+        // v2.18: updatability introspection result types.
+        "pg_relation_is_updatable" => Ok(vec![ColType::Int]),
+        "pg_column_is_updatable" => Ok(vec![ColType::Bool]),
         "generate_series" => {
             // PG resolves mixed int/numeric to the numeric signature and
             // int4/int8 mixes to int8 (implicit casts); all-NULL (strict,
@@ -1055,6 +1078,30 @@ pub(crate) fn eval_srf_call(
     let mut arg_vals = Vec::with_capacity(args.len());
     for a in args {
         arg_vals.push(eval_expr(q, scopes, a)?);
+    }
+    // v2.18: updatability introspection in FROM is a one-row
+    // scalar result (evaluated through the funcs.rs machinery).
+    let base_name = name.rsplit('.').next().unwrap_or(name);
+    if base_name == "pg_relation_is_updatable" || base_name == "pg_column_is_updatable" {
+        let name = base_name;
+        validate_coldef_for_builtin(name, col_defs)?;
+        let v = if name == "pg_relation_is_updatable" {
+            crate::exec::funcs::eval_pg_relation_is_updatable(q, &arg_vals)?
+        } else {
+            crate::exec::funcs::eval_pg_column_is_updatable(q, &arg_vals)?
+        };
+        let (names, types) = if col_defs.is_empty() {
+            (
+                table_function_col_names(name)?,
+                table_function_col_types(name, &arg_vals)?,
+            )
+        } else {
+            (
+                col_defs.iter().map(|(n, _, _)| n.clone()).collect(),
+                col_defs.iter().map(|(_, t, _)| *t).collect(),
+            )
+        };
+        return Ok((names, types, vec![Row::new(vec![v])], true));
     }
     // v2.04: pg_get_publication_tables reads the publication
     // catalog directly (its rows depend on catalog state, not on a
@@ -2960,7 +3007,7 @@ pub(crate) fn build_source(
             }
             // v0.9: information_schema virtual tables.
             if name == "information_schema.tables" {
-                let (schema, rows) = info_tables_scan(&q.eng.db, q.snap, q.own);
+                let (schema, rows) = info_tables_scan(q.eng, q.snap, q.own, q.session);
                 let schema: Vec<QCol> = schema
                     .into_iter()
                     .map(|mut c| {
@@ -2971,7 +3018,19 @@ pub(crate) fn build_source(
                 return Ok((apply_aliases(schema)?, rows));
             }
             if name == "information_schema.columns" {
-                let (schema, rows) = info_columns_scan(&q.eng.db, q.snap, q.own);
+                let (schema, rows) = info_columns_scan(q.eng, q.snap, q.own, q.session);
+                let schema: Vec<QCol> = schema
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                return Ok((apply_aliases(schema)?, rows));
+            }
+            // v2.18: information_schema.views.
+            if name == "information_schema.views" {
+                let (schema, rows) = info_views_scan(q.eng, q.snap, q.own, q.session);
                 let schema: Vec<QCol> = schema
                     .into_iter()
                     .map(|mut c| {

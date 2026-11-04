@@ -1116,7 +1116,7 @@ impl Enc {
                 self.u64(*xmin);
                 // v1.95 (RGSWAL25): view options, last.
                 self.u8(*security_invoker as u8);
-                self.u8(*check_option as u8);
+                self.u8(check_option.to_u8());
                 // v2.14 (RGSWAL33): view triggers, last (the
                 // encoder always writes the current WAL version).
                 self.str(triggers);
@@ -2450,9 +2450,12 @@ impl<'a> Dec<'a> {
                 let xmin = self.u64()?;
                 // v1.95 (RGSWAL25): trailing view options.
                 let (security_invoker, check_option) = if self.wal_version >= 25 {
-                    (self.u8()? != 0, self.u8()? != 0)
+                    (
+                        self.u8()? != 0,
+                        crate::storage::CheckOption::from_u8(self.u8()?),
+                    )
                 } else {
-                    (false, false)
+                    (false, crate::storage::CheckOption::None)
                 };
                 // v2.14 (RGSWAL33): trailing view triggers.
                 let triggers = if self.wal_version >= 33 {

@@ -1387,6 +1387,8 @@ pub(crate) fn plan_from_item(
                 || name == "information_schema.enabled_roles"
                 || name == "information_schema.applicable_roles"
                 || name == "information_schema.triggers"
+                || name == "information_schema.views"
+                || name == "information_schema.views"
             {
                 return Ok(PlanNode::SeqScan {
                     table: name.clone(),

@@ -195,7 +195,9 @@ pub enum WalRecord {
         owner: String,
         /// v1.95 (RGSWAL25): view options.
         security_invoker: bool,
-        check_option: bool,
+        /// v2.18: tri-state; persisted byte unchanged (see
+        /// storage::CheckOption — legacy 1 decodes as Cascaded).
+        check_option: crate::storage::CheckOption,
         /// v2.14 (RGSWAL33): the view's triggers, encoded with
         /// sql::encode_triggers; empty on RGSWAL32- images.
         triggers: String,
