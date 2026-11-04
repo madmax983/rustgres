@@ -1144,28 +1144,43 @@ fn qcols_of(qual: &str, cols: &[(String, ColType)]) -> Vec<QCol> {
         .collect()
 }
 
+/// Precomputed scope for repeated `eval_scoped` calls against the same
+/// (qualifier, column-list) pair: every call site here evaluates many
+/// rows (and/or many expressions) against one fixed base-relation scope
+/// per statement, so the `QCol`/`RowProv` vectors -- built once here --
+/// are reused instead of being re-derived (re-cloning every column name)
+/// on every row.
+struct ScopeCtx {
+    qc: Vec<QCol>,
+    prov: Vec<RowProv>,
+}
+
+fn scope_ctx(qual: &str, cols: &[(String, ColType)]) -> ScopeCtx {
+    ScopeCtx {
+        qc: qcols_of(qual, cols),
+        prov: vec![RowProv {
+            qual: qual.to_string(),
+            table: qual.to_string(),
+            row_id: u64::MAX,
+        }],
+    }
+}
+
 fn eval_scoped(
     eng: &mut Engine,
     ctx: &StmtCtx,
-    qual: &str,
-    cols: &[(String, ColType)],
+    scope: &ScopeCtx,
     row: &[Value],
     expr: &Expr,
 ) -> Result<Value, ExecError> {
-    let qc = qcols_of(qual, cols);
-    let prov = vec![RowProv {
-        qual: qual.to_string(),
-        table: qual.to_string(),
-        row_id: u64::MAX,
-    }];
     eval_dml_expr(
         eng,
         ctx.snap,
         ctx.own,
         ctx.session,
         ctx.role,
-        &[(&qc, row)],
-        Some(&prov),
+        &[(&scope.qc, row)],
+        Some(&scope.prov),
         expr,
         &[],
         None,
@@ -1182,9 +1197,10 @@ fn enforce_checks(
     checks: &[PendingCheck],
     new_rows: &[Row],
 ) -> Result<(), ExecError> {
+    let scope = scope_ctx(&av.base, base_cols);
     for row in new_rows {
         for chk in checks {
-            let v = eval_scoped(eng, ctx, &av.base, base_cols, row, &chk.qual)?;
+            let v = eval_scoped(eng, ctx, &scope, row, &chk.qual)?;
             if v != Value::Bool(true) {
                 return Err(exec_err(
                     "44000",
@@ -1202,6 +1218,7 @@ fn view_row_from_base(
     ctx: &StmtCtx,
     av: &AutoView,
     base_cols: &[(String, ColType)],
+    scope: &ScopeCtx,
     base_row: &[Value],
 ) -> Result<Vec<Value>, ExecError> {
     let mut out = Vec::with_capacity(av.cols.len());
@@ -1212,7 +1229,7 @@ fn view_row_from_base(
                 .position(|(n, _)| n == b)
                 .and_then(|i| base_row.get(i).cloned())
                 .unwrap_or(Value::Null),
-            VCol::Subst(e) => eval_scoped(eng, ctx, &av.base, base_cols, base_row, e)?,
+            VCol::Subst(e) => eval_scoped(eng, ctx, scope, base_row, e)?,
             VCol::Blocked(None, _) => Value::Null,
         });
     }
@@ -2399,16 +2416,17 @@ pub(crate) fn exec_insert_auto_view(
     let expanded = expand_capture_items(view, &av, returning);
     let rcols = capture_returning_cols(eng, ctx, view, &av, &expanded);
     let null_view_row = vec![Value::Null; av.view_cols.len()];
+    let scope = scope_ctx(&av.base, &base_cols);
     // Positional pairing between proposed and output rows holds
     // for DO UPDATE / DO SELECT (every proposed row yields exactly
     // one output row); verify the counts before trusting it.
     let pair_olds = base_rows.len() == rows.len() && conflict_olds.len() == rows.len();
     let mut out_rows = Vec::with_capacity(base_rows.len());
     for (i, br) in base_rows.iter().enumerate() {
-        let new_view = view_row_from_base(eng, ctx, &av, &base_cols, br)?;
+        let new_view = view_row_from_base(eng, ctx, &av, &base_cols, &scope, br)?;
         let old_view = if pair_olds {
             match &conflict_olds[i] {
-                Some(old_base) => view_row_from_base(eng, ctx, &av, &base_cols, old_base)?,
+                Some(old_base) => view_row_from_base(eng, ctx, &av, &base_cols, &scope, old_base)?,
                 None => null_view_row.clone(),
             }
         } else {
@@ -2640,11 +2658,12 @@ pub(crate) fn exec_update_auto_view(
     let expanded = expand_capture_items(view, &av, returning);
     let rcols = capture_returning_cols(eng, ctx, view, &av, &expanded);
     let null_view_row = vec![Value::Null; av.view_cols.len()];
+    let scope = scope_ctx(&av.base, &base_cols);
     let mut out_rows = Vec::with_capacity(base_rows.len());
     for (i, br) in base_rows.iter().enumerate() {
-        let new_view = view_row_from_base(eng, ctx, &av, &base_cols, br)?;
+        let new_view = view_row_from_base(eng, ctx, &av, &base_cols, &scope, br)?;
         let old_view = if needs_old {
-            view_row_from_base(eng, ctx, &av, &base_cols, &old_base_rows[i])?
+            view_row_from_base(eng, ctx, &av, &base_cols, &scope, &old_base_rows[i])?
         } else {
             null_view_row.clone()
         };
@@ -2751,10 +2770,11 @@ pub(crate) fn exec_delete_auto_view(
     let expanded = expand_capture_items(view, &av, returning);
     let rcols = capture_returning_cols(eng, ctx, view, &av, &expanded);
     let null_view_row = vec![Value::Null; av.view_cols.len()];
+    let scope = scope_ctx(&av.base, &base_cols);
     let mut out_rows = Vec::with_capacity(base_rows.len());
     for br in &base_rows {
         // DELETE's RETURNING * yields the OLD (deleted) rows.
-        let old_view = view_row_from_base(eng, ctx, &av, &base_cols, br)?;
+        let old_view = view_row_from_base(eng, ctx, &av, &base_cols, &scope, br)?;
         let vals = project_capture_row(
             eng,
             ctx,

@@ -2,6 +2,108 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: view-DML `eval_scoped` rebuilds its `QCol`/`RowProv` scope on every row of a `WITH CHECK OPTION` INSERT/UPDATE/DELETE — fix — 2026-11-04
+
+New harness, `benches/profile_view_checkoption.py` (self-contained
+launch-under-valgrind pattern, same as `profile_serial_insert.py`):
+a 20,000-row `INSERT INTO v(...) SELECT ... FROM generate_series(...)`
+through a view `WHERE tenant_id = 1`. No prior Bolt round has
+profiled `src/exec/viewdml.rs` -- the auto-updatable-views feature
+(v2.18, just landed). `WITH CHECK OPTION` views are a common pattern
+for tenant-scoping / row-visibility enforcement in real applications,
+not a synthetic construct: this is the first realistic workload that
+exercises "capture mode" in `exec_insert_auto_view` /
+`exec_update_auto_view` / `exec_delete_auto_view`, where every
+written row is re-derived into view space (`view_row_from_base`) and
+the view's qual re-evaluated against it (`enforce_checks` ->
+`eval_scoped`).
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`), 20,000 rows, `--variant checked` (view created
+`WITH CHECK OPTION`) vs `--variant plain` (identical view, no CHECK
+OPTION -- a control isolating capture mode's cost by subtraction):
+
+| variant | Ir |
+|---|---|
+| `checked` | 3,173,077,293 |
+| `plain` | 2,244,499,895 |
+
+Delta: 928,577,398 Ir, **29.3%** of the `checked` workload --
+comfortably over the 5%-of-profile relevance bar.
+`callgrind_annotate --inclusive=yes` attributes 301,850,082 Ir
+(9.51%) to `enforce_checks`, almost entirely inside `eval_scoped`
+(294,710,000 Ir, 9.29%); within that, `qcols_of` alone -- rebuilding
+a `Vec<QCol>` by cloning every base column name -- accounts for
+82,010,000 Ir (2.58%).
+
+**Hypothesis**: both `eval_scoped` call sites (`enforce_checks`'s
+per-row-per-check loop, and `view_row_from_base`'s per-row
+`VCol::Subst` loop) always pass the identical `(qual, cols)` pair --
+`(&av.base, base_cols)` -- on every call within a statement; only
+`row` and `expr` vary. `eval_scoped` nonetheless rebuilds the
+`Vec<QCol>` (via `qcols_of`, cloning every column name) and a fresh
+`Vec<RowProv>` (two more `to_string()` allocations) from scratch on
+every single call. Since the `(qual, cols)` pair is a statement-wide
+invariant, this rebuild can be hoisted to run once per statement
+instead of once per row (and, inside `enforce_checks`, once per
+row-per-check).
+
+### Change tested
+
+Introduced a `ScopeCtx { qc: Vec<QCol>, prov: Vec<RowProv> }`,
+built once via a new `scope_ctx(qual, cols)` helper at the top of
+`enforce_checks` and at each of the three view-DML entry points
+(`exec_insert_auto_view`, `exec_update_auto_view`,
+`exec_delete_auto_view`) right where `base_cols` is already
+computed. `eval_scoped` now takes `&ScopeCtx` instead of
+`qual`/`cols`, and `view_row_from_base` takes the same `&ScopeCtx`
+(built once by its caller) instead of recomputing it per call.
+Behavior is unchanged -- only the invariant setup moves outside the
+per-row loops.
+
+### Measurement (change applied)
+
+Same harness, same machine, same session. Callgrind, 20,000 rows:
+
+| variant | before Ir | after Ir | delta |
+|---|---|---|---|
+| `checked` | 3,173,077,293 | 3,026,769,373 | **-4.61%** |
+| `plain` (control) | 2,244,499,895 | 2,244,457,553 | -0.0019% (noise) |
+
+The `plain` control is unchanged within noise, confirming the fix is
+isolated to the capture-mode path. The `checked` Ir delta alone
+(4.61%) falls just short of the 5% floor, so this round leans on the
+DHAT allocation-count floor instead. DHAT, `checked` variant, same
+20,000-row workload:
+
+| counter | before | after | delta |
+|---|---|---|---|
+| total bytes | 163,633,746 | 154,854,185 | -5.37% |
+| total blocks | 1,587,799 | 1,347,811 | **-15.11%** |
+
+1,347,811 vs 1,587,799 is a drop of exactly 239,988 blocks -- matching
+the predicted count: 20,000 rows x 1 check x (9 allocations in
+`qcols_of`'s old per-call `Vec<QCol>` + 2 column-String clones each
++ 3 allocations in the old per-call `Vec<RowProv>` + 2 `String`
+clones) minus the single now-shared `ScopeCtx` allocation. Clears the
+10%-of-blocks impact floor.
+
+`cargo test --all-features`: 1256/1256 passed with the change applied
+(no test expectations changed -- behavior is identical, only the
+invariant `QCol`/`RowProv` construction moved outside the per-row
+loop). `cargo fmt --all` clean; `cargo clippy --all-targets
+--all-features -- -D warnings` shows the same 1206 pre-existing
+findings with or without this change (none newly introduced,
+none in the touched functions).
+
+### Reproduce
+
+```
+cargo build
+python3 benches/profile_view_checkoption.py --tool callgrind --rows 20000 --both
+python3 benches/profile_view_checkoption.py --tool dhat --rows 20000 --variant checked
+```
+
 ## Bolt: `seq_nextval`'s per-row `seq_advanced` membership check allocates a throwaway `String` — negative result — 2026-11-03
 
 No prior Bolt round had profiled `src/exec/seq.rs`'s `seq_nextval` (the
