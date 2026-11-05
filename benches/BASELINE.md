@@ -2,6 +2,85 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `CREATE RULE` fires each row as an independent single-row statement — finding, no fix — 2026-11-05
+
+No prior Bolt round had profiled `CREATE RULE` (v2.19, `src/exec/rules.rs`).
+New harness `benches/profile_rule_insert.py` (self-contained
+launch-under-valgrind pattern, same as `profile_trigger_insert.py`): a
+single multi-row `INSERT` into a table with a one-action `DO ALSO`
+audit-log rule (the classic `rtest_emp_ins` shape from
+`tests/conformance/pg19/sql/rules.sql`). Three variants: `rule` (the
+INSERT fires the rule once per row), `norule` (same INSERT, no rule —
+isolates the rule-firing subtree by subtraction), and `doubleinsert`
+(no rule, but the *same total row volume* written as two ordinary
+batched multi-row INSERTs into the same two tables — isolates how much
+of `rule`'s cost is pure "N single-row statements instead of 1 batched
+statement" overhead, as opposed to the inherent cost of writing the
+extra rows).
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`), 2000 rows:
+
+| variant | Ir |
+|---|---|
+| `rule` | 517,804,942 |
+| `norule` | 143,804,511 |
+| `doubleinsert` | 308,152,439 |
+
+Rule-firing subtree (`rule` − `norule`) is **72.2%** of `rule`'s total
+`Ir`. Of that, `rule` − `doubleinsert` = 209,652,503 `Ir`, **40.5%** of
+`rule`'s total cost, is cost that has no counterpart in doing the
+identical row-volume work through ordinary batched SQL — i.e. the tax
+of firing 2000 separate single-row `INSERT` statements through the
+full DML-dispatch path instead of one batched 2000-row `INSERT`.
+
+DHAT, same workload (total allocations over the run):
+
+| variant | total bytes | total blocks |
+|---|---|---|
+| `rule` | 27,380,538 | 239,187 |
+| `doubleinsert` | 12,250,768 | 113,237 |
+
+`rule` allocates 2.24x the bytes and 2.11x the blocks of
+`doubleinsert` for identical row volume.
+
+Self-cost (flat) profiling of the rule-dispatch functions themselves
+(`fire_rule_actions`, `subst_stmt`, `subst_expr`, `rule_qual_ok`,
+`fire_insert_impl`) sums to under 0.5% of total `Ir` — there is no
+single hot function to patch. `fire_insert_impl`/`fire_rule_actions`
+clone the rule action's whole statement AST and run it through
+`exec_insert_inner`'s full single-statement path (table lookup,
+view/INSTEAD-OF-trigger detection, privilege checks, CTE
+materialization, WAL framing, locking) once per firing row, so every
+per-*statement* fixed cost that path pays once for a normal batched
+INSERT is paid 2000 times instead. Real PostgreSQL's rule system
+rewrites a rule's action into the query plan once, as one set-based
+operation — never fires it per row procedurally.
+
+No fix was attempted: closing this gap means batching all rows that
+fire the same rule action into one multi-row statement before
+executing, which (unlike the mechanical per-row hoists in the FK/view-DML
+entries elsewhere in this file) changes RETURNING composition order,
+the recursion-guard scope, and the action-interleaving semantics of
+multi-action `DO ALSO (...)` rule bodies and UPDATE/DELETE rule actions.
+That is a >50-line structural change needing a human design decision,
+not a Bolt-sized patch. Full writeup, with the exact mechanism and the
+specific semantic tradeoffs a fix would need to resolve:
+[#70](https://github.com/madmax983/rustgres/issues/70).
+
+**Reproduce**:
+```bash
+cargo build
+python3 benches/profile_rule_insert.py --tool callgrind --rows 2000 --variant rule
+python3 benches/profile_rule_insert.py --tool callgrind --rows 2000 --variant norule
+python3 benches/profile_rule_insert.py --tool callgrind --rows 2000 --variant doubleinsert
+python3 benches/profile_rule_insert.py --tool dhat --rows 2000 --variant rule
+python3 benches/profile_rule_insert.py --tool dhat --rows 2000 --variant doubleinsert
+```
+
+Baseline profiles committed:
+`benches/profiles/{callgrind,dhat}.out.ruleinsert-{rule,norule,doubleinsert}-n2000-2026-11-05`.
+
 ## Bolt: view-DML `eval_scoped` rebuilds its `QCol`/`RowProv` scope on every row of a `WITH CHECK OPTION` INSERT/UPDATE/DELETE — fix — 2026-11-04
 
 New harness, `benches/profile_view_checkoption.py` (self-contained
