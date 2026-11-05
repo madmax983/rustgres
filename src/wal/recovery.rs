@@ -1563,6 +1563,11 @@ pub fn records_for_commit(
                     xmin: own,
                 });
             }
+            WriteOp::RulesSet { .. } => {
+                // v2.19: rules are checkpoint-only (CHKPT v31),
+                // never WAL-logged — same durability class as the
+                // v2.18 view column ACLs.
+            }
             WriteOp::ViewTriggers { name, .. } => {
                 // v2.14: emit the view's CURRENT trigger list (the
                 // in-place mutation is already applied to the live

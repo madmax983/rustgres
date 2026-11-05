@@ -556,6 +556,55 @@ pub(crate) fn execute_inner(
             sub,
             comment,
         } => exec_comment_on(eng, ctx, target, name, sub.as_deref(), comment.as_deref()),
+        // --- v2.19: the CREATE RULE system (exec/rules.rs) ---
+        Stmt::CreateRule {
+            name,
+            or_replace,
+            relation,
+            event,
+            condition,
+            condition_text,
+            instead,
+            nothing,
+            actions,
+        } => exec_create_rule(
+            eng,
+            ctx,
+            name,
+            *or_replace,
+            relation,
+            *event,
+            condition,
+            condition_text,
+            *instead,
+            *nothing,
+            actions,
+        ),
+        Stmt::DropRule {
+            name,
+            relation,
+            if_exists,
+            cascade,
+        } => {
+            // CASCADE/RESTRICT: rules have no dependents in this
+            // engine, so the distinction is not observable.
+            let _ = cascade;
+            exec_drop_rule(eng, ctx, name, relation, *if_exists)
+        }
+        Stmt::AlterRuleRename {
+            name,
+            relation,
+            new_name,
+        } => exec_alter_rule_rename(eng, ctx, name, relation, new_name),
+        Stmt::Notify { channel, payload } => {
+            // LISTEN/NOTIFY delivery is not modeled; the command
+            // succeeds with PG's tag (a NOTIFY action inside a rule
+            // is the common case — see exec/rules.rs).
+            let _ = (channel, payload);
+            Ok(ExecResult::Command {
+                tag: "NOTIFY".to_string(),
+            })
+        }
         // --- v0.86: user-defined functions and operators ---
         Stmt::CreateFunction {
             name,

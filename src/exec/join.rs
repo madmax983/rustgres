@@ -3278,6 +3278,26 @@ pub(crate) fn build_source(
                 let (_, rows) = pg_constraint_scan(&q.eng.db, q.snap, q.own, q.session);
                 return Ok((apply_aliases(schema)?, rows));
             }
+            // v2.19: pg_rewrite / pg_rules are virtual too.
+            if matches!(name.as_str(), "pg_rewrite" | "pg_rules")
+                && q.eng
+                    .db
+                    .find_table(name, q.snap, &q.all_xids, q.session)
+                    .is_none()
+            {
+                let (raw_schema, rows) = match name.as_str() {
+                    "pg_rewrite" => pg_rewrite_scan(&q.eng.db, q.snap, q.own, q.session),
+                    _ => pg_rules_scan(&q.eng.db, q.snap, q.own, q.session),
+                };
+                let schema: Vec<QCol> = raw_schema
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                return Ok((apply_aliases(schema)?, rows));
+            }
             // v2.09: pg_trigger is virtual too.
             if name == "pg_trigger"
                 && q.eng

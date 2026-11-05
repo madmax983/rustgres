@@ -1682,6 +1682,13 @@ pub(crate) fn exec_alter_one(
         AlterAction::SetTriggerEnabled { name: tname, mode } => {
             alter_set_trigger_enabled(eng, ctx, name, tname.as_deref(), *mode, only)
         }
+        // v2.19: ENABLE/DISABLE [ALWAYS|REPLICA] RULE (exec/rules.rs).
+        AlterAction::SetRuleEnabled { name: rname, mode } => {
+            crate::exec::rules::exec_set_rule_enabled(eng, ctx, name, rname, *mode)?;
+            Ok(ExecResult::Command {
+                tag: "ALTER TABLE".to_string(),
+            })
+        }
         AlterAction::EnableRowSecurity => alter_set_rls(eng, ctx, name, Some(true), None),
         AlterAction::DisableRowSecurity => alter_set_rls(eng, ctx, name, Some(false), None),
         AlterAction::ForceRowSecurity => alter_set_rls(eng, ctx, name, None, Some(true)),
@@ -5156,10 +5163,29 @@ pub(crate) fn exec_comment_on(
                 ));
             }
         }
+        // v2.19: COMMENT ON RULE validates against the rule
+        // registry (plus the synthesized _RETURN of a view).
+        "rule" => {
+            let rel = sub.unwrap_or_default();
+            let key = crate::exec::rules::rule_rel_key(rel);
+            let is_view = eng.db.find_view(rel, ctx.snap, ctx.own).is_some()
+                || eng.db.views.contains_key(&key);
+            let found =
+                crate::exec::rules::rules_on(eng, &crate::exec::rules::rule_key_for(eng, ctx, rel))
+                    .iter()
+                    .any(|r| r.name == name)
+                    || (name.eq_ignore_ascii_case("_RETURN") && is_view);
+            if !found {
+                return Err(exec_err(
+                    "42704",
+                    format!("rule \"{}\" for relation \"{}\" does not exist", name, key),
+                ));
+            }
+        }
         _ => {
             // collation, conversion, database, server,
             // subscription, extension, language, policy,
-            // event_trigger, fdw, rule, large_object,
+            // event_trigger, fdw, large_object,
             // text_search_*: no catalog modeled — accept.
         }
     }

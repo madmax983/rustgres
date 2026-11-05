@@ -4734,6 +4734,18 @@ pub(crate) fn eval_func(
             format!("trigger with OID {} does not exist", oid),
         ));
     }
+    // v2.19: pg_get_ruledef(oid[, pretty]) over the virtual
+    // pg_rewrite rows; unknown OID yields NULL (the
+    // pg_get_constraintdef precedent).
+    if name == "pg_get_ruledef" && !args.is_empty() {
+        let v = eval_expr(q, scopes, &args[0])?;
+        let Value::Int(oid) = v else {
+            return Ok(Value::Null);
+        };
+        return Ok(crate::exec::rules::ruledef_by_oid(
+            &q.eng.db, q.snap, q.own, oid,
+        ));
+    }
     // v2.15: pg_get_constraintdef(oid[, pretty]) — PG returns NULL
     // for an unknown OID (rules.sql proves pg_get_constraintdef(0)).
     // v2.17: pg_get_statisticsobjdef(oid) / pg_statistics_obj_is_visible(oid).
@@ -14447,7 +14459,8 @@ pub(crate) fn func_result_type(
         // v2.04: catalog description helpers used by the publication
         // suite (pg_get_expr deparses our stored filter text form).
         "pg_get_expr" | "pg_describe_object" | "obj_description" | "shobj_description"
-        | "pg_get_triggerdef" | "pg_get_constraintdef" | "pg_get_statisticsobjdef" => Ok(ColType::Text),
+        | "pg_get_triggerdef" | "pg_get_constraintdef" | "pg_get_statisticsobjdef"
+        | "pg_get_ruledef" => Ok(ColType::Text),
         // v2.17: pg_statistics_obj_is_visible(oid) -> boolean.
         "pg_statistics_obj_is_visible" => Ok(ColType::Bool),
         // v2.09: pg_trigger_depth() is int.

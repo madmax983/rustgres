@@ -2728,6 +2728,14 @@ pub enum AlterAction {
         /// Resulting pg_trigger.tgenabled: b'O' | b'A' | b'R' | b'D'.
         mode: u8,
     },
+    /// v2.19: `ALTER TABLE name {ENABLE|DISABLE} [ALWAYS|REPLICA]
+    /// RULE {name|ALL}` (PG19 AT_EnableRule/AT_DisableRule family).
+    /// `name` None means ALL rules on the relation.
+    SetRuleEnabled {
+        name: Option<String>,
+        /// Resulting pg_rewrite.ev_enabled: b'O' | b'A' | b'R' | b'D'.
+        mode: u8,
+    },
     AddConstraint {
         check: Option<CheckDef>,
         unique: Option<UniqueDef>,
@@ -8887,6 +8895,82 @@ impl TriggerDef {
     }
 }
 
+/// v2.19: rule events (PG19 pg_rewrite.ev_type characters as bytes:
+/// '1' SELECT, '2' UPDATE, '3' INSERT, '4' DELETE).
+pub mod rule_event {
+    pub const SELECT: u8 = b'1';
+    pub const UPDATE: u8 = b'2';
+    pub const INSERT: u8 = b'3';
+    pub const DELETE: u8 = b'4';
+    /// PG19 CmdType name for messages ("INSERT" / "UPDATE" / ...).
+    pub fn name(ev: u8) -> &'static str {
+        match ev {
+            SELECT => "SELECT",
+            UPDATE => "UPDATE",
+            INSERT => "INSERT",
+            _ => "DELETE",
+        }
+    }
+}
+
+/// v2.19: one action statement of a CREATE RULE (PG19 RuleStmt
+/// actions). The source `text` (token-rendered at parse time) is
+/// kept for pg_get_ruledef / pg_rules reconstruction and for
+/// checkpoint re-parse; `stmt` is the parsed form executed at fire
+/// time (after NEW/OLD substitution).
+#[derive(Clone, Debug)]
+pub struct RuleAction {
+    pub text: String,
+    pub stmt: Stmt,
+}
+
+/// v2.19: a rewrite rule (PG19 pg_rewrite row). Stored in
+/// `Database::rules` keyed by event-relation base name.
+#[derive(Clone, Debug)]
+pub struct RuleDef {
+    pub name: String,
+    /// One of `rule_event::*`.
+    pub event: u8,
+    /// DO INSTEAD (vs DO ALSO, the default).
+    pub instead: bool,
+    /// DO [INSTEAD] NOTHING: no actions; an INSTEAD NOTHING rule
+    /// still suppresses the original action for matching rows.
+    pub nothing: bool,
+    /// The WHERE qualification (PG19 ev_qual), analyzed against the
+    /// event relation with NEW/OLD pseudotables.
+    pub condition: Option<Expr>,
+    /// Token-rendered condition source (deparse / checkpoint).
+    pub condition_text: Option<String>,
+    pub actions: Vec<RuleAction>,
+    /// PG19 ev_enabled: b'O' origin, b'D' disabled, b'A' always,
+    /// b'R' replica (ALTER TABLE ... ENABLE/DISABLE RULE).
+    pub enabled: u8,
+    /// pg_rewrite.oid (Database::next_oid at CREATE).
+    pub oid: u32,
+}
+
+impl RuleDef {
+    /// PG19 fireRules: in origin/local sessions 'O' and 'A' fire;
+    /// in replica sessions 'R' and 'A' fire; 'D' never fires.
+    pub fn fires(&self, replica: bool) -> bool {
+        if replica {
+            self.enabled == b'R' || self.enabled == b'A'
+        } else {
+            self.enabled == b'O' || self.enabled == b'A'
+        }
+    }
+    /// Does any action carry a RETURNING clause? (PG19: at most one
+    /// action may, in an unconditional INSTEAD rule.)
+    pub fn action_returning(&self) -> Option<&[SelectItem]> {
+        self.actions.iter().find_map(|a| match &a.stmt {
+            Stmt::Insert { returning, .. } if !returning.is_empty() => Some(&returning[..]),
+            Stmt::Update { returning, .. } if !returning.is_empty() => Some(&returning[..]),
+            Stmt::Delete { returning, .. } if !returning.is_empty() => Some(&returning[..]),
+            _ => None,
+        })
+    }
+}
+
 /// v1.00: one statement of a bounded trigger-function body
 /// (`RETURNS trigger`, `LANGUAGE plpgsql`). This is a separate,
 /// deliberately small grammar — not an expansion of the bounded
@@ -9351,6 +9435,43 @@ pub enum Stmt {
         /// v2.14: REFERENCING OLD/NEW TABLE names.
         old_table: Option<String>,
         new_table: Option<String>,
+    },
+    // --- v2.19: CREATE RULE (PG19 RuleStmt) ---
+    CreateRule {
+        name: String,
+        or_replace: bool,
+        /// Event relation name as written (may be schema-qualified).
+        relation: String,
+        /// One of `rule_event::*`.
+        event: u8,
+        condition: Option<Expr>,
+        condition_text: Option<String>,
+        instead: bool,
+        nothing: bool,
+        actions: Vec<RuleAction>,
+    },
+    /// v2.19: `DROP RULE [IF EXISTS] name ON relation [CASCADE|RESTRICT]`.
+    DropRule {
+        name: String,
+        relation: String,
+        if_exists: bool,
+        cascade: bool,
+    },
+    /// v2.19: `ALTER RULE name ON relation RENAME TO new_name`
+    /// (PG19 RenameStmt OBJECT_RULE).
+    AlterRuleRename {
+        name: String,
+        relation: String,
+        new_name: String,
+    },
+    /// v2.19: `NOTIFY channel [, 'payload']` (PG19 NotifyStmt).
+    /// The engine has no LISTEN/NOTIFY delivery fabric; the
+    /// statement is accepted and completes with the NOTIFY tag
+    /// (rule actions use it — PG19 gram.y allows NOTIFY as a rule
+    /// action).
+    Notify {
+        channel: String,
+        payload: Option<String>,
     },
     /// v2.14: `COMMENT ON TRIGGER name ON table IS ...` — comments
     /// are not stored; the statement is a catalog no-op returning

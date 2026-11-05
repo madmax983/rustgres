@@ -685,7 +685,26 @@ pub(crate) fn build_ext_stats_for_table(
             let base = if distinct > 0.0 { 1.0 / distinct } else { 0.0 };
             let mut items: Vec<(Vec<Option<Value>>, u64)> =
                 counts.values().map(|(v, c)| (v.clone(), *c)).collect();
-            items.sort_by(|a, b| b.1.cmp(&a.1));
+            // v2.19 adjudication: frequency ties must be
+            // deterministic — the v2.17 builder emitted ties in
+            // HashMap iteration order, so equal-frequency MCVs
+            // surfaced in arbitrary order (the stats_ext_range
+            // pg_stats_ext mismatch). PG's stats builder is
+            // order-stable for ties; use the rendered key ascending
+            // as the tie-break.
+            let render_key = |vals: &Vec<Option<Value>>| -> String {
+                vals.iter()
+                    .map(|v| match v {
+                        Some(v) => value_to_text_cast(v),
+                        None => "NULL".to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            items.sort_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then_with(|| render_key(&a.0).cmp(&render_key(&b.0)))
+            });
             data.mcv = items
                 .into_iter()
                 .take(100)
@@ -712,7 +731,12 @@ pub(crate) fn build_ext_stats_for_table(
                 }
                 let mut by_freq: Vec<(Value, u64)> =
                     counts.values().map(|(v, c)| (v.clone(), *c)).collect();
-                by_freq.sort_by(|a, b| b.1.cmp(&a.1));
+                // v2.19: same deterministic tie-break as the MCV
+                // list above (rendered key ascending).
+                by_freq.sort_by(|a, b| {
+                    b.1.cmp(&a.1)
+                        .then_with(|| value_to_text_cast(&a.0).cmp(&value_to_text_cast(&b.0)))
+                });
                 data.expr_stats.push(ExtExprStat {
                     null_frac: if total > 0.0 {
                         nulls as f64 / total

@@ -4202,6 +4202,12 @@ fn run_statement(
             })
             .unwrap_or(true);
         crate::exec::set_row_security(rs);
+        // v2.19: session_replication_role for rule firing (PG19
+        // fireRules ev_enabled filter; default origin).
+        let repl = guc_value(session, "session_replication_role")
+            .map(|v| v.trim().eq_ignore_ascii_case("replica"))
+            .unwrap_or(false);
+        crate::exec::set_session_replica(repl);
         crate::exec::set_session_user(&session.session_user);
         // v1.96: current_setting() snapshot: the session's GUC map
         // plus computed values.
@@ -4856,6 +4862,8 @@ fn auto_vacuum(engine: &mut Engine, writes: &[WriteOp]) {
             | WriteOp::DbOwner { .. }
             | WriteOp::ViewState { .. }
             | WriteOp::ViewTriggers { .. }
+            // v2.19: rule DDL likewise leaves no dead row versions.
+            | WriteOp::RulesSet { .. }
             // v0.22: temp tables are single-version; their DDL leaves
             // no dead versions to reap. Shell types likewise.
             | WriteOp::CreateTempTable { .. }

@@ -396,6 +396,8 @@ pub(crate) fn drop_view_internal(
         view: snapshot,
     });
     forget_obj_schema(eng, ctx, name);
+    // v2.19: the view's rules die with it.
+    crate::exec::rules::clear_rules(ctx, eng, name);
     Ok(())
 }
 

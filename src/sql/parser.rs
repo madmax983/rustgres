@@ -400,6 +400,25 @@ impl Parser {
             "delete" => self.parse_delete(),
             // --- v2.01: MERGE
             "merge" => self.parse_merge(),
+            // --- v2.19: NOTIFY channel [, 'payload']
+            "notify" => {
+                let channel = self.expect_ident()?;
+                let payload = if matches!(self.peek(), Token::Comma) {
+                    self.next();
+                    match self.next() {
+                        Token::Str(s) => Some(s),
+                        other => {
+                            return Err(err(format!(
+                                "syntax error: expected string literal after comma in NOTIFY, found {:?}",
+                                other
+                            )));
+                        }
+                    }
+                } else {
+                    None
+                };
+                Ok(Stmt::Notify { channel, payload })
+            }
             // --- v2.04: COMMENT ON PUBLICATION
             "comment" => self.parse_comment(),
             // --- v0.74: PREPARE / EXECUTE / DEALLOCATE
@@ -815,6 +834,7 @@ impl Parser {
                 Token::Ident(s) if s == "type" => self.parse_alter_type(),
                 Token::Ident(s) if s == "function" => self.parse_alter_function(),
                 Token::Ident(s) if s == "trigger" => self.parse_alter_trigger(),
+                Token::Ident(s) if s == "rule" => self.parse_alter_rule(),
                 Token::Ident(s) if s == "policy" => self.parse_alter_policy(),
                 Token::Ident(s) if s == "publication" => self.parse_alter_publication(),
                 Token::Ident(s) if s == "default" => self.parse_alter_default_privileges(),
@@ -1477,6 +1497,11 @@ impl Parser {
                 if matches!(self.peek(), Token::Ident(s) if s == "trigger") {
                     return self.parse_create_trigger(true);
                 }
+                // v2.19: CREATE OR REPLACE RULE (PG19 RuleStmt
+                // opt_or_replace).
+                if matches!(self.peek(), Token::Ident(s) if s == "rule") {
+                    return self.parse_create_rule(true);
+                }
                 return Err(err(
                     "syntax error: OR REPLACE is only supported for CREATE FUNCTION".to_string(),
                 ));
@@ -1511,6 +1536,11 @@ impl Parser {
         // v2.02: CREATE PUBLICATION name [FOR ...] [WITH (...)].
         if matches!(self.peek(), Token::Ident(s) if s == "publication") {
             return self.parse_create_publication();
+        }
+        // v2.19: CREATE RULE name AS ON event TO rel [WHERE cond]
+        // DO [INSTEAD|ALSO] {NOTHING | stmt | (stmt; ...)}.
+        if matches!(self.peek(), Token::Ident(s) if s == "rule") {
+            return self.parse_create_rule(false);
         }
         // CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (col [, ...])
         let unique = self.eat_keyword("unique");
@@ -3285,6 +3315,19 @@ impl Parser {
             } else {
                 None
             };
+            // v2.19: ENABLE [ALWAYS|REPLICA] RULE {name|ALL}.
+            if matches!(self.peek(), Token::Ident(s) if s == "rule") {
+                self.next(); // 'rule'
+                let name = if self.eat_keyword("all") {
+                    None
+                } else {
+                    Some(self.expect_ident()?)
+                };
+                return Ok(AlterAction::SetRuleEnabled {
+                    name,
+                    mode: mode.unwrap_or(b'O'),
+                });
+            }
             if mode.is_some() || matches!(self.peek(), Token::Ident(s) if s == "trigger") {
                 self.expect_keyword("trigger")?;
                 let name = if self.eat_keyword("all") || self.eat_keyword("user") {
@@ -3306,6 +3349,16 @@ impl Parser {
             // PG19 has no DISABLE ALWAYS/REPLICA TRIGGER, but accept
             // the words leniently as a plain disable.
             let _ = self.eat_keyword("always") || self.eat_keyword("replica");
+            // v2.19: DISABLE RULE {name|ALL}.
+            if matches!(self.peek(), Token::Ident(s) if s == "rule") {
+                self.next(); // 'rule'
+                let name = if self.eat_keyword("all") {
+                    None
+                } else {
+                    Some(self.expect_ident()?)
+                };
+                return Ok(AlterAction::SetRuleEnabled { name, mode: b'D' });
+            }
             if matches!(self.peek(), Token::Ident(s) if s == "trigger") {
                 self.expect_keyword("trigger")?;
                 let name = if self.eat_keyword("all") || self.eat_keyword("user") {
@@ -4709,6 +4762,154 @@ impl Parser {
     /// CONSTRAINT TRIGGER name AFTER event [OR ...] ON table
     /// [FROM reftable] ConstraintAttributeSpec FOR EACH ROW
     /// [WHEN (...)] EXECUTE ...` (AFTER + ROW only, per gram.y).
+    /// v2.19: `CREATE [OR REPLACE] RULE name AS ON {SELECT|INSERT|
+    /// UPDATE|DELETE} TO relation [WHERE condition] DO
+    /// [INSTEAD | ALSO] {NOTHING | statement | (statement; ...)}`
+    /// (PG19 RuleStmt). Action statements are captured as token
+    /// spans, rendered back to text, and parsed with
+    /// `parse_statement_inner`; the rendered text doubles as the
+    /// stored source for pg_get_ruledef and checkpoint re-parse.
+    pub(crate) fn parse_create_rule(&mut self, or_replace: bool) -> Result<Stmt, SqlError> {
+        self.expect_keyword("rule")?;
+        let name = self.expect_ident()?;
+        self.expect_keyword("as")?;
+        self.expect_keyword("on")?;
+        let event = if self.eat_keyword("insert") {
+            rule_event::INSERT
+        } else if self.eat_keyword("update") {
+            rule_event::UPDATE
+        } else if self.eat_keyword("delete") {
+            rule_event::DELETE
+        } else if self.eat_keyword("select") {
+            rule_event::SELECT
+        } else {
+            return Err(err(
+                "syntax error: expected INSERT, UPDATE, DELETE, or SELECT in CREATE RULE"
+                    .to_string(),
+            ));
+        };
+        self.expect_keyword("to")?;
+        let relation = self.parse_table_name()?;
+        let (condition, condition_text) = if self.eat_keyword("where") {
+            let start = self.pos;
+            let e = self.parse_or()?;
+            let text = tokens_to_sql(&self.tokens[start..self.pos]);
+            (Some(e), Some(text))
+        } else {
+            (None, None)
+        };
+        self.expect_keyword("do")?;
+        let instead = if self.eat_keyword("instead") {
+            true
+        } else {
+            let _ = self.eat_keyword("also");
+            false
+        };
+        let mut nothing = false;
+        let mut actions: Vec<RuleAction> = Vec::new();
+        if self.eat_keyword("nothing") {
+            nothing = true;
+        } else if matches!(self.peek(), Token::LParen) {
+            self.next(); // '('
+            // Split the parenthesized list on top-level semicolons;
+            // the list ends at the matching ')'.
+            let mut depth = 0i32;
+            let mut span_start = self.pos;
+            let mut spans: Vec<(usize, usize)> = Vec::new();
+            let mut i = self.pos;
+            loop {
+                match self.tokens.get(i) {
+                    None => {
+                        return Err(err(
+                            "syntax error: unterminated rule action list".to_string()
+                        ));
+                    }
+                    Some(Token::LParen) | Some(Token::LBracket) => depth += 1,
+                    Some(Token::RParen) | Some(Token::RBracket) => {
+                        if depth == 0 {
+                            if i > span_start {
+                                spans.push((span_start, i));
+                            }
+                            self.pos = i + 1;
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    Some(Token::Semi) if depth == 0 => {
+                        spans.push((span_start, i));
+                        span_start = i + 1;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            for (a, b) in spans {
+                if a >= b {
+                    continue;
+                }
+                let text = tokens_to_sql(&self.tokens[a..b]);
+                let stmt = parse_statement_inner(&text)?;
+                actions.push(RuleAction { text, stmt });
+            }
+            if actions.is_empty() {
+                return Err(err("syntax error: empty rule action list".to_string()));
+            }
+        } else {
+            // Single action: up to the first top-level ';' (or the
+            // end of the token stream).
+            let mut depth = 0i32;
+            let mut end = self.tokens.len();
+            let mut i = self.pos;
+            while i < self.tokens.len() {
+                match self.tokens[i] {
+                    Token::LParen | Token::LBracket => depth += 1,
+                    Token::RParen | Token::RBracket => depth -= 1,
+                    Token::Semi if depth == 0 => {
+                        end = i;
+                        break;
+                    }
+                    Token::EOF => {
+                        end = i;
+                        break;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            let text = tokens_to_sql(&self.tokens[self.pos..end]);
+            let stmt = parse_statement_inner(&text)?;
+            actions.push(RuleAction { text, stmt });
+            self.pos = end;
+        }
+        Ok(Stmt::CreateRule {
+            name,
+            or_replace,
+            relation,
+            event,
+            condition,
+            condition_text,
+            instead,
+            nothing,
+            actions,
+        })
+    }
+
+    /// v2.19: `ALTER RULE name ON relation RENAME TO new_name`.
+    pub(crate) fn parse_alter_rule(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("rule")?;
+        let name = self.expect_ident()?;
+        self.expect_keyword("on")?;
+        let relation = self.parse_table_name()?;
+        self.expect_keyword("rename")?;
+        self.expect_keyword("to")?;
+        let new_name = self.expect_ident()?;
+        Ok(Stmt::AlterRuleRename {
+            name,
+            relation,
+            new_name,
+        })
+    }
+
     pub(crate) fn parse_create_trigger(&mut self, or_replace: bool) -> Result<Stmt, SqlError> {
         // CONSTRAINT (if present) precedes TRIGGER in the constraint
         // form and follows it in no form; accept it in either spot.
@@ -8973,6 +9174,17 @@ impl Parser {
                     }
                 }
             }
+        }
+        // v2.19: postfix ISNULL / NOTNULL (PG19 gram.y a_expr
+        // ISNULL / a_expr NOTNULL) — previously only the trigger
+        // WHEN-condition parser accepted these.
+        if matches!(self.peek(), Token::Ident(s) if s == "isnull" || s == "notnull") {
+            let neg = matches!(self.peek(), Token::Ident(s) if s == "notnull");
+            self.next();
+            expr = Expr::IsNull {
+                expr: Box::new(expr),
+                neg,
+            };
         }
         Ok(expr)
     }
@@ -15076,6 +15288,27 @@ impl Parser {
     }
 
     pub(crate) fn parse_drop(&mut self) -> Result<Stmt, SqlError> {
+        // v2.19: DROP RULE [IF EXISTS] name ON relation
+        // [CASCADE|RESTRICT] (PG19 DropRuleStmt).
+        if matches!(self.peek(), Token::Ident(s) if s == "rule") {
+            self.next(); // 'rule'
+            let if_exists = if self.eat_keyword("if") {
+                self.expect_keyword("exists")?;
+                true
+            } else {
+                false
+            };
+            let name = self.expect_ident()?;
+            self.expect_keyword("on")?;
+            let relation = self.parse_table_name()?;
+            let cascade = self.parse_cascade_opt()?;
+            return Ok(Stmt::DropRule {
+                name,
+                relation,
+                if_exists,
+                cascade,
+            });
+        }
         // v2.17: DROP STATISTICS [IF EXISTS] name [, ...] [CASCADE|RESTRICT].
         if self.eat_keyword("statistics") {
             let if_exists = if self.eat_keyword("if") {
@@ -16574,6 +16807,10 @@ pub fn split_statements(input: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut start = 0; // char index where the current statement begins
     let mut i = 0;
+    // v2.19: parenthesis depth — a `;` inside parens does not end
+    // the statement (the CREATE RULE parenthesized action list is
+    // the one place SQL puts semicolons inside parens).
+    let mut depth = 0i32;
     while i < chars.len() {
         let c = chars[i];
         if c == '\'' {
@@ -16654,7 +16891,13 @@ pub fn split_statements(input: &str) -> Vec<String> {
             // Not a quote opener (e.g. `$1`); fall through to normal
             // handling below.
         }
-        if c == ';' {
+        if c == '(' {
+            depth += 1;
+        }
+        if c == ')' && depth > 0 {
+            depth -= 1;
+        }
+        if c == ';' && depth == 0 {
             let seg: String = chars[start..i].iter().collect();
             // v2.04: a `;` inside a BEGIN ATOMIC function body does
             // not terminate the statement.

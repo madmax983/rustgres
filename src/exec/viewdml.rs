@@ -1262,6 +1262,47 @@ fn returning_refs_old(returning: &[SelectItem]) -> bool {
     })
 }
 
+/// v2.19: the RETURNING list handed to the base-relation DML for
+/// a capture. Normally `[All]` (the captured rows feed check
+/// enforcement and the user's RETURNING projection). When the
+/// base carries INSTEAD rules with no action RETURNING, capture
+/// is impossible — PG evaluates neither check options nor a user
+/// RETURNING through such rules ("check options don't work with
+/// INSTEAD rules", updatable_views.sql) — and with no user
+/// RETURNING the call degrades to no RETURNING at all: zero
+/// captured rows, checks no-op, the rule layer's tag stands.
+/// (With a user RETURNING the [All] form is kept so the rule
+/// layer raises PG's cannot-perform-RETURNING error itself.)
+fn capture_returning(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    base: &str,
+    event: u8,
+    capture: bool,
+    user_returning: &[SelectItem],
+    translated: Vec<SelectItem>,
+) -> Vec<SelectItem> {
+    if !capture {
+        return translated;
+    }
+    if user_returning.is_empty() {
+        let rs = crate::exec::rules::firing_rules(
+            eng,
+            &crate::exec::rules::rule_key_for(eng, ctx, base),
+            event,
+        );
+        let has_instead = rs.iter().any(|r| r.instead);
+        let has_ret = rs
+            .iter()
+            .filter(|r| r.instead)
+            .any(|r| r.action_returning().is_some());
+        if has_instead && !has_ret {
+            return Vec::new();
+        }
+    }
+    vec![SelectItem::All]
+}
+
 fn returning_needs_capture(returning: &[SelectItem]) -> bool {
     returning.iter().any(|item| match item {
         SelectItem::All | SelectItem::AllOf(_) => true,
@@ -2375,11 +2416,15 @@ pub(crate) fn exec_insert_auto_view(
     } else {
         Vec::new()
     };
-    let t_returning: Vec<SelectItem> = if capture {
-        vec![SelectItem::All]
-    } else {
-        translate_returning(&ren, returning).unwrap_or_default()
-    };
+    let t_returning: Vec<SelectItem> = capture_returning(
+        eng,
+        ctx,
+        &av.base,
+        crate::sql::rule_event::INSERT,
+        capture,
+        returning,
+        translate_returning(&ren, returning).unwrap_or_default(),
+    );
     let saved = suppress_privs(ctx);
     let res = exec_insert(
         eng,
@@ -2607,11 +2652,15 @@ pub(crate) fn exec_update_auto_view(
     } else {
         Vec::new()
     };
-    let t_returning: Vec<SelectItem> = if capture {
-        vec![SelectItem::All]
-    } else {
-        translate_returning(&ren, returning).unwrap_or_default()
-    };
+    let t_returning: Vec<SelectItem> = capture_returning(
+        eng,
+        ctx,
+        &av.base,
+        crate::sql::rule_event::UPDATE,
+        capture,
+        returning,
+        translate_returning(&ren, returning).unwrap_or_default(),
+    );
     let saved = suppress_privs(ctx);
     let res = exec_update(
         eng,
@@ -2731,11 +2780,15 @@ pub(crate) fn exec_delete_auto_view(
     // DELETE has no check-option enforcement in PG.
     let capture = returning_needs_capture(returning);
     let base_cols = base_scope_cols(eng, ctx, &av)?;
-    let t_returning: Vec<SelectItem> = if capture {
-        vec![SelectItem::All]
-    } else {
-        translate_returning(&ren, returning).unwrap_or_default()
-    };
+    let t_returning: Vec<SelectItem> = capture_returning(
+        eng,
+        ctx,
+        &av.base,
+        crate::sql::rule_event::DELETE,
+        capture,
+        returning,
+        translate_returning(&ren, returning).unwrap_or_default(),
+    );
     let saved = suppress_privs(ctx);
     let res = exec_delete(
         eng,

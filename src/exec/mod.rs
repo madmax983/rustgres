@@ -104,6 +104,7 @@ pub(crate) mod ranges;
 mod reorder;
 mod rls;
 mod roles;
+pub(crate) mod rules;
 mod seq;
 mod sje;
 pub(crate) mod tsearch;
@@ -334,6 +335,9 @@ mod v217_tests;
 #[path = "test_mods/v218_tests.rs"]
 mod v218_tests;
 #[cfg(test)]
+#[path = "test_mods/v219_tests.rs"]
+mod v219_tests;
+#[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;
 
@@ -378,6 +382,7 @@ pub(crate) use publication::*;
 pub(crate) use reorder::*;
 pub(crate) use rls::*;
 pub(crate) use roles::*;
+pub(crate) use rules::*;
 pub(crate) use seq::*;
 pub(crate) use sje::*;
 pub(crate) use viewdml::*;

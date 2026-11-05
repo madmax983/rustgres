@@ -46,7 +46,7 @@ pub(crate) const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK16";
 /// v2.18: version 30 adds per-view `col_acl` + `col_defaults`.
 /// v29 checkpoints are refused; remove the data directory to
 /// start fresh.
-pub(crate) const CHKPT_VERSION: u32 = 30;
+pub(crate) const CHKPT_VERSION: u32 = 31;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -1021,6 +1021,52 @@ impl Wal {
             }
         }
 
+        // v2.19 (checkpoint v31): rewrite rules. Actions persist as
+        // their source texts and are re-parsed on load; conditions
+        // ride the s-expr expr codec (empty string = no condition).
+        // Temp-table rules ("pg_temp:" keys) are session state and
+        // are never checkpointed, like the temp tables themselves.
+        {
+            let mut r_names: Vec<&String> = eng
+                .db
+                .rules
+                .keys()
+                .filter(|k| !k.starts_with("pg_temp:"))
+                .collect();
+            r_names.sort();
+            let mut n_rules = 0u32;
+            let mut r_body = Enc::new();
+            for rel in r_names {
+                for rule in &eng.db.rules[rel] {
+                    r_body.str(rel);
+                    r_body.str(&rule.name);
+                    r_body.u8(rule.event);
+                    r_body.u8(rule.instead as u8);
+                    r_body.u8(rule.nothing as u8);
+                    r_body.u8(rule.enabled);
+                    r_body.u32(rule.oid);
+                    match &rule.condition {
+                        Some(c) => r_body.str(&crate::sql::encode_expr(c)),
+                        None => r_body.str(""),
+                    }
+                    match &rule.condition_text {
+                        Some(t) => {
+                            r_body.u8(1);
+                            r_body.str(t);
+                        }
+                        None => r_body.u8(0),
+                    }
+                    r_body.u32(rule.actions.len() as u32);
+                    for a in &rule.actions {
+                        r_body.str(&a.text);
+                    }
+                    n_rules += 1;
+                }
+            }
+            img.u32(n_rules);
+            img.bytes(&r_body.buf);
+        }
+
         // 2. Write tmp file + fsync.
         let tmp_path = self.dir.join(CHKPT_TMP);
         {
@@ -1916,6 +1962,57 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         }
         let p = wp.into_publication(name.clone());
         eng.db.publications.insert(name, p);
+    }
+    // v2.19 (checkpoint v31): rewrite rules (see the writer side).
+    // Action texts are re-parsed; a text that no longer parses is
+    // skipped with the rule kept action-less rather than failing
+    // the whole load (cannot happen for images this build wrote).
+    let n_rules = d.u32().map_err(|e| bad(&e))? as usize;
+    for _ in 0..n_rules {
+        let rel = d.str().map_err(|e| bad(&e))?;
+        let name = d.str().map_err(|e| bad(&e))?;
+        let event = d.u8().map_err(|e| bad(&e))?;
+        let instead = d.u8().map_err(|e| bad(&e))? != 0;
+        let nothing = d.u8().map_err(|e| bad(&e))? != 0;
+        let enabled = d.u8().map_err(|e| bad(&e))?;
+        let oid = d.u32().map_err(|e| bad(&e))?;
+        let cond_enc = d.str().map_err(|e| bad(&e))?;
+        let condition = if cond_enc.is_empty() {
+            None
+        } else {
+            crate::sql::decode_expr(&cond_enc).ok()
+        };
+        let condition_text = if d.u8().map_err(|e| bad(&e))? != 0 {
+            Some(d.str().map_err(|e| bad(&e))?)
+        } else {
+            None
+        };
+        let n_actions = d.u32().map_err(|e| bad(&e))? as usize;
+        let mut actions = Vec::new();
+        for _ in 0..n_actions {
+            let text = d.str().map_err(|e| bad(&e))?;
+            if let Ok(stmt) = crate::sql::parse_statement_inner(&text) {
+                actions.push(crate::sql::RuleAction { text, stmt });
+            }
+        }
+        if oid >= eng.db.next_oid {
+            eng.db.next_oid = oid + 1;
+        }
+        eng.db
+            .rules
+            .entry(rel)
+            .or_default()
+            .push(crate::sql::RuleDef {
+                name,
+                event,
+                instead,
+                nothing,
+                condition,
+                condition_text,
+                actions,
+                enabled,
+                oid,
+            });
     }
     d.end().map_err(|e| bad(&e))?;
     Ok((eng, wal_end))

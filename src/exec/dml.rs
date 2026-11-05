@@ -2595,7 +2595,48 @@ pub(crate) fn exec_delete_view(
     })
 }
 
+/// v2.19: INSERT entry point — the CREATE RULE layer (exec/rules.rs)
+/// gets first refusal; with no enabled INSERT rules the statement
+/// runs through `exec_insert_inner` untouched.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_insert(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table: &str,
+    columns: &Option<Vec<InsertTarget>>,
+    rows: &[Vec<InsertValue>],
+    select: &Option<SelectStmt>,
+    with: &[CteDef],
+    on_conflict: &Option<OnConflict>,
+    returning: &[SelectItem],
+) -> Result<ExecResult, ExecError> {
+    if let Some(r) = crate::exec::rules::try_fire_insert(
+        eng,
+        ctx,
+        table,
+        columns,
+        rows,
+        select,
+        with,
+        on_conflict,
+        returning,
+    ) {
+        return r;
+    }
+    exec_insert_inner(
+        eng,
+        ctx,
+        table,
+        columns,
+        rows,
+        select,
+        with,
+        on_conflict,
+        returning,
+    )
+}
+
+pub(crate) fn exec_insert_inner(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     table: &str,
@@ -4364,7 +4405,28 @@ pub(crate) fn reorder_row(
         .collect()
 }
 
+/// v2.19: UPDATE entry point — rules first (exec/rules.rs).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_update(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table: &str,
+    alias: &Option<String>,
+    sets: &[(String, Expr)],
+    from: &[FromItem],
+    where_: &Option<Expr>,
+    with: &[CteDef],
+    returning: &[SelectItem],
+) -> Result<ExecResult, ExecError> {
+    if let Some(r) = crate::exec::rules::try_fire_update(
+        eng, ctx, table, alias, sets, from, where_, with, returning,
+    ) {
+        return r;
+    }
+    exec_update_inner(eng, ctx, table, alias, sets, from, where_, with, returning)
+}
+
+pub(crate) fn exec_update_inner(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     table: &str,
@@ -5522,7 +5584,27 @@ pub(crate) fn exec_update(
     })
 }
 
+/// v2.19: DELETE entry point — rules first (exec/rules.rs).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_delete(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table: &str,
+    alias: &Option<String>,
+    using: &[FromItem],
+    where_: &Option<Expr>,
+    with: &[CteDef],
+    returning: &[SelectItem],
+) -> Result<ExecResult, ExecError> {
+    if let Some(r) =
+        crate::exec::rules::try_fire_delete(eng, ctx, table, alias, using, where_, with, returning)
+    {
+        return r;
+    }
+    exec_delete_inner(eng, ctx, table, alias, using, where_, with, returning)
+}
+
+pub(crate) fn exec_delete_inner(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     table: &str,
@@ -6383,6 +6465,11 @@ pub(crate) fn exec_drop(
     // v1.96 finishing pass: schema attribution dies with the table.
     for name in &dropped {
         forget_obj_schema(eng, ctx, name);
+    }
+    // v2.19: the relation's rules die with it (PG: pg_rewrite rows
+    // are dependencies of the relation).
+    for name in &dropped {
+        crate::exec::rules::clear_rules(ctx, eng, name);
     }
     Ok(ExecResult::Command {
         tag: "DROP TABLE".to_string(),

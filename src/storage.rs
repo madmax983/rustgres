@@ -6059,6 +6059,13 @@ pub struct Database {
     /// Views by name (v0.9). Versioned like tables so CREATE/DROP VIEW are
     /// transactional under MVCC.
     pub views: HashMap<String, Vec<ViewDef>, FxBuildHasher>,
+    /// v2.19: rewrite rules by event-relation base name (PG19
+    /// pg_rewrite). Transactional via the statement undo log
+    /// (`WriteOp::RulesSet` carries the previous list per relation);
+    /// checkpointed (CHKPT 31, actions re-parsed from their stored
+    /// source texts on load); not WAL-logged (same durability class
+    /// as view column ACLs, v2.18 hold-back 12).
+    pub rules: HashMap<String, Vec<crate::sql::RuleDef>, FxBuildHasher>,
     /// Sequences by name (v0.9). DDL is transactional; the sequence
     /// *value* (`current`) advances non-transactionally, like PostgreSQL.
     pub sequences: HashMap<String, Vec<Sequence>, FxBuildHasher>,
@@ -6399,6 +6406,7 @@ impl Database {
             stats: HashMap::default(),
             ext_stats: Vec::new(),
             views: HashMap::default(),
+            rules: HashMap::default(),
             sequences: HashMap::default(),
             roles: HashMap::default(),
             db_acl: Vec::new(),
@@ -6622,6 +6630,10 @@ impl Database {
         self.temp_tables.remove(&session);
         // v0.87: drop the session's temp indexes too.
         self.temp_indexes.remove(&session);
+        // v2.19: drop the session's temp-table rules too (they are
+        // keyed "pg_temp:<sid>:<name>" in the rule registry).
+        let prefix = format!("pg_temp:{}:", session);
+        self.rules.retain(|k, _| !k.starts_with(&prefix));
     }
 
     /// The table version created by `own` (for WAL logging of DDL).
@@ -7485,6 +7497,12 @@ pub struct Engine {
     /// parsing becomes catalog-sensitive, and it matches PG's
     /// architecture where the plan cache keys off catalog versions.
     pub catalog_epoch: u64,
+    /// v2.19: rule-firing stack of (relation base name, event) for
+    /// the statement currently executing on this engine (PG19
+    /// rewriteHandler's rewrite_events): re-entering the same
+    /// (relation, event) while its rules are being applied is
+    /// 42P17 "infinite recursion detected in rules". Runtime-only.
+    pub rule_stack: Vec<(String, u8)>,
 }
 
 impl Engine {
@@ -7507,6 +7525,8 @@ impl Engine {
             repl_slots: HashMap::new(),
             // v0.81: catalog epoch for parse-cache invalidation.
             catalog_epoch: 0,
+            // v2.19: rule-firing recursion stack.
+            rule_stack: Vec::new(),
         }
     }
 
@@ -8574,6 +8594,13 @@ pub enum WriteOp {
     CreateView {
         name: String,
     },
+    // --- v2.19: CREATE/DROP/ALTER RULE on one relation. The op
+    // carries the relation's whole previous rule list (or None when
+    // the relation had no rules entry) so undo restores it exactly.
+    RulesSet {
+        rel: String,
+        prev: Option<Vec<crate::sql::RuleDef>>,
+    },
     DropView {
         name: String,
         view: ViewDef,
@@ -9266,6 +9293,14 @@ pub fn undo_write_op(eng: &mut Engine, owns: &[u64], op: &WriteOp) {
                 }
             }
         }
+        WriteOp::RulesSet { rel, prev } => match prev {
+            Some(prev) => {
+                eng.db.rules.insert(rel.clone(), prev.clone());
+            }
+            None => {
+                eng.db.rules.remove(rel);
+            }
+        },
         WriteOp::ViewTriggers {
             name,
             prev_triggers,

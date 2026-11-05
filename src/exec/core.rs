@@ -168,6 +168,13 @@ thread_local! {
     /// NOTICE_SINK). 0 outside any trigger.
     pub(crate) static TRIGGER_DEPTH: RefCell<i64> = const { RefCell::new(0) };
 
+    /// v2.19: the session's `session_replication_role` for rule
+    /// firing (PG19 fireRules filters pg_rewrite.ev_enabled by it).
+    /// The GUC lives in the server session; the server installs the
+    /// current value here at statement start (thread-per-connection
+    /// like NOTICE_SINK). false = origin/local, true = replica.
+    pub(crate) static SESSION_REPLICA: RefCell<bool> = const { RefCell::new(false) };
+
     /// v1.26: LATERAL namespace markers (PG19 `scanNameSpaceForRefname` /
     /// `check_agglevels_and_constraints`, PG19's parse-time LATERAL
     /// rules). Each entry is `(ns_base, depth)`:
@@ -194,6 +201,18 @@ thread_local! {
     /// cross-nest right subtree. Saved/restored on nesting.
     pub(crate) static LATERAL_INHERIT: RefCell<Option<(usize, usize)>> =
         const { RefCell::new(None) };
+}
+
+/// v2.19: is this statement running under
+/// session_replication_role = replica? (See SESSION_REPLICA.)
+pub(crate) fn session_is_replica() -> bool {
+    SESSION_REPLICA.with(|r| *r.borrow())
+}
+
+/// v2.19: server-side installer for SESSION_REPLICA (called from
+/// run_statement alongside the other per-statement session context).
+pub fn set_session_replica(replica: bool) {
+    SESSION_REPLICA.with(|r| *r.borrow_mut() = replica);
 }
 
 /// v2.10: RAII trigger-depth increment; restores on drop so every

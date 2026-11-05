@@ -120,6 +120,18 @@ pub(crate) fn exec_merge(
     with: &[CteDef],
 ) -> Result<ExecResult, ExecError> {
     let qual = alias.as_deref().unwrap_or(table).to_string();
+    // --- v2.19: PG19 rewriteHandler.c — MERGE is refused on any
+    // relation carrying an enabled non-SELECT rule.
+    if crate::exec::rules::has_enabled_nonselect_rule(eng, ctx, table) {
+        return Err(exec_err_detail(
+            "0A000",
+            format!(
+                "cannot execute MERGE on relation \"{}\"",
+                crate::exec::rules::rule_rel_key(table)
+            ),
+            "MERGE is not supported for relations with rules.",
+        ));
+    }
     // --- v2.18: MERGE into an auto-updatable view — translate the
     // target references onto the base relation and recurse (PG19
     // rewriteTargetView for CMD_MERGE). Views with INSTEAD OF
