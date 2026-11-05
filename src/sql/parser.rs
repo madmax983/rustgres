@@ -1589,6 +1589,15 @@ impl Parser {
                 // must be a plain column name. v0.99: a bare function
                 // call (`expensivefunc(x)`) is also an expression (PG19
                 // index_elem: ColId | func_expr | (a_expr)).
+                // v2.20: a bare func_expr element's trailing COLLATE
+                // is the element's opt_collate (gram.y), but the
+                // expression parser consumes it as a postfix clause —
+                // split it back off the captured source so the key
+                // text stays the bare expression (arbiter inference
+                // compares key texts) and the collation lands on the
+                // spec, exactly as before expression-level COLLATE
+                // was accepted.
+                let mut eaten_collate: Option<String> = None;
                 let (name_opt, expr_opt) = if matches!(self.peek(), Token::LParen) {
                     self.next(); // consume the expression's '('
                     let start = self.pos;
@@ -1604,7 +1613,9 @@ impl Parser {
                         // expression source.
                         self.pos = start;
                         let _ = self.parse_or()?;
-                        let src = tokens_to_sql(&self.tokens[start..self.pos]);
+                        let (span, ec) = split_trailing_collate(&self.tokens[start..self.pos]);
+                        eaten_collate = ec;
+                        let src = tokens_to_sql(span);
                         (None, Some(src))
                     } else {
                         (Some(name), None)
@@ -1616,6 +1627,7 @@ impl Parser {
                 // ON CONFLICT arbiter inference; the btree itself
                 // compares bytewise regardless.
                 let (collate, opclass) = self.parse_opt_collate_opclass()?;
+                let collate = collate.or(eaten_collate);
                 let desc = if self.eat_keyword("desc") {
                     true
                 } else {
@@ -8152,8 +8164,14 @@ impl Parser {
                 } else {
                     &self.tokens[start..self.pos]
                 };
+                // v2.20: same opt_collate split as CREATE INDEX —
+                // an element's trailing COLLATE is its suffix, not
+                // part of its key text, even though the expression
+                // skip-parse now consumes postfix COLLATE clauses.
+                let (span, eaten_collate) = split_trailing_collate(span);
                 let key = tokens_to_sql(span);
                 let (collate, opclass) = self.parse_opt_collate_opclass()?;
+                let collate = collate.or(eaten_collate);
                 cols.push(ArbiterElem {
                     key,
                     collate,
@@ -9604,6 +9622,41 @@ impl Parser {
         Ok(left)
     }
 
+    /// v2.20: postfix `COLLATE <name>` on an expression (PG19 gram.y
+    /// `a_expr COLLATE any_name`). Collation is accepted and not
+    /// modeled — this is a single-collation (byte-order) engine, the
+    /// same stance as ORDER BY terms, index elements, and column
+    /// definitions. The name may be quoted and/or schema-qualified.
+    /// Before v2.20 the expression grammar had no COLLATE postfix
+    /// at all, so `expr::text COLLATE "C"` (update.sql's :show_data
+    /// shape, 88 schedule statements) died 42601 on the QIdent.
+    pub(crate) fn eat_expr_collate(&mut self) -> Result<(), SqlError> {
+        while self.eat_keyword("collate") {
+            match self.next() {
+                Token::Ident(_) | Token::QIdent(_) | Token::Str(_) => {}
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected collation name, found {:?}",
+                        other
+                    )));
+                }
+            }
+            while *self.peek() == Token::Dot {
+                self.next();
+                match self.next() {
+                    Token::Ident(_) | Token::QIdent(_) => {}
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected collation name, found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// cast := unary (`::` type)*
     pub(crate) fn parse_cast(&mut self) -> Result<Expr, SqlError> {
         let mut expr = self.parse_unary()?;
@@ -9656,6 +9709,9 @@ impl Parser {
             // the next `::`.
             expr = self.parse_postfix_subscripts(expr)?;
         }
+        // v2.20: `expr::type COLLATE name` — the COLLATE postfix
+        // binds at this level in PG19's grammar.
+        self.eat_expr_collate()?;
         // v1.86: `expr AT TIME ZONE zone` / `expr AT LOCAL` — PG19
         // treats AT TIME ZONE as a postfix operator binding at this
         // level (just looser than `::` chains, so it applies after
@@ -9704,6 +9760,8 @@ impl Parser {
             self.pos = save;
             break;
         }
+        // v2.20: `(expr AT TIME ZONE z) COLLATE name` likewise.
+        self.eat_expr_collate()?;
         Ok(expr)
     }
 
@@ -17555,6 +17613,41 @@ pub(crate) fn split_select_into(span: &[Token]) -> Option<(Vec<TrigIntoTarget>, 
     let mut query: Vec<Token> = span[..into_at].to_vec();
     query.extend_from_slice(&span[j..]);
     Some((targets, query))
+}
+
+/// v2.20: split a trailing `COLLATE <name>` clause off a captured
+/// element token span. CREATE INDEX / ON CONFLICT elements capture
+/// their key text from a raw token span, and gram.y puts the element's
+/// opt_collate AFTER the a_expr — but the expression parser consumes a
+/// postfix COLLATE itself (parse_cast), which would leak the clause
+/// into the captured key text and hide it from
+/// parse_opt_collate_opclass. The name may be schema-qualified; only
+/// the last component is kept (parse_opt_collate_opclass's rule).
+pub(crate) fn split_trailing_collate(toks: &[Token]) -> (&[Token], Option<String>) {
+    let name_at = |t: Option<&Token>| -> Option<String> {
+        match t {
+            Some(Token::Ident(s)) | Some(Token::QIdent(s)) => Some(s.clone()),
+            _ => None,
+        }
+    };
+    let is_collate =
+        |t: Option<&Token>| matches!(t, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("collate"));
+    let n = toks.len();
+    if n >= 2 && is_collate(toks.get(n - 2)) {
+        if let Some(nm) = name_at(toks.get(n - 1)) {
+            return (&toks[..n - 2], Some(nm));
+        }
+    }
+    if n >= 4
+        && is_collate(toks.get(n - 4))
+        && matches!(toks.get(n - 2), Some(Token::Dot))
+        && name_at(toks.get(n - 3)).is_some()
+    {
+        if let Some(nm) = name_at(toks.get(n - 1)) {
+            return (&toks[..n - 4], Some(nm));
+        }
+    }
+    (toks, None)
 }
 
 /// Parse one statement from already-trimmed text (no view interception).

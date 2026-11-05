@@ -1081,7 +1081,9 @@ pub(crate) fn exec_merge(
         match a {
             MAct::Insert { new, src, .. } if partitioned => {
                 let p = pinfo.as_ref().expect("partitioned target keeps its info");
-                let dst = find_partition_leaf(eng, ctx, table, p, &columns, &new.to_vec())?;
+                // v2.20: leaf/intermediate targets validate their
+                // bound chain instead of routing from themselves.
+                let dst = route_dml_destination(eng, ctx, table, p, &columns, &new.to_vec())?;
                 routed.push(MAct::Insert { dst, new, src });
             }
             other => routed.push(other),
@@ -1570,7 +1572,8 @@ pub(crate) fn exec_merge(
             {
                 let dst = if partitioned {
                     let p = pinfo.as_ref().expect("partitioned info");
-                    find_partition_leaf(eng, ctx, table, p, &columns, &new.to_vec())?
+                    // v2.20: same leaf/intermediate guard as UPDATE.
+                    route_dml_destination(eng, ctx, table, p, &columns, &new.to_vec())?
                 } else {
                     leaf.clone()
                 };

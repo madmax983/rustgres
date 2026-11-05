@@ -515,36 +515,30 @@ pub(crate) fn range_bound_contains(
 
 /// v0.69: total ordering on Values for partition routing. Returns None
 /// for incomparable types (treated as not-equal).
+///
+/// v2.20: the v0.69 hand-rolled match only ordered integer and text
+/// pairs; every other pair (Numeric, Date, Float, Bool, Timestamp,
+/// Uuid, cross-width numeric mixes, ...) returned None, and
+/// `range_bound_contains` reads None on its upper-bound scan as
+/// "not less", so NO range bound ever contained a numeric/date/
+/// float key — routing into any subtree keyed by such a column
+/// failed 23514 (update.sql's part_b_10_b_20, keyed by
+/// `c numeric`, was the first critical path to hit it; the column
+/// permutation of that subtree was innocent — probe220 case B
+/// routes the same shape keyed by int correctly). Delegate to the
+/// engine's general btree ordering (`compare_values`: exact
+/// int/numeric comparison, pg_float_ord, bpchar trailing-space
+/// rules, date/time natural order), mapping its 42804
+/// incomparable-types error back to None so exotic key types keep
+/// the old not-equal fallback. NULLs never reach the delegate:
+/// callers pre-handle NULL keys (a RANGE key with a NULL component
+/// is unroutable; bound values are non-NULL by construction).
 pub(crate) fn compare_partition_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     use std::cmp::Ordering;
     match (a, b) {
         (Value::Null, Value::Null) => Some(Ordering::Equal),
         (Value::Null, _) | (_, Value::Null) => None,
-        // Integers: compare as i64 (SmallInt/Int/BigInt are all ints).
-        (Value::SmallInt(x), Value::SmallInt(y)) => Some(x.cmp(y)),
-        (Value::SmallInt(x), Value::Int(y)) => Some((*x as i64).cmp(y)),
-        (Value::SmallInt(x), Value::BigInt(y)) => Some((*x as i64).cmp(y)),
-        (Value::Int(x), Value::SmallInt(y)) => Some(x.cmp(&(*y as i64))),
-        (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
-        (Value::Int(x), Value::BigInt(y)) => Some(x.cmp(y)),
-        (Value::BigInt(x), Value::SmallInt(y)) => Some(x.cmp(&(*y as i64))),
-        (Value::BigInt(x), Value::Int(y)) => Some(x.cmp(y)),
-        (Value::BigInt(x), Value::BigInt(y)) => Some(x.cmp(y)),
-        // Text: lexicographic.
-        (Value::Text(x), Value::Text(y)) => Some(x.cmp(y)),
-        (Value::BpChar(x), Value::BpChar(y)) => Some(x.cmp(y)),
-        (Value::Text(x), Value::BpChar(y)) => Some(x.as_ref().cmp(y.as_ref())),
-        (Value::BpChar(x), Value::Text(y)) => Some(x.as_ref().cmp(y.as_ref())),
-        // Cross-type int/text etc: not comparable.
-        _ => {
-            // Fallback: compare discriminants for a stable (if arbitrary)
-            // order — but only for equality, not ordering.
-            if std::mem::discriminant(a) == std::mem::discriminant(b) {
-                None
-            } else {
-                None
-            }
-        }
+        _ => compare_values(a, b, false, None).ok(),
     }
 }
 
@@ -1421,7 +1415,14 @@ pub(crate) fn bound_contains(method: &PartMethod, bound: &PartBound, key: &[Valu
                 if *kv == Value::Null {
                     return *has_null;
                 }
-                values.contains(kv)
+                // v2.20: match by btree equality, not `Value`
+                // PartialEq — the latter is scale-sensitive for
+                // Numeric (1.0 != 1.00) and variant-sensitive for
+                // cross-width ints, so a LIST bound could miss a
+                // numerically equal key.
+                values
+                    .iter()
+                    .any(|v| compare_partition_values(kv, v) == Some(std::cmp::Ordering::Equal))
             } else {
                 false
             }
@@ -3604,6 +3605,39 @@ pub(crate) fn find_partition_leaf(
         "23514",
         format!("no partition of relation \"{}\" found for row", table),
     ))
+}
+
+/// v2.20: destination leaf for a DML statement's new row image whose
+/// target is `table` (UPDATE / MERGE paths). Three target shapes:
+/// - a leaf partition (bound, no children, not is_partitioned): the
+///   row cannot move — it must satisfy the leaf's whole bound chain
+///   ([`check_leaf_bound`], 23514 on violation) and stays in place;
+/// - a sub-partitioned intermediate (bound + children): the image
+///   must still satisfy the intermediate's own ancestor bound
+///   chain, then routes within its subtree;
+/// - a partitioned root (no bound): routes as before.
+/// Before v2.20 the callers handed every target to
+/// [`find_partition_leaf`] as if it were a root, so direct DML on
+/// any leaf with a matched row failed 23514 "no partition of
+/// relation \"<leaf>\" found for row".
+pub(crate) fn route_dml_destination(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table: &str,
+    pinfo: &PartitionInfo,
+    table_cols: &[(String, ColType)],
+    row: &[Value],
+) -> Result<String, ExecError> {
+    let is_leaf_target =
+        pinfo.bound.is_some() && pinfo.children.is_empty() && !pinfo.is_partitioned;
+    if is_leaf_target {
+        check_leaf_bound(eng, ctx, table, pinfo, table_cols, row)?;
+        return Ok(table.to_string());
+    }
+    if pinfo.bound.is_some() {
+        check_leaf_bound(eng, ctx, table, pinfo, table_cols, row)?;
+    }
+    find_partition_leaf(eng, ctx, table, pinfo, table_cols, row)
 }
 
 /// v0.70: validate that a row directly inserted into a leaf satisfies

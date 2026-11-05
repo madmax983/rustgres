@@ -4899,9 +4899,23 @@ pub(crate) fn exec_update_inner(
             // v0.70: route the new row through the partitioned target. A
             // changed partition key moves the row to another leaf
             // (delete old version + insert new), like PostgreSQL.
+            // v2.20: that routing is only for partitioned roots and
+            // sub-partitioned intermediates. A direct UPDATE on a
+            // leaf partition cannot move the row (PG19
+            // ExecPartitionCheck): the new image must satisfy the
+            // leaf's whole bound chain — for a DEFAULT leaf, no
+            // explicit sibling may accept it — else 23514 "violates
+            // partition constraint". The old code called
+            // find_partition_leaf with the leaf as root; a leaf has
+            // no children, so EVERY direct leaf update with a
+            // matched row failed 23514 "no partition of relation
+            // \"<leaf>\" found" (update.sql part_def / list_default).
+            // An intermediate target's new image must likewise still
+            // satisfy the intermediate's own ancestor bound chain
+            // before routing within its subtree.
             let (dst, dst_cols) = if partitioned {
                 let p = pinfo.as_ref().expect("partitioned target keeps its info");
-                let dl = find_partition_leaf(eng, ctx, table, p, &columns, &new_values)?;
+                let dl = route_dml_destination(eng, ctx, table, p, &columns, &new_values)?;
                 let dc = leaf_cols_of
                     .iter()
                     .find(|(n, _)| n == &dl)
