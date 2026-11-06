@@ -511,6 +511,7 @@ pub(crate) fn execute_inner(
             not_null,
             default,
             base_bit_typmod,
+            collate,
         } => exec_create_domain(
             eng,
             ctx,
@@ -521,8 +522,54 @@ pub(crate) fn execute_inner(
             *not_null,
             default.as_ref(),
             *base_bit_typmod,
+            collate.as_deref(),
         ),
         Stmt::DropDomain { names, if_exists } => exec_drop_domain(eng, ctx, names, *if_exists),
+        // --- v2.21: CREATE/DROP/ALTER COLLATION ---
+        Stmt::CreateCollation {
+            name,
+            if_not_exists,
+            from,
+            provider,
+            locale,
+            lc_collate,
+            lc_ctype,
+            deterministic,
+        } => crate::exec::collate::exec_create_collation(
+            eng,
+            ctx,
+            name,
+            *if_not_exists,
+            from.as_deref(),
+            provider.as_deref(),
+            locale.as_deref(),
+            lc_collate.as_deref(),
+            lc_ctype.as_deref(),
+            *deterministic,
+        ),
+        Stmt::DropCollation {
+            names,
+            if_exists,
+            cascade,
+        } => crate::exec::collate::exec_drop_collation(eng, ctx, names, *if_exists, *cascade),
+        Stmt::AlterCollation {
+            name,
+            rename_to,
+            owner_to,
+            set_schema,
+            refresh_version,
+        } => crate::exec::collate::exec_alter_collation(
+            eng,
+            ctx,
+            name,
+            rename_to.as_deref(),
+            owner_to.as_deref(),
+            set_schema.as_deref(),
+            *refresh_version,
+        ),
+        Stmt::AlterDatabaseRefreshCollation { name } => {
+            crate::exec::collate::exec_alter_database_refresh_collation(eng, ctx, name)
+        }
         // --- v0.97: ALTER DOMAIN ---
         Stmt::AlterDomain { name, action } => exec_alter_domain(eng, ctx, name, action),
         // --- v1.09: ALTER FUNCTION ---

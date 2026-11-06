@@ -4678,7 +4678,9 @@ pub(crate) fn vx_expr(
         | Expr::CastNamed { expr: x, .. }
         | Expr::FieldAccess { expr: x, .. }
         | Expr::Extract { from: x, .. }
-        | Expr::NamedArg { expr: x, .. } => {
+        | Expr::NamedArg { expr: x, .. }
+        | Expr::Collate { expr: x, .. }
+        | Expr::CollationFor { expr: x } => {
             vx_expr(q, x, schemas, outer, visible, depth, visiting)?;
         }
         Expr::AtTimeZone { expr, zone } => {

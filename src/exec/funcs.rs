@@ -372,6 +372,25 @@ pub(crate) fn eval_like(
         _ if esc_is_null => Ok(Value::Null),
         (Value::Bytea(s), Value::Bytea(p)) => {
             // bytea LIKE: match on raw bytes; % and _ are ASCII wildcards.
+            // v2.21: PG like.c — a pattern ending in a dangling
+            // escape character is 22025.
+            {
+                let esc = esc_byte.unwrap_or(b'\\');
+                let mut i = 0;
+                while i < p.len() {
+                    if p[i] == esc {
+                        if i + 1 >= p.len() {
+                            return Err(exec_err(
+                                "22025",
+                                "LIKE pattern must not end with escape character".to_string(),
+                            ));
+                        }
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
             let m = match_like_bytes(s, p, esc_byte.unwrap_or(b'\\'));
             Ok(Value::Bool(if not { !m } else { m }))
         }
@@ -383,6 +402,25 @@ pub(crate) fn eval_like(
             };
             let sc: Vec<char> = s.chars().collect();
             let pc: Vec<char> = p.chars().collect();
+            // v2.21: PG like.c — a pattern ending in a dangling
+            // escape character is 22025.
+            {
+                let esc = esc_char.unwrap_or('\\');
+                let mut i = 0;
+                while i < pc.len() {
+                    if pc[i] == esc {
+                        if i + 1 >= pc.len() {
+                            return Err(exec_err(
+                                "22025",
+                                "LIKE pattern must not end with escape character".to_string(),
+                            ));
+                        }
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
             let m = match_like(&sc, &tokenize_like(&pc, esc_char.unwrap_or('\\')));
             Ok(Value::Bool(if not { !m } else { m }))
         }
@@ -4694,6 +4732,11 @@ pub(crate) fn eval_func(
     // v1.95: SQL value functions for role context. current_user and
     // current_role are the CURRENT role (Q.role, post SET ROLE);
     // session_user is the login role installed per statement.
+    // v2.21: collation_for(x) / pg_collation_for(x) as a function
+    // call (the COLLATION FOR syntax produces Expr::CollationFor).
+    if (name == "collation_for" || name == "pg_collation_for") && args.len() == 1 {
+        return crate::exec::collate::eval_collation_for(q, scopes, &args[0]);
+    }
     if args.is_empty() {
         match name {
             "current_user" | "current_role" | "user" => {
@@ -4704,6 +4747,10 @@ pub(crate) fn eval_func(
             }
             "current_catalog" | "current_database" => {
                 return Ok(Value::text("postgres".to_string()));
+            }
+            // v2.21: the database encoding is always UTF8 here.
+            "getdatabaseencoding" => {
+                return Ok(Value::text("UTF8".to_string()));
             }
             _ => {}
         }
@@ -14449,7 +14496,8 @@ pub(crate) fn func_result_type(
         }
         "current_date" => Ok(ColType::Date),
         "current_user" | "current_role" | "session_user" | "current_catalog"
-        | "current_database" | "user" => Ok(ColType::Text),
+        | "current_database" | "user" | "getdatabaseencoding" | "collation_for"
+        | "pg_collation_for" => Ok(ColType::Text),
         // v1.96: privilege/ACL family result types.
         "has_table_privilege" | "has_column_privilege" | "has_sequence_privilege"
         | "has_database_privilege" | "has_schema_privilege" | "has_function_privilege"

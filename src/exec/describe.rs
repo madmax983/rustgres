@@ -441,6 +441,7 @@ pub(crate) fn from_schema_item(
                     | "pg_shmem_allocations"
                     | "pg_stat_activity"
                     | "pg_database"
+                    | "pg_collation"
             ) && eng.db.find_table(name, snap, &[own], session).is_none()
             {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());
@@ -449,6 +450,7 @@ pub(crate) fn from_schema_item(
                         pg_largeobject_scan(&eng.db, &name)
                     }
                     "pg_database" => (pg_database_schema(), Vec::new()),
+                    "pg_collation" => (pg_collation_schema(), Vec::new()),
                     "pg_namespace" => pg_namespace_scan(&eng.db),
                     "pg_default_acl" => pg_default_acl_scan(&eng.db),
                     "pg_shdepend" => pg_shdepend_scan(&eng.db, snap, own, session),
@@ -1107,6 +1109,10 @@ pub(crate) fn describe_select_outer(
 pub(crate) fn expr_col_name_strength(e: &Expr) -> (String, u8) {
     match e {
         Expr::Column { name, .. } => (name.clone(), 2),
+        // v2.21: a COLLATE wrapper is transparent for naming (PG
+        // FigureColname sees through CollateClause).
+        Expr::Collate { expr, .. } => expr_col_name_strength(expr),
+        Expr::CollationFor { .. } => ("pg_collation_for".to_string(), 2),
         // v0.73: PG19 names an unaliased whole-row Var after the range
         // (`SELECT tbl` -> `tbl`).
         Expr::WholeRow { qual } => (qual.clone(), 2),
@@ -1301,6 +1307,11 @@ pub(crate) fn expr_type(
         Expr::NamedArg { expr, .. } => {
             expr_type(eng, snap, own, session, schemas, outer, ctes, expr)
         }
+        // v2.21: COLLATE keeps the operand type; COLLATION FOR is name.
+        Expr::Collate { expr, .. } => {
+            expr_type(eng, snap, own, session, schemas, outer, ctes, expr)
+        }
+        Expr::CollationFor { .. } => Ok(ColType::Name),
         Expr::Column { table, name } => {
             // v0.73: PG19 correlated references — a subquery's expressions
             // resolve against the enclosing query's ranges after its own

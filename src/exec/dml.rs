@@ -1609,6 +1609,12 @@ pub(crate) fn exec_create_table_as(
             }
         }
     }
+    // v2.21: CTAS output collations; a folded conflict on a
+    // collatable column is the createas.c error (42P22).
+    let ctas_collations = {
+        let cctx = crate::exec::collate::CollCtx::from_stmt(eng, ctx);
+        crate::exec::collate::ctas_output_collations(&cctx, select, &columns)?
+    };
     let def = crate::sql::TableDef {
         columns,
         composite_types,
@@ -1632,6 +1638,8 @@ pub(crate) fn exec_create_table_as(
         of_type: None,
         gen_cols: vec![None; ncols],
         unlogged: false,
+        // v2.21: CTAS columns take the query's output collations.
+        collations: ctas_collations,
     };
     // CTAS definitions never carry constraints; the effective def is discarded.
     let _ = create_table_from_def(eng, ctx, name, &def, temp)?;

@@ -544,6 +544,10 @@ pub(crate) fn rename_col_in_expr(e: &mut Expr, old: &str, new: &str) {
     match e {
         // v0.95: named args are transparent to inspection.
         Expr::NamedArg { expr, .. } => rename_col_in_expr(expr, old, new),
+        // v2.21: collation wrappers are transparent to renaming.
+        Expr::Collate { expr, .. } | Expr::CollationFor { expr } => {
+            rename_col_in_expr(expr, old, new)
+        }
         Expr::Column { table, name } => {
             if table.is_none() && name == old {
                 *name = new.to_string();
@@ -799,6 +803,7 @@ pub(crate) fn exec_alter_one(
             name: col,
             if_not_exists,
             col_type,
+            collate,
             named_type,
             bit_typmod,
             not_null,
@@ -858,6 +863,7 @@ pub(crate) fn exec_alter_one(
                 uniques,
                 pkey,
                 fks,
+                collate.as_deref(),
             );
             // v0.69: propagate ADD COLUMN to partitions (PG does this).
             if res.is_ok() {
@@ -881,6 +887,7 @@ pub(crate) fn exec_alter_one(
                         name: col.clone(),
                         if_not_exists: *if_not_exists,
                         col_type: *col_type,
+                        collate: collate.clone(),
                         named_type: named_type.clone(),
                         bit_typmod: *bit_typmod,
                         not_null: *not_null,
@@ -2384,6 +2391,8 @@ pub(crate) fn alter_add_column(
     uniques: &[UniqueDef],
     pkey: &Option<UniqueDef>,
     fks: &[FkDef],
+    // v2.21: the new column's COLLATE, if any.
+    collate: Option<&str>,
 ) -> Result<ExecResult, ExecError> {
     alter_add_column_ext(
         eng,
@@ -2401,6 +2410,7 @@ pub(crate) fn alter_add_column(
         pkey,
         fks,
         false,
+        collate,
     )
 }
 
@@ -2422,6 +2432,8 @@ pub(crate) fn alter_add_column_ext(
     pkey: &Option<UniqueDef>,
     fks: &[FkDef],
     bypass_typed: bool,
+    // v2.21: the new column's COLLATE, if any.
+    collate: Option<&str>,
 ) -> Result<ExecResult, ExecError> {
     let t = eng
         .db
@@ -2467,6 +2479,22 @@ pub(crate) fn alter_add_column_ext(
     }
     let mut next = t.clone();
     next.columns.push((col.to_string(), col_type.clone()));
+    // v2.21: store the new column's collation (validating the name
+    // and the type, as ATExecAddColumn does).
+    if let Some(cn) = collate {
+        crate::exec::collate::validate_collation_name(&eng.db, cn)?;
+        if !crate::sql::col_type_collatable(col_type, None) {
+            return Err(exec_err(
+                "42804",
+                format!(
+                    "collations are not supported by type {}",
+                    crate::sql::col_type_pg_name(col_type, None)
+                ),
+            ));
+        }
+        let idx = next.columns.len() - 1;
+        next.set_col_collation(idx, Some(cn.to_string()));
+    }
     // v2.03: keep generated-column metadata parallel to `columns`.
     if next.gen_cols.len() < next.columns.len() {
         next.gen_cols.push(None);

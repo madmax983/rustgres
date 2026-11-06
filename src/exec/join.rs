@@ -3472,6 +3472,7 @@ pub(crate) fn build_source(
                     | "pg_shmem_allocations"
                     | "pg_stat_activity"
                     | "pg_database"
+                    | "pg_collation"
             ) && q
                 .eng
                 .db
@@ -3483,6 +3484,7 @@ pub(crate) fn build_source(
                         pg_largeobject_scan(&q.eng.db, &name)
                     }
                     "pg_database" => pg_database_scan(&q.eng.db),
+                    "pg_collation" => pg_collation_scan(&q.eng.db),
                     "pg_namespace" => pg_namespace_scan(&q.eng.db),
                     "pg_default_acl" => pg_default_acl_scan(&q.eng.db),
                     "pg_shdepend" => pg_shdepend_scan(&q.eng.db, q.snap, q.own, q.session),

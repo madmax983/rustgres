@@ -1097,6 +1097,10 @@ pub(crate) fn collect_target_srfs(
             // Pruned: no SRF collection inside SRF arguments.
         }
         Expr::NamedArg { expr, .. } => collect_target_srfs(eng, expr, group_keys, out),
+        // v2.21: collation wrappers are transparent to SRF collection.
+        Expr::Collate { expr, .. } | Expr::CollationFor { expr } => {
+            collect_target_srfs(eng, expr, group_keys, out)
+        }
         Expr::Column { .. }
         | Expr::ResolvedCol { .. }
         | Expr::Literal(_)
@@ -1397,6 +1401,15 @@ pub(crate) fn eval_grouped(
         Expr::NamedArg { expr, .. } => eval_grouped(
             q, outer, gscope, schema, rows, idxs, key_vals, group_by, expr,
         ),
+        // v2.21: COLLATE evaluates its operand (the derivation rules
+        // were enforced by the statement pre-pass); COLLATION FOR
+        // yields the operand's collation name.
+        Expr::Collate { expr, .. } => eval_grouped(
+            q, outer, gscope, schema, rows, idxs, key_vals, group_by, expr,
+        ),
+        Expr::CollationFor { expr } => {
+            crate::exec::collate::eval_collation_for(q, std::slice::from_ref(&gscope), expr)
+        }
         Expr::Agg {
             func,
             arg,

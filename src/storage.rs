@@ -5676,6 +5676,15 @@ pub struct Table {
     /// STORED|VIRTUAL`. Values are materialized on write for both
     /// kinds in this engine. Persists via the constraints codec.
     pub gen_cols: Vec<Option<(crate::sql::Expr, bool)>>,
+    /// v2.21: per-column collation name, parallel to `columns`
+    /// (`Some(name)` for a column with an explicit COLLATE, or a
+    /// collation inherited from its domain; `None` = the database
+    /// default collation). May be SHORTER than `columns` for tables
+    /// built by paths that do not maintain it — readers must treat
+    /// missing entries as `None` (see `Table::col_collation`).
+    /// Runtime-only in v2.21 (not WAL-logged / checkpointed; same
+    /// durability class as user-defined casts).
+    pub col_collations: Vec<Option<String>>,
 }
 
 /// v2.03: replica identity kind (PG19 `relreplident`).
@@ -5748,6 +5757,8 @@ impl Table {
             // v2.03: DEFAULT replica identity, no generated columns.
             replica_identity: ReplicaIdentity::Default,
             gen_cols: vec![None; n],
+            // v2.21: no explicit column collations by default.
+            col_collations: vec![None; n],
         }
     }
 
@@ -5768,6 +5779,10 @@ impl Table {
         // v2.03: generated columns (LIKE-expanded defs may be shorter).
         if def.gen_cols.len() == t.columns.len() {
             t.gen_cols = def.gen_cols.clone();
+        }
+        // v2.21: per-column collations (same length discipline).
+        if def.collations.len() == t.columns.len() {
+            t.col_collations = def.collations.clone();
         }
         t.checks = def.checks.clone();
         t.uniques = def.uniques.clone();
@@ -5795,6 +5810,22 @@ impl Table {
     /// Index of a column by (already lowercased) name.
     pub fn column_index(&self, name: &str) -> Option<usize> {
         self.columns.iter().position(|(n, _)| n == name)
+    }
+
+    /// v2.21: the collation of column `i` (`None` = database default).
+    /// Tolerant of a short `col_collations` vec (paths that do not
+    /// maintain it leave it empty).
+    pub fn col_collation(&self, i: usize) -> Option<&str> {
+        self.col_collations.get(i).and_then(|c| c.as_deref())
+    }
+
+    /// v2.21: set the collation of column `i`, growing the parallel
+    /// vec with `None` padding as needed.
+    pub fn set_col_collation(&mut self, i: usize, coll: Option<String>) {
+        if self.col_collations.len() <= i {
+            self.col_collations.resize(i + 1, None);
+        }
+        self.col_collations[i] = coll;
     }
 
     /// Position of the row version with this id, if present (O(1)).
@@ -5864,6 +5895,11 @@ pub struct DomainDef {
     /// it and check_domain_value enforces it. (Not yet carried by
     /// the WAL type record.)
     pub bit_typmod: Option<(i32, bool)>,
+    /// v2.21: the domain's own collation (`CREATE DOMAIN ... AS text
+    /// COLLATE name`); columns of this domain type inherit it unless
+    /// they carry an explicit COLLATE. Runtime-only in v2.21 (same
+    /// durability class as `bit_typmod`).
+    pub collation: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -6138,6 +6174,13 @@ pub struct Database {
     /// v2.04: WAL-logged (full-image records, RGSWAL29) and
     /// checkpointed (CHKPT 25), so publications survive restart.
     pub publications: HashMap<String, Publication, FxBuildHasher>,
+    /// v2.21: user-defined collations by (unqualified) name
+    /// (CREATE COLLATION). Runtime-only in v2.21 — not WAL-logged
+    /// or checkpointed (same durability class as user-defined
+    /// casts); transactional visibility is likewise not modeled
+    /// (a rolled-back CREATE COLLATION leaves the entry, like the
+    /// ext_stats registry).
+    pub collations: std::collections::HashMap<String, CollationDef>,
     /// v1.96: large object contents (oid -> bytes) and owners.
     /// v1.96: user-defined aggregates by name.
     pub aggregates: std::collections::HashMap<String, AggDef>,
@@ -6310,6 +6353,28 @@ pub struct ViewDef {
     /// pg_attrdef on the view); position-parallel to the view's
     /// output columns, empty = none set. Checkpoint-only.
     pub col_defaults: Vec<Option<crate::sql::DefaultExpr>>,
+    /// v2.21: per-output-column collations computed at CREATE VIEW
+    /// time (PG19 view.c: the rewritten query's target entries'
+    /// exprCollation); `None` per column = default collation or a
+    /// non-collatable type. Runtime-only in v2.21.
+    pub col_collations: Vec<Option<String>>,
+}
+
+/// v2.21: a user-defined collation (CREATE COLLATION), the
+/// pg_collation row reduced to what this engine enforces: the name
+/// (map key), determinism (drives the LIKE/regex restrictions), the
+/// provider, the locale text, and the owner.
+#[derive(Clone, Debug)]
+pub struct CollationDef {
+    /// pg_collation.colldeterministic.
+    pub deterministic: bool,
+    /// pg_collation.collprovider: 'b' builtin, 'c' libc, 'i' icu,
+    /// 'd' database default (never stored for user collations).
+    pub provider: char,
+    /// pg_collation.collcollate (the locale / lc_collate text).
+    pub locale: Option<String>,
+    /// Creating role.
+    pub owner: String,
 }
 
 /// A sequence (v0.9). Bounds and parameters are transactional DDL;
@@ -6425,6 +6490,8 @@ impl Database {
             typed_tables: std::collections::HashMap::default(),
             publications: HashMap::default(),
             schema_acls: HashMap::default(),
+            // v2.21: no user-defined collations at bootstrap.
+            collations: std::collections::HashMap::default(),
             aggregates: std::collections::HashMap::default(),
             large_objects: std::collections::HashMap::default(),
             lo_owners: std::collections::HashMap::default(),

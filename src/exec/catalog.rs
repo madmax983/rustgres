@@ -1187,6 +1187,8 @@ pub(crate) fn stmt_uses_pg_column_compression(stmt: &SelectStmt) -> bool {
             }
             // v0.95: named args are transparent to inspection.
             Expr::NamedArg { expr, .. } => expr_uses(expr),
+            // v2.21: collation wrappers are transparent to inspection.
+            Expr::Collate { expr, .. } | Expr::CollationFor { expr } => expr_uses(expr),
             // v0.79: array constructors/subscripts/slices recurse into
             // their operands.
             Expr::ArrayCtor { elems, .. } => elems.iter().any(expr_uses),
@@ -1315,6 +1317,8 @@ pub(crate) fn stmt_uses_tableoid(stmt: &SelectStmt) -> bool {
             Expr::Column { name, .. } => name == "tableoid",
             Expr::Func { args, .. } => args.iter().any(expr_uses),
             Expr::NamedArg { expr, .. } => expr_uses(expr),
+            // v2.21: collation wrappers are transparent to inspection.
+            Expr::Collate { expr, .. } | Expr::CollationFor { expr } => expr_uses(expr),
             Expr::ArrayCtor { elems, .. } => elems.iter().any(expr_uses),
             Expr::Subscript { array, indices } => expr_uses(array) || indices.iter().any(expr_uses),
             Expr::Slice { array, bounds } => {
@@ -1435,6 +1439,8 @@ pub(crate) fn stmt_uses_xmin_xmax(stmt: &SelectStmt) -> bool {
             }
             Expr::Func { args, .. } => args.iter().any(expr_uses),
             Expr::NamedArg { expr, .. } => expr_uses(expr),
+            // v2.21: collation wrappers are transparent to inspection.
+            Expr::Collate { expr, .. } | Expr::CollationFor { expr } => expr_uses(expr),
             Expr::ArrayCtor { elems, .. } => elems.iter().any(expr_uses),
             Expr::Subscript { array, indices } => expr_uses(array) || indices.iter().any(expr_uses),
             Expr::Slice { array, bounds } => {
@@ -1868,6 +1874,14 @@ pub(crate) fn resolve_predicate_columns_in(
         // v0.95: named args are transparent to column resolution.
         Expr::NamedArg { name, expr } => Ok(Expr::NamedArg {
             name: name.clone(),
+            expr: Box::new(r(expr)?),
+        }),
+        // v2.21: collation wrappers resolve through to their operand.
+        Expr::Collate { name, expr } => Ok(Expr::Collate {
+            name: name.clone(),
+            expr: Box::new(r(expr)?),
+        }),
+        Expr::CollationFor { expr } => Ok(Expr::CollationFor {
             expr: Box::new(r(expr)?),
         }),
         Expr::Extract { field, from } => Ok(Expr::Extract {
@@ -3134,6 +3148,18 @@ pub(crate) fn run_select(
     // so queries without CASE pay only a single cheap walk.
     if contains_case(stmt) {
         const_fold_check(q, stmt)?;
+    }
+    // v2.21: collation derivation/conflict validation for this
+    // query level (PG19 parse_collate.c). Pure validation: raises
+    // 42704/42804/42P21/42P22/0A000 where PG's analysis would.
+    {
+        let cctx = crate::exec::collate::CollCtx {
+            eng: &*q.eng,
+            snap: q.snap,
+            own: q.own,
+            session: q.session,
+        };
+        crate::exec::collate::validate_select_collations(&cctx, stmt, outer)?;
     }
     let base = q.ctes.len();
     if !stmt.with.is_empty() {
@@ -4425,6 +4451,104 @@ pub(crate) fn pg_stat_activity_schema() -> Vec<QCol> {
     .collect()
 }
 
+/// v2.21: pg_collation (PG19 column order). The predefined rows
+/// are the builtin/default/libc anchors plus a small ICU set —
+/// this engine does not import the OS/ICU catalogs (thousands of
+/// rows in PG); CREATE COLLATION registry rows are appended.
+pub(crate) fn pg_collation_schema() -> Vec<QCol> {
+    [
+        ("oid", ColType::Int),
+        ("collname", ColType::Name),
+        ("collnamespace", ColType::Int),
+        ("collowner", ColType::Int),
+        ("collprovider", ColType::SingleChar),
+        ("collisdeterministic", ColType::Bool),
+        ("collencoding", ColType::Int),
+        ("collcollate", ColType::Text),
+        ("collctype", ColType::Text),
+        ("colllocale", ColType::Text),
+        ("colliculocale", ColType::Text),
+        ("collicurules", ColType::Text),
+        ("collversion", ColType::Text),
+    ]
+    .into_iter()
+    .map(|(n, ty)| qcol("pg_collation", n, ty))
+    .collect()
+}
+
+pub(crate) fn pg_collation_scan(db: &Database) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = pg_collation_schema();
+    let owner_oid = role_oid_pub(&db.db_owner) as i64;
+    // (oid, name, provider, deterministic, collcollate, colllocale)
+    let mut rows: Vec<(i64, &str, u8, bool, Option<&str>, Option<&str>)> = vec![
+        (100, "default", b'd', true, None, None),
+        (950, "C", b'b', true, Some("C"), None),
+        (961, "POSIX", b'b', true, Some("POSIX"), None),
+        (810, "ucs_basic", b'b', true, None, Some("C")),
+        (811, "unicode", b'i', true, None, Some("und")),
+        (812, "pg_c_utf8", b'b', true, None, Some("C.UTF-8")),
+        (
+            813,
+            "pg_unicode_fast",
+            b'b',
+            true,
+            None,
+            Some("PG_UNICODE_FAST"),
+        ),
+        (814, "en-x-icu", b'i', true, None, Some("en")),
+        (815, "de-x-icu", b'i', true, None, Some("de")),
+        (816, "und-x-icu", b'i', true, None, Some("und")),
+    ];
+    let mut extra: Vec<(i64, String, u8, bool, Option<String>, Option<String>)> = Vec::new();
+    for (i, (name, def)) in db.collations.iter().enumerate() {
+        let (ccollate, clocale) = match def.provider {
+            'i' => (None, def.locale.clone()),
+            _ => (def.locale.clone(), None),
+        };
+        extra.push((
+            20000 + i as i64,
+            name.clone(),
+            def.provider as u8,
+            def.deterministic,
+            ccollate,
+            clocale,
+        ));
+    }
+    let mut out: Vec<QRow> = Vec::new();
+    let mut push = |oid: i64,
+                    name: &str,
+                    prov: u8,
+                    det: bool,
+                    ccollate: Option<&str>,
+                    clocale: Option<&str>| {
+        out.push(QRow {
+            cells: Row::new(vec![
+                Value::Int(oid),
+                Value::text(name),
+                Value::Int(11),
+                Value::Int(owner_oid),
+                Value::SingleChar(prov),
+                Value::Bool(det),
+                Value::Int(-1),
+                ccollate.map(Value::text).unwrap_or(Value::Null),
+                ccollate.map(Value::text).unwrap_or(Value::Null),
+                clocale.map(Value::text).unwrap_or(Value::Null),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]),
+            prov: Vec::new(),
+        });
+    };
+    for (oid, n, p, d, cc, cl) in rows.drain(..) {
+        push(oid, n, p, d, cc, cl);
+    }
+    for (oid, n, p, d, cc, cl) in &extra {
+        push(*oid, n, *p, *d, cc.as_deref(), cl.as_deref());
+    }
+    (schema, out)
+}
+
 /// v1.96: pg_database (PG19 catalogs.sgml column order) — this
 /// engine hosts exactly one database, named "postgres" (matching
 /// current_catalog()/current_database()).
@@ -4441,6 +4565,14 @@ pub(crate) fn pg_database_schema() -> Vec<QCol> {
         ("datconnlimit", ColType::Int),
         ("datfrozenxid", ColType::Int),
         ("datminmxid", ColType::Int),
+        // v2.21: PG19 order — datcollate/datctype/datlocale/
+        // datcollversion sit between datminmxid and datacl. The
+        // database provider is libc ('c'), so datlocale is NULL
+        // and the libc locale names ride datcollate/datctype.
+        ("datcollate", ColType::Text),
+        ("datctype", ColType::Text),
+        ("datlocale", ColType::Text),
+        ("datcollversion", ColType::Text),
         ("datacl", ColType::Text),
     ]
     .into_iter()
@@ -4498,6 +4630,10 @@ pub(crate) fn pg_database_scan(db: &Database) -> (Vec<QCol>, Vec<QRow>) {
             Value::Int(-1),
             Value::Int(700),
             Value::Int(1),
+            Value::text("en_US.utf8"),
+            Value::text("en_US.utf8"),
+            Value::Null,
+            Value::Null,
             datacl,
         ]),
         prov: Vec::new(),

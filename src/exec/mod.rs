@@ -67,6 +67,7 @@ mod arith;
 mod bit;
 mod cast;
 mod catalog;
+mod collate;
 mod constraint;
 mod copy_stmt;
 mod core;
@@ -340,6 +341,9 @@ mod v219_tests;
 #[cfg(test)]
 #[path = "test_mods/v220_tests.rs"]
 mod v220_tests;
+#[cfg(test)]
+#[path = "test_mods/v221_tests.rs"]
+mod v221_tests;
 #[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;

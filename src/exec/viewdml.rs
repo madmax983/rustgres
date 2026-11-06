@@ -674,6 +674,14 @@ fn map_children(
             name: name.clone(),
             expr: Box::new(f(expr)?),
         },
+        // v2.21: collation wrappers rebuild around the mapped child.
+        Expr::Collate { name, expr } => Expr::Collate {
+            name: name.clone(),
+            expr: Box::new(f(expr)?),
+        },
+        Expr::CollationFor { expr } => Expr::CollationFor {
+            expr: Box::new(f(expr)?),
+        },
         Expr::Extract { field, from } => Expr::Extract {
             field: field.clone(),
             from: Box::new(f(from)?),

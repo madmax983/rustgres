@@ -1539,6 +1539,8 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 triggers,
                 col_acl,
                 col_defaults,
+                // v2.21: collations are runtime-only state.
+                col_collations: Vec::new(),
             });
     }
     // v0.9: sequences, with their current values.
@@ -1769,6 +1771,8 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 // v1.92: the WAL domain record does not carry the
                 // bit typmod yet (bounded durability gap).
                 bit_typmod: None,
+                // v2.21: nor the domain collation (same gap class).
+                collation: None,
             })
         } else {
             None

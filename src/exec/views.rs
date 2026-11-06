@@ -55,6 +55,46 @@ pub(crate) fn exec_create_view(
     };
     // v1.96: USAGE on cast targets in the view query (PG19).
     check_select_cast_usages(eng, ctx, &select)?;
+    // v2.21: output collation states of the new definition
+    // (derivation errors propagate, as PG's analysis would raise
+    // them at CREATE VIEW). Stored on the definition; a position
+    // whose state stays a deferred conflict on a collatable type
+    // is the view.c "could not determine" error (42P22).
+    let cctx = crate::exec::collate::CollCtx::from_stmt(eng, ctx);
+    let new_out_states = crate::exec::collate::stmt_output_states(&cctx, &select, None, 0)?;
+    let new_col_collations: Vec<Option<String>> = new_out_states
+        .iter()
+        .map(|c| match c.state.strength {
+            crate::exec::collate::CollStrength::None => None,
+            _ => c.state.name.clone(),
+        })
+        .collect();
+    {
+        // NOTE: deliberately no describe_select here — the output
+        // types from stmt_output_states are the static types PG's
+        // analysis would use, and describe has pre-existing panic
+        // paths on fresh CREATE VIEW bodies (e.g. one-arg timezone()
+        // in func_result_type) that the base create path never
+        // reached.
+        for (i, c) in new_out_states.iter().enumerate() {
+            if c.state.strength == crate::exec::collate::CollStrength::Conflict {
+                let ty = c.ty.clone();
+                if crate::sql::col_type_collatable(&ty, None) {
+                    let cname = col_aliases
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| c.name.clone());
+                    return Err(exec_err(
+                        "42P22",
+                        format!(
+                            "could not determine which collation to use for view column \"{}\"",
+                            cname
+                        ),
+                    ));
+                }
+            }
+        }
+    }
     // v2.16: PG19 checkViewColumns — OR REPLACE may append columns
     // but cannot drop them, rename them, or change a column's type
     // (incl. typmod) or collation (all 42P16). Lenient when either
@@ -84,7 +124,7 @@ pub(crate) fn exec_create_view(
                                 "cannot drop columns from view".to_string(),
                             ));
                         }
-                        for (oc, nc) in old_cols.iter().zip(new_cols.iter()) {
+                        for (idx, (oc, nc)) in old_cols.iter().zip(new_cols.iter()).enumerate() {
                             if oc.0 != nc.0 {
                                 return Err(exec_err(
                                     "42P16",
@@ -98,6 +138,23 @@ pub(crate) fn exec_create_view(
                                 return Err(exec_err(
                                     "42P16",
                                     format!("cannot change data type of view column \"{}\"", oc.0),
+                                ));
+                            }
+                            // v2.21: collation comparison (42P16).
+                            // Views defined before v2.21 carry no
+                            // stored collations (all default).
+                            let old_coll =
+                                old_view.col_collations.get(idx).cloned().unwrap_or(None);
+                            let new_coll = new_col_collations.get(idx).cloned().unwrap_or(None);
+                            if old_coll != new_coll {
+                                return Err(exec_err(
+                                    "42P16",
+                                    format!(
+                                        "cannot change collation of view column \"{}\" from \"{}\" to \"{}\"",
+                                        oc.0,
+                                        crate::exec::collate::CollState::display(&old_coll),
+                                        crate::exec::collate::CollState::display(&new_coll)
+                                    ),
                                 ));
                             }
                         }
@@ -269,6 +326,8 @@ pub(crate) fn exec_create_view(
         // CREATE OR REPLACE VIEW when columns are compatible).
         col_acl: kept_col_acl,
         col_defaults: kept_col_defaults,
+        // v2.21: output collations (runtime-only, not WAL-logged).
+        col_collations: new_col_collations,
     };
     eng.db.views.entry(name.to_string()).or_default().push(def);
     note_obj_schema(eng, ctx, name, name);

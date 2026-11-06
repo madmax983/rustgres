@@ -199,6 +199,10 @@ pub(crate) fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecErr
         }
         // v0.95: named args are transparent to inspection.
         Expr::NamedArg { expr, .. } => validate_window_expr(expr, in_agg),
+        // v2.21: collation wrappers are transparent to validation.
+        Expr::Collate { expr, .. } | Expr::CollationFor { expr } => {
+            validate_window_expr(expr, in_agg)
+        }
         Expr::Cmp { left, right, .. } => {
             validate_window_expr(left, in_agg)?;
             validate_window_expr(right, in_agg)

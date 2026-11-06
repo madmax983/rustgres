@@ -172,7 +172,26 @@ pub(crate) fn infer_expr_key_type(expr: &Expr, parent: &Table) -> ColType {
             // Arithmetic: use the left operand's type.
             infer_expr_key_type(left, parent)
         }
+        // v2.21: collation/cast wrappers are transparent for key typing
+        // (PARTITION BY LIST (c COLLATE "C") keys coerce bounds as the
+        // underlying column type).
+        Expr::Collate { expr, .. } | Expr::Cast { expr, .. } | Expr::CastNamed { expr, .. } => {
+            infer_expr_key_type(expr, parent)
+        }
         _ => ColType::Int,
+    }
+}
+
+/// v2.21: peel collation wrappers off a partition bound expression
+/// (PG folds `'a' COLLATE "C"` to the literal for bound purposes).
+/// Cast wrappers around the literal fold the same way (the bound is
+/// coerced to the key type afterwards regardless).
+pub(crate) fn unwrap_bound_collate(e: &Expr) -> &Expr {
+    match e {
+        Expr::Collate { expr, .. } | Expr::Cast { expr, .. } | Expr::CastNamed { expr, .. } => {
+            unwrap_bound_collate(expr)
+        }
+        other => other,
     }
 }
 
@@ -202,7 +221,7 @@ pub(crate) fn convert_part_bound(
             let mut values = Vec::new();
             let mut has_null = false;
             for e in exprs {
-                match e {
+                match unwrap_bound_collate(e) {
                     Expr::Literal(Literal::Null) => has_null = true,
                     Expr::Literal(l) => {
                         // Coerce to the first key column's type (list keys
@@ -284,13 +303,13 @@ pub(crate) fn convert_range_bound(
     match b {
         RangeBoundDef::Min => Ok(RangeBound::Min),
         RangeBoundDef::Max => Ok(RangeBound::Max),
-        RangeBoundDef::Val(Expr::Literal(l)) => {
-            Ok(RangeBound::Val(coerce_literal(l, ty, &columns[0].0)?))
-        }
-        RangeBoundDef::Val(_) => Err(exec_err(
-            "42601",
-            "partition bound must be a literal".to_string(),
-        )),
+        RangeBoundDef::Val(e) => match unwrap_bound_collate(e) {
+            Expr::Literal(l) => Ok(RangeBound::Val(coerce_literal(l, ty, &columns[0].0)?)),
+            _ => Err(exec_err(
+                "42601",
+                "partition bound must be a literal".to_string(),
+            )),
+        },
     }
 }
 
@@ -3823,6 +3842,14 @@ pub(crate) fn expand_like_clauses(
                 .push(src.bit_typmods.get(i).copied().unwrap_or(None));
             def.domain_elem
                 .push(src.domain_elem.get(i).copied().unwrap_or(false));
+            // v2.21: the column's collation rides along (part of
+            // the column's type identity in PG, not an INCLUDING
+            // option).
+            if def.collations.len() < def.columns.len() - 1 {
+                def.collations.resize(def.columns.len() - 1, None);
+            }
+            def.collations
+                .push(src.col_collation(i).map(|s| s.to_string()));
         }
         // CHECK constraints get fresh per-table names (PG generates new
         // names for the copies; ours are per-table anyway).
@@ -3923,6 +3950,10 @@ pub(crate) fn create_table_from_def(
     // so both the temp and permanent paths below see the merged def.
     let mut like_def = def.clone();
     expand_like_clauses(eng, ctx, name, &mut like_def)?;
+    // v2.21: column collation names must resolve (42704).
+    for c in like_def.collations.iter().flatten() {
+        crate::exec::collate::validate_collation_name(&eng.db, c)?;
+    }
     // v0.81: validate named composite columns — each `ColType::Composite`
     // must name a defined composite type (42704 otherwise, like PG).
     // v0.85: a named type that resolves to a domain rewrites the column

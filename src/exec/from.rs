@@ -217,7 +217,9 @@ pub(crate) fn expr_is_volatile(db: &Database, e: &Expr) -> bool {
         | Expr::IsNull { expr, .. }
         | Expr::IsBool { expr, .. }
         | Expr::Extract { from: expr, .. }
-        | Expr::NamedArg { expr, .. } => expr_is_volatile(db, expr),
+        | Expr::NamedArg { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::CollationFor { expr } => expr_is_volatile(db, expr),
         // v1.86: AT TIME ZONE is stable (PG19 timezone() is stable).
         Expr::AtTimeZone { expr, zone } => {
             expr_is_volatile(db, expr)
@@ -417,6 +419,8 @@ pub(crate) fn collect_column_refs(e: &Expr, out: &mut Vec<(Option<String>, Strin
     match e {
         // v0.95: named args are transparent to inspection.
         Expr::NamedArg { expr, .. } => collect_column_refs(expr, out),
+        // v2.21: collation wrappers are transparent to ref collection.
+        Expr::Collate { expr, .. } | Expr::CollationFor { expr } => collect_column_refs(expr, out),
         Expr::Column { table, name } => out.push((table.clone(), name.clone())),
         // v0.73: a whole-row ref depends on every column of the range.
         Expr::WholeRow { qual } => out.push((Some(qual.clone()), "*".to_string())),

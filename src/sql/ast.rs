@@ -1570,6 +1570,20 @@ pub enum Expr {
         expr: Box<Expr>,
         name: String,
     },
+    /// v2.21: postfix `expr COLLATE name` (PG19 CollateClause /
+    /// CollateExpr). The name is the collation's last component as
+    /// written (schema qualification is dropped by the parser, like
+    /// other bounded name handling); derivation strength EXPLICIT.
+    Collate {
+        expr: Box<Expr>,
+        name: String,
+    },
+    /// v2.21: `COLLATION FOR (expr)` (PG19 pg_collation_for): the
+    /// derived collation name of the operand as a text value, or
+    /// NULL when the operand's type is unknown.
+    CollationFor {
+        expr: Box<Expr>,
+    },
     // v1.86: `expr AT TIME ZONE zone` / `expr AT LOCAL` (zone None =
     // the session TimeZone). PG converts timestamp<->timestamptz.
     AtTimeZone {
@@ -2532,6 +2546,10 @@ pub struct TableDef {
     /// v2.03: generated columns, parallel to `columns`
     /// (`Some((expr, stored))`).
     pub gen_cols: Vec<Option<(Expr, bool)>>,
+    /// v2.21: declared `COLLATE name` per column, parallel to
+    /// `columns` (`None` = no explicit collation; the column then
+    /// takes its domain's collation, else the database default).
+    pub collations: Vec<Option<String>>,
     /// v2.16: CREATE UNLOGGED TABLE (PG19 relpersistence 'u').
     pub unlogged: bool,
     /// v0.69: declarative partitioning (`None` = ordinary table).
@@ -2700,6 +2718,8 @@ pub enum AlterAction {
         serial: Option<SerialKind>,
         /// v0.41: raw `COMPRESSION` option (`None` = not specified).
         compression: Option<String>,
+        /// v2.21: the added column's declared `COLLATE name`.
+        collate: Option<String>,
         checks: Vec<CheckDef>,
         uniques: Vec<UniqueDef>,
         pkey: Option<UniqueDef>,
@@ -3106,6 +3126,9 @@ pub(crate) struct ParsedColDef {
     /// `COMPRESSION DEFAULT` right after the type name. Raw name;
     /// validated in exec (`default` = no explicit method).
     pub(crate) compression: Option<String>,
+    /// v2.21: the column's declared `COLLATE name` (last component),
+    /// when written. Validated for existence at exec (42704).
+    pub(crate) collate: Option<String>,
     pub(crate) cons: Vec<ColCon>,
 }
 
@@ -3240,6 +3263,7 @@ impl TableDef {
             deferred_not_null: Vec::new(),
             of_type: None,
             gen_cols: Vec::new(),
+            collations: Vec::new(),
             unlogged: false,
         }
     }
@@ -3550,6 +3574,8 @@ pub(crate) fn build_table_def(
             def.storage.push(None);
             // v2.03: generated-column slot (filled in pass 2).
             def.gen_cols.push(None);
+            // v2.21: declared column collation travels alongside.
+            def.collations.push(c.collate.clone());
         }
     }
     // v0.72: a bare `(LIKE src)` list contributes its columns at exec;
@@ -3841,6 +3867,8 @@ pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>
         Expr::Cast { expr, .. } => collect_col_refs(expr, out),
         // v0.81: composite expressions — recurse into sub-expressions.
         Expr::CastNamed { expr, .. } => collect_col_refs(expr, out),
+        // v2.21: COLLATE / COLLATION FOR are transparent wrappers.
+        Expr::Collate { expr, .. } | Expr::CollationFor { expr } => collect_col_refs(expr, out),
         // v1.86: AT TIME ZONE depends on both operands.
         Expr::AtTimeZone { expr, zone } => {
             collect_col_refs(expr, out);
@@ -3992,6 +4020,10 @@ pub(crate) fn collect_cast_type_names(e: &Expr, out: &mut Vec<String>) {
         // v0.81: composite expressions — recurse into sub-expressions.
         Expr::CastNamed { expr, name } => {
             out.push(name.clone());
+            collect_cast_type_names(expr, out)
+        }
+        // v2.21: COLLATE / COLLATION FOR are transparent wrappers.
+        Expr::Collate { expr, .. } | Expr::CollationFor { expr } => {
             collect_cast_type_names(expr, out)
         }
         // v1.86: AT TIME ZONE depends on both operands.
@@ -9321,6 +9353,49 @@ pub enum Stmt {
         default: Option<DefaultExpr>,
         /// v1.92: bit(n)/bit varying(n) typmod of the base type.
         base_bit_typmod: Option<(i32, bool)>,
+        /// v2.21: the domain's declared `COLLATE name`, when written
+        /// (PG19 DefineDomain: a domain carries a default collation
+        /// for its columns).
+        collate: Option<String>,
+    },
+    /// v2.21: `CREATE COLLATION [IF NOT EXISTS] name
+    /// { FROM existing | ( [LOCALE = s] [LC_COLLATE = s]
+    /// [LC_CTYPE = s] [PROVIDER = icu|libc|builtin]
+    /// [DETERMINISTIC = bool] [VERSION = s] [RULES = s] ) }`
+    /// (PG19 DefineCollation in commands/collationcmds.c).
+    CreateCollation {
+        name: String,
+        if_not_exists: bool,
+        from: Option<String>,
+        provider: Option<String>,
+        locale: Option<String>,
+        lc_collate: Option<String>,
+        lc_ctype: Option<String>,
+        deterministic: Option<bool>,
+    },
+    /// v2.21: `DROP COLLATION [IF EXISTS] name [, ...]
+    /// [CASCADE|RESTRICT]`.
+    DropCollation {
+        names: Vec<String>,
+        if_exists: bool,
+        cascade: bool,
+    },
+    /// v2.21: `ALTER COLLATION name { RENAME TO n | OWNER TO r |
+    /// SET SCHEMA s | REFRESH VERSION }` — exactly one action is
+    /// Some/true.
+    AlterCollation {
+        name: String,
+        rename_to: Option<String>,
+        owner_to: Option<String>,
+        set_schema: Option<String>,
+        refresh_version: bool,
+    },
+    /// v2.21: `ALTER DATABASE name REFRESH COLLATION VERSION`
+    /// (PG19 AlterDatabaseRefreshCollVersionStmt): the engine's
+    /// recorded database collation version is a constant, so this
+    /// validates the database name and succeeds.
+    AlterDatabaseRefreshCollation {
+        name: String,
     },
     DropDomain {
         names: Vec<String>,
@@ -10181,6 +10256,9 @@ impl Stmt {
                 | Stmt::CreateDomain { .. }
                 | Stmt::AlterDomain { .. }
                 | Stmt::DropDomain { .. }
+                | Stmt::CreateCollation { .. }
+                | Stmt::DropCollation { .. }
+                | Stmt::AlterCollation { .. }
                 | Stmt::AlterFunction { .. }
                 | Stmt::CreateIndex { .. }
                 | Stmt::DropIndex { .. }
@@ -10553,6 +10631,8 @@ pub(crate) fn max_param_expr(e: &Expr) -> usize {
         Expr::Cmp { left, right, .. } => max_param_expr(left).max(max_param_expr(right)),
         // v0.81: composite expressions recurse into their operands.
         Expr::CastNamed { expr, .. } | Expr::FieldAccess { expr, .. } => max_param_expr(expr),
+        // v2.21: COLLATE / COLLATION FOR are transparent wrappers.
+        Expr::Collate { expr, .. } | Expr::CollationFor { expr } => max_param_expr(expr),
         // v1.86: AT TIME ZONE.
         Expr::AtTimeZone { expr, zone } => {
             let z = zone.as_deref().map(max_param_expr).unwrap_or(0);

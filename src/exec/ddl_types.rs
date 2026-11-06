@@ -1265,6 +1265,7 @@ pub(crate) fn exec_alter_type(
                             &None,
                             &[],
                             true,
+                            None,
                         )?;
                     }
                 }
@@ -1874,12 +1875,27 @@ pub(crate) fn exec_create_domain(
     not_null: bool,
     default: Option<&DefaultExpr>,
     base_bit_typmod: Option<(i32, bool)>,
+    collate: Option<&str>,
 ) -> Result<ExecResult, ExecError> {
     if eng.db.types.contains_key(name) {
         return Err(exec_err(
             "42710",
             format!("type \"{}\" already exists", name),
         ));
+    }
+    // v2.21: a domain collation must name a known collation
+    // (42704) over a collatable base type (42804).
+    if let Some(cn) = collate {
+        crate::exec::collate::validate_collation_name(&eng.db, cn)?;
+        if !crate::sql::col_type_collatable(base, base_named) {
+            return Err(exec_err(
+                "42804",
+                format!(
+                    "collations are not supported by type {}",
+                    crate::sql::col_type_pg_name(base, base_named)
+                ),
+            ));
+        }
     }
     // v1.96: USAGE on the base type and on cast targets inside the
     // domain's CHECK / DEFAULT expressions (PG19 parse-time checks).
@@ -1969,6 +1985,9 @@ pub(crate) fn exec_create_domain(
                 not_null,
                 default: default.cloned(),
                 bit_typmod: base_bit_typmod,
+                // v2.21: runtime-only (not carried by the WAL
+                // record), like the other post-hoc fields.
+                collation: collate.map(|s| s.to_string()),
             }),
         },
     );

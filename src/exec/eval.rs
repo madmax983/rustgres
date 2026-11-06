@@ -1565,6 +1565,11 @@ pub(crate) fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, 
         // v0.95: a NamedArg that reaches evaluation unwraps to its value
         // (function-call paths resolve named args first).
         Expr::NamedArg { expr, .. } => eval_expr(q, scopes, expr),
+        // v2.21: COLLATE evaluates its operand (derivation conflicts
+        // were enforced by the statement pre-pass); COLLATION FOR
+        // yields the operand's collation name (or NULL).
+        Expr::Collate { expr, .. } => eval_expr(q, scopes, expr),
+        Expr::CollationFor { expr } => crate::exec::collate::eval_collation_for(q, scopes, expr),
         Expr::Column { table, name } => {
             match resolve_col(scopes, table.as_deref(), name) {
                 Ok((si, ci)) => Ok(scopes[si].row[ci].clone()),
@@ -2266,6 +2271,8 @@ pub(crate) fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
     match e {
         // v0.95: named args are transparent to inspection.
         Expr::NamedArg { expr, .. } => walk_expr(expr, f),
+        // v2.21: collation wrappers walk through to their operand.
+        Expr::Collate { expr, .. } | Expr::CollationFor { expr } => walk_expr(expr, f),
         Expr::Column { .. }
         | Expr::ResolvedCol { .. }
         | Expr::Literal(_)

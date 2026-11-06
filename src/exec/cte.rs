@@ -100,6 +100,17 @@ pub(crate) fn eval_recursive_cte(
     let width = seed.columns.len();
     let mut binding = cte_binding(cte, seed.columns, seed.rows)?;
     let seed_types: Vec<ColType> = binding.schema.iter().map(|c| c.ty.clone()).collect();
+    // v2.21: parse_cte.c — the recursive term's column collations
+    // must agree with the non-recursive term's (42P21).
+    if stmt_refs_table(right, &cte.name) {
+        let cctx = crate::exec::collate::CollCtx {
+            eng: &*q.eng,
+            snap: q.snap,
+            own: q.own,
+            session: q.session,
+        };
+        crate::exec::collate::check_recursive_cte(&cctx, &cte.name, left, right, &binding.schema)?;
+    }
     // v0.10: non-recursive UNION in WITH RECURSIVE: evaluate the right
     // side once (it doesn't reference the CTE) and union.
     if !stmt_refs_table(right, &cte.name) {
@@ -1006,6 +1017,8 @@ pub(crate) fn contains_agg(e: &Expr) -> bool {
         Expr::Agg { .. } | Expr::WithinGroup { .. } => true,
         // v0.95: named args are transparent to inspection.
         Expr::NamedArg { expr, .. } => contains_agg(expr),
+        // v2.21: collation wrappers are transparent.
+        Expr::Collate { expr, .. } | Expr::CollationFor { expr } => contains_agg(expr),
         Expr::Column { .. }
         | Expr::ResolvedCol { .. }
         | Expr::WholeRow { .. }
@@ -1165,6 +1178,10 @@ pub(crate) fn expr_walk<'a>(e: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
             }
             // v0.95: named args are transparent to inspection.
             Expr::NamedArg { expr, .. } => {
+                stack.push(expr);
+            }
+            // v2.21: collation wrappers are transparent to the walk.
+            Expr::Collate { expr, .. } | Expr::CollationFor { expr } => {
                 stack.push(expr);
             }
             Expr::Agg {
@@ -1416,6 +1433,8 @@ pub(crate) fn contains_window(e: &Expr) -> bool {
         Expr::Window { .. } => true,
         // v0.95: named args are transparent to inspection.
         Expr::NamedArg { expr, .. } => contains_window(expr),
+        // v2.21: collation wrappers are transparent.
+        Expr::Collate { expr, .. } | Expr::CollationFor { expr } => contains_window(expr),
         Expr::Column { .. }
         | Expr::ResolvedCol { .. }
         | Expr::WholeRow { .. }

@@ -830,6 +830,7 @@ impl Parser {
                 Token::Ident(s) if s == "view" => self.parse_alter_view(false),
                 Token::Ident(s) if s == "materialized" => self.parse_alter_view(true),
                 Token::Ident(s) if s == "sequence" => self.parse_alter_sequence(),
+                Token::Ident(s) if s == "collation" => self.parse_alter_collation(),
                 Token::Ident(s) if s == "domain" => self.parse_alter_domain(),
                 Token::Ident(s) if s == "type" => self.parse_alter_type(),
                 Token::Ident(s) if s == "function" => self.parse_alter_function(),
@@ -854,6 +855,11 @@ impl Parser {
                 Token::Ident(s) if s == "database" => {
                     self.next(); // 'database'
                     let name = self.expect_ident()?;
+                    if self.eat_keyword("refresh") {
+                        self.expect_keyword("collation")?;
+                        self.expect_keyword("version")?;
+                        return Ok(Stmt::AlterDatabaseRefreshCollation { name });
+                    }
                     self.expect_keyword("owner")?;
                     self.expect_keyword("to")?;
                     let new_owner = self.expect_ident()?;
@@ -1720,6 +1726,10 @@ impl Parser {
         if matches!(self.peek(), Token::Ident(s) if s == "domain") {
             return self.parse_create_domain();
         }
+        // v2.21: CREATE COLLATION (PG19 CollationStmt).
+        if matches!(self.peek(), Token::Ident(s) if s == "collation") {
+            return self.parse_create_collation();
+        }
         // v1.38: CREATE CAST (sourcetype AS targettype) WITHOUT FUNCTION
         // | WITH FUNCTION funcname | WITH INOUT [AS IMPLICIT | AS ASSIGNMENT].
         if matches!(self.peek(), Token::Ident(s) if s == "cast") {
@@ -2025,6 +2035,9 @@ impl Parser {
             of_type: None,
             gen_cols: Vec::new(),
             unlogged: false,
+            // v2.21: partition children inherit the parent's columns
+            // (and their collations) at exec.
+            collations: Vec::new(),
         };
         Ok(Stmt::CreateTable { name, def, temp })
     }
@@ -2295,14 +2308,17 @@ impl Parser {
         // non-toastable type is 0A000 (tablecmds.c
         // checkStorageMode, shared by CREATE and ALTER).
         let mut collate_seen = false;
+        let mut collate_name: Option<String> = None;
         let mut storage_mode: Option<String> = None;
         while let Token::Ident(s) = self.peek().clone() {
             match s.as_str() {
                 "collate" => {
                     self.next();
                     collate_seen = true;
-                    // Collation name may be qualified or quoted.
-                    let _ = self.parse_table_name()?;
+                    // Collation name may be qualified or quoted;
+                    // v2.21: the last component is kept and modeled.
+                    let qn = self.parse_table_name()?;
+                    collate_name = Some(qn.rsplit('.').next().unwrap_or(&qn).to_string());
                 }
                 "storage" => {
                     self.next();
@@ -2450,6 +2466,7 @@ impl Parser {
             composite_name,
             serial,
             compression,
+            collate: collate_name,
             cons,
         })
     }
@@ -3549,6 +3566,8 @@ impl Parser {
                 name: col.name,
                 if_not_exists,
                 col_type: col.col_type,
+                // v2.21: the new column's explicit COLLATE.
+                collate: col.collate,
                 named_type: col.composite_name,
                 bit_typmod: col.bit_typmod,
                 not_null,
@@ -7289,7 +7308,15 @@ impl Parser {
         let mut checks = Vec::new();
         let mut not_null = false;
         let mut default = None;
+        // v2.21: `COLLATE name` (PG19 DomainSpec: the collation is an
+        // element of the domain definition, before constraints).
+        let mut collate = None;
         loop {
+            if collate.is_none() && self.eat_keyword("collate") {
+                let qn = self.parse_table_name()?;
+                collate = Some(qn.rsplit('.').next().unwrap_or(&qn).to_string());
+                continue;
+            }
             let cname = if self.eat_keyword("constraint") {
                 Some(self.expect_ident()?)
             } else {
@@ -7360,6 +7387,7 @@ impl Parser {
             not_null,
             default,
             base_bit_typmod,
+            collate,
         })
     }
 
@@ -7474,6 +7502,213 @@ impl Parser {
             }
         }
         Ok(Stmt::AlterType { name, actions })
+    }
+
+    /// v2.21: parse a collation name as used by COLLATE / FROM / DROP
+    /// COLLATION: an optionally schema-qualified identifier (quoted or
+    /// not); returns the final component (quoted case preserved).
+    pub(crate) fn parse_coll_name(&mut self) -> Result<String, SqlError> {
+        let mut name = match self.next() {
+            Token::Ident(s) | Token::QIdent(s) => s,
+            other => {
+                return Err(err(format!(
+                    "syntax error: expected collation name, found {:?}",
+                    other
+                )));
+            }
+        };
+        while *self.peek() == Token::Dot {
+            self.next(); // '.'
+            name = match self.next() {
+                Token::Ident(s) | Token::QIdent(s) => s,
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected collation name, found {:?}",
+                        other
+                    )));
+                }
+            };
+        }
+        Ok(name)
+    }
+
+    /// v2.21: CREATE COLLATION [IF NOT EXISTS] name
+    ///   { FROM existing | ( option = value [, ...] ) }
+    /// (PG19 CollationStmt). Option names are validated exactly like
+    /// PG: only the lowercase spellings are recognized (a quoted
+    /// mixed-case name is an error, gram.y/defelem handling).
+    pub(crate) fn parse_create_collation(&mut self) -> Result<Stmt, SqlError> {
+        self.next(); // 'collation'
+        let if_not_exists = if self.eat_keyword("if") {
+            self.expect_keyword("not")?;
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_coll_name()?;
+        if self.eat_keyword("from") {
+            let from = self.parse_coll_name()?;
+            return Ok(Stmt::CreateCollation {
+                name,
+                if_not_exists,
+                from: Some(from),
+                provider: None,
+                locale: None,
+                lc_collate: None,
+                lc_ctype: None,
+                deterministic: None,
+            });
+        }
+        self.expect(Token::LParen, "'('")?;
+        let (mut provider, mut locale, mut lc_collate, mut lc_ctype) = (None, None, None, None);
+        let mut deterministic: Option<bool> = None;
+        // PG gram.y: a repeated option is "conflicting or redundant
+        // options" (collate.sql coll_dup_chk family).
+        let mut seen_attrs: Vec<String> = Vec::new();
+        loop {
+            let attr = match self.next() {
+                Token::Ident(s) => s,
+                Token::QIdent(s) => s,
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected collation attribute name, found {:?}",
+                        other
+                    )));
+                }
+            };
+            let has = |n: &str| seen_attrs.iter().any(|a| a == n);
+            if has(&attr)
+                || (attr == "locale" && (has("lc_collate") || has("lc_ctype")))
+                || ((attr == "lc_collate" || attr == "lc_ctype") && has("locale"))
+            {
+                return Err(err("conflicting or redundant options".to_string()));
+            }
+            seen_attrs.push(attr.clone());
+            self.expect(Token::Eq, "'='")?;
+            let value = match self.next() {
+                Token::Str(s) => s,
+                Token::Ident(s) | Token::QIdent(s) => s,
+                Token::Number(s) => s,
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected collation attribute value, found {:?}",
+                        other
+                    )));
+                }
+            };
+            match attr.as_str() {
+                "provider" => provider = Some(value),
+                "locale" => locale = Some(value),
+                "lc_collate" => lc_collate = Some(value),
+                "lc_ctype" => lc_ctype = Some(value),
+                "deterministic" => {
+                    deterministic = Some(match value.to_ascii_lowercase().as_str() {
+                        "true" => true,
+                        "false" => false,
+                        _ => {
+                            return Err(err(format!(
+                                "syntax error: expected boolean value for collation attribute \"deterministic\", found \"{}\"",
+                                value
+                            )));
+                        }
+                    });
+                }
+                // version is accepted and recorded nowhere (no
+                // behavioral use in this engine). rules gets a shape
+                // check mirroring PG's collator-open failure: a valid
+                // ICU tailoring starts with a reset '&' or a setting
+                // '[' (testcoll_rulesx: '!!wrong!!' errors in PG).
+                "version" => {}
+                "rules" => {
+                    let v = value.trim_start();
+                    if !v.is_empty() && !v.starts_with('&') && !v.starts_with('[') {
+                        return Err(SqlError {
+                            message: format!(
+                                "could not open collator with rules \"{}\": U_INVALID_FORMAT_ERROR",
+                                value
+                            ),
+                            code: "22023",
+                        });
+                    }
+                }
+                _ => {
+                    return Err(SqlError {
+                        message: format!("collation attribute \"{}\" not recognized", attr),
+                        code: "42601",
+                    });
+                }
+            }
+            match self.next() {
+                Token::Comma => continue,
+                Token::RParen => break,
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected ',' or ')' in CREATE COLLATION, found {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+        Ok(Stmt::CreateCollation {
+            name,
+            if_not_exists,
+            from: None,
+            provider,
+            locale,
+            lc_collate,
+            lc_ctype,
+            deterministic,
+        })
+    }
+
+    /// v2.21: ALTER COLLATION name { RENAME TO x | OWNER TO r |
+    /// SET SCHEMA s | REFRESH VERSION }.
+    pub(crate) fn parse_alter_collation(&mut self) -> Result<Stmt, SqlError> {
+        self.next(); // 'collation'
+        let name = self.parse_coll_name()?;
+        if self.eat_keyword("rename") {
+            self.expect_keyword("to")?;
+            let rename_to = self.parse_coll_name()?;
+            return Ok(Stmt::AlterCollation {
+                name,
+                rename_to: Some(rename_to),
+                owner_to: None,
+                set_schema: None,
+                refresh_version: false,
+            });
+        }
+        if self.eat_keyword("owner") {
+            self.expect_keyword("to")?;
+            let owner_to = self.expect_ident()?;
+            return Ok(Stmt::AlterCollation {
+                name,
+                rename_to: None,
+                owner_to: Some(owner_to),
+                set_schema: None,
+                refresh_version: false,
+            });
+        }
+        if self.eat_keyword("set") {
+            self.expect_keyword("schema")?;
+            let set_schema = self.expect_ident()?;
+            return Ok(Stmt::AlterCollation {
+                name,
+                rename_to: None,
+                owner_to: None,
+                set_schema: Some(set_schema),
+                refresh_version: false,
+            });
+        }
+        self.expect_keyword("refresh")?;
+        self.expect_keyword("version")?;
+        Ok(Stmt::AlterCollation {
+            name,
+            rename_to: None,
+            owner_to: None,
+            set_schema: None,
+            refresh_version: true,
+        })
     }
 
     pub(crate) fn parse_alter_domain(&mut self) -> Result<Stmt, SqlError> {
@@ -9623,28 +9858,30 @@ impl Parser {
     }
 
     /// v2.20: postfix `COLLATE <name>` on an expression (PG19 gram.y
-    /// `a_expr COLLATE any_name`). Collation is accepted and not
-    /// modeled — this is a single-collation (byte-order) engine, the
-    /// same stance as ORDER BY terms, index elements, and column
-    /// definitions. The name may be quoted and/or schema-qualified.
-    /// Before v2.20 the expression grammar had no COLLATE postfix
-    /// at all, so `expr::text COLLATE "C"` (update.sql's :show_data
-    /// shape, 88 schedule statements) died 42601 on the QIdent.
-    pub(crate) fn eat_expr_collate(&mut self) -> Result<(), SqlError> {
+    /// `a_expr COLLATE any_name`). The name may be quoted and/or
+    /// schema-qualified.
+    /// v2.21: the name is now RETURNED (last component of the last
+    /// COLLATE in a chain) so parse_cast can wrap the expression in
+    /// `Expr::Collate` and the derivation pass can enforce PG19's
+    /// conflict rules (parse_collate.c). Callers that historically
+    /// skipped the clause (skip-parses over foreign grammar) use
+    /// `eat_expr_collate_skip`.
+    pub(crate) fn eat_expr_collate(&mut self) -> Result<Option<String>, SqlError> {
+        let mut found: Option<String> = None;
         while self.eat_keyword("collate") {
-            match self.next() {
-                Token::Ident(_) | Token::QIdent(_) | Token::Str(_) => {}
+            let mut name = match self.next() {
+                Token::Ident(s) | Token::QIdent(s) | Token::Str(s) => s,
                 other => {
                     return Err(err(format!(
                         "syntax error: expected collation name, found {:?}",
                         other
                     )));
                 }
-            }
+            };
             while *self.peek() == Token::Dot {
                 self.next();
                 match self.next() {
-                    Token::Ident(_) | Token::QIdent(_) => {}
+                    Token::Ident(s) | Token::QIdent(s) => name = s,
                     other => {
                         return Err(err(format!(
                             "syntax error: expected collation name, found {:?}",
@@ -9653,8 +9890,9 @@ impl Parser {
                     }
                 }
             }
+            found = Some(name);
         }
-        Ok(())
+        Ok(found)
     }
 
     /// cast := unary (`::` type)*
@@ -9711,7 +9949,13 @@ impl Parser {
         }
         // v2.20: `expr::type COLLATE name` — the COLLATE postfix
         // binds at this level in PG19's grammar.
-        self.eat_expr_collate()?;
+        // v2.21: modeled as Expr::Collate for the derivation pass.
+        if let Some(coll) = self.eat_expr_collate()? {
+            expr = Expr::Collate {
+                expr: Box::new(expr),
+                name: coll,
+            };
+        }
         // v1.86: `expr AT TIME ZONE zone` / `expr AT LOCAL` — PG19
         // treats AT TIME ZONE as a postfix operator binding at this
         // level (just looser than `::` chains, so it applies after
@@ -9761,7 +10005,12 @@ impl Parser {
             break;
         }
         // v2.20: `(expr AT TIME ZONE z) COLLATE name` likewise.
-        self.eat_expr_collate()?;
+        if let Some(coll) = self.eat_expr_collate()? {
+            expr = Expr::Collate {
+                expr: Box::new(expr),
+                name: coll,
+            };
+        }
         Ok(expr)
     }
 
@@ -10054,6 +10303,18 @@ impl Parser {
                     return Ok(Expr::Exists {
                         sub: Box::new(sub),
                         neg: false,
+                    });
+                }
+                // v2.21: `COLLATION FOR (expr)` (PG19 gram.y
+                // func_expr_common_subexpr) — the derived collation
+                // name of the operand.
+                if name == "collation" && matches!(self.peek(), Token::Ident(s) if s == "for") {
+                    self.next(); // 'for'
+                    self.expect(Token::LParen, "'('")?;
+                    let inner = self.parse_or()?;
+                    self.expect(Token::RParen, "')'")?;
+                    return Ok(Expr::CollationFor {
+                        expr: Box::new(inner),
                     });
                 }
                 // v0.55: `CASE [operand] WHEN ... THEN ... [ELSE ...]
@@ -15650,6 +15911,29 @@ impl Parser {
             self.parse_cascade_opt()?;
             return Ok(Stmt::DropDomain { names, if_exists });
         }
+        // v2.21: DROP COLLATION [IF EXISTS] name [, ...] [CASCADE|RESTRICT].
+        if self.eat_keyword("collation") {
+            let if_exists = if self.eat_keyword("if") {
+                self.expect_keyword("exists")?;
+                true
+            } else {
+                false
+            };
+            let mut names = Vec::new();
+            loop {
+                names.push(self.parse_table_name()?);
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.next();
+            }
+            let cascade = self.parse_cascade_opt()?;
+            return Ok(Stmt::DropCollation {
+                names,
+                if_exists,
+                cascade,
+            });
+        }
         // v0.86: DROP FUNCTION [IF EXISTS] name ([type [, ...]]).
         // Argument names are accepted and ignored (PG allows them).
         if matches!(self.peek(), Token::Ident(s) if s == "function" || s == "procedure" || s == "routine")
@@ -17806,6 +18090,10 @@ pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
         Expr::CastNamed { expr, .. } | Expr::FieldAccess { expr, .. } => {
             validate_constraint_expr(expr, what)
         }
+        // v2.21: collation wrappers validate through to their operand.
+        Expr::Collate { expr, .. } | Expr::CollationFor { expr } => {
+            validate_constraint_expr(expr, what)
+        }
         // v1.86: AT TIME ZONE — validate both operands.
         Expr::AtTimeZone { expr, zone } => {
             validate_constraint_expr(expr, what)?;
@@ -18024,6 +18312,20 @@ pub(crate) fn encode_expr_inner(e: &Expr, out: &mut String) {
     match e {
         // v0.95: named args encode transparently.
         Expr::NamedArg { expr, .. } => encode_expr_inner(expr, out),
+        // v2.21: collation wrappers encode distinctly (the collation
+        // is part of the expression's identity for index keys).
+        Expr::Collate { expr, name } => {
+            out.push_str("(collate ");
+            sexpr_escape(name, out);
+            out.push(' ');
+            encode_expr_inner(expr, out);
+            out.push(')');
+        }
+        Expr::CollationFor { expr } => {
+            out.push_str("(collationfor ");
+            encode_expr_inner(expr, out);
+            out.push(')');
+        }
         Expr::Column { table, name } => {
             out.push_str("(col ");
             sexpr_escape(table.as_deref().unwrap_or(""), out);
@@ -18775,6 +19077,21 @@ impl<'a> SexprParser<'a> {
                 Expr::CastNamed {
                     expr: Box::new(expr),
                     name,
+                }
+            }
+            // v2.21: collation wrappers (encode_expr_inner heads).
+            "collate" => {
+                let name = self.atom()?;
+                let expr = self.expr()?;
+                Expr::Collate {
+                    expr: Box::new(expr),
+                    name,
+                }
+            }
+            "collationfor" => {
+                let expr = self.expr()?;
+                Expr::CollationFor {
+                    expr: Box::new(expr),
                 }
             }
             "case" => {

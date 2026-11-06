@@ -238,6 +238,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                         .map_err(|e| format!("corrupt domain default in WAL: {}", e))?,
                     // v1.92: not carried by the WAL domain record.
                     bit_typmod: None,
+                    // v2.21: not carried by the WAL domain record.
+                    collation: None,
                 }),
                 None => None,
             };
@@ -1019,6 +1021,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     // created view has neither.
                     col_acl: Vec::new(),
                     col_defaults: Vec::new(),
+                    // v2.21: collations are runtime-only state.
+                    col_collations: Vec::new(),
                 });
         }
         WalRecord::DropView { name, xmax } => {

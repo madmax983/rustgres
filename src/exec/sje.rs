@@ -1130,6 +1130,12 @@ pub(crate) fn sje_rewrite_qual(e: &Expr, from_q: &str, to_q: &str) -> Option<Exp
             name: name.clone(),
             expr: rb(expr)?,
         },
+        // v2.21: collation wrappers rebuild around the rewritten child.
+        Expr::Collate { expr, name } => Expr::Collate {
+            expr: rb(expr)?,
+            name: name.clone(),
+        },
+        Expr::CollationFor { expr } => Expr::CollationFor { expr: rb(expr)? },
         Expr::Extract { field, from } => Expr::Extract {
             field: field.clone(),
             from: rb(from)?,

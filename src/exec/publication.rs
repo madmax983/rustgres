@@ -753,6 +753,10 @@ fn filter_walk(
         }
         Expr::Cast { expr, .. } => filter_walk(eng, t, expr, cols_out),
         Expr::NamedArg { expr, .. } => filter_walk(eng, t, expr, cols_out),
+        // v2.21: collation wrappers are transparent to the filter walk.
+        Expr::Collate { expr, .. } | Expr::CollationFor { expr } => {
+            filter_walk(eng, t, expr, cols_out)
+        }
         Expr::Arith { left, right, .. } | Expr::Cmp { left, right, .. } => {
             filter_walk(eng, t, left, cols_out)?;
             filter_walk(eng, t, right, cols_out)

@@ -445,6 +445,20 @@ pub(crate) fn exec_create_index(
             }
         }
     }
+    // v2.21: element collation validation — COLLATE names must
+    // resolve (42704), expression elements are derived against
+    // the table (COLLATE on a non-collatable element is 42804,
+    // including the parenthesized form the bare-column check
+    // above cannot see), and pattern opclasses reject
+    // nondeterministic element collations.
+    if let Some(t) = eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+        .cloned()
+    {
+        let cctx = crate::exec::collate::CollCtx::from_stmt(eng, ctx);
+        crate::exec::collate::validate_index_collations(&cctx, table, &t, columns)?;
+    }
     // v1.96: USAGE on cast targets inside index expressions and the
     // predicate (PG19 parse-time type check).
     for c in columns.iter() {
