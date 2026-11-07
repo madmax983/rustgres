@@ -2168,7 +2168,7 @@ pub(crate) fn exec_call_proc(
     for a in args {
         vals.push(eval_expr(&mut q, &[], a)?);
     }
-    let _ = call_user_function(&mut q, &[], &fdef, &vals)?;
+    let _ = call_user_function(&mut q, &[], &fdef, &vals, &[])?;
     Ok(ExecResult::Command {
         tag: "CALL".to_string(),
     })
@@ -4167,6 +4167,7 @@ pub(crate) fn inject_plpgsql_arg_vars(
             cursor_params: Vec::new(),
             cursor_scroll: None,
             is_constant: false,
+            collation: None,
         });
     }
     for (cn, ct) in table_cols {
@@ -4185,6 +4186,7 @@ pub(crate) fn inject_plpgsql_arg_vars(
             cursor_params: Vec::new(),
             cursor_scroll: None,
             is_constant: false,
+            collation: None,
         });
     }
 }

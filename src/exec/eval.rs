@@ -3528,7 +3528,7 @@ pub(crate) fn probe_user_eq(
             return Ok(None);
         }
     }
-    let r = call_user_function(q, scopes, fdef, &[outer.clone(), inner.clone()])?;
+    let r = call_user_function(q, scopes, fdef, &[outer.clone(), inner.clone()], &[])?;
     Ok(match r {
         Value::Bool(b) => Some(b),
         Value::Null => None,
@@ -3700,7 +3700,7 @@ pub(crate) fn eval_user_op(
             return Ok(Value::Null);
         }
     }
-    Ok(call_user_function(q, scopes, &fdef, &[lv, rv])?)
+    Ok(call_user_function(q, scopes, &fdef, &[lv, rv], &[])?)
 }
 
 /// v0.87: evaluate a quantified comparison `left op ANY/ALL (subquery)`

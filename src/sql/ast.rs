@@ -4859,6 +4859,10 @@ pub struct PlpgsqlDecl {
     /// "variable is declared CONSTANT" error at OPEN time; the
     /// constant_refcursor family).
     pub is_constant: bool,
+    /// v2.22: the declaration's COLLATE name, if any (PG19
+    /// pl_gram.y decl_statement opt_collate). The executor seeds
+    /// the variable's tracked collation from it.
+    pub collation: Option<String>,
 }
 
 /// v1.01: sentinel for the OTHERS pseudo-condition (never a real
@@ -6018,6 +6022,7 @@ pub(crate) fn parse_plpgsql_decl(text: &str) -> Result<PlpgsqlDecl, SqlError> {
             cursor_params: Vec::new(),
             cursor_scroll: None,
             is_constant: false,
+            collation: None,
         });
     }
     // CURSOR declaration (v2.12, full form): `name [SCROLL | NO
@@ -6090,6 +6095,7 @@ pub(crate) fn parse_plpgsql_decl(text: &str) -> Result<PlpgsqlDecl, SqlError> {
                 cursor_params,
                 cursor_scroll: scroll,
                 is_constant,
+                collation: None,
             });
         }
     }
@@ -6139,12 +6145,18 @@ pub(crate) fn parse_plpgsql_decl(text: &str) -> Result<PlpgsqlDecl, SqlError> {
         },
     };
     // Clean the type text: drop NOT NULL / CONSTANT / COLLATE <name>.
+    // v2.22: the COLLATE name is KEPT (decl_collation) — a declared
+    // variable collation drives body collation propagation.
+    let mut decl_collation: Option<String> = None;
     let mut ty = type_part.trim().to_string();
     loop {
         let before = ty.clone();
         if let Some(p) = plpgsql_top_level_kw(&ty, "collate") {
             let after = ty[p + 7..].trim_start();
-            let (_, tail) = split_ident(after).unwrap_or((String::new(), after));
+            let (cname, tail) = split_ident(after).unwrap_or((String::new(), after));
+            if !cname.is_empty() && decl_collation.is_none() {
+                decl_collation = Some(cname);
+            }
             ty = format!("{}{}", &ty[..p], tail).trim().to_string();
         }
         for kw in ["not null", "constant"] {
@@ -6193,6 +6205,7 @@ pub(crate) fn parse_plpgsql_decl(text: &str) -> Result<PlpgsqlDecl, SqlError> {
         cursor_params: Vec::new(),
         cursor_scroll: None,
         is_constant,
+        collation: decl_collation,
     })
 }
 
@@ -6476,6 +6489,7 @@ pub(crate) fn ensure_loop_decl(decls: &mut Vec<PlpgsqlDecl>, var: &str, type_nam
         cursor_params: Vec::new(),
         cursor_scroll: None,
         is_constant: false,
+        collation: None,
     });
 }
 
@@ -8549,6 +8563,7 @@ pub fn parse_plpgsql_body(
             cursor_params: Vec::new(),
             cursor_scroll: None,
             is_constant: false,
+            collation: None,
         });
     }
     plpgsql_validate_returns(&stmts, &handlers, returns_set, is_void, has_out)?;
@@ -8571,6 +8586,7 @@ pub fn parse_plpgsql_body(
             cursor_params: Vec::new(),
             cursor_scroll: None,
             is_constant: false,
+            collation: None,
         });
     }
     plpgsql_validate_vars(&vdecls, &stmts, &handlers, label.as_deref())?;

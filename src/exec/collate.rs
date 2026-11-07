@@ -1532,6 +1532,200 @@ pub(crate) fn validate_select_collations(
     Ok(())
 }
 
+/// v2.22: the collation a SQL/JSON DEFAULT expression carries for
+/// the transformJsonBehavior conflict check (PG19 parse_expr.c):
+/// exprCollation of the expression, falling back through domain
+/// casts to the domain's collation; a plain literal / uncollated
+/// expression carries none.
+fn json_default_collation(ctx: &CollCtx, e: &Expr) -> Option<String> {
+    match e {
+        Expr::Collate { name, .. } => normalize_name(name),
+        Expr::CastNamed { expr, name } => domain_collation(&ctx.eng.db, name)
+            .and_then(|c| normalize_name(&c))
+            .or_else(|| json_default_collation(ctx, expr)),
+        Expr::Cast { expr, .. } => json_default_collation(ctx, expr),
+        Expr::NamedArg { expr, .. } => json_default_collation(ctx, expr),
+        Expr::Func { args, .. } | Expr::Row(args) => {
+            args.iter().find_map(|a| json_default_collation(ctx, a))
+        }
+        Expr::Arith { left, right, .. }
+        | Expr::Concat(left, right)
+        | Expr::JsonOp { left, right, .. } => {
+            json_default_collation(ctx, left).or_else(|| json_default_collation(ctx, right))
+        }
+        _ => None,
+    }
+}
+
+/// v2.22: SQL/JSON DEFAULT behavior checks (PG19 parse_expr.c
+/// transformJsonBehavior + ValidJsonBehaviorDefaultExpr), run for
+/// every `__sqljson_value` / `__sqljson_query` call at this query
+/// level:
+/// - the DEFAULT expression must be a constant, non-aggregate
+///   function, or operator expression — a subquery (or an aggregate
+///   as the outermost form) is 42804;
+/// - it must not contain column references (42804);
+/// - its collation must not conflict with the RETURNING type's
+///   collation (42P21 "collation of DEFAULT expression conflicts
+///   with RETURNING clause").
+pub(crate) fn validate_sqljson_defaults(ctx: &CollCtx, stmt: &SelectStmt) -> Result<(), ExecError> {
+    let mut roots: Vec<&Expr> = Vec::new();
+    for item in &stmt.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            roots.push(expr);
+        }
+    }
+    if let Some(w) = &stmt.where_ {
+        roots.push(w);
+    }
+    if let Some(h) = &stmt.having {
+        roots.push(h);
+    }
+    for set in &stmt.group_by {
+        roots.extend(set.iter());
+    }
+    roots.extend(stmt.distinct_on.iter());
+    for t in &stmt.order_by {
+        roots.push(&t.expr);
+    }
+    for item in &stmt.from {
+        if let FromItem::Function { args, .. } = item {
+            roots.extend(args.iter());
+        }
+    }
+    for root in roots {
+        let mut err: Option<ExecError> = None;
+        crate::exec::eval::walk_expr(root, &mut |e| {
+            if err.is_some() {
+                return;
+            }
+            if matches!(e, Expr::Func { name, .. }
+                if name == "__sqljson_value" || name == "__sqljson_query")
+            {
+                if let Err(x) = check_sqljson_call(ctx, e) {
+                    err = Some(x);
+                }
+            }
+        });
+        if let Some(x) = err {
+            return Err(x);
+        }
+    }
+    Ok(())
+}
+
+fn check_sqljson_call(ctx: &CollCtx, call: &Expr) -> Result<(), ExecError> {
+    let Expr::Func { name, args } = call else {
+        return Ok(());
+    };
+    let is_query = name == "__sqljson_query";
+    let spec_idx = if is_query { 9 } else { 7 };
+    let ret_spec: Option<String> = match args.get(spec_idx) {
+        Some(Expr::Literal(Literal::Text(s))) => Some(s.to_string()),
+        _ => None,
+    };
+    // RETURNING type's collation: only a domain target carries one.
+    let target_coll: Option<String> = ret_spec.as_deref().and_then(|spec| {
+        let base = spec
+            .trim_end_matches("[]")
+            .split('(')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        domain_collation(&ctx.eng.db, &base).and_then(|c| normalize_name(&c))
+    });
+    for (kidx, eidx) in [(3usize, 4usize), (5usize, 6usize)] {
+        let is_default = matches!(args.get(kidx), Some(Expr::Literal(Literal::Int(2))));
+        if !is_default {
+            continue;
+        }
+        let Some(raw) = args.get(eidx) else {
+            continue;
+        };
+        // JSON_VALUE's desugar wraps the DEFAULT in a cast to the
+        // RETURNING type (the evaluator's plan-time coercion); PG's
+        // checks run on the expression inside that coercion.
+        let inner: &Expr = match raw {
+            Expr::CastNamed { expr, name: cn } if !is_query => {
+                let base = ret_spec
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim_end_matches("[]")
+                    .split('(')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_lowercase();
+                if cn.to_lowercase() == base { expr } else { raw }
+            }
+            Expr::Cast { expr, .. } if !is_query && ret_spec.is_some() => expr,
+            _ => raw,
+        };
+        // Form + column-reference checks over the whole expression.
+        let mut form_bad = false;
+        let mut var_bad = false;
+        crate::exec::eval::walk_expr(inner, &mut |e| match e {
+            Expr::ScalarSub(_)
+            | Expr::ArraySubquery(_)
+            | Expr::Exists { .. }
+            | Expr::InSub { .. } => form_bad = true,
+            Expr::Column { .. } | Expr::ResolvedCol { .. } | Expr::WholeRow { .. } => {
+                var_bad = true
+            }
+            _ => {}
+        });
+        if let Expr::Func { name: fname, .. } = inner {
+            const AGGS: &[&str] = &[
+                "count",
+                "sum",
+                "avg",
+                "min",
+                "max",
+                "string_agg",
+                "array_agg",
+                "bool_and",
+                "bool_or",
+                "every",
+                "json_agg",
+                "jsonb_agg",
+                "json_object_agg",
+                "jsonb_object_agg",
+                "xmlagg",
+                "grouping",
+                "generate_series",
+                "unnest",
+            ];
+            if AGGS.contains(&fname.as_str()) {
+                form_bad = true;
+            }
+        }
+        if form_bad {
+            return Err(exec_err(
+                "42804",
+                "can only specify a constant, non-aggregate function, or operator expression for DEFAULT"
+                    .to_string(),
+            ));
+        }
+        if var_bad {
+            return Err(exec_err(
+                "42804",
+                "DEFAULT expression must not contain column references".to_string(),
+            ));
+        }
+        // Collation conflict vs the RETURNING clause.
+        if let (Some(t), Some(d)) = (&target_coll, json_default_collation(ctx, inner)) {
+            if !t.eq_ignore_ascii_case(&d) {
+                return Err(exec_err(
+                    "42P21",
+                    "collation of DEFAULT expression conflicts with RETURNING clause".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parent environment from the enclosing query's scopes (used for
 /// correlated subqueries): each outer range variable's columns get
 /// the states their underlying table/view carries when the range

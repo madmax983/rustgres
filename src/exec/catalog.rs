@@ -3160,6 +3160,9 @@ pub(crate) fn run_select(
             session: q.session,
         };
         crate::exec::collate::validate_select_collations(&cctx, stmt, outer)?;
+        // v2.22: SQL/JSON DEFAULT behavior checks (form, column
+        // references, collation vs RETURNING).
+        crate::exec::collate::validate_sqljson_defaults(&cctx, stmt)?;
     }
     let base = q.ctes.len();
     if !stmt.with.is_empty() {

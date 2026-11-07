@@ -657,6 +657,9 @@ pub(crate) fn run_func_body(
     scopes: &[Scope],
     fdef: &crate::storage::FuncDef,
     args: &[Value],
+    // v2.22: call-site argument collations parallel to `args`
+    // (empty when the call path has no expression context).
+    arg_colls: &[Option<String>],
     // v0.89: statement-local UPDATE overlay, already volatility-gated
     // by the caller (Some only for volatile functions).
     pending: Option<Rc<RefCell<Vec<(String, u64, Row)>>>>,
@@ -692,7 +695,7 @@ pub(crate) fn run_func_body(
     // below serves SQL-language and v0.97 single-RETURN plpgsql bodies.
     if let Some(pb) = &fdef.plpgsql {
         let params: Vec<Option<Value>> = coerced.into_iter().map(Some).collect();
-        return run_plpgsql_body(q, scopes, fdef, pb, &params, pending);
+        return run_plpgsql_body(q, scopes, fdef, pb, &params, arg_colls, pending);
     }
     let body = fdef.parsed.as_ref().ok_or_else(|| {
         exec_err(
@@ -1139,6 +1142,14 @@ pub(crate) struct PlpgsqlRun {
     /// field-shaped, so the result columns come from the query
     /// that produced them, not from the `record` return type).
     pub(crate) setof_cols: Option<Vec<(String, ColType)>>,
+    /// v2.22: per-slot collation names parallel to `params`
+    /// (argument slots first, then one per DECLAREd variable),
+    /// from call-site argument collations and declaration
+    /// COLLATE clauses (PG19 parse_collate.c assignment into
+    /// function bodies). `None` = no collation / the database
+    /// default, which yields in every conflict. Empty when the
+    /// call path supplied no collation information.
+    pub(crate) colls: Vec<Option<String>>,
 }
 
 impl PlpgsqlRun {
@@ -1155,8 +1166,161 @@ impl PlpgsqlRun {
             last_error: None,
             scopes: Vec::new(),
             setof_cols: None,
+            colls: Vec::new(),
         }
     }
+}
+
+/// v2.22: normalize a collation name for propagation bookkeeping:
+/// the database-default collation (and an empty name) is `None` —
+/// it yields in every conflict (PG19 parse_collate.c treats the
+/// default collation as no collation for conflict purposes).
+pub(crate) fn plpgsql_norm_collation(name: &str) -> Option<String> {
+    let n = name.trim().trim_matches('"');
+    if n.is_empty() || n.eq_ignore_ascii_case("default") {
+        None
+    } else {
+        Some(n.to_string())
+    }
+}
+
+/// v2.22: the collation a call-site argument expression carries
+/// into a function body (PG19 parse_collate.c
+/// assign_expr_collations: the argument's derived collation is
+/// assigned to the parameter). Conservative: an outermost COLLATE
+/// wins; a cast to a domain contributes the domain's collation;
+/// a plain cast recurses; anything else contributes none.
+pub(crate) fn arg_expr_collation(db: &crate::storage::Database, e: &Expr) -> Option<String> {
+    match e {
+        Expr::Collate { name, .. } => plpgsql_norm_collation(name),
+        Expr::CastNamed { expr, name } => crate::exec::collate::domain_collation(db, name)
+            .and_then(|c| plpgsql_norm_collation(&c))
+            .or_else(|| arg_expr_collation(db, expr)),
+        Expr::Cast { expr, .. } => arg_expr_collation(db, expr),
+        Expr::NamedArg { expr, .. } => arg_expr_collation(db, expr),
+        _ => None,
+    }
+}
+
+/// v2.22: the collation one side of a body expression derives from
+/// the run's slots: a `$n` Param reads its slot collation, a
+/// COLLATE wrapper overrides, a domain cast contributes the
+/// domain's collation. Anything else derives none (conservative:
+/// table columns are handled by the statement-level derivation
+/// pass in run_select, which sees the bound statement).
+pub(crate) fn plpgsql_expr_collation(
+    db: &crate::storage::Database,
+    run: &PlpgsqlRun,
+    e: &Expr,
+) -> Option<String> {
+    match e {
+        Expr::Param(n) => run
+            .colls
+            .get((*n as usize).saturating_sub(1))
+            .cloned()
+            .flatten(),
+        Expr::Collate { name, .. } => plpgsql_norm_collation(name),
+        Expr::CastNamed { expr, name } => crate::exec::collate::domain_collation(db, name)
+            .and_then(|c| plpgsql_norm_collation(&c))
+            .or_else(|| plpgsql_expr_collation(db, run, expr)),
+        Expr::Cast { expr, .. } => plpgsql_expr_collation(db, run, expr),
+        Expr::NamedArg { expr, .. } => plpgsql_expr_collation(db, run, expr),
+        _ => None,
+    }
+}
+
+/// v2.22: PG19 function-body collation propagation check. Walks a
+/// plpgsql statement's expressions BEFORE parameter substitution
+/// (variables are still `$n` Params with slot collations): a
+/// comparison or LIKE-family operation whose two sides derive
+/// different non-default collations from the slots is the
+/// parse_collate.c deferred implicit conflict, reported at the
+/// consumer as 42P22 (the mylt2 family: a variable declared
+/// `COLLATE "POSIX"` compared against a variable inheriting a
+/// call-site `COLLATE "C"` argument).
+pub(crate) fn plpgsql_collation_check(
+    db: &crate::storage::Database,
+    sel: &crate::sql::SelectStmt,
+    run: &PlpgsqlRun,
+) -> Result<(), ExecError> {
+    if run.colls.iter().all(|c| c.is_none()) {
+        return Ok(());
+    }
+    fn check_sel(
+        db: &crate::storage::Database,
+        sel: &crate::sql::SelectStmt,
+        run: &PlpgsqlRun,
+    ) -> Result<(), ExecError> {
+        let mut roots: Vec<&Expr> = Vec::new();
+        for item in &sel.items {
+            if let crate::sql::SelectItem::Expr { expr, .. } = item {
+                roots.push(expr);
+            }
+        }
+        if let Some(w) = &sel.where_ {
+            roots.push(w);
+        }
+        if let Some(h) = &sel.having {
+            roots.push(h);
+        }
+        for g in &sel.group_by {
+            roots.extend(g.iter());
+        }
+        roots.extend(sel.distinct_on.iter());
+        for t in &sel.order_by {
+            roots.push(&t.expr);
+        }
+        for root in roots {
+            let mut bad: Option<(String, String)> = None;
+            crate::exec::eval::walk_expr(root, &mut |e| {
+                if bad.is_some() {
+                    return;
+                }
+                let (l, r) = match e {
+                    Expr::Cmp { left, right, .. } => (left, right),
+                    Expr::Like { expr, pattern, .. } => (expr, pattern),
+                    Expr::IsDistinctFrom { left, right, .. } => (left, right),
+                    Expr::Between {
+                        expr, low, high, ..
+                    } => {
+                        for side in [low, high] {
+                            let a = plpgsql_expr_collation(db, run, expr);
+                            let b = plpgsql_expr_collation(db, run, side);
+                            if let (Some(a), Some(b)) = (a, b) {
+                                if !a.eq_ignore_ascii_case(&b) {
+                                    bad = Some((a, b));
+                                    return;
+                                }
+                            }
+                        }
+                        return;
+                    }
+                    _ => return,
+                };
+                let a = plpgsql_expr_collation(db, run, l);
+                let b = plpgsql_expr_collation(db, run, r);
+                if let (Some(a), Some(b)) = (a, b) {
+                    if !a.eq_ignore_ascii_case(&b) {
+                        bad = Some((a, b));
+                    }
+                }
+            });
+            if bad.is_some() {
+                return Err(exec_err(
+                    "42P22",
+                    "could not determine which collation to use for string comparison".to_string(),
+                ));
+            }
+        }
+        if let Some(root) = &sel.set_op {
+            check_sel(db, &root.left, run)?;
+            for br in &root.chain {
+                check_sel(db, &br.right, run)?;
+            }
+        }
+        Ok(())
+    }
+    check_sel(db, sel, run)
 }
 
 /// v2.12: a materialized plpgsql portal (OPEN ... FOR / OPEN bound
@@ -1537,6 +1701,9 @@ pub(crate) fn run_plpgsql_select(
             format!("plpgsql {} is not a SELECT", what),
         ));
     };
+    // v2.22: body collation propagation check on the unbound
+    // statement (variables still carry their slot collations).
+    plpgsql_collation_check(&q.eng.db, inner, run)?;
     let mut stmt = Stmt::Select(inner.clone());
     bind_plpgsql_stmt(&mut stmt, pb, run)?;
     let Stmt::Select(bound) = stmt else {
@@ -1997,6 +2164,10 @@ pub(crate) fn eval_plpgsql_query(
     pb: &crate::sql::PlpgsqlBody,
     run: &PlpgsqlRun,
 ) -> Result<SelectOut, ExecError> {
+    // v2.22: body collation propagation check (see run_plpgsql_select).
+    if let Stmt::Select(sel) = stmt {
+        plpgsql_collation_check(&q.eng.db, sel, run)?;
+    }
     let mut bound = stmt.clone();
     bind_plpgsql_stmt(&mut bound, pb, run)?;
     match &bound {
@@ -2344,6 +2515,16 @@ pub(crate) fn init_plpgsql_decls(
             let slot = run.nargs + idx;
             if slot < run.params.len() {
                 run.params[slot] = Some(v);
+            }
+            // v2.22: an undeclared-collation variable inherits its
+            // initializer's collation (PG19 assignment semantics);
+            // a declared COLLATE (seeded by run_plpgsql_body) wins.
+            if d.collation.is_none() && slot < run.colls.len() && run.colls[slot].is_none() {
+                if let Stmt::Select(sel) = def {
+                    if let Some(crate::sql::SelectItem::Expr { expr, .. }) = sel.items.first() {
+                        run.colls[slot] = plpgsql_expr_collation(&q.eng.db, run, expr);
+                    }
+                }
             }
         }
     }
@@ -3470,6 +3651,8 @@ pub(crate) fn run_plpgsql_body(
     fdef: &crate::storage::FuncDef,
     pb: &crate::sql::PlpgsqlBody,
     params: &[Option<Value>],
+    // v2.22: call-site argument collations parallel to `params`.
+    arg_colls: &[Option<String>],
     pending: Option<Rc<RefCell<Vec<(String, u64, Row)>>>>,
 ) -> Result<SelectOut, ExecError> {
     // Run the body one query level deeper (fresh CTE scope, like a
@@ -3509,6 +3692,23 @@ pub(crate) fn run_plpgsql_body(
     run.outputs = fdef_output_defs(fdef);
     run.params
         .extend(std::iter::repeat(None).take(pb.decls.len()));
+    // v2.22: seed the slot collations: arguments from the call
+    // site, declared variables from their COLLATE clauses
+    // (undeclared variables inherit at init_plpgsql_decls).
+    run.colls = vec![None; run.params.len()];
+    for (i, c) in arg_colls.iter().enumerate() {
+        if i < run.colls.len() {
+            run.colls[i] = c.clone();
+        }
+    }
+    for (idx, d) in pb.decls.iter().enumerate() {
+        if let Some(c) = &d.collation {
+            let slot = run.nargs + idx;
+            if slot < run.colls.len() {
+                run.colls[slot] = plpgsql_norm_collation(c);
+            }
+        }
+    }
     init_plpgsql_decls(&mut call_q, scopes, pb, &mut run)?;
     let mark = plpgsql_write_mark(&call_q);
     let flow = match run_plpgsql_stmts(
@@ -3643,6 +3843,8 @@ pub(crate) fn call_user_function(
     scopes: &[Scope],
     fdef: &crate::storage::FuncDef,
     args: &[Value],
+    // v2.22: call-site argument collations parallel to `args`.
+    arg_colls: &[Option<String>],
 ) -> Result<Value, ExecError> {
     if fdef.lang == crate::sql::FuncLang::Internal {
         return eval_internal_function(&fdef.body, args);
@@ -3669,7 +3871,7 @@ pub(crate) fn call_user_function(
                 .unwrap_or_else(|| "postgres".to_string()),
         );
     }
-    let out = run_func_body(q, scopes, fdef, args, volatile_pending(q, fdef));
+    let out = run_func_body(q, scopes, fdef, args, arg_colls, volatile_pending(q, fdef));
     q.priv_role_override = saved_override;
     let out = out?;
     // v1.96: procedures and void functions have no return value —
@@ -3777,7 +3979,7 @@ pub(crate) fn call_table_function(
             format!("internal function \"{}\" cannot be used in FROM", fdef.name),
         ));
     }
-    let out = run_func_body(q, scopes, fdef, args, volatile_pending(q, fdef))?;
+    let out = run_func_body(q, scopes, fdef, args, &[], volatile_pending(q, fdef))?;
     if out.rows.is_empty() && out.columns.is_empty() {
         // STRICT-on-NULL: zero rows.
         return Ok((vec![], vec![], vec![]));
@@ -5307,12 +5509,20 @@ pub(crate) fn eval_func(
                     q.plan_fold_memo.borrow_mut().insert(node, hit.clone());
                     return Ok(hit);
                 }
-                let v = call_user_function(q, scopes, &fdef, &raw_vals)?;
+                let arg_colls: Vec<Option<String>> = args
+                    .iter()
+                    .map(|a| arg_expr_collation(&q.eng.db, a))
+                    .collect();
+                let v = call_user_function(q, scopes, &fdef, &raw_vals, &arg_colls)?;
                 q.immutable_fn_cache.borrow_mut().insert(key, v.clone());
                 q.plan_fold_memo.borrow_mut().insert(node, v.clone());
                 return Ok(v);
             }
-            return call_user_function(q, scopes, &fdef, &raw_vals);
+            let arg_colls: Vec<Option<String>> = args
+                .iter()
+                .map(|a| arg_expr_collation(&q.eng.db, a))
+                .collect();
+            return call_user_function(q, scopes, &fdef, &raw_vals, &arg_colls);
         }
         let mut vals = Vec::with_capacity(raw_vals.len());
         for v in raw_vals {
@@ -8816,7 +9026,7 @@ pub(crate) fn eval_user_srf_vals(
             format!("internal function \"{}\" is not set-returning", fdef.name),
         ));
     }
-    let out = run_func_body(q, scopes, &fdef, vals, volatile_pending(q, &fdef))?;
+    let out = run_func_body(q, scopes, &fdef, vals, &[], volatile_pending(q, &fdef))?;
     let mut result = Vec::with_capacity(out.rows.len());
     for row in out.rows {
         let v = row.iter().next().cloned().unwrap_or(Value::Null);
