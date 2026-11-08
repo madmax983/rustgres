@@ -1403,6 +1403,20 @@ def setup_statements(need_tenk, need_onek, need_road):
         stmts.append("CREATE TABLE onek2 AS SELECT * FROM onek")
     if need_road:
         _load_road_table(stmts)
+    # v2.23: PG's test_setup.sql defines the hand-rolled hash
+    # operator classes every regress suite may name (insert.sql's
+    # hash_parted uses part_test_int4_ops). Until v2.23 the engine
+    # parsed and discarded partition-key opclass names, so the
+    # prologue did not need them; now that opclasses are validated
+    # and honored, the prologue must define them exactly as
+    # test_setup.sql does ($-args in place of the named parameters,
+    # PARALLEL SAFE omitted — neither changes the semantics).
+    stmts += [
+        "CREATE FUNCTION part_hashint4_noop(int4, int8) RETURNS int8 AS $$ select $1 + $2 $$ LANGUAGE sql STRICT IMMUTABLE",
+        "CREATE OPERATOR CLASS part_test_int4_ops FOR TYPE int4 USING hash AS OPERATOR 1 =, FUNCTION 2 part_hashint4_noop(int4, int8)",
+        "CREATE FUNCTION part_hashtext_length(text, int8) RETURNS int8 AS $$ select length(coalesce($1, ''))::int8 $$ LANGUAGE sql STRICT IMMUTABLE",
+        "CREATE OPERATOR CLASS part_test_text_ops FOR TYPE text USING hash AS OPERATOR 1 =, FUNCTION 2 part_hashtext_length(text, int8)",
+    ]
     return stmts
 
 

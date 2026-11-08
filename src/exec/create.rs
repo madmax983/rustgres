@@ -264,7 +264,7 @@ pub(crate) fn exec_create(
         }
         if let Some(p) = &eff_def.partition {
             for k in &p.keys {
-                if let crate::sql::PartitionKeyDef::Expr(e) = k {
+                if let crate::sql::PartitionKeyDef::Expr(e, _) = k {
                     check_expr_cast_usages(eng, ctx, e)?;
                 }
             }

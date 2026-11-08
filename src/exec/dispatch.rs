@@ -741,6 +741,41 @@ pub(crate) fn execute_inner(
             *hashes,
             *merges,
         ),
+        // --- v2.23: operator classes ---
+        Stmt::CreateOperatorClass {
+            name,
+            is_default,
+            for_type,
+            method,
+            eq_operator,
+            eq_leftarg,
+            eq_rightarg,
+            hash_function,
+            hash_arg_types,
+        } => exec_create_operator_class(
+            eng,
+            ctx,
+            name,
+            *is_default,
+            for_type,
+            method,
+            eq_operator.as_deref(),
+            eq_leftarg.as_deref(),
+            eq_rightarg.as_deref(),
+            hash_function.as_deref(),
+            hash_arg_types,
+        ),
+        Stmt::DropOperatorClass {
+            name,
+            method,
+            if_exists,
+            cascade,
+        } => exec_drop_operator_class(eng, ctx, name, method, *if_exists, *cascade),
+        Stmt::AlterOperatorClassSchema {
+            name,
+            method,
+            new_schema,
+        } => exec_alter_operator_class_schema(eng, ctx, name, method, new_schema),
         // --- v1.00: triggers (bounded) ---
         Stmt::CreateTrigger {
             name,

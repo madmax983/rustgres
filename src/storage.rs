@@ -4562,6 +4562,51 @@ pub enum PartBound {
 pub struct PartKey {
     pub col: usize,
     pub expr: Option<crate::sql::Expr>,
+    /// v2.23: the operator class named in the PARTITION BY key
+    /// (e.g. `a part_test_int4_ops`), as written (possibly
+    /// schema-qualified). `None` = the type's default hash opclass.
+    /// For HASH keys it selects the FUNCTION 2 extended hash used
+    /// for routing; for RANGE/LIST keys it is recorded only.
+    pub opclass: Option<String>,
+}
+
+/// v2.23: a user-defined operator class (CREATE OPERATOR CLASS).
+/// One entry per (name, method); `name` is stored as written
+/// (possibly schema-qualified, e.g. `alter1.ctype_hash_ops`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpClassDef {
+    /// Class name as written at CREATE (last component is the
+    /// class name; a leading `schema.` is the owning schema).
+    pub name: String,
+    /// Owning schema (the qualifier of `name`, or "public").
+    pub schema: String,
+    /// The type the class is FOR (as written, e.g. `int4`,
+    /// `alter1.ctype`).
+    pub for_type: String,
+    /// Access method: `hash` or `btree` (lowercase, as written).
+    pub method: String,
+    /// CREATE ... DEFAULT flag.
+    pub is_default: bool,
+    /// OPERATOR 1: the equality operator (name as written, e.g.
+    /// `=`, `===`, `alter1.=`), with its argument types when the
+    /// class item spelled them out.
+    pub eq_operator: Option<String>,
+    pub eq_leftarg: Option<String>,
+    pub eq_rightarg: Option<String>,
+    /// FUNCTION 2: the extended hash function (name as written)
+    /// and its declared argument types, e.g.
+    /// `part_hashint4_noop(int4, int8)`.
+    pub hash_function: Option<String>,
+    pub hash_arg_types: Vec<String>,
+    /// Creating role.
+    pub owner: String,
+}
+
+impl OpClassDef {
+    /// The unqualified class name (last component of `name`).
+    pub fn base_name(&self) -> &str {
+        self.name.rsplit('.').next().unwrap_or(&self.name)
+    }
 }
 
 /// Partition metadata for a table. A partitioned parent has `method` +
@@ -6084,6 +6129,14 @@ pub struct Database {
     /// single) definitions for its arities. Transactional, WAL-logged
     /// and checkpointed like functions.
     pub operators: HashMap<String, Vec<OperDef>, FxBuildHasher>,
+    /// v2.23: user-defined operator classes (CREATE OPERATOR
+    /// CLASS). A Vec (not a map) because the identity is
+    /// (name, method) and names may be schema-qualified.
+    /// Transactional via the statement undo log
+    /// (`WriteOp::OpClassSet` carries the previous entry);
+    /// checkpointed at CHKPT_VERSION 32 and WAL-logged (record
+    /// tag 35) — routing-critical state, see the WriteOp docs.
+    pub opclasses: Vec<OpClassDef>,
     /// v1.38: user-defined casts by (source, target) canonical type
     /// name. Only the binary (`WITHOUT FUNCTION`) method is supported.
     /// Transactional via the statement undo log (`WriteOp::CreateCast`).
@@ -6504,6 +6557,8 @@ impl Database {
             // v0.86: user-defined functions and operators.
             functions: HashMap::default(),
             operators: HashMap::default(),
+            // v2.23: no user-defined operator classes at bootstrap.
+            opclasses: Vec::new(),
             // v1.38: user-defined casts (in-memory; see the field docs).
             casts: HashMap::default(),
             // v0.37: table OIDs for pg_class.
@@ -8597,6 +8652,19 @@ pub enum WriteOp {
         name: String,
         prev: Vec<OperDef>,
     },
+    // --- v2.23: CREATE/DROP/ALTER OPERATOR CLASS. Operator
+    // classes live in `Database::opclasses` (not the versioned
+    // catalog); the op carries the previous entry for the
+    // (name, method) identity so undo restores it exactly.
+    // Checkpointed (CHKPT 32) AND WAL-logged (record tag 35):
+    // the registry is routing-critical, so a checkpoint-only
+    // copy lost across a crash restart would silently degrade
+    // custom-opclass hash routing to the default hash.
+    OpClassSet {
+        name: String,
+        method: String,
+        prev: Option<OpClassDef>,
+    },
     // --- v1.38: CREATE CAST. Casts live in `Database::casts` (not the
     // versioned catalog and not WAL-logged — see the field docs); the
     // op carries the previous entry so statement-undo / ROLLBACK
@@ -9008,6 +9076,16 @@ pub fn undo_write_op(eng: &mut Engine, owns: &[u64], op: &WriteOp) {
                 eng.db.operators.remove(name);
             } else {
                 eng.db.operators.insert(name.clone(), prev.clone());
+            }
+        }
+        // --- v2.23: operator-class DDL undo. Restore the previous
+        // (name, method) entry, or remove it when there was none.
+        WriteOp::OpClassSet { name, method, prev } => {
+            eng.db
+                .opclasses
+                .retain(|c| !(c.name == *name && c.method == *method));
+            if let Some(def) = prev {
+                eng.db.opclasses.push(def.clone());
             }
         }
         // --- v1.38: cast DDL undo. Restore the previous entry, or

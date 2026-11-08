@@ -215,6 +215,19 @@ pub enum WalRecord {
         triggers: String,
         xmin: u64,
     },
+    /// v2.23 (RGSWAL34): an operator-class registry change (CREATE
+    /// / DROP OPERATOR CLASS, ALTER ... SET SCHEMA). Carries the
+    /// complete post-change entry for (name, method); `None`
+    /// removes it. The registry is routing-critical state (a lost
+    /// class silently degrades custom-opclass hash routing to the
+    /// default hash), so unlike rules it is WAL-logged, not
+    /// checkpoint-only.
+    OpClassSet {
+        name: String,
+        method: String,
+        def: Option<crate::storage::OpClassDef>,
+        xmin: u64,
+    },
     CreateSequence {
         name: String,
         seq: WalSequence,

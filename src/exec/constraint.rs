@@ -1505,12 +1505,30 @@ fn cascade_dest_leaf(
                 &root_t.columns,
                 &root_row,
             )?;
+            // v2.23: HASH roots judge by the PG row hash.
+            let row_hash = if root_pinfo.method == crate::storage::PartMethod::Hash {
+                crate::exec::partition::partition_row_hash(
+                    eng,
+                    ctx,
+                    &root_pinfo,
+                    &root_t.columns,
+                    &key,
+                )
+                .ok()
+            } else {
+                None
+            };
             let fits = leaf
                 .partition
                 .as_ref()
                 .and_then(|p| p.bound.as_ref())
                 .is_some_and(|b| {
-                    crate::exec::partition::bound_contains(&root_pinfo.method, b, &key)
+                    crate::exec::partition::bound_contains_hash(
+                        &root_pinfo.method,
+                        b,
+                        &key,
+                        row_hash,
+                    )
                 });
             if fits {
                 table.to_string()

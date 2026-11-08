@@ -831,6 +831,9 @@ impl Parser {
                 Token::Ident(s) if s == "materialized" => self.parse_alter_view(true),
                 Token::Ident(s) if s == "sequence" => self.parse_alter_sequence(),
                 Token::Ident(s) if s == "collation" => self.parse_alter_collation(),
+                // v2.23: ALTER OPERATOR CLASS/FAMILY name USING
+                // method SET SCHEMA s.
+                Token::Ident(s) if s == "operator" => self.parse_alter_operator_class(),
                 Token::Ident(s) if s == "domain" => self.parse_alter_domain(),
                 Token::Ident(s) if s == "type" => self.parse_alter_type(),
                 Token::Ident(s) if s == "function" => self.parse_alter_function(),
@@ -1518,6 +1521,12 @@ impl Parser {
         }
         if matches!(self.peek(), Token::Ident(s) if s == "procedure") {
             return self.parse_create_procedure();
+        }
+        // v2.23: CREATE OPERATOR CLASS ... (peek2 = "class").
+        if matches!(self.peek(), Token::Ident(s) if s == "operator")
+            && matches!(self.peek2(), Token::Ident(s) if s == "class")
+        {
+            return self.parse_create_operator_class();
         }
         if matches!(self.peek(), Token::Ident(s) if s == "operator") {
             return self.parse_create_operator();
@@ -3141,32 +3150,44 @@ impl Parser {
             // or bare columns. A bare (optionally opclass-qualified) column
             // stays a column key; anything else becomes an expression key.
             let e = self.parse_or()?;
-            match e {
-                Expr::Column { table: None, name } => {
-                    // Optional operator class (e.g. `a part_test_int4_ops`):
-                    // parsed and ignored (PG19 uses it for hash opclasses;
-                    // our hash uses the value directly).
-                    if matches!(self.peek(), Token::Ident(s) if s != "collate") {
-                        // Peek: is it followed by ',' or ')'? If so it's an
-                        // opclass name, not the next key. We can't easily
-                        // lookahead two tokens, so consume it only if the
-                        // next token after it is ',' or ')'.
-                        let save = self.pos;
-                        let _opclass = self.expect_ident()?;
-                        match self.peek() {
-                            Token::Comma | Token::RParen => {}
-                            _ => {
-                                // Not an opclass — rewind (it was the next key,
-                                // but keys are comma-separated so this means
-                                // a syntax error; let the ','/' )' check fail).
-                                self.pos = save;
-                            }
+            // v2.23: an optional operator class may follow the key
+            // (`a part_test_int4_ops`, `(expr) some_ops`), possibly
+            // schema-qualified. It is an identifier (or qualified
+            // name) immediately followed by ',' or ')'. Capture it:
+            // for HASH keys it selects the opclass FUNCTION 2 hash.
+            let mut opclass: Option<String> = None;
+            if matches!(self.peek(), Token::Ident(s) if s != "collate") {
+                let save = self.pos;
+                if let Ok(first) = self.expect_ident() {
+                    let mut cand = first;
+                    // Schema-qualified opclass: `sch.ops`.
+                    if matches!(self.peek(), Token::Dot) {
+                        let save2 = self.pos;
+                        self.next();
+                        if let Ok(second) = self.expect_ident() {
+                            cand = format!("{}.{}", cand, second);
+                        } else {
+                            self.pos = save2;
                         }
                     }
-                    keys.push(PartitionKeyDef::Column(name));
+                    match self.peek() {
+                        Token::Comma | Token::RParen => opclass = Some(cand),
+                        _ => {
+                            // Not an opclass — rewind (it was the next
+                            // key, but keys are comma-separated so this
+                            // means a syntax error; let the ','/' )'
+                            // check fail).
+                            self.pos = save;
+                        }
+                    }
+                }
+            }
+            match e {
+                Expr::Column { table: None, name } => {
+                    keys.push(PartitionKeyDef::Column(name, opclass));
                 }
                 other => {
-                    keys.push(PartitionKeyDef::Expr(other));
+                    keys.push(PartitionKeyDef::Expr(other, opclass));
                 }
             }
             match self.next() {
@@ -4316,7 +4337,20 @@ impl Parser {
                 // CreateFunctionStmt); unknown languages fail at CREATE
                 // with 42883 in the executor (proclang.c
                 // get_language_oid), not here.
-                lang_name = Some(self.expect_ident()?);
+                // v2.23: PG19 also accepts a string literal here
+                // (Sconst in gram.y's function definition: LANGUAGE
+                // 'plpgsql' — update.sql's dummy_hashint4 shape,
+                // which failed 42601 at base).
+                lang_name = Some(match self.next() {
+                    Token::Ident(s) | Token::QIdent(s) => s,
+                    Token::Str(s) => s.to_string(),
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected language name, found {:?}",
+                            other
+                        )));
+                    }
+                });
             } else if self.eat_keyword("immutable") {
                 volatility = FuncVolatility::Immutable;
             } else if self.eat_keyword("stable") {
@@ -4549,7 +4583,18 @@ impl Parser {
         let mut security_definer = false;
         loop {
             if self.eat_keyword("language") {
-                lang_name = Some(self.expect_ident()?);
+                // v2.23: string-literal language names, as in
+                // parse_create_function.
+                lang_name = Some(match self.next() {
+                    Token::Ident(s) | Token::QIdent(s) => s,
+                    Token::Str(s) => s.to_string(),
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected language name, found {:?}",
+                            other
+                        )));
+                    }
+                });
             } else if self.eat_keyword("security") {
                 if self.eat_keyword("definer") {
                     security_definer = true;
@@ -7074,7 +7119,16 @@ impl Parser {
     /// Parse an operator name: `=` or a `?`-led `Token::Op`.
     pub(crate) fn parse_operator_name(&mut self) -> Result<String, SqlError> {
         match self.next() {
-            Token::Eq => Ok("=".to_string()),
+            // v2.23: consecutive Eq tokens form multi-= operators
+            // (`==`, `===` — the lexer emits one Eq per '=').
+            Token::Eq => {
+                let mut name = "=".to_string();
+                while matches!(self.peek(), Token::Eq) {
+                    self.next();
+                    name.push('=');
+                }
+                Ok(name)
+            }
             // v1.96: symbolic operator tokens beyond Op (e.g. `!!`).
             Token::BangBang => Ok("!!".to_string()),
             // v1.96: multi-char operators from paired tokens.
@@ -7259,11 +7313,217 @@ impl Parser {
         })
     }
 
+    /// v2.23: one operator reference inside an operator-class item:
+    /// `[schema.]opname [ ( type [, ...] | NONE [, ...] ) ]`. The
+    /// operator name may itself be qualified (`alter1.=`), in which
+    /// case the returned name keeps the qualifier.
+    pub(crate) fn parse_opclass_operator_ref(
+        &mut self,
+    ) -> Result<(String, Option<String>, Option<String>), SqlError> {
+        // Optional schema qualifier: Ident '.' followed by the
+        // operator token. A bare operator has no leading Ident
+        // (except Op tokens, handled by parse_operator_name).
+        let mut name =
+            if matches!(self.peek(), Token::Ident(_)) && matches!(self.peek2(), Token::Dot) {
+                let schema = self.expect_ident()?;
+                self.next(); // '.'
+                format!("{}.{}", schema, self.parse_operator_name()?)
+            } else {
+                self.parse_operator_name()?
+            };
+        let mut leftarg = None;
+        let mut rightarg = None;
+        if matches!(self.peek(), Token::LParen) {
+            self.next();
+            let mut types = Vec::new();
+            loop {
+                if matches!(self.peek(), Token::Ident(s) if s == "none") {
+                    self.next();
+                    types.push(None);
+                } else {
+                    types.push(Some(self.parse_func_type_name()?));
+                }
+                match self.next() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')' in operator argument types, found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+            if types.len() == 2 {
+                leftarg = types[0].clone();
+                rightarg = types[1].clone();
+            } else if types.len() == 1 {
+                rightarg = types[0].clone();
+            }
+            let _ = &mut name;
+        }
+        Ok((name, leftarg, rightarg))
+    }
+
+    /// v2.23: `CREATE OPERATOR CLASS name [DEFAULT] FOR TYPE type
+    /// USING method AS item [, ...]` (PG19 DefineOpClassStmt). Items:
+    /// `OPERATOR n opspec`, `FUNCTION n fname (types)`,
+    /// `STORAGE type`. Only OPERATOR 1 and FUNCTION 2 are modeled.
+    pub(crate) fn parse_create_operator_class(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("operator")?;
+        self.expect_keyword("class")?;
+        let name = self.expect_qualified_ident()?;
+        let is_default = self.eat_keyword("default");
+        self.expect_keyword("for")?;
+        self.expect_keyword("type")?;
+        // FOR TYPE may be schema-qualified (alter1.ctype) or a
+        // multiword builtin; expect_qualified_ident covers the
+        // qualified/plain cases in the corpus.
+        let for_type = if matches!(self.peek(), Token::Ident(s) if s == "double") {
+            self.next();
+            self.expect_keyword("precision")?;
+            "double precision".to_string()
+        } else {
+            self.expect_qualified_ident()?
+        };
+        self.expect_keyword("using")?;
+        let method = self.expect_ident()?;
+        self.expect_keyword("as")?;
+        let mut eq_operator = None;
+        let mut eq_leftarg = None;
+        let mut eq_rightarg = None;
+        let mut hash_function = None;
+        let mut hash_arg_types = Vec::new();
+        loop {
+            if self.eat_keyword("operator") {
+                let num = self.expect_u32()?;
+                let (opname, la, ra) = self.parse_opclass_operator_ref()?;
+                if num == 1 {
+                    eq_operator = Some(opname);
+                    eq_leftarg = la;
+                    eq_rightarg = ra;
+                }
+            } else if self.eat_keyword("function") {
+                let num = self.expect_u32()?;
+                let fname = self.expect_qualified_ident()?;
+                self.expect(Token::LParen, "'('")?;
+                let mut types = Vec::new();
+                if *self.peek() != Token::RParen {
+                    loop {
+                        types.push(self.parse_func_type_name()?);
+                        match self.next() {
+                            Token::Comma => continue,
+                            Token::RParen => break,
+                            other => {
+                                return Err(err(format!(
+                                    "syntax error: expected ',' or ')' in FUNCTION argument types, found {:?}",
+                                    other
+                                )));
+                            }
+                        }
+                    }
+                } else {
+                    self.next();
+                }
+                if num == 2 {
+                    hash_function = Some(fname);
+                    hash_arg_types = types;
+                }
+            } else if self.eat_keyword("storage") {
+                let _ = self.parse_func_type_name()?;
+            } else {
+                return Err(err(format!(
+                    "syntax error: expected OPERATOR, FUNCTION or STORAGE in operator class definition, found {:?}",
+                    self.peek()
+                )));
+            }
+            match self.next() {
+                Token::Comma => continue,
+                Token::Semi | Token::EOF => break,
+                other => {
+                    // The statement splitter may hand us the bare
+                    // statement; a stray token here is a syntax error
+                    // unless it starts the next clause (none exist
+                    // for this statement).
+                    return Err(err(format!(
+                        "syntax error: expected ',' in operator class definition, found {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+        Ok(Stmt::CreateOperatorClass {
+            name,
+            is_default,
+            for_type,
+            method,
+            eq_operator,
+            eq_leftarg,
+            eq_rightarg,
+            hash_function,
+            hash_arg_types,
+        })
+    }
+
+    /// v2.23: `DROP OPERATOR CLASS [IF EXISTS] name USING method
+    /// [CASCADE|RESTRICT]` (PG19 DropOpClassStmt).
+    pub(crate) fn parse_drop_operator_class(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("operator")?;
+        self.expect_keyword("class")?;
+        let if_exists = if self.eat_keyword("if") {
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.expect_qualified_ident()?;
+        self.expect_keyword("using")?;
+        let method = self.expect_ident()?;
+        let cascade = self.parse_cascade_opt()?;
+        Ok(Stmt::DropOperatorClass {
+            name,
+            method,
+            if_exists,
+            cascade,
+        })
+    }
+
+    /// v2.23: `ALTER OPERATOR CLASS|FAMILY name USING method SET
+    /// SCHEMA schema` (PG19 AlterOpFamilyStmt's schema form — the
+    /// only form in the regress corpus). Other ALTER OPERATOR
+    /// forms (RENAME TO / OWNER TO) parse to the same statement
+    /// shape only for SET SCHEMA; the rest stay 42601.
+    pub(crate) fn parse_alter_operator_class(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("operator")?;
+        if !self.eat_keyword("class") {
+            self.expect_keyword("family")?;
+        }
+        let name = self.expect_qualified_ident()?;
+        self.expect_keyword("using")?;
+        let method = self.expect_ident()?;
+        self.expect_keyword("set")?;
+        self.expect_keyword("schema")?;
+        let new_schema = self.expect_ident()?;
+        Ok(Stmt::AlterOperatorClassSchema {
+            name,
+            method,
+            new_schema,
+        })
+    }
+
     /// v0.86: an operator name inside CREATE OPERATOR options
     /// (`=` or a `?`-led name).
     pub(crate) fn parse_oper_name(&mut self) -> Result<String, SqlError> {
         match self.next() {
-            Token::Eq => Ok("=".to_string()),
+            // v2.23: `==` / `===` from consecutive Eq tokens.
+            Token::Eq => {
+                let mut name = "=".to_string();
+                while matches!(self.peek(), Token::Eq) {
+                    self.next();
+                    name.push('=');
+                }
+                Ok(name)
+            }
             Token::BangBang => Ok("!!".to_string()),
             Token::Shr => {
                 if matches!(self.peek(), Token::Gt) {
@@ -15939,6 +16199,12 @@ impl Parser {
         if matches!(self.peek(), Token::Ident(s) if s == "function" || s == "procedure" || s == "routine")
         {
             return self.parse_drop_function();
+        }
+        // v2.23: DROP OPERATOR CLASS [IF EXISTS] name USING method.
+        if matches!(self.peek(), Token::Ident(s) if s == "operator")
+            && matches!(self.peek2(), Token::Ident(s) if s == "class")
+        {
+            return self.parse_drop_operator_class();
         }
         // v0.86: DROP OPERATOR [IF EXISTS] name (lefttype, righttype)
         // (PG19; use NONE for a missing side).

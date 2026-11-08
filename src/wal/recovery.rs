@@ -65,6 +65,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
         | WalRecord::AlterTable { xmin, .. }
         | WalRecord::CreateView { xmin, .. }
         | WalRecord::AlterViewTriggers { xmin, .. }
+        | WalRecord::OpClassSet { xmin, .. }
         | WalRecord::DropView { xmax: xmin, .. }
         | WalRecord::CreateSequence { xmin, .. }
         | WalRecord::DropSequence { xmax: xmin, .. }
@@ -1060,6 +1061,21 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 }
             }
         }
+        WalRecord::OpClassSet {
+            name,
+            method,
+            def,
+            ..
+        } => {
+            // v2.23: upsert the post-change entry for
+            // (name, method); None removes it.
+            eng.db
+                .opclasses
+                .retain(|c| !(c.name == *name && c.method == *method));
+            if let Some(d) = def {
+                eng.db.opclasses.push(d.clone());
+            }
+        }
         WalRecord::CreateSequence { name, seq, xmin } => {
             eng.db
                 .sequences
@@ -1571,6 +1587,28 @@ pub fn records_for_commit(
                 // v2.19: rules are checkpoint-only (CHKPT v31),
                 // never WAL-logged — same durability class as the
                 // v2.18 view column ACLs.
+            }
+            WriteOp::OpClassSet { name, method, .. } => {
+                // v2.23: emit the registry's CURRENT entry for
+                // (name, method) — the in-place mutation is
+                // already applied to the live registry at
+                // conversion time (the AlterViewTriggers pattern).
+                // The registry is routing-critical: a copy lost
+                // across a crash restart silently degrades
+                // custom-opclass hash routing to the default hash,
+                // so it is WAL-logged, not checkpoint-only.
+                let def = eng
+                    .db
+                    .opclasses
+                    .iter()
+                    .find(|c| c.name == *name && c.method == *method)
+                    .cloned();
+                out.push(WalRecord::OpClassSet {
+                    name: name.clone(),
+                    method: method.clone(),
+                    def,
+                    xmin: own,
+                });
             }
             WriteOp::ViewTriggers { name, .. } => {
                 // v2.14: emit the view's CURRENT trigger list (the

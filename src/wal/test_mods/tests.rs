@@ -800,7 +800,11 @@ fn v180_sample_partition() -> crate::storage::PartitionInfo {
     use crate::storage::{PartBound, PartKey, PartMethod, PartitionInfo, RangeBound};
     PartitionInfo {
         method: PartMethod::Range,
-        key: vec![PartKey { col: 1, expr: None }],
+        key: vec![PartKey {
+            col: 1,
+            expr: None,
+            opclass: None,
+        }],
         bound: Some(PartBound::Range {
             lower: vec![RangeBound::Val(Value::Int(0))],
             upper: vec![RangeBound::Max],

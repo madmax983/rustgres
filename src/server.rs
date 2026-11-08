@@ -4864,6 +4864,8 @@ fn auto_vacuum(engine: &mut Engine, writes: &[WriteOp]) {
             | WriteOp::ViewTriggers { .. }
             // v2.19: rule DDL likewise leaves no dead row versions.
             | WriteOp::RulesSet { .. }
+            // v2.23: operator-class DDL likewise.
+            | WriteOp::OpClassSet { .. }
             // v0.22: temp tables are single-version; their DDL leaves
             // no dead versions to reap. Shell types likewise.
             | WriteOp::CreateTempTable { .. }

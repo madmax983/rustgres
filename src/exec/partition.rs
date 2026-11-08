@@ -46,6 +46,16 @@ pub(crate) fn build_partition_info(
             .bound
             .as_ref()
             .ok_or_else(|| exec_err("42601", "PARTITION OF requires FOR VALUES".to_string()))?;
+        // v2.23: PG19 parse_utilcmd.c — a hash-partitioned table
+        // may not have a default partition (42P16).
+        if pinfo.method == crate::storage::PartMethod::Hash
+            && matches!(bound_def, PartBoundDef::Default)
+        {
+            return Err(exec_err(
+                "42P16",
+                "a hash-partitioned table may not have a default partition".to_string(),
+            ));
+        }
         let bound = convert_part_bound(eng, ctx, bound_def, parent, &pinfo)?;
         // Validate the bound against siblings (no overlap).
         check_bound_no_overlap(eng, ctx, parent_name, &pinfo, &bound, name)?;
@@ -61,7 +71,7 @@ pub(crate) fn build_partition_info(
             let mut key = Vec::new();
             for kd in &def.keys {
                 match kd {
-                    PartitionKeyDef::Column(col) => {
+                    PartitionKeyDef::Column(col, opclass) => {
                         let idx = columns.iter().position(|(n, _)| n == col).ok_or_else(|| {
                             exec_err(
                                 "42703",
@@ -74,14 +84,29 @@ pub(crate) fn build_partition_info(
                         key.push(PartKey {
                             col: idx,
                             expr: None,
+                            opclass: opclass.clone(),
                         });
                     }
-                    PartitionKeyDef::Expr(e) => {
+                    PartitionKeyDef::Expr(e, opclass) => {
                         key.push(PartKey {
                             col: usize::MAX,
                             expr: Some(e.clone()),
+                            opclass: opclass.clone(),
                         });
                     }
+                }
+            }
+            // v2.23: a HASH sub-partition key's opclasses resolve
+            // like a root's (unknown class -> 42704).
+            if def.method == crate::storage::PartMethod::Hash {
+                for (kd, pk) in def.keys.iter().zip(key.iter()) {
+                    let ty = if pk.expr.is_none() {
+                        Some(columns[pk.col].1)
+                    } else {
+                        None
+                    };
+                    let _ = kd;
+                    super::opclass::validate_key_opclass(eng, pk, ty)?;
                 }
             }
             (def.method, key)
@@ -103,7 +128,7 @@ pub(crate) fn build_partition_info(
         let mut key = Vec::new();
         for kd in &def.keys {
             match kd {
-                PartitionKeyDef::Column(col) => {
+                PartitionKeyDef::Column(col, opclass) => {
                     let idx = columns.iter().position(|(n, _)| n == col).ok_or_else(|| {
                         exec_err(
                             "42703",
@@ -113,14 +138,33 @@ pub(crate) fn build_partition_info(
                     key.push(PartKey {
                         col: idx,
                         expr: None,
+                        opclass: opclass.clone(),
                     });
                 }
-                PartitionKeyDef::Expr(e) => {
+                PartitionKeyDef::Expr(e, opclass) => {
                     key.push(PartKey {
                         col: usize::MAX,
                         expr: Some(e.clone()),
+                        opclass: opclass.clone(),
                     });
                 }
+            }
+        }
+        // v2.23: for a HASH root, every named opclass must resolve
+        // (PG19 42704 for an unknown class; a class whose type does
+        // not match the key column's type is 42P16-ish — PG reports
+        // "operator class ... does not exist for access method" /
+        // type mismatch at parse analysis; the census only needs
+        // the unknown-name error). RANGE/LIST keys accept + record
+        // any class (btree semantics are not wired).
+        if def.method == crate::storage::PartMethod::Hash {
+            for pk in &key {
+                let ty = if pk.expr.is_none() {
+                    Some(columns[pk.col].1)
+                } else {
+                    None
+                };
+                super::opclass::validate_key_opclass(eng, pk, ty)?;
             }
         }
         let info = PartitionInfo {
@@ -273,10 +317,18 @@ pub(crate) fn convert_part_bound(
             })
         }
         PartBoundDef::Hash { modulus, remainder } => {
-            if *modulus == 0 || *remainder >= *modulus {
+            // v2.23: PG19 parse_utilcmd.c messages (42P16).
+            if *modulus == 0 {
                 return Err(exec_err(
-                    "42601",
-                    "invalid MODULUS/REMAINDER for hash partition".to_string(),
+                    "42P16",
+                    "modulus for hash partition must be an integer value greater than zero"
+                        .to_string(),
+                ));
+            }
+            if *remainder >= *modulus {
+                return Err(exec_err(
+                    "42P16",
+                    "remainder for hash partition must be less than modulus".to_string(),
                 ));
             }
             Ok(PartBound::Hash {
@@ -367,6 +419,44 @@ pub(crate) fn check_bound_no_overlap(
     bound: &PartBound,
     new_name: &str,
 ) -> Result<(), ExecError> {
+    // v2.23: PG19's hash modulus factor rule (partbounds.c
+    // check_new_partition_bound): every modulus must be a factor
+    // of the next larger modulus — for any sibling pair, one
+    // modulus must divide the other (42P17).
+    if let (PartMethod::Hash, PartBound::Hash { modulus: nm, .. }) = (&pinfo.method, bound) {
+        for child_name in &pinfo.children {
+            if child_name == new_name {
+                continue;
+            }
+            let Some(PartBound::Hash { modulus: sm, .. }) = eng
+                .db
+                .find_table(child_name, ctx.snap, &ctx.all_xids, ctx.session)
+                .and_then(|child| child.partition.as_ref())
+                .and_then(|cinfo| cinfo.bound.as_ref())
+            else {
+                continue;
+            };
+            if nm % sm != 0 && sm % nm != 0 {
+                let detail = if nm < sm {
+                    format!(
+                        "The new modulus {} is not a factor of {}, the modulus of existing partition \"{}\".",
+                        nm, sm, child_name
+                    )
+                } else {
+                    format!(
+                        "The new modulus {} is not divisible by {}, the modulus of existing partition \"{}\".",
+                        nm, sm, child_name
+                    )
+                };
+                return Err(exec_err_detail(
+                    "42P17",
+                    "every hash partition modulus must be a factor of the next larger modulus"
+                        .to_string(),
+                    detail,
+                ));
+            }
+        }
+    }
     for child_name in &pinfo.children {
         // v1.80: skip a stale link (child gone, or no longer a bounded
         // partition) like routing does, instead of panicking. v1.79's
@@ -463,9 +553,20 @@ pub(crate) fn bounds_overlap(method: &PartMethod, a: &PartBound, b: &PartBound) 
                 remainder: br,
             },
         ) => {
-            // PG requires the same modulus for all hash partitions;
-            // overlap iff remainders are equal.
-            am == bm && ar == br
+            // v2.23: the residue classes {x = ar (mod am)} and
+            // {x = br (mod bm)} intersect iff ar = br modulo
+            // gcd(am, bm) (PG19's indexes[] overlap test reduces
+            // to this once the factor rule holds).
+            fn gcd(mut a: u32, mut b: u32) -> u32 {
+                while b != 0 {
+                    let t = b;
+                    b = a % b;
+                    a = t;
+                }
+                a.max(1)
+            }
+            let g = gcd(*am, *bm);
+            ar % g == br % g
         }
         _ => false,
     }
@@ -725,6 +826,16 @@ pub(crate) fn attach_partition(
                 format!("invalid bound specification for a {} partition", kind),
             ));
         }
+        // v2.23: PG19 — a hash-partitioned table may not have a
+        // default partition (parse_utilcmd.c, 42P16).
+        if pinfo.method == crate::storage::PartMethod::Hash
+            && matches!(bound_def, PartBoundDef::Default)
+        {
+            return Err(exec_err(
+                "42P16",
+                "a hash-partitioned table may not have a default partition".to_string(),
+            ));
+        }
         // Extra child columns are rejected (42804); missing ones
         // are caught by the compatibility loop below.
         for (cname, _) in &child.columns {
@@ -879,18 +990,46 @@ pub(crate) fn attach_partition(
     {
         // Copy the rows out; the borrow ends before key evaluation,
         // which needs `&mut eng`.
-        let rows: Vec<Row> = {
+        // v2.23: an intermediate (sub-partitioned) child's rows live
+        // in its descendant leaves — PG scans the whole subtree
+        // (the alter_table hpart_5 shape: the violating row sits in
+        // hpart_5_a, not in hpart_5 itself). Each row travels with
+        // its own table's column list for the remap to parent order.
+        let mut rows: Vec<(Vec<(String, ColType)>, Row)> = Vec::new();
+        {
             let child = eng
                 .db
                 .find_table(child_name, ctx.snap, &ctx.all_xids, ctx.session)
                 .expect("child still visible");
-            child
+            for rv in child
                 .rows
                 .iter()
                 .filter(|rv| row_visible(rv, ctx.snap, &ctx.all_xids))
-                .map(|rv| rv.values.clone())
-                .collect()
-        };
+            {
+                rows.push((child_cols.clone(), rv.values.clone()));
+            }
+            let leaves =
+                collect_partition_leaves(&eng.db, child_name, ctx.snap, ctx.own, ctx.session);
+            for leaf in leaves {
+                if leaf == child_name {
+                    continue;
+                }
+                let Some(lt) = eng
+                    .db
+                    .find_table(&leaf, ctx.snap, &ctx.all_xids, ctx.session)
+                else {
+                    continue;
+                };
+                let lcols = lt.columns.clone();
+                for rv in lt
+                    .rows
+                    .iter()
+                    .filter(|rv| row_visible(rv, ctx.snap, &ctx.all_xids))
+                {
+                    rows.push((lcols.clone(), rv.values.clone()));
+                }
+            }
+        }
         // v2.06: for a DEFAULT attach the converted bound is a dummy
         // that contains nothing; PG's rule is the inverse — every
         // existing row must fall outside every SIBLING bound (a row
@@ -918,18 +1057,24 @@ pub(crate) fn attach_partition(
         } else {
             Vec::new()
         };
-        for values in &rows {
-            // Map child row to parent column order, then check bound.
+        for (row_cols, values) in &rows {
+            // Map the row to parent column order, then check bound.
             // v0.70: expression partition keys are evaluated for real
             // (was NULL), via the shared key evaluator.
-            let prow = remap_row_to_parent(&child_cols, &parent_cols, values);
+            let prow = remap_row_to_parent(row_cols, &parent_cols, values);
             let key = eval_table_part_key(eng, ctx, parent_name, &pinfo, &parent_cols, &prow)?;
+            // v2.23: HASH attach validation uses the PG row hash.
+            let row_hash = if pinfo.method == crate::storage::PartMethod::Hash {
+                Some(partition_row_hash(eng, ctx, &pinfo, &parent_cols, &key)?)
+            } else {
+                None
+            };
             let row_ok = if matches!(bound_def, PartBoundDef::Default) {
                 sibling_bounds
                     .iter()
-                    .all(|sb| !bound_contains(&pinfo.method, sb, &key))
+                    .all(|sb| !bound_contains_hash(&pinfo.method, sb, &key, row_hash))
             } else {
-                bound_contains(&pinfo.method, &bound, &key)
+                bound_contains_hash(&pinfo.method, &bound, &key, row_hash)
             };
             if !row_ok {
                 return Err(exec_err(
@@ -1449,27 +1594,477 @@ pub(crate) fn bound_contains(method: &PartMethod, bound: &PartBound, key: &[Valu
         (PartMethod::Range, PartBound::Range { lower, upper }) => {
             range_bound_contains(lower, upper, key)
         }
-        (PartMethod::Hash, PartBound::Hash { modulus, remainder }) => {
-            if key.len() == 1 {
-                hash_value(&key[0], *modulus) == *remainder
-            } else {
-                false
-            }
+        (PartMethod::Hash, PartBound::Hash { .. }) => {
+            // v2.23: HASH membership needs the PG row hash, which
+            // can require calling a user hash function — it cannot
+            // be computed from the key alone. Callers with engine
+            // access use `bound_contains_hash`; reaching this arm
+            // means a pure call site judged a hash bound, which is
+            // a programming error — fail closed (no match).
+            false
         }
         _ => false,
     }
 }
 
-/// v0.69: PG's hashint4-like hash for partitioning: the corpus routes
-/// by `a % 4`, so we use the integer value directly (non-negative mod).
-pub(crate) fn hash_value(v: &Value, modulus: u32) -> u32 {
-    let i: i64 = match v {
-        Value::SmallInt(x) => *x as i64,
-        Value::Int(x) => *x,
-        Value::BigInt(x) => *x,
-        _ => 0,
-    };
-    ((i % modulus as i64 + modulus as i64) % modulus as i64) as u32
+// ------------------------------------------------------------------
+// v2.23: the PG hash-partition algorithm (partitioning/partbounds.c
+// compute_partition_hash_value, include/catalog/partition.h,
+// common/hashfn.c). rowHash starts at 0; each non-NULL key value is
+// hashed with the key's opclass FUNCTION 2 (or the type's default
+// extended hash) under HASH_PARTITION_SEED, and combined with
+// hash_combine64. The bound matches iff rowHash % modulus ==
+// remainder. An all-NULL key hashes to 0.
+// ------------------------------------------------------------------
+
+pub(crate) const HASH_PARTITION_SEED: u64 = 0x7A5B22367996DCFD;
+
+pub(crate) fn hash_combine64(a: u64, b: u64) -> u64 {
+    a ^ b
+        .wrapping_add(0x49a0f4dd15e5a8e3)
+        .wrapping_add(a << 54)
+        .wrapping_add(a >> 7)
+}
+
+fn jenkins_mix(a: &mut u32, b: &mut u32, c: &mut u32) {
+    *a = a.wrapping_sub(*c);
+    *a ^= c.rotate_left(4);
+    *c = c.wrapping_add(*b);
+    *b = b.wrapping_sub(*a);
+    *b ^= a.rotate_left(6);
+    *a = a.wrapping_add(*c);
+    *c = c.wrapping_sub(*b);
+    *c ^= b.rotate_left(8);
+    *b = b.wrapping_add(*a);
+    *a = a.wrapping_sub(*c);
+    *a ^= c.rotate_left(16);
+    *c = c.wrapping_add(*b);
+    *b = b.wrapping_sub(*a);
+    *b ^= a.rotate_left(19);
+    *a = a.wrapping_add(*c);
+    *c = c.wrapping_sub(*b);
+    *c ^= b.rotate_left(4);
+    *b = b.wrapping_add(*a);
+}
+
+fn jenkins_final(a: &mut u32, b: &mut u32, c: &mut u32) {
+    *c ^= *b;
+    *c = c.wrapping_sub(b.rotate_left(14));
+    *a ^= *c;
+    *a = a.wrapping_sub(c.rotate_left(11));
+    *b ^= *a;
+    *b = b.wrapping_sub(a.rotate_left(25));
+    *c ^= *b;
+    *c = c.wrapping_sub(b.rotate_left(16));
+    *a ^= *c;
+    *a = a.wrapping_sub(c.rotate_left(4));
+    *b ^= *a;
+    *b = b.wrapping_sub(a.rotate_left(14));
+    *c ^= *b;
+    *c = c.wrapping_sub(b.rotate_left(24));
+}
+
+/// Jenkins `hash_bytes` (common/hashfn.c), little-endian path —
+/// byte-identical to the C unaligned path for every input.
+// The non-extended entry point is part of the faithful hashfn.c
+// port; routing uses the extended forms, so this one is only
+// exercised by the pinned-vector unit tests.
+#[allow(dead_code)]
+pub(crate) fn hash_bytes(k: &[u8]) -> u32 {
+    let (mut a, mut b, mut c) = jenkins_hash_state(k, 0, false);
+    jenkins_final(&mut a, &mut b, &mut c);
+    c
+}
+
+/// Jenkins `hash_bytes_extended` (common/hashfn.c).
+pub(crate) fn hash_bytes_extended(k: &[u8], seed: u64) -> u64 {
+    let (mut a, mut b, mut c) = jenkins_hash_state(k, seed, true);
+    jenkins_final(&mut a, &mut b, &mut c);
+    ((b as u64) << 32) | (c as u64)
+}
+
+/// Shared body of hash_bytes / hash_bytes_extended: the initial
+/// state, the optional seed mix, the 12-byte chunk loop and the
+/// tail switch (little-endian, unaligned formulation — the C
+/// aligned path produces identical results).
+fn jenkins_hash_state(k: &[u8], seed: u64, extended: bool) -> (u32, u32, u32) {
+    let mut a: u32 = 0x9e3779b9u32
+        .wrapping_add(k.len() as u32)
+        .wrapping_add(3923095);
+    let mut b = a;
+    let mut c = a;
+    if extended && seed != 0 {
+        a = a.wrapping_add((seed >> 32) as u32);
+        b = b.wrapping_add(seed as u32);
+        jenkins_mix(&mut a, &mut b, &mut c);
+    }
+    let mut chunks = k.chunks_exact(12);
+    for ch in &mut chunks {
+        a = a.wrapping_add(u32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]));
+        b = b.wrapping_add(u32::from_le_bytes([ch[4], ch[5], ch[6], ch[7]]));
+        c = c.wrapping_add(u32::from_le_bytes([ch[8], ch[9], ch[10], ch[11]]));
+        jenkins_mix(&mut a, &mut b, &mut c);
+    }
+    let t = chunks.remainder();
+    // Tail (little-endian), the C switch's fallthrough written
+    // out case by case:
+    //   11: c+=t[10]<<24; 10: c+=t[9]<<16; 9: c+=t[8]<<8;
+    //   8: b+=word(t[4..8]), a+=word(t[0..4])
+    //   7: b+=t[6]<<16; 6: b+=t[5]<<8; 5: b+=t[4];
+    //   4: a+=word(t[0..4])
+    //   3: a+=t[2]<<16; 2: a+=t[1]<<8; 1: a+=t[0]
+    match t.len() {
+        11 => {
+            c = c.wrapping_add((t[10] as u32) << 24);
+            c = c.wrapping_add((t[9] as u32) << 16);
+            c = c.wrapping_add((t[8] as u32) << 8);
+            b = b.wrapping_add(u32::from_le_bytes([t[4], t[5], t[6], t[7]]));
+            a = a.wrapping_add(u32::from_le_bytes([t[0], t[1], t[2], t[3]]));
+        }
+        10 => {
+            c = c.wrapping_add((t[9] as u32) << 16);
+            c = c.wrapping_add((t[8] as u32) << 8);
+            b = b.wrapping_add(u32::from_le_bytes([t[4], t[5], t[6], t[7]]));
+            a = a.wrapping_add(u32::from_le_bytes([t[0], t[1], t[2], t[3]]));
+        }
+        9 => {
+            c = c.wrapping_add((t[8] as u32) << 8);
+            b = b.wrapping_add(u32::from_le_bytes([t[4], t[5], t[6], t[7]]));
+            a = a.wrapping_add(u32::from_le_bytes([t[0], t[1], t[2], t[3]]));
+        }
+        8 => {
+            b = b.wrapping_add(u32::from_le_bytes([t[4], t[5], t[6], t[7]]));
+            a = a.wrapping_add(u32::from_le_bytes([t[0], t[1], t[2], t[3]]));
+        }
+        7 => {
+            b = b.wrapping_add((t[6] as u32) << 16);
+            b = b.wrapping_add((t[5] as u32) << 8);
+            b = b.wrapping_add(t[4] as u32);
+            a = a.wrapping_add(u32::from_le_bytes([t[0], t[1], t[2], t[3]]));
+        }
+        6 => {
+            b = b.wrapping_add((t[5] as u32) << 8);
+            b = b.wrapping_add(t[4] as u32);
+            a = a.wrapping_add(u32::from_le_bytes([t[0], t[1], t[2], t[3]]));
+        }
+        5 => {
+            b = b.wrapping_add(t[4] as u32);
+            a = a.wrapping_add(u32::from_le_bytes([t[0], t[1], t[2], t[3]]));
+        }
+        4 => {
+            a = a.wrapping_add(u32::from_le_bytes([t[0], t[1], t[2], t[3]]));
+        }
+        3 => {
+            a = a.wrapping_add((t[2] as u32) << 16);
+            a = a.wrapping_add((t[1] as u32) << 8);
+            a = a.wrapping_add(t[0] as u32);
+        }
+        2 => {
+            a = a.wrapping_add((t[1] as u32) << 8);
+            a = a.wrapping_add(t[0] as u32);
+        }
+        1 => {
+            a = a.wrapping_add(t[0] as u32);
+        }
+        _ => {}
+    }
+    (a, b, c)
+}
+
+/// `hash_bytes_uint32_extended` (common/hashfn.c).
+pub(crate) fn hash_bytes_uint32_extended(k: u32, seed: u64) -> u64 {
+    let mut a: u32 = 0x9e3779b9u32.wrapping_add(4).wrapping_add(3923095);
+    let mut b = a;
+    let mut c = a;
+    if seed != 0 {
+        a = a.wrapping_add((seed >> 32) as u32);
+        b = b.wrapping_add(seed as u32);
+        jenkins_mix(&mut a, &mut b, &mut c);
+    }
+    a = a.wrapping_add(k);
+    jenkins_final(&mut a, &mut b, &mut c);
+    ((b as u64) << 32) | (c as u64)
+}
+
+/// hashint8's cross-type fold (access/hash/hashfunc.c): xor the
+/// high half (or its complement for negatives) into the low half.
+fn hash_int8_fold(val: i64) -> u32 {
+    let lo = val as u32;
+    let hi = (val >> 32) as u32;
+    if val >= 0 { lo ^ hi } else { lo ^ !hi }
+}
+
+/// v2.23: the default extended hash for a value (the type's
+/// default hash opclass FUNCTION 2), ported per type from
+/// PG19's utils/adt and access/hash sources. `col_ty` refines
+/// variants that share a Value representation (text vs bpchar vs
+/// name; int widths); when it is `None` the Value variant decides.
+pub(crate) fn default_extended_hash(v: &Value, col_ty: Option<&ColType>, seed: u64) -> u64 {
+    match v {
+        Value::SmallInt(x) => hash_bytes_uint32_extended(*x as i32 as u32, seed),
+        Value::Int(x) => {
+            // int4 by default; an int8 column carrying an Int
+            // value (the engine widens freely) folds as int8.
+            if matches!(col_ty, Some(ColType::BigInt)) {
+                hash_bytes_uint32_extended(hash_int8_fold(*x), seed)
+            } else {
+                hash_bytes_uint32_extended(*x as i32 as u32, seed)
+            }
+        }
+        Value::BigInt(x) => hash_bytes_uint32_extended(hash_int8_fold(*x), seed),
+        Value::Bool(b) => hash_bytes_uint32_extended(if *b { 1 } else { 0 }, seed),
+        Value::SingleChar(b) => hash_bytes_uint32_extended(*b as u32, seed),
+        Value::Float4(f) => {
+            if *f == 0.0 {
+                return seed;
+            }
+            let key8 = if f.is_nan() { f64::NAN } else { *f as f64 };
+            hash_bytes_extended(&key8.to_le_bytes(), seed)
+        }
+        Value::Float(f) => {
+            if *f == 0.0 {
+                return seed;
+            }
+            let key = if f.is_nan() { f64::NAN } else { *f };
+            hash_bytes_extended(&key.to_le_bytes(), seed)
+        }
+        Value::Text(s) => {
+            if matches!(col_ty, Some(ColType::Char(_))) {
+                // hashbpcharextended: bcTruelen (trailing spaces
+                // are not part of the value).
+                let trimmed = s.trim_end_matches(' ');
+                hash_bytes_extended(trimmed.as_bytes(), seed)
+            } else {
+                hash_bytes_extended(s.as_bytes(), seed)
+            }
+        }
+        Value::BpChar(s) => {
+            let trimmed = s.trim_end_matches(' ');
+            hash_bytes_extended(trimmed.as_bytes(), seed)
+        }
+        Value::Date(d) => hash_bytes_uint32_extended(*d as u32, seed),
+        Value::Timestamp(t) | Value::Timestamptz(t) | Value::Time(t) => {
+            hash_bytes_uint32_extended(hash_int8_fold(*t), seed)
+        }
+        Value::TimeTz(t, zone) => {
+            let th = hash_bytes_uint32_extended(hash_int8_fold(*t), seed);
+            th ^ hash_bytes_uint32_extended(*zone as u32, seed)
+        }
+        Value::Interval(iv) => {
+            // interval_cmp_value: ((months*30 + days) * USECS_PER_DAY
+            // + micros), low 64 bits, hashed as int8.
+            let span: i128 = ((iv.months as i128 * 30 + iv.days as i128) * 86_400_000_000i128)
+                + iv.micros as i128;
+            hash_bytes_uint32_extended(hash_int8_fold(span as i64), seed)
+        }
+        Value::Uuid(bytes) => hash_bytes_extended(bytes, seed),
+        Value::Bytea(bytes) => hash_bytes_extended(bytes, seed),
+        Value::PgLsn(x) => hash_bytes_uint32_extended(hash_int8_fold(*x as i64), seed),
+        Value::Array(av) => {
+            // hash_array_extended (arrayfuncs.c): result starts
+            // at 1; each element is hashed with the ORIGINAL
+            // seed (NULL elements hash to 0) and folded in as
+            // result = result*31 + elthash. (The scope note's
+            // "running seed / combine64" reading does not match
+            // the C; the C is authoritative.)
+            let mut result: u64 = 1;
+            for e in &av.elems {
+                let eh = if *e == Value::Null {
+                    0
+                } else {
+                    default_extended_hash(e, None, seed)
+                };
+                result = result.wrapping_mul(31).wrapping_add(eh);
+            }
+            result
+        }
+        Value::Numeric(n) => {
+            // Documented fallback: hash_any_extended over the
+            // canonical text (PG hashes the base-10000 digit
+            // array + weight; no schedule statement observes a
+            // numeric default-hash placement).
+            hash_bytes_extended(n.to_text().as_bytes(), seed)
+        }
+        other => {
+            // Documented fallback for jsonb/json/record/bit and
+            // every remaining variant: hash the canonical text.
+            hash_bytes_extended(value_to_text_cast(other).as_bytes(), seed)
+        }
+    }
+}
+
+/// v2.23: the partition key type list for a table's columns —
+/// plain keys take the column type; expression keys infer from
+/// the expression shape (the `infer_expr_key_type` rules against
+/// a column slice instead of a `Table`).
+pub(crate) fn key_col_types(cols: &[(String, ColType)], pinfo: &PartitionInfo) -> Vec<ColType> {
+    pinfo
+        .key
+        .iter()
+        .map(|k| match &k.expr {
+            None => cols[k.col].1,
+            Some(e) => infer_key_type_from_cols(e, cols),
+        })
+        .collect()
+}
+
+fn infer_key_type_from_cols(expr: &Expr, cols: &[(String, ColType)]) -> ColType {
+    match expr {
+        Expr::Column { name, .. } => cols
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, ty)| *ty)
+            .unwrap_or(ColType::Int),
+        Expr::Func { name, args } => {
+            if name.eq_ignore_ascii_case("lower") || name.eq_ignore_ascii_case("upper") {
+                ColType::Text
+            } else if name.eq_ignore_ascii_case("abs") {
+                args.first()
+                    .map(|a| infer_key_type_from_cols(a, cols))
+                    .unwrap_or(ColType::Int)
+            } else {
+                ColType::Text
+            }
+        }
+        Expr::Arith { left, .. } => infer_key_type_from_cols(left, cols),
+        Expr::Collate { expr, .. } | Expr::Cast { expr, .. } | Expr::CastNamed { expr, .. } => {
+            infer_key_type_from_cols(expr, cols)
+        }
+        _ => ColType::Int,
+    }
+}
+
+/// v2.23: hash one partition key value under its opclass. A
+/// custom class with a FUNCTION 2 calls that user function with
+/// (value, seed) through the standard machinery (a NULL return
+/// is 22023, like PG's "hash function returned null"); a class
+/// without FUNCTION 2 (a btree-style equality-only class used on
+/// a hash key) falls back to the default hash. No class -> the
+/// default extended hash for the value's type.
+pub(crate) fn partition_key_hash(
+    eng: &mut Engine,
+    ctx: &StmtCtx,
+    pinfo: &PartitionInfo,
+    idx: usize,
+    value: &Value,
+    col_ty: &ColType,
+) -> Result<u64, ExecError> {
+    let pk = &pinfo.key[idx];
+    if let Some(ocname) = &pk.opclass
+        && let Some(class) = super::opclass::find_opclass(&eng.db, ocname, "hash")
+        && let Some(fname) = &class.hash_function
+    {
+        let base = fname.rsplit('.').next().unwrap_or(fname).to_string();
+        let arg_types: Vec<String> = if class.hash_arg_types.is_empty() {
+            vec![
+                match col_ty {
+                    ColType::SmallInt => "int2".to_string(),
+                    ColType::Int => "int4".to_string(),
+                    ColType::BigInt => "int8".to_string(),
+                    ColType::Text | ColType::Varchar(_) | ColType::Char(_) => "text".to_string(),
+                    _ => "int4".to_string(),
+                },
+                "int8".to_string(),
+            ]
+        } else {
+            class.hash_arg_types.clone()
+        };
+        let fdef = find_function_by_signature(eng, &base, &arg_types)
+            .ok_or_else(|| exec_err("42883", format!("function \"{}\" does not exist", fname)))?;
+        // Build a Q over the statement context (the
+        // eval_partition_key_expr pattern).
+        let mut lock_ids = Vec::new();
+        let mut q = Q {
+            eng,
+            snap: ctx.snap,
+            own: ctx.own,
+            all_xids: ctx.all_xids.clone(),
+            session: ctx.session,
+            depth: 0,
+            lock_ids: &mut lock_ids,
+            ctes: Vec::new(),
+            wctx: None,
+            srf_vals: Vec::new(),
+            role: ctx.role,
+            read_only: false,
+            priv_scopes: Vec::new(),
+            priv_role_override: None,
+            hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+            immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+            plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
+            hashed_in: Rc::new(RefCell::new(Vec::new())),
+            pending_updates: None,
+            write: None,
+        };
+        let out = call_user_function(
+            &mut q,
+            &[],
+            &fdef,
+            &[value.clone(), Value::BigInt(HASH_PARTITION_SEED as i64)],
+            &[None, None],
+        )?;
+        return match out {
+            Value::BigInt(x) => Ok(x as u64),
+            Value::Int(x) => Ok(x as u64),
+            Value::SmallInt(x) => Ok(x as u64),
+            Value::Null => Err(exec_err(
+                "22023",
+                format!("hash function \"{}\" returned null", fname),
+            )),
+            other => Err(exec_err(
+                "42804",
+                format!(
+                    "hash function \"{}\" returned {}, expected bigint",
+                    fname,
+                    other.type_name()
+                ),
+            )),
+        };
+    }
+    Ok(default_extended_hash(
+        value,
+        Some(col_ty),
+        HASH_PARTITION_SEED,
+    ))
+}
+
+/// v2.23: the PG row hash for a fully evaluated partition key
+/// (compute_partition_hash_value): NULL values are skipped.
+pub(crate) fn partition_row_hash(
+    eng: &mut Engine,
+    ctx: &StmtCtx,
+    pinfo: &PartitionInfo,
+    table_cols: &[(String, ColType)],
+    key: &[Value],
+) -> Result<u64, ExecError> {
+    let types = key_col_types(table_cols, pinfo);
+    let mut row_hash: u64 = 0;
+    for (i, v) in key.iter().enumerate() {
+        if *v == Value::Null {
+            continue;
+        }
+        let h = partition_key_hash(eng, ctx, pinfo, i, v, &types[i])?;
+        row_hash = hash_combine64(row_hash, h);
+    }
+    Ok(row_hash)
+}
+
+/// v2.23: `bound_contains` with a caller-computed row hash for
+/// HASH bounds. `row_hash` is required iff the method is Hash
+/// (callers pass `None` for other methods).
+pub(crate) fn bound_contains_hash(
+    method: &PartMethod,
+    bound: &PartBound,
+    key: &[Value],
+    row_hash: Option<u64>,
+) -> bool {
+    match (method, bound) {
+        (PartMethod::Hash, PartBound::Hash { modulus, remainder }) => match row_hash {
+            Some(h) => h % (*modulus as u64) == (*remainder as u64),
+            None => false,
+        },
+        _ => bound_contains(method, bound, key),
+    }
 }
 
 /// v0.69: collect all leaf partition names under a partitioned table
@@ -3513,6 +4108,10 @@ pub(crate) fn explicit_sibling_accepts(
     pinfo: &PartitionInfo,
     except: &str,
     key: &[Value],
+    // v2.23: the key's PG row hash when the method is Hash
+    // (computed by the caller, which owns the &mut Engine the
+    // hash may need for user-function calls).
+    row_hash: Option<u64>,
 ) -> Result<bool, ExecError> {
     for child_name in &pinfo.children {
         if child_name == except {
@@ -3533,7 +4132,7 @@ pub(crate) fn explicit_sibling_accepts(
             continue;
         }
         let cbound = cinfo.bound.as_ref().expect("child has bound");
-        if bound_contains(&pinfo.method, cbound, key) {
+        if bound_contains_hash(&pinfo.method, cbound, key, row_hash) {
             return Ok(true);
         }
     }
@@ -3552,6 +4151,13 @@ pub(crate) fn find_partition_leaf(
     row: &[Value],
 ) -> Result<String, ExecError> {
     let key = eval_table_part_key(eng, ctx, table, pinfo, table_cols, row)?;
+    // v2.23: for HASH routing, the PG row hash is computed once
+    // per level (it may call user hash functions).
+    let row_hash = if pinfo.method == crate::storage::PartMethod::Hash {
+        Some(partition_row_hash(eng, ctx, pinfo, table_cols, &key)?)
+    } else {
+        None
+    };
     // Non-default children first, then the default partition (PG19:
     // the default only receives rows no explicit sibling accepts).
     //
@@ -3579,10 +4185,10 @@ pub(crate) fn find_partition_leaf(
                 continue;
             }
             let matches = if cinfo_ref.is_default {
-                !explicit_sibling_accepts(eng, ctx, pinfo, child_name, &key)?
+                !explicit_sibling_accepts(eng, ctx, pinfo, child_name, &key, row_hash)?
             } else {
                 let cbound = cinfo_ref.bound.as_ref().expect("child has bound");
-                bound_contains(&pinfo.method, cbound, &key)
+                bound_contains_hash(&pinfo.method, cbound, &key, row_hash)
             };
             if !matches {
                 continue;
@@ -3693,11 +4299,23 @@ pub(crate) fn check_leaf_bound(
         // parent's key (the current table's bound is parent-relative).
         let prow = remap_row_to_parent(&cur_cols, &parent_cols, &cur_row);
         let key = eval_table_part_key(eng, ctx, &parent_name, &parent_pinfo, &parent_cols, &prow)?;
+        // v2.23: HASH levels judge by the PG row hash.
+        let row_hash = if parent_pinfo.method == crate::storage::PartMethod::Hash {
+            Some(partition_row_hash(
+                eng,
+                ctx,
+                &parent_pinfo,
+                &parent_cols,
+                &key,
+            )?)
+        } else {
+            None
+        };
         let bound = cur_pinfo.bound.as_ref().expect("partition has bound");
         let ok = if cur_pinfo.is_default {
-            !explicit_sibling_accepts(eng, ctx, &parent_pinfo, &cur_name, &key)?
+            !explicit_sibling_accepts(eng, ctx, &parent_pinfo, &cur_name, &key, row_hash)?
         } else {
-            bound_contains(&parent_pinfo.method, bound, &key)
+            bound_contains_hash(&parent_pinfo.method, bound, &key, row_hash)
         };
         if !ok {
             return Err(exec_err(

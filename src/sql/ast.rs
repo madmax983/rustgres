@@ -2664,10 +2664,12 @@ pub struct PartitionDef {
 }
 
 /// v0.69: one `PARTITION BY` key: a column or a parenthesized expression.
+/// v2.23: each key also carries the operator class named after it
+/// (`a part_test_int4_ops`), `None` for the type's default class.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PartitionKeyDef {
-    Column(String),
-    Expr(Expr),
+    Column(String, Option<String>),
+    Expr(Expr, Option<String>),
 }
 
 /// v0.69: `FOR VALUES` bound as parsed (values still `Expr`s; exec
@@ -9641,6 +9643,37 @@ pub enum Stmt {
         hashes: bool,
         merges: bool,
     },
+    // --- v2.23: CREATE OPERATOR CLASS [DEFAULT] FOR TYPE t USING
+    // method AS OPERATOR n opspec, FUNCTION n fname(types), ... —
+    // only the items the engine models are kept: OPERATOR 1 (the
+    // equality operator) and FUNCTION 2 (the extended hash
+    // function). Other items are parsed and discarded.
+    CreateOperatorClass {
+        name: String,
+        is_default: bool,
+        for_type: String,
+        method: String,
+        eq_operator: Option<String>,
+        eq_leftarg: Option<String>,
+        eq_rightarg: Option<String>,
+        hash_function: Option<String>,
+        hash_arg_types: Vec<String>,
+    },
+    // --- v2.23: DROP OPERATOR CLASS [IF EXISTS] name USING method.
+    DropOperatorClass {
+        name: String,
+        method: String,
+        if_exists: bool,
+        cascade: bool,
+    },
+    // --- v2.23: ALTER OPERATOR CLASS/FAMILY name USING method
+    // SET SCHEMA schema (the only ALTER OPERATOR CLASS form in
+    // the regress corpus).
+    AlterOperatorClassSchema {
+        name: String,
+        method: String,
+        new_schema: String,
+    },
     // --- v0.11: roles and privileges ---
     CreateRole {
         name: String,
@@ -10275,6 +10308,9 @@ impl Stmt {
                 | Stmt::CreateCollation { .. }
                 | Stmt::DropCollation { .. }
                 | Stmt::AlterCollation { .. }
+                | Stmt::CreateOperatorClass { .. }
+                | Stmt::DropOperatorClass { .. }
+                | Stmt::AlterOperatorClassSchema { .. }
                 | Stmt::AlterFunction { .. }
                 | Stmt::CreateIndex { .. }
                 | Stmt::DropIndex { .. }

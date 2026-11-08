@@ -4915,6 +4915,328 @@ pub(crate) fn try_eval_ctor_func(
 /// the plan-fold memo (`Q::plan_fold_memo`). It always identifies the
 /// original call site, even when named-argument reordering below
 /// replaces the `args` slice.
+/// v2.23: the static type PG would see for a supplied
+/// satisfies_hash_partition key argument, for the partbounds.c
+/// type check. `None` = unknown / NULL literal (no check, like
+/// PG's binary-coercible pass for untyped literals).
+fn shp_supplied_type(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Cast { to, .. } => Some(super::opclass::key_type_display(to)),
+        Expr::CastNamed { name, .. } => Some(name.clone()),
+        Expr::Literal(Literal::Null) => None,
+        Expr::Literal(Literal::Int(_)) => Some("integer".to_string()),
+        Expr::Literal(Literal::Text(_)) => Some("text".to_string()),
+        Expr::Literal(Literal::Float(_)) => Some("double precision".to_string()),
+        Expr::Literal(Literal::Bool(_)) => Some("boolean".to_string()),
+        Expr::Func { name, .. } if name.eq_ignore_ascii_case("now") => {
+            Some("timestamp with time zone".to_string())
+        }
+        Expr::ArrayCtor { elems, .. } => elems.iter().find_map(shp_supplied_type),
+        _ => None,
+    }
+}
+
+/// v2.23: satisfies_hash_partition — a faithful port of PG19
+/// partbounds.c's SQL function: NULL among the first three args
+/// -> false (checked first); modulus/remainder range errors
+/// (22023) fire next, before the parent is opened; an unknown OID
+/// is the relation_open failure (XX000); a non-hash parent, a
+/// wrong key count, and per-key type mismatches are 22023 with
+/// PG's messages. The row hash shares the routing core, using
+/// the PARENT's key opclasses.
+pub(crate) fn eval_satisfies_hash_partition(
+    q: &mut Q,
+    scopes: &[Scope],
+    args: &[Expr],
+) -> Result<Value, ExecError> {
+    if args.len() < 3 {
+        return Err(exec_err(
+            "42883",
+            "function satisfies_hash_partition requires at least 3 arguments".to_string(),
+        ));
+    }
+    let v_oid = eval_expr(q, scopes, &args[0])?;
+    let v_mod = eval_expr(q, scopes, &args[1])?;
+    let v_rem = eval_expr(q, scopes, &args[2])?;
+    // PG: return false if the parent OID, modulus, or remainder
+    // is NULL — before any range validation.
+    if v_oid == Value::Null || v_mod == Value::Null || v_rem == Value::Null {
+        return Ok(Value::Bool(false));
+    }
+    let as_i64 = |v: &Value| -> Option<i64> {
+        match v {
+            Value::Int(x) | Value::BigInt(x) => Some(*x),
+            Value::SmallInt(x) => Some(*x as i64),
+            _ => None,
+        }
+    };
+    let modulus = as_i64(&v_mod).ok_or_else(|| {
+        exec_err(
+            "22023",
+            "modulus for hash partition must be an integer value greater than zero".to_string(),
+        )
+    })?;
+    let remainder = as_i64(&v_rem).ok_or_else(|| {
+        exec_err(
+            "22023",
+            "remainder for hash partition must be an integer value greater than or equal to zero"
+                .to_string(),
+        )
+    })?;
+    if modulus <= 0 {
+        return Err(exec_err(
+            "22023",
+            "modulus for hash partition must be an integer value greater than zero".to_string(),
+        ));
+    }
+    if remainder < 0 {
+        return Err(exec_err(
+            "22023",
+            "remainder for hash partition must be an integer value greater than or equal to zero"
+                .to_string(),
+        ));
+    }
+    if remainder >= modulus {
+        return Err(exec_err(
+            "22023",
+            "remainder for hash partition must be less than modulus".to_string(),
+        ));
+    }
+    // Resolve the parent relation from the OID argument. The
+    // engine carries regclass values as their display text and
+    // plain oid arguments as integers.
+    let (pname, ptable): (String, Table) = {
+        let by_name = |q: &mut Q, raw: &str| -> Result<(String, Table), ExecError> {
+            let base = raw.rsplit('.').next().unwrap_or(raw).trim_matches('"');
+            if let Some(t) = q.eng.db.find_table(base, q.snap, &q.all_xids, q.session) {
+                return Ok((base.to_string(), t.clone()));
+            }
+            // A view (or any non-table relation) opens fine in PG
+            // and then fails the hash-partitioned check below.
+            if q.eng.db.views.contains_key(base) {
+                return Err(exec_err(
+                    "22023",
+                    format!("\"{}\" is not a hash partitioned table", base),
+                ));
+            }
+            Err(exec_err(
+                "42P01",
+                format!("relation \"{}\" does not exist", raw),
+            ))
+        };
+        match &v_oid {
+            Value::Int(i) | Value::BigInt(i) => {
+                let oid = *i as u32;
+                match q.eng.db.table_name_by_oid(oid) {
+                    Some(n) => {
+                        let t = q
+                            .eng
+                            .db
+                            .find_table(&n, q.snap, &q.all_xids, q.session)
+                            .ok_or_else(|| {
+                                exec_err(
+                                    "XX000",
+                                    format!("could not open relation with OID {}", oid),
+                                )
+                            })?;
+                        (n, t.clone())
+                    }
+                    None => {
+                        return Err(exec_err(
+                            "XX000",
+                            format!("could not open relation with OID {}", oid),
+                        ));
+                    }
+                }
+            }
+            Value::SmallInt(i) => {
+                let oid = *i as u32;
+                match q.eng.db.table_name_by_oid(oid) {
+                    Some(n) => {
+                        let t = q
+                            .eng
+                            .db
+                            .find_table(&n, q.snap, &q.all_xids, q.session)
+                            .ok_or_else(|| {
+                                exec_err(
+                                    "XX000",
+                                    format!("could not open relation with OID {}", oid),
+                                )
+                            })?;
+                        (n, t.clone())
+                    }
+                    None => {
+                        return Err(exec_err(
+                            "XX000",
+                            format!("could not open relation with OID {}", oid),
+                        ));
+                    }
+                }
+            }
+            Value::Text(s) => {
+                let s: &str = s;
+                if s == "-" {
+                    return Err(exec_err(
+                        "XX000",
+                        "could not open relation with OID 0".to_string(),
+                    ));
+                }
+                if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+                    let oid: u32 = s.parse().unwrap_or(0);
+                    match q.eng.db.table_name_by_oid(oid) {
+                        Some(n) => {
+                            let t = q
+                                .eng
+                                .db
+                                .find_table(&n, q.snap, &q.all_xids, q.session)
+                                .ok_or_else(|| {
+                                    exec_err(
+                                        "XX000",
+                                        format!("could not open relation with OID {}", oid),
+                                    )
+                                })?;
+                            (n, t.clone())
+                        }
+                        None => {
+                            return Err(exec_err(
+                                "XX000",
+                                format!("could not open relation with OID {}", oid),
+                            ));
+                        }
+                    }
+                } else {
+                    by_name(q, s)?
+                }
+            }
+            _ => {
+                return Err(exec_err(
+                    "22023",
+                    "first argument of satisfies_hash_partition must be a relation OID".to_string(),
+                ));
+            }
+        }
+    };
+    let pinfo = ptable.partition.clone().ok_or_else(|| {
+        exec_err(
+            "22023",
+            format!("\"{}\" is not a hash partitioned table", pname),
+        )
+    })?;
+    // A leaf partition has no partition key of its own in PG (its
+    // key lives on the parent) — same rejection. An intermediate
+    // (bound + its own PARTITION BY) does have one.
+    if pinfo.method != crate::storage::PartMethod::Hash
+        || (pinfo.parent.is_some() && !pinfo.is_partitioned)
+    {
+        return Err(exec_err(
+            "22023",
+            format!("\"{}\" is not a hash partitioned table", pname),
+        ));
+    }
+    let nkeys = pinfo.key.len();
+    let key_types = super::partition::key_col_types(&ptable.columns, &pinfo);
+    // Collect the key values (plain or VARIADIC array form).
+    let values: Vec<Value> = if args.len() == 4
+        && matches!(&args[3], Expr::Func { name, args: inner } if name == "__variadic" && inner.len() == 1)
+    {
+        let Expr::Func { args: inner, .. } = &args[3] else {
+            unreachable!()
+        };
+        let av = eval_expr(q, scopes, &inner[0])?;
+        if av == Value::Null {
+            // VARIADIC NULL::sometype[] -> false.
+            return Ok(Value::Bool(false));
+        }
+        let Value::Array(arr) = av else {
+            return Err(exec_err(
+                "22023",
+                "VARIADIC argument of satisfies_hash_partition must be an array".to_string(),
+            ));
+        };
+        // Type check: the array's element type against every key
+        // (PG checks each key against the single element type).
+        // The evaluated array carries its element type.
+        let ed = arr.elem.sql_name();
+        for (j, kt) in key_types.iter().enumerate() {
+            let kd = super::opclass::key_type_display(kt);
+            if canon_func_type_name(&kd) != canon_func_type_name(ed) {
+                return Err(exec_err(
+                    "22023",
+                    format!(
+                        "column {} of the partition key has type \"{}\", but supplied value is of type \"{}\"",
+                        j + 1,
+                        kd,
+                        ed
+                    ),
+                ));
+            }
+        }
+        if arr.elems.len() != nkeys {
+            return Err(exec_err(
+                "22023",
+                format!(
+                    "number of partitioning columns ({}) does not match number of partition keys provided ({})",
+                    nkeys,
+                    arr.elems.len()
+                ),
+            ));
+        }
+        arr.elems.clone()
+    } else {
+        let supplied = &args[3..];
+        if supplied.len() != nkeys {
+            return Err(exec_err(
+                "22023",
+                format!(
+                    "number of partitioning columns ({}) does not match number of partition keys provided ({})",
+                    nkeys,
+                    supplied.len()
+                ),
+            ));
+        }
+        for (j, e) in supplied.iter().enumerate() {
+            if let Some(sd) = shp_supplied_type(e) {
+                let kd = super::opclass::key_type_display(&key_types[j]);
+                if canon_func_type_name(&kd) != canon_func_type_name(&sd) {
+                    return Err(exec_err(
+                        "22023",
+                        format!(
+                            "column {} of the partition key has type {}, but supplied value is of type {}",
+                            j + 1,
+                            kd,
+                            sd
+                        ),
+                    ));
+                }
+            }
+        }
+        let mut vals = Vec::with_capacity(supplied.len());
+        for e in supplied {
+            vals.push(eval_expr(q, scopes, e)?);
+        }
+        vals
+    };
+    // The row hash, via the shared routing core.
+    let mut writes: Vec<WriteOp> = Vec::new();
+    let mut ctx = StmtCtx {
+        privs_suppressed: false,
+        snap: q.snap,
+        own: q.own,
+        write_xid: q.own,
+        all_xids: q.all_xids.clone(),
+        level: IsolationLevel::ReadCommitted,
+        writes: &mut writes,
+        session: q.session,
+        role: q.role,
+        read_only: false,
+        default_toast_compression: crate::storage::ToastCompression::Pglz,
+        notices: Vec::new(),
+    };
+    let row_hash =
+        super::partition::partition_row_hash(q.eng, &mut ctx, &pinfo, &ptable.columns, &values)?;
+    Ok(Value::Bool(row_hash % (modulus as u64) == remainder as u64))
+}
+
 pub(crate) fn eval_func(
     q: &mut Q,
     scopes: &[Scope],
@@ -4994,6 +5316,11 @@ pub(crate) fn eval_func(
         return Ok(crate::exec::rules::ruledef_by_oid(
             &q.eng.db, q.snap, q.own, oid,
         ));
+    }
+    // v2.23: satisfies_hash_partition(oid, modulus, remainder,
+    // key...) — PG19 partbounds.c. Never returns NULL.
+    if name == "satisfies_hash_partition" {
+        return eval_satisfies_hash_partition(q, scopes, args);
     }
     // v2.15: pg_get_constraintdef(oid[, pretty]) — PG returns NULL
     // for an unknown OID (rules.sql proves pg_get_constraintdef(0)).
@@ -14721,6 +15048,8 @@ pub(crate) fn func_result_type(
         | "pg_get_ruledef" => Ok(ColType::Text),
         // v2.17: pg_statistics_obj_is_visible(oid) -> boolean.
         "pg_statistics_obj_is_visible" => Ok(ColType::Bool),
+        // v2.23: satisfies_hash_partition(...) -> boolean.
+        "satisfies_hash_partition" => Ok(ColType::Bool),
         // v2.09: pg_trigger_depth() is int.
         "pg_trigger_depth" => Ok(ColType::Int),
         // v1.96: large-object family result types.

@@ -15,7 +15,7 @@ fn unparenthesized_expression_key() {
     let p = part_def("create table t (a text) partition by list (lower(a))");
     assert_eq!(p.keys.len(), 1);
     match &p.keys[0] {
-        PartitionKeyDef::Expr(Expr::Func { name, .. }) => assert_eq!(name, "lower"),
+        PartitionKeyDef::Expr(Expr::Func { name, .. }, _) => assert_eq!(name, "lower"),
         other => panic!("expected Expr key, got {:?}", other),
     }
 }
@@ -24,28 +24,33 @@ fn unparenthesized_expression_key() {
 fn bare_column_key() {
     let p = part_def("create table t (a int) partition by list (a)");
     assert_eq!(p.keys.len(), 1);
-    assert_eq!(p.keys[0], PartitionKeyDef::Column("a".to_string()));
+    assert_eq!(p.keys[0], PartitionKeyDef::Column("a".to_string(), None));
 }
 
 #[test]
 fn parenthesized_arithmetic_key() {
     let p = part_def("create table t (a int, b int) partition by range ((a + b))");
     assert_eq!(p.keys.len(), 1);
-    assert!(matches!(p.keys[0], PartitionKeyDef::Expr(_)));
+    assert!(matches!(p.keys[0], PartitionKeyDef::Expr(_, _)));
 }
 
 #[test]
 fn opclass_key() {
-    // A bare column with an operator class stays a column key.
+    // v2.23: a bare column with an operator class stays a column
+    // key, and the opclass name is now captured (it was discarded
+    // before v2.23).
     let p = part_def("create table t (a int) partition by hash (a int4_ops)");
     assert_eq!(p.keys.len(), 1);
-    assert_eq!(p.keys[0], PartitionKeyDef::Column("a".to_string()));
+    assert_eq!(
+        p.keys[0],
+        PartitionKeyDef::Column("a".to_string(), Some("int4_ops".to_string()))
+    );
 }
 
 #[test]
 fn multiple_keys() {
     let p = part_def("create table t (a int, b text) partition by list (a, lower(b))");
     assert_eq!(p.keys.len(), 2);
-    assert_eq!(p.keys[0], PartitionKeyDef::Column("a".to_string()));
-    assert!(matches!(p.keys[1], PartitionKeyDef::Expr(_)));
+    assert_eq!(p.keys[0], PartitionKeyDef::Column("a".to_string(), None));
+    assert!(matches!(p.keys[1], PartitionKeyDef::Expr(_, _)));
 }

@@ -2951,13 +2951,19 @@ pub(crate) fn exec_create_operator(
 ) -> Result<ExecResult, ExecError> {
     // v0.87: the procedure must exist with a signature matching the
     // operator's argument types (PG19).
+    // v2.23: PG resolves the procedure against the whole catalog,
+    // builtins included — `CREATE OPERATOR === (... PROCEDURE =
+    // int4eq ...)` (partition_prune.sql) names a builtin operator
+    // function, which lives in no user-function registry here.
     {
         let proc_args: Vec<String> = [leftarg, rightarg]
             .into_iter()
             .flatten()
             .map(|s| s.to_string())
             .collect();
-        if find_function_by_signature(eng, procedure, &proc_args).is_none() {
+        if find_function_by_signature(eng, procedure, &proc_args).is_none()
+            && !crate::sql::is_builtin_fn(procedure)
+        {
             return Err(exec_err(
                 "42883",
                 format!("function \"{}\" does not exist", procedure),
@@ -2969,6 +2975,48 @@ pub(crate) fn exec_create_operator(
     }
     if let Some(t) = rightarg {
         resolve_func_type_name(eng, ctx.snap, ctx.own, ctx.session, t)?;
+    }
+    // v2.23: PG19 pg_operator.c link validations (42P13), masked
+    // before v2.23 by the `===` parse failure: an operator cannot
+    // be its own negator, and a commutator whose commutator link
+    // already points at a third operator cannot be claimed.
+    if negator == Some(name) {
+        return Err(exec_err(
+            "42P13",
+            "operator cannot be its own negator".to_string(),
+        ));
+    }
+    if let Some(com) = commutator {
+        if com != name {
+            if let Some(defs) = eng.db.operators.get(com) {
+                for d in defs {
+                    // The commutator's own signature is the new
+                    // operator's signature swapped.
+                    if d.leftarg.as_deref() == rightarg && d.rightarg.as_deref() == leftarg {
+                        if let Some(existing) = &d.commutator {
+                            if existing != name {
+                                return Err(exec_err(
+                                    "42P13",
+                                    format!(
+                                        "commutator operator {} is already the commutator of operator {}",
+                                        com, existing
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            // The builtin equality operator is its own commutator
+            // in pg_catalog for every (T, T) signature, so claiming
+            // `=` as a commutator always conflicts the same way.
+            if com == "=" && leftarg.is_some() && leftarg == rightarg {
+                return Err(exec_err(
+                    "42P13",
+                    "commutator operator = is already the commutator of operator =".to_string(),
+                ));
+            }
+        }
     }
     let prev = eng.db.operators.get(name).cloned().unwrap_or_default();
     let dup = prev

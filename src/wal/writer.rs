@@ -46,7 +46,11 @@ pub(crate) const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK16";
 /// v2.18: version 30 adds per-view `col_acl` + `col_defaults`.
 /// v29 checkpoints are refused; remove the data directory to
 /// start fresh.
-pub(crate) const CHKPT_VERSION: u32 = 31;
+/// v2.23: version 32 adds the operator-class registry section
+/// (and partition keys carry opclass names in the table images).
+/// v31 checkpoints are refused; remove the data directory to
+/// start fresh.
+pub(crate) const CHKPT_VERSION: u32 = 32;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -116,11 +120,14 @@ pub(crate) const CHKPT_VERSION: u32 = 31;
 /// the field decodes as false.
 /// v2.12: `RGSWAL31` — CreateFunction records carry `arg_modes`
 /// (trailing list). Older logs still read; modes decode as all-IN.
-pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL33";
+pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL34";
 /// v1.80: the format version number in [`WAL_MAGIC`].
 /// v2.14: version 33 — CreateView records carry view triggers
 /// (trailing string). Older logs still read; triggers decode empty.
-pub(crate) const WAL_VERSION: u32 = 33;
+/// v2.23: version 34 — partition metadata carries per-key
+/// operator class names (trailing). Older logs still read; the
+/// opclasses decode as absent.
+pub(crate) const WAL_VERSION: u32 = 34;
 /// v1.80: oldest WAL format this build can replay.
 pub(crate) const MIN_READABLE_WAL_VERSION: u32 = 20;
 pub(crate) const WAL_HEADER_LEN: u64 = 16;
@@ -1065,6 +1072,18 @@ impl Wal {
             }
             img.u32(n_rules);
             img.bytes(&r_body.buf);
+        }
+
+        // v2.23 (checkpoint v32): the operator-class registry
+        // (CREATE OPERATOR CLASS). Sorted by (name, method) for a
+        // deterministic image.
+        {
+            let mut classes: Vec<&crate::storage::OpClassDef> = eng.db.opclasses.iter().collect();
+            classes.sort_by(|a, b| a.name.cmp(&b.name).then(a.method.cmp(&b.method)));
+            img.u32(classes.len() as u32);
+            for c in classes {
+                img.opclass(c);
+            }
         }
 
         // 2. Write tmp file + fsync.
@@ -2017,6 +2036,12 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 enabled,
                 oid,
             });
+    }
+    // v2.23 (checkpoint v32): the operator-class registry.
+    let n_classes = d.u32().map_err(|e| bad(&e))? as usize;
+    for _ in 0..n_classes {
+        let def = d.opclass().map_err(|e| bad(&e))?;
+        eng.db.opclasses.push(def);
     }
     d.end().map_err(|e| bad(&e))?;
     Ok((eng, wal_end))

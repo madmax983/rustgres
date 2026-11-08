@@ -1136,6 +1136,24 @@ impl Enc {
                 self.str(triggers);
                 self.u64(*xmin);
             }
+            WalRecord::OpClassSet {
+                name,
+                method,
+                def,
+                xmin,
+            } => {
+                self.u8(35);
+                self.str(name);
+                self.str(method);
+                match def {
+                    Some(d) => {
+                        self.u8(1);
+                        self.opclass(d);
+                    }
+                    None => self.u8(0),
+                }
+                self.u64(*xmin);
+            }
             WalRecord::CreateSequence { name, seq, xmin } => {
                 self.u8(10);
                 self.str(name);
@@ -1502,6 +1520,35 @@ impl Enc {
         }
     }
 
+    /// v2.23: one operator-class registry entry, shared by the
+    /// checkpoint image (CHKPT 32) and the OpClassSet WAL record.
+    pub(crate) fn opclass(&mut self, c: &crate::storage::OpClassDef) {
+        self.str(&c.name);
+        self.str(&c.schema);
+        self.str(&c.for_type);
+        self.str(&c.method);
+        self.u8(c.is_default as u8);
+        for opt in [
+            &c.eq_operator,
+            &c.eq_leftarg,
+            &c.eq_rightarg,
+            &c.hash_function,
+        ] {
+            match opt {
+                Some(s) => {
+                    self.u8(1);
+                    self.str(s);
+                }
+                None => self.u8(0),
+            }
+        }
+        self.u32(c.hash_arg_types.len() as u32);
+        for t in &c.hash_arg_types {
+            self.str(t);
+        }
+        self.str(&c.owner);
+    }
+
     /// v0.96: encode a `Vec<String>` (inheritance parent links).
     /// v1.80: partition metadata, shared by checkpoint table entries and
     /// the WAL `CreateTable`/`AlterTable` records (one codec, one format).
@@ -1578,6 +1625,18 @@ impl Enc {
         // v0.72: whether this table is itself partitioned
         // (a childless partitioned table is not a leaf).
         self.u8(if p.is_partitioned { 1 } else { 0 });
+        // v2.23 (CHKPT 32 / current WAL): per-key operator class
+        // names, parallel to the key list written above. Appended
+        // at the end so the prefix layout is unchanged.
+        for k in &p.key {
+            match &k.opclass {
+                Some(s) => {
+                    self.u8(1);
+                    self.str(s);
+                }
+                None => self.u8(0),
+            }
+        }
     }
 
     pub(crate) fn str_list(&mut self, v: &[String]) {
@@ -2847,6 +2906,22 @@ impl<'a> Dec<'a> {
                     xmin,
                 })
             }
+            35 => {
+                let name = self.str()?;
+                let method = self.str()?;
+                let def = if self.u8()? != 0 {
+                    Some(self.opclass()?)
+                } else {
+                    None
+                };
+                let xmin = self.u64()?;
+                Ok(WalRecord::OpClassSet {
+                    name,
+                    method,
+                    def,
+                    xmin,
+                })
+            }
             t => Err(self.err(&format!("unknown record tag {}", t))),
         }
     }
@@ -3014,6 +3089,46 @@ impl<'a> Dec<'a> {
         Ok(out)
     }
 
+    /// v2.23: decode one operator-class registry entry (see
+    /// [`Enc::opclass`]).
+    pub(crate) fn opclass(&mut self) -> Result<crate::storage::OpClassDef, String> {
+        let name = self.str()?;
+        let schema = self.str()?;
+        let for_type = self.str()?;
+        let method = self.str()?;
+        let is_default = self.u8()? != 0;
+        let opt = |d: &mut Self| -> Result<Option<String>, String> {
+            if d.u8()? != 0 {
+                Ok(Some(d.str()?))
+            } else {
+                Ok(None)
+            }
+        };
+        let eq_operator = opt(self)?;
+        let eq_leftarg = opt(self)?;
+        let eq_rightarg = opt(self)?;
+        let hash_function = opt(self)?;
+        let n_args = self.u32()? as usize;
+        let mut hash_arg_types = Vec::new();
+        for _ in 0..n_args {
+            hash_arg_types.push(self.str()?);
+        }
+        let owner = self.str()?;
+        Ok(crate::storage::OpClassDef {
+            name,
+            schema,
+            for_type,
+            method,
+            is_default,
+            eq_operator,
+            eq_leftarg,
+            eq_rightarg,
+            hash_function,
+            hash_arg_types,
+            owner,
+        })
+    }
+
     /// v0.96: decode a `Vec<String>` (inheritance parent links).
     /// v1.80: decode [`Enc::partition`].
     pub(crate) fn partition(&mut self) -> Result<Option<crate::storage::PartitionInfo>, String> {
@@ -3043,7 +3158,13 @@ impl<'a> Dec<'a> {
                 } else {
                     None
                 };
-                key.push(crate::storage::PartKey { col, expr });
+                key.push(crate::storage::PartKey {
+                    col,
+                    expr,
+                    // v2.23: filled in below, after the bound /
+                    // children / is_partitioned fields.
+                    opclass: None,
+                });
             }
             let has_bound = self.u8()? != 0;
             let bound = if has_bound {
@@ -3091,6 +3212,16 @@ impl<'a> Dec<'a> {
             }
             // v0.72: the is_partitioned flag (format version 11).
             let is_partitioned = self.u8()? != 0;
+            // v2.23 (RGSWAL34): per-key opclasses, appended by
+            // the encoder. Logs at RGSWAL33 and below end here.
+            let mut key = key;
+            if self.wal_version >= 34 {
+                for k in key.iter_mut() {
+                    if self.u8()? != 0 {
+                        k.opclass = Some(self.str()?);
+                    }
+                }
+            }
             Ok(Some(crate::storage::PartitionInfo {
                 method,
                 key,
