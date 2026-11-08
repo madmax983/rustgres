@@ -4111,33 +4111,45 @@ pub(crate) fn cmp_records(
             "cannot compare records with different field counts".to_string(),
         ));
     }
-    let mut saw_null = false;
+    // v2.24: NULL handling follows PG19's record_eq / record_cmp
+    // (utils/adt/rowtypes.c), which never return SQL NULL: two NULL
+    // fields are EQUAL, exactly one NULL is definitively UNEQUAL for
+    // `=`/`<>` and sorts larger for ordering (NULLS LAST), and a field
+    // equality that itself yields NULL counts as unequal for `=`
+    // (record_eq treats a null equality result as false). The old
+    // three-valued propagation made every whole-row comparison that
+    // touched a NULL column evaluate to NULL — an RLS WITH CHECK over
+    // a whole-row var then read NULL as a policy violation even for a
+    // genuinely equal row (update.sql's wholerow policy, c=112).
+    // Bare row-constructor comparisons do not flow through here; they
+    // keep their three-valued logic in eval_row_cmp.
     for ((_, va), (_, vb)) in fa.iter().zip(fb.iter()) {
-        // NULL handling: for `=`/`<>`, a NULL field makes the result
-        // NULL (unless a definitive inequality is found); for ordering,
-        // NULL sorts larger (PG's default ASC NULLS LAST).
         let va_null = matches!(va, Value::Null);
         let vb_null = matches!(vb, Value::Null);
         if va_null || vb_null {
-            match op {
-                CmpOp::Eq | CmpOp::Ne => {
-                    if va_null != vb_null || !va_null {
-                        // One side NULL, other not: for `=` this is not
-                        // definitive (result NULL); continue checking.
+            match (va_null, vb_null) {
+                (true, true) => continue,
+                _ => match op {
+                    CmpOp::Eq => return Ok(Some(Ordering::Less)),
+                    CmpOp::Ne => return Ok(Some(Ordering::Greater)),
+                    _ => {
+                        if va_null {
+                            return Ok(Some(Ordering::Greater));
+                        } else {
+                            return Ok(Some(Ordering::Less));
+                        }
                     }
-                    saw_null = true;
-                    continue;
-                }
-                _ => match (va_null, vb_null) {
-                    (true, true) => continue,
-                    (true, false) => return Ok(Some(Ordering::Greater)),
-                    (false, true) => return Ok(Some(Ordering::Less)),
-                    (false, false) => unreachable!(),
                 },
             }
         }
         match cmp_ordering(va, vb, CmpOp::Eq)? {
-            None => saw_null = true,
+            None => match op {
+                CmpOp::Eq => return Ok(Some(Ordering::Less)),
+                CmpOp::Ne => return Ok(Some(Ordering::Greater)),
+                // A field with no ordering (should not happen for
+                // orderable field types) keeps the old NULL result.
+                _ => return Ok(None),
+            },
             Some(Ordering::Equal) => {}
             Some(ord) => {
                 // For `=`/`<>`, a definitive inequality decides; for
@@ -4150,16 +4162,7 @@ pub(crate) fn cmp_records(
             }
         }
     }
-    match op {
-        CmpOp::Eq | CmpOp::Ne => {
-            if saw_null {
-                Ok(None)
-            } else {
-                Ok(Some(Ordering::Equal))
-            }
-        }
-        _ => Ok(Some(Ordering::Equal)),
-    }
+    Ok(Some(Ordering::Equal))
 }
 
 /// v0.81: PG19 `record_image_eq` — byte-oriented record identity for

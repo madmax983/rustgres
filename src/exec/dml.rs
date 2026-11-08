@@ -5172,6 +5172,131 @@ pub(crate) fn exec_update_inner(
         let from_schema = from_data.map(|(s, _)| s);
         (plan, moves, ret_new, ret_from, ret_prov_ids, from_schema)
     };
+    // v2.24: a partition move is heap_delete + ExecInsert in PG19
+    // (nodeModifyTable.c): the destination leaf's BEFORE INSERT row
+    // triggers fire on the routed row, the leaf bound and the row
+    // constraints are re-validated on the post-trigger image, and the
+    // RLS WITH CHECK below judges that final image — not the
+    // SET-clause image (update.sql's trig_d_1_15 pair: SET c=151 must
+    // pass once the destination trigger makes it 152, and SET c=150
+    // must fail once it becomes 151). Fire the triggers here, before
+    // any check or mutation, and fold the final images back into
+    // `moves` and their `ret_new` slots (RETURNING also shows the
+    // final image in PG). A trigger returning NULL suppresses the
+    // insert side of the move; the delete side — and its FK cascade,
+    // already applied above — still happens, as in PG.
+    let (moves, ret_new, ret_from, ret_prov_ids) = if moves.is_empty() {
+        (moves, ret_new, ret_from, ret_prov_ids)
+    } else {
+        // The ret_new slot of each move, in moves order: ret entries
+        // were pushed in encounter order alongside plan rows, and row
+        // ids are unique, so the (id, dst) pairs match exactly. If
+        // they ever drift, fall back to the pre-v2.24 images rather
+        // than misaligning RETURNING.
+        let mut slots: Vec<usize> = Vec::with_capacity(moves.len());
+        {
+            let mut mi = 0;
+            for (ri, (rid, rdst)) in ret_prov_ids.iter().enumerate() {
+                if mi < moves.len() && moves[mi].1 == *rid && moves[mi].3 == *rdst {
+                    slots.push(ri);
+                    mi += 1;
+                }
+            }
+        }
+        if slots.len() != moves.len() {
+            (moves, ret_new, ret_from, ret_prov_ids)
+        } else {
+            let parent_cols: Vec<(String, ColType)> = {
+                let t = eng
+                    .db
+                    .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+                    .expect("target still visible");
+                t.columns.clone()
+            };
+            // Fire per destination leaf, in leaf order for determinism.
+            let mut dsts: Vec<String> = moves.iter().map(|m| m.3.clone()).collect();
+            dsts.sort_unstable();
+            dsts.dedup();
+            let mut final_rows: Vec<Option<Row>> = vec![None; moves.len()];
+            for dst in &dsts {
+                let idxs: Vec<usize> = moves
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| &m.3 == dst)
+                    .map(|(i, _)| i)
+                    .collect();
+                let (leaf_cols, leaf_pinfo) = {
+                    let lt = eng
+                        .db
+                        .find_table(dst, ctx.snap, &ctx.all_xids, ctx.session)
+                        .expect("destination leaf still visible");
+                    (lt.columns.clone(), lt.partition.clone())
+                };
+                let rows_only: Vec<Row> = idxs.iter().map(|&i| moves[i].4.clone()).collect();
+                let fired = fire_before_insert_triggers(eng, ctx, dst, &leaf_cols, &rows_only)?;
+                for (&i, fr) in idxs.iter().zip(fired.iter()) {
+                    if let Some(fr) = fr {
+                        if fr[..] != moves[i].4[..] {
+                            let dst_meta = {
+                                let dt = eng
+                                    .db
+                                    .find_table(dst, ctx.snap, &ctx.all_xids, ctx.session)
+                                    .expect("destination leaf still visible");
+                                TableMeta::of(dt)
+                            };
+                            check_row_constraints(
+                                eng,
+                                ctx.snap,
+                                ctx.own,
+                                ctx.session,
+                                ctx.role,
+                                &dst_meta,
+                                dst,
+                                &fr[..],
+                            )?;
+                        }
+                        if let Some(pinfo) = &leaf_pinfo {
+                            check_leaf_bound(eng, ctx, dst, pinfo, &leaf_cols, &fr[..])?;
+                        }
+                        final_rows[i] = Some(fr.clone());
+                    }
+                }
+            }
+            let mut new_moves: Vec<(String, u64, u64, String, Row)> =
+                Vec::with_capacity(moves.len());
+            let mut ret_new = ret_new;
+            let mut drop_slots: Vec<usize> = Vec::new();
+            for (i, (m, fin)) in moves.into_iter().zip(final_rows).enumerate() {
+                match fin {
+                    Some(fr) => {
+                        let parent_img = reorder_row(
+                            &{
+                                let lt = eng
+                                    .db
+                                    .find_table(&m.3, ctx.snap, &ctx.all_xids, ctx.session)
+                                    .expect("destination leaf still visible");
+                                lt.columns.clone()
+                            },
+                            &parent_cols,
+                            &fr,
+                        );
+                        ret_new[slots[i]] = Row::new(parent_img);
+                        new_moves.push((m.0, m.1, m.2, m.3, fr));
+                    }
+                    None => drop_slots.push(slots[i]),
+                }
+            }
+            let mut ret_from = ret_from;
+            let mut ret_prov_ids = ret_prov_ids;
+            drop_slots.sort_unstable_by(|a, b| b.cmp(a));
+            for s in drop_slots {
+                ret_new.remove(s);
+                ret_from.remove(s);
+                ret_prov_ids.remove(s);
+            }
+            (new_moves, ret_new, ret_from, ret_prov_ids)
+        }
+    };
     // v2.02: replica-identity guard for partitioned targets.
     // v2.05 correction (PG19 ExecInitModifyTable): PG initializes
     // EVERY leaf result relation of a partitioned target (partition
