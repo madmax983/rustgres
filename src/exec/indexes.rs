@@ -109,6 +109,30 @@ pub(crate) fn check_partitioned_insert_unique(
             .expect("target still visible; engine lock held throughout");
         t.columns.clone()
     };
+    // v2.24: when no leaf under this partitioned table carries any
+    // unique/PK constraint, every row's per-leaf `uniques` list below
+    // is empty and `unique_violations_all` can never find a hit -- the
+    // whole function is a no-op. Checking that cheaply (one
+    // `visible_indexes_for`/`temp_unique_cols` pass per leaf, not per
+    // row) lets a plain (unconstrained) partitioned table's INSERT skip
+    // the per-row `find_row_leaf` routing grouping entirely, instead of
+    // paying a full leaf-routing pass (duplicating the one
+    // `route_partition_inserts` already does for the same rows) for
+    // zero benefit.
+    let leaves = collect_partition_leaves(&eng.db, table, ctx.snap, ctx.own, ctx.session);
+    let any_unique = leaves.iter().any(|leaf| {
+        if eng.db.is_temp_table(ctx.session, leaf) {
+            !temp_unique_cols(&eng.db, leaf, ctx.snap, &ctx.all_xids, ctx.session).is_empty()
+        } else {
+            eng.db
+                .visible_indexes_for(leaf, ctx.snap, &ctx.all_xids, ctx.session)
+                .into_iter()
+                .any(|ix| ix.def.unique && ix.def.planner_usable)
+        }
+    });
+    if !any_unique {
+        return Ok(());
+    }
     // Group candidate row indices by destination leaf (routing is
     // statement-atomic: no mutation happens here).
     let mut by_leaf: Vec<(String, Vec<usize>)> = Vec::new();
