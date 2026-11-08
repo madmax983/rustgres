@@ -2,6 +2,160 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `check_partitioned_insert_unique` routes every INSERT row through a full partition-leaf lookup even when no leaf has a unique constraint — fix — 2026-11-08
+
+Fixes the target identified in the baseline entry immediately below this
+one.
+
+### Change
+
+`src/exec/indexes.rs`: `check_partitioned_insert_unique` ran its per-row
+`find_row_leaf` grouping loop unconditionally for every INSERT into a
+partitioned parent, even though the loop exists only to group rows by
+leaf so each leaf's unique indexes can be checked — if no leaf under the
+table carries any unique/PK constraint, every row's `uniques` list is
+empty and `unique_violations_all` can never report a hit, so the entire
+per-row routing pass accomplishes nothing. Added a cheap upfront check:
+collect the table's leaves (`collect_partition_leaves`, already used
+elsewhere in this file's module) and, for each one, check whether it has
+any unique/PK constraint — via `visible_indexes_for` filtered the same
+way the existing code already filters (`ix.def.unique &&
+ix.def.planner_usable`) for a permanent leaf, or via `temp_unique_cols`
+(mirroring `unique_violations_all`'s own temp-table branch) for a temp
+leaf. When no leaf anywhere in the subtree has one, the function returns
+`Ok(())` immediately, before ever calling `find_row_leaf`. This is exactly
+the condition under which the function's own loop body already did
+nothing; the only behavior-visible edge case is a childless partitioned
+root (no leaves to insert into at all), where the 23514 "no partition ...
+found for row" error now surfaces from `route_partition_inserts` instead
+of from this function's `find_row_leaf` call — same error code, same
+message, same table name, just raised a few lines later in the same
+statement's pre-write validation pass (confirmed unchanged by the
+conformance run below).
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_hash_partition_insert.py --variant hash
+--rows {500,1000,2000}`), same workload, same machine, same session.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`), total `Ir`:
+
+| rows (N) | before | after | delta |
+|---|---|---|---|
+| 500  | 92,214,570  | 70,547,602  | **-23.50%** |
+| 1000 | 176,321,100 | 133,225,533 | **-24.44%** |
+| 2000 | 345,398,385 | 258,806,263 | **-25.07%** |
+
+The `plain` control (same row volume, same `INSERT ... SELECT` shape, no
+partitioning at all) is unchanged by the fix: 129,517,033 before vs.
+129,517,570 after at N=2000 (+0.0004%, noise), confirming the saving is
+isolated to the partitioned-INSERT path with no side effects elsewhere.
+
+DHAT (N=2000, same workload):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total bytes allocated | 16,215,759 | 12,766,309 | **-21.28%** |
+| Total blocks allocated | 206,066 | 152,015 | **-26.23%** |
+
+Both the `Ir` reduction (23.5-25.1%) and the DHAT reduction (21-26%)
+clear their floors (≥5% / ≥10%) several times over, and the callgrind
+delta at N=2000 (86,592,122 `Ir`) lands almost exactly on
+`check_partitioned_insert_unique`'s own inclusive cost in the baseline
+profile (86,732,307 `Ir`, 25.11% of the baseline total) — confirming the
+fix removes the targeted subtree itself, not some unrelated cost that
+happened to move.
+
+`cargo test --all-features`: 1321/1321 passed, unchanged. `cargo fmt
+--all -- --check`: clean. `cargo clippy --all-targets --all-features --
+-D warnings`: 1268 errors on both the pre-fix and post-fix tree (the
+same pre-existing toolchain/lint-version mismatch noted throughout this
+file, confirmed via `git stash`/`git stash pop`); none of the flagged
+lines fall inside this round's changed function. `tests/conformance/
+schedule_runner.py --tests hash_part,partition_prune,partition_join,
+partition_aggregate,partition_info,constraints,alter_table,create_table,
+foreign_key`: identical PASS=4656/REAL-FAIL=1305 (including the same two
+mid-run server-restart log lines) on both trees — zero behavior change,
+including for the childless-partitioned-root edge case called out above.
+
+Before/after profiles committed:
+`benches/profiles/{callgrind,dhat}.out.hashpartinsert-{base,after}-n{500,1000,2000}-2026-11-08`
+(dhat and the `plain` control only at N=2000).
+
+**Reproduce**: check out the parent (baseline) commit, `cargo build`,
+`python3 benches/profile_hash_partition_insert.py --tool callgrind
+--variant hash --rows 2000` (repeat for 500/1000, and with `--tool dhat`
+for the allocation numbers) for the before numbers; check out this
+commit, `cargo build`, repeat for the after numbers.
+
+## Bolt: `check_partitioned_insert_unique` routes every INSERT row through a full partition-leaf lookup even when no leaf has a unique constraint — baseline — 2026-11-08
+
+**Why this workload**: v2.20-v2.23 (partition routing for non-integer
+keys, direct-leaf DML, collation derivation, and — the focus here —
+v2.23's multi-column `PARTITION BY HASH` routing with the real PG hash
+algorithm) all landed after the last Bolt round (2026-11-05's `CREATE
+RULE` harness); no prior round has profiled any of this new partitioning
+machinery. New harness, `benches/profile_hash_partition_insert.py`
+(self-contained launch-under-valgrind pattern, same as
+`profile_rule_insert.py`): a single multi-row `INSERT ... SELECT ...
+FROM generate_series` into a table `PARTITION BY HASH (a, b)` with 4
+explicit `MODULUS 4` partitions and default (no custom opclass) hash
+functions — the ordinary real-world shape; custom opclasses, per
+`tests/conformance/pg19/sql/hash_part.sql`, exist only to make hash
+results deterministic for the conformance suite, not something a real
+schema would use. `--variant plain` is a control: an identical
+two-column table with no partitioning at all, same row volume, same
+`INSERT ... SELECT` shape, isolating partition routing's share of the
+profile by subtraction.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`), 2000 rows:
+
+| variant | Ir |
+|---|---|
+| `hash` | 345,398,385 |
+| `plain` (control) | 129,517,033 |
+
+The partition-routing subtree is 215,881,352 `Ir`, **62.5%** of the
+`hash` workload's total — nowhere near the 5%-of-profile floor, it's
+nearly two-thirds of the whole statement's cost.
+`callgrind_annotate --inclusive=yes` breaks that subtree down:
+`route_partition_inserts` (the routing pass that actually places each
+row) is 37.4% of the total; a second, independent pass,
+`check_partitioned_insert_unique` (the statement-atomic UNIQUE-check
+pass, called right before `route_partition_inserts` from
+`exec_insert_inner`) is a further 25.1% on its own.
+
+Reading `check_partitioned_insert_unique` (`src/exec/indexes.rs`): for
+every candidate row, it calls `find_row_leaf` (`src/exec/dml.rs`) to
+determine which leaf the row would land in, purely so it can group rows
+by leaf and check each leaf's unique indexes against them. `find_row_leaf`
+re-implements the exact same bound-evaluation / hash-computation /
+sibling-matching walk as `find_partition_leaf` — the function
+`route_partition_inserts` itself calls moments later to actually place
+the row. **Hypothesis**: the bench table has no PRIMARY KEY or UNIQUE
+constraint anywhere in its partition subtree (an ordinary, common shape —
+not every partitioned table has one), so every leaf's `uniques` list is
+empty and the function's own per-row check loop (lines 147-188) never
+does anything once `find_row_leaf` returns — the entire per-row
+leaf-routing pass, including one `partition_row_hash`/`partition_key_hash`
+call per row for a HASH-partitioned table, is 100% wasted work,
+duplicating the routing `route_partition_inserts` is about to redo
+anyway. Fix and measurement in the entry above this one.
+
+**Reproduce**:
+```bash
+cargo build
+python3 benches/profile_hash_partition_insert.py --tool callgrind --rows 2000 --variant hash
+python3 benches/profile_hash_partition_insert.py --tool callgrind --rows 2000 --variant plain
+python3 benches/profile_hash_partition_insert.py --tool dhat --rows 2000 --variant hash
+```
+
+Baseline profiles committed:
+`benches/profiles/callgrind.out.hashpartinsert-{base,plain-base}-n{500,1000,2000}-2026-11-08`,
+`benches/profiles/dhat.out.hashpartinsert-base-n2000-2026-11-08`.
+
 ## Bolt: `CREATE RULE` fires each row as an independent single-row statement — finding, no fix — 2026-11-05
 
 No prior Bolt round had profiled `CREATE RULE` (v2.19, `src/exec/rules.rs`).
