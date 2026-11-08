@@ -2,6 +2,73 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `check_partitioned_insert_unique` routes every INSERT row through a full partition-leaf lookup even when no leaf has a unique constraint — baseline — 2026-11-08
+
+**Why this workload**: v2.20-v2.23 (partition routing for non-integer
+keys, direct-leaf DML, collation derivation, and — the focus here —
+v2.23's multi-column `PARTITION BY HASH` routing with the real PG hash
+algorithm) all landed after the last Bolt round (2026-11-05's `CREATE
+RULE` harness); no prior round has profiled any of this new partitioning
+machinery. New harness, `benches/profile_hash_partition_insert.py`
+(self-contained launch-under-valgrind pattern, same as
+`profile_rule_insert.py`): a single multi-row `INSERT ... SELECT ...
+FROM generate_series` into a table `PARTITION BY HASH (a, b)` with 4
+explicit `MODULUS 4` partitions and default (no custom opclass) hash
+functions — the ordinary real-world shape; custom opclasses, per
+`tests/conformance/pg19/sql/hash_part.sql`, exist only to make hash
+results deterministic for the conformance suite, not something a real
+schema would use. `--variant plain` is a control: an identical
+two-column table with no partitioning at all, same row volume, same
+`INSERT ... SELECT` shape, isolating partition routing's share of the
+profile by subtraction.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`), 2000 rows:
+
+| variant | Ir |
+|---|---|
+| `hash` | 345,398,385 |
+| `plain` (control) | 129,517,033 |
+
+The partition-routing subtree is 215,881,352 `Ir`, **62.5%** of the
+`hash` workload's total — nowhere near the 5%-of-profile floor, it's
+nearly two-thirds of the whole statement's cost.
+`callgrind_annotate --inclusive=yes` breaks that subtree down:
+`route_partition_inserts` (the routing pass that actually places each
+row) is 37.4% of the total; a second, independent pass,
+`check_partitioned_insert_unique` (the statement-atomic UNIQUE-check
+pass, called right before `route_partition_inserts` from
+`exec_insert_inner`) is a further 25.1% on its own.
+
+Reading `check_partitioned_insert_unique` (`src/exec/indexes.rs`): for
+every candidate row, it calls `find_row_leaf` (`src/exec/dml.rs`) to
+determine which leaf the row would land in, purely so it can group rows
+by leaf and check each leaf's unique indexes against them. `find_row_leaf`
+re-implements the exact same bound-evaluation / hash-computation /
+sibling-matching walk as `find_partition_leaf` — the function
+`route_partition_inserts` itself calls moments later to actually place
+the row. **Hypothesis**: the bench table has no PRIMARY KEY or UNIQUE
+constraint anywhere in its partition subtree (an ordinary, common shape —
+not every partitioned table has one), so every leaf's `uniques` list is
+empty and the function's own per-row check loop (lines 147-188) never
+does anything once `find_row_leaf` returns — the entire per-row
+leaf-routing pass, including one `partition_row_hash`/`partition_key_hash`
+call per row for a HASH-partitioned table, is 100% wasted work,
+duplicating the routing `route_partition_inserts` is about to redo
+anyway. Fix and measurement in the entry above this one.
+
+**Reproduce**:
+```bash
+cargo build
+python3 benches/profile_hash_partition_insert.py --tool callgrind --rows 2000 --variant hash
+python3 benches/profile_hash_partition_insert.py --tool callgrind --rows 2000 --variant plain
+python3 benches/profile_hash_partition_insert.py --tool dhat --rows 2000 --variant hash
+```
+
+Baseline profiles committed:
+`benches/profiles/callgrind.out.hashpartinsert-{base,plain-base}-n{500,1000,2000}-2026-11-08`,
+`benches/profiles/dhat.out.hashpartinsert-base-n2000-2026-11-08`.
+
 ## Bolt: `CREATE RULE` fires each row as an independent single-row statement — finding, no fix — 2026-11-05
 
 No prior Bolt round had profiled `CREATE RULE` (v2.19, `src/exec/rules.rs`).
