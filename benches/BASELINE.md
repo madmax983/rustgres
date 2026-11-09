@@ -2,6 +2,77 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `route_partition_inserts` re-walks the whole partition bound chain after firing BEFORE INSERT triggers, even when the leaf has none — baseline — 2026-11-09
+
+**Why this workload**: the previous Bolt round (2026-11-08) fixed
+`check_partitioned_insert_unique`'s wasted per-row leaf lookup in the
+same `hash`-partitioned-INSERT path, but left `route_partition_inserts`
+itself unexamined — its own entry noted the routing pass is still
+37.4% of the `hash` workload's `Ir` even after that fix landed. Same
+harness, no changes needed
+(`benches/profile_hash_partition_insert.py`, already committed): a
+multi-row `INSERT ... SELECT ... FROM generate_series` into a
+`PARTITION BY HASH (a, b)` table with 4 explicit `MODULUS 4`
+partitions and default hash functions, against a `--variant plain`
+control (identical shape, no partitioning) to isolate the
+partition-routing subtree's share of `Ir` by subtraction. Figures below
+are on top of 2026-11-08's fix (this round's own baseline).
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`), 2000 rows, `--variant hash`, total `Ir` =
+258,741,923 (plain control: 129,517,892).
+
+`callgrind_annotate --tree=calling --inclusive=yes` breaks
+`route_partition_inserts`'s own inclusive cost (49.95% of the total)
+down by direct callee:
+
+| callee | Ir | % of total |
+|---|---|---|
+| `check_leaf_bound` (2,000 calls) | 66,035,658 | 25.52% |
+| `find_partition_leaf` (2,000 calls) | 41,744,162 | 16.13% |
+| (row remap/`HashMap` grouping/`Row::new`, inherent) | ~21,000,000 | ~8% |
+| `fire_before_insert_triggers` (4 calls — once per leaf group) | 225,437 | 0.09% |
+
+`check_leaf_bound` — called once per row, *after* trigger firing, to
+re-validate the leaf's bound in case a trigger changed the row — costs
+*more* than `find_partition_leaf`, the routing pass that decided which
+leaf the row belongs to in the first place. Reading
+`fire_before_insert_triggers` (same file): when a leaf has no eligible
+BEFORE INSERT FOR EACH ROW trigger (`firing.is_empty()`), it takes a
+fast path that returns every row cloned unchanged — confirmed by its
+own cost here, 0.09% for all 4 leaf groups combined, nowhere near
+`check_leaf_bound`'s 25.52%. **Hypothesis**: the bench table (like most
+partitioned tables — PG itself only fires row triggers created
+directly on a leaf, which is uncommon) has no BEFORE INSERT ROW
+trigger on any leaf, so every one of the 2,000 post-trigger
+`check_leaf_bound` calls re-derives a bound chain that
+`find_partition_leaf` already proved true for the identical,
+unmodified row moments earlier — 100% redundant work, gated only on
+"does this leaf have a trigger that could invalidate the earlier
+proof", a check `route_partition_inserts` never makes. Fix and
+measurement in the entry above this one.
+
+**Reproduce**:
+```bash
+cargo build
+python3 benches/profile_hash_partition_insert.py --tool callgrind --rows 2000 --variant hash --keep-log /tmp/cg.hash.n2000
+python3 benches/profile_hash_partition_insert.py --tool callgrind --rows 2000 --variant plain
+python3 benches/profile_hash_partition_insert.py --tool dhat --rows 2000 --variant hash
+callgrind_annotate --tree=calling --inclusive=yes /tmp/cg.hash.n2000 | grep -A2 'route_partition_inserts \[/home'
+```
+Note: `profile_hash_partition_insert.py`'s `--log-file` and
+`--callgrind-out-file`/`--dhat-out-file` paths collide (both land on
+`<tmpdir>/<tool>.out`), so a raw kept log has valgrind's own summary
+text spliced into the callgrind/dhat data; `callgrind_annotate` can
+choke on it (`too many event counts`) and the dhat file isn't valid
+JSON. The single `Ir`/`Total:` numbers this entry relies on are
+unaffected (they're read before the splice point), but a fresh
+`--tree=calling` breakdown needs the two paths separated first.
+
+Baseline profiles committed:
+`benches/profiles/{callgrind,dhat}.out.hashpartinsert-checkleafbound-
+{base,plain-base}-n{500,1000,2000}-2026-11-09`.
+
 ## Bolt: `check_partitioned_insert_unique` routes every INSERT row through a full partition-leaf lookup even when no leaf has a unique constraint — fix — 2026-11-08
 
 Fixes the target identified in the baseline entry immediately below this
