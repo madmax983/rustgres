@@ -2214,12 +2214,17 @@ pub(crate) fn route_partition_inserts(
     // cases). Suppressed rows never reach the leaf.
     let mut result: Vec<(String, Vec<(u64, Row)>)> = Vec::with_capacity(by_leaf.len());
     for (leaf_name, (leaf_cols, leaf_rows)) in by_leaf {
-        let leaf_pinfo = {
+        let (leaf_pinfo, leaf_has_row_triggers) = {
             let lt = eng
                 .db
                 .find_table(&leaf_name, ctx.snap, &ctx.all_xids, ctx.session)
                 .expect("leaf still visible");
-            lt.partition.clone().expect("leaf is partitioned")
+            (
+                lt.partition.clone().expect("leaf is partitioned"),
+                lt.triggers
+                    .iter()
+                    .any(is_eligible_before_insert_row_trigger),
+            )
         };
         let rows_only: Vec<Row> = leaf_rows.iter().map(|(_, r)| r.clone()).collect();
         let fired = fire_before_insert_triggers(eng, ctx, &leaf_name, &leaf_cols, &rows_only)?;
@@ -2232,13 +2237,37 @@ pub(crate) fn route_partition_inserts(
             }
         }
         // v1.00: the leaf's partition bound is an implicit CHECK — it
-        // must hold for the post-trigger row.
-        for (_, row) in &fired_rows {
-            check_leaf_bound(eng, ctx, &leaf_name, &leaf_pinfo, &leaf_cols, &row[..])?;
+        // must hold for the post-trigger row. Skip the walk-up entirely
+        // when the leaf has no eligible BEFORE INSERT FOR EACH ROW
+        // trigger: `fire_before_insert_triggers` then returns every row
+        // byte-for-byte unchanged (its own `firing.is_empty()` fast
+        // path), so the row is exactly what `find_partition_leaf`
+        // already proved satisfies this same bound chain while routing
+        // it here, and the walk-up (one `eval_table_part_key`/
+        // `partition_row_hash` per ancestor level, same primitives
+        // `find_partition_leaf` already called) cannot find a
+        // violation.
+        if leaf_has_row_triggers {
+            for (_, row) in &fired_rows {
+                check_leaf_bound(eng, ctx, &leaf_name, &leaf_pinfo, &leaf_cols, &row[..])?;
+            }
         }
         result.push((leaf_name, fired_rows));
     }
     Ok(result)
+}
+
+/// Whether `tr` is a BEFORE INSERT FOR EACH ROW trigger that
+/// [`fire_before_insert_triggers`] would actually fire. Shared with
+/// [`route_partition_inserts`], which uses it to skip the post-trigger
+/// bound re-check entirely when a leaf has no such trigger (the
+/// re-check can only matter for a row a trigger might have changed).
+fn is_eligible_before_insert_row_trigger(tr: &TriggerDef) -> bool {
+    tr.timing == TriggerTiming::Before
+        && tr.for_each_row
+        && tr.fires()
+        && !tr.has_transition
+        && (tr.events & trig_event::INSERT) != 0
 }
 
 /// v1.00: fire BEFORE INSERT FOR EACH ROW triggers for `table`.
@@ -2269,13 +2298,7 @@ pub(crate) fn fire_before_insert_triggers(
             .expect("table still visible");
         t.triggers
             .iter()
-            .filter(|tr| {
-                tr.timing == TriggerTiming::Before
-                    && tr.for_each_row
-                    && tr.fires()
-                    && !tr.has_transition
-                    && (tr.events & trig_event::INSERT) != 0
-            })
+            .filter(|tr| is_eligible_before_insert_row_trigger(tr))
             .cloned()
             .collect()
     };

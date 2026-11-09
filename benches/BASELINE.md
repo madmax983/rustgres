@@ -2,6 +2,173 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `route_partition_inserts` re-walks the whole partition bound chain after firing BEFORE INSERT triggers, even when the leaf has none — fix — 2026-11-09
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec/partition.rs`: after routing rows to a leaf and firing that
+leaf's BEFORE INSERT FOR EACH ROW triggers, `route_partition_inserts`
+unconditionally re-validated every row against the leaf's full bound
+chain via `check_leaf_bound` (walking leaf → root, re-running
+`eval_table_part_key`/`partition_row_hash`/`bound_contains_hash` at
+every ancestor level) — the comment above the loop explains why: "a
+trigger may have moved the row out of its partition". But
+`fire_before_insert_triggers` already special-cases the leaf having no
+eligible trigger: its `firing.is_empty()` branch returns every row
+cloned byte-for-byte, unchanged. When nothing could have moved the
+row, the bound chain `check_leaf_bound` re-walks is exactly the one
+`find_partition_leaf` already proved the row satisfies while choosing
+this leaf a few lines earlier — the re-check is guaranteed to pass and
+is pure duplicated work.
+
+Factored the trigger-eligibility predicate
+`fire_before_insert_triggers` already computed internally
+(`tr.timing == TriggerTiming::Before && tr.for_each_row && tr.fires()
+&& !tr.has_transition && (tr.events & trig_event::INSERT) != 0`) out
+into a shared `is_eligible_before_insert_row_trigger`, and used it in
+`route_partition_inserts` to check once per leaf (not per row) whether
+the leaf has any such trigger. The `check_leaf_bound` loop over
+`fired_rows` now runs only when it does; the direct-insert bound
+checks elsewhere in the same function (the `pinfo.bound.is_some()`
+branch, where there was no prior routing decision to trust) and
+`route_dml_destination`'s own `check_leaf_bound` calls (UPDATE/MERGE
+target validation) are untouched — both have no equivalent
+already-proven invariant to lean on.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_hash_partition_insert.py --variant
+{hash,plain} --rows {500,1000,2000}`), same workload, same machine,
+same session.
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`), total `Ir`, `--variant hash`:
+
+| rows (N) | before | after | delta |
+|---|---|---|---|
+| 500  | 70,557,024  | 53,969,746  | **-23.51%** |
+| 1000 | 133,191,480 | 100,042,630 | **-24.89%** |
+| 2000 | 258,741,923 | 192,340,404 | **-25.67%** |
+
+The `plain` control (same row volume, same `INSERT ... SELECT` shape,
+no partitioning at all) is unchanged by the fix at N=2000:
+129,517,892 before vs. 129,518,609 after (+0.0006%, noise), confirming
+the saving is isolated to the partitioned-INSERT path.
+
+DHAT (N=2000, `--variant hash`):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| Total bytes allocated | 12,766,309 | 9,098,309 | **-28.73%** |
+| Total blocks allocated | 152,015 | 94,015 | **-38.15%** |
+
+Both the `Ir` reduction (23.5-25.7%) and the DHAT reduction (28.7% /
+38.2%) clear their floors (≥5% / ≥10%) several times over, and the
+`Ir` saved at N=2000 (66,401,519) lands close to `check_leaf_bound`'s
+own inclusive cost in the baseline profile (66,035,658 Ir, 25.52% of
+the baseline total, see below) — confirming the fix removes the
+targeted subtree itself.
+
+`cargo test --all-features`: 1328/1328 passed, identical on both
+trees. `cargo fmt --all -- --check`: clean. `cargo clippy
+--all-targets --all-features -- -D warnings`: 1269 errors on both the
+pre-fix and post-fix tree (confirmed via `git stash`/`git stash pop`;
+the same pre-existing toolchain/lint-version mismatch noted throughout
+this file), none in the changed lines.
+`tests/conformance/schedule_runner.py --tests
+hash_part,triggers,partition_prune,partition_join,partition_aggregate,
+partition_info,constraints,alter_table,create_table,foreign_key`:
+identical PASS=5613/REAL-FAIL=1382 (same two mid-run server-restart log
+lines) on both trees — including `triggers.sql`'s `trigpart*` fixtures,
+which exercise a BEFORE INSERT ROW trigger that *does* move a row
+across a partition boundary (the case the untouched branch of this
+fix exists for).
+
+Before/after profiles committed:
+`benches/profiles/{callgrind,dhat}.out.hashpartinsert-checkleafbound-
+{base,after}-n{500,1000,2000}-2026-11-09` (dhat and the `plain` control
+only at N=2000).
+
+**Reproduce**: check out the parent (baseline) commit, `cargo build`,
+`python3 benches/profile_hash_partition_insert.py --tool callgrind
+--variant hash --rows 2000` (repeat for 500/1000, and with `--tool
+dhat` for the allocation numbers) for the before numbers; check out
+this commit, `cargo build`, repeat for the after numbers.
+
+## Bolt: `route_partition_inserts` re-walks the whole partition bound chain after firing BEFORE INSERT triggers, even when the leaf has none — baseline — 2026-11-09
+
+**Why this workload**: the previous Bolt round (2026-11-08) fixed
+`check_partitioned_insert_unique`'s wasted per-row leaf lookup in the
+same `hash`-partitioned-INSERT path, but left `route_partition_inserts`
+itself unexamined — its own entry noted the routing pass is still
+37.4% of the `hash` workload's `Ir` even after that fix landed. Same
+harness, no changes needed
+(`benches/profile_hash_partition_insert.py`, already committed): a
+multi-row `INSERT ... SELECT ... FROM generate_series` into a
+`PARTITION BY HASH (a, b)` table with 4 explicit `MODULUS 4`
+partitions and default hash functions, against a `--variant plain`
+control (identical shape, no partitioning) to isolate the
+partition-routing subtree's share of `Ir` by subtraction. Figures below
+are on top of 2026-11-08's fix (this round's own baseline).
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`), 2000 rows, `--variant hash`, total `Ir` =
+258,741,923 (plain control: 129,517,892).
+
+`callgrind_annotate --tree=calling --inclusive=yes` breaks
+`route_partition_inserts`'s own inclusive cost (49.95% of the total)
+down by direct callee:
+
+| callee | Ir | % of total |
+|---|---|---|
+| `check_leaf_bound` (2,000 calls) | 66,035,658 | 25.52% |
+| `find_partition_leaf` (2,000 calls) | 41,744,162 | 16.13% |
+| (row remap/`HashMap` grouping/`Row::new`, inherent) | ~21,000,000 | ~8% |
+| `fire_before_insert_triggers` (4 calls — once per leaf group) | 225,437 | 0.09% |
+
+`check_leaf_bound` — called once per row, *after* trigger firing, to
+re-validate the leaf's bound in case a trigger changed the row — costs
+*more* than `find_partition_leaf`, the routing pass that decided which
+leaf the row belongs to in the first place. Reading
+`fire_before_insert_triggers` (same file): when a leaf has no eligible
+BEFORE INSERT FOR EACH ROW trigger (`firing.is_empty()`), it takes a
+fast path that returns every row cloned unchanged — confirmed by its
+own cost here, 0.09% for all 4 leaf groups combined, nowhere near
+`check_leaf_bound`'s 25.52%. **Hypothesis**: the bench table (like most
+partitioned tables — PG itself only fires row triggers created
+directly on a leaf, which is uncommon) has no BEFORE INSERT ROW
+trigger on any leaf, so every one of the 2,000 post-trigger
+`check_leaf_bound` calls re-derives a bound chain that
+`find_partition_leaf` already proved true for the identical,
+unmodified row moments earlier — 100% redundant work, gated only on
+"does this leaf have a trigger that could invalidate the earlier
+proof", a check `route_partition_inserts` never makes. Fix and
+measurement in the entry above this one.
+
+**Reproduce**:
+```bash
+cargo build
+python3 benches/profile_hash_partition_insert.py --tool callgrind --rows 2000 --variant hash --keep-log /tmp/cg.hash.n2000
+python3 benches/profile_hash_partition_insert.py --tool callgrind --rows 2000 --variant plain
+python3 benches/profile_hash_partition_insert.py --tool dhat --rows 2000 --variant hash
+callgrind_annotate --tree=calling --inclusive=yes /tmp/cg.hash.n2000 | grep -A2 'route_partition_inserts \[/home'
+```
+Note: `profile_hash_partition_insert.py`'s `--log-file` and
+`--callgrind-out-file`/`--dhat-out-file` paths collide (both land on
+`<tmpdir>/<tool>.out`), so a raw kept log has valgrind's own summary
+text spliced into the callgrind/dhat data; `callgrind_annotate` can
+choke on it (`too many event counts`) and the dhat file isn't valid
+JSON. The single `Ir`/`Total:` numbers this entry relies on are
+unaffected (they're read before the splice point), but a fresh
+`--tree=calling` breakdown needs the two paths separated first.
+
+Baseline profiles committed:
+`benches/profiles/{callgrind,dhat}.out.hashpartinsert-checkleafbound-
+{base,plain-base}-n{500,1000,2000}-2026-11-09`.
+
 ## Bolt: `check_partitioned_insert_unique` routes every INSERT row through a full partition-leaf lookup even when no leaf has a unique constraint — fix — 2026-11-08
 
 Fixes the target identified in the baseline entry immediately below this
