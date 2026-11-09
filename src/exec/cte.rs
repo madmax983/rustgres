@@ -89,6 +89,21 @@ pub(crate) fn cte_binding(
 /// iterations, so cyclic graphs terminate; UNION ALL keeps duplicates.
 /// A safety cap aborts runaway UNION ALL recursion (Postgres would loop
 /// forever).
+/// v2.25: PG19 UNION type-resolution rank within the numeric type
+/// category (parse_type.c select_common_type: the wider/preferred
+/// type wins). Used by the recursive-CTE seed-type rule below.
+fn numeric_type_rank(t: &ColType) -> Option<u8> {
+    match t {
+        ColType::SmallInt => Some(0),
+        ColType::Int => Some(1),
+        ColType::BigInt => Some(2),
+        ColType::Numeric(_) => Some(3),
+        ColType::Float4 => Some(4),
+        ColType::Float => Some(5),
+        _ => None,
+    }
+}
+
 pub(crate) fn eval_recursive_cte(
     q: &mut Q,
     cte: &CteDef,
@@ -204,6 +219,23 @@ pub(crate) fn eval_recursive_cte(
             let cells = cells.into_cells();
             let mut coerced = Vec::with_capacity(cells.len());
             for (v, ty) in cells.into_iter().zip(seed_types.iter()) {
+                // v2.25: PG19's recursive-CTE type rule (parse_cte.c):
+                // the UNION's overall type is resolved across both
+                // terms, and when it differs from the non-recursive
+                // term's type the query errors 42804 ("recursive
+                // query ... has type X in non-recursive term but type
+                // Y overall"). Within the numeric category the wider
+                // type wins resolution, so a recursive term WIDER
+                // than the seed (numeric into an integer seed) is
+                // that error — coerce_value's assignment casts must
+                // not silently narrow it into the seed type.
+                if let (Some(vr), Some(sr)) =
+                    (numeric_type_rank(&v.col_type()), numeric_type_rank(ty))
+                {
+                    if vr > sr {
+                        return Err(assign_err(&cte.name, ty, &v.type_name()));
+                    }
+                }
                 coerced.push(coerce_value(v, ty, &cte.name)?);
             }
             let row = QRow {

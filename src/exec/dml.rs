@@ -54,6 +54,17 @@ pub(crate) fn coerce_literal(
                 .parse::<f64>()
                 .map(Value::Float)
                 .map_err(|_| assign_err(col_name, col_type, lit.type_name())),
+            // v2.25: decimal literal -> integer column: parse exactly
+            // as numeric, then the numeric->int assignment cast.
+            ColType::SmallInt | ColType::Int | ColType::BigInt => {
+                let n = crate::storage::Numeric::parse(s).map_err(|_| {
+                    exec_err(
+                        "22P02",
+                        format!("invalid input syntax for type numeric: {:?}", s),
+                    )
+                })?;
+                coerce_value(Value::Numeric(n), col_type, col_name)
+            }
             ColType::Text => Ok(Value::text(s.as_str())),
             _ => Err(assign_err(col_name, col_type, lit.type_name())),
         },
@@ -135,6 +146,9 @@ pub(crate) fn coerce_float_lit(
             .map_err(|_| exec_err("22003", "value out of range for type numeric"))
             .and_then(|n| apply_numeric_typmod(n, *tm))
             .map(Value::Numeric),
+        // v2.25: float literal -> integer column is PG's assignment
+        // cast (rint + range check), not a type mismatch.
+        ColType::SmallInt | ColType::Int | ColType::BigInt => float_to_int_value(f, col_type),
         ColType::Text => Ok(Value::text(Value::Float(f).to_text().unwrap_or_default())),
         _ => Err(assign_err(col_name, col_type, from)),
     }
@@ -184,8 +198,52 @@ pub(crate) fn coerce_numeric_lit(
         ColType::Numeric(tm) => apply_numeric_typmod(n.clone(), *tm).map(Value::Numeric),
         ColType::Float4 => Ok(Value::Float4(n.to_f64() as f32)),
         ColType::Float => Ok(Value::Float(n.to_f64())),
+        // v2.25: numeric literal -> integer column is PG's assignment
+        // cast (round half away from zero + range check).
+        ColType::SmallInt | ColType::Int | ColType::BigInt => {
+            coerce_value(Value::Numeric(n.clone()), col_type, col_name)
+        }
         ColType::Text => Ok(Value::text(n.to_text())),
         _ => Err(assign_err(col_name, col_type, "numeric")),
+    }
+}
+
+/// v2.25: PG19's float->integer assignment cast (float.c dtoi2/4/8,
+/// ftoi2/4/8): rint() (round half to even), then a range check that
+/// NaN also fails — 22003 "<type> out of range".
+fn float_to_int_value(f: f64, col_type: &ColType) -> Result<Value, ExecError> {
+    let range_msg = match col_type {
+        ColType::SmallInt => "smallint out of range",
+        ColType::Int => "integer out of range",
+        _ => "bigint out of range",
+    };
+    let r = f.round_ties_even();
+    if r.is_nan() {
+        return Err(exec_err("22003", range_msg.to_string()));
+    }
+    match col_type {
+        ColType::SmallInt => {
+            if r < i16::MIN as f64 || r > i16::MAX as f64 {
+                Err(exec_err("22003", range_msg.to_string()))
+            } else {
+                Ok(Value::SmallInt(r as i16))
+            }
+        }
+        ColType::Int => {
+            if r < i32::MIN as f64 || r > i32::MAX as f64 {
+                Err(exec_err("22003", range_msg.to_string()))
+            } else {
+                Ok(Value::Int(r as i64))
+            }
+        }
+        _ => {
+            // float.c FLOAT8_FITS_IN_INT64 bounds.
+            if r < -9_223_372_036_854_775_808.0 || r >= 9_223_372_036_854_776_000.0 {
+                Err(exec_err("22003", range_msg.to_string()))
+            } else {
+                Ok(Value::BigInt(r as i64))
+            }
+        }
     }
 }
 
@@ -227,6 +285,54 @@ pub(crate) fn coerce_value(
         }
         _ => {}
     }
+    // v2.25: numeric / float -> integer assignment casts (pg_cast.dat:
+    // numeric->int2/int4/int8 and float4/float8->int2/int4/int8 are all
+    // castcontext 'a'). PG19 numeric_int2/4/8 round half away from zero
+    // (Numeric::to_i64's semantics), report 22003 "<type> out of range"
+    // on overflow, and 0A000 on NaN/Infinity ("cannot convert NaN to
+    // integer", numeric.c). The float casts (float.c dtoi2/4/8,
+    // ftoi2/4/8) apply rint() — round half to even — then the same
+    // 22003 range check, with NaN failing it.
+    match (&v, col_type) {
+        (Value::Numeric(n), ColType::SmallInt | ColType::Int | ColType::BigInt) => {
+            let (pg_name, range_msg) = match col_type {
+                ColType::SmallInt => ("smallint", "smallint out of range"),
+                ColType::Int => ("integer", "integer out of range"),
+                _ => ("bigint", "bigint out of range"),
+            };
+            if n.is_nan() {
+                return Err(exec_err(
+                    "0A000",
+                    format!("cannot convert NaN to {}", pg_name),
+                ));
+            }
+            if n.to_f64().is_infinite() {
+                return Err(exec_err(
+                    "0A000",
+                    format!("cannot convert infinity to {}", pg_name),
+                ));
+            }
+            let i = n
+                .to_i64()
+                .ok_or_else(|| exec_err("22003", range_msg.to_string()))?;
+            return match col_type {
+                ColType::SmallInt => i16::try_from(i)
+                    .map(Value::SmallInt)
+                    .map_err(|_| exec_err("22003", range_msg.to_string())),
+                ColType::Int => i32::try_from(i)
+                    .map(|x| Value::Int(x as i64))
+                    .map_err(|_| exec_err("22003", range_msg.to_string())),
+                _ => Ok(Value::BigInt(i)),
+            };
+        }
+        (Value::Float(f), ColType::SmallInt | ColType::Int | ColType::BigInt) => {
+            return float_to_int_value(*f, col_type);
+        }
+        (Value::Float4(f), ColType::SmallInt | ColType::Int | ColType::BigInt) => {
+            return float_to_int_value(*f as f64, col_type);
+        }
+        _ => {}
+    }
     let widened = match (&v, col_type) {
         (Value::SmallInt(i), ColType::Int) => Some(Value::Int(*i as i64)),
         (Value::SmallInt(i), ColType::BigInt) => Some(Value::BigInt(*i as i64)),
@@ -263,8 +369,28 @@ pub(crate) fn coerce_value(
     // Text goes through the type's input function (assignment cast).
     // v0.35: character targets use assignment semantics; bpchar values
     // coerce like text.
+    // v2.25: PG assignment context also converts ANY source type to a
+    // text target through its output function (CoerceViaIO — e.g.
+    // INSERT INTO t(textcol) SELECT 1), resolves oid targets (carried
+    // as Value::Int here; int4->oid is an assignment cast), and casts
+    // within the date/time family (timestamp <-> timestamptz, date ->
+    // timestamp(tz), timestamp(tz) -> date are all castcontext 'a').
+    // eval_assign_cast / eval_cast implement exactly those
+    // conversions; everything else stays a 42804 type mismatch.
+    let io_or_family = matches!(col_type, ColType::Text | ColType::Oid)
+        || (matches!(
+            v,
+            Value::Date(_) | Value::Timestamp(_) | Value::Timestamptz(_)
+        ) && matches!(
+            col_type,
+            ColType::Date | ColType::Timestamp | ColType::Timestamptz
+        ))
+        // Array -> array assignment retypes element-wise (PG's
+        // array assignment cast; eval_cast's Array arm).
+        || (matches!(v, Value::Array(_)) && matches!(col_type, ColType::Array(_)));
     if matches!(v, Value::Text(_) | Value::BpChar(_))
         || matches!(col_type, ColType::Char(_) | ColType::Varchar(_))
+        || io_or_family
     {
         return eval_assign_cast(&v, col_type).map_err(|e| {
             if e.code == "42846" {
@@ -3081,15 +3207,14 @@ pub(crate) fn exec_insert_inner(
                         // typmod like any other assignment (PG's
                         // apply_typmod); the SELECT's rows are Values, not
                         // pre-coerced to the target type.
-                        values[ti] = match ctype {
-                            ColType::Numeric(tm) => match v {
-                                Value::Numeric(n) => {
-                                    apply_numeric_typmod(n.clone(), *tm).map(Value::Numeric)?
-                                }
-                                _ => v.clone(),
-                            },
-                            _ => v.clone(),
-                        };
+                        // v2.25: PG applies the full assignment cast to
+                        // INSERT...SELECT source rows (coerce_to_target
+                        // type in nodeModifyTable / transformInsertRow);
+                        // the old typmod-only special case stored raw
+                        // values of the wrong type (a Numeric 65536.000
+                        // sitting in an integer column). coerce_value
+                        // covers the typmod case internally.
+                        values[ti] = coerce_value(v.clone(), ctype, cname)?;
                     }
                     explicit[ti] = true;
                 }

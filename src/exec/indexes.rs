@@ -87,6 +87,24 @@ pub(crate) fn check_insert_unique(
             }
         }
     }
+    // v2.25: a direct INSERT into a partition LEAF must also honour
+    // unique indexes declared on its ancestors (PG's child indexes).
+    // Intermediate (sub-partitioned) targets are excluded: their rows
+    // route onward and the partitioned path checks the true leaves.
+    {
+        let is_leaf = db.find_table(table, snap, owns, session).is_some_and(|t| {
+            t.partition
+                .as_ref()
+                .is_some_and(|p| p.parent.is_some() && !p.is_partitioned)
+        });
+        if is_leaf {
+            let anc = ancestor_unique_indexes(db, table, snap, owns, session);
+            if !anc.is_empty() {
+                let rows_v: Vec<Vec<Value>> = rows.iter().map(|r| r[..].to_vec()).collect();
+                check_leaf_ancestor_uniques(db, table, &rows_v, &anc, snap, owns, session)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -121,6 +139,13 @@ pub(crate) fn check_partitioned_insert_unique(
     // zero benefit.
     let leaves = collect_partition_leaves(&eng.db, table, ctx.snap, ctx.own, ctx.session);
     let any_unique = leaves.iter().any(|leaf| {
+        // v2.25: ancestor unique indexes (declared on this parent or
+        // higher) also count — a leaf with no local unique index can
+        // still be constrained by a partitioned unique index above it.
+        if !ancestor_unique_indexes(&eng.db, leaf, ctx.snap, &ctx.all_xids, ctx.session).is_empty()
+        {
+            return true;
+        }
         if eng.db.is_temp_table(ctx.session, leaf) {
             !temp_unique_cols(&eng.db, leaf, ctx.snap, &ctx.all_xids, ctx.session).is_empty()
         } else {
@@ -207,6 +232,340 @@ pub(crate) fn check_partitioned_insert_unique(
                             eng, ctx, leaf, &name,
                         )));
                     }
+                }
+            }
+        }
+        // v2.25: unique indexes declared on ancestors of this leaf
+        // (a partitioned unique index on the parent has a child index
+        // here in PG) — checked against the statement's own rows for
+        // this leaf and the leaf's existing rows.
+        let anc = ancestor_unique_indexes(&eng.db, leaf, ctx.snap, &ctx.all_xids, ctx.session);
+        if !anc.is_empty() {
+            check_leaf_ancestor_uniques(
+                &eng.db,
+                leaf,
+                &leaf_rows,
+                &anc,
+                ctx.snap,
+                &ctx.all_xids,
+                ctx.session,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// v2.25: one unique index declared on an ANCESTOR of a partition leaf,
+/// mapped onto the leaf's column positions. In PG19 a partitioned index
+/// has a physical child index on every leaf and ExecInsert enforces the
+/// leaf's own indexes; this engine keeps no child index objects (the
+/// catalog model is unchanged), so INSERT-time enforcement consults the
+/// ancestors' index definitions directly.
+pub(crate) struct AncestorUnique {
+    /// The name PG's 23505 names: the constraint name for a
+    /// constraint-backed index, else the PG child-index name
+    /// (`<leaf>_<key cols>_idx`, ChooseIndexName dedup rules).
+    pub report_name: String,
+    /// Key column positions in the LEAF's column order.
+    pub cols: Vec<usize>,
+    pub nulls_not_distinct: bool,
+}
+
+/// v2.25: the 23505 report name for `ix` (an index on ancestor `anc`)
+/// as enforced on `leaf`.
+pub(crate) fn ancestor_index_report_name(
+    db: &Database,
+    anc: &str,
+    ix: &IndexDef,
+    leaf: &str,
+    snap: &Snapshot,
+    owns: &[u64],
+    session: u64,
+) -> String {
+    if ix.internal {
+        // Constraint-backed: PG names the constraint (the child's
+        // constraint carries the parent's name).
+        if let Some(t) = db.find_table(anc, snap, owns, session) {
+            let is_child = t.partition.as_ref().is_some_and(|p| p.parent.is_some());
+            let mut defs: Vec<&UniqueDef> = t.uniques.iter().collect();
+            if let Some(pk) = &t.pkey {
+                defs.push(pk);
+            }
+            for u in defs {
+                if constraint_index_name(anc, &u.name, is_child) == ix.name {
+                    return u.name.clone();
+                }
+            }
+        }
+    }
+    // Standalone index: ChooseIndexName on the leaf.
+    let base = format!("{}_{}_idx", leaf, ix.col_names.join("_"));
+    let mut cand = base.clone();
+    let mut i = 1;
+    while db.find_index(&cand, snap, owns).is_some()
+        || db.find_table(&cand, snap, owns, session).is_some()
+    {
+        cand = format!("{}{}", base, i);
+        i += 1;
+    }
+    cand
+}
+
+/// v2.25: every unique, planner-usable index on every ancestor of
+/// `leaf` (nearest ancestor first), mapped to leaf column positions.
+/// An index the leaf already backs with an equivalent unique index
+/// (same key position SET — e.g. a UNIQUE/PK constraint propagated at
+/// PARTITION OF time, which the leaf-local checks already enforce) is
+/// skipped, as is an index naming a column the leaf no longer has.
+pub(crate) fn ancestor_unique_indexes(
+    db: &Database,
+    leaf: &str,
+    snap: &Snapshot,
+    owns: &[u64],
+    session: u64,
+) -> Vec<AncestorUnique> {
+    let Some(lt) = db.find_table(leaf, snap, owns, session) else {
+        return Vec::new();
+    };
+    if lt.partition.as_ref().is_none_or(|p| p.parent.is_none()) {
+        return Vec::new();
+    }
+    let mut own_sets: Vec<Vec<usize>> = db
+        .visible_indexes_for(leaf, snap, owns, session)
+        .into_iter()
+        .filter(|ix| ix.def.unique && ix.def.planner_usable)
+        .map(|ix| {
+            let mut c = ix.def.cols.clone();
+            c.sort_unstable();
+            c
+        })
+        .collect();
+    own_sets.extend(
+        temp_unique_cols(db, leaf, snap, owns, session)
+            .into_iter()
+            .map(|(_, mut c, _)| {
+                c.sort_unstable();
+                c
+            }),
+    );
+    let mut out = Vec::new();
+    let mut cur = lt.partition.as_ref().and_then(|p| p.parent.clone());
+    let mut hops = 0usize;
+    while let Some(anc) = cur {
+        hops += 1;
+        if hops > 10_000 {
+            break;
+        }
+        let Some(at) = db.find_table(&anc, snap, owns, session) else {
+            break;
+        };
+        for ix in db.visible_indexes_for(&anc, snap, owns, session) {
+            if !ix.def.unique || !ix.def.planner_usable {
+                continue;
+            }
+            let mapped: Option<Vec<usize>> = ix
+                .def
+                .col_names
+                .iter()
+                .map(|n| lt.column_index(n))
+                .collect();
+            let Some(cols) = mapped else { continue };
+            let mut sorted = cols.clone();
+            sorted.sort_unstable();
+            if own_sets.contains(&sorted) {
+                continue;
+            }
+            out.push(AncestorUnique {
+                report_name: ancestor_index_report_name(
+                    db, &anc, &ix.def, leaf, snap, owns, session,
+                ),
+                cols,
+                nulls_not_distinct: ix.def.nulls_not_distinct,
+            });
+        }
+        cur = at.partition.as_ref().and_then(|p| p.parent.clone());
+    }
+    out
+}
+
+/// v2.25: does a visible existing row of `leaf` already carry `key`
+/// over `cols`? Mirrors the visibility rule of
+/// unique_violations_all_multi's temp-table branch (a version deleted
+/// by us does not conflict; our own or snapshot-visible versions do),
+/// with IndexKey comparison so cross-type equality (numeric 1 vs
+/// integer 1) matches index semantics.
+pub(crate) fn leaf_existing_key_conflict(
+    db: &Database,
+    leaf: &str,
+    cols: &[usize],
+    key: &IndexKey,
+    snap: &Snapshot,
+    owns: &[u64],
+    session: u64,
+) -> bool {
+    let Some(t) = db.find_table(leaf, snap, owns, session) else {
+        return false;
+    };
+    t.rows.iter().any(|r| {
+        if owns.contains(&r.xmax) {
+            return false; // deleted by us: not a conflict
+        }
+        if !(owns.contains(&r.xmin) || row_visible(r, snap, owns)) {
+            return false;
+        }
+        temp_key(cols, &r.values) == *key
+    })
+}
+
+/// v2.25: statement-atomic check of `rows` (in LEAF column order,
+/// none of them inserted yet) against the leaf's ancestor unique
+/// indexes: in-batch duplicates and conflicts with existing rows.
+pub(crate) fn check_leaf_ancestor_uniques(
+    db: &Database,
+    leaf: &str,
+    rows: &[Vec<Value>],
+    anc: &[AncestorUnique],
+    snap: &Snapshot,
+    owns: &[u64],
+    session: u64,
+) -> Result<(), ExecError> {
+    for (j, values) in rows.iter().enumerate() {
+        for au in anc {
+            let key = temp_key(&au.cols, values);
+            if !au.nulls_not_distinct && key.0.iter().any(|v| matches!(v, Value::Null)) {
+                continue; // NULLs never conflict (NULLS DISTINCT)
+            }
+            if rows[..j].iter().any(|prev| temp_key(&au.cols, prev) == key)
+                || leaf_existing_key_conflict(db, leaf, &au.cols, &key, snap, owns, session)
+            {
+                return Err(unique_violation_err(&au.report_name));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// v2.25: do any two visible rows of `leaf` share a key over `cols`
+/// (the within-leaf duplicate scan PG performs when it builds a child
+/// index at CREATE INDEX / ATTACH PARTITION time)?
+pub(crate) fn leaf_within_dup(
+    db: &Database,
+    leaf: &str,
+    cols: &[usize],
+    nulls_not_distinct: bool,
+    snap: &Snapshot,
+    owns: &[u64],
+    session: u64,
+) -> bool {
+    let Some(t) = db.find_table(leaf, snap, owns, session) else {
+        return false;
+    };
+    let mut seen: BTreeSet<IndexKey> = BTreeSet::new();
+    for r in &t.rows {
+        if owns.contains(&r.xmax) {
+            continue;
+        }
+        if !(owns.contains(&r.xmin) || row_visible(r, snap, owns)) {
+            continue;
+        }
+        let key = temp_key(cols, &r.values);
+        if !nulls_not_distinct && key.0.iter().any(|v| matches!(v, Value::Null)) {
+            continue;
+        }
+        if !seen.insert(key) {
+            return true;
+        }
+    }
+    false
+}
+
+/// v2.25: validate that attaching `child`'s subtree under the chain
+/// ending at `parent` creates no within-leaf duplicate for any unique
+/// index on `parent` or its ancestors (PG builds a child index per
+/// leaf at ATTACH and fails 23505 on duplicates). Called from
+/// attach_partition before any mutation.
+pub(crate) fn validate_attach_ancestor_uniques(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    parent: &str,
+    child: &str,
+) -> Result<(), ExecError> {
+    // Ancestor chain including the parent itself.
+    let mut chain: Vec<String> = Vec::new();
+    let mut cur = Some(parent.to_string());
+    let mut hops = 0usize;
+    while let Some(name) = cur {
+        hops += 1;
+        if hops > 10_000 {
+            break;
+        }
+        let Some(t) = eng
+            .db
+            .find_table(&name, ctx.snap, &ctx.all_xids, ctx.session)
+        else {
+            break;
+        };
+        chain.push(name.clone());
+        cur = t.partition.as_ref().and_then(|p| p.parent.clone());
+    }
+    let leaves = collect_partition_leaves(&eng.db, child, ctx.snap, ctx.own, ctx.session);
+    for anc in &chain {
+        for ix in eng
+            .db
+            .visible_indexes_for(anc, ctx.snap, &ctx.all_xids, ctx.session)
+        {
+            if !ix.def.unique || !ix.def.planner_usable {
+                continue;
+            }
+            for leaf in &leaves {
+                let Some(lt) = eng
+                    .db
+                    .find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session)
+                else {
+                    continue;
+                };
+                let mapped: Option<Vec<usize>> = ix
+                    .def
+                    .col_names
+                    .iter()
+                    .map(|n| lt.column_index(n))
+                    .collect();
+                let Some(cols) = mapped else { continue };
+                // A leaf already backing an equivalent unique index
+                // cannot hold duplicates.
+                let mut sorted = cols.clone();
+                sorted.sort_unstable();
+                let backed = eng
+                    .db
+                    .visible_indexes_for(leaf, ctx.snap, &ctx.all_xids, ctx.session)
+                    .into_iter()
+                    .filter(|x| x.def.unique && x.def.planner_usable)
+                    .any(|x| {
+                        let mut c = x.def.cols.clone();
+                        c.sort_unstable();
+                        c == sorted
+                    });
+                if backed {
+                    continue;
+                }
+                if leaf_within_dup(
+                    &eng.db,
+                    leaf,
+                    &cols,
+                    ix.def.nulls_not_distinct,
+                    ctx.snap,
+                    &ctx.all_xids,
+                    ctx.session,
+                ) {
+                    return Err(unique_violation_err(&ancestor_index_report_name(
+                        &eng.db,
+                        anc,
+                        &ix.def,
+                        leaf,
+                        ctx.snap,
+                        &ctx.all_xids,
+                        ctx.session,
+                    )));
                 }
             }
         }
@@ -778,6 +1137,55 @@ pub(crate) fn exec_create_index(
                             return Err(unique_violation_err(name));
                         }
                     }
+                }
+            }
+        }
+    }
+    // v2.25: CREATE UNIQUE INDEX on a partitioned table builds a
+    // child index on every leaf in PG19; a leaf already holding
+    // duplicate keys fails the CREATE with 23505 naming the child
+    // index. This engine creates no child objects (enforcement is
+    // consultative — see ancestor_unique_indexes), but the build-time
+    // validation is real.
+    if unique && planner_usable && mv_rows.is_none() && !is_temp {
+        let partitioned = eng
+            .db
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+            .is_some_and(|t| t.partition.as_ref().is_some_and(|p| p.is_partitioned));
+        if partitioned {
+            let leaves = collect_partition_leaves(&eng.db, table, ctx.snap, ctx.own, ctx.session);
+            for leaf in &leaves {
+                let Some(lt) = eng
+                    .db
+                    .find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session)
+                else {
+                    continue;
+                };
+                let mapped: Option<Vec<usize>> = ix
+                    .def
+                    .col_names
+                    .iter()
+                    .map(|n| lt.column_index(n))
+                    .collect();
+                let Some(lcols) = mapped else { continue };
+                if leaf_within_dup(
+                    &eng.db,
+                    leaf,
+                    &lcols,
+                    nulls_not_distinct,
+                    ctx.snap,
+                    &ctx.all_xids,
+                    ctx.session,
+                ) {
+                    return Err(unique_violation_err(&ancestor_index_report_name(
+                        &eng.db,
+                        table,
+                        &ix.def,
+                        leaf,
+                        ctx.snap,
+                        &ctx.all_xids,
+                        ctx.session,
+                    )));
                 }
             }
         }
@@ -1597,6 +2005,18 @@ pub(crate) fn plan_order_scan(
     // the scan returned heap order — the v2.02-found defect where
     // SELECT ... ORDER BY over an RLS table came back unsorted.
     if t.rls_enabled {
+        return None;
+    }
+    // v2.25: a partitioned parent's rows live in its leaves and its
+    // own index tree covers none of them, so the index cannot certify
+    // scan order — the scan layer concatenates leaf rows (in leaf
+    // order), and trusting the hint returned them unsorted
+    // (indexing.sql's final idxpart SELECT). True leaves and plain
+    // tables keep the hint: their indexes cover their rows.
+    if t.partition
+        .as_ref()
+        .is_some_and(|p| p.is_partitioned || !p.children.is_empty())
+    {
         return None;
     }
     // ORDER BY alias safety: an unqualified ORDER BY column that matches a

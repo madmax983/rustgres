@@ -1194,6 +1194,10 @@ pub(crate) fn attach_partition(
             }
         }
     }
+    // v2.25: PG19 builds a child index on the attaching subtree's
+    // leaves for every unique index on the new ancestors; duplicates
+    // within a leaf abort the ATTACH with 23505.
+    validate_attach_ancestor_uniques(eng, ctx, parent_name, child_name)?;
     // Set the child's partition info — versioned, so ROLLBACK undoes it.
     // v0.70: an already-partitioned child keeps its own method, key,
     // and children (it becomes a sub-partitioned intermediate); only
