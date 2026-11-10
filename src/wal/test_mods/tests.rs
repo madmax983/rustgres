@@ -353,6 +353,67 @@ fn records_for_commit_skips_overwritten_delete() {
 }
 
 #[test]
+fn v226_drop_index_removed_outright_still_reaches_wal() {
+    // Regression (v2.26): ALTER TABLE ... DROP COLUMN removes a
+    // dropped UNIQUE/PK constraint's backing index from the index
+    // map outright (alter.rs v0.9 path) and records the drop as a
+    // plain WriteOp::DropIndex. The WAL converter's ownership probe
+    // used to require a live map entry, so the record was skipped:
+    // crash recovery resurrected the index as live, and once the
+    // table itself was dropped and a checkpoint written, startup
+    // refused the data directory ("no live version of table").
+    // An absent entry must therefore still produce the record.
+    let mut eng = engine_with_committed_table();
+    let xid = eng.begin_txn();
+    let snapshot = Index::new(IndexDef::plain(
+        "t_b_key".into(),
+        "t".into(),
+        vec![0],
+        vec!["a".into()],
+        true,
+        true,
+        1,
+    ));
+    // The map holds NO entry under the name: alter.rs removed it.
+    let writes = vec![WriteOp::DropIndex {
+        name: "t_b_key".into(),
+        index: snapshot,
+    }];
+    let recs = records_for_commit(&eng, xid, &writes, 0).unwrap();
+    assert_eq!(recs.len(), 1);
+    match &recs[0] {
+        WalRecord::DropIndex { name, xmax } => {
+            assert_eq!(name, "t_b_key");
+            assert_eq!(*xmax, xid);
+        }
+        r => panic!("unexpected record: {:?}", r),
+    }
+
+    // Control: an entry present but dropped by a RIVAL committed
+    // transaction still suppresses our record (first-winner-wins).
+    let mut eng2 = engine_with_committed_table();
+    let xid2 = eng2.begin_txn();
+    let mut rival = Index::new(IndexDef::plain(
+        "t_b_key".into(),
+        "t".into(),
+        vec![0],
+        vec!["a".into()],
+        true,
+        true,
+        1,
+    ));
+    rival.def.dropped_xmax = 5; // rival xid (committed range < next_xid)
+    let snap2 = rival.clone();
+    eng2.db.indexes.insert("t_b_key".into(), rival);
+    let writes2 = vec![WriteOp::DropIndex {
+        name: "t_b_key".into(),
+        index: snap2,
+    }];
+    let recs2 = records_for_commit(&eng2, xid2, &writes2, 0).unwrap();
+    assert!(recs2.is_empty(), "rival drop must win, got {recs2:?}");
+}
+
+#[test]
 fn records_for_commit_fails_lost_update() {
     // UPDATE/UPDATE race: our delete-half was overwritten, but our
     // insert-half survives -> committing would duplicate the row.

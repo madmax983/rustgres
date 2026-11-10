@@ -2134,6 +2134,197 @@ pub(crate) fn col_type_name(ty: &ColType) -> &'static str {
 /// not a partitioned parent, returns a single group for the target
 /// itself (no-op). If the target is a leaf (has a bound), validates the
 /// bound instead of routing.
+/// v2.26: merge a `PARTITION OF` element list into the inherited
+/// def's constraint fields (PG19 tablecmds.c MergeAttributes,
+/// is_partition block; error shapes from parse_utilcmd.c /
+/// MergeCheckConstraint). The caller has already cloned the parent's
+/// rowtype and constraints into the def; `ov` is the element def built
+/// by `build_partition_override_def` (its column types are
+/// placeholders — only names and the parallel constraint fields are
+/// read). Fields are passed split because the caller holds
+/// `&def.partition` borrowed across the merge.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_partition_overrides(
+    child: &str,
+    ov: TableDef,
+    columns: &[(String, crate::storage::ColType)],
+    gen_cols: &mut Vec<Option<(crate::sql::Expr, bool)>>,
+    defaults: &mut Vec<Option<crate::sql::DefaultExpr>>,
+    not_null: &mut Vec<bool>,
+    checks: &mut Vec<crate::sql::CheckDef>,
+    uniques: &mut Vec<crate::sql::UniqueDef>,
+    pkey: &mut Option<crate::sql::UniqueDef>,
+    fks: &mut Vec<crate::sql::FkDef>,
+) -> Result<(), ExecError> {
+    let bare = child.rsplit('.').next().unwrap_or(child);
+    let col_pos = |col: &str| -> Result<usize, ExecError> {
+        columns
+            .iter()
+            .position(|(n, _)| n == col)
+            .ok_or_else(|| exec_err("42703", format!("column \"{}\" does not exist", col)))
+    };
+    // Per-column elements: existence, the generated-family rules,
+    // DEFAULT replacement, NOT NULL accumulation.
+    for (oi, (col, _ty)) in ov.columns.iter().enumerate() {
+        let pos = col_pos(col)?;
+        let pgen = gen_cols.get(pos).cloned().unwrap_or(None);
+        let ogen = ov.gen_cols.get(oi).cloned().unwrap_or(None);
+        match (&pgen, &ogen) {
+            (Some(_), None) => {
+                if ov.defaults.get(oi).and_then(|d| d.as_ref()).is_some() {
+                    return Err(exec_err(
+                        "42P16",
+                        format!(
+                            "column \"{}\" inherits from generated column but specifies default",
+                            col
+                        ),
+                    ));
+                }
+            }
+            (None, Some(_)) => {
+                return Err(exec_err(
+                    "42P16",
+                    format!("child column \"{}\" specifies generation expression", col),
+                ));
+            }
+            (Some((_, ps)), Some((_, os))) if ps != os => {
+                return Err(exec_err(
+                    "42P16",
+                    format!(
+                        "column \"{}\" inherits from generated column of different kind",
+                        col
+                    ),
+                ));
+            }
+            (Some(_), Some((e, s))) => {
+                if gen_cols.len() != columns.len() {
+                    *gen_cols = vec![None; columns.len()];
+                }
+                gen_cols[pos] = Some((e.clone(), *s));
+            }
+            _ => {}
+        }
+        if pgen.is_none() {
+            if let Some(d) = ov.defaults.get(oi).and_then(|d| d.clone()) {
+                defaults[pos] = Some(d);
+            }
+        }
+        if ov.not_null.get(oi).copied().unwrap_or(false) && !not_null[pos] {
+            not_null[pos] = true;
+            // PG records a named not-null constraint on the child
+            // (part_b_b_not_null in create_table's pg_constraint
+            // expectations).
+            let cname = format!("{}_{}_not_null", bare, col);
+            if !checks.iter().any(|c| c.name == cname) {
+                checks.push(crate::sql::CheckDef {
+                    name: cname,
+                    expr: crate::sql::Expr::IsNull {
+                        expr: Box::new(crate::sql::Expr::Column {
+                            table: None,
+                            name: col.clone(),
+                        }),
+                        neg: true,
+                    },
+                    not_valid: false,
+                    kind: crate::sql::CheckKind::NotNull,
+                    no_inherit: false,
+                    enforced: true,
+                });
+            }
+        }
+    }
+    // Table-constraint NOT NULL elements naming columns with no
+    // column element of their own (deferred by the builder).
+    for col in &ov.deferred_not_null {
+        let pos = col_pos(col)?;
+        not_null[pos] = true;
+    }
+    // CHECK elements (column- and table-level): an element whose name
+    // and expression match an inherited constraint MERGES with it
+    // (PG NOTICE "merging constraint ... with inherited definition");
+    // the same name with a different expression is 42710.
+    for c in &ov.checks {
+        if c.kind == crate::sql::CheckKind::NotNull {
+            // Not-null constraint records travel with the flags set
+            // above; keep the record if its name is new.
+            if !checks.iter().any(|x| x.name == c.name) {
+                checks.push(c.clone());
+            }
+            continue;
+        }
+        let mut refs: Vec<(Option<String>, String)> = Vec::new();
+        crate::sql::collect_col_refs(&c.expr, &mut refs);
+        for (_, r) in &refs {
+            col_pos(r)?;
+        }
+        if let Some(existing) = checks.iter().find(|x| x.name == c.name) {
+            if existing.expr == c.expr && existing.kind == c.kind {
+                continue;
+            }
+            return Err(exec_err(
+                "42710",
+                format!(
+                    "check constraint name \"{}\" appears multiple times but with different expressions",
+                    c.name
+                ),
+            ));
+        }
+        checks.push(c.clone());
+    }
+    // UNIQUE elements.
+    for u in &ov.uniques {
+        for c in &u.cols {
+            col_pos(c)?;
+        }
+        if let Some(existing) = uniques.iter().find(|x| x.name == u.name) {
+            if existing.cols == u.cols {
+                continue;
+            }
+            return Err(exec_err(
+                "42P16",
+                format!(
+                    "constraint \"{}\" for relation \"{}\" already exists",
+                    u.name, bare
+                ),
+            ));
+        }
+        uniques.push(u.clone());
+    }
+    // PRIMARY KEY element.
+    if let Some(pk) = &ov.pkey {
+        for c in &pk.cols {
+            col_pos(c)?;
+        }
+        match &*pkey {
+            None => {
+                for c in &pk.cols {
+                    let pos = col_pos(c)?;
+                    not_null[pos] = true;
+                }
+                *pkey = Some(pk.clone());
+            }
+            Some(existing) if existing.cols == pk.cols => {}
+            Some(_) => {
+                return Err(exec_err(
+                    "42601",
+                    "multiple primary keys for table".to_string(),
+                ));
+            }
+        }
+    }
+    // FOREIGN KEY elements (validated by the caller's usual FK pass).
+    for fk in &ov.fks {
+        for c in &fk.cols {
+            col_pos(c)?;
+        }
+        if fks.iter().any(|x| x.name == fk.name) {
+            continue;
+        }
+        fks.push(fk.clone());
+    }
+    Ok(())
+}
+
 pub(crate) fn route_partition_inserts(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -2250,6 +2441,80 @@ pub(crate) fn route_partition_inserts(
         if leaf_has_row_triggers {
             for (_, row) in &fired_rows {
                 check_leaf_bound(eng, ctx, &leaf_name, &leaf_pinfo, &leaf_cols, &row[..])?;
+            }
+        }
+        // v2.26: leaf-local write semantics (PG19 ExecInsert judges
+        // the row by the LEAF's tuple descriptor): a partition whose
+        // definitions differ from the target's — a generated-column
+        // override, an element NOT NULL, or a leaf-local CHECK (all
+        // from a PARTITION OF element list) — recomputes its generated
+        // columns and re-validates the routed rows against its own
+        // constraint set. Leaves whose definitions match the target's
+        // (the overwhelmingly common plain child) skip everything.
+        {
+            let (leaf_meta, target_meta) = {
+                let lt = eng
+                    .db
+                    .find_table(&leaf_name, ctx.snap, &ctx.all_xids, ctx.session)
+                    .expect("leaf still visible");
+                let tt = eng
+                    .db
+                    .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+                    .expect("target still visible");
+                (TableMeta::of(lt), TableMeta::of(tt))
+            };
+            let by_name =
+                |meta: &TableMeta, n: &str| meta.columns.iter().position(|(cn, _)| cn == n);
+            let gen_differs = leaf_meta.columns.iter().enumerate().any(|(li, (ln, _))| {
+                let lg = leaf_meta.gen_cols.get(li).cloned().unwrap_or(None);
+                let tg = by_name(&target_meta, ln)
+                    .and_then(|ti| target_meta.gen_cols.get(ti).cloned().unwrap_or(None));
+                lg != tg
+            });
+            let nn_differs = leaf_meta.columns.iter().enumerate().any(|(li, (ln, _))| {
+                let lv = leaf_meta.not_null.get(li).copied().unwrap_or(false);
+                let tv = by_name(&target_meta, ln)
+                    .and_then(|ti| target_meta.not_null.get(ti).copied())
+                    .unwrap_or(false);
+                lv != tv
+            });
+            let extra_checks = leaf_meta.checks.iter().any(|c| {
+                !target_meta
+                    .checks
+                    .iter()
+                    .any(|t| t.name == c.name && t.expr == c.expr)
+            });
+            if gen_differs || nn_differs || extra_checks {
+                for (_, row) in &mut fired_rows {
+                    let mut vals = row[..].to_vec();
+                    if gen_differs {
+                        compute_generated_columns(
+                            eng,
+                            ctx.snap,
+                            ctx.own,
+                            ctx.session,
+                            ctx.role,
+                            &leaf_meta,
+                            &mut vals,
+                        )?;
+                    }
+                    check_row_constraints(
+                        eng,
+                        ctx.snap,
+                        ctx.own,
+                        ctx.session,
+                        ctx.role,
+                        &leaf_meta,
+                        &leaf_name,
+                        &vals,
+                    )?;
+                    *row = Row::new(vals);
+                }
+                if gen_differs && !leaf_has_row_triggers {
+                    for (_, row) in &fired_rows {
+                        check_leaf_bound(eng, ctx, &leaf_name, &leaf_pinfo, &leaf_cols, &row[..])?;
+                    }
+                }
             }
         }
         result.push((leaf_name, fired_rows));
@@ -5143,6 +5408,28 @@ pub(crate) fn create_table_from_def(
                 // v0.72: same for STORAGE — PG copies attstorage as part
                 // of the rowtype.
                 def.storage = parent.col_storage.iter().map(|b| Some(*b)).collect();
+                // v2.26: generated expressions and collations are part
+                // of the rowtype too (the clone above never carried
+                // them, so children silently lost both).
+                def.gen_cols = parent.gen_cols.clone();
+                def.collations = parent.col_collations.clone();
+                // v2.26: PARTITION OF element list (PG19
+                // MergeAttributes) merged into the inherited def.
+                if let Some(ov) = def.partition_overrides.take().map(|b| *b) {
+                    apply_partition_overrides(
+                        name,
+                        ov,
+                        &def.columns,
+                        &mut def.gen_cols,
+                        &mut def.defaults,
+                        &mut def.not_null,
+                        &mut def.checks,
+                        &mut def.uniques,
+                        &mut def.pkey,
+                        &mut def.fks,
+                    )?;
+                    validate_generated_columns(eng, &def)?;
+                }
                 // v1.41: attnums travel with the rowtype too (stashed
                 // for after the table is built, like temp_pinfo).
                 temp_attnums = Some(parent.attnums.clone());
@@ -5282,6 +5569,28 @@ pub(crate) fn create_table_from_def(
             // v0.72: same for STORAGE — PG copies attstorage as part of
             // the rowtype.
             def.storage = parent.col_storage.iter().map(|b| Some(*b)).collect();
+            // v2.26: generated expressions and collations are part of
+            // the rowtype too (the clone above never carried them, so
+            // children silently lost both).
+            def.gen_cols = parent.gen_cols.clone();
+            def.collations = parent.col_collations.clone();
+            // v2.26: PARTITION OF element list (PG19 MergeAttributes)
+            // merged into the inherited def.
+            if let Some(ov) = def.partition_overrides.take().map(|b| *b) {
+                apply_partition_overrides(
+                    name,
+                    ov,
+                    &def.columns,
+                    &mut def.gen_cols,
+                    &mut def.defaults,
+                    &mut def.not_null,
+                    &mut def.checks,
+                    &mut def.uniques,
+                    &mut def.pkey,
+                    &mut def.fks,
+                )?;
+                validate_generated_columns(eng, &def)?;
+            }
             // v1.41: PARTITION OF copies the parent's rowtype — attnums
             // travel with it (PG assigns the child the parent's
             // attribute numbers, gaps included).

@@ -2577,6 +2577,15 @@ pub struct TableDef {
     /// v1.96: `CREATE TABLE name OF type_name` — a typed table whose
     /// columns come from the named composite type (expanded at exec).
     pub of_type: Option<String>,
+    /// v2.26: `CREATE TABLE ... PARTITION OF parent ( <elements> )` —
+    /// the OptTypedTableElementList, built by
+    /// `build_partition_override_def` into a def whose columns are the
+    /// named parent columns (types are placeholders; the parent's
+    /// rowtype wins) and whose constraint fields carry the per-column
+    /// overrides plus any table-constraint elements. Merged into the
+    /// inherited def at exec (PG19 MergeAttributes). `None` when the
+    /// statement named no element list.
+    pub partition_overrides: Option<Box<TableDef>>,
 }
 
 /// v1.95: the command a row-level-security policy applies to
@@ -3155,6 +3164,13 @@ pub(crate) enum ColCon {
         expr: Expr,
         stored: bool,
     },
+    /// v2.26: `GENERATED {ALWAYS|BY DEFAULT} AS IDENTITY [(seq opts)]`.
+    /// Identity columns are not implemented engine-wide; the variant
+    /// exists so each context can raise its own PG error (plain
+    /// CREATE TABLE: 0A000 "identity columns are not supported";
+    /// PARTITION OF element: 0A000 "identity columns are not supported
+    /// on partitions").
+    Identity,
 }
 
 pub(crate) enum ParsedTableCon {
@@ -3267,6 +3283,7 @@ impl TableDef {
             gen_cols: Vec::new(),
             collations: Vec::new(),
             unlogged: false,
+            partition_overrides: None,
         }
     }
 }
@@ -3698,6 +3715,16 @@ pub(crate) fn build_table_def(
                         ColCon::Generated { expr, stored } => {
                             def.gen_cols[i] = Some((expr.clone(), *stored))
                         }
+                        // v2.26: identity columns are not implemented;
+                        // plain CREATE TABLE keeps the engine's
+                        // standing 0A000 (the PARTITION OF builder
+                        // pre-scans and reports its own message).
+                        ColCon::Identity => {
+                            return Err(SqlError {
+                                message: "identity columns are not supported".to_string(),
+                                code: "0A000",
+                            });
+                        }
                     }
                 }
             }
@@ -3852,6 +3879,33 @@ pub(crate) fn build_table_def(
         }
     }
     Ok(def)
+}
+
+/// v2.26: build the override def for a `PARTITION OF` element list
+/// (PG19 gram.y OptTypedTableElementList: columnOptions and
+/// TableConstraints naming PARENT columns; there are no type names).
+/// Reuses `build_table_def` with a non-empty placeholder `inherits`
+/// so every column-existence check defers to the exec merge against
+/// the parent's rowtype (and a table-constraint-only list is legal).
+/// The one context-specific rule applied here is PG19's blanket
+/// rejection of identity in a partition (parse_utilcmd.c
+/// transformCreateStmt): 0A000 "identity columns are not supported
+/// on partitions" — it precedes the MergeAttributes checks.
+pub(crate) fn build_partition_override_def(
+    table: &str,
+    items: Vec<TableItem>,
+) -> Result<TableDef, SqlError> {
+    for item in &items {
+        if let TableItem::Col(c) = item {
+            if c.cons.iter().any(|k| matches!(k, ColCon::Identity)) {
+                return Err(SqlError {
+                    message: "identity columns are not supported on partitions".to_string(),
+                    code: "0A000",
+                });
+            }
+        }
+    }
+    build_table_def(table, items, &[String::new()])
 }
 
 /// Collect `(qualifier, name)` of every column reference in an expression.

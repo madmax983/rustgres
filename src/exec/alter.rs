@@ -2,6 +2,99 @@
 // Zero semantic changes; map in goals/.../hidden_files/refactor-modularize/.
 use super::*;
 
+thread_local! {
+    /// v2.26: true while a DROP CONSTRAINT is being propagated from a
+    /// partitioned/inheritance parent to its children. PG19's
+    /// ATExecDropConstraint permits the drop on a child only when
+    /// recursing (`coninhcount > 0 && !recursing` errors); the
+    /// user-issued drop directly on a child carrying an inherited
+    /// constraint fails with 42P16 (see
+    /// `drop_constraint_is_inherited`).
+    static DROP_CONSTRAINT_RECURSING: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// v2.26: PG19 refuses `ALTER TABLE child DROP CONSTRAINT c` when
+/// `c` is inherited from the partitioned parent (42P16
+/// "cannot drop inherited constraint ... of relation ...",
+/// tablecmds.c ATExecDropConstraint: `coninhcount > 0 &&
+/// !recursing`). The engine's TableDef carries no coninhcount, so
+/// inheritance is derived from the parent's definition: a CHECK is
+/// inherited when the parent carries the same NAME (a PARTITION OF
+/// element definition identical to the parent's merges into the
+/// inherited constraint, so it stays non-droppable on the child);
+/// FK / UNIQUE / PRIMARY KEY copies are renamed per child, so they
+/// are matched by shape (columns, plus the referenced table for
+/// FKs) instead of by name. A constraint found only on the child
+/// (a purely local PARTITION OF element definition) is droppable.
+///
+/// Scoped to PARTITION children: for plain INHERITS children the
+/// engine does not model the local/inherited duality (a locally
+/// added constraint on an inheritance child merges with the
+/// inherited definition in PG, and a parent drop only decrements
+/// coninhcount, leaving a local copy behind), so a name/shape
+/// match there can misfire; that refinement is held back (see
+/// hidden_files/v226/scope.md).
+pub(crate) fn drop_constraint_is_inherited(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    name: &str,
+    con: &str,
+) -> bool {
+    let Some(t) = eng
+        .db
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+    else {
+        return false;
+    };
+    if !table_has_constraint(t, con) {
+        return false;
+    }
+    let parents: Vec<String> = t
+        .partition
+        .as_ref()
+        .and_then(|p| p.parent.clone())
+        .into_iter()
+        .collect();
+    if parents.is_empty() {
+        return false;
+    }
+    let child_fk = t.fks.iter().find(|f| f.name == con);
+    let child_uq = t.uniques.iter().find(|u| u.name == con);
+    let child_pk = t.pkey.as_ref().filter(|p| p.name == con);
+    parents.iter().any(|pname| {
+        let Some(pt) = eng
+            .db
+            .find_table(pname, ctx.snap, &ctx.all_xids, ctx.session)
+        else {
+            return false;
+        };
+        if pt.checks.iter().any(|c| c.name == con) {
+            return true;
+        }
+        if let Some(cf) = child_fk {
+            if pt
+                .fks
+                .iter()
+                .any(|pf| pf.cols == cf.cols && pf.ref_table == cf.ref_table)
+            {
+                return true;
+            }
+        }
+        if let Some(cu) = child_uq {
+            if pt.uniques.iter().any(|pu| pu.cols == cu.cols) {
+                return true;
+            }
+        }
+        if let Some(cp) = child_pk {
+            if pt.pkey.as_ref().is_some_and(|pp| pp.cols == cp.cols) {
+                return true;
+            }
+        }
+        false
+    })
+}
+
 /// v0.37: ALTER TABLE name ALTER COLUMN col SET STORAGE mode.
 /// Follows PG's `ATExecSetStorage`: the mode name is case-insensitive;
 /// invalid names are 22023; non-toastable types may only use PLAIN
@@ -1321,15 +1414,34 @@ pub(crate) fn exec_alter_one(
                     }
                 }
             }
+            // v2.26: PG19 refuses to drop an inherited constraint
+            // directly on a partition child (42P16); drops arriving
+            // via parent propagation are recursing and skip the
+            // guard.
+            let recursing = DROP_CONSTRAINT_RECURSING.with(|c| c.get());
+            if !recursing && drop_constraint_is_inherited(eng, ctx, name, con) {
+                let bare = name.rsplit('.').next().unwrap_or(name);
+                return Err(exec_err(
+                    "42P16",
+                    format!(
+                        "cannot drop inherited constraint \"{}\" of relation \"{}\"",
+                        con, bare
+                    ),
+                ));
+            }
             let res = alter_drop_constraint(eng, ctx, name, con, *cascade);
             // v0.70: propagate DROP CONSTRAINT to partitions.
-            if res.is_ok() {
+            // v2.26: ONLY confines the drop to the named table
+            // (PG19 leaves the children's copies in place).
+            if res.is_ok() && !only {
                 let children: Vec<String> = eng
                     .db
                     .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
                     .and_then(|t| t.partition.as_ref())
                     .map(|p| p.children.clone())
                     .unwrap_or_default();
+                let prev = DROP_CONSTRAINT_RECURSING.with(|c| c.replace(true));
+                let mut prop: Result<(), ExecError> = Ok(());
                 for child in &children {
                     // Skip children that don't carry this constraint.
                     let missing = eng
@@ -1344,8 +1456,14 @@ pub(crate) fn exec_alter_one(
                         cascade: *cascade,
                         if_exists: false,
                     };
-                    exec_alter(eng, ctx, child, std::slice::from_ref(&child_action))?;
+                    if let Err(e) = exec_alter(eng, ctx, child, std::slice::from_ref(&child_action))
+                    {
+                        prop = Err(e);
+                        break;
+                    }
                 }
+                DROP_CONSTRAINT_RECURSING.with(|c| c.set(prev));
+                prop?;
             }
             res
         }
@@ -3081,7 +3199,12 @@ pub(crate) fn alter_drop_column_ext(
         for ix in drop_idx_for {
             // v0.9: DROP the backing index for the dropped UNIQUE/PK constraint.
             // Use direct map removal (bypasses MVCC visibility which may miss
-            // the index due to snapshot timing).
+            // the index due to snapshot timing). v2.26: the WAL
+            // converter (records_for_commit) now treats a DropIndex
+            // op whose entry is absent from the map as ours to log —
+            // previously the absent entry failed its ownership check
+            // and the drop never reached the WAL, so crash recovery
+            // resurrected the index (see the DropIndex arm there).
             if let Some(index) = eng.db.indexes.remove(&ix) {
                 ctx.writes.push(WriteOp::DropIndex {
                     name: ix.clone(),

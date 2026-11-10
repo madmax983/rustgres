@@ -2004,7 +2004,26 @@ impl Parser {
         name: String,
         temp: bool,
     ) -> Result<Stmt, SqlError> {
-        let (parent, bound, sub) = self.parse_partition_of()?;
+        self.expect_keyword("partition")?;
+        self.expect_keyword("of")?;
+        // v2.04: the parent may be schema-qualified.
+        let parent = self.expect_qualified_ident()?;
+        // v2.26: optional OptTypedTableElementList between the parent
+        // and the bound (PG19 gram.y): elements name parent columns
+        // and carry only qualifications, or are table constraints.
+        let overrides = if *self.peek() == Token::LParen {
+            let items = self.parse_partition_elements()?;
+            Some(Box::new(build_partition_override_def(&name, items)?))
+        } else {
+            None
+        };
+        let bound = self.parse_partition_bound()?;
+        // Optional sub-partitioning: `PARTITION BY ...`.
+        let sub = if matches!(self.peek(), Token::Ident(s) if s == "partition") {
+            Some(self.parse_partition_by()?)
+        } else {
+            None
+        };
         // The child inherits the parent's method and key; a trailing
         // `PARTITION BY` makes it a sub-partitioned intermediate.
         let (method, keys) = match sub {
@@ -2047,8 +2066,63 @@ impl Parser {
             // v2.21: partition children inherit the parent's columns
             // (and their collations) at exec.
             collations: Vec::new(),
+            // v2.26: PARTITION OF element list (merged at exec).
+            partition_overrides: overrides,
         };
         Ok(Stmt::CreateTable { name, def, temp })
+    }
+
+    /// v2.26: `( TypedTableElement [, ...] )` after `PARTITION OF
+    /// parent` (PG19 gram.y): each element is a TableConstraint or a
+    /// columnOptions — `ColId [WITH OPTIONS] ColQualList` with NO
+    /// type name (the column is the parent's).
+    pub(crate) fn parse_partition_elements(&mut self) -> Result<Vec<TableItem>, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let mut items: Vec<TableItem> = Vec::new();
+        if *self.peek() == Token::RParen {
+            self.next();
+            return Ok(items);
+        }
+        loop {
+            if self.is_table_constraint_start() {
+                items.push(TableItem::TableCon(self.parse_table_constraint()?));
+            } else {
+                items.push(TableItem::Col(self.parse_partition_col_element()?));
+            }
+            match self.next() {
+                Token::Comma => continue,
+                Token::RParen => break,
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected ',' or ')' in partition element list, found {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+        Ok(items)
+    }
+
+    /// v2.26: one columnOptions element: a parent column name, an
+    /// optional `WITH OPTIONS` noise prefix, and a ColQualList. The
+    /// recorded type is a placeholder — the parent's rowtype wins at
+    /// the exec merge.
+    pub(crate) fn parse_partition_col_element(&mut self) -> Result<ParsedColDef, SqlError> {
+        let name = self.expect_ident()?;
+        if self.eat_keyword("with") {
+            self.expect_keyword("options")?;
+        }
+        let (cons, collate) = self.parse_col_quals(&name)?;
+        Ok(ParsedColDef {
+            name,
+            col_type: ColType::Text,
+            bit_typmod: None,
+            composite_name: None,
+            serial: None,
+            compression: None,
+            collate,
+            cons,
+        })
     }
 
     /// v0.48: true when the tokens ahead are `( ... ) AS` — the CTAS
@@ -2376,7 +2450,47 @@ impl Parser {
         } else {
             None
         };
+        let (cons, qual_collate) = self.parse_col_quals(&name)?;
+        if collate_name.is_none() {
+            collate_name = qual_collate;
+        } else if qual_collate.is_some() {
+            collate_name = qual_collate;
+        }
+        // v2.26: a COLLATE appearing inside the qual list (PG19
+        // ColQualList) gets the same type check as the pre-type one.
+        if collate_name.is_some() && !collate_seen {
+            if !col_type_collatable(&col_type, composite_name.as_deref()) {
+                return Err(SqlError {
+                    message: format!(
+                        "collations are not supported by type {}",
+                        col_type_pg_name(&col_type, composite_name.as_deref())
+                    ),
+                    code: "42804",
+                });
+            }
+        }
+        Ok(ParsedColDef {
+            name,
+            col_type,
+            bit_typmod,
+            composite_name,
+            serial,
+            compression,
+            collate: collate_name,
+            cons,
+        })
+    }
+
+    /// v2.26: the ColQualList loop shared by `parse_column_def` and
+    /// the PARTITION OF element parser (PG19 gram.y ColQualList:
+    /// `[CONSTRAINT name] <constraint>` items plus COLLATE, which
+    /// SplitColQualList separates back out — returned alongside).
+    pub(crate) fn parse_col_quals(
+        &mut self,
+        name: &str,
+    ) -> Result<(Vec<ColCon>, Option<String>), SqlError> {
         let mut cons = Vec::new();
+        let mut qual_collate: Option<String> = None;
         loop {
             let cname = if self.eat_keyword("constraint") {
                 Some(self.expect_ident()?)
@@ -2394,6 +2508,10 @@ impl Parser {
                 }
             } else if self.eat_keyword("null") {
                 cons.push(ColCon::Null);
+            } else if cname.is_none() && self.eat_keyword("collate") {
+                // v2.26: COLLATE is a ColQualList item in PG19.
+                let qn = self.parse_table_name()?;
+                qual_collate = Some(qn.rsplit('.').next().unwrap_or(&qn).to_string());
             } else if self.eat_keyword("unique") {
                 let nnd = self.parse_nulls_not_distinct()?;
                 let (df, idf) = self.parse_unique_attrs()?;
@@ -2403,7 +2521,10 @@ impl Parser {
                 let (df, idf) = self.parse_unique_attrs()?;
                 cons.push(ColCon::PKey(cname, df, idf));
             } else if self.eat_keyword("default") {
-                if cons.iter().any(|c| matches!(c, ColCon::Generated { .. })) {
+                if cons
+                    .iter()
+                    .any(|c| matches!(c, ColCon::Generated { .. } | ColCon::Identity))
+                {
                     return Err(err(format!(
                         "both default and generation expression specified for column \"{}\"",
                         name
@@ -2425,7 +2546,10 @@ impl Parser {
             } else if self.eat_keyword("generated") {
                 // v2.03: PG19 rejects a second generation clause and a
                 // DEFAULT + generation combination (gtest_err_1/5a).
-                if cons.iter().any(|c| matches!(c, ColCon::Generated { .. })) {
+                if cons
+                    .iter()
+                    .any(|c| matches!(c, ColCon::Generated { .. } | ColCon::Identity))
+                {
                     return Err(err(format!(
                         "multiple generation clauses specified for column \"{}\"",
                         name
@@ -2437,28 +2561,44 @@ impl Parser {
                         name
                     )));
                 }
-                // v2.03: GENERATED ALWAYS AS (expr) STORED|VIRTUAL
-                // (PG19). GENERATED BY DEFAULT/ALWAYS AS IDENTITY is a
-                // sequence-backed identity column — not supported.
-                if !self.eat_keyword("always") {
-                    return Err(SqlError {
-                        message: "identity columns are not supported".to_string(),
-                        code: "0A000",
-                    });
+                // v2.03: GENERATED ALWAYS AS (expr) STORED|VIRTUAL.
+                // v2.26: GENERATED {ALWAYS|BY DEFAULT} AS IDENTITY
+                // [(seq opts)] parses to ColCon::Identity; consumers
+                // raise their context's 0A000 (identity columns are
+                // not implemented engine-wide).
+                let always = self.eat_keyword("always");
+                if !always {
+                    self.expect_keyword("by")?;
+                    self.expect_keyword("default")?;
                 }
                 self.expect_keyword("as")?;
-                self.expect(Token::LParen, "'('")?;
-                let e = self.parse_or()?;
-                self.expect(Token::RParen, "')'")?;
-                // PG19: GENERATED ALWAYS AS (expr) with no STORED /
-                // VIRTUAL keyword defaults to VIRTUAL.
-                let stored = if self.eat_keyword("stored") {
-                    true
+                if self.eat_keyword("identity") {
+                    if *self.peek() == Token::LParen {
+                        self.next();
+                        let _ = self.parse_sequence_opts()?;
+                        self.expect(Token::RParen, "')'")?;
+                    }
+                    cons.push(ColCon::Identity);
                 } else {
-                    let _ = self.eat_keyword("virtual");
-                    false
-                };
-                cons.push(ColCon::Generated { expr: e, stored });
+                    if !always {
+                        return Err(err(
+                            "syntax error: generated expression requires GENERATED ALWAYS"
+                                .to_string(),
+                        ));
+                    }
+                    self.expect(Token::LParen, "'('")?;
+                    let e = self.parse_or()?;
+                    self.expect(Token::RParen, "')'")?;
+                    // PG19: GENERATED ALWAYS AS (expr) with no STORED /
+                    // VIRTUAL keyword defaults to VIRTUAL.
+                    let stored = if self.eat_keyword("stored") {
+                        true
+                    } else {
+                        let _ = self.eat_keyword("virtual");
+                        false
+                    };
+                    cons.push(ColCon::Generated { expr: e, stored });
+                }
             } else {
                 if cname.is_some() {
                     return Err(err(
@@ -2468,16 +2608,7 @@ impl Parser {
                 break;
             }
         }
-        Ok(ParsedColDef {
-            name,
-            col_type,
-            bit_typmod,
-            composite_name,
-            serial,
-            compression,
-            collate: collate_name,
-            cons,
-        })
+        Ok((cons, qual_collate))
     }
 
     /// Parse a table-level constraint: `[CONSTRAINT name] PRIMARY KEY (cols)
@@ -3289,32 +3420,6 @@ impl Parser {
         Ok(out)
     }
 
-    /// Parse `PARTITION OF parent FOR VALUES ... [PARTITION BY ...]`.
-    pub(crate) fn parse_partition_of(
-        &mut self,
-    ) -> Result<
-        (
-            String,
-            PartBoundDef,
-            Option<(crate::storage::PartMethod, Vec<PartitionKeyDef>)>,
-        ),
-        SqlError,
-    > {
-        self.expect_keyword("partition")?;
-        self.expect_keyword("of")?;
-        // v2.04: the parent may be schema-qualified
-        // (`PARTITION OF sch1.tbl1`, publication.sql's sch section).
-        let parent = self.expect_qualified_ident()?;
-        let bound = self.parse_partition_bound()?;
-        // Optional sub-partitioning: `PARTITION BY ...`.
-        let sub = if matches!(self.peek(), Token::Ident(s) if s == "partition") {
-            Some(self.parse_partition_by()?)
-        } else {
-            None
-        };
-        Ok((parent, bound, sub))
-    }
-
     pub(crate) fn parse_alter_action(&mut self) -> Result<AlterAction, SqlError> {
         // v2.03: ALTER TABLE t REPLICA IDENTITY {DEFAULT|FULL|NOTHING|
         // USING INDEX name} (PG19 ReplicaIdentityStmt).
@@ -3565,6 +3670,15 @@ impl Parser {
                         return Err(SqlError {
                             message: "generated columns are not supported in ADD COLUMN"
                                 .to_string(),
+                            code: "0A000",
+                        });
+                    }
+                    // v2.26: identity columns are not implemented
+                    // (same standing rejection as before this variant
+                    // existed).
+                    ColCon::Identity => {
+                        return Err(SqlError {
+                            message: "identity columns are not supported".to_string(),
                             code: "0A000",
                         });
                     }

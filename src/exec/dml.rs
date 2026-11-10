@@ -1766,6 +1766,8 @@ pub(crate) fn exec_create_table_as(
         unlogged: false,
         // v2.21: CTAS columns take the query's output collations.
         collations: ctas_collations,
+        // v2.26: CTAS has no PARTITION OF element list.
+        partition_overrides: None,
     };
     // CTAS definitions never carry constraints; the effective def is discarded.
     let _ = create_table_from_def(eng, ctx, name, &def, temp)?;
