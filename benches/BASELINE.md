@@ -2,6 +2,70 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `check_leaf_ancestor_uniques` rescans the whole in-batch row list per row — fix — 2026-11-10
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec/indexes.rs`: `check_leaf_ancestor_uniques` tracked in-batch
+duplicates for a leaf's ancestor unique indexes with
+`rows[..j].iter().any(|prev| temp_key(&au.cols, prev) == key)` — an
+O(batch_len) rescan of every earlier row per row per ancestor index.
+Replaced with the same `Vec<BTreeSet<IndexKey>>` "seen set" per
+ancestor index that `check_insert_unique` already uses for the
+equivalent non-partitioned-leaf duplicate check (v2.05): one ordered
+membership check + insert per row, O(log batch_len). The per-row
+existing-row conflict check (`leaf_existing_key_conflict`) and the
+NULLS-DISTINCT skip are unchanged; only the in-batch duplicate test
+changed shape. Behavior is identical (same `IndexKey`/`index_key_cmp`
+cross-type equality the BTreeSet-based fix elsewhere in this file
+already relies on) — all 1336 existing tests, including the 8
+`v225_tests` covering this exact enforcement, pass unchanged.
+
+### Measurement
+
+Callgrind (valgrind 3.22.0), `--variant ancestor`, same harness:
+
+| rows | Ir before | Ir after | ratio before | ratio after |
+|---|---|---|---|---|
+| 250 | 81,901,127 | 42,377,746 | — | — |
+| 500 | 238,740,044 | 77,157,573 | 2.92x | 1.82x |
+| 1000 | 802,020,284 | 147,276,792 | 3.36x | 1.91x |
+| 2000 | 2,925,737,485 | 286,616,559 | 3.65x | 1.95x |
+
+The scaling ratio drops from ~3.5x (quadratic) to ~1.9x (linear-ish,
+the residual being the `BTreeSet` `O(log n)` factor and the unchanged
+per-row `leaf_existing_key_conflict` scan) as batch size doubles.
+
+At 2000 rows (kept logs, `callgrind.out.ancunique-{base,after}-
+n2000-2026-11-10`):
+
+| metric | before | after | delta |
+|---|---|---|---|
+| Ir (callgrind) | 2,926,683,963 | 286,620,633 | **-90.2%** |
+| dhat total bytes | 107,300,774 | 11,535,070 | **-89.2%** |
+| dhat total blocks (allocations) | 2,153,066 | 156,375 | **-92.7%** |
+
+`callgrind_annotate --tree=calling --inclusive=yes` on the after log:
+`check_leaf_ancestor_uniques`'s own inclusive share drops from 91.14%
+of total `Ir` to 9.51%, with the cost now dominated by
+`BTreeSet::insert` (5.76%) instead of the `Iter::any` rescan.
+
+**Reproduce**:
+```bash
+cargo build
+python3 benches/profile_ancestor_unique_insert.py --tool callgrind --rows 2000 --variant ancestor --keep-log /tmp/cg.anc.after
+callgrind_annotate --tree=calling --inclusive=yes /tmp/cg.anc.after | grep -A6 'check_leaf_ancestor_uniques \['
+python3 benches/profile_ancestor_unique_insert.py --tool callgrind --sizes --variant ancestor
+python3 benches/profile_ancestor_unique_insert.py --tool dhat --rows 2000 --variant ancestor
+cargo test --all-features
+```
+
+After profiles committed:
+`benches/profiles/{callgrind,dhat}.out.ancunique-after-n2000-2026-11-10`.
+
 ## Bolt: `check_leaf_ancestor_uniques` rescans the whole in-batch row list per row — baseline — 2026-11-10
 
 **Why this workload**: v2.25 (2026-11-09, landed right after the last
