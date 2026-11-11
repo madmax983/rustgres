@@ -2,6 +2,88 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `commit_table_version` never prunes dead schema versions, making `find_table`/`table_visible` cost grow ~quadratically with ALTERs against one table — finding, no fix — 2026-11-11
+
+Full writeup with profile tables and reproduction commands: #75
+
+**Why this workload**: v2.26 (2026-11-10) added a new per-leaf block to
+`route_partition_inserts` (two `TableMeta::of()` clones, to detect
+`PARTITION OF` element-list overrides) that had never been profiled.
+New harness `benches/profile_manypart_insert.py`: a RANGE-partitioned
+table with `--parts` leaves and no column overrides, bulk-loaded via
+one `INSERT` touching every leaf once, isolating the new block's
+per-leaf-group cost from per-row insert cost. `--variant manypart`
+(DDL + INSERT), `--variant setup` (DDL only), `--variant plain`
+(no partitioning, same row volume, control).
+
+**The v2.26 hypothesis was wrong**: the two `TableMeta::of()` clones
+are only ~0.4% of `Ir` and ~3.3% of DHAT allocation blocks on this
+workload — well under the 5%/10% floor, because the bench table has
+only 3 plain columns and no checks/FKs/defaults, so each clone is
+cheap. Not worth fixing on its own.
+
+**What the same profile surfaced instead**: `find_table`/`table_visible`
+is 29.18% of total `Ir` at `--parts 200` (`manypart`), driven by
+`owns.contains(&t.created_xmin)`/`snap.active.contains(&t.dropped_xmax)`
+linear scans (306,315 calls to `table_visible`). Across `--parts`
+25/50/100/200, the insert-phase cost (`manypart` Ir minus `setup` Ir,
+isolating the INSERT from one-time DDL) grows 3.58x/3.81x/3.93x per
+doubling — trending to the 4x a quadratic term gives, confirmed by
+fitting `Ir(n) = a·n + b·n²` to the n=50/n=200 endpoints and predicting
+n=100 within 0.54%. The `plain` control (same row volume, no
+partitioning) stays near-linear (1.3-1.65x per doubling) — ruling out
+"more rows costs more" as the explanation.
+
+**Confirmed general, not partition-specific**: a second harness (ad
+hoc, not committed — ships no fix) repeats plain `ALTER TABLE t ADD
+COLUMN cN int` N times against one unpartitioned table, no
+`PARTITION OF` involved at all. Same mechanism: `table_visible` is
+37.69% of `Ir` at N=200 (120,801 calls), Ir growing 3.00x/3.42x per
+doubling (N=50→100→200: 43,412,028 / 130,138,818 / 445,078,994).
+
+**Mechanism**: `commit_table_version` (`src/exec/partition.rs:671`,
+shared by every `ALTER TABLE`-family mutation including
+`parent_link_child`/`ATTACH PARTITION`) marks the previous version
+dead (`old_live.dropped_xmax = ctx.own`) and unconditionally
+`versions.push(next)`s the new one into `eng.db.tables[name]:
+Vec<Table>` — nothing ever removes a schema-dead entry from that
+`Vec`. `find_table` resolves a name via `vs.iter().find(|t|
+table_visible(...))`, a linear scan that pays for every dead version,
+forever. The codebase already fixed this for **row** versions
+(`Database::vacuum_table`, `src/storage.rs:7758`, pruning via
+`version_dead_to_all(txns, v)` after `DELETE`/`UPDATE`/`DROP`-family
+commits) but has no equivalent for the table-schema version list
+itself — `vacuum_table` only prunes `t.rows` inside each surviving
+`Table`, never the `Vec<Table>`.
+
+**No fix shipped**: pruning a schema version is only safe when it is
+dead to *every* active session's snapshot, not just the committing
+one (the same `version_dead_to_all` check `vacuum_table` already uses
+for rows) — wiring that into `commit_table_version` is a
+correctness-sensitive change to the core MVCC/storage model
+(`Database::tables`): pruning a version a concurrent `REPEATABLE
+READ`/`SERIALIZABLE` transaction's older snapshot still needs would be
+silent data corruption, not a perf regression. It also needs a human
+policy decision on when to run it (inline per commit vs.
+triggered-like-row-vacuum vs. periodic), and touches a function called
+from many ALTER-family sites across `src/exec/partition.rs` and
+`src/exec/alter.rs` — more than a mechanical hoist. Recorded here so a
+future round doesn't re-spend a profiling cycle re-deriving it.
+
+**Reproduce**:
+```bash
+cargo build
+python3 benches/profile_manypart_insert.py --tool callgrind --sizes --variant manypart
+python3 benches/profile_manypart_insert.py --tool callgrind --sizes --variant setup
+python3 benches/profile_manypart_insert.py --tool callgrind --sizes --variant plain
+python3 benches/profile_manypart_insert.py --tool callgrind --parts 200 --variant manypart --keep-log /tmp/cg.manypart.200
+callgrind_annotate --tree=calling --inclusive=yes /tmp/cg.manypart.200 | grep -A2 'table_visible \['
+```
+
+Profiles committed: `benches/profiles/callgrind.out.manypart-n200-2026-11-11`
+(`--variant manypart`), `benches/profiles/callgrind.out.manypart-setup-n200-2026-11-11`
+(`--variant setup`).
+
 ## Bolt: `route_partition_inserts` re-walks the whole partition bound chain after firing BEFORE INSERT triggers, even when the leaf has none — fix — 2026-11-09
 
 Fixes the target identified in the baseline entry immediately below
