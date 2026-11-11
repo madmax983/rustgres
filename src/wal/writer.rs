@@ -1366,6 +1366,8 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         match crate::sql::decode_constraints(&constraints) {
             Ok(dc) => {
                 __t.not_null = dc.not_null;
+                __t.nn_local = dc.nn_local.clone();
+                __t.att_local = dc.att_local.clone();
                 __t.defaults = dc.defaults;
                 __t.checks = dc.checks;
                 __t.uniques = dc.uniques;

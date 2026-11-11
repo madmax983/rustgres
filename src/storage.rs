@@ -5655,6 +5655,20 @@ pub struct Table {
     // --- v0.9: constraints ---
     /// Per-column NOT NULL flags (PRIMARY KEY implies NOT NULL).
     pub not_null: Vec<bool>,
+    /// v2.27: per-column not-null locality, parallel to `not_null`
+    /// (PG19 conislocal for the column's not-null constraint): true
+    /// when this table locally declared/added the not-null, false
+    /// when it exists only by inheritance. Maintained by the CREATE /
+    /// ALTER paths that change either vec; `nn_is_local` tolerates a
+    /// short vec. Persists via the constraints codec's (nnlocal ...)
+    /// section.
+    pub nn_local: Vec<bool>,
+    /// v2.27: per-column attribute locality (pg_attribute.attislocal)
+    /// parallel to `columns`: false = the column exists on this table
+    /// only by inheritance. PG19 semantics: a locally redeclared
+    /// (merged) INHERITS column stays local; partition children are
+    /// never local; DETACH / NO INHERIT / ONLY-parent drops localize.
+    pub att_local: Vec<bool>,
     /// Per-column DEFAULTs; None = no default.
     pub defaults: Vec<Option<DefaultExpr>>,
     pub checks: Vec<CheckDef>,
@@ -5771,6 +5785,8 @@ impl Table {
             created_xmin,
             dropped_xmax: 0,
             not_null: vec![false; n],
+            nn_local: vec![true; n],
+            att_local: vec![true; n],
             defaults: vec![None; n],
             checks: Vec::new(),
             uniques: Vec::new(),
@@ -5820,6 +5836,19 @@ impl Table {
             }
         }
         t.not_null = def.not_null.clone();
+        // v2.27: the def's nn_local when the merge maintained it
+        // (same length), else every not-null is local (plain CREATE).
+        t.nn_local = if def.nn_local.len() == def.not_null.len() {
+            def.nn_local.clone()
+        } else {
+            vec![true; def.not_null.len()]
+        };
+        // v2.27: same discipline for attribute locality.
+        t.att_local = if def.att_local.len() == def.columns.len() {
+            def.att_local.clone()
+        } else {
+            vec![true; def.columns.len()]
+        };
         t.defaults = def.defaults.clone();
         // v2.03: generated columns (LIKE-expanded defs may be shorter).
         if def.gen_cols.len() == t.columns.len() {
@@ -5871,6 +5900,62 @@ impl Table {
             self.col_collations.resize(i + 1, None);
         }
         self.col_collations[i] = coll;
+    }
+
+    /// v2.27: is column `i`'s not-null locally defined here?
+    /// Tolerant of a short `nn_local` vec (paths that do not maintain
+    /// it leave it empty): falls back to the not-null flag itself,
+    /// i.e. an unmaintained not-null reads as local, matching the
+    /// pre-v2.27 behaviour where inherited not-nulls could not be
+    /// distinguished.
+    pub fn nn_is_local(&self, i: usize) -> bool {
+        self.nn_local
+            .get(i)
+            .copied()
+            .unwrap_or_else(|| self.not_null.get(i).copied().unwrap_or(false))
+    }
+
+    /// v2.27: is column `i` locally defined (pg_attribute.attislocal)?
+    /// Tolerant of a short vec: unmaintained columns read as local,
+    /// matching pre-v2.27 behaviour.
+    pub fn att_is_local(&self, i: usize) -> bool {
+        self.att_local.get(i).copied().unwrap_or(true)
+    }
+
+    /// v2.27: set column `i`'s attribute locality, growing the vec
+    /// (seeded all-local) as needed.
+    pub fn set_att_local(&mut self, i: usize, local: bool) {
+        if self.att_local.len() < self.columns.len() {
+            self.att_local.resize(self.columns.len(), true);
+        }
+        if self.att_local.len() <= i {
+            self.att_local.resize(i + 1, true);
+        }
+        self.att_local[i] = local;
+    }
+
+    /// v2.27: set column `i`'s not-null locality, growing the vec
+    /// (seeded from the current flags) as needed.
+    pub fn set_nn_local(&mut self, i: usize, local: bool) {
+        if self.nn_local.len() < self.not_null.len() {
+            let mut v: Vec<bool> = self
+                .not_null
+                .iter()
+                .enumerate()
+                .map(|(j, n)| {
+                    if j < self.nn_local.len() {
+                        self.nn_local[j]
+                    } else {
+                        *n
+                    }
+                })
+                .collect();
+            std::mem::swap(&mut v, &mut self.nn_local);
+        }
+        if self.nn_local.len() <= i {
+            self.nn_local.resize(i + 1, true);
+        }
+        self.nn_local[i] = local;
     }
 
     /// Position of the row version with this id, if present (O(1)).

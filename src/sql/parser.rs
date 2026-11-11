@@ -2042,6 +2042,8 @@ impl Parser {
             bit_typmods: Vec::new(),
             domain_elem: Vec::new(),
             not_null: Vec::new(),
+            nn_local: Vec::new(),
+            att_local: Vec::new(),
             defaults: Vec::new(),
             serial: Vec::new(),
             compression: Vec::new(),
@@ -2504,7 +2506,7 @@ impl Parser {
                     self.expect_keyword("inherit")?;
                     cons.push(ColCon::NotNullNoInherit);
                 } else {
-                    cons.push(ColCon::NotNull);
+                    cons.push(ColCon::NotNull(cname));
                 }
             } else if self.eat_keyword("null") {
                 cons.push(ColCon::Null);
@@ -3637,7 +3639,31 @@ impl Parser {
             }
             for con in col.cons {
                 match con {
-                    ColCon::NotNull => not_null = true,
+                    ColCon::NotNull(cname) => {
+                        not_null = true;
+                        // v2.27: an explicitly named NOT NULL on an
+                        // ADD COLUMN materializes as a constraint
+                        // record under that name (PG19) — and feeds
+                        // the name-collision check in
+                        // alter_add_column_ext.
+                        if let Some(n) = cname {
+                            checks.push(CheckDef {
+                                name: n,
+                                expr: Expr::IsNull {
+                                    expr: Box::new(Expr::Column {
+                                        table: None,
+                                        name: col.name.clone(),
+                                    }),
+                                    neg: true,
+                                },
+                                not_valid: false,
+                                kind: CheckKind::NotNull,
+                                no_inherit: false,
+                                enforced: true,
+                                is_local: true,
+                            });
+                        }
+                    }
                     ColCon::NotNullNoInherit => not_null = true,
                     ColCon::Null => {
                         if col.serial.is_some() {
@@ -3654,6 +3680,7 @@ impl Parser {
                         deferrable: df,
                         initially_deferred: idf,
                         nulls_not_distinct: nnd,
+                        is_local: true,
                     }),
                     ColCon::PKey(n, df, idf) => {
                         pkey = Some(UniqueDef {
@@ -3662,6 +3689,7 @@ impl Parser {
                             deferrable: df,
                             initially_deferred: idf,
                             nulls_not_distinct: false,
+                            is_local: true,
                         });
                         not_null = true;
                     }
@@ -3690,6 +3718,7 @@ impl Parser {
                         kind: CheckKind::Check,
                         no_inherit: noinh,
                         enforced: enf,
+                        is_local: true,
                     }),
                     ColCon::References { name: n, tail } => fks.push(tail.into_fk(
                         n.unwrap_or_else(|| format!("{}_fkey", col.name)),
@@ -4006,6 +4035,7 @@ impl Parser {
                     deferrable: df,
                     initially_deferred: idf,
                     nulls_not_distinct: false,
+                    is_local: true,
                 }),
                 check: None,
                 unique: None,
@@ -4019,6 +4049,7 @@ impl Parser {
                     deferrable: df,
                     initially_deferred: idf,
                     nulls_not_distinct: nnd,
+                    is_local: true,
                 }),
                 check: None,
                 pkey: None,
@@ -4033,6 +4064,7 @@ impl Parser {
                     kind: CheckKind::Check,
                     no_inherit: noinh,
                     enforced: enf,
+                    is_local: true,
                 }),
                 unique: None,
                 pkey: None,
@@ -7719,6 +7751,7 @@ impl Parser {
                     kind: CheckKind::Check,
                     no_inherit: false,
                     enforced: true,
+                    is_local: true,
                 });
             } else if self.eat_keyword("not") {
                 self.expect_keyword("null")?;
@@ -19729,6 +19762,12 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
         // v2.06: ENFORCED flag (older checkpoints omit it; the
         // decoder defaults a missing flag to true).
         out.push_str(if c.enforced { " 1" } else { " 0" });
+        // v2.27: IS LOCAL bit (PG19 conislocal), appended only when
+        // false so local constraints keep byte-identical encodings;
+        // the decoder defaults a missing bit to true.
+        if !c.is_local {
+            out.push_str(" 0");
+        }
         out.push(')');
     }
     out.push_str(") (uniques");
@@ -19744,13 +19783,16 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
         // plain constraints stay byte-identical; the decoder defaults
         // a missing section to (0 0). v2.08: a third bit
         // (nulls_not_distinct) is appended only when set.
-        if u.deferrable || u.initially_deferred || u.nulls_not_distinct {
+        if u.deferrable || u.initially_deferred || u.nulls_not_distinct || !u.is_local {
             out.push_str(" (attrs ");
             out.push_str(if u.deferrable { "1" } else { "0" });
             out.push(' ');
             out.push_str(if u.initially_deferred { "1" } else { "0" });
-            if u.nulls_not_distinct {
-                out.push_str(" 1");
+            if u.nulls_not_distinct || !u.is_local {
+                out.push_str(if u.nulls_not_distinct { " 1" } else { " 0" });
+            }
+            if !u.is_local {
+                out.push_str(" 0");
             }
             out.push(')');
         }
@@ -19765,13 +19807,16 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
                 out.push(' ');
                 sexpr_escape(c, &mut out);
             }
-            if pk.deferrable || pk.initially_deferred || pk.nulls_not_distinct {
+            if pk.deferrable || pk.initially_deferred || pk.nulls_not_distinct || !pk.is_local {
                 out.push_str(" (attrs ");
                 out.push_str(if pk.deferrable { "1" } else { "0" });
                 out.push(' ');
                 out.push_str(if pk.initially_deferred { "1" } else { "0" });
-                if pk.nulls_not_distinct {
-                    out.push_str(" 1");
+                if pk.nulls_not_distinct || !pk.is_local {
+                    out.push_str(if pk.nulls_not_distinct { " 1" } else { " 0" });
+                }
+                if !pk.is_local {
+                    out.push_str(" 0");
                 }
                 out.push(')');
             }
@@ -19812,6 +19857,10 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
         out.push_str(if f.enforced { "1" } else { "0" });
         out.push(' ');
         out.push_str(if f.not_valid { "1" } else { "0" });
+        // v2.27: IS LOCAL bit, appended only when false.
+        if !f.is_local {
+            out.push_str(" 0");
+        }
         out.push(')');
         // v2.15: optional (actcols (del ...) (upd ...)) section with
         // the SET NULL/DEFAULT column lists (- = no list).
@@ -19902,7 +19951,35 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
     for tr in &t.triggers {
         encode_one_trigger(tr, &mut out);
     }
-    out.push_str("))");
+    out.push(')');
+    // v2.27: optional trailing (nnlocal ...) section — per-column
+    // not-null locality bits (Table::nn_local), emitted only when some
+    // column's locality differs from its not_null flag (the decoder
+    // default: a not-null column is local). Pre-v2.27 encodings omit
+    // it entirely.
+    if t.nn_local
+        .iter()
+        .zip(t.not_null.iter())
+        .any(|(l, n)| l != n)
+        || t.nn_local.len() != t.not_null.len() && t.nn_local.iter().any(|l| !l)
+    {
+        out.push_str(" (nnlocal");
+        for b in &t.nn_local {
+            out.push_str(if *b { " 1" } else { " 0" });
+        }
+        out.push(')');
+    }
+    // v2.27: optional trailing (attlocal ...) section — per-column
+    // attislocal bits (Table::att_local), emitted only when some
+    // column is non-local (the decoder default is local).
+    if t.att_local.iter().any(|l| !l) {
+        out.push_str(" (attlocal");
+        for b in &t.att_local {
+            out.push_str(if *b { " 1" } else { " 0" });
+        }
+        out.push(')');
+    }
+    out.push(')');
     out
 }
 
@@ -20220,6 +20297,13 @@ pub struct DecodedConstraints {
     pub gen_cols: Vec<Option<(Expr, bool)>>,
     /// v2.09: triggers (absent in pre-v2.09 encodings: none).
     pub triggers: Vec<TriggerDef>,
+    /// v2.27: per-column not-null locality (absent in pre-v2.27
+    /// encodings: decoded as a copy of `not_null` — every not-null
+    /// treated as locally defined).
+    pub nn_local: Vec<bool>,
+    /// v2.27: per-column attribute locality (absent in pre-v2.27
+    /// encodings: decoded as all-local).
+    pub att_local: Vec<bool>,
 }
 
 pub(crate) fn sexpr_is_close(p: &mut SexprParser) -> bool {
@@ -20336,6 +20420,16 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
                 o => return Err(format!("bad check enforced flag {}", o)),
             }
         };
+        // v2.27: optional IS LOCAL bit (older checkpoints omit it).
+        let is_local = if sexpr_is_close(&mut p) {
+            true
+        } else {
+            match p.atom()?.as_str() {
+                "1" => true,
+                "0" => false,
+                o => return Err(format!("bad check is-local flag {}", o)),
+            }
+        };
         p.close()?;
         checks.push(CheckDef {
             name,
@@ -20344,6 +20438,7 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
             kind,
             no_inherit,
             enforced,
+            is_local,
         });
     }
     p.close()?;
@@ -20356,10 +20451,10 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
     // inside a unique/pkey entry (pre-v2.07 encodings omit it ->
     // all false; v2.08 appends the nulls_not_distinct bit only when
     // set, so two-bit sections decode with n = false).
-    fn unique_attrs(p: &mut SexprParser) -> Result<(bool, bool, bool), String> {
+    fn unique_attrs(p: &mut SexprParser) -> Result<(bool, bool, bool, bool), String> {
         p.ws();
         if p.chars.peek() != Some(&'(') {
-            return Ok((false, false, false));
+            return Ok((false, false, false, true));
         }
         p.open()?;
         if p.atom()? != "attrs" {
@@ -20375,15 +20470,18 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
         let d = bit(p)?;
         let i = bit(p)?;
         let n = if sexpr_is_close(p) { false } else { bit(p)? };
+        // v2.27: optional IS LOCAL bit (present only when false in
+        // encodings written by v2.27+; older ones default to local).
+        let is_local = if sexpr_is_close(p) { true } else { bit(p)? };
         p.close()?;
-        Ok((d, i, n))
+        Ok((d, i, n, is_local))
     }
     let mut uniques = Vec::new();
     while !sexpr_is_close(&mut p) {
         p.open()?;
         let name = p.atom()?;
         let mut cols = Vec::new();
-        let mut attrs = (false, false, false);
+        let mut attrs = (false, false, false, true);
         loop {
             p.ws();
             if sexpr_is_close(&mut p) {
@@ -20402,6 +20500,7 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
             deferrable: attrs.0,
             initially_deferred: attrs.1,
             nulls_not_distinct: attrs.2,
+            is_local: attrs.3,
         });
     }
     p.close()?;
@@ -20415,7 +20514,7 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
     } else {
         let name = p.atom()?;
         let mut cols = Vec::new();
-        let mut attrs = (false, false, false);
+        let mut attrs = (false, false, false, true);
         if name != "-" {
             loop {
                 p.ws();
@@ -20435,6 +20534,7 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
             deferrable: attrs.0,
             initially_deferred: attrs.1,
             nulls_not_distinct: attrs.2,
+            is_local: attrs.3,
         })
     };
     // Careful: `(pkey -)` encodes absence as the atom "-".
@@ -20492,6 +20592,7 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
         // pre-v2.06 encodings omit it.
         let (mut match_full, mut deferrable, mut initially_deferred) = (false, false, false);
         let (mut fk_enforced, mut fk_not_valid) = (true, false);
+        let mut fk_is_local = true;
         if !sexpr_is_close(&mut p) {
             p.open()?;
             if p.atom()? != "attrs" {
@@ -20509,6 +20610,10 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
             initially_deferred = bit(&mut p)?;
             fk_enforced = bit(&mut p)?;
             fk_not_valid = bit(&mut p)?;
+            // v2.27: optional IS LOCAL bit (present only when false).
+            if !sexpr_is_close(&mut p) {
+                fk_is_local = bit(&mut p)?;
+            }
             p.close()?;
         }
         // v2.15: optional (actcols (del ...) (upd ...)) section.
@@ -20551,6 +20656,7 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
             initially_deferred,
             enforced: fk_enforced,
             not_valid: fk_not_valid,
+            is_local: fk_is_local,
         });
     }
     p.close()?;
@@ -20644,6 +20750,10 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
     let mut gen_cols: Vec<Option<(Expr, bool)>> = Vec::new();
     // v2.09: optional trailing (triggers ...) section.
     let mut triggers: Vec<TriggerDef> = Vec::new();
+    // v2.27: optional trailing (nnlocal ...) section.
+    let mut nn_local: Vec<bool> = Vec::new();
+    // v2.27: optional trailing (attlocal ...) section.
+    let mut att_local: Vec<bool> = Vec::new();
     while !sexpr_is_close(&mut p) {
         p.open()?;
         match p.atom()?.as_str() {
@@ -20693,6 +20803,26 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
                 }
                 p.close()?;
             }
+            "nnlocal" => {
+                while !sexpr_is_close(&mut p) {
+                    nn_local.push(match p.atom()?.as_str() {
+                        "1" => true,
+                        "0" => false,
+                        o => return Err(format!("bad nnlocal bit {}", o)),
+                    });
+                }
+                p.close()?;
+            }
+            "attlocal" => {
+                while !sexpr_is_close(&mut p) {
+                    att_local.push(match p.atom()?.as_str() {
+                        "1" => true,
+                        "0" => false,
+                        o => return Err(format!("bad attlocal bit {}", o)),
+                    });
+                }
+                p.close()?;
+            }
             o => return Err(format!("bad trailing constraints section {}", o)),
         }
     }
@@ -20700,6 +20830,12 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
     p.ws();
     if p.chars.peek().is_some() {
         return Err("trailing data in constraints encoding".into());
+    }
+    if nn_local.is_empty() {
+        nn_local = not_null.clone();
+    }
+    if att_local.is_empty() {
+        att_local = vec![true; not_null.len()];
     }
     Ok(DecodedConstraints {
         not_null,
@@ -20714,6 +20850,8 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
         replica_identity,
         gen_cols,
         triggers,
+        nn_local,
+        att_local,
     })
 }
 
@@ -20759,6 +20897,7 @@ pub fn decode_domain_checks(s: &str) -> Result<Vec<CheckDef>, String> {
             kind: CheckKind::Check,
             no_inherit: false,
             enforced: true,
+            is_local: true,
         });
     }
     p.ws();

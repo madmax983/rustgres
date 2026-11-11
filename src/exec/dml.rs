@@ -1748,6 +1748,8 @@ pub(crate) fn exec_create_table_as(
         bit_typmods: vec![None; ncols],
         domain_elem: vec![false; ncols],
         not_null: vec![false; ncols],
+        nn_local: vec![true; ncols],
+        att_local: vec![true; ncols],
         defaults: vec![None; ncols],
         serial: vec![None; ncols],
         compression: vec![None; ncols],

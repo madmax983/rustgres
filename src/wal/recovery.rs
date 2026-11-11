@@ -535,6 +535,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             match crate::sql::decode_constraints(constraints) {
                 Ok(dc) => {
                     t.not_null = dc.not_null;
+                    t.nn_local = dc.nn_local.clone();
+                    t.att_local = dc.att_local.clone();
                     t.defaults = dc.defaults;
                     t.checks = dc.checks;
                     t.uniques = dc.uniques;
@@ -851,6 +853,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             match crate::sql::decode_constraints(constraints) {
                 Ok(dc) => {
                     t.not_null = dc.not_null;
+                    t.nn_local = dc.nn_local.clone();
+                    t.att_local = dc.att_local.clone();
                     t.defaults = dc.defaults;
                     t.checks = dc.checks;
                     t.uniques = dc.uniques;

@@ -92,6 +92,7 @@ mod join;
 mod json;
 mod jsonpath;
 mod jsontable;
+mod locality;
 mod merge;
 mod opclass;
 mod orderby;
@@ -360,6 +361,9 @@ mod v225_tests;
 #[cfg(test)]
 #[path = "test_mods/v226_tests.rs"]
 mod v226_tests;
+#[cfg(test)]
+#[path = "test_mods/v227_tests.rs"]
+mod v227_tests;
 #[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;

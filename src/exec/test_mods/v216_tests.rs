@@ -153,17 +153,14 @@ fn v216_rename_constraint_and_locality() {
     );
     // Plain rename propagates to the child.
     ok(&mut eng, "alter table p rename constraint c1 to c1x");
-    // NOTE (v2.26): PG19 would refuse this drop with 42P16
-    // "cannot drop inherited constraint" (coninhcount > 0,
-    // tablecmds.c ATExecDropConstraint). The v2.26 guard
-    // implements that rule for PARTITION children — where the
-    // PARTITION OF element merge creates the copies — but plain
-    // INHERITS children are not locality-tracked yet (a locally
-    // added constraint merges with the inherited definition in
-    // PG, which the engine does not model), so the drop still
-    // succeeds here; the inherits-side refinement is held back
-    // (hidden_files/v226/scope.md).
-    ok(&mut eng, "alter table c drop constraint c1x");
+    // v2.27: the v2.26 hold-back is gone — the full locality model
+    // refuses the drop of an inherited constraint on a plain
+    // INHERITS child too (42P16 "cannot drop inherited constraint",
+    // tablecmds.c dropconstraint_internal, coninhcount > 0).
+    assert_eq!(
+        err_code(&mut eng, "alter table c drop constraint c1x"),
+        "42P16"
+    );
     assert_eq!(
         err_code(&mut eng, "alter table p rename constraint nope to x"),
         "42704"
