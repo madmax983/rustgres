@@ -7430,8 +7430,10 @@ impl Database {
         // Fresh snapshot: everything committed as of now is visible.
         // `owns` are still in `active`; row_visible would accept our own
         // rows, so they are excluded explicitly by id below.
+        let mut active: Vec<u64> = txns.active.iter().copied().collect();
+        active.sort_unstable();
         let fresh = Snapshot {
-            active: txns.active.iter().copied().collect(),
+            active,
             next_xid: txns.next_xid,
         };
         // v0.22: temp tables are session-local — no concurrent transaction
@@ -7477,7 +7479,7 @@ impl Database {
 /// flat (one live definition per name at a time — enforced at commit).
 pub(crate) fn index_visible(def: &IndexDef, snap: &Snapshot, owns: &[u64]) -> bool {
     let created_ok = owns.contains(&def.created_xmin)
-        || (def.created_xmin < snap.next_xid && !snap.active.contains(&def.created_xmin));
+        || (def.created_xmin < snap.next_xid && !snap.is_active(def.created_xmin));
     if !created_ok {
         return false;
     }
@@ -7487,7 +7489,7 @@ pub(crate) fn index_visible(def: &IndexDef, snap: &Snapshot, owns: &[u64]) -> bo
     if owns.contains(&def.dropped_xmax) {
         return false;
     }
-    !(def.dropped_xmax < snap.next_xid && !snap.active.contains(&def.dropped_xmax))
+    !(def.dropped_xmax < snap.next_xid && !snap.is_active(def.dropped_xmax))
 }
 
 /// Per-column statistics from ANALYZE (v0.8).
@@ -7569,6 +7571,20 @@ pub struct TableStats {
 pub struct Snapshot {
     pub active: Vec<u64>,
     pub next_xid: u64,
+}
+
+impl Snapshot {
+    /// Was `xid` active (BEGIN'd but not yet committed/aborted) when this
+    /// snapshot was taken? `active` is kept sorted by every constructor
+    /// below, so this is `O(log active.len())` instead of the `O(active.len())`
+    /// a plain `active.contains(&xid)` scan costs on every visibility check
+    /// (`row_visible`/`table_visible`/etc.) for every row — a cost that
+    /// scales with the number of *other* connections currently idle in an
+    /// open transaction (see benches/profile_snapshot_active.py).
+    #[inline]
+    fn is_active(&self, xid: u64) -> bool {
+        self.active.binary_search(&xid).is_ok()
+    }
 }
 
 /// Global transaction state, kept beside the database inside [`Engine`].
@@ -8023,7 +8039,7 @@ pub fn version_dead_to_all(txns: &TxnManager, v: &RowVersion) -> bool {
     // version that exists). Dead unless some active snapshot predates
     // the deleter's commit and could still see the old version.
     for snap in txns.snapshots.values() {
-        if !(v.xmax < snap.next_xid && !snap.active.contains(&v.xmax)) {
+        if !(v.xmax < snap.next_xid && !snap.is_active(v.xmax)) {
             return false;
         }
     }
@@ -8035,8 +8051,7 @@ pub fn row_visible(v: &RowVersion, snap: &Snapshot, owns: &[u64]) -> bool {
     // v1.21: `owns` is every xid owned by the reading transaction (top +
     // sub-xids). A transaction sees its own sub-xid rows even when the
     // snapshot predates the sub-xid allocation (RepeatableRead).
-    let xmin_ok =
-        owns.contains(&v.xmin) || (v.xmin < snap.next_xid && !snap.active.contains(&v.xmin));
+    let xmin_ok = owns.contains(&v.xmin) || (v.xmin < snap.next_xid && !snap.is_active(v.xmin));
     if !xmin_ok {
         return false;
     }
@@ -8046,13 +8061,13 @@ pub fn row_visible(v: &RowVersion, snap: &Snapshot, owns: &[u64]) -> bool {
     if owns.contains(&v.xmax) {
         return false;
     }
-    !(v.xmax < snap.next_xid && !snap.active.contains(&v.xmax))
+    !(v.xmax < snap.next_xid && !snap.is_active(v.xmax))
 }
 
 /// Table-version visibility for (`snap`, `owns`).
 pub fn table_visible(t: &Table, snap: &Snapshot, owns: &[u64]) -> bool {
     let created_ok = owns.contains(&t.created_xmin)
-        || (t.created_xmin < snap.next_xid && !snap.active.contains(&t.created_xmin));
+        || (t.created_xmin < snap.next_xid && !snap.is_active(t.created_xmin));
     if !created_ok {
         return false;
     }
@@ -8062,13 +8077,13 @@ pub fn table_visible(t: &Table, snap: &Snapshot, owns: &[u64]) -> bool {
     if owns.contains(&t.dropped_xmax) {
         return false;
     }
-    !(t.dropped_xmax < snap.next_xid && !snap.active.contains(&t.dropped_xmax))
+    !(t.dropped_xmax < snap.next_xid && !snap.is_active(t.dropped_xmax))
 }
 
 /// Visibility for view versions (v0.9): same rules as tables.
 pub fn view_visible(v: &ViewDef, snap: &Snapshot, own: u64) -> bool {
     let created_ok = v.created_xmin == own
-        || (v.created_xmin < snap.next_xid && !snap.active.contains(&v.created_xmin));
+        || (v.created_xmin < snap.next_xid && !snap.is_active(v.created_xmin));
     if !created_ok {
         return false;
     }
@@ -8078,13 +8093,13 @@ pub fn view_visible(v: &ViewDef, snap: &Snapshot, own: u64) -> bool {
     if v.dropped_xmax == own {
         return false;
     }
-    !(v.dropped_xmax < snap.next_xid && !snap.active.contains(&v.dropped_xmax))
+    !(v.dropped_xmax < snap.next_xid && !snap.is_active(v.dropped_xmax))
 }
 
 /// Visibility for sequence versions (v0.9): same rules as tables.
 pub fn seq_visible(s: &Sequence, snap: &Snapshot, own: u64) -> bool {
     let created_ok = s.created_xmin == own
-        || (s.created_xmin < snap.next_xid && !snap.active.contains(&s.created_xmin));
+        || (s.created_xmin < snap.next_xid && !snap.is_active(s.created_xmin));
     if !created_ok {
         return false;
     }
@@ -8094,13 +8109,13 @@ pub fn seq_visible(s: &Sequence, snap: &Snapshot, own: u64) -> bool {
     if s.dropped_xmax == own {
         return false;
     }
-    !(s.dropped_xmax < snap.next_xid && !snap.active.contains(&s.dropped_xmax))
+    !(s.dropped_xmax < snap.next_xid && !snap.is_active(s.dropped_xmax))
 }
 
 /// Visibility for role versions (v0.11): same rules as tables.
 pub fn role_visible(r: &Role, snap: &Snapshot, own: u64) -> bool {
     let created_ok = r.created_xmin == own
-        || (r.created_xmin < snap.next_xid && !snap.active.contains(&r.created_xmin));
+        || (r.created_xmin < snap.next_xid && !snap.is_active(r.created_xmin));
     if !created_ok {
         return false;
     }
@@ -8110,7 +8125,7 @@ pub fn role_visible(r: &Role, snap: &Snapshot, own: u64) -> bool {
     if r.dropped_xmax == own {
         return false;
     }
-    !(r.dropped_xmax < snap.next_xid && !snap.active.contains(&r.dropped_xmax))
+    !(r.dropped_xmax < snap.next_xid && !snap.is_active(r.dropped_xmax))
 }
 
 // ---------------------------------------------------------------------------
@@ -9669,10 +9684,9 @@ mod tests {
     }
 
     fn snap(active: &[u64], next_xid: u64) -> Snapshot {
-        Snapshot {
-            active: active.to_vec(),
-            next_xid,
-        }
+        let mut active = active.to_vec();
+        active.sort_unstable();
+        Snapshot { active, next_xid }
     }
 
     #[test]
