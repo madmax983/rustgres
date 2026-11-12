@@ -1748,6 +1748,8 @@ pub(crate) fn exec_create_table_as(
         bit_typmods: vec![None; ncols],
         domain_elem: vec![false; ncols],
         not_null: vec![false; ncols],
+        nn_local: vec![true; ncols],
+        att_local: vec![true; ncols],
         defaults: vec![None; ncols],
         serial: vec![None; ncols],
         compression: vec![None; ncols],
@@ -1766,6 +1768,8 @@ pub(crate) fn exec_create_table_as(
         unlogged: false,
         // v2.21: CTAS columns take the query's output collations.
         collations: ctas_collations,
+        // v2.26: CTAS has no PARTITION OF element list.
+        partition_overrides: None,
     };
     // CTAS definitions never carry constraints; the effective def is discarded.
     let _ = create_table_from_def(eng, ctx, name, &def, temp)?;

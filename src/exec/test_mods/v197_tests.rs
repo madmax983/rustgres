@@ -652,7 +652,9 @@ fn v197_no_inherit_not_null_family() {
     // ADD PRIMARY KEY (as NOT VALID ones do).
     ok(&mut eng, "CREATE TABLE z3 (a int, NOT NULL a NO INHERIT)");
     let e = err(&mut eng, "ALTER TABLE z3 ADD CONSTRAINT nna NOT NULL a");
-    assert_eq!(e.code, "42P16");
+    // v2.27 correction: PG19 StoreRelNotNull raises this with
+    // ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE (55000), not 42P16.
+    assert_eq!(e.code, "55000");
     assert!(e.message.contains("cannot change NO INHERIT status"));
     ok(&mut eng, "CREATE TABLE z4 (a int) PARTITION BY HASH (a)");
     ok(

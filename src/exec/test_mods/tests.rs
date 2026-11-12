@@ -3898,6 +3898,7 @@ fn v76_check_not_valid_encode_decode_roundtrip() {
         kind: crate::sql::CheckKind::Check,
         no_inherit: false,
         enforced: true,
+        is_local: true,
     });
     t.checks.push(CheckDef {
         name: "c_nv".to_string(),
@@ -3906,6 +3907,7 @@ fn v76_check_not_valid_encode_decode_roundtrip() {
         kind: crate::sql::CheckKind::Check,
         no_inherit: false,
         enforced: true,
+        is_local: true,
     });
     // v0.77: a NOT NULL-kind check round-trips its kind.
     t.checks.push(CheckDef {
@@ -3921,6 +3923,7 @@ fn v76_check_not_valid_encode_decode_roundtrip() {
         kind: crate::sql::CheckKind::NotNull,
         no_inherit: false,
         enforced: true,
+        is_local: true,
     });
     let encoded = encode_constraints(&t);
     let dec = decode_constraints(&encoded).unwrap();

@@ -921,6 +921,20 @@ pub(crate) fn attach_partition(
             if parent_t.not_null.get(pi) != Some(&true) {
                 continue;
             }
+            // v2.27: the conflict is directional — a VALID parent
+            // not-null cannot merge into a NOT VALID child copy.
+            // When the parent's own constraint is NOT VALID too,
+            // the two merge without complaint (constraints.sql
+            // notnull_tbl1_3 attach). A flag-only parent not-null
+            // is inherently valid.
+            let parent_nn_valid = !parent_t.checks.iter().any(|pc| {
+                pc.kind == crate::sql::CheckKind::NotNull
+                    && pc.not_valid
+                    && crate::sql::check_expr_column(&pc.expr).as_deref() == Some(pname.as_str())
+            });
+            if !parent_nn_valid {
+                continue;
+            }
             for cc in &child_t.checks {
                 if cc.kind == crate::sql::CheckKind::NotNull && cc.not_valid {
                     let mut refs: Vec<(Option<String>, String)> = Vec::new();
@@ -1232,6 +1246,56 @@ pub(crate) fn attach_partition(
         .clone();
     let mut next = prev.clone();
     next.partition = Some(cinfo);
+    // v2.27: ATTACH locality flips (PG19 MergeWithExistingConstraint
+    // / AttachPartition): every child constraint the parent also
+    // carries becomes non-local (coninhcount 1 by derivation),
+    // not-null flags the parent carries become non-local, and all
+    // columns become attribute-non-local. Child-only constraints
+    // stay local.
+    {
+        let parent = eng
+            .db
+            .find_table(parent_name, ctx.snap, &ctx.all_xids, ctx.session)
+            .cloned();
+        if let Some(parent) = parent {
+            for c in next.checks.iter_mut() {
+                let r = crate::exec::locality::ConRef::of_check(c);
+                if crate::exec::locality::parent_carries(&parent, &r, true) {
+                    c.is_local = false;
+                }
+            }
+            for u in next.uniques.iter_mut() {
+                if parent.uniques.iter().any(|pu| pu.cols == u.cols) {
+                    u.is_local = false;
+                }
+            }
+            if let Some(pk) = next.pkey.as_mut() {
+                if parent.pkey.as_ref().is_some_and(|pp| pp.cols == pk.cols) {
+                    pk.is_local = false;
+                }
+            }
+            for f in next.fks.iter_mut() {
+                if parent
+                    .fks
+                    .iter()
+                    .any(|pf| pf.cols == f.cols && pf.ref_table == f.ref_table)
+                {
+                    f.is_local = false;
+                }
+            }
+            for i in 0..next.columns.len() {
+                let col = next.columns[i].0.clone();
+                if let Some(pi) = parent.column_index(&col) {
+                    if parent.not_null.get(pi).copied().unwrap_or(false)
+                        && next.not_null.get(i).copied().unwrap_or(false)
+                    {
+                        next.set_nn_local(i, false);
+                    }
+                }
+                next.set_att_local(i, false);
+            }
+        }
+    }
     // v2.15: the child's own FK flips/clones from the merge above
     // ride its new version; descendants get their own versions.
     for (tname, fname) in &fk_flips {
@@ -1522,6 +1586,77 @@ pub(crate) fn alter_inherit(
                 ));
             }
         }
+        // v2.27: PG19 — a VALID parent constraint cannot merge
+        // into a NOT VALID child copy at INHERIT time either
+        // (constraints.sql: "constraint \"nn_parent\" conflicts
+        // with NOT VALID constraint on child table ..."). Checks
+        // match by definition, not-nulls by column; a parent
+        // not-null backed by a NO INHERIT constraint never merges
+        // and is exempt, as above.
+        for pc in &parent.checks {
+            if pc.not_valid {
+                continue;
+            }
+            let child_conflict = match pc.kind {
+                crate::sql::CheckKind::Check => {
+                    let pexpr = format!("{:?}", pc.expr);
+                    child.checks.iter().find(|cc| {
+                        cc.kind == crate::sql::CheckKind::Check
+                            && cc.not_valid
+                            && format!("{:?}", cc.expr) == pexpr
+                    })
+                }
+                crate::sql::CheckKind::NotNull => {
+                    let pcol = crate::sql::check_expr_column(&pc.expr);
+                    let Some(pcol) = pcol else { continue };
+                    if pc.no_inherit {
+                        continue;
+                    }
+                    child.checks.iter().find(|cc| {
+                        cc.kind == crate::sql::CheckKind::NotNull
+                            && cc.not_valid
+                            && crate::sql::check_expr_column(&cc.expr).as_deref()
+                                == Some(pcol.as_str())
+                    })
+                }
+            };
+            if let Some(cc) = child_conflict {
+                return Err(exec_err(
+                    "42P17",
+                    format!(
+                        "constraint \"{}\" conflicts with NOT VALID constraint on child table \"{}\"",
+                        cc.name, child_name
+                    ),
+                ));
+            }
+        }
+        // A flag-only parent not-null (no record on the parent) is
+        // inherently VALID: same conflict against a NOT VALID
+        // child record for the column.
+        for (pi, (pname, _)) in parent.columns.iter().enumerate() {
+            if parent.not_null.get(pi) != Some(&true) {
+                continue;
+            }
+            if parent.checks.iter().any(|pc| {
+                pc.kind == crate::sql::CheckKind::NotNull
+                    && crate::sql::check_expr_column(&pc.expr).as_deref() == Some(pname.as_str())
+            }) {
+                continue; // record case handled above
+            }
+            if let Some(cc) = child.checks.iter().find(|cc| {
+                cc.kind == crate::sql::CheckKind::NotNull
+                    && cc.not_valid
+                    && crate::sql::check_expr_column(&cc.expr).as_deref() == Some(pname.as_str())
+            }) {
+                return Err(exec_err(
+                    "42P17",
+                    format!(
+                        "constraint \"{}\" conflicts with NOT VALID constraint on child table \"{}\"",
+                        cc.name, child_name
+                    ),
+                ));
+            }
+        }
         let prev = child.clone();
         let mut next = child;
         next.inherits.push(parent_name.to_string());
@@ -1545,6 +1680,66 @@ pub(crate) fn alter_inherit(
         let prev = child.clone();
         let mut next = child;
         next.inherits.retain(|p| p != parent_name);
+        // v2.27: PG19 RemoveInheritance — the link's removal
+        // decrements the child's inhcounts (derived here, so they
+        // already reflect the unlink); copies whose count reaches 0
+        // are marked LOCAL, never deleted. Columns likewise.
+        {
+            let refs: Vec<crate::exec::locality::ConRef> = next
+                .checks
+                .iter()
+                .map(crate::exec::locality::ConRef::of_check)
+                .collect();
+            for r in &refs {
+                if crate::exec::locality::con_inhcount(
+                    &eng.db,
+                    ctx.snap,
+                    &ctx.all_xids,
+                    ctx.session,
+                    &next,
+                    r,
+                ) == 0
+                {
+                    match r {
+                        crate::exec::locality::ConRef::Check(n) => {
+                            for c in next.checks.iter_mut() {
+                                if c.kind == crate::sql::CheckKind::Check && &c.name == n {
+                                    c.is_local = true;
+                                }
+                            }
+                        }
+                        crate::exec::locality::ConRef::NotNull(col) => {
+                            if let Some(i) = next.column_index(col) {
+                                next.set_nn_local(i, true);
+                            }
+                            for c in next.checks.iter_mut() {
+                                if c.kind == crate::sql::CheckKind::NotNull
+                                    && crate::sql::check_expr_column(&c.expr).as_deref()
+                                        == Some(col.as_str())
+                                {
+                                    c.is_local = true;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            for i in 0..next.columns.len() {
+                let col = next.columns[i].0.clone();
+                if crate::exec::locality::att_inhcount(
+                    &eng.db,
+                    ctx.snap,
+                    &ctx.all_xids,
+                    ctx.session,
+                    &next,
+                    &col,
+                ) == 0
+                {
+                    next.set_att_local(i, true);
+                }
+            }
+        }
         if eng.db.is_temp_table(ctx.session, child_name) {
             alter_swap_temp(eng, ctx, child_name, None, next, None)?;
         } else {
@@ -2134,6 +2329,224 @@ pub(crate) fn col_type_name(ty: &ColType) -> &'static str {
 /// not a partitioned parent, returns a single group for the target
 /// itself (no-op). If the target is a leaf (has a bound), validates the
 /// bound instead of routing.
+/// v2.26: merge a `PARTITION OF` element list into the inherited
+/// def's constraint fields (PG19 tablecmds.c MergeAttributes,
+/// is_partition block; error shapes from parse_utilcmd.c /
+/// MergeCheckConstraint). The caller has already cloned the parent's
+/// rowtype and constraints into the def; `ov` is the element def built
+/// by `build_partition_override_def` (its column types are
+/// placeholders — only names and the parallel constraint fields are
+/// read). Fields are passed split because the caller holds
+/// `&def.partition` borrowed across the merge.
+/// v2.27: a PARTITION OF child's not-null locality (PG19
+/// conislocal for the column's not-null constraint): inherited
+/// not-nulls are non-local, except a column whose NOT NULL was
+/// restated by a PARTITION OF element definition — that element
+/// records a local NotNull CheckDef (see apply_partition_overrides),
+/// e.g. part_b's `b NOT NULL` yields part_b_b_not_null at t / 1.
+pub(crate) fn fix_partition_child_nn_local(t: &mut Table) {
+    for i in 0..t.columns.len() {
+        if !t.not_null.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let col = t.columns[i].0.clone();
+        let local = t.checks.iter().any(|c| {
+            c.kind == crate::sql::CheckKind::NotNull
+                && c.is_local
+                && crate::sql::check_expr_column(&c.expr).as_deref() == Some(col.as_str())
+        });
+        t.set_nn_local(i, local);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_partition_overrides(
+    child: &str,
+    ov: TableDef,
+    columns: &[(String, crate::storage::ColType)],
+    gen_cols: &mut Vec<Option<(crate::sql::Expr, bool)>>,
+    defaults: &mut Vec<Option<crate::sql::DefaultExpr>>,
+    not_null: &mut Vec<bool>,
+    checks: &mut Vec<crate::sql::CheckDef>,
+    uniques: &mut Vec<crate::sql::UniqueDef>,
+    pkey: &mut Option<crate::sql::UniqueDef>,
+    fks: &mut Vec<crate::sql::FkDef>,
+) -> Result<(), ExecError> {
+    let bare = child.rsplit('.').next().unwrap_or(child);
+    let col_pos = |col: &str| -> Result<usize, ExecError> {
+        columns
+            .iter()
+            .position(|(n, _)| n == col)
+            .ok_or_else(|| exec_err("42703", format!("column \"{}\" does not exist", col)))
+    };
+    // Per-column elements: existence, the generated-family rules,
+    // DEFAULT replacement, NOT NULL accumulation.
+    for (oi, (col, _ty)) in ov.columns.iter().enumerate() {
+        let pos = col_pos(col)?;
+        let pgen = gen_cols.get(pos).cloned().unwrap_or(None);
+        let ogen = ov.gen_cols.get(oi).cloned().unwrap_or(None);
+        match (&pgen, &ogen) {
+            (Some(_), None) => {
+                if ov.defaults.get(oi).and_then(|d| d.as_ref()).is_some() {
+                    return Err(exec_err(
+                        "42P16",
+                        format!(
+                            "column \"{}\" inherits from generated column but specifies default",
+                            col
+                        ),
+                    ));
+                }
+            }
+            (None, Some(_)) => {
+                return Err(exec_err(
+                    "42P16",
+                    format!("child column \"{}\" specifies generation expression", col),
+                ));
+            }
+            (Some((_, ps)), Some((_, os))) if ps != os => {
+                return Err(exec_err(
+                    "42P16",
+                    format!(
+                        "column \"{}\" inherits from generated column of different kind",
+                        col
+                    ),
+                ));
+            }
+            (Some(_), Some((e, s))) => {
+                if gen_cols.len() != columns.len() {
+                    *gen_cols = vec![None; columns.len()];
+                }
+                gen_cols[pos] = Some((e.clone(), *s));
+            }
+            _ => {}
+        }
+        if pgen.is_none() {
+            if let Some(d) = ov.defaults.get(oi).and_then(|d| d.clone()) {
+                defaults[pos] = Some(d);
+            }
+        }
+        // v2.27: the local record is pushed whenever the element
+        // restates NOT NULL, even when the parent column is already
+        // not-null — PG records part_b_b_not_null as a LOCAL
+        // constraint (conislocal t, coninhcount 1) in exactly that
+        // case; the pre-v2.27 gate on `!not_null[pos]` skipped it.
+        if ov.not_null.get(oi).copied().unwrap_or(false) {
+            not_null[pos] = true;
+            // PG records a named not-null constraint on the child
+            // (part_b_b_not_null in create_table's pg_constraint
+            // expectations).
+            let cname = format!("{}_{}_not_null", bare, col);
+            if !checks.iter().any(|c| c.name == cname) {
+                checks.push(crate::sql::CheckDef {
+                    name: cname,
+                    expr: crate::sql::Expr::IsNull {
+                        expr: Box::new(crate::sql::Expr::Column {
+                            table: None,
+                            name: col.clone(),
+                        }),
+                        neg: true,
+                    },
+                    not_valid: false,
+                    kind: crate::sql::CheckKind::NotNull,
+                    no_inherit: false,
+                    enforced: true,
+                    is_local: true,
+                });
+            }
+        }
+    }
+    // Table-constraint NOT NULL elements naming columns with no
+    // column element of their own (deferred by the builder).
+    for col in &ov.deferred_not_null {
+        let pos = col_pos(col)?;
+        not_null[pos] = true;
+    }
+    // CHECK elements (column- and table-level): an element whose name
+    // and expression match an inherited constraint MERGES with it
+    // (PG NOTICE "merging constraint ... with inherited definition");
+    // the same name with a different expression is 42710.
+    for c in &ov.checks {
+        if c.kind == crate::sql::CheckKind::NotNull {
+            // Not-null constraint records travel with the flags set
+            // above; keep the record if its name is new.
+            if !checks.iter().any(|x| x.name == c.name) {
+                checks.push(c.clone());
+            }
+            continue;
+        }
+        let mut refs: Vec<(Option<String>, String)> = Vec::new();
+        crate::sql::collect_col_refs(&c.expr, &mut refs);
+        for (_, r) in &refs {
+            col_pos(r)?;
+        }
+        if let Some(existing) = checks.iter().find(|x| x.name == c.name) {
+            if existing.expr == c.expr && existing.kind == c.kind {
+                continue;
+            }
+            return Err(exec_err(
+                "42710",
+                format!(
+                    "check constraint name \"{}\" appears multiple times but with different expressions",
+                    c.name
+                ),
+            ));
+        }
+        checks.push(c.clone());
+    }
+    // UNIQUE elements.
+    for u in &ov.uniques {
+        for c in &u.cols {
+            col_pos(c)?;
+        }
+        if let Some(existing) = uniques.iter().find(|x| x.name == u.name) {
+            if existing.cols == u.cols {
+                continue;
+            }
+            return Err(exec_err(
+                "42P16",
+                format!(
+                    "constraint \"{}\" for relation \"{}\" already exists",
+                    u.name, bare
+                ),
+            ));
+        }
+        uniques.push(u.clone());
+    }
+    // PRIMARY KEY element.
+    if let Some(pk) = &ov.pkey {
+        for c in &pk.cols {
+            col_pos(c)?;
+        }
+        match &*pkey {
+            None => {
+                for c in &pk.cols {
+                    let pos = col_pos(c)?;
+                    not_null[pos] = true;
+                }
+                *pkey = Some(pk.clone());
+            }
+            Some(existing) if existing.cols == pk.cols => {}
+            Some(_) => {
+                return Err(exec_err(
+                    "42601",
+                    "multiple primary keys for table".to_string(),
+                ));
+            }
+        }
+    }
+    // FOREIGN KEY elements (validated by the caller's usual FK pass).
+    for fk in &ov.fks {
+        for c in &fk.cols {
+            col_pos(c)?;
+        }
+        if fks.iter().any(|x| x.name == fk.name) {
+            continue;
+        }
+        fks.push(fk.clone());
+    }
+    Ok(())
+}
+
 pub(crate) fn route_partition_inserts(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -2250,6 +2663,80 @@ pub(crate) fn route_partition_inserts(
         if leaf_has_row_triggers {
             for (_, row) in &fired_rows {
                 check_leaf_bound(eng, ctx, &leaf_name, &leaf_pinfo, &leaf_cols, &row[..])?;
+            }
+        }
+        // v2.26: leaf-local write semantics (PG19 ExecInsert judges
+        // the row by the LEAF's tuple descriptor): a partition whose
+        // definitions differ from the target's — a generated-column
+        // override, an element NOT NULL, or a leaf-local CHECK (all
+        // from a PARTITION OF element list) — recomputes its generated
+        // columns and re-validates the routed rows against its own
+        // constraint set. Leaves whose definitions match the target's
+        // (the overwhelmingly common plain child) skip everything.
+        {
+            let (leaf_meta, target_meta) = {
+                let lt = eng
+                    .db
+                    .find_table(&leaf_name, ctx.snap, &ctx.all_xids, ctx.session)
+                    .expect("leaf still visible");
+                let tt = eng
+                    .db
+                    .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+                    .expect("target still visible");
+                (TableMeta::of(lt), TableMeta::of(tt))
+            };
+            let by_name =
+                |meta: &TableMeta, n: &str| meta.columns.iter().position(|(cn, _)| cn == n);
+            let gen_differs = leaf_meta.columns.iter().enumerate().any(|(li, (ln, _))| {
+                let lg = leaf_meta.gen_cols.get(li).cloned().unwrap_or(None);
+                let tg = by_name(&target_meta, ln)
+                    .and_then(|ti| target_meta.gen_cols.get(ti).cloned().unwrap_or(None));
+                lg != tg
+            });
+            let nn_differs = leaf_meta.columns.iter().enumerate().any(|(li, (ln, _))| {
+                let lv = leaf_meta.not_null.get(li).copied().unwrap_or(false);
+                let tv = by_name(&target_meta, ln)
+                    .and_then(|ti| target_meta.not_null.get(ti).copied())
+                    .unwrap_or(false);
+                lv != tv
+            });
+            let extra_checks = leaf_meta.checks.iter().any(|c| {
+                !target_meta
+                    .checks
+                    .iter()
+                    .any(|t| t.name == c.name && t.expr == c.expr)
+            });
+            if gen_differs || nn_differs || extra_checks {
+                for (_, row) in &mut fired_rows {
+                    let mut vals = row[..].to_vec();
+                    if gen_differs {
+                        compute_generated_columns(
+                            eng,
+                            ctx.snap,
+                            ctx.own,
+                            ctx.session,
+                            ctx.role,
+                            &leaf_meta,
+                            &mut vals,
+                        )?;
+                    }
+                    check_row_constraints(
+                        eng,
+                        ctx.snap,
+                        ctx.own,
+                        ctx.session,
+                        ctx.role,
+                        &leaf_meta,
+                        &leaf_name,
+                        &vals,
+                    )?;
+                    *row = Row::new(vals);
+                }
+                if gen_differs && !leaf_has_row_triggers {
+                    for (_, row) in &fired_rows {
+                        check_leaf_bound(eng, ctx, &leaf_name, &leaf_pinfo, &leaf_cols, &row[..])?;
+                    }
+                }
             }
         }
         result.push((leaf_name, fired_rows));
@@ -4513,6 +5000,7 @@ pub(crate) fn expand_like_clauses(
                     kind: ck.kind,
                     no_inherit: ck.no_inherit,
                     enforced: true,
+                    is_local: true,
                 });
             }
         }
@@ -4535,6 +5023,7 @@ pub(crate) fn expand_like_clauses(
                     deferrable: u.deferrable,
                     initially_deferred: u.initially_deferred,
                     nulls_not_distinct: u.nulls_not_distinct,
+                    is_local: true,
                 });
             }
             if def.pkey.is_none() {
@@ -4545,6 +5034,7 @@ pub(crate) fn expand_like_clauses(
                         deferrable: pk.deferrable,
                         initially_deferred: pk.initially_deferred,
                         nulls_not_distinct: pk.nulls_not_distinct,
+                        is_local: true,
                     });
                 }
             }
@@ -4712,6 +5202,13 @@ pub(crate) fn create_table_from_def(
         // column definition resolves them (PG19's bogus-marker
         // pass in DefineRelation).
         let mut merged_gen: Vec<Option<(crate::sql::Expr, bool)>> = Vec::new();
+        // v2.27: not-null locality parallel to the merged columns
+        // (false = the not-null exists only by inheritance).
+        let mut merged_nn: Vec<bool> = Vec::new();
+        // v2.27: attribute locality parallel to the merged columns
+        // (false = inherited-only; a local redeclaration merges and
+        // stays local, PG19 MergeChildAttribute).
+        let mut merged_att: Vec<bool> = Vec::new();
         // v2.16 finishing pass: effective per-column storage carried
         // alongside the merge for the same reason (PG19
         // MergeChildAttribute storage conflicts, 42804).
@@ -4879,6 +5376,9 @@ pub(crate) fn create_table_from_def(
                 merged
                     .not_null
                     .push(parent.not_null.get(i).copied().unwrap_or(false));
+                // v2.27: an inherited not-null is non-local.
+                merged_nn.push(!parent.not_null.get(i).copied().unwrap_or(false));
+                merged_att.push(false);
                 merged
                     .defaults
                     .push(parent.defaults.get(i).cloned().unwrap_or(None));
@@ -4897,9 +5397,21 @@ pub(crate) fn create_table_from_def(
             // v2.16: NO INHERIT constraints do not propagate to
             // children (PG19 connoinherit) — neither CHECKs nor
             // not-null constraint entries.
-            merged
-                .checks
-                .extend(parent.checks.iter().filter(|c| !c.no_inherit).cloned());
+            // v2.27: inherited copies are non-local; the same
+            // constraint arriving from two parents merges into ONE
+            // entry (its derived coninhcount counts both parents).
+            for pc in parent.checks.iter().filter(|c| !c.no_inherit) {
+                let dup = merged.checks.iter().any(|c| {
+                    c.name == pc.name
+                        && c.kind == pc.kind
+                        && format!("{:?}", c.expr) == format!("{:?}", pc.expr)
+                });
+                if !dup {
+                    let mut copy = pc.clone();
+                    copy.is_local = false;
+                    merged.checks.push(copy);
+                }
+            }
         }
         // The child's own columns; a child column with the same name as
         // an inherited one merges into the inherited position (PG19
@@ -4955,8 +5467,17 @@ pub(crate) fn create_table_from_def(
             }
             // The local column refines the inherited slot: NOT NULL
             // accumulates, and local default/serial/storage settings win.
+            // v2.27: a locally (re)declared column is local.
+            if let Some(l) = merged_att.get_mut(pos) {
+                *l = true;
+            }
             if like_def.not_null.get(i).copied().unwrap_or(false) {
                 merged.not_null[pos] = true;
+                // v2.27: a locally declared not-null on a merged
+                // column makes the constraint local too.
+                if let Some(l) = merged_nn.get_mut(pos) {
+                    *l = true;
+                }
             }
             if let Some(d) = like_def.defaults.get(i).and_then(|d| d.clone()) {
                 merged.defaults[pos] = Some(d);
@@ -5013,6 +5534,8 @@ pub(crate) fn create_table_from_def(
             merged
                 .not_null
                 .push(like_def.not_null.get(i).copied().unwrap_or(false));
+            merged_nn.push(true);
+            merged_att.push(true);
             merged
                 .defaults
                 .push(like_def.defaults.get(i).cloned().unwrap_or(None));
@@ -5026,7 +5549,23 @@ pub(crate) fn create_table_from_def(
                 .storage
                 .push(like_def.storage.get(i).cloned().unwrap_or(None));
         }
-        merged.checks.extend(like_def.checks.iter().cloned());
+        // v2.27: a local CHECK identical (name + definition) to an
+        // inherited copy merges into it and makes it local (PG19
+        // MergeWithExistingConstraint); differing definitions with
+        // the same name were already rejected in exec_create.
+        for lc in like_def.checks.iter() {
+            if let Some(ex) = merged.checks.iter_mut().find(|c| {
+                c.kind == lc.kind
+                    && c.name == lc.name
+                    && format!("{:?}", c.expr) == format!("{:?}", lc.expr)
+            }) {
+                ex.is_local = true;
+                continue;
+            }
+            merged.checks.push(lc.clone());
+        }
+        merged.nn_local = merged_nn.clone();
+        merged.att_local = merged_att.clone();
         merged.uniques = like_def.uniques.clone();
         merged.pkey = like_def.pkey.clone();
         merged.fks = like_def.fks.clone();
@@ -5119,19 +5658,49 @@ pub(crate) fn create_table_from_def(
                         )
                     })?;
                 def.columns = parent.columns.clone();
+                // v2.27: partition children are never attribute-local.
+                def.att_local = vec![false; parent.columns.len()];
                 def.composite_types = parent.composite_types.clone();
                 def.domain_types = parent.domain_types.clone();
                 def.bit_typmods = parent.bit_typmods.clone();
                 def.domain_elem = parent.domain_elem.clone();
                 def.not_null = parent.not_null.clone();
                 def.defaults = parent.defaults.clone();
-                def.checks = parent.checks.clone();
+                def.checks = parent
+                    .checks
+                    .iter()
+                    .map(|c| {
+                        let mut c = c.clone();
+                        // v2.27: partition copies are never local.
+                        c.is_local = false;
+                        c
+                    })
+                    .collect();
                 // v0.70: inherit the parent's constraints too (PG copies
                 // them to every partition). Backing unique indexes get
                 // per-table names via `constraint_index_name`.
-                def.uniques = parent.uniques.clone();
-                def.pkey = parent.pkey.clone();
-                def.fks = parent.fks.clone();
+                def.uniques = parent
+                    .uniques
+                    .iter()
+                    .map(|u| {
+                        let mut u = u.clone();
+                        u.is_local = false;
+                        u
+                    })
+                    .collect();
+                def.pkey = parent.pkey.clone().map(|mut p| {
+                    p.is_local = false;
+                    p
+                });
+                def.fks = parent
+                    .fks
+                    .iter()
+                    .map(|f| {
+                        let mut f = f.clone();
+                        f.is_local = false;
+                        f
+                    })
+                    .collect();
                 // v0.72: inherit the parent's per-column COMPRESSION
                 // settings too (PG copies the whole rowtype) — see the
                 // permanent-table PARTITION OF path for why.
@@ -5143,6 +5712,28 @@ pub(crate) fn create_table_from_def(
                 // v0.72: same for STORAGE — PG copies attstorage as part
                 // of the rowtype.
                 def.storage = parent.col_storage.iter().map(|b| Some(*b)).collect();
+                // v2.26: generated expressions and collations are part
+                // of the rowtype too (the clone above never carried
+                // them, so children silently lost both).
+                def.gen_cols = parent.gen_cols.clone();
+                def.collations = parent.col_collations.clone();
+                // v2.26: PARTITION OF element list (PG19
+                // MergeAttributes) merged into the inherited def.
+                if let Some(ov) = def.partition_overrides.take().map(|b| *b) {
+                    apply_partition_overrides(
+                        name,
+                        ov,
+                        &def.columns,
+                        &mut def.gen_cols,
+                        &mut def.defaults,
+                        &mut def.not_null,
+                        &mut def.checks,
+                        &mut def.uniques,
+                        &mut def.pkey,
+                        &mut def.fks,
+                    )?;
+                    validate_generated_columns(eng, &def)?;
+                }
                 // v1.41: attnums travel with the rowtype too (stashed
                 // for after the table is built, like temp_pinfo).
                 temp_attnums = Some(parent.attnums.clone());
@@ -5157,6 +5748,10 @@ pub(crate) fn create_table_from_def(
             }
         }
         let mut t = Table::with_def(&def, ctx.own);
+        // v2.27: a temp PARTITION OF child's not-null locality.
+        if temp_parent.is_some() {
+            fix_partition_child_nn_local(&mut t);
+        }
         t.partition = temp_pinfo;
         // v1.41: PARTITION OF child takes the parent's attnums.
         if let Some(a) = temp_attnums {
@@ -5255,19 +5850,49 @@ pub(crate) fn create_table_from_def(
                 })?;
             // Inherit columns (PG copies the parent's rowtype).
             def.columns = parent.columns.clone();
+            // v2.27: partition children are never attribute-local.
+            def.att_local = vec![false; parent.columns.len()];
             def.composite_types = parent.composite_types.clone();
             def.domain_types = parent.domain_types.clone();
             def.bit_typmods = parent.bit_typmods.clone();
             def.domain_elem = parent.domain_elem.clone();
             def.not_null = parent.not_null.clone();
             def.defaults = parent.defaults.clone();
-            def.checks = parent.checks.clone();
+            def.checks = parent
+                .checks
+                .iter()
+                .map(|c| {
+                    let mut c = c.clone();
+                    // v2.27: partition copies are never local.
+                    c.is_local = false;
+                    c
+                })
+                .collect();
             // v0.70: inherit the parent's constraints too (PG copies
             // them to every partition). Backing unique indexes get
             // per-table names via `constraint_index_name`.
-            def.uniques = parent.uniques.clone();
-            def.pkey = parent.pkey.clone();
-            def.fks = parent.fks.clone();
+            def.uniques = parent
+                .uniques
+                .iter()
+                .map(|u| {
+                    let mut u = u.clone();
+                    u.is_local = false;
+                    u
+                })
+                .collect();
+            def.pkey = parent.pkey.clone().map(|mut p| {
+                p.is_local = false;
+                p
+            });
+            def.fks = parent
+                .fks
+                .iter()
+                .map(|f| {
+                    let mut f = f.clone();
+                    f.is_local = false;
+                    f
+                })
+                .collect();
             // v0.72: inherit the parent's per-column COMPRESSION settings
             // too (PG copies the whole rowtype). Without this,
             // `def.compression` stays empty and the zip below truncates
@@ -5282,6 +5907,28 @@ pub(crate) fn create_table_from_def(
             // v0.72: same for STORAGE — PG copies attstorage as part of
             // the rowtype.
             def.storage = parent.col_storage.iter().map(|b| Some(*b)).collect();
+            // v2.26: generated expressions and collations are part of
+            // the rowtype too (the clone above never carried them, so
+            // children silently lost both).
+            def.gen_cols = parent.gen_cols.clone();
+            def.collations = parent.col_collations.clone();
+            // v2.26: PARTITION OF element list (PG19 MergeAttributes)
+            // merged into the inherited def.
+            if let Some(ov) = def.partition_overrides.take().map(|b| *b) {
+                apply_partition_overrides(
+                    name,
+                    ov,
+                    &def.columns,
+                    &mut def.gen_cols,
+                    &mut def.defaults,
+                    &mut def.not_null,
+                    &mut def.checks,
+                    &mut def.uniques,
+                    &mut def.pkey,
+                    &mut def.fks,
+                )?;
+                validate_generated_columns(eng, &def)?;
+            }
             // v1.41: PARTITION OF copies the parent's rowtype — attnums
             // travel with it (PG assigns the child the parent's
             // attribute numbers, gaps included).
@@ -5292,6 +5939,8 @@ pub(crate) fn create_table_from_def(
             // Stash the info for after the table is created.
             // (We can't borrow parent mutably while building.)
             let mut t = Table::with_def(&def, ctx.own);
+            // v2.27: a PARTITION OF child's not-null locality.
+            fix_partition_child_nn_local(&mut t);
             t.attnums = inherit_attnums;
             t.next_attnum = inherit_next_attnum;
             t.partition = Some(pinfo);
@@ -5819,6 +6468,25 @@ pub(crate) fn detach_partition(
     // Child side: clear the parent link and bound. A leaf becomes a
     // plain table; an intermediate keeps method/key/children.
     let mut next = child.clone();
+    // v2.27: DETACH locality flips (PG19 RemoveInheritance): with the
+    // parent link gone every surviving constraint/column is local
+    // (attislocal/conislocal true, inhcounts 0 by derivation).
+    for c in next.checks.iter_mut() {
+        c.is_local = true;
+    }
+    for u in next.uniques.iter_mut() {
+        u.is_local = true;
+    }
+    if let Some(pk) = next.pkey.as_mut() {
+        pk.is_local = true;
+    }
+    for f in next.fks.iter_mut() {
+        f.is_local = true;
+    }
+    for i in 0..next.columns.len() {
+        next.set_nn_local(i, true);
+        next.set_att_local(i, true);
+    }
     match &mut next.partition {
         Some(pi) => {
             pi.parent = None;

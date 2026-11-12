@@ -2,6 +2,294 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: binary-search `Snapshot.active` instead of linear-scanning it — fix — 2026-11-12
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/storage.rs`: added `Snapshot::is_active(&self, xid: u64) -> bool`,
+a `self.active.binary_search(&xid).is_ok()` one-liner, and switched
+every `snap.active.contains(&xid)` read site (13 total: `index_visible`
+x2, `version_dead_to_all`, `row_visible` x2, `table_visible` x2,
+`view_visible`, `seq_visible`, `role_visible` — each arm's created/
+dropped xmin/xmax check) to call it. `binary_search` on an unsorted
+slice is silently wrong (it can return either answer for a key that's
+actually absent, depending where the scan happens to land), so this is
+only safe because *every* `Snapshot` is now guaranteed sorted:
+
+- `Engine::take_snapshot` already sorted (`active.sort_unstable()`) —
+  unchanged.
+- `committed_unique_violation`'s fresh commit-time-recheck snapshot and
+  `server.rs::txn_vacuum`'s pre-VACUUM snapshot both built `active` by
+  collecting `TxnManager::active` (a `HashSet`, unordered iteration)
+  straight into the `Vec` with no sort. Both now sort right after the
+  collect, before constructing the `Snapshot`.
+- The `storage.rs` test helper `snap(active: &[u64], next_xid: u64)`
+  now sorts its input too, so no test can construct an unsorted
+  `Snapshot` and silently drift from the invariant other code now
+  relies on.
+
+No visibility rule changes: `binary_search(&xid).is_ok()` returns
+exactly the same `true`/`false` as `contains(&xid)` for any sorted
+slice — this is a pure algorithmic substitution (`O(k)` → `O(log k)`
+per check, `k` = concurrently active transactions), not a behavior
+change. `is_active` is a private method (every call site is already
+inside `storage.rs`); `txns.active.contains(..)` (the `HashSet` itself,
+already `O(1)`, 4 call sites in `storage.rs`/`exec/dml.rs`) is
+untouched — only the `Snapshot.active: Vec<u64>` reads moved.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_snapshot_active.py --rows 2000 --count
+10`), same four `--idle-txns` sizes, same machine, same session.
+
+Callgrind `Ir` (`--collect-jumps=yes --cache-sim=yes`):
+
+| `--idle-txns` | before | after | delta |
+|---|---|---|---|
+| 0 | 350,881,859 | 344,110,042 (avg of 344,113,550 / 344,106,533) | **-1.93%** |
+| 50 | 606,308,714 | 520,266,398 | **-14.19%** |
+| 100 | 869,931,414 | 694,585,372 | **-20.16%** |
+| 200 | 1,432,822,897 (avg) | 1,068,729,897 (avg of 1,068,484,342 / 1,068,975,451) | **-25.42%** |
+
+Reproducibility at the two endpoints (two independent runs each, same
+binary): `--idle-txns 0` after-fix pair agrees to 0.002%; `--idle-txns
+200` before-fix pair agrees to 0.028% and after-fix pair to 0.046% —
+all three to four orders of magnitude tighter than the smallest
+reported delta (1.93%), so every row in the table above is signal, not
+noise.
+
+The **-1.93%** at `--idle-txns 0` — where `active` is empty either way
+and `contains`/`binary_search` are both trivially `O(1)` — shows this
+fix has a small fixed per-call saving independent of `k` too (plausibly
+fewer debug-build bounds/UB-check instrumentation sites on
+`binary_search`'s code path than on `contains`'s `Iterator::fold`-based
+one). Isolating the `k`-dependent term by subtracting that fixed
+per-call delta: the pre-fix marginal cost per idle connection was
+5.11M-5.41M `Ir` (baseline entry); post-fix it is 3.50M-3.74M `Ir`
+(e.g. `(520,266,398-344,110,042)/50 = 3.52M`). The difference,
+~1.6-1.9M `Ir` saved per idle connection, is this fix's share; the
+remaining ~3.5M `Ir`/connection is `BEGIN`'s own inherent
+handshake/parse/`begin_txn` cost, which this change does not touch and
+does not claim to reduce — only the visibility-check scan is in scope
+here.
+
+The whole-workload delta at `--idle-txns 200` (**-25.42%**) is larger
+than the pre-fix self-cost share attributed to
+`SliceContains::slice_contains` alone (15.53%, baseline entry) because
+self-cost excludes the knock-on icache/dcache cost of repeatedly
+walking a 200-element `Vec` versus a ≤8-step binary search — expected,
+and the direct before/after delta (not the self-cost breakdown) is the
+authoritative number for the impact-floor check.
+
+Both clear the ≥5%-of-profile relevance bar and the ≥5%-`Ir`-reduction
+impact floor at every `--idle-txns` size from 50 up, by a wide margin
+at realistic idle-connection counts (14-25%).
+
+`cargo test --all-features`: 1365/1365 passed, same as the pre-fix
+tree. `cargo fmt --all -- --check`: clean. `cargo clippy --all-targets
+--all-features -- -D warnings`: 1300 errors on both the pre-fix and
+post-fix tree (confirmed via `git stash`, compared by count) — the
+same toolchain/lint-version mismatch noted in every prior Bolt round in
+this file; zero new errors from this diff.
+
+**Reproduce**: check out the parent (baseline) commit, `cargo build`,
+repeat the baseline entry's reproduce command at `--idle-txns 0`, `50`,
+`100`, `200` for the before numbers; check out this commit, `cargo
+build`, repeat for the after numbers.
+
+## Bolt: `row_visible`/`table_visible`/etc. linear-scan `Snapshot.active` per check, costing more as other connections sit idle in an open transaction — baseline — 2026-11-12
+
+**Why this workload**: every prior Bolt round in this file drove its
+workload through exactly one connection. `src/storage.rs`'s MVCC
+visibility family (`row_visible`, `table_visible`, `index_visible`,
+`view_visible`, `seq_visible`, `role_visible`, plus
+`version_dead_to_all`) each test `snap.active.contains(&xid)` —
+`Snapshot.active: Vec<u64>` is the list of xids that were active
+(`BEGIN`'d but not yet committed/aborted) when the snapshot was taken,
+and `Vec::contains` is a linear scan. With one connection, `active`
+holds 0-1 entries for the whole session and this scan is free; no
+prior round varied the number of *other, concurrently open*
+transactions, so this cost was never exercised.
+
+That is not a synthetic case: a connection-pooled app (PgBouncer in
+session mode, an ORM that opens a transaction per request and holds it
+across other work, a long-running report, a forgotten interactive
+`BEGIN`) routinely has tens to hundreds of sessions idle mid-transaction
+while other sessions keep issuing ordinary queries — every one of
+which re-pays this scan on every row it reads, scaled by however many
+other transactions happen to be open at that moment.
+
+New harness `benches/profile_snapshot_active.py`: opens `--idle-txns`
+separate connections, sends a bare `BEGIN` on each over the real wire
+protocol (the same `txn_begin` → `Engine::begin_txn` path any client's
+`BEGIN` takes, registering the xid in `TxnManager::active`) and leaves
+them open — blocked on `recv`, never committing — then runs the real,
+measured workload (`--count` iterations of `SELECT * FROM bench_snap`
+over a `--rows`-row table) on one further, separate connection. Each
+idle connection's `BEGIN` completes synchronously before the next one
+opens and before the measured phase starts, so by the time the
+workload runs, the idle connections are parked on a blocking `recv`
+with nothing pending — not runnable, not scheduled, contributing no
+further instructions during the measured phase. Reproduced twice at
+`--idle-txns 0` and `--idle-txns 200`: both pairs agree to within
+0.03%-0.12%, i.e. this multi-connection harness is deterministic enough
+to gate on, like every single-connection harness already in this file.
+
+**Reproduce** (one size; the asymptotic table below repeats this at
+four `--idle-txns` sizes):
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes ./target/debug/rustgres --port 5433 &
+python3 benches/profile_snapshot_active.py --rows 2000 --count 10 --idle-txns 200
+kill -TERM %1   # SIGTERM flushes callgrind's output
+callgrind_annotate --auto=no /tmp/cg.out | head -40
+```
+
+**Profile** (Callgrind, valgrind 3.22.0, pre-fix, `--rows 2000 --count 10
+--idle-txns 200`): **1,432,822,897** total `Ir` (average of two runs,
+1,432,623,911 and 1,433,021,882 — 0.028% apart). Summing every
+`callgrind_annotate` line whose symbol resolves through
+`<u64 as core::slice::cmp::SliceContains>::slice_contains` (the
+generic body `Vec<u64>::contains` compiles to, covering both
+`snap.active.contains(..)` and the much smaller `owns.contains(..)`
+checks that share the same generic instantiation):
+
+| self-cost group | Ir | % of total |
+|---|---|---|
+| `SliceContains::slice_contains` and its `Iterator::fold`/`any` callers | 222,466,280 | **15.53%** |
+
+Comfortably past the 5%-of-profile floor on self-cost alone — and
+self-cost understates the full effect, since it excludes the knock-on
+icache/dcache cost of walking a growing `Vec` repeatedly (see the fix
+entry's larger whole-workload delta).
+
+**Hypothesis**: `take_snapshot` (`src/storage.rs`) already sorts
+`active` (`active.sort_unstable()`) before building the `Snapshot`, and
+two more call sites (`committed_unique_violation`'s commit-time
+recheck, and `txn_vacuum`'s pre-VACUUM snapshot) build one too, from
+the same `TxnManager::active` `HashSet` — currently *without* sorting.
+Once every construction site is made to sort (a cheap, one-time
+`O(k log k)` cost already paid by the common path), every read site's
+`snap.active.contains(&xid)` can become a `binary_search`, turning each
+visibility check from `O(k)` (`k` = concurrently active transactions)
+into `O(log k)` — the same mechanism this file has already used twice
+for row/table versions (`row_pos`'s `O(1)` index, `table_visible`'s
+still-open quadratic-version-count finding two entries above this one)
+applied to the *transaction* axis instead of the row/version axis.
+
+**Asymptotic confirmation** (4 sizes, same harness, same machine, same
+session, fresh data directory per run):
+
+| `--idle-txns` | total `Ir` (pre-fix) |
+|---|---|
+| 0 | 350,881,859 (avg of 351,083,104 / 350,680,613) |
+| 50 | 606,308,714 |
+| 100 | 869,931,414 |
+| 200 | 1,432,822,897 (avg of 1,432,623,911 / 1,433,021,882) |
+
+Marginal `Ir` per additional idle connection (slope between
+consecutive sizes) rises from 5.11M (0→50) to 5.19M (50→100) to 5.41M
+(100→200, computed against the 0-point) — consistent with a per-row
+`O(k)` scan term riding on top of the connections' own inherent,
+`k`-independent-but-additive setup cost (`BEGIN`'s handshake/parse/
+`begin_txn`, unaffected by this fix and still present after it — see
+the fix entry for the decomposition).
+
+`cargo test --all-features`: 1365/1365 passed (pre-fix tree). `cargo
+fmt --all -- --check`: clean.
+
+**Reproduce the 4-size table**: repeat the single-size reproduce
+command above with `--idle-txns 0`, `50`, `100`, `200` against fresh
+data directories, each run its own server process on the same port
+(stop/restart between sizes).
+
+## Bolt: `commit_table_version` never prunes dead schema versions, making `find_table`/`table_visible` cost grow ~quadratically with ALTERs against one table — finding, no fix — 2026-11-11
+
+Full writeup with profile tables and reproduction commands: #75
+
+**Why this workload**: v2.26 (2026-11-10) added a new per-leaf block to
+`route_partition_inserts` (two `TableMeta::of()` clones, to detect
+`PARTITION OF` element-list overrides) that had never been profiled.
+New harness `benches/profile_manypart_insert.py`: a RANGE-partitioned
+table with `--parts` leaves and no column overrides, bulk-loaded via
+one `INSERT` touching every leaf once, isolating the new block's
+per-leaf-group cost from per-row insert cost. `--variant manypart`
+(DDL + INSERT), `--variant setup` (DDL only), `--variant plain`
+(no partitioning, same row volume, control).
+
+**The v2.26 hypothesis was wrong**: the two `TableMeta::of()` clones
+are only ~0.4% of `Ir` and ~3.3% of DHAT allocation blocks on this
+workload — well under the 5%/10% floor, because the bench table has
+only 3 plain columns and no checks/FKs/defaults, so each clone is
+cheap. Not worth fixing on its own.
+
+**What the same profile surfaced instead**: `find_table`/`table_visible`
+is 29.18% of total `Ir` at `--parts 200` (`manypart`), driven by
+`owns.contains(&t.created_xmin)`/`snap.active.contains(&t.dropped_xmax)`
+linear scans (306,315 calls to `table_visible`). Across `--parts`
+25/50/100/200, the insert-phase cost (`manypart` Ir minus `setup` Ir,
+isolating the INSERT from one-time DDL) grows 3.58x/3.81x/3.93x per
+doubling — trending to the 4x a quadratic term gives, confirmed by
+fitting `Ir(n) = a·n + b·n²` to the n=50/n=200 endpoints and predicting
+n=100 within 0.54%. The `plain` control (same row volume, no
+partitioning) stays near-linear (1.3-1.65x per doubling) — ruling out
+"more rows costs more" as the explanation.
+
+**Confirmed general, not partition-specific**: a second harness (ad
+hoc, not committed — ships no fix) repeats plain `ALTER TABLE t ADD
+COLUMN cN int` N times against one unpartitioned table, no
+`PARTITION OF` involved at all. Same mechanism: `table_visible` is
+37.69% of `Ir` at N=200 (120,801 calls), Ir growing 3.00x/3.42x per
+doubling (N=50→100→200: 43,412,028 / 130,138,818 / 445,078,994).
+
+**Mechanism**: `commit_table_version` (`src/exec/partition.rs:671`,
+shared by every `ALTER TABLE`-family mutation including
+`parent_link_child`/`ATTACH PARTITION`) marks the previous version
+dead (`old_live.dropped_xmax = ctx.own`) and unconditionally
+`versions.push(next)`s the new one into `eng.db.tables[name]:
+Vec<Table>` — nothing ever removes a schema-dead entry from that
+`Vec`. `find_table` resolves a name via `vs.iter().find(|t|
+table_visible(...))`, a linear scan that pays for every dead version,
+forever. The codebase already fixed this for **row** versions
+(`Database::vacuum_table`, `src/storage.rs:7758`, pruning via
+`version_dead_to_all(txns, v)` after `DELETE`/`UPDATE`/`DROP`-family
+commits) but has no equivalent for the table-schema version list
+itself — `vacuum_table` only prunes `t.rows` inside each surviving
+`Table`, never the `Vec<Table>`.
+
+**No fix shipped**: pruning a schema version is only safe when it is
+dead to *every* active session's snapshot, not just the committing
+one (the same `version_dead_to_all` check `vacuum_table` already uses
+for rows) — wiring that into `commit_table_version` is a
+correctness-sensitive change to the core MVCC/storage model
+(`Database::tables`): pruning a version a concurrent `REPEATABLE
+READ`/`SERIALIZABLE` transaction's older snapshot still needs would be
+silent data corruption, not a perf regression. It also needs a human
+policy decision on when to run it (inline per commit vs.
+triggered-like-row-vacuum vs. periodic), and touches a function called
+from many ALTER-family sites across `src/exec/partition.rs` and
+`src/exec/alter.rs` — more than a mechanical hoist. Recorded here so a
+future round doesn't re-spend a profiling cycle re-deriving it.
+
+**Reproduce**:
+```bash
+cargo build
+python3 benches/profile_manypart_insert.py --tool callgrind --sizes --variant manypart
+python3 benches/profile_manypart_insert.py --tool callgrind --sizes --variant setup
+python3 benches/profile_manypart_insert.py --tool callgrind --sizes --variant plain
+python3 benches/profile_manypart_insert.py --tool callgrind --parts 200 --variant manypart --keep-log /tmp/cg.manypart.200
+callgrind_annotate --tree=calling --inclusive=yes /tmp/cg.manypart.200 | grep -A2 'table_visible \['
+```
+
+Profiles committed: `benches/profiles/callgrind.out.manypart-n200-2026-11-11`
+(`--variant manypart`), `benches/profiles/callgrind.out.manypart-setup-n200-2026-11-11`
+(`--variant setup`).
+
 ## Bolt: `check_leaf_ancestor_uniques` rescans the whole in-batch row list per row — fix — 2026-11-10
 
 Fixes the target identified in the baseline entry immediately below

@@ -153,11 +153,20 @@ fn v216_rename_constraint_and_locality() {
     );
     // Plain rename propagates to the child.
     ok(&mut eng, "alter table p rename constraint c1 to c1x");
-    ok(&mut eng, "alter table c drop constraint c1x");
+    // v2.27: the v2.26 hold-back is gone — the full locality model
+    // refuses the drop of an inherited constraint on a plain
+    // INHERITS child too (42P16 "cannot drop inherited constraint",
+    // tablecmds.c dropconstraint_internal, coninhcount > 0).
+    assert_eq!(
+        err_code(&mut eng, "alter table c drop constraint c1x"),
+        "42P16"
+    );
     assert_eq!(
         err_code(&mut eng, "alter table p rename constraint nope to x"),
         "42704"
     );
+    // The parent still carries its own c1x, so re-adding the name
+    // there is a duplicate (42710).
     assert_eq!(
         err_code(&mut eng, "alter table p add constraint c1x check (b > 0)"),
         "42710"

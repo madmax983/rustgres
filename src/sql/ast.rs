@@ -2414,6 +2414,15 @@ pub struct CheckDef {
     /// v2.06: [NOT] ENFORCED (PG19 conenforced). Only meaningful for
     /// kind == Check: a non-enforced CHECK is catalogued, not evaluated.
     pub enforced: bool,
+    /// v2.27: PG19 conislocal — the constraint has a local definition
+    /// on this relation (as opposed to existing only by inheritance).
+    /// The companion coninhcount is NOT stored: it is derived from the
+    /// live parent links (see exec::locality). Partition children keep
+    /// this false for inherited CHECK/UNIQUE/PK/FK copies even when a
+    /// PARTITION OF element restated the definition (PG19 heap.c
+    /// MergeWithExistingConstraint partition rule); NOT NULL entries
+    /// created by a PARTITION OF element keep it true.
+    pub is_local: bool,
 }
 
 /// v0.76: a NOT NULL column constraint added via ALTER TABLE
@@ -2444,6 +2453,8 @@ pub struct UniqueDef {
     /// EQUAL for uniqueness instead of never conflicting. Always false
     /// for PRIMARY KEY (the grammar has no null-treatment clause).
     pub nulls_not_distinct: bool,
+    /// v2.27: PG19 conislocal (see CheckDef::is_local).
+    pub is_local: bool,
 }
 
 impl UniqueDef {
@@ -2455,6 +2466,7 @@ impl UniqueDef {
             deferrable: false,
             initially_deferred: false,
             nulls_not_distinct: false,
+            is_local: true,
         }
     }
 }
@@ -2500,6 +2512,8 @@ pub struct FkDef {
     /// v2.06: added NOT VALID (PG19 convalidated == !not_valid):
     /// existing rows were not validated at ADD time.
     pub not_valid: bool,
+    /// v2.27: PG19 conislocal (see CheckDef::is_local).
+    pub is_local: bool,
 }
 
 /// v0.9: the full schema of a CREATE TABLE: columns plus constraints.
@@ -2526,6 +2540,16 @@ pub struct TableDef {
     /// array element, not to the whole column value.
     pub domain_elem: Vec<bool>,
     pub not_null: Vec<bool>,
+    /// v2.27: not-null locality parallel to `not_null`, carried only
+    /// through the INHERITS merge in create_table_from_def (empty =
+    /// unmaintained; Table::with_def then treats every not-null as
+    /// local, the plain-CREATE truth).
+    pub nn_local: Vec<bool>,
+    /// v2.27: attribute locality parallel to `columns`, carried
+    /// through the INHERITS / PARTITION OF merges like `nn_local`
+    /// (empty = unmaintained; with_def then treats every column as
+    /// local).
+    pub att_local: Vec<bool>,
     pub defaults: Vec<Option<DefaultExpr>>,
     /// v0.65: per-column serial pseudo-type marker (parallel to
     /// `columns`). Exec creates the backing sequence (type-specific
@@ -2577,6 +2601,15 @@ pub struct TableDef {
     /// v1.96: `CREATE TABLE name OF type_name` — a typed table whose
     /// columns come from the named composite type (expanded at exec).
     pub of_type: Option<String>,
+    /// v2.26: `CREATE TABLE ... PARTITION OF parent ( <elements> )` —
+    /// the OptTypedTableElementList, built by
+    /// `build_partition_override_def` into a def whose columns are the
+    /// named parent columns (types are placeholders; the parent's
+    /// rowtype wins) and whose constraint fields carry the per-column
+    /// overrides plus any table-constraint elements. Merged into the
+    /// inherited def at exec (PG19 MergeAttributes). `None` when the
+    /// statement named no element list.
+    pub partition_overrides: Option<Box<TableDef>>,
 }
 
 /// v1.95: the command a row-level-security policy applies to
@@ -3135,7 +3168,11 @@ pub(crate) struct ParsedColDef {
 }
 
 pub(crate) enum ColCon {
-    NotNull,
+    /// v2.27: carries the explicit `CONSTRAINT name`, if any —
+    /// PG19 materializes a named not-null as a pg_constraint
+    /// record under that name; an unnamed one is flag-only here
+    /// (the catalog synthesizes `{table}_{col}_not_null`).
+    NotNull(Option<String>),
     /// v1.97: column-level `NOT NULL NO INHERIT` (PG19).
     NotNullNoInherit,
     Null,
@@ -3155,6 +3192,13 @@ pub(crate) enum ColCon {
         expr: Expr,
         stored: bool,
     },
+    /// v2.26: `GENERATED {ALWAYS|BY DEFAULT} AS IDENTITY [(seq opts)]`.
+    /// Identity columns are not implemented engine-wide; the variant
+    /// exists so each context can raise its own PG error (plain
+    /// CREATE TABLE: 0A000 "identity columns are not supported";
+    /// PARTITION OF element: 0A000 "identity columns are not supported
+    /// on partitions").
+    Identity,
 }
 
 pub(crate) enum ParsedTableCon {
@@ -3221,6 +3265,7 @@ impl ParsedFkTail {
             initially_deferred: self.initially_deferred,
             enforced: self.enforced,
             not_valid: self.not_valid,
+            is_local: true,
         }
     }
 }
@@ -3250,6 +3295,8 @@ impl TableDef {
             bit_typmods: Vec::new(),
             domain_elem: Vec::new(),
             not_null: Vec::new(),
+            nn_local: Vec::new(),
+            att_local: Vec::new(),
             defaults: Vec::new(),
             serial: Vec::new(),
             compression: Vec::new(),
@@ -3267,6 +3314,7 @@ impl TableDef {
             gen_cols: Vec::new(),
             collations: Vec::new(),
             unlogged: false,
+            partition_overrides: None,
         }
     }
 }
@@ -3407,6 +3455,7 @@ pub(crate) fn def_add_pkey(
         deferrable,
         initially_deferred,
         nulls_not_distinct: false,
+        is_local: true,
     });
     Ok(())
 }
@@ -3417,7 +3466,7 @@ pub(crate) fn def_add_unique(
     def: &mut TableDef,
     name: Option<String>,
     cols: &[String],
-    col: &str,
+    _col: &str,
     // v0.96: with `INHERITS`, columns may come from the parents; the
     // existence check is deferred to exec (see def_add_pkey).
     defer_col_check: bool,
@@ -3441,7 +3490,7 @@ pub(crate) fn def_add_unique(
             }
             n.clone()
         }
-        None => choose_auto_name(def, &format!("{}_{}_key", table, col)),
+        None => choose_auto_name(def, &format!("{}_{}_key", table, cols.join("_"))),
     };
     def.uniques.push(UniqueDef {
         name: cname,
@@ -3449,6 +3498,7 @@ pub(crate) fn def_add_unique(
         deferrable,
         initially_deferred,
         nulls_not_distinct,
+        is_local: true,
     });
     Ok(())
 }
@@ -3499,6 +3549,7 @@ pub(crate) fn def_add_check(
         kind: CheckKind::Check,
         no_inherit,
         enforced,
+        is_local: true,
     });
     Ok(())
 }
@@ -3610,7 +3661,36 @@ pub(crate) fn build_table_def(
                 }
                 for con in &c.cons {
                     match con {
-                        ColCon::NotNull => def.not_null[i] = true,
+                        ColCon::NotNull(cname) => {
+                            def.not_null[i] = true;
+                            // v2.27: an explicitly named column-level
+                            // NOT NULL materializes as a constraint
+                            // record under that name (PG19), so DROP
+                            // CONSTRAINT / pg_constraint see it.
+                            if let Some(n) = cname {
+                                if !def
+                                    .checks
+                                    .iter()
+                                    .any(|x| x.kind == CheckKind::NotNull && x.name == *n)
+                                {
+                                    def.checks.push(CheckDef {
+                                        name: n.clone(),
+                                        expr: Expr::IsNull {
+                                            expr: Box::new(Expr::Column {
+                                                table: None,
+                                                name: c.name.clone(),
+                                            }),
+                                            neg: true,
+                                        },
+                                        not_valid: false,
+                                        kind: CheckKind::NotNull,
+                                        no_inherit: false,
+                                        enforced: true,
+                                        is_local: true,
+                                    });
+                                }
+                            }
+                        }
                         ColCon::NotNullNoInherit => {
                             def.not_null[i] = true;
                             // v1.97: record the NO INHERIT not-null
@@ -3631,6 +3711,7 @@ pub(crate) fn build_table_def(
                                 kind: CheckKind::NotNull,
                                 no_inherit: true,
                                 enforced: true,
+                                is_local: true,
                             });
                         }
                         ColCon::Null => {
@@ -3697,6 +3778,16 @@ pub(crate) fn build_table_def(
                         // v2.03: generated column definition.
                         ColCon::Generated { expr, stored } => {
                             def.gen_cols[i] = Some((expr.clone(), *stored))
+                        }
+                        // v2.26: identity columns are not implemented;
+                        // plain CREATE TABLE keeps the engine's
+                        // standing 0A000 (the PARTITION OF builder
+                        // pre-scans and reports its own message).
+                        ColCon::Identity => {
+                            return Err(SqlError {
+                                message: "identity columns are not supported".to_string(),
+                                code: "0A000",
+                            });
                         }
                     }
                 }
@@ -3782,7 +3873,7 @@ pub(crate) fn build_table_def(
                                 if let TableItem::Col(c) = it {
                                     c.name == *col
                                         && c.cons.iter().any(|k| {
-                                            matches!(k, ColCon::NotNull | ColCon::PKey(..))
+                                            matches!(k, ColCon::NotNull(..) | ColCon::PKey(..))
                                         })
                                 } else {
                                     false
@@ -3809,7 +3900,37 @@ pub(crate) fn build_table_def(
                                 kind: CheckKind::NotNull,
                                 no_inherit: true,
                                 enforced: true,
+                                is_local: true,
                             });
+                        }
+                        // v2.27: an explicitly named table-level
+                        // NOT NULL materializes as a constraint
+                        // record under that name (PG19), like the
+                        // named column-level form.
+                        if !*no_inherit {
+                            if let Some(n) = con_name {
+                                if !def
+                                    .checks
+                                    .iter()
+                                    .any(|x| x.kind == CheckKind::NotNull && x.name == *n)
+                                {
+                                    def.checks.push(CheckDef {
+                                        name: n.clone(),
+                                        expr: Expr::IsNull {
+                                            expr: Box::new(Expr::Column {
+                                                table: None,
+                                                name: col.clone(),
+                                            }),
+                                            neg: true,
+                                        },
+                                        not_valid: false,
+                                        kind: CheckKind::NotNull,
+                                        no_inherit: false,
+                                        enforced: true,
+                                        is_local: true,
+                                    });
+                                }
+                            }
                         }
                         def.not_null[i] = true;
                     } else if inherits.is_empty() {
@@ -3854,7 +3975,42 @@ pub(crate) fn build_table_def(
     Ok(def)
 }
 
+/// v2.26: build the override def for a `PARTITION OF` element list
+/// (PG19 gram.y OptTypedTableElementList: columnOptions and
+/// TableConstraints naming PARENT columns; there are no type names).
+/// Reuses `build_table_def` with a non-empty placeholder `inherits`
+/// so every column-existence check defers to the exec merge against
+/// the parent's rowtype (and a table-constraint-only list is legal).
+/// The one context-specific rule applied here is PG19's blanket
+/// rejection of identity in a partition (parse_utilcmd.c
+/// transformCreateStmt): 0A000 "identity columns are not supported
+/// on partitions" — it precedes the MergeAttributes checks.
+pub(crate) fn build_partition_override_def(
+    table: &str,
+    items: Vec<TableItem>,
+) -> Result<TableDef, SqlError> {
+    for item in &items {
+        if let TableItem::Col(c) = item {
+            if c.cons.iter().any(|k| matches!(k, ColCon::Identity)) {
+                return Err(SqlError {
+                    message: "identity columns are not supported on partitions".to_string(),
+                    code: "0A000",
+                });
+            }
+        }
+    }
+    build_table_def(table, items, &[String::new()])
+}
+
 /// Collect `(qualifier, name)` of every column reference in an expression.
+/// v2.27: the single column a NOT NULL constraint expression
+/// (`col IS NOT NULL`) constrains, if the expression has that shape.
+pub fn check_expr_column(e: &Expr) -> Option<String> {
+    let mut refs = Vec::new();
+    collect_col_refs(e, &mut refs);
+    refs.into_iter().next().map(|(_, n)| n)
+}
+
 pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>) {
     match e {
         // v0.95: named args are transparent to inspection.

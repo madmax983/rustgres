@@ -5232,8 +5232,10 @@ fn txn_vacuum(
     // v0.11: VACUUM requires ownership (or superuser), like PostgreSQL.
     // The session role is the authenticated role. VACUUM runs outside
     // any transaction, so build a fresh snapshot from the live state.
+    let mut vacuum_active: Vec<u64> = guard.txns.active.iter().cloned().collect();
+    vacuum_active.sort_unstable();
     let snap = crate::storage::Snapshot {
-        active: guard.txns.active.iter().cloned().collect(),
+        active: vacuum_active,
         next_xid: guard.txns.next_xid,
     };
     let is_owner = |db: &crate::storage::Database, snap: &crate::storage::Snapshot, name: &str| {

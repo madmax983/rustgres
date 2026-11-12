@@ -5655,6 +5655,20 @@ pub struct Table {
     // --- v0.9: constraints ---
     /// Per-column NOT NULL flags (PRIMARY KEY implies NOT NULL).
     pub not_null: Vec<bool>,
+    /// v2.27: per-column not-null locality, parallel to `not_null`
+    /// (PG19 conislocal for the column's not-null constraint): true
+    /// when this table locally declared/added the not-null, false
+    /// when it exists only by inheritance. Maintained by the CREATE /
+    /// ALTER paths that change either vec; `nn_is_local` tolerates a
+    /// short vec. Persists via the constraints codec's (nnlocal ...)
+    /// section.
+    pub nn_local: Vec<bool>,
+    /// v2.27: per-column attribute locality (pg_attribute.attislocal)
+    /// parallel to `columns`: false = the column exists on this table
+    /// only by inheritance. PG19 semantics: a locally redeclared
+    /// (merged) INHERITS column stays local; partition children are
+    /// never local; DETACH / NO INHERIT / ONLY-parent drops localize.
+    pub att_local: Vec<bool>,
     /// Per-column DEFAULTs; None = no default.
     pub defaults: Vec<Option<DefaultExpr>>,
     pub checks: Vec<CheckDef>,
@@ -5771,6 +5785,8 @@ impl Table {
             created_xmin,
             dropped_xmax: 0,
             not_null: vec![false; n],
+            nn_local: vec![true; n],
+            att_local: vec![true; n],
             defaults: vec![None; n],
             checks: Vec::new(),
             uniques: Vec::new(),
@@ -5820,6 +5836,19 @@ impl Table {
             }
         }
         t.not_null = def.not_null.clone();
+        // v2.27: the def's nn_local when the merge maintained it
+        // (same length), else every not-null is local (plain CREATE).
+        t.nn_local = if def.nn_local.len() == def.not_null.len() {
+            def.nn_local.clone()
+        } else {
+            vec![true; def.not_null.len()]
+        };
+        // v2.27: same discipline for attribute locality.
+        t.att_local = if def.att_local.len() == def.columns.len() {
+            def.att_local.clone()
+        } else {
+            vec![true; def.columns.len()]
+        };
         t.defaults = def.defaults.clone();
         // v2.03: generated columns (LIKE-expanded defs may be shorter).
         if def.gen_cols.len() == t.columns.len() {
@@ -5871,6 +5900,62 @@ impl Table {
             self.col_collations.resize(i + 1, None);
         }
         self.col_collations[i] = coll;
+    }
+
+    /// v2.27: is column `i`'s not-null locally defined here?
+    /// Tolerant of a short `nn_local` vec (paths that do not maintain
+    /// it leave it empty): falls back to the not-null flag itself,
+    /// i.e. an unmaintained not-null reads as local, matching the
+    /// pre-v2.27 behaviour where inherited not-nulls could not be
+    /// distinguished.
+    pub fn nn_is_local(&self, i: usize) -> bool {
+        self.nn_local
+            .get(i)
+            .copied()
+            .unwrap_or_else(|| self.not_null.get(i).copied().unwrap_or(false))
+    }
+
+    /// v2.27: is column `i` locally defined (pg_attribute.attislocal)?
+    /// Tolerant of a short vec: unmaintained columns read as local,
+    /// matching pre-v2.27 behaviour.
+    pub fn att_is_local(&self, i: usize) -> bool {
+        self.att_local.get(i).copied().unwrap_or(true)
+    }
+
+    /// v2.27: set column `i`'s attribute locality, growing the vec
+    /// (seeded all-local) as needed.
+    pub fn set_att_local(&mut self, i: usize, local: bool) {
+        if self.att_local.len() < self.columns.len() {
+            self.att_local.resize(self.columns.len(), true);
+        }
+        if self.att_local.len() <= i {
+            self.att_local.resize(i + 1, true);
+        }
+        self.att_local[i] = local;
+    }
+
+    /// v2.27: set column `i`'s not-null locality, growing the vec
+    /// (seeded from the current flags) as needed.
+    pub fn set_nn_local(&mut self, i: usize, local: bool) {
+        if self.nn_local.len() < self.not_null.len() {
+            let mut v: Vec<bool> = self
+                .not_null
+                .iter()
+                .enumerate()
+                .map(|(j, n)| {
+                    if j < self.nn_local.len() {
+                        self.nn_local[j]
+                    } else {
+                        *n
+                    }
+                })
+                .collect();
+            std::mem::swap(&mut v, &mut self.nn_local);
+        }
+        if self.nn_local.len() <= i {
+            self.nn_local.resize(i + 1, true);
+        }
+        self.nn_local[i] = local;
     }
 
     /// Position of the row version with this id, if present (O(1)).
@@ -7345,8 +7430,10 @@ impl Database {
         // Fresh snapshot: everything committed as of now is visible.
         // `owns` are still in `active`; row_visible would accept our own
         // rows, so they are excluded explicitly by id below.
+        let mut active: Vec<u64> = txns.active.iter().copied().collect();
+        active.sort_unstable();
         let fresh = Snapshot {
-            active: txns.active.iter().copied().collect(),
+            active,
             next_xid: txns.next_xid,
         };
         // v0.22: temp tables are session-local — no concurrent transaction
@@ -7392,7 +7479,7 @@ impl Database {
 /// flat (one live definition per name at a time — enforced at commit).
 pub(crate) fn index_visible(def: &IndexDef, snap: &Snapshot, owns: &[u64]) -> bool {
     let created_ok = owns.contains(&def.created_xmin)
-        || (def.created_xmin < snap.next_xid && !snap.active.contains(&def.created_xmin));
+        || (def.created_xmin < snap.next_xid && !snap.is_active(def.created_xmin));
     if !created_ok {
         return false;
     }
@@ -7402,7 +7489,7 @@ pub(crate) fn index_visible(def: &IndexDef, snap: &Snapshot, owns: &[u64]) -> bo
     if owns.contains(&def.dropped_xmax) {
         return false;
     }
-    !(def.dropped_xmax < snap.next_xid && !snap.active.contains(&def.dropped_xmax))
+    !(def.dropped_xmax < snap.next_xid && !snap.is_active(def.dropped_xmax))
 }
 
 /// Per-column statistics from ANALYZE (v0.8).
@@ -7484,6 +7571,20 @@ pub struct TableStats {
 pub struct Snapshot {
     pub active: Vec<u64>,
     pub next_xid: u64,
+}
+
+impl Snapshot {
+    /// Was `xid` active (BEGIN'd but not yet committed/aborted) when this
+    /// snapshot was taken? `active` is kept sorted by every constructor
+    /// below, so this is `O(log active.len())` instead of the `O(active.len())`
+    /// a plain `active.contains(&xid)` scan costs on every visibility check
+    /// (`row_visible`/`table_visible`/etc.) for every row — a cost that
+    /// scales with the number of *other* connections currently idle in an
+    /// open transaction (see benches/profile_snapshot_active.py).
+    #[inline]
+    fn is_active(&self, xid: u64) -> bool {
+        self.active.binary_search(&xid).is_ok()
+    }
 }
 
 /// Global transaction state, kept beside the database inside [`Engine`].
@@ -7938,7 +8039,7 @@ pub fn version_dead_to_all(txns: &TxnManager, v: &RowVersion) -> bool {
     // version that exists). Dead unless some active snapshot predates
     // the deleter's commit and could still see the old version.
     for snap in txns.snapshots.values() {
-        if !(v.xmax < snap.next_xid && !snap.active.contains(&v.xmax)) {
+        if !(v.xmax < snap.next_xid && !snap.is_active(v.xmax)) {
             return false;
         }
     }
@@ -7950,8 +8051,7 @@ pub fn row_visible(v: &RowVersion, snap: &Snapshot, owns: &[u64]) -> bool {
     // v1.21: `owns` is every xid owned by the reading transaction (top +
     // sub-xids). A transaction sees its own sub-xid rows even when the
     // snapshot predates the sub-xid allocation (RepeatableRead).
-    let xmin_ok =
-        owns.contains(&v.xmin) || (v.xmin < snap.next_xid && !snap.active.contains(&v.xmin));
+    let xmin_ok = owns.contains(&v.xmin) || (v.xmin < snap.next_xid && !snap.is_active(v.xmin));
     if !xmin_ok {
         return false;
     }
@@ -7961,13 +8061,13 @@ pub fn row_visible(v: &RowVersion, snap: &Snapshot, owns: &[u64]) -> bool {
     if owns.contains(&v.xmax) {
         return false;
     }
-    !(v.xmax < snap.next_xid && !snap.active.contains(&v.xmax))
+    !(v.xmax < snap.next_xid && !snap.is_active(v.xmax))
 }
 
 /// Table-version visibility for (`snap`, `owns`).
 pub fn table_visible(t: &Table, snap: &Snapshot, owns: &[u64]) -> bool {
     let created_ok = owns.contains(&t.created_xmin)
-        || (t.created_xmin < snap.next_xid && !snap.active.contains(&t.created_xmin));
+        || (t.created_xmin < snap.next_xid && !snap.is_active(t.created_xmin));
     if !created_ok {
         return false;
     }
@@ -7977,13 +8077,13 @@ pub fn table_visible(t: &Table, snap: &Snapshot, owns: &[u64]) -> bool {
     if owns.contains(&t.dropped_xmax) {
         return false;
     }
-    !(t.dropped_xmax < snap.next_xid && !snap.active.contains(&t.dropped_xmax))
+    !(t.dropped_xmax < snap.next_xid && !snap.is_active(t.dropped_xmax))
 }
 
 /// Visibility for view versions (v0.9): same rules as tables.
 pub fn view_visible(v: &ViewDef, snap: &Snapshot, own: u64) -> bool {
     let created_ok = v.created_xmin == own
-        || (v.created_xmin < snap.next_xid && !snap.active.contains(&v.created_xmin));
+        || (v.created_xmin < snap.next_xid && !snap.is_active(v.created_xmin));
     if !created_ok {
         return false;
     }
@@ -7993,13 +8093,13 @@ pub fn view_visible(v: &ViewDef, snap: &Snapshot, own: u64) -> bool {
     if v.dropped_xmax == own {
         return false;
     }
-    !(v.dropped_xmax < snap.next_xid && !snap.active.contains(&v.dropped_xmax))
+    !(v.dropped_xmax < snap.next_xid && !snap.is_active(v.dropped_xmax))
 }
 
 /// Visibility for sequence versions (v0.9): same rules as tables.
 pub fn seq_visible(s: &Sequence, snap: &Snapshot, own: u64) -> bool {
     let created_ok = s.created_xmin == own
-        || (s.created_xmin < snap.next_xid && !snap.active.contains(&s.created_xmin));
+        || (s.created_xmin < snap.next_xid && !snap.is_active(s.created_xmin));
     if !created_ok {
         return false;
     }
@@ -8009,13 +8109,13 @@ pub fn seq_visible(s: &Sequence, snap: &Snapshot, own: u64) -> bool {
     if s.dropped_xmax == own {
         return false;
     }
-    !(s.dropped_xmax < snap.next_xid && !snap.active.contains(&s.dropped_xmax))
+    !(s.dropped_xmax < snap.next_xid && !snap.is_active(s.dropped_xmax))
 }
 
 /// Visibility for role versions (v0.11): same rules as tables.
 pub fn role_visible(r: &Role, snap: &Snapshot, own: u64) -> bool {
     let created_ok = r.created_xmin == own
-        || (r.created_xmin < snap.next_xid && !snap.active.contains(&r.created_xmin));
+        || (r.created_xmin < snap.next_xid && !snap.is_active(r.created_xmin));
     if !created_ok {
         return false;
     }
@@ -8025,7 +8125,7 @@ pub fn role_visible(r: &Role, snap: &Snapshot, own: u64) -> bool {
     if r.dropped_xmax == own {
         return false;
     }
-    !(r.dropped_xmax < snap.next_xid && !snap.active.contains(&r.dropped_xmax))
+    !(r.dropped_xmax < snap.next_xid && !snap.is_active(r.dropped_xmax))
 }
 
 // ---------------------------------------------------------------------------
@@ -9584,10 +9684,9 @@ mod tests {
     }
 
     fn snap(active: &[u64], next_xid: u64) -> Snapshot {
-        Snapshot {
-            active: active.to_vec(),
-            next_xid,
-        }
+        let mut active = active.to_vec();
+        active.sort_unstable();
+        Snapshot { active, next_xid }
     }
 
     #[test]

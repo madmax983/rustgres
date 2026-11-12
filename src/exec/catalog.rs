@@ -158,6 +158,10 @@ pub(crate) fn pg_attribute_schema() -> Vec<QCol> {
         ("attrelid", ColType::Int),
         ("attname", ColType::Text),
         ("attnum", ColType::Int),
+        // v2.27: appended (bounded subset stays bounded: attnotnull
+        // and friends still raise "column does not exist").
+        ("attislocal", ColType::Bool),
+        ("attinhcount", ColType::SmallInt),
     ]
     .into_iter()
     .map(|(n, ty)| QCol {
@@ -188,6 +192,11 @@ pub(crate) fn pg_attribute_scan(
             continue;
         };
         for (i, (col_name, _)) in t.columns.iter().enumerate() {
+            // v2.27: attinhcount is derived (direct parents carrying
+            // the column); attislocal is its zero test (PG19).
+            let inh = super::locality::att_inhcount(db, snap, &[own], session, t, col_name);
+            // attislocal is the stored local-definition bit (a
+            // merged INHERITS column stays local in PG19).
             rows.push(QRow {
                 cells: Row::new(vec![
                     Value::Int(t.oid as i64),
@@ -195,6 +204,8 @@ pub(crate) fn pg_attribute_scan(
                     // v1.41: the real PG attnum (never reused after
                     // DROP), not the 1-based column position.
                     Value::Int(t.attnums.get(i).copied().unwrap_or(i as i16 + 1) as i64),
+                    Value::Bool(t.att_is_local(i)),
+                    Value::Int(inh),
                 ]),
                 prov: Vec::new(),
             });
@@ -5027,6 +5038,12 @@ pub(crate) fn pg_constraint_schema() -> Vec<QCol> {
         ("confmatchtype", ColType::SingleChar),
         ("conkey", ColType::Array(ArrayElem::Int)),
         ("confkey", ColType::Array(ArrayElem::Int)),
+        // v2.27: appended locality columns (existing indices, e.g.
+        // conrelid at 8, are unchanged).
+        ("conislocal", ColType::Bool),
+        ("coninhcount", ColType::SmallInt),
+        ("connoinherit", ColType::Bool),
+        ("conbin", ColType::Text),
     ]
     .into_iter()
     .map(|(n, ty)| QCol {
@@ -5056,6 +5073,9 @@ pub(crate) fn pg_constraint_scan(
 ) -> (Vec<QCol>, Vec<QRow>) {
     let schema = pg_constraint_schema();
     let mut rows = Vec::new();
+    // v2.27: (table name, constraint reference) per emitted row, for
+    // the conparentid second pass below.
+    let mut meta: Vec<(String, super::locality::ConRef)> = Vec::new();
     let mut names: Vec<&String> = db.tables.keys().collect();
     names.sort();
     if let Some(tmps) = db.temp_tables.get(&session) {
@@ -5083,15 +5103,30 @@ pub(crate) fn pg_constraint_scan(
             continue;
         };
         let relid = Value::Int(t.oid as i64);
+        // v2.27: locality triple for one constraint reference:
+        // (conislocal, coninhcount, conbin text for CHECK-like rows).
+        let loc =
+            |r: &super::locality::ConRef, bin: Option<String>| -> (bool, i64, Option<String>) {
+                (
+                    super::locality::con_is_local(db, snap, &[own], session, t, r),
+                    super::locality::con_inhcount(db, snap, &[own], session, t, r),
+                    bin,
+                )
+            };
         // v2.07: the builder takes (condeferrable, condeferred) too —
-        // UNIQUE/PK rows now report their real stored flags.
+        // UNIQUE/PK rows now report their real stored flags. v2.27:
+        // and the locality tail (conislocal, coninhcount,
+        // connoinherit, conbin); conparentid is filled by the second
+        // pass (placeholder 0 here).
         let plain = |contype: u8,
                      cname: &str,
                      deferrable: bool,
                      deferred: bool,
                      enforced: bool,
                      validated: bool,
-                     conkey: Vec<i64>|
+                     conkey: Vec<i64>,
+                     lc: (bool, i64, Option<String>),
+                     noinherit: bool|
          -> Vec<Value> {
             vec![
                 Value::text(cname),
@@ -5111,9 +5146,18 @@ pub(crate) fn pg_constraint_scan(
                 Value::SingleChar(b's'),
                 int_array(conkey),
                 Value::Null,
+                Value::Bool(lc.0),
+                Value::Int(lc.1),
+                Value::Bool(noinherit),
+                match lc.2 {
+                    Some(b) => Value::text(b),
+                    None => Value::Null,
+                },
             ]
         };
         if let Some(pk) = &t.pkey {
+            let r = super::locality::ConRef::PKey(pk.cols.clone());
+            let lc = loc(&r, None);
             rows.push(mk(plain(
                 b'p',
                 &pk.name,
@@ -5122,9 +5166,14 @@ pub(crate) fn pg_constraint_scan(
                 true,
                 true,
                 attnums(t, &pk.cols),
+                lc,
+                false,
             )));
+            meta.push((name.to_string(), r));
         }
         for u in &t.uniques {
+            let r = super::locality::ConRef::Unique(u.cols.clone());
+            let lc = loc(&r, None);
             rows.push(mk(plain(
                 b'u',
                 &u.name,
@@ -5133,12 +5182,31 @@ pub(crate) fn pg_constraint_scan(
                 true,
                 true,
                 attnums(t, &u.cols),
+                lc,
+                false,
             )));
+            meta.push((name.to_string(), r));
         }
         for c in &t.checks {
             let contype = match c.kind {
                 crate::sql::CheckKind::Check => b'c',
                 crate::sql::CheckKind::NotNull => b'n',
+            };
+            let r = super::locality::ConRef::of_check(c);
+            // v2.27: CHECK rows carry the deparsed expression in
+            // conbin (pg_get_expr is the identity in this engine);
+            // NOT NULL rows carry theirs too (PG19). Their conkey is
+            // the column attnum; plain CHECK conkey stays empty.
+            let bin = Some(format!(
+                "({})",
+                crate::exec::publication::deparse_filter(&c.expr)
+            ));
+            let lc = loc(&r, bin);
+            let conkey = match c.kind {
+                crate::sql::CheckKind::NotNull => crate::sql::check_expr_column(&c.expr)
+                    .map(|col| attnums(t, &[col]))
+                    .unwrap_or_default(),
+                crate::sql::CheckKind::Check => Vec::new(),
             };
             rows.push(mk(plain(
                 contype,
@@ -5147,8 +5215,52 @@ pub(crate) fn pg_constraint_scan(
                 false,
                 c.enforced,
                 !c.not_valid,
-                Vec::new(),
+                conkey,
+                lc,
+                c.no_inherit,
             )));
+            meta.push((name.to_string(), r));
+        }
+        // v2.27: NOT NULL rows for flag-only columns (no named
+        // NotNull CheckDef) — PG19 has a pg_constraint 'n' row for
+        // EVERY not-null column, named <table>_<column>_not_null.
+        for (i, (col_name, _)) in t.columns.iter().enumerate() {
+            if !t.not_null.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let covered = t.checks.iter().any(|c| {
+                c.kind == crate::sql::CheckKind::NotNull
+                    && crate::sql::check_expr_column(&c.expr).as_deref() == Some(col_name.as_str())
+            });
+            if covered {
+                continue;
+            }
+            let r = super::locality::ConRef::NotNull(col_name.clone());
+            let expr = crate::sql::Expr::IsNull {
+                expr: Box::new(crate::sql::Expr::Column {
+                    table: None,
+                    name: col_name.clone(),
+                }),
+                neg: true,
+            };
+            let bin = Some(format!(
+                "({})",
+                crate::exec::publication::deparse_filter(&expr)
+            ));
+            let lc = loc(&r, bin);
+            let bare = name.rsplit('.').next().unwrap_or(name);
+            rows.push(mk(plain(
+                b'n',
+                &format!("{}_{}_not_null", bare, col_name),
+                false,
+                false,
+                true,
+                true,
+                attnums(t, &[col_name.clone()]),
+                lc,
+                false,
+            )));
+            meta.push((name.to_string(), r));
         }
         // v2.09: a pure constraint trigger (no same-named stored
         // constraint) gets a contype-'t' pg_constraint row, like PG
@@ -5190,7 +5302,15 @@ pub(crate) fn pg_constraint_scan(
                 Value::SingleChar(b's'),
                 int_array(Vec::new()),
                 Value::Null,
+                Value::Bool(true),
+                Value::Int(0),
+                Value::Bool(false),
+                Value::Null,
             ]));
+            meta.push((
+                name.to_string(),
+                super::locality::ConRef::Check(tr.name.clone()),
+            ));
         }
         for f in &t.fks {
             let (confrelid, confkey) = match db.find_table(&f.ref_table, snap, &[own], session) {
@@ -5204,6 +5324,8 @@ pub(crate) fn pg_constraint_scan(
                 }
                 None => (0, Value::Null),
             };
+            let r = super::locality::ConRef::Fk(f.cols.clone(), f.ref_table.clone());
+            let lc = loc(&r, None);
             rows.push(mk(vec![
                 Value::text(f.name.clone()),
                 Value::Int(2200),
@@ -5222,7 +5344,73 @@ pub(crate) fn pg_constraint_scan(
                 Value::SingleChar(if f.match_full { b'f' } else { b's' }),
                 int_array(attnums(t, &f.cols)),
                 confkey,
+                Value::Bool(lc.0),
+                Value::Int(lc.1),
+                Value::Bool(false),
+                Value::Null,
             ]));
+            meta.push((name.to_string(), r));
+        }
+    }
+    // v2.27: conparentid second pass — a partition child's row points
+    // at the matching constraint row on its partition parent (plain
+    // INHERITS links stay 0, as in PG19). Parent rows are located by
+    // stored name, or (for not-null) by column.
+    let snapshot: Vec<(String, super::locality::ConRef, i64, i64)> = meta
+        .iter()
+        .enumerate()
+        .map(|(i, (tn, r))| {
+            let oid = match &rows[i].cells[0] {
+                Value::Int(v) => *v,
+                _ => 0,
+            };
+            let relid = match &rows[i].cells[8] {
+                Value::Int(v) => *v,
+                _ => 0,
+            };
+            (tn.clone(), r.clone(), oid, relid)
+        })
+        .collect();
+    for i in 0..meta.len() {
+        let (tname, r) = &meta[i];
+        let Some(t) = db.find_table(tname, snap, &[own], session) else {
+            continue;
+        };
+        let Some(pname) = t.partition.as_ref().and_then(|p| p.parent.clone()) else {
+            continue;
+        };
+        let Some(pt) = db.find_table(&pname, snap, &[own], session) else {
+            continue;
+        };
+        if !super::locality::parent_carries(pt, r, true) {
+            continue;
+        }
+        let parent_oid = snapshot.iter().find_map(|(tn, pr, oid, relid)| {
+            if tn != &pname || *relid != pt.oid as i64 {
+                return None;
+            }
+            let name_match =
+                super::locality::con_stored_name(pt, pr) == super::locality::con_stored_name(pt, r);
+            let nn_match = matches!(
+                (pr, r),
+                (
+                    super::locality::ConRef::NotNull(a),
+                    super::locality::ConRef::NotNull(b)
+                ) if a == b
+            );
+            let shape_match = pr == r;
+            if name_match || nn_match || shape_match {
+                Some(*oid)
+            } else {
+                None
+            }
+        });
+        if let Some(po) = parent_oid {
+            if po != 0 {
+                let mut cells: Vec<Value> = rows[i].cells.iter().cloned().collect();
+                cells[12] = Value::Int(po);
+                rows[i].cells = Row::new(cells);
+            }
         }
     }
     (schema, rows)

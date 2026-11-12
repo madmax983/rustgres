@@ -535,6 +535,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             match crate::sql::decode_constraints(constraints) {
                 Ok(dc) => {
                     t.not_null = dc.not_null;
+                    t.nn_local = dc.nn_local.clone();
+                    t.att_local = dc.att_local.clone();
                     t.defaults = dc.defaults;
                     t.checks = dc.checks;
                     t.uniques = dc.uniques;
@@ -851,6 +853,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             match crate::sql::decode_constraints(constraints) {
                 Ok(dc) => {
                     t.not_null = dc.not_null;
+                    t.nn_local = dc.nn_local.clone();
+                    t.att_local = dc.att_local.clone();
                     t.defaults = dc.defaults;
                     t.checks = dc.checks;
                     t.uniques = dc.uniques;
@@ -2072,11 +2076,25 @@ pub fn records_for_commit(
                 // TABLE ... DROP COLUMN shifts positions this way). That drop
                 // must reach the WAL ahead of the row rewrite, or replay
                 // indexes the rewritten rows through the stale definition.
-                let won = eng
-                    .db
-                    .indexes
-                    .get(name)
-                    .is_some_and(|ix| ix.def.dropped_xmax == own || ix.def.created_xmin == own);
+                // v2.26: an ABSENT entry is also ours to log. ALTER
+                // TABLE ... DROP COLUMN removes a dropped constraint's
+                // backing index from the map outright (alter.rs v0.9
+                // path) instead of marking it, so the ownership probe
+                // below found nothing and the drop never reached the
+                // WAL: crash recovery resurrected the index (created
+                // by an earlier committed CreateIndex) as live, and a
+                // later checkpoint paired the live index with its
+                // dropped table — which startup recovery refuses
+                // ("no live version of table"). A concurrent winner
+                // still shows up as a present entry owned by another
+                // xid (marked, not removed), so absence here means
+                // this transaction's own outright removal. A
+                // duplicate DropIndex record is harmless at replay
+                // (the handler just re-marks the entry).
+                let won = match eng.db.indexes.get(name) {
+                    Some(ix) => ix.def.dropped_xmax == own || ix.def.created_xmin == own,
+                    None => true,
+                };
                 if !won {
                     i += 1;
                     continue; // overwritten by a concurrent drop; theirs wins
