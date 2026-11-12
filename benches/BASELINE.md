@@ -2,6 +2,104 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: binary-search `Snapshot.active` instead of linear-scanning it — fix — 2026-11-12
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/storage.rs`: added `Snapshot::is_active(&self, xid: u64) -> bool`,
+a `self.active.binary_search(&xid).is_ok()` one-liner, and switched
+every `snap.active.contains(&xid)` read site (13 total: `index_visible`
+x2, `version_dead_to_all`, `row_visible` x2, `table_visible` x2,
+`view_visible`, `seq_visible`, `role_visible` — each arm's created/
+dropped xmin/xmax check) to call it. `binary_search` on an unsorted
+slice is silently wrong (it can return either answer for a key that's
+actually absent, depending where the scan happens to land), so this is
+only safe because *every* `Snapshot` is now guaranteed sorted:
+
+- `Engine::take_snapshot` already sorted (`active.sort_unstable()`) —
+  unchanged.
+- `committed_unique_violation`'s fresh commit-time-recheck snapshot and
+  `server.rs::txn_vacuum`'s pre-VACUUM snapshot both built `active` by
+  collecting `TxnManager::active` (a `HashSet`, unordered iteration)
+  straight into the `Vec` with no sort. Both now sort right after the
+  collect, before constructing the `Snapshot`.
+- The `storage.rs` test helper `snap(active: &[u64], next_xid: u64)`
+  now sorts its input too, so no test can construct an unsorted
+  `Snapshot` and silently drift from the invariant other code now
+  relies on.
+
+No visibility rule changes: `binary_search(&xid).is_ok()` returns
+exactly the same `true`/`false` as `contains(&xid)` for any sorted
+slice — this is a pure algorithmic substitution (`O(k)` → `O(log k)`
+per check, `k` = concurrently active transactions), not a behavior
+change. `is_active` is a private method (every call site is already
+inside `storage.rs`); `txns.active.contains(..)` (the `HashSet` itself,
+already `O(1)`, 4 call sites in `storage.rs`/`exec/dml.rs`) is
+untouched — only the `Snapshot.active: Vec<u64>` reads moved.
+
+### Measurement (after fix)
+
+Same harness (`benches/profile_snapshot_active.py --rows 2000 --count
+10`), same four `--idle-txns` sizes, same machine, same session.
+
+Callgrind `Ir` (`--collect-jumps=yes --cache-sim=yes`):
+
+| `--idle-txns` | before | after | delta |
+|---|---|---|---|
+| 0 | 350,881,859 | 344,110,042 (avg of 344,113,550 / 344,106,533) | **-1.93%** |
+| 50 | 606,308,714 | 520,266,398 | **-14.19%** |
+| 100 | 869,931,414 | 694,585,372 | **-20.16%** |
+| 200 | 1,432,822,897 (avg) | 1,068,729,897 (avg of 1,068,484,342 / 1,068,975,451) | **-25.42%** |
+
+Reproducibility at the two endpoints (two independent runs each, same
+binary): `--idle-txns 0` after-fix pair agrees to 0.002%; `--idle-txns
+200` before-fix pair agrees to 0.028% and after-fix pair to 0.046% —
+all three to four orders of magnitude tighter than the smallest
+reported delta (1.93%), so every row in the table above is signal, not
+noise.
+
+The **-1.93%** at `--idle-txns 0` — where `active` is empty either way
+and `contains`/`binary_search` are both trivially `O(1)` — shows this
+fix has a small fixed per-call saving independent of `k` too (plausibly
+fewer debug-build bounds/UB-check instrumentation sites on
+`binary_search`'s code path than on `contains`'s `Iterator::fold`-based
+one). Isolating the `k`-dependent term by subtracting that fixed
+per-call delta: the pre-fix marginal cost per idle connection was
+5.11M-5.41M `Ir` (baseline entry); post-fix it is 3.50M-3.74M `Ir`
+(e.g. `(520,266,398-344,110,042)/50 = 3.52M`). The difference,
+~1.6-1.9M `Ir` saved per idle connection, is this fix's share; the
+remaining ~3.5M `Ir`/connection is `BEGIN`'s own inherent
+handshake/parse/`begin_txn` cost, which this change does not touch and
+does not claim to reduce — only the visibility-check scan is in scope
+here.
+
+The whole-workload delta at `--idle-txns 200` (**-25.42%**) is larger
+than the pre-fix self-cost share attributed to
+`SliceContains::slice_contains` alone (15.53%, baseline entry) because
+self-cost excludes the knock-on icache/dcache cost of repeatedly
+walking a 200-element `Vec` versus a ≤8-step binary search — expected,
+and the direct before/after delta (not the self-cost breakdown) is the
+authoritative number for the impact-floor check.
+
+Both clear the ≥5%-of-profile relevance bar and the ≥5%-`Ir`-reduction
+impact floor at every `--idle-txns` size from 50 up, by a wide margin
+at realistic idle-connection counts (14-25%).
+
+`cargo test --all-features`: 1365/1365 passed, same as the pre-fix
+tree. `cargo fmt --all -- --check`: clean. `cargo clippy --all-targets
+--all-features -- -D warnings`: 1300 errors on both the pre-fix and
+post-fix tree (confirmed via `git stash`, compared by count) — the
+same toolchain/lint-version mismatch noted in every prior Bolt round in
+this file; zero new errors from this diff.
+
+**Reproduce**: check out the parent (baseline) commit, `cargo build`,
+repeat the baseline entry's reproduce command at `--idle-txns 0`, `50`,
+`100`, `200` for the before numbers; check out this commit, `cargo
+build`, repeat for the after numbers.
+
 ## Bolt: `row_visible`/`table_visible`/etc. linear-scan `Snapshot.active` per check, costing more as other connections sit idle in an open transaction — baseline — 2026-11-12
 
 **Why this workload**: every prior Bolt round in this file drove its
