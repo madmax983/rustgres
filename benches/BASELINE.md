@@ -2,6 +2,114 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `row_visible`/`table_visible`/etc. linear-scan `Snapshot.active` per check, costing more as other connections sit idle in an open transaction — baseline — 2026-11-12
+
+**Why this workload**: every prior Bolt round in this file drove its
+workload through exactly one connection. `src/storage.rs`'s MVCC
+visibility family (`row_visible`, `table_visible`, `index_visible`,
+`view_visible`, `seq_visible`, `role_visible`, plus
+`version_dead_to_all`) each test `snap.active.contains(&xid)` —
+`Snapshot.active: Vec<u64>` is the list of xids that were active
+(`BEGIN`'d but not yet committed/aborted) when the snapshot was taken,
+and `Vec::contains` is a linear scan. With one connection, `active`
+holds 0-1 entries for the whole session and this scan is free; no
+prior round varied the number of *other, concurrently open*
+transactions, so this cost was never exercised.
+
+That is not a synthetic case: a connection-pooled app (PgBouncer in
+session mode, an ORM that opens a transaction per request and holds it
+across other work, a long-running report, a forgotten interactive
+`BEGIN`) routinely has tens to hundreds of sessions idle mid-transaction
+while other sessions keep issuing ordinary queries — every one of
+which re-pays this scan on every row it reads, scaled by however many
+other transactions happen to be open at that moment.
+
+New harness `benches/profile_snapshot_active.py`: opens `--idle-txns`
+separate connections, sends a bare `BEGIN` on each over the real wire
+protocol (the same `txn_begin` → `Engine::begin_txn` path any client's
+`BEGIN` takes, registering the xid in `TxnManager::active`) and leaves
+them open — blocked on `recv`, never committing — then runs the real,
+measured workload (`--count` iterations of `SELECT * FROM bench_snap`
+over a `--rows`-row table) on one further, separate connection. Each
+idle connection's `BEGIN` completes synchronously before the next one
+opens and before the measured phase starts, so by the time the
+workload runs, the idle connections are parked on a blocking `recv`
+with nothing pending — not runnable, not scheduled, contributing no
+further instructions during the measured phase. Reproduced twice at
+`--idle-txns 0` and `--idle-txns 200`: both pairs agree to within
+0.03%-0.12%, i.e. this multi-connection harness is deterministic enough
+to gate on, like every single-connection harness already in this file.
+
+**Reproduce** (one size; the asymptotic table below repeats this at
+four `--idle-txns` sizes):
+```bash
+cargo build
+DATADIR=$(mktemp -d) RUSTGRES_DATA_DIR="$DATADIR" \
+  valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out \
+  --collect-jumps=yes --cache-sim=yes ./target/debug/rustgres --port 5433 &
+python3 benches/profile_snapshot_active.py --rows 2000 --count 10 --idle-txns 200
+kill -TERM %1   # SIGTERM flushes callgrind's output
+callgrind_annotate --auto=no /tmp/cg.out | head -40
+```
+
+**Profile** (Callgrind, valgrind 3.22.0, pre-fix, `--rows 2000 --count 10
+--idle-txns 200`): **1,432,822,897** total `Ir` (average of two runs,
+1,432,623,911 and 1,433,021,882 — 0.028% apart). Summing every
+`callgrind_annotate` line whose symbol resolves through
+`<u64 as core::slice::cmp::SliceContains>::slice_contains` (the
+generic body `Vec<u64>::contains` compiles to, covering both
+`snap.active.contains(..)` and the much smaller `owns.contains(..)`
+checks that share the same generic instantiation):
+
+| self-cost group | Ir | % of total |
+|---|---|---|
+| `SliceContains::slice_contains` and its `Iterator::fold`/`any` callers | 222,466,280 | **15.53%** |
+
+Comfortably past the 5%-of-profile floor on self-cost alone — and
+self-cost understates the full effect, since it excludes the knock-on
+icache/dcache cost of walking a growing `Vec` repeatedly (see the fix
+entry's larger whole-workload delta).
+
+**Hypothesis**: `take_snapshot` (`src/storage.rs`) already sorts
+`active` (`active.sort_unstable()`) before building the `Snapshot`, and
+two more call sites (`committed_unique_violation`'s commit-time
+recheck, and `txn_vacuum`'s pre-VACUUM snapshot) build one too, from
+the same `TxnManager::active` `HashSet` — currently *without* sorting.
+Once every construction site is made to sort (a cheap, one-time
+`O(k log k)` cost already paid by the common path), every read site's
+`snap.active.contains(&xid)` can become a `binary_search`, turning each
+visibility check from `O(k)` (`k` = concurrently active transactions)
+into `O(log k)` — the same mechanism this file has already used twice
+for row/table versions (`row_pos`'s `O(1)` index, `table_visible`'s
+still-open quadratic-version-count finding two entries above this one)
+applied to the *transaction* axis instead of the row/version axis.
+
+**Asymptotic confirmation** (4 sizes, same harness, same machine, same
+session, fresh data directory per run):
+
+| `--idle-txns` | total `Ir` (pre-fix) |
+|---|---|
+| 0 | 350,881,859 (avg of 351,083,104 / 350,680,613) |
+| 50 | 606,308,714 |
+| 100 | 869,931,414 |
+| 200 | 1,432,822,897 (avg of 1,432,623,911 / 1,433,021,882) |
+
+Marginal `Ir` per additional idle connection (slope between
+consecutive sizes) rises from 5.11M (0→50) to 5.19M (50→100) to 5.41M
+(100→200, computed against the 0-point) — consistent with a per-row
+`O(k)` scan term riding on top of the connections' own inherent,
+`k`-independent-but-additive setup cost (`BEGIN`'s handshake/parse/
+`begin_txn`, unaffected by this fix and still present after it — see
+the fix entry for the decomposition).
+
+`cargo test --all-features`: 1365/1365 passed (pre-fix tree). `cargo
+fmt --all -- --check`: clean.
+
+**Reproduce the 4-size table**: repeat the single-size reproduce
+command above with `--idle-txns 0`, `50`, `100`, `200` against fresh
+data directories, each run its own server process on the same port
+(stop/restart between sizes).
+
 ## Bolt: `commit_table_version` never prunes dead schema versions, making `find_table`/`table_visible` cost grow ~quadratically with ALTERs against one table — finding, no fix — 2026-11-11
 
 Full writeup with profile tables and reproduction commands: #75
