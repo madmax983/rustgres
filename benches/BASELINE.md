@@ -2,6 +2,174 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `find_partition_leaf` clones the matched child's `PartitionInfo`/`columns` even when the match is an ordinary leaf — fix — 2026-11-13
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec/partition.rs`: in `find_partition_leaf`'s matched-candidate
+branch, moved the `cinfo_ref.children.is_empty()` check (and its two
+outcomes — the 23514 error for a childless *partitioned* table, and
+the ordinary `Ok(child_name.clone())` return) ahead of the second
+`find_table`/`.clone()` pair. Both clones (`child.partition.clone()`,
+`child.columns.clone()`) now happen only in the recursion branch,
+where they are actually used — the recursive call takes `&mut
+Engine`, so it needs owned data once the borrow from the first
+`find_table` call ends; the common case (an ordinary, non-further-
+partitioned leaf) returns straight from the existing `cinfo_ref`
+borrow with no second lookup and no clone at all. Behavior is
+unchanged: the `is_empty()`/`is_partitioned` checks read the identical
+fields off `cinfo_ref` that they previously read off the clone
+`cinfo`, and the error message/`Ok` value are byte-identical. Every
+other partition method (RANGE/LIST, and multi-level HASH where the
+match genuinely does have children of its own) takes the unchanged
+recursion path, unaffected by this reordering.
+
+### Measurement
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes`),
+direct `valgrind` invocation (see note in the baseline entry below on
+why, not the harness's own `--keep-log`), 2000-row `INSERT INTO
+bench_hashpart SELECT ... PARTITION BY HASH (a, b)` with 4 flat
+`MODULUS 4` leaves (the harness's `--variant hash`):
+
+| metric | before | after | delta |
+|---|---|---|---|
+| Ir (callgrind, avg of 3 runs before / 3 runs after) | 190,868,810 | 178,637,931 | **-6.41%** |
+| dhat total bytes (lifetime sum over the dhat JSON's `pps`) | 9,214,674 | 8,232,674 | **-10.66%** |
+| dhat total blocks (allocations, same sum) | 94,174 | 82,174 | **-12.74%** |
+
+Reproducibility: the three before-runs (190,885,785 / 190,853,661 /
+190,866,984) and three after-runs (178,652,925 / 178,618,925 /
+178,641,942) each agree to within 0.02% — three orders of magnitude
+tighter than the smallest reported delta (6.41%), so every row above
+is signal.
+
+`callgrind_annotate --inclusive=yes` on the after profile:
+`route_partition_inserts`'s inclusive share drops from 31.85% to
+27.15% of (a now smaller) workload total; `find_partition_leaf`'s
+drops from 20.91% to 15.46%.
+
+Clears the impact floor on both counters independently (Ir ≥5%,
+allocations ≥10%).
+
+`cargo test --all-features`: 1365/1365 passed, unchanged from the
+pre-fix tree. `cargo fmt --all -- --check`: clean. `cargo clippy
+--all-targets --all-features -- -D warnings`: 1300 errors on both the
+pre-fix and post-fix tree (same pre-existing toolchain/lint-version
+mismatch noted in every prior Bolt round in this file; confirmed via
+`git stash` + error-count comparison) — zero new errors from this
+diff.
+
+**Reproduce** (one run; repeat at the parent commit for the before
+numbers):
+```bash
+cargo build
+python3 benches/profile_hash_partition_insert.py --tool callgrind --rows 2000 --variant hash
+python3 benches/profile_hash_partition_insert.py --tool dhat --rows 2000 --variant hash
+```
+For a clean saved profile to run `callgrind_annotate` against (the
+harness's `--keep-log` collides `--log-file` with
+`--callgrind-out-file`/`--dhat-out-file` — see the baseline entry
+below), invoke `valgrind` directly against the same
+`CREATE TABLE ... PARTITION BY HASH (a, b)` / 4x `CREATE TABLE ...
+PARTITION OF ... FOR VALUES WITH (MODULUS 4, REMAINDER n)` / `INSERT
+INTO ... SELECT ... FROM generate_series(1, 2000) g` sequence the
+harness sends, with `--callgrind-out-file`/`--dhat-out-file` and
+`--log-file` pointed at distinct paths.
+
+After profiles committed:
+`benches/profiles/{callgrind,dhat}.out.hashpartinsert-leafclone-after-n2000-2026-11-13`.
+
+## Bolt: `find_partition_leaf` clones the matched child's `PartitionInfo`/`columns` even when the match is an ordinary (non-further-partitioned) leaf — baseline — 2026-11-13
+
+**Why this workload**: re-profiling
+`benches/profile_hash_partition_insert.py` (committed 2026-11-08, the
+only harness exercising v2.20-v2.23's partition-routing machinery)
+against the SAME `INSERT INTO bench_hashpart ... PARTITION BY HASH
+(a, b)` workload, now that this cycle's two routing fixes
+(`f63bd85`: skip leaf routing in `check_partitioned_insert_unique`
+when no leaf has a unique constraint; `94ebfdd`: skip the
+post-trigger bound re-check when a leaf has no row trigger) have
+already landed and cut this workload from 345,398,385 `Ir` (the
+2026-11-08 baseline entry) to ~190.9M. Re-profiling what's left to
+see whether another floor-clearing target remains in the same hot
+path, rather than declaring the routing machinery done after two
+rounds.
+
+Callgrind (2000 rows, `--variant hash`), three runs: 190,885,785 /
+190,853,661 / 190,866,984 (agree to within 0.02%).
+`callgrind_annotate --inclusive=yes`: `route_partition_inserts` is
+31.85% of the total, almost entirely from its own call to
+`find_partition_leaf` (20.91%).
+
+Reading `find_partition_leaf` (`src/exec/partition.rs`): its
+sibling-candidate loop already defers cloning a *rejected* candidate's
+`PartitionInfo`/`columns` until it passes the cheap bound test (a
+prior Bolt fix, 2026-09-23 — see that entry further down this file).
+But once a candidate *matches*, the function unconditionally clones
+both `child.partition` (a `PartitionInfo`, several nested `Vec`s) and
+`child.columns` (a `Vec<(String, ColType)>`) via a second `find_table`
+lookup — even though the very next line,
+`if cinfo.children.is_empty() { ... return Ok(child_name.clone()); }`,
+throws both clones away for every *ordinary* leaf (a partition with no
+children of its own — the overwhelmingly common shape; only a
+genuinely sub-partitioned match needs the owned `cinfo`/`child_cols`,
+for the recursive call one line further down). Line-level annotation
+(`callgrind_annotate --auto=yes`) on this profile, per row, attributed
+to this one block: second `find_table` call 3,728,820 `Ir`,
+`PartitionInfo::clone` 3,408,000 `Ir`, `columns.clone()` 2,566,000
+`Ir`, plus `drop_glue` for both once the match turns out to be a leaf
+(1,240,000 + 1,008,000 `Ir`) — **12.05M `Ir`, 6.3% of this workload**,
+100% discarded on this bench's shape (4 flat `MODULUS 4` partitions,
+no sub-partitioning levels).
+
+This is not specific to HASH partitioning: `find_partition_leaf`
+routes every INSERT into any multi-child partitioned table (RANGE,
+LIST, or HASH), so the same waste applies whenever the matched leaf
+is an ordinary (non-further-partitioned) partition — the common case
+for all three methods. The HASH bench is used here only because it is
+the one harness this cycle already has committed for the partition-
+routing path.
+
+**Hypothesis**: check `cinfo_ref.children.is_empty()` — available for
+free from the existing borrowed reference already used for the bound
+test one line above — *before* doing the second lookup+clone. Only
+clone when the match is genuinely sub-partitioned and the function is
+about to recurse, mirroring the exact "borrow first, clone only the
+one candidate that needs it" principle the 2026-09-23 fix already
+applies to rejected candidates — one step further down the same
+function, applied to the matched candidate too. Fix and measurement
+in the entry above this one.
+
+**Note on the harness's `--keep-log`**: `profile_hash_partition_insert.py`'s
+`run_one` passes `--log-file={log_dir}/{tool}.out` *and*, for
+`tool=callgrind`/`dhat`, `--callgrind-out-file`/`--dhat-out-file` at
+`{log_dir}/callgrind.out` / `{log_dir}/dhat.out` — for `--tool dhat`
+specifically, `{tool}.out` and `dhat.out` are the *same path*, so
+valgrind's own stderr-redirected-to-`--log-file` chatter and the
+dhat JSON/callgrind text both land in one file, corrupting it for
+`callgrind_annotate`/`json.load`. The printed `Ir=`/summary-line
+output (parsed before the corruption matters) is unaffected and was
+used as-is above; every profile *saved* in this round
+(`benches/profiles/*-leafclone-*`) was captured with a direct
+`valgrind` invocation using distinct paths instead. Not fixed here —
+out of scope for this round's target (a one-line path collision in a
+profiling-only script, never seen by a real client); flagging it so
+a future round doesn't re-diagnose it from scratch.
+
+**Reproduce**:
+```bash
+cargo build
+python3 benches/profile_hash_partition_insert.py --tool callgrind --rows 2000 --variant hash
+```
+
+Baseline profiles committed:
+`benches/profiles/{callgrind,dhat}.out.hashpartinsert-leafclone-base-n2000-2026-11-13`
+(direct `valgrind` invocation, not `--keep-log`; see the note above).
+
 ## Bolt: binary-search `Snapshot.active` instead of linear-scanning it — fix — 2026-11-12
 
 Fixes the target identified in the baseline entry immediately below
