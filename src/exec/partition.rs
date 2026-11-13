@@ -4707,7 +4707,34 @@ pub(crate) fn find_partition_leaf(
             if !matches {
                 continue;
             }
-            // Matched: this is the only candidate worth cloning.
+            // Matched. The common case is an ordinary leaf (no further
+            // children of its own): resolve it straight from the
+            // `cinfo_ref` borrow above with no clone at all. Only a
+            // genuinely sub-partitioned match needs owned data, because
+            // the recursive call below takes `&mut Engine`, which can't
+            // coexist with a borrow of `eng.db` — so defer the clone
+            // until we know recursion is actually happening (same
+            // "borrow first, clone only the one candidate that needs
+            // it" principle as the rejected-candidate check above, one
+            // step further).
+            if cinfo_ref.children.is_empty() {
+                // v1.16: a childless *partitioned* table holds no rows —
+                // but PG19 commits to the matched partition: the 23514
+                // names the matched child (e.g. "no partition of
+                // relation mlparted5_cd found for row"), it does NOT
+                // fall through to siblings or the DEFAULT partition.
+                // (v0.72 used `continue` here, misnaming the parent.)
+                if cinfo_ref.is_partitioned {
+                    return Err(exec_err(
+                        "23514",
+                        format!("no partition of relation \"{}\" found for row", child_name),
+                    ));
+                }
+                return Ok(child_name.clone());
+            }
+            // Recurse: this candidate is itself sub-partitioned. Clone
+            // what the recursive call needs, then remap the row to the
+            // child's column order and evaluate the child's key there.
             let (cinfo, child_cols) = {
                 let child = eng
                     .db
@@ -4718,23 +4745,6 @@ pub(crate) fn find_partition_leaf(
                     child.columns.clone(),
                 )
             };
-            if cinfo.children.is_empty() {
-                // v1.16: a childless *partitioned* table holds no rows —
-                // but PG19 commits to the matched partition: the 23514
-                // names the matched child (e.g. "no partition of
-                // relation mlparted5_cd found for row"), it does NOT
-                // fall through to siblings or the DEFAULT partition.
-                // (v0.72 used `continue` here, misnaming the parent.)
-                if cinfo.is_partitioned {
-                    return Err(exec_err(
-                        "23514",
-                        format!("no partition of relation \"{}\" found for row", child_name),
-                    ));
-                }
-                return Ok(child_name.clone());
-            }
-            // Recurse: remap the row to the child's column order and
-            // evaluate the *child's* key there.
             let crow = remap_row_to_parent(table_cols, &child_cols, row);
             return find_partition_leaf(eng, ctx, child_name, &cinfo, &child_cols, &crow);
         }
