@@ -125,6 +125,10 @@ pub fn copy_from_rows(
         eng,
         ctx,
         table,
+        // v2.28: COPY FROM treats explicitly listed columns as
+        // user-supplied system values (PG19 copy.c: a listed
+        // GENERATED ALWAYS identity column stores the input).
+        Some(b's'),
         &targets,
         &insert_rows,
         &None,

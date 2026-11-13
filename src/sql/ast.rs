@@ -2570,6 +2570,12 @@ pub struct TableDef {
     /// v2.03: generated columns, parallel to `columns`
     /// (`Some((expr, stored))`).
     pub gen_cols: Vec<Option<(Expr, bool)>>,
+    /// v2.28: identity columns, parallel to `columns`
+    /// (`Some(b'a')` = GENERATED ALWAYS, `Some(b'd')` = BY DEFAULT).
+    pub identity: Vec<Option<u8>>,
+    /// v2.28: sequence options per identity column, parallel to
+    /// `columns` (consumed at exec to create the backing sequence).
+    pub identity_opts: Vec<Option<SequenceOpts>>,
     /// v2.21: declared `COLLATE name` per column, parallel to
     /// `columns` (`None` = no explicit collation; the column then
     /// takes its domain's collation, else the database default).
@@ -2601,6 +2607,12 @@ pub struct TableDef {
     /// v1.96: `CREATE TABLE name OF type_name` — a typed table whose
     /// columns come from the named composite type (expanded at exec).
     pub of_type: Option<String>,
+    /// v2.28: the parsed `OF type ( element, ... )` list, carried to
+    /// exec and validated against the type's fields there (PG19
+    /// MergeAttributes: unknown column 42703, duplicate 42701,
+    /// generated/identity elements 0A000). Valid options keep the
+    /// historical ignore behavior at expansion.
+    pub typed_elements: Vec<TableItem>,
     /// v2.26: `CREATE TABLE ... PARTITION OF parent ( <elements> )` —
     /// the OptTypedTableElementList, built by
     /// `build_partition_override_def` into a def whose columns are the
@@ -2755,6 +2767,9 @@ pub enum AlterAction {
         compression: Option<String>,
         /// v2.21: the added column's declared `COLLATE name`.
         collate: Option<String>,
+        /// v2.28: `GENERATED {ALWAYS|BY DEFAULT} AS IDENTITY [(opts)]`
+        /// on the added column: (always, sequence options).
+        identity: Option<(bool, SequenceOpts)>,
         checks: Vec<CheckDef>,
         uniques: Vec<UniqueDef>,
         pkey: Option<UniqueDef>,
@@ -2896,6 +2911,29 @@ pub enum AlterAction {
     AlterColumnDropExpression {
         name: String,
         if_exists: bool,
+    },
+    /// v2.28: `ALTER COLUMN c ADD GENERATED {ALWAYS|BY DEFAULT} AS
+    /// IDENTITY [(opts)]` (PG19 AT_AddIdentity).
+    AlterColumnAddIdentity {
+        name: String,
+        always: bool,
+        opts: SequenceOpts,
+    },
+    /// v2.28: `ALTER COLUMN c DROP IDENTITY [IF EXISTS]` (PG19
+    /// AT_DropIdentity).
+    AlterColumnDropIdentity {
+        name: String,
+        if_exists: bool,
+    },
+    /// v2.28: `ALTER COLUMN c SET GENERATED {ALWAYS|BY DEFAULT}` and/or
+    /// the identity sequence-option alters (`SET INCREMENT BY n`,
+    /// `SET START WITH n`, `RESTART`, ...) chained in one phrase
+    /// (PG19 AT_SetIdentity / AT_ResetIdentity / sequence alters).
+    /// `generated` None = kind unchanged.
+    AlterColumnSetIdentity {
+        name: String,
+        generated: Option<bool>,
+        opts: SequenceOpts,
     },
     RenameColumn {
         old: String,
@@ -3100,6 +3138,7 @@ impl SequenceOpts {
 // ---------------------------------------------------------------------------
 
 /// One item inside `CREATE TABLE (...)`.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TableItem {
     Col(ParsedColDef),
     TableCon(ParsedTableCon),
@@ -3143,6 +3182,7 @@ pub enum LikeKind {
     Generated,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ParsedColDef {
     pub(crate) name: String,
     pub(crate) col_type: ColType,
@@ -3167,6 +3207,7 @@ pub(crate) struct ParsedColDef {
     pub(crate) cons: Vec<ColCon>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ColCon {
     /// v2.27: carries the explicit `CONSTRAINT name`, if any —
     /// PG19 materializes a named not-null as a pg_constraint
@@ -3192,15 +3233,17 @@ pub(crate) enum ColCon {
         expr: Expr,
         stored: bool,
     },
-    /// v2.26: `GENERATED {ALWAYS|BY DEFAULT} AS IDENTITY [(seq opts)]`.
-    /// Identity columns are not implemented engine-wide; the variant
-    /// exists so each context can raise its own PG error (plain
-    /// CREATE TABLE: 0A000 "identity columns are not supported";
-    /// PARTITION OF element: 0A000 "identity columns are not supported
-    /// on partitions").
-    Identity,
+    /// v2.28: `GENERATED {ALWAYS|BY DEFAULT} AS IDENTITY [(seq opts)]`.
+    /// `always` distinguishes GENERATED ALWAYS (pg_attribute
+    /// attidentity 'a') from BY DEFAULT ('d'); `opts` are the
+    /// parenthesized sequence options for the backing sequence.
+    Identity {
+        always: bool,
+        opts: SequenceOpts,
+    },
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ParsedTableCon {
     /// v2.07: table PRIMARY KEY (cols) + ConstraintAttributeSpec
     /// results (deferrable, initially_deferred).
@@ -3229,6 +3272,7 @@ pub(crate) enum ParsedTableCon {
     },
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ParsedFkTail {
     pub(crate) ref_table: String,
     pub(crate) ref_cols: Vec<String>,
@@ -3311,7 +3355,10 @@ impl TableDef {
             inherits: Vec::new(),
             deferred_not_null: Vec::new(),
             of_type: None,
+            typed_elements: Vec::new(),
             gen_cols: Vec::new(),
+            identity: Vec::new(),
+            identity_opts: Vec::new(),
             collations: Vec::new(),
             unlogged: false,
             partition_overrides: None,
@@ -3627,6 +3674,9 @@ pub(crate) fn build_table_def(
             def.storage.push(None);
             // v2.03: generated-column slot (filled in pass 2).
             def.gen_cols.push(None);
+            // v2.28: identity slots (filled in pass 2).
+            def.identity.push(None);
+            def.identity_opts.push(None);
             // v2.21: declared column collation travels alongside.
             def.collations.push(c.collate.clone());
         }
@@ -3743,7 +3793,21 @@ pub(crate) fn build_table_def(
                             *df,
                             *idf,
                         )?,
-                        ColCon::Default(d) => def.defaults[i] = Some(d.clone()),
+                        ColCon::Default(d) => {
+                            // v2.28: identity declared earlier in the
+                            // clause list + DEFAULT (either order is
+                            // PG's 42601).
+                            if def.identity[i].is_some() {
+                                return Err(SqlError {
+                                    message: format!(
+                                        "both default and identity specified for column \"{}\" of table \"{}\"",
+                                        c.name, table
+                                    ),
+                                    code: "42601",
+                                });
+                            }
+                            def.defaults[i] = Some(d.clone())
+                        }
                         ColCon::Check(n, e, nv, enf, noinh) => def_add_check(
                             table,
                             &mut def,
@@ -3779,15 +3843,50 @@ pub(crate) fn build_table_def(
                         ColCon::Generated { expr, stored } => {
                             def.gen_cols[i] = Some((expr.clone(), *stored))
                         }
-                        // v2.26: identity columns are not implemented;
-                        // plain CREATE TABLE keeps the engine's
-                        // standing 0A000 (the PARTITION OF builder
-                        // pre-scans and reports its own message).
-                        ColCon::Identity => {
-                            return Err(SqlError {
-                                message: "identity columns are not supported".to_string(),
-                                code: "0A000",
-                            });
+                        // v2.28: identity columns (PG19
+                        // parse_utilcmd.c transformColumnDefinition):
+                        // integer-family type only, implicitly NOT
+                        // NULL, mutually exclusive with DEFAULT /
+                        // serial / generated expressions (42601).
+                        ColCon::Identity { always, opts } => {
+                            if c.serial.is_some() || def.defaults[i].is_some() {
+                                return Err(SqlError {
+                                    message: format!(
+                                        "both default and identity specified for column \"{}\" of table \"{}\"",
+                                        c.name, table
+                                    ),
+                                    code: "42601",
+                                });
+                            }
+                            if def.gen_cols[i].is_some() {
+                                return Err(SqlError {
+                                    message: format!(
+                                        "both identity and generation expression specified for column \"{}\"",
+                                        c.name
+                                    ),
+                                    code: "42601",
+                                });
+                            }
+                            if !matches!(
+                                def.columns[i].1,
+                                ColType::SmallInt | ColType::Int | ColType::BigInt
+                            ) {
+                                return Err(SqlError {
+                                    message:
+                                        "identity column type must be smallint, integer, or bigint"
+                                            .to_string(),
+                                    code: "42P16",
+                                });
+                            }
+                            if c.cons.iter().any(|k| matches!(k, ColCon::Null)) {
+                                return Err(err(format!(
+                                    "conflicting NULL/NOT NULL declarations for column \"{}\" of table \"{}\"",
+                                    c.name, table
+                                )));
+                            }
+                            def.not_null[i] = true;
+                            def.identity[i] = Some(if *always { b'a' } else { b'd' });
+                            def.identity_opts[i] = Some(opts.clone());
                         }
                     }
                 }
@@ -3991,7 +4090,7 @@ pub(crate) fn build_partition_override_def(
 ) -> Result<TableDef, SqlError> {
     for item in &items {
         if let TableItem::Col(c) = item {
-            if c.cons.iter().any(|k| matches!(k, ColCon::Identity)) {
+            if c.cons.iter().any(|k| matches!(k, ColCon::Identity { .. })) {
                 return Err(SqlError {
                     message: "identity columns are not supported on partitions".to_string(),
                     code: "0A000",
@@ -10153,6 +10252,9 @@ pub enum Stmt {
     },
     Insert {
         table: String,
+        /// v2.28: `OVERRIDING {SYSTEM|USER} VALUE` (PG19): Some(b's')
+        /// = SYSTEM, Some(b'u') = USER, None = clause absent.
+        overriding: Option<u8>,
         /// v0.84: targets carry PG19 indirection (`f2[1]`, `f3.if2`).
         columns: Option<Vec<InsertTarget>>,
         rows: Vec<Vec<InsertValue>>,
@@ -10419,6 +10521,10 @@ pub enum MergeAction {
         columns: Option<Vec<String>>,
         /// The single VALUES row's expressions; None = DEFAULT VALUES.
         values: Option<Vec<Expr>>,
+        /// v2.28: `OVERRIDING {SYSTEM|USER} VALUE` on the action
+        /// (None / b's' / b'u'); PG19 merge.c + nodeModifyTable apply
+        /// the plain-INSERT identity rules to MERGE insert actions.
+        overriding: Option<u8>,
     },
     DoNothing,
 }

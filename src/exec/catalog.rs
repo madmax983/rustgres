@@ -162,6 +162,9 @@ pub(crate) fn pg_attribute_schema() -> Vec<QCol> {
         // and friends still raise "column does not exist").
         ("attislocal", ColType::Bool),
         ("attinhcount", ColType::SmallInt),
+        // v2.28: attidentity ('' / 'a' / 'd'), appended like the
+        // v2.27 columns.
+        ("attidentity", ColType::Text),
     ]
     .into_iter()
     .map(|(n, ty)| QCol {
@@ -206,6 +209,12 @@ pub(crate) fn pg_attribute_scan(
                     Value::Int(t.attnums.get(i).copied().unwrap_or(i as i16 + 1) as i64),
                     Value::Bool(t.att_is_local(i)),
                     Value::Int(inh),
+                    // v2.28: attidentity.
+                    Value::text(match t.identity_at(i) {
+                        b'a' => "a",
+                        b'd' => "d",
+                        _ => "",
+                    }),
                 ]),
                 prov: Vec::new(),
             });

@@ -112,6 +112,53 @@ pub(crate) fn exec_create(
                 ));
             }
         };
+        // v2.28: PG19 MergeAttributes validation of the OF element
+        // list (typed_table personsx/persons4, generated_stored
+        // gtest28): an element must name a field of the type (42703),
+        // may name it only once (42701), and may not carry a
+        // generation expression (0A000 — generated columns are not
+        // supported on typed tables). Identity elements are already
+        // rejected at parse; the arm is kept for totality. Before
+        // this, the list was consumed at parse and discarded, so
+        // these statements silently SUCCEEDED.
+        {
+            let mut seen = std::collections::HashSet::new();
+            for it in &def.typed_elements {
+                if let crate::sql::TableItem::Col(c) = it {
+                    if !seen.insert(c.name.as_str()) {
+                        return Err(exec_err(
+                            "42701",
+                            format!("column \"{}\" specified more than once", c.name),
+                        ));
+                    }
+                    if !fields.iter().any(|(fname, _, _)| fname == &c.name) {
+                        return Err(exec_err(
+                            "42703",
+                            format!("column \"{}\" does not exist", c.name),
+                        ));
+                    }
+                    for k in &c.cons {
+                        match k {
+                            crate::sql::ColCon::Generated { .. } => {
+                                return Err(exec_err(
+                                    "0A000",
+                                    "generated columns are not supported on typed tables"
+                                        .to_string(),
+                                ));
+                            }
+                            crate::sql::ColCon::Identity { .. } => {
+                                return Err(exec_err(
+                                    "0A000",
+                                    "identity columns are not supported on typed tables"
+                                        .to_string(),
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
         let mut d = def.clone();
         d.of_type = None;
         for (fname, fty, named) in &fields {
@@ -405,6 +452,90 @@ pub(crate) fn create_serial_sequence(
         .push(WriteOp::CreateSequence { name: name.clone() });
     note_obj_schema(eng, ctx, &name, &name);
     Ok(name)
+}
+
+/// v2.28: create the backing sequence for an identity column
+/// (PG19 generateSerialExtraStmts with for_identity): name
+/// `<table>_<column>_seq` with ChooseRelationName suffixing, typed by
+/// the column type, parameters from the identity sequence options via
+/// `sequence_params`. Owned by the column like a serial sequence, so
+/// DROP TABLE / DROP IDENTITY cleanup rides `owned_seqs_of`.
+pub(crate) fn create_identity_sequence(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table: &str,
+    col: &str,
+    col_type: ColType,
+    opts: &crate::sql::SequenceOpts,
+    temp_session: Option<u64>,
+) -> Result<String, ExecError> {
+    let base = format!("{}_{}_seq", table, col);
+    let mut name = base.clone();
+    let mut n = 1u32;
+    while eng.db.find_sequence(&name, ctx.snap, ctx.own).is_some()
+        || eng
+            .db
+            .find_table(&name, ctx.snap, &ctx.all_xids, ctx.session)
+            .is_some()
+        || eng.db.find_view(&name, ctx.snap, ctx.own).is_some()
+    {
+        name = format!("{}{}", base, n);
+        n += 1;
+    }
+    let mut o = opts.clone();
+    o.seq_type = Some(match col_type {
+        ColType::SmallInt => crate::sql::SeqType::SmallInt,
+        ColType::BigInt => crate::sql::SeqType::BigInt,
+        _ => crate::sql::SeqType::Integer,
+    });
+    let (seq_type, start, increment, min_value, max_value, cycle, cache, _) =
+        sequence_params(&o, None)?;
+    let mut seq = Sequence::new(
+        name.clone(),
+        seq_type,
+        start,
+        increment,
+        min_value,
+        max_value,
+        cycle,
+        cache,
+        ctx.own,
+    );
+    seq.owned_by = Some((table.to_string(), col.to_string(), temp_session));
+    seq.owner = ctx.role.to_string();
+    eng.db.sequences.entry(name.clone()).or_default().push(seq);
+    ctx.writes
+        .push(WriteOp::CreateSequence { name: name.clone() });
+    note_obj_schema(eng, ctx, &name, &name);
+    Ok(name)
+}
+
+/// v2.28: wire identity defaults into a freshly built table: for
+/// every identity column whose def carries sequence options (a
+/// locally declared identity — partition children share the parent's
+/// sequence and carry `identity_opts == None`, so they are skipped),
+/// create the backing sequence and set `DEFAULT nextval('<seq>')`.
+pub(crate) fn wire_identity_defaults(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table: &str,
+    t: &mut Table,
+    def: &TableDef,
+    temp_session: Option<u64>,
+) -> Result<(), ExecError> {
+    for i in 0..t.columns.len() {
+        if def.identity.get(i).and_then(|k| *k).is_none() {
+            continue;
+        }
+        let Some(opts) = def.identity_opts.get(i).and_then(|o| o.clone()) else {
+            continue;
+        };
+        let (cname, ctype) = t.columns[i].clone();
+        let seq_name =
+            create_identity_sequence(eng, ctx, table, &cname, ctype, &opts, temp_session)?;
+        t.defaults[i] = Some(DefaultExpr::Nextval(seq_name));
+    }
+    Ok(())
 }
 
 /// v0.65: wire serial defaults into a freshly built table: for every

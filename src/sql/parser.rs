@@ -1895,8 +1895,31 @@ impl Parser {
         if self.eat_keyword("of") {
             let tname = self.parse_table_name()?;
             let base = tname.rsplit('.').next().unwrap_or(&tname).to_string();
+            // v2.28: an optional TypedTableElement list may follow;
+            // PG19 rejects identity options on typed tables (0A000).
+            // The list is carried into the def: exec validates the
+            // elements against the type's fields (unknown 42703,
+            // duplicate 42701, generated 0A000 — MergeAttributes);
+            // valid options keep the historical ignore behavior.
+            let mut typed_elements = Vec::new();
+            if *self.peek() == Token::LParen {
+                let items = self.parse_partition_elements()?;
+                for it in &items {
+                    if let TableItem::Col(c) = it {
+                        if c.cons.iter().any(|k| matches!(k, ColCon::Identity { .. })) {
+                            return Err(SqlError {
+                                message: "identity columns are not supported on typed tables"
+                                    .to_string(),
+                                code: "0A000",
+                            });
+                        }
+                    }
+                }
+                typed_elements = items;
+            }
             let mut def = TableDef::empty();
             def.of_type = Some(base);
+            def.typed_elements = typed_elements;
             def.unlogged = unlogged;
             return Ok(Stmt::CreateTable { name, def, temp });
         }
@@ -2064,12 +2087,15 @@ impl Parser {
             deferred_not_null: Vec::new(),
             of_type: None,
             gen_cols: Vec::new(),
+            identity: Vec::new(),
+            identity_opts: Vec::new(),
             unlogged: false,
             // v2.21: partition children inherit the parent's columns
             // (and their collations) at exec.
             collations: Vec::new(),
             // v2.26: PARTITION OF element list (merged at exec).
             partition_overrides: overrides,
+            typed_elements: Vec::new(),
         };
         Ok(Stmt::CreateTable { name, def, temp })
     }
@@ -2523,10 +2549,18 @@ impl Parser {
                 let (df, idf) = self.parse_unique_attrs()?;
                 cons.push(ColCon::PKey(cname, df, idf));
             } else if self.eat_keyword("default") {
-                if cons
-                    .iter()
-                    .any(|c| matches!(c, ColCon::Generated { .. } | ColCon::Identity))
-                {
+                if cons.iter().any(|c| matches!(c, ColCon::Identity { .. })) {
+                    // v2.28: identity first, DEFAULT second — PG's
+                    // identity-specific 42601.
+                    return Err(SqlError {
+                        message: format!(
+                            "both default and identity specified for column \"{}\"",
+                            name
+                        ),
+                        code: "42601",
+                    });
+                }
+                if cons.iter().any(|c| matches!(c, ColCon::Generated { .. })) {
                     return Err(err(format!(
                         "both default and generation expression specified for column \"{}\"",
                         name
@@ -2546,28 +2580,41 @@ impl Parser {
                 let tail = self.parse_fk_tail()?;
                 cons.push(ColCon::References { name: cname, tail });
             } else if self.eat_keyword("generated") {
-                // v2.03: PG19 rejects a second generation clause and a
-                // DEFAULT + generation combination (gtest_err_1/5a).
-                if cons
-                    .iter()
-                    .any(|c| matches!(c, ColCon::Generated { .. } | ColCon::Identity))
-                {
-                    return Err(err(format!(
-                        "multiple generation clauses specified for column \"{}\"",
-                        name
-                    )));
-                }
+                // v2.03: PG19 rejects a DEFAULT + generation
+                // combination (gtest_err_1/5a). A second generation
+                // clause is rejected after parsing (below), where
+                // both kinds are known.
                 if cons.iter().any(|c| matches!(c, ColCon::Default(_))) {
+                    // v2.28: when the generation clause turns out to
+                    // be IDENTITY, PG's message is the identity one;
+                    // peek ahead (always/by default + as identity).
+                    let save = self.pos;
+                    let _ = self.eat_keyword("always")
+                        || (self.eat_keyword("by") && {
+                            let _ = self.eat_keyword("default");
+                            true
+                        });
+                    let _ = self.eat_keyword("as");
+                    let is_identity = self.eat_keyword("identity");
+                    self.pos = save;
+                    if is_identity {
+                        return Err(SqlError {
+                            message: format!(
+                                "both default and identity specified for column \"{}\"",
+                                name
+                            ),
+                            code: "42601",
+                        });
+                    }
                     return Err(err(format!(
                         "both default and generation expression specified for column \"{}\"",
                         name
                     )));
                 }
                 // v2.03: GENERATED ALWAYS AS (expr) STORED|VIRTUAL.
-                // v2.26: GENERATED {ALWAYS|BY DEFAULT} AS IDENTITY
-                // [(seq opts)] parses to ColCon::Identity; consumers
-                // raise their context's 0A000 (identity columns are
-                // not implemented engine-wide).
+                // v2.28: GENERATED {ALWAYS|BY DEFAULT} AS IDENTITY
+                // [(seq opts)] parses to ColCon::Identity (the v2.26
+                // blanket 0A000 became a real feature).
                 let always = self.eat_keyword("always");
                 if !always {
                     self.expect_keyword("by")?;
@@ -2575,12 +2622,37 @@ impl Parser {
                 }
                 self.expect_keyword("as")?;
                 if self.eat_keyword("identity") {
+                    let mut opts = SequenceOpts::default();
                     if *self.peek() == Token::LParen {
                         self.next();
-                        let _ = self.parse_sequence_opts()?;
+                        opts = self.parse_sequence_opts()?;
                         self.expect(Token::RParen, "')'")?;
                     }
-                    cons.push(ColCon::Identity);
+                    cons.push(ColCon::Identity { always, opts });
+                    // v2.28: duplicate generation clauses (PG19
+                    // parse_utilcmd messages, 42601).
+                    let n_id = cons
+                        .iter()
+                        .filter(|c| matches!(c, ColCon::Identity { .. }))
+                        .count();
+                    let n_gen = cons
+                        .iter()
+                        .filter(|c| matches!(c, ColCon::Generated { .. }))
+                        .count();
+                    if n_id + n_gen > 1 {
+                        let msg = if n_id >= 2 {
+                            format!("multiple identity specifications for column \"{}\"", name)
+                        } else {
+                            format!(
+                                "both identity and generation expression specified for column \"{}\"",
+                                name
+                            )
+                        };
+                        return Err(SqlError {
+                            message: msg,
+                            code: "42601",
+                        });
+                    }
                 } else {
                     if !always {
                         return Err(err(
@@ -2600,6 +2672,32 @@ impl Parser {
                         false
                     };
                     cons.push(ColCon::Generated { expr: e, stored });
+                    // v2.28: identity + generation expression (either
+                    // order) is PG's 42601; two generated-expression
+                    // clauses keep the v2.03 message.
+                    let n_id = cons
+                        .iter()
+                        .filter(|c| matches!(c, ColCon::Identity { .. }))
+                        .count();
+                    let n_gen = cons
+                        .iter()
+                        .filter(|c| matches!(c, ColCon::Generated { .. }))
+                        .count();
+                    if n_id + n_gen > 1 {
+                        if n_id >= 1 {
+                            return Err(SqlError {
+                                message: format!(
+                                    "both identity and generation expression specified for column \"{}\"",
+                                    name
+                                ),
+                                code: "42601",
+                            });
+                        }
+                        return Err(err(format!(
+                            "multiple generation clauses specified for column \"{}\"",
+                            name
+                        )));
+                    }
                 }
             } else {
                 if cname.is_some() {
@@ -3628,6 +3726,8 @@ impl Parser {
             let col = self.parse_column_def()?;
             let mut not_null = false;
             let mut default = None;
+            // v2.28: ADD COLUMN ... IDENTITY (implies NOT NULL).
+            let mut identity: Option<(bool, SequenceOpts)> = None;
             let mut checks = Vec::new();
             let mut uniques = Vec::new();
             let mut pkey = None;
@@ -3701,14 +3801,35 @@ impl Parser {
                             code: "0A000",
                         });
                     }
-                    // v2.26: identity columns are not implemented
-                    // (same standing rejection as before this variant
-                    // existed).
-                    ColCon::Identity => {
-                        return Err(SqlError {
-                            message: "identity columns are not supported".to_string(),
-                            code: "0A000",
-                        });
+                    // v2.28: identity on ADD COLUMN. DEFAULT +
+                    // identity and serial + identity are PG's 42601
+                    // "both default and identity specified" (the
+                    // serial's implicit default counts); the type
+                    // check runs in exec (domain/composite resolution
+                    // lives there) as well as here for base types.
+                    ColCon::Identity { always, opts } => {
+                        if default.is_some() || col.serial.is_some() {
+                            return Err(SqlError {
+                                message: format!(
+                                    "both default and identity specified for column \"{}\"",
+                                    col.name
+                                ),
+                                code: "42601",
+                            });
+                        }
+                        if !matches!(
+                            col.col_type,
+                            ColType::SmallInt | ColType::Int | ColType::BigInt
+                        ) {
+                            return Err(SqlError {
+                                message:
+                                    "identity column type must be smallint, integer, or bigint"
+                                        .to_string(),
+                                code: "42P16",
+                            });
+                        }
+                        not_null = true;
+                        identity = Some((always, opts));
                     }
                     ColCon::Check(n, e, nv, enf, noinh) => checks.push(CheckDef {
                         name: n
@@ -3738,6 +3859,7 @@ impl Parser {
                 default,
                 serial: col.serial,
                 compression: col.compression,
+                identity,
                 checks,
                 uniques,
                 pkey,
@@ -3833,6 +3955,45 @@ impl Parser {
             }
             self.eat_keyword("column");
             let cname = self.expect_ident()?;
+            // v2.28: ALTER COLUMN c ADD GENERATED {ALWAYS|BY DEFAULT}
+            // AS IDENTITY [(seq opts)] (PG19 AT_AddIdentity).
+            if self.eat_keyword("add") {
+                self.expect_keyword("generated")?;
+                let always = self.eat_keyword("always");
+                if !always {
+                    self.expect_keyword("by")?;
+                    self.expect_keyword("default")?;
+                }
+                self.expect_keyword("as")?;
+                self.expect_keyword("identity")?;
+                let mut opts = SequenceOpts::default();
+                if *self.peek() == Token::LParen {
+                    self.next();
+                    opts = self.parse_sequence_opts()?;
+                    self.expect(Token::RParen, "')'")?;
+                }
+                return Ok(AlterAction::AlterColumnAddIdentity {
+                    name: cname,
+                    always,
+                    opts,
+                });
+            }
+            // v2.28: ALTER COLUMN c RESTART [WITH n] (identity
+            // sequence restart, PG19 AT_ResetIdentity).
+            if matches!(self.peek(), Token::Ident(k) if k == "restart") {
+                self.next();
+                let mut opts = SequenceOpts::default();
+                opts.restart = Some(if self.eat_keyword("with") {
+                    self.parse_seq_int("RESTART")?
+                } else {
+                    SequenceOpts::RESTART_SENTINEL
+                });
+                return Ok(AlterAction::AlterColumnSetIdentity {
+                    name: cname,
+                    generated: None,
+                    opts,
+                });
+            }
             // v2.06: ALTER COLUMN c SET DATA TYPE t — the spelled-out
             // form of TYPE (PG19 gram.y accepts both). Lookahead so
             // SET NOT NULL / SET STORAGE etc. keep their own branch.
@@ -3871,6 +4032,37 @@ impl Parser {
                 });
             }
             if self.eat_keyword("set") {
+                // v2.28: ALTER COLUMN c SET GENERATED {ALWAYS|BY
+                // DEFAULT} [SET <seq opts>...] (PG19 AT_SetIdentity).
+                if self.eat_keyword("generated") {
+                    let always = self.eat_keyword("always");
+                    if !always {
+                        self.expect_keyword("by")?;
+                        self.expect_keyword("default")?;
+                    }
+                    let mut opts = SequenceOpts::default();
+                    self.parse_identity_set_chain(&mut opts)?;
+                    return Ok(AlterAction::AlterColumnSetIdentity {
+                        name: cname,
+                        generated: Some(always),
+                        opts,
+                    });
+                }
+                // v2.28: ALTER COLUMN c SET INCREMENT/START/... — a
+                // bare identity sequence-option alter (PG19 routes it
+                // to the backing sequence).
+                if matches!(self.peek(), Token::Ident(k) if matches!(k.as_str(),
+                    "increment" | "start" | "minvalue" | "maxvalue" | "cache" | "restart"))
+                {
+                    let mut opts = SequenceOpts::default();
+                    self.parse_identity_seq_segment(&mut opts)?;
+                    self.parse_identity_set_chain(&mut opts)?;
+                    return Ok(AlterAction::AlterColumnSetIdentity {
+                        name: cname,
+                        generated: None,
+                        opts,
+                    });
+                }
                 // v2.03: ALTER COLUMN c SET NOT NULL (PG19).
                 if self.eat_keyword("not") {
                     self.expect_keyword("null")?;
@@ -3932,6 +4124,20 @@ impl Parser {
                 });
             }
             if self.eat_keyword("drop") {
+                // v2.28: ALTER COLUMN c DROP IDENTITY [IF EXISTS]
+                // (PG19 AT_DropIdentity).
+                if self.eat_keyword("identity") {
+                    let if_exists = if self.eat_keyword("if") {
+                        self.expect_keyword("exists")?;
+                        true
+                    } else {
+                        false
+                    };
+                    return Ok(AlterAction::AlterColumnDropIdentity {
+                        name: cname,
+                        if_exists,
+                    });
+                }
                 // v2.03: ALTER COLUMN c DROP NOT NULL (PG19).
                 if self.eat_keyword("not") {
                     self.expect_keyword("null")?;
@@ -8328,6 +8534,76 @@ impl Parser {
         })
     }
 
+    /// v2.28: parse ONE identity sequence-option segment body (the
+    /// leading SET is already consumed): INCREMENT [BY] n | START
+    /// [WITH] n | MINVALUE n | MAXVALUE n | CACHE n | RESTART
+    /// [[WITH] n]. Merges into `opts`.
+    pub(crate) fn parse_identity_seq_segment(
+        &mut self,
+        opts: &mut SequenceOpts,
+    ) -> Result<(), SqlError> {
+        if self.eat_keyword("increment") {
+            let _ = self.eat_keyword("by");
+            opts.increment = Some(self.parse_seq_int("INCREMENT")?);
+        } else if self.eat_keyword("start") {
+            let _ = self.eat_keyword("with");
+            opts.start = Some(self.parse_seq_int("START")?);
+        } else if self.eat_keyword("minvalue") {
+            opts.min_value = Some(self.parse_seq_int("MINVALUE")?);
+        } else if self.eat_keyword("maxvalue") {
+            opts.max_value = Some(self.parse_seq_int("MAXVALUE")?);
+        } else if self.eat_keyword("cache") {
+            opts.cache = Some(self.parse_seq_int("CACHE")?);
+        } else if self.eat_keyword("restart") {
+            opts.restart = Some(if self.eat_keyword("with") {
+                self.parse_seq_int("RESTART")?
+            } else {
+                SequenceOpts::RESTART_SENTINEL
+            });
+        } else {
+            return Err(err(
+                "syntax error: expected identity sequence option".to_string()
+            ));
+        }
+        Ok(())
+    }
+
+    /// v2.28: parse the tail of an identity SET phrase: zero or more
+    /// `SET <segment>` plus bare `RESTART` segments (PG19 spells e.g.
+    /// `SET GENERATED BY DEFAULT SET INCREMENT BY 2 SET START WITH
+    /// 100 RESTART` as chained subcommands of one ALTER COLUMN).
+    pub(crate) fn parse_identity_set_chain(
+        &mut self,
+        opts: &mut SequenceOpts,
+    ) -> Result<(), SqlError> {
+        loop {
+            if matches!(self.peek(), Token::Ident(k) if k == "set") {
+                // Only continue when the SET opens a seq segment.
+                let save = self.pos;
+                self.next();
+                if matches!(self.peek(), Token::Ident(k) if matches!(k.as_str(),
+                    "increment" | "start" | "minvalue" | "maxvalue" | "cache" | "restart"))
+                {
+                    self.parse_identity_seq_segment(opts)?;
+                    continue;
+                }
+                self.pos = save;
+                break;
+            }
+            if matches!(self.peek(), Token::Ident(k) if k == "restart") {
+                self.next();
+                opts.restart = Some(if self.eat_keyword("with") {
+                    self.parse_seq_int("RESTART")?
+                } else {
+                    SequenceOpts::RESTART_SENTINEL
+                });
+                continue;
+            }
+            break;
+        }
+        Ok(())
+    }
+
     pub(crate) fn parse_sequence_opts(&mut self) -> Result<SequenceOpts, SqlError> {
         let mut opts = SequenceOpts::default();
         loop {
@@ -8528,6 +8804,24 @@ impl Parser {
         } else {
             None
         };
+        // v2.28: `OVERRIDING {SYSTEM|USER} VALUE` (PG19 gram.y: the
+        // clause sits between the column list and the row source).
+        let overriding = if self.eat_keyword("overriding") {
+            let k = self.expect_ident()?;
+            self.expect_keyword("value")?;
+            match k.as_str() {
+                "system" => Some(b's'),
+                "user" => Some(b'u'),
+                _ => {
+                    return Err(err(format!(
+                        "syntax error: expected SYSTEM or USER in OVERRIDING clause, found \"{}\"",
+                        k
+                    )));
+                }
+            }
+        } else {
+            None
+        };
         // v0.10: `INSERT INTO ... SELECT ...` (or VALUES).
         // v0.72: `INSERT INTO ... (SELECT ...)` — parenthesized query
         // source (PG19); parse_select_query_not_consumed eats the parens.
@@ -8577,6 +8871,7 @@ impl Parser {
         let returning = self.parse_returning()?;
         Ok(Stmt::Insert {
             table,
+            overriding,
             columns,
             rows,
             select,
@@ -13658,10 +13953,26 @@ impl Parser {
                     } else {
                         None
                     };
-                    if self.eat_keyword("overriding") {
-                        let _ = self.expect_ident()?; // SYSTEM | USER
+                    // v2.28: OVERRIDING {SYSTEM|USER} VALUE — parsed
+                    // and KEPT (identity enforcement at exec); earlier
+                    // the clause was consumed and discarded, so MERGE
+                    // insert actions silently ignored it.
+                    let overriding = if self.eat_keyword("overriding") {
+                        let k = self.expect_ident()?;
                         self.expect_keyword("value")?;
-                    }
+                        match k.as_str() {
+                            "system" => Some(b's'),
+                            "user" => Some(b'u'),
+                            _ => {
+                                return Err(err(format!(
+                                    "syntax error: expected SYSTEM or USER in OVERRIDING clause, found \"{}\"",
+                                    k
+                                )));
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let values = if columns.is_none() && self.eat_keyword("default") {
                         self.expect_keyword("values")?;
                         None
@@ -13688,7 +13999,11 @@ impl Parser {
                         }
                         Some(vs)
                     };
-                    MergeAction::Insert { columns, values }
+                    MergeAction::Insert {
+                        columns,
+                        values,
+                        overriding,
+                    }
                 }
                 (MergeMatchKind::Matched, "update")
                 | (MergeMatchKind::NotMatchedBySource, "update") => {
@@ -19979,6 +20294,21 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
         }
         out.push(')');
     }
+    // v2.28: optional trailing (identity ...) section — per-column
+    // attidentity chars, emitted only when some column is an identity
+    // column (decoder default: none). Pre-v2.28 encodings omit it.
+    if t.identity.iter().any(|k| *k != 0) {
+        out.push_str(" (identity");
+        for i in 0..t.columns.len() {
+            out.push(' ');
+            out.push(match t.identity_at(i) {
+                b'a' => 'a',
+                b'd' => 'd',
+                _ => '-',
+            });
+        }
+        out.push(')');
+    }
     out.push(')');
     out
 }
@@ -20304,6 +20634,9 @@ pub struct DecodedConstraints {
     /// v2.27: per-column attribute locality (absent in pre-v2.27
     /// encodings: decoded as all-local).
     pub att_local: Vec<bool>,
+    /// v2.28: per-column identity kinds (absent in pre-v2.28
+    /// encodings: empty = no identity columns).
+    pub identity: Vec<u8>,
 }
 
 pub(crate) fn sexpr_is_close(p: &mut SexprParser) -> bool {
@@ -20754,6 +21087,8 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
     let mut nn_local: Vec<bool> = Vec::new();
     // v2.27: optional trailing (attlocal ...) section.
     let mut att_local: Vec<bool> = Vec::new();
+    // v2.28: optional trailing (identity ...) section.
+    let mut identity: Vec<u8> = Vec::new();
     while !sexpr_is_close(&mut p) {
         p.open()?;
         match p.atom()?.as_str() {
@@ -20823,6 +21158,17 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
                 }
                 p.close()?;
             }
+            "identity" => {
+                while !sexpr_is_close(&mut p) {
+                    identity.push(match p.atom()?.as_str() {
+                        "a" => b'a',
+                        "d" => b'd',
+                        "-" => 0,
+                        o => return Err(format!("bad identity kind {}", o)),
+                    });
+                }
+                p.close()?;
+            }
             o => return Err(format!("bad trailing constraints section {}", o)),
         }
     }
@@ -20852,6 +21198,7 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
         triggers,
         nn_local,
         att_local,
+        identity,
     })
 }
 

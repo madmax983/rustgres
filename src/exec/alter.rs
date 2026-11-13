@@ -992,6 +992,7 @@ pub(crate) fn exec_alter_one(
             default,
             serial,
             compression,
+            identity,
             checks,
             uniques,
             pkey,
@@ -1030,6 +1031,24 @@ pub(crate) fn exec_alter_one(
             if let Some(crate::sql::DefaultExpr::Expr(e)) = default {
                 check_expr_cast_usages(eng, ctx, e)?;
             }
+            // v2.28: PG19 ATExecAddColumn — an identity column
+            // cannot be added recursively: a non-partitioned table
+            // with inheritance children rejects it (42P16).
+            if identity.is_some() {
+                let t = eng
+                    .db
+                    .find_table(name, ctx.snap, &ctx.all_xids, ctx.session);
+                let partitioned = t
+                    .as_ref()
+                    .is_some_and(|t| t.partition.as_ref().is_some_and(|p| p.is_partitioned));
+                if !partitioned && !direct_inheritance_children(eng, ctx, name).is_empty() {
+                    return Err(exec_err(
+                        "42P16",
+                        "cannot recursively add identity column to table that has child tables"
+                            .to_string(),
+                    ));
+                }
+            }
             let res = alter_add_column(
                 eng,
                 ctx,
@@ -1046,6 +1065,7 @@ pub(crate) fn exec_alter_one(
                 pkey,
                 fks,
                 collate.as_deref(),
+                identity.clone(),
             );
             // v0.69: propagate ADD COLUMN to partitions (PG does this).
             // v2.27: PG19 ATExecAddColumn recurses to ALL children,
@@ -1106,6 +1126,21 @@ pub(crate) fn exec_alter_one(
                     // v2.27: plain-inheritance children receive the
                     // column and its CHECK/NOT NULL only — UNIQUE /
                     // PK / FK column constraints never inherit.
+                    // v2.28: a partition child of an identity ADD
+                    // COLUMN shares the parent's sequence: its
+                    // default is the parent's nextval (the flag is
+                    // patched onto the child after the add below).
+                    let child_default = if identity.is_some() && is_partition_child_name {
+                        eng.db
+                            .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                            .and_then(|pt| {
+                                pt.column_index(col)
+                                    .and_then(|ci| pt.defaults.get(ci).cloned().flatten())
+                            })
+                            .or_else(|| default.clone())
+                    } else {
+                        default.clone()
+                    };
                     let child_action = AlterAction::AddColumn {
                         name: col.clone(),
                         if_not_exists: *if_not_exists,
@@ -1114,9 +1149,10 @@ pub(crate) fn exec_alter_one(
                         named_type: named_type.clone(),
                         bit_typmod: *bit_typmod,
                         not_null: *not_null,
-                        default: default.clone(),
+                        default: child_default,
                         serial: *serial,
                         compression: compression.clone(),
+                        identity: None,
                         checks: checks.clone(),
                         uniques: if is_partition_child_name {
                             uniques.clone()
@@ -1138,6 +1174,30 @@ pub(crate) fn exec_alter_one(
                     {
                         prop = Err(e);
                         break;
+                    }
+                    // v2.28: stamp the identity flag on the partition
+                    // child (its default already points at the shared
+                    // parent sequence via child_default above).
+                    if let Some((always, _)) = identity {
+                        if is_partition_child_name {
+                            if let Some(ct) = eng
+                                .db
+                                .find_table(child, ctx.snap, &ctx.all_xids, ctx.session)
+                                .cloned()
+                            {
+                                if let Some(ci) = ct.column_index(col) {
+                                    let mut next = ct;
+                                    while next.identity.len() < next.columns.len() {
+                                        next.identity.push(0);
+                                    }
+                                    next.identity[ci] = if *always { b'a' } else { b'd' };
+                                    if let Err(e) = alter_swap(eng, ctx, child, None, next, None) {
+                                        prop = Err(e);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 ADD_COLUMN_PROPAGATING.with(|c| c.set(prev));
@@ -1746,6 +1806,22 @@ pub(crate) fn exec_alter_one(
         AlterAction::AlterColumnDropNotNull { name: col } => {
             alter_set_not_null(eng, ctx, name, col, false, only)
         }
+        // v2.28: identity column alters (PG19 AT_AddIdentity /
+        // AT_DropIdentity / AT_SetIdentity).
+        AlterAction::AlterColumnAddIdentity {
+            name: col,
+            always,
+            opts,
+        } => alter_add_identity(eng, ctx, name, col, *always, opts, only),
+        AlterAction::AlterColumnDropIdentity {
+            name: col,
+            if_exists,
+        } => alter_drop_identity(eng, ctx, name, col, *if_exists, only),
+        AlterAction::AlterColumnSetIdentity {
+            name: col,
+            generated,
+            opts,
+        } => alter_set_identity(eng, ctx, name, col, *generated, opts, only),
         // v2.05: SET EXPRESSION / DROP EXPRESSION (PG19).
         AlterAction::AlterColumnSetExpression { name: col, expr } => {
             alter_column_expression(eng, ctx, name, col, Some(expr.clone()), false)
@@ -2753,7 +2829,79 @@ pub(crate) fn alter_column_type_ext(
             seen.push(key);
         }
     }
+    // v2.28: PG19 sequence.c — ALTER COLUMN TYPE on an identity
+    // column retypes the backing sequence (seqtypid follows the
+    // column); a non-integer target type is 22023. Only the OWNING
+    // table retypes (partition children share the parent's seq).
+    let identity_seq: Option<(String, crate::sql::SeqType)> = if t.identity_at(idx) != 0 {
+        let st = match col_type {
+            ColType::SmallInt => crate::sql::SeqType::SmallInt,
+            ColType::Int => crate::sql::SeqType::Integer,
+            ColType::BigInt => crate::sql::SeqType::BigInt,
+            _ => {
+                return Err(exec_err(
+                    "22023",
+                    "identity column type must be smallint, integer, or bigint".to_string(),
+                ));
+            }
+        };
+        match t.defaults.get(idx).and_then(|d| d.as_ref()) {
+            Some(crate::sql::DefaultExpr::Nextval(sn)) => Some((sn.clone(), st)),
+            _ => None,
+        }
+    } else {
+        None
+    };
     alter_swap(eng, ctx, name, None, next, Some(new_rows))?;
+    if let Some((seq_name, st)) = identity_seq {
+        let owns = eng
+            .db
+            .find_sequence(&seq_name, ctx.snap, ctx.own)
+            .is_some_and(|sq| {
+                sq.owned_by
+                    .as_ref()
+                    .is_some_and(|(ot, oc, _)| ot == name && oc == col)
+            });
+        if owns {
+            if let Some(live) = eng.db.find_sequence(&seq_name, ctx.snap, ctx.own).cloned() {
+                let prev = live.clone();
+                let mut next_seq = live;
+                next_seq.seq_type = st;
+                // Version supersede, mirroring exec_alter_sequence:
+                // the old version is dropped at this xid and the new
+                // one is created at it.
+                next_seq.created_xmin = ctx.own;
+                next_seq.dropped_xmax = 0;
+                if let Some(versions) = eng.db.sequences.get_mut(&seq_name) {
+                    if let Some(cur) = versions
+                        .iter_mut()
+                        .find(|sq| crate::storage::seq_visible(sq, ctx.snap, ctx.own))
+                    {
+                        cur.dropped_xmax = ctx.own;
+                    }
+                }
+                // Keep bounds inside the new type's range (PG keeps
+                // explicit bounds; the type defaults are the only
+                // out-of-range case the regress suite exercises).
+                let (dmin, dmax) = crate::exec::seq::seq_type_defaults_pub(st, next_seq.increment);
+                if next_seq.max_value > dmax {
+                    next_seq.max_value = dmax;
+                }
+                if next_seq.min_value < dmin {
+                    next_seq.min_value = dmin;
+                }
+                eng.db
+                    .sequences
+                    .get_mut(&seq_name)
+                    .expect("sequence visible")
+                    .push(next_seq);
+                ctx.writes.push(crate::storage::WriteOp::AlterSequence {
+                    name: seq_name.clone(),
+                    prev,
+                });
+            }
+        }
+    }
     Ok(ExecResult::Command {
         tag: "ALTER TABLE".to_string(),
     })
@@ -2778,6 +2926,8 @@ pub(crate) fn alter_add_column(
     fks: &[FkDef],
     // v2.21: the new column's COLLATE, if any.
     collate: Option<&str>,
+    // v2.28: GENERATED ... AS IDENTITY on the new column.
+    identity: Option<(bool, crate::sql::SequenceOpts)>,
 ) -> Result<ExecResult, ExecError> {
     alter_add_column_ext(
         eng,
@@ -2796,6 +2946,8 @@ pub(crate) fn alter_add_column(
         fks,
         false,
         collate,
+        identity,
+        None,
     )
 }
 
@@ -2819,6 +2971,10 @@ pub(crate) fn alter_add_column_ext(
     bypass_typed: bool,
     // v2.21: the new column's COLLATE, if any.
     collate: Option<&str>,
+    // v2.28: identity on the new column + a shared backing sequence
+    // name for partition propagation (None = create a fresh one).
+    identity: Option<(bool, crate::sql::SequenceOpts)>,
+    identity_seq: Option<String>,
 ) -> Result<ExecResult, ExecError> {
     let t = eng
         .db
@@ -2883,7 +3039,7 @@ pub(crate) fn alter_add_column_ext(
         .rows
         .iter()
         .any(|r| row_visible(r, ctx.snap, &ctx.all_xids));
-    if not_null && default.is_none() && has_rows {
+    if not_null && default.is_none() && has_rows && identity.is_none() {
         return Err(exec_err(
             "23502",
             format!("column \"{}\" contains null values", col),
@@ -2911,6 +3067,20 @@ pub(crate) fn alter_add_column_ext(
     if next.gen_cols.len() < next.columns.len() {
         next.gen_cols.push(None);
     }
+    // v2.28: keep identity metadata parallel to `columns`.
+    while next.identity.len() < next.columns.len() - 1 {
+        next.identity.push(0);
+    }
+    next.identity.push(match &identity {
+        Some((always, _)) => {
+            if *always {
+                b'a'
+            } else {
+                b'd'
+            }
+        }
+        None => 0,
+    });
     // v1.93: keep the declared bit typmods parallel to `columns`
     // (padding a short vec like col_compression below).
     if next.bit_typmods.len() < next.columns.len() - 1 {
@@ -3012,6 +3182,21 @@ pub(crate) fn alter_add_column_ext(
     // has ended, and point the new column's default at it.
     if let Some(kind) = serial_kind {
         let seq_name = create_serial_sequence(eng, ctx, name, col, kind, None)?;
+        *next
+            .defaults
+            .last_mut()
+            .expect("new column default just pushed") = Some(DefaultExpr::Nextval(seq_name));
+    }
+    // v2.28: identity backing sequence (fresh, or the partitioned
+    // parent's shared sequence when propagating). The row-fill loop
+    // below evaluates the new column's default per existing row, so
+    // a populated table is filled from the sequence in row order
+    // (PG19 ATExecAddColumn for identity).
+    if let Some((_, opts)) = &identity {
+        let seq_name = match &identity_seq {
+            Some(sn) => sn.clone(),
+            None => create_identity_sequence(eng, ctx, name, col, *col_type, opts, None)?,
+        };
         *next
             .defaults
             .last_mut()
@@ -4712,6 +4897,20 @@ fn set_not_null_impl(
         )
     })?;
     let refnn = super::locality::ConRef::NotNull(col.to_string());
+    // v2.28: PG19 ATExecDropNotNull — an identity column must stay
+    // NOT NULL while it is an identity column (55000). Only the
+    // user-addressed table is checked; recursion into partition
+    // children of an identity parent is unreachable because the
+    // parent check fires first.
+    if !set && top && t.identity_at(ci) != 0 {
+        return Err(exec_err(
+            "55000",
+            format!(
+                "column \"{}\" of relation \"{}\" is an identity column",
+                col, name
+            ),
+        ));
+    }
     if set {
         if !t.not_null.get(ci).copied().unwrap_or(false) {
             for r in t
@@ -5053,6 +5252,292 @@ pub(crate) fn alter_column_expression(
     })
 }
 
+/// v2.28: shared lookup for the identity ALTER handlers.
+fn identity_target(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    name: &str,
+    col: &str,
+) -> Result<(Table, usize), ExecError> {
+    let t = eng
+        .db
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
+        .clone();
+    let ci = t.column_index(col).ok_or_else(|| {
+        exec_err(
+            "42703",
+            format!("column \"{}\" of relation \"{}\" does not exist", col, name),
+        )
+    })?;
+    Ok((t, ci))
+}
+
+/// v2.28: the partition-context guards shared by the identity ALTER
+/// handlers (PG19 tablecmds.c: 42P16 family). `verb` is "add" /
+/// "change" / "drop" wording per handler.
+fn identity_partition_guard(t: &Table, only: bool, verb: &str) -> Result<(), ExecError> {
+    if t.partition.as_ref().is_some_and(|p| p.parent.is_some()) {
+        return Err(exec_err(
+            "42P16",
+            match verb {
+                "add" => "cannot add identity to a column of a partition".to_string(),
+                "drop" => "cannot drop identity from a column of a partition".to_string(),
+                _ => "cannot change identity column of a partition".to_string(),
+            },
+        ));
+    }
+    if only && t.partition.as_ref().is_some_and(|p| p.is_partitioned) {
+        return Err(exec_err(
+            "42P16",
+            match verb {
+                "add" => {
+                    "cannot add identity to a column of only the partitioned table".to_string()
+                }
+                "drop" => {
+                    "cannot drop identity from a column of only the partitioned table".to_string()
+                }
+                _ => "cannot change identity column of only the partitioned table".to_string(),
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// v2.28: stamp (or clear, kind == 0) the identity flag + default on
+/// every partition descendant of `name` for column `col`. The
+/// descendants share the parent's sequence: setting passes the
+/// parent's Nextval default; clearing removes the default too.
+fn identity_propagate_partitions(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    col: &str,
+    kind: u8,
+    parent_default: &Option<DefaultExpr>,
+) -> Result<(), ExecError> {
+    for child in partition_descendants(eng, ctx, name) {
+        if eng.db.is_temp_table(ctx.session, &child) {
+            continue;
+        }
+        let Some(ct) = eng
+            .db
+            .find_table(&child, ctx.snap, &ctx.all_xids, ctx.session)
+            .cloned()
+        else {
+            continue;
+        };
+        let Some(ci) = ct.column_index(col) else {
+            continue;
+        };
+        let mut next = ct;
+        while next.identity.len() < next.columns.len() {
+            next.identity.push(0);
+        }
+        next.identity[ci] = kind;
+        if ci < next.defaults.len() {
+            next.defaults[ci] = if kind == 0 {
+                None
+            } else {
+                parent_default.clone()
+            };
+        }
+        alter_swap(eng, ctx, &child, None, next, None)?;
+    }
+    Ok(())
+}
+
+/// v2.28: `ALTER COLUMN c ADD GENERATED {ALWAYS|BY DEFAULT} AS
+/// IDENTITY [(opts)]` (PG19 ATExecAddIdentity).
+pub(crate) fn alter_add_identity(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    col: &str,
+    always: bool,
+    opts: &crate::sql::SequenceOpts,
+    only: bool,
+) -> Result<ExecResult, ExecError> {
+    let (t, ci) = identity_target(eng, ctx, name, col)?;
+    identity_partition_guard(&t, only, "add")?;
+    if t.identity_at(ci) != 0 {
+        return Err(exec_err(
+            "55000",
+            format!(
+                "column \"{}\" of relation \"{}\" is already an identity column",
+                col, name
+            ),
+        ));
+    }
+    if !t.not_null.get(ci).copied().unwrap_or(false) {
+        return Err(exec_err(
+            "55000",
+            format!(
+                "column \"{}\" of relation \"{}\" must be declared NOT NULL before identity can be added",
+                col, name
+            ),
+        ));
+    }
+    if t.defaults.get(ci).and_then(|d| d.as_ref()).is_some() {
+        return Err(exec_err(
+            "55000",
+            format!(
+                "column \"{}\" of relation \"{}\" already has a default value",
+                col, name
+            ),
+        ));
+    }
+    let ctype = t.columns[ci].1;
+    if !matches!(ctype, ColType::SmallInt | ColType::Int | ColType::BigInt) {
+        return Err(exec_err(
+            "42P16",
+            "identity column type must be smallint, integer, or bigint".to_string(),
+        ));
+    }
+    // PG19: existing NULLs block ADD GENERATED (23502).
+    if t.rows
+        .iter()
+        .filter(|r| row_visible(r, ctx.snap, &ctx.all_xids))
+        .any(|r| r.values.get(ci) == Some(&Value::Null))
+    {
+        return Err(exec_err(
+            "23502",
+            format!(
+                "column \"{}\" of relation \"{}\" contains null values",
+                col, name
+            ),
+        ));
+    }
+    let is_temp = eng.db.is_temp_table(ctx.session, name);
+    let seq_name = create_identity_sequence(
+        eng,
+        ctx,
+        name,
+        col,
+        ctype,
+        opts,
+        if is_temp { Some(ctx.session) } else { None },
+    )?;
+    let default = Some(DefaultExpr::Nextval(seq_name));
+    let mut next = t.clone();
+    while next.identity.len() < next.columns.len() {
+        next.identity.push(0);
+    }
+    next.identity[ci] = if always { b'a' } else { b'd' };
+    if ci < next.defaults.len() {
+        next.defaults[ci] = default.clone();
+    }
+    alter_swap(eng, ctx, name, None, next, None)?;
+    identity_propagate_partitions(
+        eng,
+        ctx,
+        name,
+        col,
+        if always { b'a' } else { b'd' },
+        &default,
+    )?;
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
+/// v2.28: `ALTER COLUMN c DROP IDENTITY [IF EXISTS]` (PG19
+/// ATExecDropIdentity): drops the backing sequence and the default;
+/// NOT NULL stays.
+pub(crate) fn alter_drop_identity(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    col: &str,
+    if_exists: bool,
+    only: bool,
+) -> Result<ExecResult, ExecError> {
+    let (t, ci) = identity_target(eng, ctx, name, col)?;
+    identity_partition_guard(&t, only, "drop")?;
+    if t.identity_at(ci) == 0 {
+        if if_exists {
+            return Ok(ExecResult::Command {
+                tag: "ALTER TABLE".to_string(),
+            });
+        }
+        return Err(exec_err(
+            "55000",
+            format!(
+                "column \"{}\" of relation \"{}\" is not an identity column",
+                col, name
+            ),
+        ));
+    }
+    let seq_name = match t.defaults.get(ci).and_then(|d| d.as_ref()) {
+        Some(DefaultExpr::Nextval(sn)) => Some(sn.clone()),
+        _ => None,
+    };
+    let mut next = t.clone();
+    while next.identity.len() < next.columns.len() {
+        next.identity.push(0);
+    }
+    next.identity[ci] = 0;
+    if ci < next.defaults.len() {
+        next.defaults[ci] = None;
+    }
+    alter_swap(eng, ctx, name, None, next, None)?;
+    identity_propagate_partitions(eng, ctx, name, col, 0, &None)?;
+    if let Some(sn) = seq_name {
+        drop_serial_sequence(eng, ctx, &sn)?;
+    }
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
+/// v2.28: `ALTER COLUMN c SET GENERATED ...` and/or identity
+/// sequence-option alters (PG19 ATExecSetIdentity + the sequence
+/// alters gram.y chains onto the same phrase).
+pub(crate) fn alter_set_identity(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    col: &str,
+    generated: Option<bool>,
+    opts: &crate::sql::SequenceOpts,
+    only: bool,
+) -> Result<ExecResult, ExecError> {
+    let (t, ci) = identity_target(eng, ctx, name, col)?;
+    identity_partition_guard(&t, only, "change")?;
+    if t.identity_at(ci) == 0 {
+        return Err(exec_err(
+            "55000",
+            format!(
+                "column \"{}\" of relation \"{}\" is not an identity column",
+                col, name
+            ),
+        ));
+    }
+    let seq_name = match t.defaults.get(ci).and_then(|d| d.as_ref()) {
+        Some(DefaultExpr::Nextval(sn)) => Some(sn.clone()),
+        _ => None,
+    };
+    if let Some(always) = generated {
+        let kind = if always { b'a' } else { b'd' };
+        let mut next = t.clone();
+        while next.identity.len() < next.columns.len() {
+            next.identity.push(0);
+        }
+        next.identity[ci] = kind;
+        let default = next.defaults.get(ci).cloned().unwrap_or(None);
+        alter_swap(eng, ctx, name, None, next, None)?;
+        identity_propagate_partitions(eng, ctx, name, col, kind, &default)?;
+    }
+    if *opts != crate::sql::SequenceOpts::default() {
+        if let Some(sn) = &seq_name {
+            exec_alter_sequence(eng, ctx, sn, false, opts)?;
+        }
+    }
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
 pub(crate) fn alter_set_default(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -5070,6 +5555,17 @@ pub(crate) fn alter_set_default(
             format!("column \"{}\" of relation \"{}\" does not exist", col, name),
         )
     })?;
+    // v2.28: PG19 ATExecSetDefault — an identity column's default is
+    // its sequence; SET DEFAULT is rejected (55000).
+    if default.is_some() && t.identity_at(ci) != 0 {
+        return Err(exec_err(
+            "55000",
+            format!(
+                "column \"{}\" of relation \"{}\" is an identity column",
+                col, name
+            ),
+        ));
+    }
     if let Some(DefaultExpr::Expr(e)) = &default {
         validate_constraint_expr(e, "DEFAULT").map_err(sql_err)?;
         // v1.96: a NEW default expression needs USAGE on the types

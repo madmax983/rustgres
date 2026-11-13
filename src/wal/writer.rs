@@ -1382,6 +1382,11 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 } else {
                     vec![None; __t.columns.len()]
                 };
+                __t.identity = if dc.identity.len() == __t.columns.len() {
+                    dc.identity.clone()
+                } else {
+                    vec![0; __t.columns.len()]
+                };
                 __t.triggers = dc.triggers.clone();
             }
             Err(e) => {

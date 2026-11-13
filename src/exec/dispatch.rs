@@ -180,6 +180,7 @@ pub(crate) fn execute_inner(
         }
         Stmt::Insert {
             table,
+            overriding,
             columns,
             rows,
             select,
@@ -190,6 +191,7 @@ pub(crate) fn execute_inner(
             eng,
             ctx,
             table,
+            *overriding,
             columns,
             rows,
             select,

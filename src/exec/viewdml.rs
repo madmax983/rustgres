@@ -2241,6 +2241,9 @@ pub(crate) fn exec_insert_auto_view(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     view: &str,
+    // v2.28: OVERRIDING clause (applies to the base relation's
+    // identity columns, PG19).
+    overriding: Option<u8>,
     columns: &Option<Vec<InsertTarget>>,
     rows: &[Vec<InsertValue>],
     select: &Option<SelectStmt>,
@@ -2438,6 +2441,7 @@ pub(crate) fn exec_insert_auto_view(
         eng,
         ctx,
         &av.base,
+        overriding,
         &t_columns,
         rows,
         select,
@@ -3101,7 +3105,11 @@ pub(crate) fn exec_merge_auto_view(
                 }
                 MergeAction::Update { sets: t_sets }
             }
-            MergeAction::Insert { columns, values } => {
+            MergeAction::Insert {
+                columns,
+                values,
+                overriding,
+            } => {
                 // v2.18: view column defaults fill omitted columns
                 // (and the whole row for INSERT DEFAULT VALUES).
                 let vdefs = view_defaults_of(eng, ctx, view, av.view_cols.len());
@@ -3184,6 +3192,7 @@ pub(crate) fn exec_merge_auto_view(
                 MergeAction::Insert {
                     columns: t_cols,
                     values: values.clone(),
+                    overriding: *overriding,
                 }
             }
             MergeAction::Delete => MergeAction::Delete,
@@ -3209,7 +3218,9 @@ pub(crate) fn exec_merge_auto_view(
                 collect_col_refs(c, &quals, &mut read_cols);
             }
             match &w.action {
-                MergeAction::Insert { columns, values } => {
+                MergeAction::Insert {
+                    columns, values, ..
+                } => {
                     has_insert = true;
                     ins_cols = match columns {
                         Some(cs) => cs.clone(),

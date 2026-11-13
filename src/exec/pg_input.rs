@@ -4113,6 +4113,7 @@ fn builtin_function_exists(name: &str) -> bool {
             | "col_description"
             | "pg_table_size"
             | "pg_relation_size"
+            | "pg_get_serial_sequence"
             | "nextval"
             | "currval"
             | "setval"

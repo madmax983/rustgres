@@ -29,6 +29,9 @@ pub(crate) struct TableMeta {
     pub(crate) fks: Vec<FkDef>,
     /// v2.03: generated columns, parallel to `columns`.
     pub(crate) gen_cols: Vec<Option<(crate::sql::Expr, bool)>>,
+    /// v2.28: identity kinds, parallel to `columns` (0 / b'a' / b'd'),
+    /// normalized to full length by `TableMeta::of`.
+    pub(crate) identity: Vec<u8>,
 }
 
 impl TableMeta {
@@ -45,6 +48,7 @@ impl TableMeta {
             pkey: t.pkey.clone(),
             fks: t.fks.clone(),
             gen_cols: t.gen_cols.clone(),
+            identity: (0..t.columns.len()).map(|i| t.identity_at(i)).collect(),
         }
     }
 

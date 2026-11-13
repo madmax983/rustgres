@@ -1266,6 +1266,8 @@ pub(crate) fn exec_alter_type(
                             &[],
                             true,
                             None,
+                            None,
+                            None,
                         )?;
                     }
                 }

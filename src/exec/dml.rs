@@ -1765,11 +1765,14 @@ pub(crate) fn exec_create_table_as(
         deferred_not_null: Vec::new(),
         of_type: None,
         gen_cols: vec![None; ncols],
+        identity: vec![None; ncols],
+        identity_opts: vec![None; ncols],
         unlogged: false,
         // v2.21: CTAS columns take the query's output collations.
         collations: ctas_collations,
         // v2.26: CTAS has no PARTITION OF element list.
         partition_overrides: None,
+        typed_elements: Vec::new(),
     };
     // CTAS definitions never carry constraints; the effective def is discarded.
     let _ = create_table_from_def(eng, ctx, name, &def, temp)?;
@@ -2737,10 +2740,19 @@ pub(crate) fn exec_delete_view(
 /// gets first refusal; with no enabled INSERT rules the statement
 /// runs through `exec_insert_inner` untouched.
 #[allow(clippy::too_many_arguments)]
+/// v2.28: is this SET-clause expression the bare `DEFAULT` keyword?
+/// The expression parser leaves DEFAULT as an unqualified column
+/// reference named "default" (no Expr variant exists for it).
+pub(crate) fn is_bare_default_expr(e: &Expr) -> bool {
+    matches!(e, Expr::Column { table: None, name } if name == "default")
+}
+
 pub(crate) fn exec_insert(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     table: &str,
+    // v2.28: OVERRIDING {SYSTEM|USER} VALUE (None / b's' / b'u').
+    overriding: Option<u8>,
     columns: &Option<Vec<InsertTarget>>,
     rows: &[Vec<InsertValue>],
     select: &Option<SelectStmt>,
@@ -2752,6 +2764,7 @@ pub(crate) fn exec_insert(
         eng,
         ctx,
         table,
+        overriding,
         columns,
         rows,
         select,
@@ -2765,6 +2778,7 @@ pub(crate) fn exec_insert(
         eng,
         ctx,
         table,
+        overriding,
         columns,
         rows,
         select,
@@ -2778,6 +2792,8 @@ pub(crate) fn exec_insert_inner(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     table: &str,
+    // v2.28: OVERRIDING {SYSTEM|USER} VALUE (None / b's' / b'u').
+    overriding: Option<u8>,
     columns: &Option<Vec<InsertTarget>>,
     rows: &[Vec<InsertValue>],
     select: &Option<SelectStmt>,
@@ -2806,6 +2822,7 @@ pub(crate) fn exec_insert_inner(
             eng,
             ctx,
             table,
+            overriding,
             columns,
             rows,
             select,
@@ -3180,6 +3197,26 @@ pub(crate) fn exec_insert_inner(
                 for (j, v) in cells.iter().enumerate() {
                     let (ti, indir) = targets[j];
                     let (cname, ctype) = &meta.columns[ti];
+                    // v2.28: identity rules for INSERT...SELECT rows
+                    // (same as VALUES: ALWAYS needs OVERRIDING SYSTEM,
+                    // OVERRIDING USER discards the source value).
+                    {
+                        let idk = meta.identity.get(ti).copied().unwrap_or(0);
+                        if idk != 0 && indir.is_empty() {
+                            if overriding == Some(b'u') {
+                                continue;
+                            }
+                            if idk == b'a' && overriding != Some(b's') {
+                                return Err(exec_err(
+                                    "428C9",
+                                    format!(
+                                        "cannot insert a non-DEFAULT value into column \"{}\"",
+                                        cname
+                                    ),
+                                ));
+                            }
+                        }
+                    }
                     if !indir.is_empty() {
                         // v0.84: indirection target in INSERT...SELECT.
                         // SELECT rows are Values, so coerce to the leaf
@@ -3344,6 +3381,30 @@ pub(crate) fn exec_insert_inner(
                                 cname
                             ),
                         ));
+                    }
+                    // v2.28: identity columns (PG19 rewriteInsertRows /
+                    // nodeModifyTable): an explicit non-DEFAULT value
+                    // into a GENERATED ALWAYS column is 428C9 unless
+                    // OVERRIDING SYSTEM VALUE; OVERRIDING USER VALUE
+                    // discards the user value for identity columns of
+                    // either kind (the column stays un-explicit, so
+                    // the default fill below supplies nextval).
+                    {
+                        let idk = meta.identity.get(ci).copied().unwrap_or(0);
+                        if idk != 0 && !matches!(v, InsertValue::Default) {
+                            if overriding == Some(b'u') && indir.is_empty() {
+                                continue;
+                            }
+                            if idk == b'a' && overriding != Some(b's') {
+                                return Err(exec_err(
+                                    "428C9",
+                                    format!(
+                                        "cannot insert a non-DEFAULT value into column \"{}\"",
+                                        cname
+                                    ),
+                                ));
+                            }
+                        }
                     }
                     // v0.84: indirection targets (`f2[1]`, `f3.if2`).
                     // PG19 rejects DEFAULT into an indirection path
@@ -4721,6 +4782,16 @@ pub(crate) fn exec_update_inner(
                 ));
             }
         }
+        // v2.28: PG19 — a GENERATED ALWAYS identity column can only
+        // be updated to DEFAULT (428C9); BY DEFAULT is unrestricted.
+        for ((name, expr), &ci) in sets.iter().zip(set_cols.iter()) {
+            if meta.identity.get(ci).copied().unwrap_or(0) == b'a' && !is_bare_default_expr(expr) {
+                return Err(exec_err(
+                    "428C9",
+                    format!("column \"{}\" can only be updated to DEFAULT", name),
+                ));
+            }
+        }
         let columns = meta.columns.clone();
         // v0.85: composite type names for positional record coercion on
         // UPDATE assignment.
@@ -4979,6 +5050,31 @@ pub(crate) fn exec_update_inner(
             check_row_lock(eng, leaf, *id, ctx.own)?;
             let mut new_values = values.to_vec();
             for ((_, expr), &ci) in sets.iter().zip(set_cols.iter()) {
+                // v2.28: `SET col = DEFAULT` (PG19): the parser
+                // leaves DEFAULT as a bare column ref; substitute the
+                // column's default (nextval for identity/serial).
+                if is_bare_default_expr(expr) {
+                    let (cname, ctype) = &columns[ci];
+                    let dd = domain_default(eng, &meta, ci).cloned();
+                    let v = match meta.defaults[ci].as_ref().or(dd.as_ref()) {
+                        Some(d) => eval_default(
+                            eng,
+                            ctx.snap,
+                            ctx.own,
+                            ctx.session,
+                            ctx.role,
+                            d,
+                            ctype,
+                            cname,
+                        )?,
+                        None => Value::Null,
+                    };
+                    new_values[ci] = coerce_value(v, ctype, cname)?;
+                    let comp = composite_types.get(ci).and_then(|o| o.as_deref());
+                    let assigned = std::mem::replace(&mut new_values[ci], Value::Null);
+                    new_values[ci] = coerce_assign_composite(eng, assigned, comp)?;
+                    continue;
+                }
                 let v = match &from_data {
                     None => eval_update_expr(
                         eng,

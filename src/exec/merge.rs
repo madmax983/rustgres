@@ -340,7 +340,9 @@ pub(crate) fn exec_merge(
                     }
                 }
             }
-            MergeAction::Insert { columns, values } => {
+            MergeAction::Insert {
+                columns, values, ..
+            } => {
                 if let Some(cols) = columns {
                     let mut seen = HashSet::new();
                     for c in cols {
@@ -924,6 +926,7 @@ pub(crate) fn exec_merge(
                 if let MergeAction::Insert {
                     columns: icols,
                     values,
+                    overriding,
                 } = &w.action
                 {
                     let row = build_merge_insert(
@@ -933,6 +936,7 @@ pub(crate) fn exec_merge(
                         table,
                         icols,
                         values,
+                        *overriding,
                         &src_schema,
                         srow,
                         &ctes,
@@ -1728,6 +1732,7 @@ fn build_merge_insert(
     table: &str,
     icols: &Option<Vec<String>>,
     values: &Option<Vec<Expr>>,
+    overriding: Option<u8>,
     src_schema: &[QCol],
     srow: &Row,
     ctes: &[Rc<CteBinding>],
@@ -1744,6 +1749,30 @@ fn build_merge_insert(
             None => (0..exprs.len()).collect(),
         };
         for (expr, &ci) in exprs.iter().zip(targets.iter()) {
+            // v2.28: identity rules for MERGE insert actions (PG19
+            // identity.sql itest15/16; ExecInsert via MERGE applies
+            // the plain-INSERT rules — see exec_insert's VALUES
+            // builder): explicit non-DEFAULT value into a GENERATED
+            // ALWAYS identity column is 428C9 unless OVERRIDING
+            // SYSTEM VALUE; OVERRIDING USER VALUE discards the user
+            // value for identity columns of either kind (stays
+            // un-explicit, so the default fill below supplies
+            // nextval). A bare DEFAULT takes the default as usual.
+            let idk = meta.identity.get(ci).copied().unwrap_or(0);
+            if idk != 0 && !is_bare_default_expr(expr) {
+                if overriding == Some(b'u') {
+                    continue;
+                }
+                if idk == b'a' && overriding != Some(b's') {
+                    return Err(exec_err(
+                        "428C9",
+                        format!(
+                            "cannot insert a non-DEFAULT value into column \"{}\"",
+                            meta.columns[ci].0
+                        ),
+                    ));
+                }
+            }
             let v = eval_m(eng, ctx, src_schema, srow, expr, ctes)?;
             let (cname, ctype) = &meta.columns[ci];
             let mut nv = coerce_value(v, ctype, cname)?;

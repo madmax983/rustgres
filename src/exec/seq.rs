@@ -14,6 +14,24 @@ use super::*;
 /// ALTER (None for CREATE): unresolved options fall back to it, and
 /// `AS` on ALTER resets min/max to the new type's bounds only when the
 /// old bounds were the old type's defaults.
+/// v2.28: PG19 default (min, max) bounds for a sequence type and
+/// direction, used when an identity column's type change retypes
+/// its backing sequence.
+pub(crate) fn seq_type_defaults_pub(st: crate::sql::SeqType, increment: i64) -> (i64, i64) {
+    use crate::sql::SeqType;
+    let tmax: i64 = match st {
+        SeqType::SmallInt => i16::MAX as i64,
+        SeqType::Integer => i32::MAX as i64,
+        SeqType::BigInt => i64::MAX,
+    };
+    let tmin: i64 = match st {
+        SeqType::SmallInt => i16::MIN as i64,
+        SeqType::Integer => i32::MIN as i64,
+        SeqType::BigInt => i64::MIN,
+    };
+    if increment < 0 { (tmin, -1) } else { (1, tmax) }
+}
+
 pub(crate) fn sequence_params(
     opts: &SequenceOpts,
     cur: Option<&crate::storage::Sequence>,
@@ -328,6 +346,23 @@ pub(crate) fn exec_alter_sequence(
     // bound-reset semantics).
     let (seq_type, start, increment, min_value, max_value, cycle, cache, restart) =
         sequence_params(opts, Some(live))?;
+    // v2.28: PG19 sequence.c — an identity column's sequence cannot
+    // be re-owned directly (0A000 "cannot change ownership of
+    // identity sequence"); only DROP IDENTITY detaches it.
+    if opts.owned_by.is_some() {
+        if let Some((tbl, col, _)) = &live.owned_by {
+            if let Some(t) = eng.db.find_table(tbl, ctx.snap, &ctx.all_xids, ctx.session) {
+                if let Some(ci) = t.column_index(col) {
+                    if t.identity_at(ci) != 0 {
+                        return Err(exec_err(
+                            "0A000",
+                            "cannot change ownership of identity sequence".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
     // v0.98: OWNED BY is validated (table/column existence) before any
     // version is created.
     let owned_by_update: Option<Option<(String, String, Option<u64>)>> = match &opts.owned_by {

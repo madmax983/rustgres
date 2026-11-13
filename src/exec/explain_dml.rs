@@ -70,6 +70,7 @@ pub(crate) fn validate_explain_stmt(
         Stmt::Select(sel) => validate_explain_select(q, sel),
         Stmt::Insert {
             table,
+            overriding: _,
             columns,
             rows,
             select,
@@ -1366,6 +1367,7 @@ pub(crate) fn exec_explain_dml_analyze(
     match stmt {
         Stmt::Insert {
             table,
+            overriding: _,
             columns,
             rows,
             select,
@@ -1408,6 +1410,7 @@ pub(crate) fn exec_explain_dml_analyze(
                 eng,
                 ctx,
                 table,
+                None,
                 columns,
                 rows,
                 select,

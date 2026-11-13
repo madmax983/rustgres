@@ -77,6 +77,10 @@ fn info_column_row(
     nullable: &str,
     data_type: &str,
     is_updatable: &str,
+    // v2.28: the 7 identity cells (is_identity, identity_generation,
+    // identity_start, identity_increment, identity_maximum,
+    // identity_minimum, identity_cycle).
+    identity_cells: Vec<Value>,
 ) -> QRow {
     let t = |v: &str| Value::text(v);
     QRow {
@@ -115,15 +119,16 @@ fn info_column_row(
             Value::Null, // maximum_cardinality
             t(column),   // dtd_identifier (PG: the column's own name-ish id)
             t("NO"),     // is_self_referencing
-            t("NO"),     // is_identity
-            Value::Null, // identity_generation
-            Value::Null, // identity_start
-            Value::Null, // identity_increment
-            Value::Null, // identity_maximum
-            Value::Null, // identity_minimum
-            Value::Null, // identity_cycle
-            t("NEVER"),  // is_generated
-            Value::Null, // generation_expression
+            // v2.28: identity cells supplied by the caller.
+            identity_cells[0].clone(), // is_identity
+            identity_cells[1].clone(), // identity_generation
+            identity_cells[2].clone(), // identity_start
+            identity_cells[3].clone(), // identity_increment
+            identity_cells[4].clone(), // identity_maximum
+            identity_cells[5].clone(), // identity_minimum
+            identity_cells[6].clone(), // identity_cycle
+            t("NEVER"),                // is_generated
+            Value::Null,               // generation_expression
             t(is_updatable),
         ]),
         prov: Vec::new(),
@@ -190,11 +195,54 @@ pub(crate) fn info_columns_scan(
         })
         .collect();
     tables.sort_by(|a, b| a.0.cmp(&b.0));
+    // v2.28: PG19 information_schema identity cells: non-identity
+    // columns report is_identity NO, NULL generation/bounds, and
+    // identity_cycle NO (the view's quirk); identity columns report
+    // the backing sequence's parameters and a NULL column_default.
+    let no_identity: Vec<Value> = vec![
+        Value::text("NO"),
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::Null,
+        Value::text("NO"),
+    ];
     for (tn, t) in tables {
         for (i, (cn, ty)) in t.columns.iter().enumerate() {
-            let default = match &t.defaults[i] {
-                Some(d) => Value::text(format!("{:?}", d)),
-                None => Value::Null,
+            let idk = t.identity_at(i);
+            let default = if idk != 0 {
+                Value::Null
+            } else {
+                match &t.defaults[i] {
+                    Some(d) => Value::text(format!("{:?}", d)),
+                    None => Value::Null,
+                }
+            };
+            let identity_cells = if idk == 0 {
+                no_identity.clone()
+            } else {
+                let seq = t.defaults.get(i).and_then(|d| d.as_ref()).and_then(|d| {
+                    if let crate::sql::DefaultExpr::Nextval(sn) = d {
+                        db.find_sequence(sn, snap, own)
+                    } else {
+                        None
+                    }
+                });
+                let num = |f: &dyn Fn(&crate::storage::Sequence) -> i64| {
+                    seq.map(|sq| Value::text(f(sq).to_string()))
+                        .unwrap_or(Value::Null)
+                };
+                vec![
+                    Value::text("YES"),
+                    Value::text(if idk == b'a' { "ALWAYS" } else { "BY DEFAULT" }),
+                    num(&|sq| sq.start),
+                    num(&|sq| sq.increment),
+                    num(&|sq| sq.max_value),
+                    num(&|sq| sq.min_value),
+                    seq.map(|sq| Value::text(if sq.cycle { "YES" } else { "NO" }))
+                        .unwrap_or_else(|| Value::text("NO")),
+                ]
             };
             rows.push(info_column_row(
                 &tn,
@@ -206,6 +254,7 @@ pub(crate) fn info_columns_scan(
                 if t.not_null[i] { "NO" } else { "YES" },
                 &format!("{:?}", ty),
                 "YES",
+                identity_cells,
             ));
         }
     }
@@ -259,6 +308,7 @@ pub(crate) fn info_columns_scan(
                 "YES",
                 &format!("{:?}", ty),
                 if upd { "YES" } else { "NO" },
+                no_identity.clone(),
             ));
         }
     }
@@ -317,6 +367,19 @@ pub(crate) fn info_sequences_scan(
         }) else {
             continue;
         };
+        // v2.28: identity backing sequences are internal (PG19
+        // DEPENDENCY_INTERNAL) and hidden from
+        // information_schema.sequences; serial sequences stay
+        // visible. The owning column's identity flag decides.
+        if let Some((tbl, col, _)) = &s.owned_by {
+            if let Some(t) = db.find_table(tbl, snap, &[own], 0) {
+                if let Some(ci) = t.column_index(col) {
+                    if t.identity_at(ci) != 0 {
+                        continue;
+                    }
+                }
+            }
+        }
         // v0.99: data_type/precision follow the stored sequence type
         // (PG19 seqtypid), not inferred bounds.
         let (data_type, precision) = match s.seq_type {

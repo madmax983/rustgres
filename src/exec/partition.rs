@@ -806,6 +806,42 @@ pub(crate) fn attach_partition(
                 "cannot attach inheritance child as partition".to_string(),
             ));
         }
+        // v2.28: PG19 identity attach rules — a table carrying its
+        // OWN identity column cannot be attached (55000); a parent
+        // identity column requires the child's column to be NOT
+        // NULL (42804), and the child then adopts the identity.
+        for (ci, (cname, _)) in child.columns.iter().enumerate() {
+            if child.identity_at(ci) != 0 {
+                return Err(exec_err(
+                    "55000",
+                    format!(
+                        "table \"{}\" being attached contains an identity column \"{}\"",
+                        child_name, cname
+                    ),
+                ));
+            }
+        }
+        if let Some(parent) = eng
+            .db
+            .find_table(parent_name, ctx.snap, &ctx.all_xids, ctx.session)
+        {
+            for (pi, (pname, _)) in parent.columns.iter().enumerate() {
+                if parent.identity_at(pi) == 0 {
+                    continue;
+                }
+                if let Some(ci) = child.column_index(pname) {
+                    if !child.not_null.get(ci).copied().unwrap_or(false) {
+                        return Err(exec_err(
+                            "42804",
+                            format!(
+                                "column \"{}\" in child table \"{}\" must be marked NOT NULL",
+                                pname, child_name
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
         // Bound form must match the parent's strategy (PG19
         // transformPartitionBound, 42P16).
         let form_ok = match (&pinfo.method, bound_def) {
@@ -1290,6 +1326,16 @@ pub(crate) fn attach_partition(
                         && next.not_null.get(i).copied().unwrap_or(false)
                     {
                         next.set_nn_local(i, false);
+                    }
+                    // v2.28: the child adopts the parent's identity
+                    // (flag + shared nextval default).
+                    let pk = parent.identity_at(pi);
+                    if pk != 0 {
+                        if next.identity.len() < next.columns.len() {
+                            next.identity.resize(next.columns.len(), 0);
+                        }
+                        next.identity[i] = pk;
+                        next.defaults[i] = parent.defaults.get(pi).cloned().unwrap_or(None);
                     }
                 }
                 next.set_att_local(i, false);
@@ -4945,6 +4991,35 @@ pub(crate) fn expand_like_clauses(
             // columns — a nextval DEFAULT may still ride along via
             // INCLUDING DEFAULTS, referencing the source's sequence).
             def.serial.push(None);
+            // v2.28: identity only with INCLUDING IDENTITY (or ALL):
+            // the flag copies and a FRESH sequence is created at
+            // wire time (identity_opts carries the source sequence's
+            // parameters, PG19 transformTableLikeClause). Without the
+            // option the column is plain (and its nextval default can
+            // still ride via INCLUDING DEFAULTS, like serial's).
+            {
+                let kind = src.identity_at(i);
+                if including(LikeKind::Identity) && kind != 0 {
+                    def.identity.push(Some(kind));
+                    let mut o = crate::sql::SequenceOpts::default();
+                    if let Some(crate::sql::DefaultExpr::Nextval(sn)) =
+                        src.defaults.get(i).cloned().flatten()
+                    {
+                        if let Some(sq) = eng.db.find_sequence(&sn, ctx.snap, ctx.own) {
+                            o.start = Some(sq.start);
+                            o.increment = Some(sq.increment);
+                            o.min_value = Some(sq.min_value);
+                            o.max_value = Some(sq.max_value);
+                            o.cycle = Some(sq.cycle);
+                            o.cache = Some(sq.cache);
+                        }
+                    }
+                    def.identity_opts.push(Some(o));
+                } else {
+                    def.identity.push(None);
+                    def.identity_opts.push(None);
+                }
+            }
             // v0.72: compression only with INCLUDING COMPRESSION (or ALL);
             // the parent's explicit method round-trips through its name
             // (PG: GetCompressionMethodName(attcompression)).
@@ -5202,6 +5277,11 @@ pub(crate) fn create_table_from_def(
         // column definition resolves them (PG19's bogus-marker
         // pass in DefineRelation).
         let mut merged_gen: Vec<Option<(crate::sql::Expr, bool)>> = Vec::new();
+        // v2.28: identity is NOT inherited (PG19 MergeAttributes):
+        // inherited slots stay None and their nextval defaults are
+        // stripped; only a child's own declaration sets the slot.
+        let mut merged_identity: Vec<Option<u8>> = Vec::new();
+        let mut merged_idopts: Vec<Option<crate::sql::SequenceOpts>> = Vec::new();
         // v2.27: not-null locality parallel to the merged columns
         // (false = the not-null exists only by inheritance).
         let mut merged_nn: Vec<bool> = Vec::new();
@@ -5379,13 +5459,17 @@ pub(crate) fn create_table_from_def(
                 // v2.27: an inherited not-null is non-local.
                 merged_nn.push(!parent.not_null.get(i).copied().unwrap_or(false));
                 merged_att.push(false);
-                merged
-                    .defaults
-                    .push(parent.defaults.get(i).cloned().unwrap_or(None));
+                merged.defaults.push(if parent.identity_at(i) != 0 {
+                    None
+                } else {
+                    parent.defaults.get(i).cloned().unwrap_or(None)
+                });
                 merged.serial.push(None);
                 merged.compression.push(None);
                 merged.storage.push(None);
                 merged_gen.push(parent.gen_cols.get(i).cloned().unwrap_or(None));
+                merged_identity.push(None);
+                merged_idopts.push(None);
                 merged_storage.push(
                     parent
                         .col_storage
@@ -5485,6 +5569,12 @@ pub(crate) fn create_table_from_def(
             if let Some(s) = like_def.serial.get(i).and_then(|s| s.clone()) {
                 merged.serial[pos] = Some(s);
             }
+            // v2.28: the child's own identity declaration on a merged
+            // column sets the slot (identity itself never inherits).
+            if let Some(k) = like_def.identity.get(i).and_then(|k| *k) {
+                merged_identity[pos] = Some(k);
+                merged_idopts[pos] = like_def.identity_opts.get(i).cloned().unwrap_or(None);
+            }
             if let Some(c) = like_def.compression.get(i).and_then(|c| c.clone()) {
                 merged.compression[pos] = Some(c);
             }
@@ -5542,6 +5632,8 @@ pub(crate) fn create_table_from_def(
             merged
                 .serial
                 .push(like_def.serial.get(i).cloned().unwrap_or(None));
+            merged_identity.push(like_def.identity.get(i).cloned().unwrap_or(None));
+            merged_idopts.push(like_def.identity_opts.get(i).cloned().unwrap_or(None));
             merged
                 .compression
                 .push(like_def.compression.get(i).cloned().unwrap_or(None));
@@ -5566,6 +5658,8 @@ pub(crate) fn create_table_from_def(
         }
         merged.nn_local = merged_nn.clone();
         merged.att_local = merged_att.clone();
+        merged.identity = merged_identity;
+        merged.identity_opts = merged_idopts;
         merged.uniques = like_def.uniques.clone();
         merged.pkey = like_def.pkey.clone();
         merged.fks = like_def.fks.clone();
@@ -5717,6 +5811,17 @@ pub(crate) fn create_table_from_def(
                 // them, so children silently lost both).
                 def.gen_cols = parent.gen_cols.clone();
                 def.collations = parent.col_collations.clone();
+                // v2.28: partitions inherit the identity flag and SHARE the
+                // parent's sequence (the copied nextval default above is the
+                // parent's); identity_opts stay None so wire time creates
+                // no new sequence.
+                def.identity = (0..parent.columns.len())
+                    .map(|i| {
+                        let k = parent.identity_at(i);
+                        if k == 0 { None } else { Some(k) }
+                    })
+                    .collect();
+                def.identity_opts = vec![None; parent.columns.len()];
                 // v2.26: PARTITION OF element list (PG19
                 // MergeAttributes) merged into the inherited def.
                 if let Some(ov) = def.partition_overrides.take().map(|b| *b) {
@@ -5782,6 +5887,11 @@ pub(crate) fn create_table_from_def(
         // namespace under the same <table>_<column>_seq naming).
         // Runs before the temp_tables borrow below.
         wire_serial_defaults(eng, ctx, name, &mut t, &def.serial, Some(ctx.session))?;
+        // v2.28: identity backing sequences for temp tables too;
+        // a temp PARTITION OF child shares its parent's sequence.
+        if temp_parent.is_none() {
+            wire_identity_defaults(eng, ctx, name, &mut t, &def, Some(ctx.session))?;
+        }
         let tmps = eng.db.temp_tables.entry(ctx.session).or_default();
         tmps.insert(name.to_string(), t);
         // v0.70: link a temp PARTITION OF child into its parent's
@@ -5912,6 +6022,17 @@ pub(crate) fn create_table_from_def(
             // children silently lost both).
             def.gen_cols = parent.gen_cols.clone();
             def.collations = parent.col_collations.clone();
+            // v2.28: partitions inherit the identity flag and SHARE the
+            // parent's sequence (the copied nextval default above is the
+            // parent's); identity_opts stay None so wire time creates
+            // no new sequence.
+            def.identity = (0..parent.columns.len())
+                .map(|i| {
+                    let k = parent.identity_at(i);
+                    if k == 0 { None } else { Some(k) }
+                })
+                .collect();
+            def.identity_opts = vec![None; parent.columns.len()];
             // v2.26: PARTITION OF element list (PG19 MergeAttributes)
             // merged into the inherited def.
             if let Some(ov) = def.partition_overrides.take().map(|b| *b) {
@@ -6013,6 +6134,8 @@ pub(crate) fn create_table_from_def(
     ensure_toast_table_eager(eng, ctx, name, &mut t);
     // v0.65: real SERIAL — backing sequences + nextval defaults.
     wire_serial_defaults(eng, ctx, name, &mut t, &def.serial, None)?;
+    // v2.28: identity backing sequences + nextval defaults.
+    wire_identity_defaults(eng, ctx, name, &mut t, &def, None)?;
     eng.db.tables.entry(name.to_string()).or_default().push(t);
     ctx.writes.push(WriteOp::CreateTable {
         name: name.to_string(),
@@ -6486,6 +6609,16 @@ pub(crate) fn detach_partition(
     for i in 0..next.columns.len() {
         next.set_nn_local(i, true);
         next.set_att_local(i, true);
+        // v2.28: DETACH strips the identity property and its
+        // nextval default (PG19: the detached table keeps the
+        // column and its NOT NULL, but generates nothing).
+        if next.identity_at(i) != 0 {
+            if next.identity.len() < next.columns.len() {
+                next.identity.resize(next.columns.len(), 0);
+            }
+            next.identity[i] = 0;
+            next.defaults[i] = None;
+        }
     }
     match &mut next.partition {
         Some(pi) => {

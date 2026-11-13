@@ -5604,6 +5604,58 @@ pub(crate) fn eval_func(
         let v = eval_expr(q, scopes, &args[0])?;
         return pg_column_compression_value(q, scopes, &args[0], &v, true);
     }
+    // v2.28: pg_get_serial_sequence(table, column) — the name of
+    // the serial/identity backing sequence as "public.<seq>", or
+    // NULL when the column has none (PG19 ruleutils.c).
+    if name == "pg_get_serial_sequence" {
+        let mut vals = Vec::with_capacity(args.len());
+        for a in args {
+            vals.push(eval_expr(q, scopes, a)?);
+        }
+        if vals.len() != 2 {
+            return Err(exec_err(
+                "42883",
+                "function pg_get_serial_sequence() does not exist".to_string(),
+            ));
+        }
+        let (Value::Text(tname), Value::Text(cname)) = (&vals[0], &vals[1]) else {
+            return Ok(Value::Null);
+        };
+        // Strip an optional schema qualifier (single-schema engine).
+        let tname = tname.rsplit('.').next().unwrap_or(tname);
+        let Some(t) = q.eng.db.find_table(tname, q.snap, &q.all_xids, q.session) else {
+            return Ok(Value::Null);
+        };
+        let Some(ci) = t.column_index(cname) else {
+            return Ok(Value::Null);
+        };
+        // The owned sequence (serial + identity), else a plain
+        // nextval default's sequence (PG resolves both).
+        let mut seq: Option<String> = None;
+        for (sn, vs) in q.eng.db.sequences.iter() {
+            if vs.iter().any(|sq| {
+                crate::storage::seq_visible(sq, q.snap, q.own)
+                    && sq.owned_by.as_ref().is_some_and(|(ot, oc, _)| {
+                        ot.as_str() == AsRef::<str>::as_ref(tname)
+                            && oc.as_str() == AsRef::<str>::as_ref(cname)
+                    })
+            }) {
+                seq = Some(sn.clone());
+                break;
+            }
+        }
+        if seq.is_none() {
+            if let Some(crate::sql::DefaultExpr::Nextval(sn)) =
+                t.defaults.get(ci).and_then(|d| d.as_ref())
+            {
+                seq = Some(sn.clone());
+            }
+        }
+        return Ok(match seq {
+            Some(sn) => Value::text(format!("public.{}", sn)),
+            None => Value::Null,
+        });
+    }
     // v0.37: pg_relation_size needs engine access.
     if name == "pg_relation_size" {
         let mut vals = Vec::with_capacity(args.len());
@@ -6595,6 +6647,7 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         // v0.37: TOAST introspection functions.
         "pg_column_compression" => n == 1,
         "pg_relation_size" => n == 1 || n == 2,
+        "pg_get_serial_sequence" => n == 2,
         // v2.18: updatability introspection (PG19 misc.c).
         "pg_relation_is_updatable" => n == 2,
         "pg_column_is_updatable" => n == 3,
@@ -14823,6 +14876,8 @@ pub(crate) fn func_result_type(
         // v0.37: TOAST introspection functions.
         "pg_column_compression" => Ok(ColType::Text),
         "pg_relation_size" => Ok(ColType::BigInt),
+        // v2.28: pg_get_serial_sequence(text, text) -> text.
+        "pg_get_serial_sequence" => Ok(ColType::Text),
         // v2.18: updatability introspection (PG19 misc.c).
         "pg_relation_is_updatable" => Ok(ColType::Int),
         "pg_column_is_updatable" => Ok(ColType::Bool),

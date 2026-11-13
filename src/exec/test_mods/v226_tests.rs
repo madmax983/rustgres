@@ -206,12 +206,18 @@ fn identity_element_is_0a000_on_partitions() {
         "{}",
         e.message
     );
-    // Plain CREATE TABLE keeps the engine's standing rejection.
-    let e = err(
+    // v2.28 supersedes the v2.26 standing rejection: plain CREATE
+    // TABLE identity is now a real feature. The PARTITION OF element
+    // rejection above is unchanged.
+    ok(
         &mut eng,
         "create table plain_id (f3 bigint generated always as identity)",
     );
-    assert_eq!(e.code, "0A000");
+    ok(&mut eng, "insert into plain_id default values");
+    assert_eq!(
+        rows_text(&mut eng, "select f3 from plain_id"),
+        vec![vec!["1"]]
+    );
 }
 
 #[test]
