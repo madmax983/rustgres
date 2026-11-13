@@ -429,13 +429,23 @@ pub(crate) fn check_leaf_ancestor_uniques(
     owns: &[u64],
     session: u64,
 ) -> Result<(), ExecError> {
-    for (j, values) in rows.iter().enumerate() {
-        for au in anc {
+    // v2.25.1: `rows[..j].iter().any(...)` rescanned every earlier row
+    // of the batch for every row, making one multi-row INSERT's
+    // in-batch duplicate check O(batch_len^2) per ancestor unique
+    // index -- the exact anti-pattern `check_insert_unique` already
+    // avoids with a per-constraint `BTreeSet<IndexKey>` (see its
+    // v2.05 comment). Mirror that here: one ordered-set membership
+    // check + insert per row, same `IndexKey`/`index_key_cmp`
+    // cross-type-equality semantics.
+    let mut seen: Vec<BTreeSet<IndexKey>> = vec![BTreeSet::new(); anc.len()];
+    for values in rows.iter() {
+        for (au, seen_keys) in anc.iter().zip(seen.iter_mut()) {
             let key = temp_key(&au.cols, values);
             if !au.nulls_not_distinct && key.0.iter().any(|v| matches!(v, Value::Null)) {
                 continue; // NULLs never conflict (NULLS DISTINCT)
             }
-            if rows[..j].iter().any(|prev| temp_key(&au.cols, prev) == key)
+            let in_batch_dup = !seen_keys.insert(key.clone());
+            if in_batch_dup
                 || leaf_existing_key_conflict(db, leaf, &au.cols, &key, snap, owns, session)
             {
                 return Err(unique_violation_err(&au.report_name));

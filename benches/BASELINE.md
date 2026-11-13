@@ -290,6 +290,153 @@ Profiles committed: `benches/profiles/callgrind.out.manypart-n200-2026-11-11`
 (`--variant manypart`), `benches/profiles/callgrind.out.manypart-setup-n200-2026-11-11`
 (`--variant setup`).
 
+## Bolt: `check_leaf_ancestor_uniques` rescans the whole in-batch row list per row — fix — 2026-11-10
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec/indexes.rs`: `check_leaf_ancestor_uniques` tracked in-batch
+duplicates for a leaf's ancestor unique indexes with
+`rows[..j].iter().any(|prev| temp_key(&au.cols, prev) == key)` — an
+O(batch_len) rescan of every earlier row per row per ancestor index.
+Replaced with the same `Vec<BTreeSet<IndexKey>>` "seen set" per
+ancestor index that `check_insert_unique` already uses for the
+equivalent non-partitioned-leaf duplicate check (v2.05): one ordered
+membership check + insert per row, O(log batch_len). The per-row
+existing-row conflict check (`leaf_existing_key_conflict`) and the
+NULLS-DISTINCT skip are unchanged; only the in-batch duplicate test
+changed shape. Behavior is identical (same `IndexKey`/`index_key_cmp`
+cross-type equality the BTreeSet-based fix elsewhere in this file
+already relies on) — all 1336 existing tests, including the 8
+`v225_tests` covering this exact enforcement, pass unchanged.
+
+### Measurement
+
+Callgrind (valgrind 3.22.0), `--variant ancestor`, same harness:
+
+| rows | Ir before | Ir after | ratio before | ratio after |
+|---|---|---|---|---|
+| 250 | 81,901,127 | 42,377,746 | — | — |
+| 500 | 238,740,044 | 77,157,573 | 2.92x | 1.82x |
+| 1000 | 802,020,284 | 147,276,792 | 3.36x | 1.91x |
+| 2000 | 2,925,737,485 | 286,616,559 | 3.65x | 1.95x |
+
+The scaling ratio drops from ~3.5x (quadratic) to ~1.9x (linear-ish,
+the residual being the `BTreeSet` `O(log n)` factor and the unchanged
+per-row `leaf_existing_key_conflict` scan) as batch size doubles.
+
+At 2000 rows (kept logs, `callgrind.out.ancunique-{base,after}-
+n2000-2026-11-10`):
+
+| metric | before | after | delta |
+|---|---|---|---|
+| Ir (callgrind) | 2,926,683,963 | 286,620,633 | **-90.2%** |
+| dhat total bytes | 107,300,774 | 11,535,070 | **-89.2%** |
+| dhat total blocks (allocations) | 2,153,066 | 156,375 | **-92.7%** |
+
+`callgrind_annotate --tree=calling --inclusive=yes` on the after log:
+`check_leaf_ancestor_uniques`'s own inclusive share drops from 91.14%
+of total `Ir` to 9.51%, with the cost now dominated by
+`BTreeSet::insert` (5.76%) instead of the `Iter::any` rescan.
+
+**Reproduce**:
+```bash
+cargo build
+python3 benches/profile_ancestor_unique_insert.py --tool callgrind --rows 2000 --variant ancestor --keep-log /tmp/cg.anc.after
+callgrind_annotate --tree=calling --inclusive=yes /tmp/cg.anc.after | grep -A6 'check_leaf_ancestor_uniques \['
+python3 benches/profile_ancestor_unique_insert.py --tool callgrind --sizes --variant ancestor
+python3 benches/profile_ancestor_unique_insert.py --tool dhat --rows 2000 --variant ancestor
+cargo test --all-features
+```
+
+After profiles committed:
+`benches/profiles/{callgrind,dhat}.out.ancunique-after-n2000-2026-11-10`.
+
+## Bolt: `check_leaf_ancestor_uniques` rescans the whole in-batch row list per row — baseline — 2026-11-10
+
+**Why this workload**: v2.25 (2026-11-09, landed right after the last
+Bolt round) added per-leaf consultative enforcement of a UNIQUE INDEX
+declared on a partitioned table's *parent* — PG19 gives every leaf a
+physical child index for such an index and `ExecInsert` enforces it;
+this engine keeps no child-index objects, so INSERT-time enforcement
+walks the ancestor chain instead (`ancestor_unique_indexes`,
+`check_leaf_ancestor_uniques` in `src/exec/indexes.rs`). This code path
+has never been profiled. New harness,
+`benches/profile_ancestor_unique_insert.py`: a 4-way RANGE-partitioned
+table (the common real-world shape — partition by a surrogate/date
+key) with a standalone `UNIQUE INDEX` on a non-partition-key column
+(e.g. an external business-key/reference column — exactly
+`idxpart`/`create unique index on idxpart (a)` from
+`src/exec/test_mods/v225_tests.rs`), bulk-loaded via a single
+multi-row `INSERT ... SELECT ... FROM generate_series`. Two controls
+isolate the new code's share by subtraction: `--variant nounique`
+(identically partitioned, no unique index anywhere) and `--variant
+plain` (no partitioning at all).
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`), 2000 rows: `ancestor` = 2,926,683,963 Ir vs.
+`nounique` = 180,759,076 Ir vs. `plain` = 130,225,105 Ir — the new
+ancestor-unique-enforcement code alone (`ancestor` minus `nounique`)
+is **93.8%** of the `ancestor` workload's total `Ir`.
+
+Scaling across batch sizes (`--variant ancestor`, same harness):
+
+| rows | Ir | ratio vs. previous size |
+|---|---|---|
+| 250 | 81,901,127 | — |
+| 500 | 238,740,044 | 2.92x |
+| 1000 | 802,020,284 | 3.36x |
+| 2000 | 2,925,737,485 | 3.65x |
+
+Doubling the batch size roughly *quadruples* `Ir` — classic O(n²), not
+the O(n log n) the rest of this engine's statement-atomic unique
+checks use (`check_insert_unique`'s `BTreeSet<IndexKey>` "seen" sets,
+v2.05).
+
+`callgrind_annotate --tree=calling --inclusive=yes` confirms the
+mechanism directly:
+
+```
+2,926,683,963 Ir total
+2,667,401,002 (91.14%) check_leaf_ancestor_uniques (inclusive)
+2,660,156,862 (90.89%)   -> Iter<Vec<Vec<Value>>>::any::<check_leaf_ancestor_uniques::{closure#1}>
+    4,408,000 ( 0.15%)   -> leaf_existing_key_conflict (2,000 calls)
+```
+
+**Mechanism**: `check_leaf_ancestor_uniques`
+(`src/exec/indexes.rs:423`) does, per candidate row `j`:
+`rows[..j].iter().any(|prev| temp_key(&au.cols, prev) == key)` — an
+O(batch_len) rescan of every earlier row in the statement's own batch,
+for every row, for every ancestor unique index. That's exactly the
+anti-pattern `check_insert_unique` already fixed in v2.05 (its own
+comment: "the previous `rows[..i].iter().any(...)` rescanned every
+earlier row of the batch for every row, making one multi-row INSERT's
+in-batch duplicate check O(batch_len^2)") — `check_leaf_ancestor_uniques`
+reintroduced the identical pattern for the new ancestor-index path
+instead of reusing the `BTreeSet<IndexKey>` "seen set" fix.
+`leaf_existing_key_conflict` (the linear scan against rows already
+committed to the leaf) is a separate, much smaller cost here (0.15%)
+since the bench table starts empty — it is *not* the target.
+
+Fix (BTreeSet-based in-batch dedup, mirroring `check_insert_unique`)
+follows in the next commit.
+
+**Reproduce**:
+```bash
+cargo build
+python3 benches/profile_ancestor_unique_insert.py --tool callgrind --rows 2000 --variant ancestor --keep-log /tmp/cg.anc.n2000
+python3 benches/profile_ancestor_unique_insert.py --tool callgrind --rows 2000 --variant nounique
+python3 benches/profile_ancestor_unique_insert.py --tool callgrind --rows 2000 --variant plain
+python3 benches/profile_ancestor_unique_insert.py --tool callgrind --sizes --variant ancestor
+python3 benches/profile_ancestor_unique_insert.py --tool dhat --rows 2000 --variant ancestor
+callgrind_annotate --tree=calling --inclusive=yes /tmp/cg.anc.n2000 | grep -A6 'check_leaf_ancestor_uniques \['
+```
+
+Baseline profiles committed:
+`benches/profiles/{callgrind,dhat}.out.ancunique-base-n2000-2026-11-10`.
+
 ## Bolt: `route_partition_inserts` re-walks the whole partition bound chain after firing BEFORE INSERT triggers, even when the leaf has none — fix — 2026-11-09
 
 Fixes the target identified in the baseline entry immediately below
