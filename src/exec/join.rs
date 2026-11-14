@@ -3349,6 +3349,28 @@ pub(crate) fn build_source(
                 let (_, rows) = pg_inherits_scan(&q.eng.db, q.snap, q.own, q.session);
                 return Ok((apply_aliases(schema)?, rows));
             }
+            // v2.29: pg_index / pg_indexes are virtual too (the
+            // index catalog family).
+            if matches!(name.as_str(), "pg_index" | "pg_indexes")
+                && q.eng
+                    .db
+                    .find_table(name, q.snap, &q.all_xids, q.session)
+                    .is_none()
+            {
+                let (schema0, rows) = if name == "pg_index" {
+                    pg_index_scan(&q.eng.db, q.snap, q.own, q.session)
+                } else {
+                    pg_indexes_scan(&q.eng.db, q.snap, q.own, q.session)
+                };
+                let schema: Vec<QCol> = schema0
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                return Ok((apply_aliases(schema)?, rows));
+            }
             // v0.98: pg_sequences is virtual too (sequence catalog).
             if name == "pg_sequences"
                 && q.eng

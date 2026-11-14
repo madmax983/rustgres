@@ -5359,6 +5359,53 @@ pub(crate) fn eval_func(
             },
         );
     }
+    // v2.29: pg_get_indexdef(oid[, pretty]) — the CREATE INDEX text
+    // for a synthetic index OID (NULL for unknown OIDs, like PG);
+    // the 3-arg form (oid, colno, pretty) renders one key element
+    // (colno 0 renders the whole index's element list context-free —
+    // PG returns the single column definition).
+    if name == "pg_get_indexdef" && !args.is_empty() {
+        let v = eval_expr(q, scopes, &args[0])?;
+        let defs = crate::exec::catalog::visible_index_defs(&q.eng.db, q.snap, q.own, q.session);
+        // The oid arrives as Int, or as Text when it flowed through
+        // a regclass cast (this engine carries regclass as text).
+        let hit = match &v {
+            Value::Int(oid) => defs
+                .iter()
+                .enumerate()
+                .find(|(i, _)| 40000 + *i as i64 == *oid)
+                .map(|(_, d)| d),
+            Value::Text(s) => defs
+                .iter()
+                .find(|d| d.name == s.as_ref() || d.name.rsplit('.').next() == Some(s.as_ref())),
+            _ => None,
+        };
+        let Some(d) = hit else {
+            return Ok(Value::Null);
+        };
+        if args.len() >= 3 {
+            let cn = eval_expr(q, scopes, &args[1])?;
+            let Value::Int(colno) = cn else {
+                return Ok(Value::Null);
+            };
+            if !(1..=d.cols.len() as i64).contains(&colno) {
+                return Ok(Value::Null);
+            }
+            return Ok(Value::text(crate::exec::catalog::index_elem_text(
+                d,
+                (colno - 1) as usize,
+            )));
+        }
+        let partitioned = q
+            .eng
+            .db
+            .find_table(&d.table, q.snap, &q.all_xids, q.session)
+            .is_some_and(|t| t.partition.as_ref().is_some_and(|p| p.is_partitioned));
+        return Ok(Value::text(crate::exec::catalog::indexdef_text(
+            d,
+            partitioned,
+        )));
+    }
     // v2.09/v2.10: pg_trigger_depth() — the live trigger call depth
     // (trigger.c's counter, thread-local here); 0 outside a trigger.
     if name == "pg_trigger_depth" && args.is_empty() {
@@ -15100,7 +15147,7 @@ pub(crate) fn func_result_type(
         // suite (pg_get_expr deparses our stored filter text form).
         "pg_get_expr" | "pg_describe_object" | "obj_description" | "shobj_description"
         | "pg_get_triggerdef" | "pg_get_constraintdef" | "pg_get_statisticsobjdef"
-        | "pg_get_ruledef" => Ok(ColType::Text),
+        | "pg_get_ruledef" | "pg_get_indexdef" => Ok(ColType::Text),
         // v2.17: pg_statistics_obj_is_visible(oid) -> boolean.
         "pg_statistics_obj_is_visible" => Ok(ColType::Bool),
         // v2.23: satisfies_hash_partition(...) -> boolean.

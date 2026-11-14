@@ -1522,6 +1522,22 @@ pub(crate) fn plan_from_item(
                     output: scan_output(name, None, &[], where_, &[]),
                 });
             }
+            // v2.29: pg_index / pg_indexes are virtual too; the
+            // estimate is the live index count.
+            if matches!(name.as_str(), "pg_index" | "pg_indexes")
+                && eng.db.find_table(name, snap, &[own], session).is_none()
+            {
+                let rows =
+                    super::catalog::visible_index_defs(&eng.db, snap, own, session).len() as u64;
+                return Ok(PlanNode::SeqScan {
+                    table: name.clone(),
+                    alias: None,
+                    filter: None,
+                    rows,
+                    // v1.46: VERBOSE `Output:`.
+                    output: scan_output(name, None, &[], where_, &[]),
+                });
+            }
             // v0.98: pg_sequences is virtual too; the estimate is the
             // live sequence count.
             if name.as_str() == "pg_sequences"

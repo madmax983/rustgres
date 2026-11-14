@@ -1557,9 +1557,12 @@ impl Parser {
         if matches!(self.peek(), Token::Ident(s) if s == "rule") {
             return self.parse_create_rule(false);
         }
-        // CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (col [, ...])
+        // CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] name
+        // ON [ONLY] table (col [, ...]) [INCLUDE (col [, ...])]
         let unique = self.eat_keyword("unique");
         if self.eat_keyword("index") {
+            // v2.29: optional CONCURRENTLY (PG19 IndexStmt).
+            let concurrently = self.eat_keyword("concurrently");
             let if_not_exists = if self.eat_keyword("if") {
                 self.expect_keyword("not")?;
                 self.expect_keyword("exists")?;
@@ -1583,6 +1586,8 @@ impl Parser {
                 self.expect_ident()?
             };
             self.expect_keyword("on")?;
+            // v2.29: optional ONLY before the table name.
+            let only = self.eat_keyword("only");
             let table = self.expect_ident()?;
             // v0.88: `USING btree` may appear between the table and the
             // column list. v0.89: rustgres only implements btree, so any
@@ -1684,9 +1689,28 @@ impl Parser {
                     "syntax error: index requires at least one column".to_string()
                 ));
             }
+            // v2.29: gram.y IndexStmt — INCLUDE (col, ...) sits
+            // after the key list, before opt_unique_null_treatment.
+            let mut include: Vec<String> = Vec::new();
+            if self.eat_keyword("include") {
+                self.expect(Token::LParen, "'('")?;
+                loop {
+                    include.push(self.expect_ident()?);
+                    match self.next() {
+                        Token::Comma => continue,
+                        Token::RParen => break,
+                        other => {
+                            return Err(err(format!(
+                                "syntax error: expected ',' or ')', found {:?}",
+                                other
+                            )));
+                        }
+                    }
+                }
+            }
             // v2.08: gram.y IndexStmt — opt_unique_null_treatment
-            // sits after the column list (and INCLUDE, unsupported
-            // here), before reloptions/WHERE.
+            // sits after the column list (and INCLUDE), before
+            // reloptions/WHERE.
             let nulls_not_distinct = self.parse_nulls_not_distinct()?;
             // v0.88: partial index predicate.
             let predicate = if self.eat_keyword("where") {
@@ -1711,6 +1735,9 @@ impl Parser {
                 if_not_exists,
                 predicate,
                 nulls_not_distinct,
+                concurrently,
+                only,
+                include,
             });
         }
         // v0.9: CREATE SEQUENCE (CREATE VIEW is intercepted before
@@ -2728,8 +2755,11 @@ impl Parser {
                 return Ok(ParsedTableCon::PKeyUsingIndex(cname, idx));
             }
             let cols = self.parse_col_name_list()?;
+            // v2.29: INCLUDE (cols) rides between the key list and
+            // the attribute spec (gram.y IndexElem-less form).
+            let inc = self.parse_include_opt()?;
             let (df, idf) = self.parse_unique_attrs()?;
-            Ok(ParsedTableCon::PKey(cname, cols, df, idf))
+            Ok(ParsedTableCon::PKey(cname, cols, df, idf, inc))
         } else if self.eat_keyword("unique") {
             // v2.07: UNIQUE USING INDEX name (ALTER TABLE ADD).
             if self.eat_keyword("using") {
@@ -2741,8 +2771,9 @@ impl Parser {
             // UNIQUE and the column list for table constraints.
             let nnd = self.parse_nulls_not_distinct()?;
             let cols = self.parse_col_name_list()?;
+            let inc = self.parse_include_opt()?;
             let (df, idf) = self.parse_unique_attrs()?;
-            Ok(ParsedTableCon::Unique(cname, cols, df, idf, nnd))
+            Ok(ParsedTableCon::Unique(cname, cols, df, idf, nnd, inc))
         } else if self.eat_keyword("check") {
             self.expect(Token::LParen, "'('")?;
             let e = self.parse_or()?;
@@ -2790,6 +2821,16 @@ impl Parser {
             Err(err(
                 "syntax error: expected PRIMARY KEY, UNIQUE, CHECK or FOREIGN KEY".to_string(),
             ))
+        }
+    }
+
+    /// v2.29: optional `INCLUDE (col [, ...])` after an index or
+    /// constraint key list (PG19 gram.y opt_include).
+    pub(crate) fn parse_include_opt(&mut self) -> Result<Vec<String>, SqlError> {
+        if self.eat_keyword("include") {
+            self.parse_col_name_list()
+        } else {
+            Ok(Vec::new())
         }
     }
 
@@ -3781,6 +3822,7 @@ impl Parser {
                         initially_deferred: idf,
                         nulls_not_distinct: nnd,
                         is_local: true,
+                        include: Vec::new(),
                     }),
                     ColCon::PKey(n, df, idf) => {
                         pkey = Some(UniqueDef {
@@ -3790,6 +3832,7 @@ impl Parser {
                             initially_deferred: idf,
                             nulls_not_distinct: false,
                             is_local: true,
+                            include: Vec::new(),
                         });
                         not_null = true;
                     }
@@ -4234,7 +4277,7 @@ impl Parser {
             ParsedTableCon::UniqueUsingIndex(_name, idx) => {
                 Ok(AlterAction::AddUniqueUsingIndex { index: idx })
             }
-            ParsedTableCon::PKey(name, cols, df, idf) => Ok(AlterAction::AddConstraint {
+            ParsedTableCon::PKey(name, cols, df, idf, inc) => Ok(AlterAction::AddConstraint {
                 pkey: Some(UniqueDef {
                     name: name.unwrap_or_default(),
                     cols,
@@ -4242,26 +4285,30 @@ impl Parser {
                     initially_deferred: idf,
                     nulls_not_distinct: false,
                     is_local: true,
+                    include: inc,
                 }),
                 check: None,
                 unique: None,
                 fk: None,
                 notnull: None,
             }),
-            ParsedTableCon::Unique(name, cols, df, idf, nnd) => Ok(AlterAction::AddConstraint {
-                unique: Some(UniqueDef {
-                    name: name.unwrap_or_default(),
-                    cols,
-                    deferrable: df,
-                    initially_deferred: idf,
-                    nulls_not_distinct: nnd,
-                    is_local: true,
-                }),
-                check: None,
-                pkey: None,
-                fk: None,
-                notnull: None,
-            }),
+            ParsedTableCon::Unique(name, cols, df, idf, nnd, inc) => {
+                Ok(AlterAction::AddConstraint {
+                    unique: Some(UniqueDef {
+                        name: name.unwrap_or_default(),
+                        cols,
+                        deferrable: df,
+                        initially_deferred: idf,
+                        nulls_not_distinct: nnd,
+                        is_local: true,
+                        include: inc,
+                    }),
+                    check: None,
+                    pkey: None,
+                    fk: None,
+                    notnull: None,
+                })
+            }
             ParsedTableCon::Check(name, e, nv, enf, noinh) => Ok(AlterAction::AddConstraint {
                 check: Some(CheckDef {
                     name: name.unwrap_or_default(),
@@ -16503,6 +16550,9 @@ impl Parser {
             return self.parse_drop_role();
         }
         if self.eat_keyword("index") {
+            // v2.29: DROP INDEX [CONCURRENTLY] [IF EXISTS] (PG19
+            // DropStmt for indexes: CONCURRENTLY precedes IF EXISTS).
+            let concurrently = self.eat_keyword("concurrently");
             let if_exists = if self.eat_keyword("if") {
                 self.expect_keyword("exists")?;
                 true
@@ -16518,7 +16568,15 @@ impl Parser {
                 }
                 self.next(); // ','
             }
-            return Ok(Stmt::DropIndex { names, if_exists });
+            // PG also allows a trailing CASCADE / RESTRICT (a no-op
+            // distinction for indexes here beyond dependency errors
+            // the executor already raises).
+            let _ = self.parse_cascade_opt()?;
+            return Ok(Stmt::DropIndex {
+                names,
+                if_exists,
+                concurrently,
+            });
         }
         // v1.96: DROP MATERIALIZED VIEW.
         if self.eat_keyword("materialized") {
@@ -20111,6 +20169,17 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
             }
             out.push(')');
         }
+        // v2.29: optional trailing (include ...) — emitted only
+        // when non-empty; the decoder defaults a missing section
+        // to no included columns.
+        if !u.include.is_empty() {
+            out.push_str(" (include");
+            for c in &u.include {
+                out.push(' ');
+                sexpr_escape(c, &mut out);
+            }
+            out.push(')');
+        }
         out.push(')');
     }
     out.push(')');
@@ -20132,6 +20201,14 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
                 }
                 if !pk.is_local {
                     out.push_str(" 0");
+                }
+                out.push(')');
+            }
+            if !pk.include.is_empty() {
+                out.push_str(" (include");
+                for c in &pk.include {
+                    out.push(' ');
+                    sexpr_escape(c, &mut out);
                 }
                 out.push(')');
             }
@@ -20809,23 +20886,63 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
         p.close()?;
         Ok((d, i, n, is_local))
     }
+    // v2.29 helper: an optional trailing (include col...) sub-list.
+    fn unique_include(p: &mut SexprParser) -> Result<Vec<String>, String> {
+        p.open()?;
+        if p.atom()? != "include" {
+            return Err("bad unique include head".into());
+        }
+        let mut cols = Vec::new();
+        while !sexpr_is_close(p) {
+            cols.push(p.atom()?);
+        }
+        p.close()?;
+        Ok(cols)
+    }
+    // v2.29 helper: parse the tail of one unique/pkey entry — plain
+    // column atoms, then any mix of (attrs ...) / (include ...)
+    // sub-lists (the encoder emits attrs first, include second;
+    // older encodings carry neither or only attrs).
+    fn unique_tail(
+        p: &mut SexprParser,
+    ) -> Result<(Vec<String>, (bool, bool, bool, bool), Vec<String>), String> {
+        let mut cols = Vec::new();
+        let mut attrs = (false, false, false, true);
+        let mut include = Vec::new();
+        loop {
+            p.ws();
+            if sexpr_is_close(p) {
+                break;
+            }
+            if p.chars.peek() == Some(&'(') {
+                // Peek the sub-list head on a cloned iterator
+                // (unique_attrs / unique_include open it themselves).
+                let mut probe = p.chars.clone();
+                probe.next(); // '('
+                while matches!(probe.peek(), Some(c) if c.is_whitespace()) {
+                    probe.next();
+                }
+                let mut head = String::new();
+                while matches!(probe.peek(), Some(c) if !c.is_whitespace() && *c != '(' && *c != ')')
+                {
+                    head.push(probe.next().expect("peeked"));
+                }
+                if head == "include" {
+                    include = unique_include(p)?;
+                } else {
+                    attrs = unique_attrs(p)?;
+                }
+            } else {
+                cols.push(p.atom()?);
+            }
+        }
+        Ok((cols, attrs, include))
+    }
     let mut uniques = Vec::new();
     while !sexpr_is_close(&mut p) {
         p.open()?;
         let name = p.atom()?;
-        let mut cols = Vec::new();
-        let mut attrs = (false, false, false, true);
-        loop {
-            p.ws();
-            if sexpr_is_close(&mut p) {
-                break;
-            }
-            if p.chars.peek() == Some(&'(') {
-                attrs = unique_attrs(&mut p)?;
-                break;
-            }
-            cols.push(p.atom()?);
-        }
+        let (cols, attrs, include) = unique_tail(&mut p)?;
         p.close()?;
         uniques.push(UniqueDef {
             name,
@@ -20834,6 +20951,7 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
             initially_deferred: attrs.1,
             nulls_not_distinct: attrs.2,
             is_local: attrs.3,
+            include,
         });
     }
     p.close()?;
@@ -20846,21 +20964,11 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
         None
     } else {
         let name = p.atom()?;
-        let mut cols = Vec::new();
-        let mut attrs = (false, false, false, true);
-        if name != "-" {
-            loop {
-                p.ws();
-                if sexpr_is_close(&mut p) {
-                    break;
-                }
-                if p.chars.peek() == Some(&'(') {
-                    attrs = unique_attrs(&mut p)?;
-                    break;
-                }
-                cols.push(p.atom()?);
-            }
-        }
+        let (cols, attrs, include) = if name != "-" {
+            unique_tail(&mut p)?
+        } else {
+            (Vec::new(), (false, false, false, true), Vec::new())
+        };
         Some(UniqueDef {
             name,
             cols,
@@ -20868,6 +20976,7 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
             initially_deferred: attrs.1,
             nulls_not_distinct: attrs.2,
             is_local: attrs.3,
+            include,
         })
     };
     // Careful: `(pkey -)` encodes absence as the atom "-".

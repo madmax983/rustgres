@@ -786,6 +786,336 @@ fn index_expr_is_mutable(eng: &Engine, e: &Expr) -> bool {
     mutable
 }
 
+// ---------------------------------------------------------------------------
+// v2.29: physical child indexes for partitioned indexes. A partitioned
+// index (an index on a partitioned table) has one real Index object per
+// descendant relation, linked by IndexDef.parent_index (the pg_inherits
+// link PG exposes). Children are built by CREATE INDEX (unless ONLY),
+// PARTITION OF, and ATTACH PARTITION; an equivalent pre-existing index
+// on the child is ADOPTED (linked, not duplicated), and adoption stops
+// the downward recursion for that branch (PG19 DefineIndex behaviour:
+// the idxpart21 case in indexing.sql).
+// ---------------------------------------------------------------------------
+
+/// v2.29: PG equivalence for index propagation/adoption: same key
+/// columns (names + expression sources), uniqueness, predicate, and
+/// INCLUDE set.
+pub(crate) fn index_defs_equivalent(a: &IndexDef, b: &IndexDef) -> bool {
+    a.col_names == b.col_names
+        && a.exprs == b.exprs
+        && a.unique == b.unique
+        && a.predicate == b.predicate
+        && a.include_names == b.include_names
+        && a.nulls_not_distinct == b.nulls_not_distinct
+}
+
+/// v2.29: ChooseIndexName for a child index on `table`:
+/// `<table>_<key parts>_idx`, uniquified with 1, 2, ... against
+/// indexes and tables (mirrors the unnamed-CREATE INDEX rule).
+pub(crate) fn choose_index_name(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    table: &str,
+    key_names: &[String],
+    is_temp: bool,
+) -> String {
+    let base = format!("{}_{}_idx", table, key_names.join("_"));
+    let mut cand = base.clone();
+    let mut i = 1;
+    while index_name_taken(eng, ctx, &cand, is_temp) {
+        cand = format!("{base}{i}");
+        i += 1;
+    }
+    cand
+}
+
+/// v2.29: set (or clear) an index's parent link durably: permanent
+/// indexes go through the DropIndex + CreateIndex write-op pair (the
+/// ALTER-rebuild pattern, so WAL replay and rollback both see the new
+/// definition); temp indexes mutate in place (session-local).
+pub(crate) fn relink_index_parent(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    new_parent: Option<String>,
+) -> Result<(), ExecError> {
+    if let Some(m) = eng.db.temp_indexes.get_mut(&ctx.session) {
+        if let Some(ix) = m.get_mut(name) {
+            if index_visible(&ix.def, ctx.snap, &ctx.all_xids) {
+                ix.def.parent_index = new_parent;
+                return Ok(());
+            }
+        }
+    }
+    let Some(snapshot) = eng.db.find_index(name, ctx.snap, &ctx.all_xids).cloned() else {
+        return Ok(());
+    };
+    if snapshot.def.parent_index == new_parent {
+        return Ok(());
+    }
+    eng.db
+        .find_index_mut(name, ctx.snap, &ctx.all_xids)
+        .expect("index still present; engine lock held throughout")
+        .def
+        .dropped_xmax = ctx.own;
+    ctx.writes.push(WriteOp::DropIndex {
+        name: name.to_string(),
+        index: snapshot.clone(),
+    });
+    let mut def = snapshot.def.clone();
+    def.parent_index = new_parent;
+    def.created_xmin = ctx.own;
+    def.dropped_xmax = 0;
+    let ix = Index {
+        def,
+        tree: snapshot.tree.clone(),
+    };
+    eng.db.indexes.insert(name.to_string(), ix);
+    ctx.writes.push(WriteOp::CreateIndex {
+        name: name.to_string(),
+    });
+    Ok(())
+}
+
+/// v2.29: create (or adopt) the child of `parent_def` on `child_table`.
+/// Returns `(child_def, created_new)`; `created_new` is false for an
+/// adopted pre-existing index (the caller must not recurse past it).
+/// `Ok(None)` when the child lacks a keyed column (not a partition
+/// shape this engine can mirror — the consultative ancestor checks
+/// remain the enforcement backstop there).
+pub(crate) fn create_child_index(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    parent_def: &IndexDef,
+    child_table: &str,
+) -> Result<Option<(IndexDef, bool)>, ExecError> {
+    let Some(ct) = eng
+        .db
+        .find_table(child_table, ctx.snap, &ctx.all_xids, ctx.session)
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    // Map key columns by name; expression keys keep usize::MAX.
+    let mut cols: Vec<usize> = Vec::with_capacity(parent_def.cols.len());
+    for (i, cn) in parent_def.col_names.iter().enumerate() {
+        if parent_def.exprs.get(i).cloned().flatten().is_some() {
+            cols.push(usize::MAX);
+        } else {
+            match ct.column_index(cn) {
+                Some(p) => cols.push(p),
+                None => return Ok(None),
+            }
+        }
+    }
+    let mut include_cols: Vec<usize> = Vec::with_capacity(parent_def.include_names.len());
+    for cn in &parent_def.include_names {
+        match ct.column_index(cn) {
+            Some(p) => include_cols.push(p),
+            None => return Ok(None),
+        }
+    }
+    // Adopt an equivalent existing index instead of duplicating it.
+    for cand in eng
+        .db
+        .visible_indexes_for(child_table, ctx.snap, &ctx.all_xids, ctx.session)
+    {
+        if cand.def.parent_index.is_none() && index_defs_equivalent(&cand.def, parent_def) {
+            let cname = cand.def.name.clone();
+            relink_index_parent(eng, ctx, &cname, Some(parent_def.name.clone()))?;
+            let adopted = eng
+                .db
+                .find_index(&cname, ctx.snap, &ctx.all_xids)
+                .or_else(|| {
+                    eng.db
+                        .temp_indexes
+                        .get(&ctx.session)
+                        .and_then(|m| m.get(&cname))
+                })
+                .map(|ix| ix.def.clone());
+            return Ok(adopted.map(|d| (d, false)));
+        }
+        if cand.def.parent_index.as_deref() == Some(parent_def.name.as_str())
+            && index_defs_equivalent(&cand.def, parent_def)
+        {
+            return Ok(Some((cand.def.clone(), false)));
+        }
+    }
+    let is_temp = eng.db.is_temp_table(ctx.session, child_table);
+    let key_names: Vec<String> = parent_def
+        .col_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            if parent_def.exprs.get(i).cloned().flatten().is_some() {
+                "expr".to_string()
+            } else {
+                n.clone()
+            }
+        })
+        .collect();
+    let cname = choose_index_name(eng, ctx, child_table, &key_names, is_temp);
+    let def = IndexDef {
+        name: cname.clone(),
+        table: child_table.to_string(),
+        cols,
+        col_names: parent_def.col_names.clone(),
+        unique: parent_def.unique,
+        internal: false,
+        created_xmin: ctx.own,
+        dropped_xmax: 0,
+        desc: parent_def.desc.clone(),
+        nulls_first: parent_def.nulls_first.clone(),
+        exprs: parent_def.exprs.clone(),
+        collates: parent_def.collates.clone(),
+        opclasses: parent_def.opclasses.clone(),
+        predicate: parent_def.predicate.clone(),
+        planner_usable: parent_def.planner_usable,
+        nulls_not_distinct: parent_def.nulls_not_distinct,
+        parent_index: Some(parent_def.name.clone()),
+        include_names: parent_def.include_names.clone(),
+        include_cols,
+    };
+    let mut ix = Index::new(def.clone());
+    if def.planner_usable {
+        for r in &ct.rows {
+            let key = ix.key_for(&r.values);
+            ix.insert(key, r.id);
+        }
+        if def.unique {
+            // Liveness mirrors exec_create_index's build check,
+            // except rows deleted by THIS transaction count as dead
+            // (PG: your own deletes are invisible to you; the child
+            // index and the delete live and die in the same txn, so
+            // no abort can resurrect a conflict).
+            for (key, ids) in &ix.tree {
+                if !def.nulls_not_distinct && key.0.iter().any(|v| matches!(v, Value::Null)) {
+                    continue;
+                }
+                let mut live = 0u32;
+                for &id in ids {
+                    let dead = match ct.row_pos(id) {
+                        Some(pos) => {
+                            let r = &ct.rows[pos];
+                            r.xmax != 0 && (r.xmax == ctx.own || eng.xid_committed(r.xmax))
+                        }
+                        None => true,
+                    };
+                    if !dead {
+                        live += 1;
+                        if live >= 2 {
+                            return Err(unique_violation_err(&cname));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if is_temp {
+        eng.db
+            .temp_indexes
+            .entry(ctx.session)
+            .or_default()
+            .insert(cname.clone(), ix);
+        ctx.writes.push(WriteOp::CreateTempIndex {
+            session: ctx.session,
+            name: cname.clone(),
+        });
+    } else {
+        eng.db.indexes.insert(cname.clone(), ix);
+        ctx.writes.push(WriteOp::CreateIndex { name: cname });
+    }
+    Ok(Some((def, true)))
+}
+
+/// v2.29: propagate `parent_def` (an index on `parent_table`) into the
+/// subtree rooted at `child_table`: create/adopt the child there, and
+/// recurse only through newly created children.
+pub(crate) fn propagate_index_subtree(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    parent_def: &IndexDef,
+    child_table: &str,
+) -> Result<(), ExecError> {
+    let Some((child_def, created_new)) = create_child_index(eng, ctx, parent_def, child_table)?
+    else {
+        return Ok(());
+    };
+    if !created_new {
+        return Ok(());
+    }
+    let grandchildren: Vec<String> = eng
+        .db
+        .find_table(child_table, ctx.snap, &ctx.all_xids, ctx.session)
+        .and_then(|t| t.partition.as_ref().map(|p| p.children.clone()))
+        .unwrap_or_default();
+    for g in grandchildren {
+        propagate_index_subtree(eng, ctx, &child_def, &g)?;
+    }
+    Ok(())
+}
+
+/// v2.29: every non-internal index on `parent_table` gains physical
+/// children in the subtree rooted at `child_table` (PARTITION OF /
+/// ATTACH PARTITION entry point).
+pub(crate) fn propagate_parent_indexes(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    parent_table: &str,
+    child_table: &str,
+) -> Result<(), ExecError> {
+    let defs: Vec<IndexDef> = eng
+        .db
+        .visible_indexes_for(parent_table, ctx.snap, &ctx.all_xids, ctx.session)
+        .into_iter()
+        .filter(|ix| !ix.def.internal)
+        .map(|ix| ix.def.clone())
+        .collect();
+    for def in defs {
+        propagate_index_subtree(eng, ctx, &def, child_table)?;
+    }
+    Ok(())
+}
+
+/// v2.29: all index names in the family rooted at `root` (root first,
+/// then descendants breadth-first) across the permanent map and this
+/// session's temp map.
+pub(crate) fn index_family_names(eng: &Engine, ctx: &StmtCtx, root: &str) -> Vec<String> {
+    let mut out = vec![root.to_string()];
+    let mut i = 0;
+    while i < out.len() {
+        let cur = out[i].clone();
+        let mut kids: Vec<String> = eng
+            .db
+            .indexes
+            .values()
+            .filter(|ix| {
+                ix.def.parent_index.as_deref() == Some(cur.as_str())
+                    && index_visible(&ix.def, ctx.snap, &ctx.all_xids)
+            })
+            .map(|ix| ix.def.name.clone())
+            .collect();
+        if let Some(m) = eng.db.temp_indexes.get(&ctx.session) {
+            kids.extend(
+                m.values()
+                    .filter(|ix| {
+                        ix.def.parent_index.as_deref() == Some(cur.as_str())
+                            && index_visible(&ix.def, ctx.snap, &ctx.all_xids)
+                    })
+                    .map(|ix| ix.def.name.clone()),
+            );
+        }
+        kids.sort();
+        for k in kids {
+            if !out.contains(&k) {
+                out.push(k);
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 pub(crate) fn exec_create_index(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -797,6 +1127,10 @@ pub(crate) fn exec_create_index(
     predicate: Option<&str>,
     // v2.08: NULLS NOT DISTINCT.
     nulls_not_distinct: bool,
+    // v2.29: CONCURRENTLY / ON ONLY / INCLUDE columns.
+    concurrently: bool,
+    only: bool,
+    include: &[String],
 ) -> Result<ExecResult, ExecError> {
     // v0.11: indexing a table needs its owner (or a superuser).
     require_table_owner(eng, ctx, table)?;
@@ -1065,6 +1399,171 @@ pub(crate) fn exec_create_index(
         }
         (cols, col_names, descs, nulls_firsts, exprs)
     };
+    // v2.29 (schedule adjudication): PG builds an expression index
+    // over the existing rows, so a per-row DATA error (the indexing
+    // suite's (a/b) with b = 0 -> 22012) fails the CREATE. Expression
+    // indexes are catalog-only in this engine (never built), so
+    // without this pass the statement silently succeeded. Evaluate
+    // every expression element and the predicate against each
+    // snapshot-visible row; only class-22 (data exception) errors
+    // abort the CREATE — name-resolution and function-capability
+    // errors (whole-row vars 42703, UDF RAISE P0001, ...) belong to
+    // the catalog-only model and are ignored, matching how the
+    // engine treats expression indexes everywhere else. (For
+    // CONCURRENTLY, PG would additionally leave an invalid index
+    // behind on a data error — not modeled; statement outcome
+    // matches.)
+    if mv_rows.is_none() && exprs.iter().any(|e| e.is_some()) {
+        if let Some(t) = eng
+            .db
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+            .cloned()
+        {
+            let mut expr_objs: Vec<crate::sql::Expr> = Vec::new();
+            for e in exprs.iter().flatten() {
+                if let Ok(parsed) = crate::sql::parse_expr_str(e) {
+                    expr_objs.push(parsed);
+                }
+            }
+            if let Some(pred) = predicate {
+                if let Ok(parsed) = crate::sql::parse_expr_str(pred) {
+                    expr_objs.push(parsed);
+                }
+            }
+            if !expr_objs.is_empty() {
+                let schema: Vec<QCol> = t
+                    .columns
+                    .iter()
+                    .map(|(n, ty)| QCol {
+                        qual: String::new(),
+                        name: n.clone(),
+                        ty: ty.clone(),
+                        hidden: false,
+                        src_ord: 0,
+                    })
+                    .collect();
+                let mut lock_ids = Vec::new();
+                let mut q = Q {
+                    eng: &mut *eng,
+                    snap: ctx.snap,
+                    own: ctx.own,
+                    all_xids: ctx.all_xids.clone(),
+                    session: ctx.session,
+                    role: ctx.role,
+                    read_only: false,
+                    depth: 0,
+                    lock_ids: &mut lock_ids,
+                    ctes: Vec::new(),
+                    wctx: None,
+                    srf_vals: Vec::new(),
+                    priv_scopes: Vec::new(),
+                    priv_role_override: None,
+                    hashed_exists: std::rc::Rc::new(std::cell::RefCell::new(
+                        std::collections::HashMap::new(),
+                    )),
+                    immutable_fn_cache: std::rc::Rc::new(std::cell::RefCell::new(
+                        std::collections::HashMap::new(),
+                    )),
+                    plan_fold_memo: std::rc::Rc::new(std::cell::RefCell::new(
+                        std::collections::HashMap::new(),
+                    )),
+                    hashed_in: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+                    pending_updates: None,
+                    write: None,
+                };
+                for r in &t.rows {
+                    if !crate::storage::row_visible(r, ctx.snap, &ctx.all_xids) {
+                        continue;
+                    }
+                    for e in &expr_objs {
+                        let frame = Scope {
+                            schema: &schema,
+                            row: &r.values,
+                            prov: None,
+                        };
+                        if let Err(err) = eval_expr(&mut q, &[frame], e) {
+                            if err.code.starts_with("22") {
+                                return Err(err);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // v2.29: INCLUDE columns resolve against the same column list
+    // (42703 when missing, like key columns).
+    let include_cols: Vec<usize> = {
+        let table_col_names: Vec<String> = match &mv_col_names {
+            Some(names) => names.clone(),
+            None => eng
+                .db
+                .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+                .map(|t| t.columns.iter().map(|(n, _)| n.clone()).collect())
+                .unwrap_or_default(),
+        };
+        let mut out = Vec::with_capacity(include.len());
+        for n in include {
+            let pos = table_col_names
+                .iter()
+                .position(|cn| cn == n)
+                .ok_or_else(|| {
+                    exec_err(
+                        "42703",
+                        format!("column \"{}\" of relation \"{}\" does not exist", n, table),
+                    )
+                })?;
+            out.push(pos);
+        }
+        out
+    };
+    // v2.29: PG19 DefineIndex — a UNIQUE index on a partitioned
+    // table must include every partition-key column among its key
+    // columns (indexcmds.c, ERRCODE_FEATURE_NOT_SUPPORTED).
+    if unique {
+        if let Some(t) = eng
+            .db
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+        {
+            if t.partition.as_ref().is_some_and(|p| p.is_partitioned) {
+                // Plain-column partition keys must all appear among
+                // the index's key column names (expression keys can
+                // never satisfy the rule, like PG).
+                let part = t.partition.as_ref().expect("partitioned");
+                let lacks = part.key.iter().any(|k| match &k.expr {
+                    Some(_) => true,
+                    None => {
+                        let kname = t.columns.get(k.col).map(|(n, _)| n.as_str());
+                        !kname.is_some_and(|kn| col_names.iter().any(|n| n == kn))
+                    }
+                });
+                if lacks {
+                    return Err(exec_err(
+                        "0A000",
+                        "UNIQUE constraint on partitioned table must include all partitioning columns"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    // v2.29: CREATE INDEX CONCURRENTLY on a partitioned table is
+    // rejected like PG19 (indexcmds.c DefineIndex).
+    if concurrently {
+        let partitioned = eng
+            .db
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+            .is_some_and(|t| t.partition.as_ref().is_some_and(|p| p.is_partitioned));
+        if partitioned {
+            return Err(exec_err(
+                "0A000",
+                format!(
+                    "cannot create index on partitioned table \"{}\" concurrently",
+                    table
+                ),
+            ));
+        }
+    }
     // v1.99: per-key collation / operator class from the specs.
     let (collates, opclasses): (Vec<Option<String>>, Vec<Option<String>>) = columns
         .iter()
@@ -1087,6 +1586,9 @@ pub(crate) fn exec_create_index(
         predicate: predicate.map(|s| s.to_string()),
         planner_usable,
         nulls_not_distinct,
+        parent_index: None,
+        include_names: include.to_vec(),
+        include_cols,
     });
     if planner_usable && mv_rows.is_some() {
         // Matview build: keys come from the rows computed above;
@@ -1207,16 +1709,36 @@ pub(crate) fn exec_create_index(
             .temp_indexes
             .entry(ctx.session)
             .or_default()
-            .insert(name.to_string(), ix);
+            .insert(name.to_string(), ix.clone());
         ctx.writes.push(WriteOp::CreateTempIndex {
             session: ctx.session,
             name: name.to_string(),
         });
     } else {
-        eng.db.indexes.insert(name.to_string(), ix);
+        eng.db.indexes.insert(name.to_string(), ix.clone());
         ctx.writes.push(WriteOp::CreateIndex {
             name: name.to_string(),
         });
+    }
+    // v2.29: a partitioned index gains a physical child index on
+    // every descendant relation (unless created ON ONLY). The v2.25
+    // consultative validation above stays as the pre-insert check;
+    // the children created here are real, maintained Index objects.
+    if !only && mv_rows.is_none() {
+        let partitioned = eng
+            .db
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+            .is_some_and(|t| t.partition.as_ref().is_some_and(|p| p.is_partitioned));
+        if partitioned {
+            let children: Vec<String> = eng
+                .db
+                .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+                .and_then(|t| t.partition.as_ref().map(|p| p.children.clone()))
+                .unwrap_or_default();
+            for child in children {
+                propagate_index_subtree(eng, ctx, &ix.def, &child)?;
+            }
+        }
     }
     Ok(ExecResult::Command {
         tag: "CREATE INDEX".to_string(),
@@ -1227,9 +1749,10 @@ pub(crate) fn exec_create_index(
 /// RENAME is a real registry rename (Drop+Create WriteOp pair);
 /// a same-named UNIQUE/PK constraint on the index's table renames
 /// with it (PG keeps them in lockstep). Statistics targets,
-/// reloptions, tablespace and ATTACH PARTITION are validated and
-/// accepted — the planner consumes none of them, and the index
-/// registry is flat per table (no parent-index linkage is kept).
+/// reloptions and tablespace are validated and accepted — the
+/// planner consumes none of them. v2.29: ATTACH PARTITION is a real
+/// link now — IndexDef.parent_index records the parent index (the
+/// pg_inherits edge), validated against PG19's checks.
 
 /// v2.16: validate ALTER INDEX reloptions (shared SET / RESET).
 fn validate_index_reloptions(pairs: &[(String, String)]) -> Result<(), ExecError> {
@@ -1472,10 +1995,79 @@ pub(crate) fn exec_alter_index(
                     ));
                 }
             }
-            // The child's table should be a partition of the
-            // parent index's table when partition linkage is
-            // recorded; the flat registry keeps no index linkage,
-            // so existence is the enforceable part here.
+            // v2.29: real linkage. The child must be an index on a
+            // partition of the parent index's table, with a matching
+            // definition (PG19 AttachPartitionIndex / CompareIndexDefs);
+            // success records the pg_inherits link. Already-attached
+            // to this same parent is a quiet no-op.
+            {
+                let child_ix = eng
+                    .db
+                    .find_index(child, ctx.snap, &ctx.all_xids)
+                    .cloned()
+                    .or_else(|| {
+                        eng.db
+                            .temp_indexes
+                            .get(&ctx.session)
+                            .and_then(|m| m.get(child))
+                            .cloned()
+                    });
+                if let Some(cix) = child_ix {
+                    if cix.def.parent_index.as_deref() == Some(name) {
+                        // Already attached here: quiet.
+                    } else {
+                        let parent_tbl = ix.def.table.clone();
+                        let child_tbl = cix.def.table.clone();
+                        let on_partition = eng
+                            .db
+                            .find_table(&child_tbl, ctx.snap, &ctx.all_xids, ctx.session)
+                            .is_some_and(|t| {
+                                t.partition.as_ref().and_then(|p| p.parent.as_deref())
+                                    == Some(parent_tbl.as_str())
+                            });
+                        let fail = |detail: String| ExecError {
+                            code: "55000",
+                            message: format!(
+                                "cannot attach index \"{}\" as a partition of index \"{}\"",
+                                child, name
+                            ),
+                            detail: Some(detail),
+                        };
+                        if !on_partition {
+                            return Err(fail(format!(
+                                "Index \"{}\" is not an index on any partition of table \"{}\"",
+                                child, parent_tbl
+                            )));
+                        }
+                        if cix.def.parent_index.is_some() {
+                            return Err(fail(format!(
+                                "Another index \"{}\" is already attached for partition \"{}\"",
+                                cix.def.parent_index.clone().unwrap_or_default(),
+                                child_tbl
+                            )));
+                        }
+                        // A sibling already attached for this partition?
+                        let sibling = eng
+                            .db
+                            .visible_indexes_for(&child_tbl, ctx.snap, &ctx.all_xids, ctx.session)
+                            .into_iter()
+                            .find(|s| {
+                                s.def.parent_index.as_deref() == Some(name) && s.def.name != *child
+                            })
+                            .map(|s| s.def.name.clone());
+                        if let Some(sib) = sibling {
+                            return Err(fail(format!(
+                                "Another index \"{}\" is already attached for partition \"{}\"",
+                                sib, child_tbl
+                            )));
+                        }
+                        if !index_defs_equivalent(&cix.def, &ix.def) {
+                            return Err(fail("The index definitions do not match.".to_string()));
+                        }
+                        relink_index_parent(eng, ctx, child, Some(name.to_string()))?;
+                    }
+                }
+            }
         }
     }
     Ok(ExecResult::Command {
@@ -1488,6 +2080,8 @@ pub(crate) fn exec_drop_index(
     ctx: &mut StmtCtx,
     names: &[String],
     if_exists: bool,
+    // v2.29: DROP INDEX CONCURRENTLY.
+    concurrently: bool,
 ) -> Result<ExecResult, ExecError> {
     // v0.89: like PostgreSQL, resolve every name before dropping any: a
     // missing name anywhere in the list aborts the whole statement with
@@ -1500,15 +2094,51 @@ pub(crate) fn exec_drop_index(
             .get(&ctx.session)
             .and_then(|m| m.get(name))
             .filter(|ix| index_visible(&ix.def, ctx.snap, &ctx.all_xids))
-            .is_some();
-        if !temp_hit && eng.db.find_index(name, ctx.snap, &ctx.all_xids).is_none() && !if_exists {
+            .cloned();
+        let perm_hit = eng.db.find_index(name, ctx.snap, &ctx.all_xids).cloned();
+        let found = temp_hit.clone().or_else(|| perm_hit.clone());
+        if found.is_none() && !if_exists {
             return Err(exec_err(
                 "42P01",
                 format!("index \"{}\" does not exist", name),
             ));
         }
+        // v2.29: a physical child index cannot be dropped directly
+        // (PG19 dependency check, 2BP01); drop its parent instead.
+        if let Some(f) = &found {
+            if let Some(parent) = &f.def.parent_index {
+                return Err(exec_err(
+                    "2BP01",
+                    format!(
+                        "cannot drop index {} because index {} requires it",
+                        name, parent
+                    ),
+                ));
+            }
+            // v2.29: DROP INDEX CONCURRENTLY on a partitioned index
+            // is rejected (tablecmds.c) — except for TEMP partitioned
+            // indexes, where PG performs the drop (indexing.sql).
+            if concurrently && temp_hit.is_none() {
+                let partitioned = eng
+                    .db
+                    .find_table(&f.def.table, ctx.snap, &ctx.all_xids, ctx.session)
+                    .is_some_and(|t| t.partition.as_ref().is_some_and(|p| p.is_partitioned));
+                if partitioned {
+                    return Err(exec_err(
+                        "0A000",
+                        format!("cannot drop partitioned index \"{}\" concurrently", name),
+                    ));
+                }
+            }
+        }
     }
     for name in names {
+        // v2.29: dropping a partitioned index drops its whole
+        // descendant family with it (children first).
+        let family = index_family_names(eng, ctx, name);
+        for member in family.iter().skip(1).rev() {
+            exec_drop_one_index(eng, ctx, member, true)?;
+        }
         exec_drop_one_index(eng, ctx, name, if_exists)?;
     }
     Ok(ExecResult::Command {

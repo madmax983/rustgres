@@ -113,9 +113,17 @@ fn partitioned_unique_index_null_keys_never_conflict() {
         &mut eng,
         "create table np1 partition of np for values from (0) to (100)",
     );
-    ok(&mut eng, "create unique index on np (a)");
+    // v2.29: PG19 DefineIndex rejects a UNIQUE index on a
+    // partitioned table that omits a partition-key column (0A000);
+    // the v2.25-era form of this test used exactly that shape.
+    let e = err(&mut eng, "create unique index on np (a)");
+    assert_eq!(e.code, "0A000");
+    // With the partition key included, NULL key parts never
+    // conflict (NULLS DISTINCT), across leaves and within one.
+    ok(&mut eng, "create unique index on np (b, a)");
     ok(&mut eng, "insert into np values (null, 1), (null, 2)");
     ok(&mut eng, "insert into np select null, 3");
+    ok(&mut eng, "insert into np values (null, 1)");
 }
 
 #[test]

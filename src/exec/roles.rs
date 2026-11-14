@@ -3544,6 +3544,30 @@ pub(crate) fn exec_cluster(
                     format!("cannot cluster on partial index \"{}\"", ix),
                 ));
             }
+            // v2.29: PG19 repack.c — an invalid index (a partitioned
+            // index whose partitions lack linked children, e.g. an
+            // ON ONLY creation) cannot cluster.
+            {
+                let defs = crate::exec::catalog::visible_index_defs(
+                    &eng.db,
+                    ctx.snap,
+                    ctx.own,
+                    ctx.session,
+                );
+                if !crate::exec::catalog::index_is_valid(
+                    &eng.db,
+                    ctx.snap,
+                    ctx.own,
+                    ctx.session,
+                    &defs,
+                    &idef,
+                ) {
+                    return Err(exec_err(
+                        "0A000",
+                        format!("cannot cluster on invalid index \"{}\"", ix),
+                    ));
+                }
+            }
             // A partitioned parent itself is never marked clustered
             // (its partitions are); PG leaves the parent unmarked,
             // so a later bare CLUSTER on it still errors.

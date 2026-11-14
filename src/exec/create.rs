@@ -326,11 +326,26 @@ pub(crate) fn exec_create(
     // tables get none — the global index map cannot represent them.)
     if !temp {
         if let Some(pk) = &eff_def.pkey {
-            create_constraint_index(eng, ctx, name, &pk.name, &pk.cols, true, false)?;
+            create_constraint_index(eng, ctx, name, &pk.name, &pk.cols, true, false, &pk.include)?;
         }
         for u in &eff_def.uniques {
-            create_constraint_index(eng, ctx, name, &u.name, &u.cols, true, u.nulls_not_distinct)?;
+            create_constraint_index(
+                eng,
+                ctx,
+                name,
+                &u.name,
+                &u.cols,
+                true,
+                u.nulls_not_distinct,
+                &u.include,
+            )?;
         }
+    }
+    // v2.29: a new partition inherits physical child indexes from
+    // every standalone index on its parent (PG19 DefineIndex /
+    // CreatePartitionIndexes at PARTITION OF time).
+    if let Some(parent) = eff_def.partition.as_ref().and_then(|p| p.parent.clone()) {
+        propagate_parent_indexes(eng, ctx, &parent, name)?;
     }
     // v2.16: record UNLOGGED creations for the SET LOGGED /
     // SET UNLOGGED prep checks.

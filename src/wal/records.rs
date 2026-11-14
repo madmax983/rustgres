@@ -127,6 +127,13 @@ pub enum WalRecord {
         /// v2.08 (RGSWAL30): NULLS NOT DISTINCT unique index;
         /// trailing field, present only in RGSWAL30+ images.
         nulls_not_distinct: bool,
+        /// v2.29 (RGSWAL35): parent partitioned index name for a
+        /// physical child index; trailing field, present only in
+        /// RGSWAL35+ images.
+        parent_index: Option<String>,
+        /// v2.29 (RGSWAL35): INCLUDE column names; trailing field,
+        /// present only in RGSWAL35+ images.
+        include_names: Vec<String>,
         xmin: u64,
     },
     DropIndex {

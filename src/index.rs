@@ -279,6 +279,21 @@ pub struct IndexDef {
     /// Only meaningful for unique indexes: NULL key parts compare
     /// EQUAL for uniqueness instead of never conflicting.
     pub nulls_not_distinct: bool,
+    /// v2.29: name of the parent partitioned index this index is a
+    /// physical child of (PG19 pg_inherits link between indexes), or
+    /// `None` for a standalone index. Children are real Index objects
+    /// created by CREATE INDEX / PARTITION OF / ATTACH propagation;
+    /// DROP INDEX refuses them directly (2BP01) and dropping the
+    /// parent drops the whole family.
+    pub parent_index: Option<String>,
+    /// v2.29: INCLUDE column names (PG19 CREATE INDEX ... INCLUDE),
+    /// parallel to `include_cols`. Catalog/rendering only: included
+    /// columns are never keys (uniqueness, ordering and the planner
+    /// ignore them). Persisted by name; positions are re-derived.
+    pub include_names: Vec<String>,
+    /// v2.29: INCLUDE column positions in the indexed table, parallel
+    /// to `include_names`.
+    pub include_cols: Vec<usize>,
 }
 
 impl IndexDef {
@@ -311,6 +326,9 @@ impl IndexDef {
             predicate: None,
             planner_usable: true,
             nulls_not_distinct: false,
+            parent_index: None,
+            include_names: Vec::new(),
+            include_cols: Vec::new(),
         }
     }
 }

@@ -787,9 +787,26 @@ pub(crate) fn plan_upsert(
             // index never satisfies it — even when it is the only
             // unique index on those columns (the conflict then
             // surfaces as the NND index's own 23505, per PG).
+            // v2.29: prefer a constraint-backed candidate over a
+            // standalone index when both match the inference spec.
+            // PG picks by index OID order; constraint indexes are
+            // created with their table, before any later standalone
+            // index, so this mirrors PG's pick — and it matters now
+            // that CREATE INDEX ON ONLY parses: a standalone unique
+            // index on a partitioned table may have no per-leaf
+            // backing index to arbitrate with (partition_info's
+            // non-valid parent index case), while the PRIMARY KEY
+            // created with the table does.
             let found = unique
                 .iter()
-                .find(|(_, _, cn, _, co, op, nnd)| !*nnd && arbiter_elems_match(cn, co, op, cols));
+                .find(|(_, _, cn, con, co, op, nnd)| {
+                    con.is_some() && !*nnd && arbiter_elems_match(cn, co, op, cols)
+                })
+                .or_else(|| {
+                    unique.iter().find(|(_, _, cn, _, co, op, nnd)| {
+                        !*nnd && arbiter_elems_match(cn, co, op, cols)
+                    })
+                });
             match found {
                 Some((n, pcols, _, con, _, _, nnd)) => {
                     vec![(n.clone(), pcols.clone(), con.clone(), *nnd)]

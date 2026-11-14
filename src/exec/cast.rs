@@ -1249,6 +1249,13 @@ pub(crate) fn regclass_display(q: &Q, oid: u32) -> String {
             return name.clone();
         }
     }
+    // v2.29: synthetic index OIDs render as the index name.
+    {
+        let imap = crate::exec::catalog::index_oid_map(&q.eng.db, q.snap, q.own, q.session);
+        if let Some((n, _)) = imap.iter().find(|(_, o)| **o == oid as i64) {
+            return n.clone();
+        }
+    }
     // v2.04: view stand-in oids (name hash) render as the view name.
     for (vname, v) in &q.eng.db.views {
         if v.iter().any(|vd| vd.dropped_xmax == 0) && crate::exec::catalog::name_oid(vname) == oid {
@@ -1316,6 +1323,15 @@ pub(crate) fn eval_regclass_cast(q: &mut Q, v: &Value) -> Result<Value, ExecErro
                 oid
             } else if let Some(t) = q.eng.db.find_table(s, q.snap, &q.all_xids, q.session) {
                 t.oid
+            } else if let Some((_, o)) =
+                crate::exec::catalog::index_oid_map(&q.eng.db, q.snap, q.own, q.session)
+                    .iter()
+                    .find(|(n, _)| {
+                        n.as_str() == s.as_ref() || n.rsplit('.').next() == Some(s.as_ref())
+                    })
+            {
+                // v2.29: index names resolve to their synthetic OID.
+                *o as u32
             } else if q
                 .eng
                 .db

@@ -750,6 +750,9 @@ fn v088_create_index_metadata_roundtrip() {
         opclasses: vec![Some("text_pattern_ops".into()), None],
         // v2.08: NULLS NOT DISTINCT (RGSWAL30 trailing byte).
         nulls_not_distinct: true,
+        // v2.29: parent link + INCLUDE names (RGSWAL35 trailing).
+        parent_index: Some("parent_ix".into()),
+        include_names: vec!["c".into()],
         xmin: 42,
     };
     let mut e = Enc::new();
@@ -769,9 +772,13 @@ fn v088_create_index_metadata_roundtrip() {
             collates,
             opclasses,
             nulls_not_distinct,
+            parent_index,
+            include_names,
             xmin,
         } => {
             assert!(nulls_not_distinct);
+            assert_eq!(parent_index.as_deref(), Some("parent_ix"));
+            assert_eq!(include_names, vec!["c".to_string()]);
             assert_eq!(collates, vec![None, Some("C".to_string())]);
             assert_eq!(opclasses, vec![Some("text_pattern_ops".to_string()), None]);
             assert_eq!(name, "ix");
@@ -1261,6 +1268,8 @@ fn v200_alter_replay_create_index_entries_resolve() {
             collates: vec![None],
             opclasses: vec![None],
             nulls_not_distinct: false,
+            parent_index: None,
+            include_names: Vec::new(),
             xmin: 6,
         },
     )

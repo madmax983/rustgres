@@ -3266,12 +3266,17 @@ pub(crate) fn alter_add_column_ext(
         });
     }
     // Backing indexes for new unique/pkey constraints.
-    let mut new_indexes: Vec<(String, Vec<String>, bool)> = Vec::new();
+    let mut new_indexes: Vec<(String, Vec<String>, bool, Vec<String>)> = Vec::new();
     for u in uniques {
-        new_indexes.push((u.name.clone(), u.cols.clone(), u.nulls_not_distinct));
+        new_indexes.push((
+            u.name.clone(),
+            u.cols.clone(),
+            u.nulls_not_distinct,
+            u.include.clone(),
+        ));
     }
     if let Some(pk) = pkey {
-        new_indexes.push((pk.name.clone(), pk.cols.clone(), false));
+        new_indexes.push((pk.name.clone(), pk.cols.clone(), false, pk.include.clone()));
     }
     // v0.37: adding the first toastable column earns the table a toast
     // table (like PG), so reltoastrelid is set even before any row is
@@ -3280,13 +3285,13 @@ pub(crate) fn alter_add_column_ext(
     // old version (whose toast_relid is still 0).
     ensure_toast_table_eager(eng, ctx, name, &mut next);
     alter_swap(eng, ctx, name, None, next, Some(new_rows))?;
-    for (ix_name, cols, nnd) in new_indexes {
+    for (ix_name, cols, nnd, inc) in new_indexes {
         if eng.db.is_temp_table(ctx.session, name) {
             // v0.77: temp tables have no backing global indexes (v0.22);
             // duplicates are checked by scanning the rows.
             temp_unique_dup_check(eng, ctx, name, &ix_name, &cols, nnd)?;
         } else {
-            create_constraint_index(eng, ctx, name, &ix_name, &cols, true, nnd)?;
+            create_constraint_index(eng, ctx, name, &ix_name, &cols, true, nnd, &inc)?;
         }
     }
     Ok(ExecResult::Command {
@@ -3856,6 +3861,17 @@ pub(crate) fn alter_drop_column_ext(
         internal: bool,
         // v2.08: NULLS NOT DISTINCT survives the rebuild.
         nulls_not_distinct: bool,
+        // v2.29: parent link + INCLUDEs survive the rebuild.
+        parent_index: Option<String>,
+        include_names: Vec<String>,
+        include_cols: Vec<usize>,
+        desc: Vec<bool>,
+        nulls_first: Vec<bool>,
+        exprs: Vec<Option<String>>,
+        collates: Vec<Option<String>>,
+        opclasses: Vec<Option<String>>,
+        predicate: Option<String>,
+        planner_usable: bool,
     }
     let mut shifted: Vec<ShiftedIndex> = Vec::with_capacity(index_defs.len());
     for (ix_name, cols, col_names) in index_defs {
@@ -3868,6 +3884,16 @@ pub(crate) fn alter_drop_column_ext(
             unique: snapshot.def.unique,
             internal: snapshot.def.internal,
             nulls_not_distinct: snapshot.def.nulls_not_distinct,
+            parent_index: snapshot.def.parent_index.clone(),
+            include_names: snapshot.def.include_names.clone(),
+            include_cols: snapshot.def.include_cols.clone(),
+            desc: snapshot.def.desc.clone(),
+            nulls_first: snapshot.def.nulls_first.clone(),
+            exprs: snapshot.def.exprs.clone(),
+            collates: snapshot.def.collates.clone(),
+            opclasses: snapshot.def.opclasses.clone(),
+            predicate: snapshot.def.predicate.clone(),
+            planner_usable: snapshot.def.planner_usable,
         });
     }
     alter_swap(eng, ctx, name, None, next, Some(new_rows))?;
@@ -3878,9 +3904,23 @@ pub(crate) fn alter_drop_column_ext(
         unique,
         internal,
         nulls_not_distinct,
+        parent_index,
+        include_names,
+        include_cols,
+        desc,
+        nulls_first,
+        exprs,
+        collates,
+        opclasses,
+        predicate,
+        planner_usable,
     } in shifted
     {
         let new_cols: Vec<usize> = cols
+            .into_iter()
+            .map(|p| if p > ci { p - 1 } else { p })
+            .collect();
+        let new_include_cols: Vec<usize> = include_cols
             .into_iter()
             .map(|p| if p > ci { p - 1 } else { p })
             .collect();
@@ -3894,6 +3934,16 @@ pub(crate) fn alter_drop_column_ext(
             ctx.own,
         );
         def.nulls_not_distinct = nulls_not_distinct;
+        def.parent_index = parent_index;
+        def.include_names = include_names;
+        def.include_cols = new_include_cols;
+        def.desc = desc;
+        def.nulls_first = nulls_first;
+        def.exprs = exprs;
+        def.collates = collates;
+        def.opclasses = opclasses;
+        def.predicate = predicate;
+        def.planner_usable = planner_usable;
         let mut ix = Index::new(def);
         let t2 = eng
             .db
@@ -4578,7 +4628,16 @@ pub(crate) fn alter_add_constraint(
             // duplicates are checked by scanning the rows.
             temp_unique_dup_check(eng, ctx, name, &u.name, &u.cols, u.nulls_not_distinct)?;
         } else {
-            create_constraint_index(eng, ctx, name, &u.name, &u.cols, true, u.nulls_not_distinct)?;
+            create_constraint_index(
+                eng,
+                ctx,
+                name,
+                &u.name,
+                &u.cols,
+                true,
+                u.nulls_not_distinct,
+                &u.include,
+            )?;
         }
         return Ok(ExecResult::Command {
             tag: "ALTER TABLE".to_string(),
@@ -4636,7 +4695,7 @@ pub(crate) fn alter_add_constraint(
             // v0.77: temp tables have no backing global indexes (v0.22).
             temp_unique_dup_check(eng, ctx, name, &pk.name, &pk.cols, false)?;
         } else {
-            create_constraint_index(eng, ctx, name, &pk.name, &pk.cols, true, false)?;
+            create_constraint_index(eng, ctx, name, &pk.name, &pk.cols, true, false, &pk.include)?;
         }
         return Ok(ExecResult::Command {
             tag: "ALTER TABLE".to_string(),

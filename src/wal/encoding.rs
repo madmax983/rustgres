@@ -981,6 +981,8 @@ impl Enc {
                 collates,
                 opclasses,
                 nulls_not_distinct,
+                parent_index,
+                include_names,
                 xmin,
             } => {
                 self.u8(5);
@@ -1012,6 +1014,16 @@ impl Enc {
                 self.opt_str_list(opclasses);
                 // v2.08 (RGSWAL30): NULLS NOT DISTINCT, trailing.
                 self.u8(*nulls_not_distinct as u8);
+                // v2.29 (RGSWAL35): parent index link + INCLUDE
+                // column names, trailing.
+                match parent_index {
+                    Some(p) => {
+                        self.u8(1);
+                        self.str(p);
+                    }
+                    None => self.u8(0),
+                }
+                self.str_list(include_names);
             }
             WalRecord::DropIndex { name, xmax } => {
                 self.u8(6);
@@ -2386,6 +2398,16 @@ impl<'a> Dec<'a> {
                 } else {
                     false
                 };
+                // v2.29: parent link + INCLUDE names ride
+                // RGSWAL35+ only (trailing).
+                let (parent_index, include_names) = if self.wal_version >= 35 {
+                    let has_parent = self.u8()? != 0;
+                    let parent = if has_parent { Some(self.str()?) } else { None };
+                    let includes = self.str_list_d()?;
+                    (parent, includes)
+                } else {
+                    (None, Vec::new())
+                };
                 Ok(WalRecord::CreateIndex {
                     name,
                     table,
@@ -2399,6 +2421,8 @@ impl<'a> Dec<'a> {
                     collates,
                     opclasses,
                     nulls_not_distinct,
+                    parent_index,
+                    include_names,
                     xmin,
                 })
             }

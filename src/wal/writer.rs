@@ -50,7 +50,10 @@ pub(crate) const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK16";
 /// (and partition keys carry opclass names in the table images).
 /// v31 checkpoints are refused; remove the data directory to
 /// start fresh.
-pub(crate) const CHKPT_VERSION: u32 = 32;
+/// v2.29: version 33 adds the per-index parent link + INCLUDE
+/// column names to index images. v32 checkpoints are refused;
+/// remove the data directory to start fresh.
+pub(crate) const CHKPT_VERSION: u32 = 33;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -120,14 +123,17 @@ pub(crate) const CHKPT_VERSION: u32 = 32;
 /// the field decodes as false.
 /// v2.12: `RGSWAL31` — CreateFunction records carry `arg_modes`
 /// (trailing list). Older logs still read; modes decode as all-IN.
-pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL34";
+pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL35";
 /// v1.80: the format version number in [`WAL_MAGIC`].
 /// v2.14: version 33 — CreateView records carry view triggers
 /// (trailing string). Older logs still read; triggers decode empty.
 /// v2.23: version 34 — partition metadata carries per-key
 /// operator class names (trailing). Older logs still read; the
 /// opclasses decode as absent.
-pub(crate) const WAL_VERSION: u32 = 34;
+/// v2.29: version 35 — CreateIndex records carry the parent
+/// partitioned index link + INCLUDE column names (trailing). Older
+/// logs still read; the link decodes as None and includes as empty.
+pub(crate) const WAL_VERSION: u32 = 35;
 /// v1.80: oldest WAL format this build can replay.
 pub(crate) const MIN_READABLE_WAL_VERSION: u32 = 20;
 pub(crate) const WAL_HEADER_LEN: u64 = 16;
@@ -591,6 +597,15 @@ impl Wal {
             ix_body.opt_str_list(&ix.def.opclasses);
             // v2.08 (checkpoint v27): NULLS NOT DISTINCT.
             ix_body.u8(ix.def.nulls_not_distinct as u8);
+            // v2.29 (checkpoint v33): parent index link + INCLUDEs.
+            match &ix.def.parent_index {
+                Some(p) => {
+                    ix_body.u8(1);
+                    ix_body.str(p);
+                }
+                None => ix_body.u8(0),
+            }
+            ix_body.str_list(&ix.def.include_names);
             ix_body.u64(ix.def.created_xmin);
             ix_body.u64(0); // live index: no committed drop
             n_indexes += 1;
@@ -1440,6 +1455,13 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         opclasses.resize(n_cols, None);
         // v2.08 (checkpoint v27): NULLS NOT DISTINCT.
         let nulls_not_distinct = d.u8().map_err(|e| bad(&e))? != 0;
+        // v2.29 (checkpoint v33): parent index link + INCLUDE names.
+        let parent_index = if d.u8().map_err(|e| bad(&e))? != 0 {
+            Some(d.str().map_err(|e| bad(&e))?)
+        } else {
+            None
+        };
+        let include_names = d.str_list_d().map_err(|e| bad(&e))?;
         let created_xmin = d.u64().map_err(|e| bad(&e))?;
         let dropped_xmax = d.u64().map_err(|e| bad(&e))?;
         let bad_idx = |why: String| {
@@ -1475,6 +1497,11 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
             // v0.88: expression / partial indexes are catalog-only (never
             // built); their definitions still round-trip for fidelity.
             let planner_usable = !any_expr && predicate.is_none();
+            // v2.29: INCLUDE positions re-derived from names.
+            let include_cols: Vec<usize> = include_names
+                .iter()
+                .filter_map(|c| t.column_index(c))
+                .collect();
             let mut ix = Index::new(IndexDef {
                 name: name.clone(),
                 table: table.clone(),
@@ -1492,6 +1519,9 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 predicate,
                 planner_usable,
                 nulls_not_distinct,
+                parent_index,
+                include_names,
+                include_cols,
             });
             if planner_usable {
                 for r in &t.rows {

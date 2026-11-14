@@ -4154,6 +4154,27 @@ fn run_statement(
     session: &mut Session,
     stmt: &Stmt,
 ) -> Result<ExecResult, ExecError> {
+    // v2.29: PG19 PreventInTransactionBlock — CREATE/DROP INDEX
+    // CONCURRENTLY cannot run inside a transaction block (25001).
+    if session.txn.is_some() {
+        match stmt {
+            Stmt::CreateIndex {
+                concurrently: true, ..
+            } => {
+                return Err(err_25001(
+                    "CREATE INDEX CONCURRENTLY cannot run inside a transaction block",
+                ));
+            }
+            Stmt::DropIndex {
+                concurrently: true, ..
+            } => {
+                return Err(err_25001(
+                    "DROP INDEX CONCURRENTLY cannot run inside a transaction block",
+                ));
+            }
+            _ => {}
+        }
+    }
     // v0.74: SQL-level EXECUTE resolves to the stored prepared
     // statement with its arguments bound, so the checks below see the
     // real statement. (PREPARE/DEALLOCATE are handled in the match.)

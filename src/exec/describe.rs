@@ -366,6 +366,25 @@ pub(crate) fn from_schema_item(
                 out.push(apply_aliases(schema)?);
                 return Ok(());
             }
+            // v2.29: pg_index / pg_indexes are virtual too.
+            if matches!(name.as_str(), "pg_index" | "pg_indexes")
+                && eng.db.find_table(name, snap, &[own], session).is_none()
+            {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let schema: Vec<QCol> = (if name == "pg_index" {
+                    pg_index_schema()
+                } else {
+                    pg_indexes_schema()
+                })
+                .into_iter()
+                .map(|mut c| {
+                    c.qual = qual.clone();
+                    c
+                })
+                .collect();
+                out.push(apply_aliases(schema)?);
+                return Ok(());
+            }
             // v0.98: pg_sequences is virtual too (sequence catalog).
             if name == "pg_sequences" && eng.db.find_table(name, snap, &[own], session).is_none() {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());

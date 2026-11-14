@@ -2455,6 +2455,9 @@ pub struct UniqueDef {
     pub nulls_not_distinct: bool,
     /// v2.27: PG19 conislocal (see CheckDef::is_local).
     pub is_local: bool,
+    /// v2.29: INCLUDE columns of the backing covering index (PG19
+    /// index_including): carried by the index, never keys.
+    pub include: Vec<String>,
 }
 
 impl UniqueDef {
@@ -2467,6 +2470,7 @@ impl UniqueDef {
             initially_deferred: false,
             nulls_not_distinct: false,
             is_local: true,
+            include: Vec::new(),
         }
     }
 }
@@ -3247,12 +3251,12 @@ pub(crate) enum ColCon {
 pub(crate) enum ParsedTableCon {
     /// v2.07: table PRIMARY KEY (cols) + ConstraintAttributeSpec
     /// results (deferrable, initially_deferred).
-    PKey(Option<String>, Vec<String>, bool, bool),
+    PKey(Option<String>, Vec<String>, bool, bool, Vec<String>),
     /// v2.06: `PRIMARY KEY USING INDEX name` (ALTER ADD form).
     PKeyUsingIndex(Option<String>, String),
     /// v2.07: table UNIQUE (cols) + ConstraintAttributeSpec results.
-    /// v2.08: plus nulls_not_distinct.
-    Unique(Option<String>, Vec<String>, bool, bool, bool),
+    /// v2.08: plus nulls_not_distinct. v2.29: plus INCLUDE columns.
+    Unique(Option<String>, Vec<String>, bool, bool, bool, Vec<String>),
     /// v2.07: `UNIQUE USING INDEX name` (ALTER ADD form).
     UniqueUsingIndex(Option<String>, String),
     /// v2.16: plus NO INHERIT (gram.y ConstraintAttributeSpec).
@@ -3470,9 +3474,11 @@ pub(crate) fn def_add_pkey(
     // v2.07: ConstraintAttributeSpec results.
     deferrable: bool,
     initially_deferred: bool,
+    // v2.29: INCLUDE columns of the backing index.
+    include: &[String],
 ) -> Result<(), SqlError> {
     if !defer_col_check {
-        for c in cols {
+        for c in cols.iter().chain(include.iter()) {
             if !def_col_exists(def, c) {
                 return Err(err(format!("column \"{}\" does not exist", c)));
             }
@@ -3503,6 +3509,7 @@ pub(crate) fn def_add_pkey(
         initially_deferred,
         nulls_not_distinct: false,
         is_local: true,
+        include: include.to_vec(),
     });
     Ok(())
 }
@@ -3522,9 +3529,11 @@ pub(crate) fn def_add_unique(
     initially_deferred: bool,
     // v2.08: NULLS NOT DISTINCT (parsed before the column list).
     nulls_not_distinct: bool,
+    // v2.29: INCLUDE columns of the backing index.
+    include: &[String],
 ) -> Result<(), SqlError> {
     if !defer_col_check {
-        for c in cols {
+        for c in cols.iter().chain(include.iter()) {
             if !def_col_exists(def, c) {
                 return Err(err(format!("column \"{}\" does not exist", c)));
             }
@@ -3537,7 +3546,20 @@ pub(crate) fn def_add_unique(
             }
             n.clone()
         }
-        None => choose_auto_name(def, &format!("{}_{}_key", table, cols.join("_"))),
+        // v2.29: PG's ChooseConstraintName for a covering unique
+        // names key + INCLUDE columns (tbl_c1_c2_c3_c4_key).
+        None => choose_auto_name(
+            def,
+            &format!(
+                "{}_{}_key",
+                table,
+                cols.iter()
+                    .chain(include.iter())
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("_")
+            ),
+        ),
     };
     def.uniques.push(UniqueDef {
         name: cname,
@@ -3546,6 +3568,7 @@ pub(crate) fn def_add_unique(
         initially_deferred,
         nulls_not_distinct,
         is_local: true,
+        include: include.to_vec(),
     });
     Ok(())
 }
@@ -3783,6 +3806,7 @@ pub(crate) fn build_table_def(
                             *df,
                             *idf,
                             *nnd,
+                            &[],
                         )?,
                         ColCon::PKey(n, df, idf) => def_add_pkey(
                             table,
@@ -3792,6 +3816,7 @@ pub(crate) fn build_table_def(
                             false,
                             *df,
                             *idf,
+                            &[],
                         )?,
                         ColCon::Default(d) => {
                             // v2.28: identity declared earlier in the
@@ -3897,7 +3922,7 @@ pub(crate) fn build_table_def(
                         "PRIMARY KEY / UNIQUE USING INDEX is only valid in ALTER TABLE".to_string(),
                     ));
                 }
-                ParsedTableCon::PKey(n, cols, df, idf) => def_add_pkey(
+                ParsedTableCon::PKey(n, cols, df, idf, inc) => def_add_pkey(
                     table,
                     &mut def,
                     n.clone(),
@@ -3905,8 +3930,9 @@ pub(crate) fn build_table_def(
                     !inherits.is_empty(),
                     *df,
                     *idf,
+                    inc,
                 )?,
-                ParsedTableCon::Unique(n, cols, df, idf, nnd) => {
+                ParsedTableCon::Unique(n, cols, df, idf, nnd, inc) => {
                     let first = cols[0].clone();
                     def_add_unique(
                         table,
@@ -3918,6 +3944,7 @@ pub(crate) fn build_table_def(
                         *df,
                         *idf,
                         *nnd,
+                        inc,
                     )?
                 }
                 ParsedTableCon::Check(n, e, nv, enf, noinh) => def_add_check(
@@ -10409,10 +10436,20 @@ pub enum Stmt {
         predicate: Option<String>,
         /// v2.08: NULLS NOT DISTINCT (only meaningful when unique).
         nulls_not_distinct: bool,
+        /// v2.29: CREATE INDEX CONCURRENTLY (PG19 IndexStmt.concurrent).
+        concurrently: bool,
+        /// v2.29: `ON ONLY table` — no child indexes are created on
+        /// partitions (PG19 IndexStmt.relation kind ONLY).
+        only: bool,
+        /// v2.29: INCLUDE column names (PG19 IndexStmt.accessMethod
+        /// includeAttribute list), in written order.
+        include: Vec<String>,
     },
     DropIndex {
         names: Vec<String>,
         if_exists: bool,
+        /// v2.29: DROP INDEX CONCURRENTLY.
+        concurrently: bool,
     },
     // --- v0.8: EXPLAIN (planned, never executed)
     // v1.03: `analyze` preserves the ANALYZE option; true means the inner

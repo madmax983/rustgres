@@ -728,6 +728,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             collates,
             opclasses,
             nulls_not_distinct,
+            parent_index,
+            include_names,
             xmin,
         } => {
             // Rebuild the index from the table's current rows: at recovery
@@ -761,6 +763,11 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 let mut op = opclasses.clone();
                 op.resize(n, None);
                 let planner_usable = !any_expr && predicate.is_none();
+                // v2.29: INCLUDE positions re-derived from names.
+                let include_cols: Vec<usize> = include_names
+                    .iter()
+                    .filter_map(|c| t.column_index(c))
+                    .collect();
                 let mut ix = Index::new(IndexDef {
                     name: name.clone(),
                     table: table.clone(),
@@ -778,6 +785,9 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     predicate: predicate.clone(),
                     planner_usable,
                     nulls_not_distinct: *nulls_not_distinct,
+                    parent_index: parent_index.clone(),
+                    include_names: include_names.clone(),
+                    include_cols,
                 });
                 if planner_usable {
                     for r in &t.rows {
@@ -2062,6 +2072,8 @@ pub fn records_for_commit(
                     collates: ix.def.collates.clone(),
                     opclasses: ix.def.opclasses.clone(),
                     nulls_not_distinct: ix.def.nulls_not_distinct,
+                    parent_index: ix.def.parent_index.clone(),
+                    include_names: ix.def.include_names.clone(),
                     xmin: own,
                 });
             }

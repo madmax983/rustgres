@@ -22,6 +22,17 @@ pub(crate) fn pg_class_schema() -> Vec<QCol> {
         // relforcerowsecurity), appended to the bounded subset.
         ("relrowsecurity", ColType::Bool),
         ("relforcerowsecurity", ColType::Bool),
+        // v2.29: appended index-family columns (positions of the
+        // existing six are unchanged). relhassubclass — the relation
+        // has subclasses in pg_inherits (partitions, inheritance
+        // children, or child indexes for a partitioned index);
+        // relnamespace — 2200 (public) for user objects, 11
+        // (pg_catalog) for the well-known catalog rows; relam — the
+        // access method oid (403 btree for indexes, 2 heap for
+        // tables, 0 otherwise).
+        ("relhassubclass", ColType::Bool),
+        ("relnamespace", ColType::Int),
+        ("relam", ColType::Int),
     ]
     .into_iter()
     .map(|(n, ty)| QCol {
@@ -46,6 +57,21 @@ pub(crate) fn pg_class_scan(
     // Sort by name for deterministic output.
     let mut names: Vec<&String> = db.tables.keys().collect();
     names.sort();
+    // v2.29: superclass name set (partition parents + inheritance
+    // parents) for relhassubclass, computed once.
+    let mut superclasses: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for n in &names {
+        if let Some(t) = db.find_table(n, snap, &[own], session) {
+            if let Some(p) = &t.partition {
+                if let Some(parent) = &p.parent {
+                    superclasses.insert(parent.clone());
+                }
+            }
+            for parent in &t.inherits {
+                superclasses.insert(parent.clone());
+            }
+        }
+    }
     for name in names {
         // Only the live version is visible in pg_class.
         let Some(t) = db.find_table(name, snap, &[own], session) else {
@@ -64,6 +90,10 @@ pub(crate) fn pg_class_scan(
         } else {
             Value::SingleChar(b'r')
         };
+        // v2.29: relhassubclass — any partition child or plain
+        // inheritance child makes this relation a superclass.
+        let has_subclass = t.partition.as_ref().is_some_and(|p| !p.children.is_empty())
+            || superclasses.contains(name.as_str());
         rows.push(QRow {
             cells: Row::new(vec![
                 Value::Int(t.oid as i64),
@@ -75,9 +105,42 @@ pub(crate) fn pg_class_scan(
                 relkind,
                 Value::Bool(t.rls_enabled),
                 Value::Bool(t.rls_forced),
+                Value::Bool(has_subclass),
+                Value::Int(2200),
+                Value::Int(2),
             ]),
             prov: Vec::new(),
         });
+    }
+    // v2.29: index rows (relkind 'i', or 'I' for a partitioned
+    // index). OIDs come from the shared synthetic index_oid_map so
+    // pg_index.indexrelid and pg_inherits links join exactly.
+    {
+        let oids = index_oid_map(db, snap, own, session);
+        let defs = visible_index_defs(db, snap, own, session);
+        let parents_with_children: std::collections::HashSet<&str> = defs
+            .iter()
+            .filter_map(|d| d.parent_index.as_deref())
+            .collect();
+        for d in &defs {
+            let on_partitioned = db
+                .find_table(&d.table, snap, &[own], session)
+                .is_some_and(|t| t.partition.as_ref().is_some_and(|p| p.is_partitioned));
+            rows.push(QRow {
+                cells: Row::new(vec![
+                    Value::Int(oids.get(&d.name).copied().unwrap_or(0)),
+                    Value::text(d.name.rsplit('.').next().unwrap_or(d.name.as_str())),
+                    Value::Int(0),
+                    Value::SingleChar(if on_partitioned { b'I' } else { b'i' }),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Bool(parents_with_children.contains(d.name.as_str())),
+                    Value::Int(2200),
+                    Value::Int(403),
+                ]),
+                prov: Vec::new(),
+            });
+        }
     }
     // v1.96: well-known catalog relations with their PG19 oids, so
     // `SELECT oid FROM pg_class WHERE relname = 'pg_authid'` resolves.
@@ -103,6 +166,9 @@ pub(crate) fn pg_class_scan(
                     Value::SingleChar(b'r'),
                     Value::Bool(false),
                     Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Int(11),
+                    Value::Int(2),
                 ]),
                 prov: Vec::new(),
             });
@@ -124,6 +190,9 @@ pub(crate) fn pg_class_scan(
                 Value::SingleChar(b'r'),
                 Value::Bool(false),
                 Value::Bool(false),
+                Value::Bool(false),
+                Value::Int(11),
+                Value::Int(2),
             ]),
             prov: Vec::new(),
         });
@@ -223,6 +292,431 @@ pub(crate) fn pg_attribute_scan(
     (schema, rows)
 }
 // ---------------------------------------------------------------------------
+// v2.29: pg_index / pg_indexes (virtual). Synthesized from the live
+// IndexDefs (standalone, constraint-backed, and physical partition
+// children alike). Index OIDs are synthetic — 40000+n in index-name
+// order over the visible indexes, the pg_constraint (20000) /
+// pg_trigger (30000) discipline: stable within a scan and consistent
+// across pg_class / pg_index / pg_inherits / regclass /
+// pg_get_indexdef because every consumer shares index_oid_map.
+// indkey / indclass / indcollation / indoption are int2vector /
+// oidvector in PG and display space-separated, so they are carried
+// as text in that exact rendering (NOT as {a,b} arrays).
+// ---------------------------------------------------------------------------
+
+/// v2.29: every visible index definition (permanent + this session's
+/// temp indexes), sorted by name.
+pub(crate) fn visible_index_defs(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> Vec<IndexDef> {
+    let mut defs: Vec<IndexDef> = db
+        .indexes
+        .values()
+        .filter(|ix| crate::storage::index_visible(&ix.def, snap, &[own]))
+        .map(|ix| ix.def.clone())
+        .collect();
+    if let Some(m) = db.temp_indexes.get(&session) {
+        defs.extend(
+            m.values()
+                .filter(|ix| crate::storage::index_visible(&ix.def, snap, &[own]))
+                .map(|ix| ix.def.clone()),
+        );
+    }
+    defs.sort_by(|a, b| a.name.cmp(&b.name));
+    defs
+}
+
+/// v2.29: synthetic OID per visible index name (40000-based).
+pub(crate) fn index_oid_map(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> std::collections::HashMap<String, i64> {
+    visible_index_defs(db, snap, own, session)
+        .into_iter()
+        .enumerate()
+        .map(|(i, d)| (d.name, 40000 + i as i64))
+        .collect()
+}
+
+/// v2.29: PG19's hard-wired btree opclass oid for a named opclass,
+/// when known (pg_opclass.dat oid_symbol entries + pattern ops).
+fn opclass_oid_by_name(name: &str) -> Option<i64> {
+    Some(match name {
+        "int4_ops" | "int_ops" => 1978,
+        "int2_ops" => 1979,
+        "int8_ops" => 3124,
+        "oid_ops" => 1981,
+        "numeric_ops" => 3125,
+        "text_ops" => 3126,
+        "date_ops" => 3122,
+        "float8_ops" => 3123,
+        "timestamp_ops" => 3128,
+        "timestamptz_ops" => 3127,
+        "text_pattern_ops" => 4217,
+        "varchar_pattern_ops" => 4218,
+        "bpchar_pattern_ops" => 4219,
+        _ => return None,
+    })
+}
+
+/// v2.29: default btree opclass oid for a column type (the
+/// hard-wired PG19 oids; types whose opclass oid is initdb-assigned
+/// in PG fall back to 0 — recorded in v229 scope.md).
+fn default_opclass_oid(ty: &ColType) -> i64 {
+    match ty {
+        ColType::SmallInt => 1979,
+        ColType::Int => 1978,
+        ColType::BigInt => 3124,
+        ColType::Numeric(_) => 3125,
+        ColType::Text | ColType::Varchar(_) | ColType::Char(_) => 3126,
+        ColType::Date => 3122,
+        ColType::Float => 3123,
+        ColType::Timestamp => 3128,
+        ColType::Timestamptz => 3127,
+        ColType::Oid => 1981,
+        _ => 0,
+    }
+}
+
+/// v2.29: is this column type collatable (PG indcollation nonzero)?
+fn type_collatable(ty: &ColType) -> bool {
+    matches!(
+        ty,
+        ColType::Text | ColType::Varchar(_) | ColType::Char(_) | ColType::Name
+    )
+}
+
+/// v2.29: collation oid for a collation name (PG's well-known oids:
+/// default 100, C 950, POSIX 951; anything else rides 100).
+fn collation_oid(name: Option<&str>) -> i64 {
+    match name {
+        Some("C") => 950,
+        Some("POSIX") => 951,
+        _ => 100,
+    }
+}
+
+/// v2.29: space-separated vector rendering (int2vector/oidvector out).
+fn vec_text(items: &[i64]) -> Value {
+    Value::text(
+        items
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// v2.29: PG's indisvalid for one index definition. A partitioned
+/// index (family root or intermediate, i.e. its table is itself
+/// partitioned) is valid only when every direct partition child of
+/// its table carries a linked child index — an ON ONLY creation
+/// starts invalid and becomes valid as children attach (PG19
+/// indexcmds.c / ATExecAttachPartition index machinery). Leaf and
+/// standalone indexes are always valid in this engine (CIC build
+/// failures leave no invalid leftovers here).
+pub(crate) fn index_is_valid(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    defs: &[IndexDef],
+    d: &IndexDef,
+) -> bool {
+    let Some(t) = db.find_table(&d.table, snap, &[own], session) else {
+        return true;
+    };
+    let Some(p) = &t.partition else {
+        return true;
+    };
+    if !p.is_partitioned {
+        return true;
+    }
+    p.children.iter().all(|child| {
+        defs.iter()
+            .any(|cd| &cd.table == child && cd.parent_index.as_deref() == Some(d.name.as_str()))
+    })
+}
+
+pub(crate) fn pg_index_schema() -> Vec<QCol> {
+    [
+        ("indexrelid", ColType::Int),
+        ("indrelid", ColType::Int),
+        ("indnatts", ColType::SmallInt),
+        ("indnkeyatts", ColType::SmallInt),
+        ("indisunique", ColType::Bool),
+        ("indnullsnotdistinct", ColType::Bool),
+        ("indisprimary", ColType::Bool),
+        ("indisexclusion", ColType::Bool),
+        ("indimmediate", ColType::Bool),
+        ("indisclustered", ColType::Bool),
+        ("indisvalid", ColType::Bool),
+        ("indcheckxmin", ColType::Bool),
+        ("indisready", ColType::Bool),
+        ("indislive", ColType::Bool),
+        ("indisreplident", ColType::Bool),
+        // Vector columns: text carrying the space-separated
+        // int2vector/oidvector rendering (see section header).
+        ("indkey", ColType::Text),
+        ("indcollation", ColType::Text),
+        ("indclass", ColType::Text),
+        ("indoption", ColType::Text),
+        ("indexprs", ColType::Text),
+        ("indpred", ColType::Text),
+    ]
+    .into_iter()
+    .map(|(n, ty)| QCol {
+        qual: "pg_index".to_string(),
+        name: n.to_string(),
+        ty,
+        hidden: false,
+        src_ord: 0,
+    })
+    .collect()
+}
+
+pub(crate) fn pg_index_scan(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = pg_index_schema();
+    let oids = index_oid_map(db, snap, own, session);
+    let defs = visible_index_defs(db, snap, own, session);
+    let mut rows = Vec::new();
+    for d in &defs {
+        let Some(t) = db.find_table(&d.table, snap, &[own], session) else {
+            continue;
+        };
+        // indisprimary / constraint deferrability via the owning
+        // constraint (the backing index name resolves through
+        // constraint_index_name like the rest of the engine).
+        let is_child_table = t.partition.as_ref().is_some_and(|p| p.parent.is_some());
+        let mut indisprimary = false;
+        let mut deferrable = false;
+        if let Some(pk) = &t.pkey {
+            if super::partition::constraint_index_name(&d.table, &pk.name, is_child_table) == d.name
+            {
+                indisprimary = true;
+                deferrable = pk.deferrable;
+            }
+        }
+        if !indisprimary {
+            for u in &t.uniques {
+                if super::partition::constraint_index_name(&d.table, &u.name, is_child_table)
+                    == d.name
+                {
+                    deferrable = u.deferrable;
+                    break;
+                }
+            }
+        }
+        // indkey: attnums of keys then INCLUDEs (0 for expressions).
+        let attnum_of =
+            |pos: usize| -> i64 { t.attnums.get(pos).copied().unwrap_or(pos as i16 + 1) as i64 };
+        let mut indkey: Vec<i64> = d
+            .cols
+            .iter()
+            .map(|&c| if c == usize::MAX { 0 } else { attnum_of(c) })
+            .collect();
+        indkey.extend(d.include_cols.iter().map(|&c| attnum_of(c)));
+        // Per-KEY-column vectors (PG19 carries indnkeyatts entries).
+        let mut indclass: Vec<i64> = Vec::with_capacity(d.cols.len());
+        let mut indcollation: Vec<i64> = Vec::with_capacity(d.cols.len());
+        let mut indoption: Vec<i64> = Vec::with_capacity(d.cols.len());
+        for (i, &c) in d.cols.iter().enumerate() {
+            let ty = if c == usize::MAX {
+                None
+            } else {
+                t.columns.get(c).map(|(_, ty)| ty)
+            };
+            let opc = d
+                .opclasses
+                .get(i)
+                .cloned()
+                .flatten()
+                .and_then(|n| opclass_oid_by_name(&n))
+                .unwrap_or_else(|| ty.map(default_opclass_oid).unwrap_or(0));
+            indclass.push(opc);
+            let coll = if ty.is_some_and(|ty| type_collatable(ty)) {
+                let named = d
+                    .collates
+                    .get(i)
+                    .cloned()
+                    .flatten()
+                    .or_else(|| t.col_collation(c).map(|s| s.to_string()));
+                collation_oid(named.as_deref())
+            } else {
+                0
+            };
+            indcollation.push(coll);
+            let mut opt = 0i64;
+            if d.desc.get(i).copied().unwrap_or(false) {
+                opt |= 1; // INDOPTION_DESC
+            }
+            if d.nulls_first.get(i).copied().unwrap_or(false) {
+                opt |= 2; // INDOPTION_NULLS_FIRST
+            }
+            indoption.push(opt);
+        }
+        let indisclustered = db.cluster_marks.get(&d.table).is_some_and(|m| m == &d.name);
+        let indisvalid = index_is_valid(db, snap, own, session, &defs, d);
+        let indisreplident = matches!(
+            &t.replica_identity,
+            crate::storage::ReplicaIdentity::Index(n) if n == &d.name
+        );
+        rows.push(QRow {
+            cells: Row::new(vec![
+                Value::Int(oids.get(&d.name).copied().unwrap_or(0)),
+                Value::Int(t.oid as i64),
+                Value::Int((d.cols.len() + d.include_cols.len()) as i64),
+                Value::Int(d.cols.len() as i64),
+                Value::Bool(d.unique),
+                Value::Bool(d.nulls_not_distinct),
+                Value::Bool(indisprimary),
+                Value::Bool(false),
+                Value::Bool(!(d.unique && deferrable)),
+                Value::Bool(indisclustered),
+                Value::Bool(indisvalid),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::Bool(indisreplident),
+                vec_text(&indkey),
+                vec_text(&indcollation),
+                vec_text(&indclass),
+                vec_text(&indoption),
+                Value::Null,
+                match &d.predicate {
+                    Some(p) => Value::text(p.clone()),
+                    None => Value::Null,
+                },
+            ]),
+            prov: Vec::new(),
+        });
+    }
+    (schema, rows)
+}
+
+/// v2.29: pg_get_indexdef rendering (PG19 ruleutils.c
+/// pg_get_indexdef_worker, non-pretty): one key element's text.
+pub(crate) fn index_elem_text(d: &IndexDef, i: usize) -> String {
+    let mut s = if let Some(e) = d.exprs.get(i).cloned().flatten() {
+        format!("({})", e)
+    } else {
+        d.col_names.get(i).cloned().unwrap_or_default()
+    };
+    if let Some(oc) = d.opclasses.get(i).cloned().flatten() {
+        s.push(' ');
+        s.push_str(&oc);
+    }
+    if d.desc.get(i).copied().unwrap_or(false) {
+        s.push_str(" DESC");
+        // PG prints NULLS LAST for DESC only when it is the
+        // non-default placement.
+        if !d.nulls_first.get(i).copied().unwrap_or(true) {
+            s.push_str(" NULLS LAST");
+        }
+    } else if d.nulls_first.get(i).copied().unwrap_or(false) {
+        s.push_str(" NULLS FIRST");
+    }
+    s
+}
+
+/// v2.29: full CREATE INDEX text for one index definition (the
+/// pg_get_indexdef / pg_indexes.indexdef rendering). `partitioned`
+/// is whether the indexed table is a partitioned parent (PG renders
+/// ON ONLY for partitioned indexes).
+pub(crate) fn indexdef_text(d: &IndexDef, partitioned: bool) -> String {
+    let mut s = String::from("CREATE ");
+    if d.unique {
+        s.push_str("UNIQUE ");
+    }
+    s.push_str("INDEX ");
+    s.push_str(d.name.rsplit('.').next().unwrap_or(d.name.as_str()));
+    s.push_str(" ON ");
+    if partitioned {
+        s.push_str("ONLY ");
+    }
+    s.push_str("public.");
+    s.push_str(d.table.rsplit('.').next().unwrap_or(d.table.as_str()));
+    s.push_str(" USING btree (");
+    let elems: Vec<String> = (0..d.cols.len()).map(|i| index_elem_text(d, i)).collect();
+    s.push_str(&elems.join(", "));
+    s.push(')');
+    if !d.include_names.is_empty() {
+        s.push_str(" INCLUDE (");
+        s.push_str(&d.include_names.join(", "));
+        s.push(')');
+    }
+    if let Some(p) = &d.predicate {
+        s.push_str(" WHERE ");
+        s.push_str(p);
+    }
+    s
+}
+
+pub(crate) fn pg_indexes_schema() -> Vec<QCol> {
+    [
+        ("schemaname", ColType::Text),
+        ("tablename", ColType::Text),
+        ("indexname", ColType::Text),
+        ("tablespace", ColType::Text),
+        ("indexdef", ColType::Text),
+    ]
+    .into_iter()
+    .map(|(n, ty)| QCol {
+        qual: "pg_indexes".to_string(),
+        name: n.to_string(),
+        ty,
+        hidden: false,
+        src_ord: 0,
+    })
+    .collect()
+}
+
+pub(crate) fn pg_indexes_scan(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = pg_indexes_schema();
+    let defs = visible_index_defs(db, snap, own, session);
+    let mut rows = Vec::new();
+    for d in &defs {
+        let Some(t) = db.find_table(&d.table, snap, &[own], session) else {
+            continue;
+        };
+        // PG's view filters C.relkind IN ('r','m','p'): indexes on
+        // toast tables and other exotic parents stay out.
+        if t.partition.as_ref().is_some_and(|p| p.is_partitioned) {
+            // partitioned parent: included ('p')
+        } else if d.table.starts_with("pg_toast.") {
+            continue;
+        }
+        let partitioned = t.partition.as_ref().is_some_and(|p| p.is_partitioned);
+        rows.push(QRow {
+            cells: Row::new(vec![
+                Value::text("public"),
+                Value::text(d.table.rsplit('.').next().unwrap_or(d.table.as_str())),
+                Value::text(d.name.rsplit('.').next().unwrap_or(d.name.as_str())),
+                // reltablespace 0 in this engine -> LEFT JOIN miss.
+                Value::Null,
+                Value::text(indexdef_text(d, partitioned)),
+            ]),
+            prov: Vec::new(),
+        });
+    }
+    (schema, rows)
+}
+// ---------------------------------------------------------------------------
 // v0.96: pg_inherits (virtual). A real table by the same name takes
 // precedence, like pg_class. Exposes inhrelid (child table OID),
 // inhparent (parent table OID), and inhseqno (1-based position of the
@@ -280,6 +774,26 @@ pub(crate) fn pg_inherits_scan(
                 ]),
                 prov: Vec::new(),
             });
+        }
+    }
+    // v2.29: index partition links (child index -> parent index)
+    // under the shared synthetic index OIDs.
+    {
+        let oids = index_oid_map(db, snap, own, session);
+        for d in visible_index_defs(db, snap, own, session) {
+            if let Some(parent) = &d.parent_index {
+                if let (Some(&child_oid), Some(&parent_oid)) = (oids.get(&d.name), oids.get(parent))
+                {
+                    rows.push(QRow {
+                        cells: Row::new(vec![
+                            Value::Int(child_oid),
+                            Value::Int(parent_oid),
+                            Value::Int(1),
+                        ]),
+                        prov: Vec::new(),
+                    });
+                }
+            }
         }
     }
     (schema, rows)
@@ -5971,7 +6485,13 @@ pub(crate) fn pg_constraintdef_for_oid(
     match contype {
         b'p' => {
             let pk = t.pkey.as_ref().filter(|p| p.name == cname)?;
-            Some(format!("PRIMARY KEY ({})", pk.cols.join(", ")))
+            // v2.29: INCLUDE columns render after the key list.
+            let inc = if pk.include.is_empty() {
+                String::new()
+            } else {
+                format!(" INCLUDE ({})", pk.include.join(", "))
+            };
+            Some(format!("PRIMARY KEY ({}){}", pk.cols.join(", "), inc))
         }
         b'u' => {
             let u = t.uniques.iter().find(|u| u.name == cname)?;
@@ -5980,7 +6500,12 @@ pub(crate) fn pg_constraintdef_for_oid(
             } else {
                 ""
             };
-            Some(format!("UNIQUE{} ({})", nnd, u.cols.join(", ")))
+            let inc = if u.include.is_empty() {
+                String::new()
+            } else {
+                format!(" INCLUDE ({})", u.include.join(", "))
+            };
+            Some(format!("UNIQUE{} ({}){}", nnd, u.cols.join(", "), inc))
         }
         b'c' => {
             let c = t

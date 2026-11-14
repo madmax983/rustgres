@@ -4565,6 +4565,16 @@ pub(crate) fn regclass_value_oid(q: &mut Q, v: &Value) -> Result<u32, ExecError>
                 // mirroring eval_regclass_cast (pg_default_acl & co.
                 // are not user tables).
                 Ok(oid)
+            } else if let Some((_, o)) =
+                crate::exec::catalog::index_oid_map(&q.eng.db, q.snap, q.own, q.session)
+                    .iter()
+                    .find(|(n, _)| {
+                        n.as_str() == s.as_ref() || n.rsplit('.').next() == Some(s.as_ref())
+                    })
+            {
+                // v2.29: index names resolve to their synthetic OID,
+                // mirroring eval_regclass_cast.
+                Ok(*o as u32)
             } else {
                 let t = q
                     .eng

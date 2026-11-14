@@ -1385,6 +1385,10 @@ pub(crate) fn attach_partition(
     }
     // Link into the parent's children — versioned, so ROLLBACK undoes it.
     parent_link_child(eng, ctx, parent_name, child_name, true);
+    // v2.29: the parent's partitioned indexes gain physical child
+    // indexes on the attached subtree (PG19 CreateIndexOnPartitions
+    // via ATExecAttachPartition).
+    propagate_parent_indexes(eng, ctx, parent_name, child_name)?;
     Ok(ExecResult::Command {
         tag: "ALTER TABLE".to_string(),
     })
@@ -5109,6 +5113,7 @@ pub(crate) fn expand_like_clauses(
                     initially_deferred: u.initially_deferred,
                     nulls_not_distinct: u.nulls_not_distinct,
                     is_local: true,
+                    include: u.include.clone(),
                 });
             }
             if def.pkey.is_none() {
@@ -5120,6 +5125,7 @@ pub(crate) fn expand_like_clauses(
                         initially_deferred: pk.initially_deferred,
                         nulls_not_distinct: pk.nulls_not_distinct,
                         is_local: true,
+                        include: pk.include.clone(),
                     });
                 }
             }
@@ -6473,6 +6479,8 @@ pub(crate) fn create_constraint_index(
     internal: bool,
     // v2.08: NULLS NOT DISTINCT of the owning constraint.
     nulls_not_distinct: bool,
+    // v2.29: INCLUDE columns of the owning constraint.
+    include: &[String],
 ) -> Result<(), ExecError> {
     let t = eng
         .db
@@ -6518,6 +6526,11 @@ pub(crate) fn create_constraint_index(
         ctx.own,
     );
     def.nulls_not_distinct = nulls_not_distinct;
+    // v2.29: INCLUDE columns ride the backing index (positions
+    // resolved against the same table; unknown names are skipped —
+    // the constraint's own validation already rejected them).
+    def.include_names = include.to_vec();
+    def.include_cols = include.iter().filter_map(|c| t.column_index(c)).collect();
     let mut ix = Index::new(def);
     for r in &t.rows {
         let key = ix.key_for(&r.values);
@@ -6650,6 +6663,22 @@ pub(crate) fn detach_partition(
         }
     }
     commit_table_version(eng, ctx, child_name, child, next);
+    // v2.29: DETACH leaves the child's indexes in place as
+    // standalone indexes (PG19 RemoveInheritance): clear the parent
+    // link of every index on the detached table itself (its own
+    // descendants keep pointing at those indexes).
+    {
+        let owned: Vec<String> = eng
+            .db
+            .visible_indexes_for(child_name, ctx.snap, &ctx.all_xids, ctx.session)
+            .into_iter()
+            .filter(|ix| ix.def.parent_index.is_some())
+            .map(|ix| ix.def.name.clone())
+            .collect();
+        for iname in owned {
+            relink_index_parent(eng, ctx, &iname, None)?;
+        }
+    }
     Ok(ExecResult::Command {
         tag: "ALTER TABLE".to_string(),
     })
