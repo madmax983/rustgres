@@ -596,6 +596,10 @@ pub(crate) struct UpsertPlan {
     /// name). DO NOTHING without an arbiter arbitrates every usable
     /// leaf constraint instead of the parent's index list.
     pub(crate) explicit_arbiter: bool,
+    /// v2.31: the explicit arbiter names a WITHOUT OVERLAPS
+    /// constraint (exclusion arbiter; DO UPDATE was rejected at
+    /// plan time with 0A000).
+    pub(crate) wo_arbiter: bool,
     /// v2.08: nulls_not_distinct of each arbiter index (parallel to
     /// `indexes`); a leaf index is arbiter-compatible only when its
     /// null treatment matches (PG19 execPartition.c
@@ -749,6 +753,37 @@ pub(crate) fn plan_upsert(
         )
     };
     let explicit_arbiter = !matches!(oc.arbiter, ConflictArbiter::None);
+    // v2.31: ON CONFLICT ON CONSTRAINT naming a WITHOUT OVERLAPS
+    // constraint: DO UPDATE is 0A000 (PG19); DO NOTHING arbitrates
+    // on the exclusion constraint (handled in the insert loop).
+    let mut wo_arbiter = false;
+    if let ConflictArbiter::Constraint(cname) = &oc.arbiter {
+        let wo_def = t
+            .pkey
+            .iter()
+            .chain(t.uniques.iter())
+            .find(|u| u.without_overlaps && &u.name == cname);
+        if let Some(u) = wo_def {
+            if matches!(oc.action, ConflictAction::DoUpdate { .. }) {
+                return Err(exec_err(
+                    "0A000",
+                    "ON CONFLICT DO UPDATE not supported with exclusion constraints",
+                ));
+            }
+            wo_arbiter = true;
+            let cols: Vec<usize> = u.cols.iter().filter_map(|c| t.column_index(c)).collect();
+            return Ok(UpsertPlan {
+                indexes: vec![(u.name.clone(), cols)],
+                set_cols: Vec::new(),
+                action: oc.action.clone(),
+                con_names: vec![Some(u.name.clone())],
+                key_names: vec![u.cols.clone()],
+                explicit_arbiter: true,
+                arbiter_nnd: vec![false],
+                wo_arbiter,
+            });
+        }
+    }
     // v2.08: the trailing bool carries the arbiter's null treatment.
     let resolved: Vec<(String, Vec<usize>, Option<String>, bool)> = match &oc.arbiter {
         ConflictArbiter::None => {
@@ -827,6 +862,7 @@ pub(crate) fn plan_upsert(
                             .iter()
                             .any(|ix| {
                                 ix.def.unique
+                                    && !ix.def.without_overlaps
                                     && !ix.def.nulls_not_distinct
                                     && arbiter_elems_match(
                                         &ix.def.col_names,
@@ -908,6 +944,7 @@ pub(crate) fn plan_upsert(
         key_names,
         explicit_arbiter,
         arbiter_nnd,
+        wo_arbiter,
     })
 }
 
@@ -3901,6 +3938,60 @@ pub(crate) fn exec_insert_inner(
                     resolve_unique_violations(eng, ctx, &ctable, violated)?;
                 }
             }
+            // v2.31: WITHOUT OVERLAPS probe — the backing GiST index
+            // is catalog-only, so arbiter machinery above cannot see
+            // exclusion conflicts. Bare DO NOTHING and a WO
+            // constraint arbiter absorb them (skip); every other
+            // action/arbiter combination surfaces 23P01.
+            if conflict.is_none() {
+                if let Some(t) = eng
+                    .db
+                    .find_table(&ctable, ctx.snap, &ctx.all_xids, ctx.session)
+                {
+                    let defs = crate::exec::indexes::wo_defs(t);
+                    if !defs.is_empty() {
+                        let mut existing: Vec<Vec<Value>> = t
+                            .rows
+                            .iter()
+                            .filter(|r| crate::storage::row_visible(r, ctx.snap, &ctx.all_xids))
+                            .map(|r| r.values[..].to_vec())
+                            .collect();
+                        for (pid, prow) in &latest {
+                            if !partitioned_upsert
+                                || planned_leaf.get(pid).map(|l| l.as_str())
+                                    == Some(ctable.as_str())
+                            {
+                                existing.push(prow[..].to_vec());
+                            }
+                        }
+                        for def in defs {
+                            match crate::exec::indexes::check_one_wo_def(
+                                t,
+                                &ctable,
+                                def,
+                                &[cvalues.clone()],
+                                &existing,
+                                false,
+                            ) {
+                                Ok(()) => {}
+                                Err(e) if e.code == "23P01" => {
+                                    let absorb = matches!(&plan.action, ConflictAction::DoNothing)
+                                        && (!plan.explicit_arbiter || plan.wo_arbiter);
+                                    if absorb {
+                                        conflict = Some(0);
+                                    } else {
+                                        return Err(e);
+                                    }
+                                }
+                                Err(e) => return Err(e),
+                            }
+                            if conflict.is_some() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             let Some(tid) = conflict else {
                 // No conflict: insert.
                 let id = eng.alloc_row_id();
@@ -5353,6 +5444,18 @@ pub(crate) fn exec_update_inner(
                     );
                     resolve_unique_violations(eng, ctx, dst, violated)?;
                 }
+                // v2.31: WITHOUT OVERLAPS exclusion check against
+                // the destination's final image.
+                let batch: Vec<Vec<Value>> = rows.iter().map(|r| r[..].to_vec()).collect();
+                crate::exec::indexes::check_without_overlaps_batch(
+                    eng,
+                    dst,
+                    &batch,
+                    excl,
+                    ctx.snap,
+                    &ctx.all_xids,
+                    ctx.session,
+                )?;
             }
         }
         // v0.8: pairwise unique check — two rows updated to the same unique

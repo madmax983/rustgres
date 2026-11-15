@@ -3341,7 +3341,7 @@ pub(crate) fn alter_add_column_ext(
             // duplicates are checked by scanning the rows.
             temp_unique_dup_check(eng, ctx, name, &ix_name, &cols, nnd)?;
         } else {
-            create_constraint_index(eng, ctx, name, &ix_name, &cols, true, nnd, &inc)?;
+            create_constraint_index(eng, ctx, name, &ix_name, &cols, true, nnd, &inc, false)?;
         }
     }
     Ok(ExecResult::Command {
@@ -3508,7 +3508,10 @@ pub(crate) fn alter_drop_column_ext(
                 } else {
                     fk.ref_cols.clone()
                 };
-                if ref_cols.iter().any(|c| c == col) {
+                // v2.31: a PERIOD foreign key also depends on the
+                // referenced PERIOD column, which is not part of
+                // ref_cols.
+                if ref_cols.iter().any(|c| c == col) || fk.ref_period_col.as_deref() == Some(col) {
                     dep_fks.push((tname.clone(), fk.name.clone()));
                 }
             }
@@ -4716,6 +4719,16 @@ pub(crate) fn alter_add_constraint(
                 ));
             }
         }
+        if u.without_overlaps {
+            crate::exec::create::validate_wo_table_types(eng, &next, u)?;
+            crate::exec::indexes::validate_without_overlaps_existing(
+                &next,
+                name,
+                u,
+                ctx.snap,
+                &ctx.all_xids,
+            )?;
+        }
         next.uniques.push(u.clone());
         alter_swap(eng, ctx, name, None, next, None)?;
         if eng.db.is_temp_table(ctx.session, name) {
@@ -4732,6 +4745,7 @@ pub(crate) fn alter_add_constraint(
                 true,
                 u.nulls_not_distinct,
                 &u.include,
+                u.without_overlaps,
             )?;
         }
         return Ok(ExecResult::Command {
@@ -4784,13 +4798,33 @@ pub(crate) fn alter_add_constraint(
                 *nn = true;
             }
         }
+        if pk.without_overlaps {
+            crate::exec::create::validate_wo_table_types(eng, &next, pk)?;
+            crate::exec::indexes::validate_without_overlaps_existing(
+                &next,
+                name,
+                pk,
+                ctx.snap,
+                &ctx.all_xids,
+            )?;
+        }
         next.pkey = Some(pk.clone());
         alter_swap(eng, ctx, name, None, next, None)?;
         if eng.db.is_temp_table(ctx.session, name) {
             // v0.77: temp tables have no backing global indexes (v0.22).
             temp_unique_dup_check(eng, ctx, name, &pk.name, &pk.cols, false)?;
         } else {
-            create_constraint_index(eng, ctx, name, &pk.name, &pk.cols, true, false, &pk.include)?;
+            create_constraint_index(
+                eng,
+                ctx,
+                name,
+                &pk.name,
+                &pk.cols,
+                true,
+                false,
+                &pk.include,
+                pk.without_overlaps,
+            )?;
         }
         return Ok(ExecResult::Command {
             tag: "ALTER TABLE".to_string(),
@@ -7185,9 +7219,10 @@ pub(crate) fn alter_add_primary_key_using_index(
         }
     };
     if !def.unique {
-        return Err(exec_err(
+        return Err(exec_err_detail(
             "42809",
-            format!("index \"{}\" is not unique", index_name),
+            format!("\"{}\" is not a unique index", index_name),
+            "Cannot create a primary key or unique constraint using such an index.",
         ));
     }
     // v2.08: PG19 catalog/index.c — an NND index cannot back a
@@ -7282,9 +7317,10 @@ pub(crate) fn alter_add_unique_using_index(
         }
     };
     if !def.unique {
-        return Err(exec_err(
+        return Err(exec_err_detail(
             "42809",
-            format!("index \"{}\" is not unique", index_name),
+            format!("\"{}\" is not a unique index", index_name),
+            "Cannot create a primary key or unique constraint using such an index.",
         ));
     }
     check_using_index_sorting(&t, &def)?;

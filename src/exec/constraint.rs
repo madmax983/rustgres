@@ -725,6 +725,12 @@ pub(crate) fn check_row_constraints(
 pub(crate) fn fk_ref_cols(parent_meta: &TableMeta, fk: &FkDef) -> Result<Vec<String>, ExecError> {
     if fk.ref_cols.is_empty() {
         match &parent_meta.pkey {
+            // v2.31: a PERIOD foreign key with an omitted referenced
+            // list keys on the WITHOUT OVERLAPS primary key's SCALAR
+            // columns (the PERIOD column is the containment key).
+            Some(pk) if fk.period_col.is_some() && pk.without_overlaps && !pk.cols.is_empty() => {
+                Ok(pk.cols[..pk.cols.len() - 1].to_vec())
+            }
             Some(pk) => Ok(pk.cols.clone()),
             None => Err(exec_err(
                 "42830",
@@ -798,6 +804,125 @@ pub(crate) fn fk_parent_key_exists(
         }
     }
     Ok(false)
+}
+
+/// v2.31: a range/multirange value as a multirange (for union /
+/// containment math over PERIOD columns).
+pub(crate) fn value_to_multi(v: &Value) -> Option<crate::storage::MultiVal> {
+    match v {
+        Value::Range(r) => Some(crate::exec::ranges::multi_from_range((**r).clone())),
+        Value::Multirange(m) => Some((**m).clone()),
+        _ => None,
+    }
+}
+
+/// v2.31: is `period_value` contained in the union of the PERIOD
+/// ranges of every referenced-table row (whole partition tree)
+/// whose scalar key equals `key`? PG19 ri_triggers.c semantics:
+/// coverage may be joint across several referenced rows
+/// (`$n <@ range_agg(...)`). `extra_periods` are period values of
+/// statement-local rows (self-referencing INSERT batch) that also
+/// count as referenced rows for this key.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fk_period_covered(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    fk: &FkDef,
+    key: &[Value],
+    period_value: &Value,
+    ignore: Option<(&str, u64)>,
+    extra_periods: &[Value],
+) -> Result<bool, ExecError> {
+    let Some(child_multi) = value_to_multi(period_value) else {
+        return Ok(true);
+    };
+    if child_multi.ranges.is_empty() {
+        return Ok(true);
+    }
+    // v2.31: the referenced PERIOD column is the explicit one, or
+    // (omitted referenced list) the WITHOUT OVERLAPS primary key's
+    // last column.
+    let ref_pc_owned: String = match &fk.ref_period_col {
+        Some(c) => c.clone(),
+        None => {
+            let parent = eng.db.find_table(&fk.ref_table, snap, &[own], session);
+            match parent
+                .and_then(|t| t.pkey.as_ref())
+                .filter(|pk| pk.without_overlaps)
+                .and_then(|pk| pk.cols.last().cloned())
+            {
+                Some(c) => c,
+                None => return Ok(false),
+            }
+        }
+    };
+    let ref_pc = &ref_pc_owned;
+    let mut union: Option<crate::storage::MultiVal> = None;
+    let add = |u: &mut Option<crate::storage::MultiVal>, v: &Value| {
+        if let Some(m) = value_to_multi(v) {
+            *u = Some(match u.take() {
+                None => m,
+                Some(prev) => crate::exec::ranges::multi_union(&prev, &m),
+            });
+        }
+    };
+    for v in extra_periods {
+        add(&mut union, v);
+    }
+    let mut stack = vec![fk.ref_table.clone()];
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while let Some(name) = stack.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let Some(t) = eng.db.find_table(&name, snap, &[own], session) else {
+            continue;
+        };
+        if let Some(p) = &t.partition {
+            for c in &p.children {
+                stack.push(c.clone());
+            }
+        }
+        let meta = TableMeta::of(t);
+        let ref_cols = fk_ref_cols(&meta, fk)?;
+        let pos: Vec<usize> = ref_cols
+            .iter()
+            .map(|c| t.column_index(c).expect("fk ref cols validated at DDL"))
+            .collect();
+        let ppos = t
+            .column_index(ref_pc)
+            .expect("fk ref period col validated at DDL");
+        for r in t
+            .rows
+            .iter()
+            .filter(|r| row_visible(r, snap, &[own]))
+            .filter(|r| !matches!(ignore, Some((tn, id)) if tn == name && r.id == id))
+        {
+            if pos
+                .iter()
+                .zip(key.iter())
+                .all(|(&pi, kv)| fk_key_eq(&r.values[pi], kv))
+            {
+                add(&mut union, &r.values[ppos]);
+            }
+        }
+    }
+    Ok(match union {
+        None => false,
+        Some(u) => crate::exec::ranges::multi_contains_multi(&u, &child_multi),
+    })
+}
+
+/// v2.31: PG19 DETAIL text for a temporal FK key:
+/// `Key (parent_id, valid_at)=([1,2), [2018-01-02,2018-04-01))`.
+pub(crate) fn fk_key_text(cols: &[String], values: &[Value]) -> String {
+    let vals: Vec<String> = values
+        .iter()
+        .map(|v| v.to_text().unwrap_or_else(|| "null".to_string()))
+        .collect();
+    format!("Key ({})=({})", cols.join(", "), vals.join(", "))
 }
 
 /// Child-side foreign-key check for one new row (INSERT / UPDATE /
@@ -918,6 +1043,67 @@ pub(crate) fn check_fk_child_row_pv(
             && hkey.len() == key.len()
             && hkey.iter().zip(key.iter()).all(|(a, b)| fk_key_eq(a, b))
         {
+            continue;
+        }
+        // v2.31: PERIOD foreign keys — the scalar key must exist
+        // AND the union of the referenced rows' PERIOD ranges must
+        // cover this row's PERIOD range (PG19 ri_triggers.c).
+        if let Some(pc) = &fk.period_col {
+            let ppos = child_meta
+                .column_index(pc)
+                .expect("fk period col validated at DDL");
+            let pval = values[ppos].clone();
+            if matches!(pval, Value::Null) {
+                continue;
+            }
+            let self_ref = fk.ref_table == child_table;
+            let extra: Vec<Value> = if self_ref {
+                self_new
+                    .iter()
+                    .filter(|v| {
+                        child_pos
+                            .iter()
+                            .zip(key.iter())
+                            .all(|(&ci, kv)| fk_key_eq(&v[ci], kv))
+                    })
+                    .map(|v| v[ppos].clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let covered = fk_period_covered(
+                eng,
+                snap,
+                own,
+                session,
+                fk,
+                &key,
+                &pval,
+                if self_ref {
+                    ignore_id.map(|id| (child_table, id))
+                } else {
+                    None
+                },
+                &extra,
+            )?;
+            if !covered {
+                let mut cols = fk.cols.clone();
+                cols.push(pc.clone());
+                let mut vals = key.clone();
+                vals.push(pval);
+                return Err(exec_err_detail(
+                    "23503",
+                    format!(
+                        "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
+                        child_table, fk.name
+                    ),
+                    format!(
+                        "{} is not present in table \"{}\".",
+                        fk_key_text(&cols, &vals),
+                        fk.ref_table
+                    ),
+                ));
+            }
             continue;
         }
         let parent = eng
@@ -1095,6 +1281,233 @@ impl FkCascade {
 /// `changed` holds (row id, old values, new values or None for delete) for
 /// the parent table. RESTRICT violations fail with 23503; CASCADE / SET
 /// NULL / SET DEFAULT collect into `out` (recursively, depth-limited).
+/// v2.31: referenced-side PERIOD check (PG19 ri_triggers.c
+/// RI_FKey_noaction_upd/del over temporal FKs): after the changed
+/// rows' final images are applied, every referencing row whose
+/// scalar key was touched must still be covered by the union of
+/// the referenced rows' PERIOD ranges for that key. The "post"
+/// image is computed from the visible rows minus the changed row
+/// ids plus their new images.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_fk_period_parent_change(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    parent_table: &str,
+    parent_meta: &TableMeta,
+    child_table: &str,
+    fk: &FkDef,
+    changed: &[(u64, Row, Option<Row>)],
+) -> Result<(), ExecError> {
+    let Some(pc) = &fk.period_col else {
+        return Ok(());
+    };
+    // Referenced PERIOD column: explicit, or the WITHOUT OVERLAPS
+    // primary key's last column for an omitted referenced list.
+    let ref_pc_owned: String = match &fk.ref_period_col {
+        Some(c) => c.clone(),
+        None => match parent_meta
+            .pkey
+            .as_ref()
+            .filter(|pk| pk.without_overlaps)
+            .and_then(|pk| pk.cols.last().cloned())
+        {
+            Some(c) => c,
+            None => return Ok(()),
+        },
+    };
+    let ref_pc = &ref_pc_owned;
+    let ref_cols = fk_ref_cols(parent_meta, fk)?;
+    // Post-change referenced rows across the whole partition tree:
+    // (scalar key, period value) pairs.
+    let changed_ids: Vec<u64> = changed.iter().map(|(id, _, _)| *id).collect();
+    let mut post: Vec<(Vec<Value>, Value)> = Vec::new();
+    let mut stack = vec![parent_table.to_string()];
+    // Include ancestors' trees: coverage may live in sibling leaves;
+    // walk up to the root first.
+    let mut root = parent_table.to_string();
+    loop {
+        let parent_of = eng
+            .db
+            .find_table(&root, snap, &[own], session)
+            .and_then(|t| t.partition.as_ref())
+            .and_then(|p| p.parent.clone());
+        match parent_of {
+            Some(p) => root = p,
+            None => break,
+        }
+    }
+    stack.push(root);
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while let Some(name) = stack.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let Some(t) = eng.db.find_table(&name, snap, &[own], session) else {
+            continue;
+        };
+        if let Some(p) = &t.partition {
+            for c in &p.children {
+                stack.push(c.clone());
+            }
+        }
+        let Ok(rc) = fk_ref_cols(&TableMeta::of(t), fk) else {
+            continue;
+        };
+        let pos: Vec<usize> = rc
+            .iter()
+            .map(|c| t.column_index(c).expect("fk ref cols validated at DDL"))
+            .collect();
+        let ppos = t
+            .column_index(ref_pc)
+            .expect("fk ref period col validated at DDL");
+        for r in t.rows.iter().filter(|r| row_visible(r, snap, &[own])) {
+            if changed_ids.contains(&r.id) {
+                continue;
+            }
+            post.push((
+                pos.iter().map(|&i| r.values[i].clone()).collect(),
+                r.values[ppos].clone(),
+            ));
+        }
+    }
+    // New images of the changed rows (in the changed table's order).
+    let parent_pos: Vec<usize> = ref_cols
+        .iter()
+        .map(|c| {
+            parent_meta
+                .column_index(c)
+                .expect("fk ref cols validated at DDL")
+        })
+        .collect();
+    let parent_ppos = parent_meta
+        .column_index(ref_pc)
+        .expect("fk ref period col validated at DDL");
+    for (_, _, nv) in changed {
+        if let Some(nv) = nv {
+            post.push((
+                parent_pos.iter().map(|&i| nv[i].clone()).collect(),
+                nv[parent_ppos].clone(),
+            ));
+        }
+    }
+    // Affected scalar keys: old and new keys of the changed rows.
+    let mut affected: Vec<Vec<Value>> = Vec::new();
+    for (_, old, nv) in changed {
+        for vals in std::iter::once(old).chain(nv.iter()) {
+            let k: Vec<Value> = parent_pos.iter().map(|&i| vals[i].clone()).collect();
+            if !affected
+                .iter()
+                .any(|a| a.iter().zip(k.iter()).all(|(x, y)| fk_key_eq(x, y)))
+            {
+                affected.push(k);
+            }
+        }
+    }
+    // Referencing rows across the child's whole tree.
+    let mut cstack = vec![child_table.to_string()];
+    let mut cseen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while let Some(cname) = cstack.pop() {
+        if !cseen.insert(cname.clone()) {
+            continue;
+        }
+        let Some(ct) = eng.db.find_table(&cname, snap, &[own], session) else {
+            continue;
+        };
+        if let Some(p) = &ct.partition {
+            for c in &p.children {
+                cstack.push(c.clone());
+            }
+        }
+        let cpos: Vec<usize> = fk
+            .cols
+            .iter()
+            .map(|c| ct.column_index(c).expect("fk cols validated at DDL"))
+            .collect();
+        let cppos = ct.column_index(pc).expect("fk period col validated at DDL");
+        for r in ct.rows.iter().filter(|r| row_visible(r, snap, &[own])) {
+            let ckey: Vec<Value> = cpos.iter().map(|&i| r.values[i].clone()).collect();
+            if ckey.iter().any(|v| matches!(v, Value::Null)) {
+                continue;
+            }
+            if !affected
+                .iter()
+                .any(|a| a.iter().zip(ckey.iter()).all(|(x, y)| fk_key_eq(x, y)))
+            {
+                continue;
+            }
+            let pval = &r.values[cppos];
+            if matches!(pval, Value::Null) {
+                continue;
+            }
+            let Some(child_multi) = value_to_multi(pval) else {
+                continue;
+            };
+            if child_multi.ranges.is_empty() {
+                continue;
+            }
+            let mut union: Option<crate::storage::MultiVal> = None;
+            for (k, pv) in &post {
+                if k.iter().zip(ckey.iter()).all(|(x, y)| fk_key_eq(x, y)) {
+                    if let Some(m) = value_to_multi(pv) {
+                        union = Some(match union.take() {
+                            None => m,
+                            Some(prev) => crate::exec::ranges::multi_union(&prev, &m),
+                        });
+                    }
+                }
+            }
+            let covered = match &union {
+                None => false,
+                Some(u) => crate::exec::ranges::multi_contains_multi(u, &child_multi),
+            };
+            if !covered {
+                // Blame a changed row with this scalar key (prefer
+                // one whose old period overlapped the child's).
+                let blamed = changed
+                    .iter()
+                    .filter(|(_, old, _)| {
+                        parent_pos
+                            .iter()
+                            .zip(ckey.iter())
+                            .all(|(&pi, kv)| fk_key_eq(&old[pi], kv))
+                    })
+                    .max_by_key(|(_, old, _)| values_overlap_pub(&old[parent_ppos], pval));
+                let Some((_, old, nv)) = blamed else {
+                    continue;
+                };
+                let mut cols = ref_cols.clone();
+                cols.push(ref_pc.clone());
+                let mut vals: Vec<Value> = parent_pos.iter().map(|&i| old[i].clone()).collect();
+                vals.push(old[parent_ppos].clone());
+                return Err(exec_err_detail(
+                    "23503",
+                    format!(
+                        "{} on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"",
+                        if nv.is_some() { "update" } else { "delete" },
+                        parent_table,
+                        fk.name,
+                        child_table
+                    ),
+                    format!(
+                        "{} is still referenced from table \"{}\".",
+                        fk_key_text(&cols, &vals),
+                        child_table
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Small pub wrapper so the blame heuristic can reuse the WO
+/// overlap helper.
+fn values_overlap_pub(a: &Value, b: &Value) -> bool {
+    crate::exec::indexes::values_overlap(a, b)
+}
+
 pub(crate) fn plan_fk_cascade(
     eng: &mut Engine,
     snap: &Snapshot,
@@ -1133,6 +1546,22 @@ pub(crate) fn plan_fk_cascade(
                     old_values.clone(),
                 );
             }
+            continue;
+        }
+        // v2.31: PERIOD FKs take the coverage path (NO ACTION only;
+        // every other action was rejected at DDL).
+        if fk.period_col.is_some() {
+            check_fk_period_parent_change(
+                eng,
+                snap,
+                own,
+                session,
+                parent_table,
+                parent_meta,
+                &child_table,
+                &fk,
+                changed,
+            )?;
             continue;
         }
         let ref_cols = fk_ref_cols(parent_meta, &fk)?;

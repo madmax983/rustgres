@@ -730,6 +730,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             nulls_not_distinct,
             parent_index,
             include_names,
+            without_overlaps,
+            gist,
             xmin,
         } => {
             // Rebuild the index from the table's current rows: at recovery
@@ -762,7 +764,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 co.resize(n, None);
                 let mut op = opclasses.clone();
                 op.resize(n, None);
-                let planner_usable = !any_expr && predicate.is_none();
+                let planner_usable = !any_expr && predicate.is_none() && !gist;
                 // v2.29: INCLUDE positions re-derived from names.
                 let include_cols: Vec<usize> = include_names
                     .iter()
@@ -788,6 +790,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     parent_index: parent_index.clone(),
                     include_names: include_names.clone(),
                     include_cols,
+                    without_overlaps: *without_overlaps,
+                    gist: *gist,
                 });
                 if planner_usable {
                     for r in &t.rows {
@@ -2074,6 +2078,8 @@ pub fn records_for_commit(
                     nulls_not_distinct: ix.def.nulls_not_distinct,
                     parent_index: ix.def.parent_index.clone(),
                     include_names: ix.def.include_names.clone(),
+                    without_overlaps: ix.def.without_overlaps,
+                    gist: ix.def.gist,
                     xmin: own,
                 });
             }

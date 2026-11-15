@@ -105,6 +105,12 @@ pub(crate) fn check_insert_unique(
             }
         }
     }
+    // v2.31: WITHOUT OVERLAPS exclusion enforcement (scan-based;
+    // the backing GiST index is catalog-only in this engine).
+    {
+        let batch: Vec<Vec<Value>> = rows.iter().map(|r| r[..].to_vec()).collect();
+        check_without_overlaps_batch(eng, table, &batch, &[], snap, owns, session)?;
+    }
     Ok(())
 }
 
@@ -139,6 +145,15 @@ pub(crate) fn check_partitioned_insert_unique(
     // zero benefit.
     let leaves = collect_partition_leaves(&eng.db, table, ctx.snap, ctx.own, ctx.session);
     let any_unique = leaves.iter().any(|leaf| {
+        // v2.31: a leaf carrying only WITHOUT OVERLAPS definitions
+        // (catalog-only GiST indexes) still needs the routing pass.
+        if eng
+            .db
+            .find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session)
+            .is_some_and(|t| !wo_defs(t).is_empty())
+        {
+            return true;
+        }
         // v2.25: ancestor unique indexes (declared on this parent or
         // higher) also count — a leaf with no local unique index can
         // still be constrained by a partitioned unique index above it.
@@ -251,6 +266,21 @@ pub(crate) fn check_partitioned_insert_unique(
                 ctx.session,
             )?;
         }
+        // v2.31: WITHOUT OVERLAPS defs declared on the partitioned
+        // parent ride the ancestors' UniqueDefs; the leaf's own copies
+        // (when propagated) are checked by the same scan against the
+        // leaf's defs — but a WO def on the parent has no equality
+        // index, so check the parent's WO defs mapped onto the leaf
+        // explicitly when the leaf carries none of its own.
+        check_without_overlaps_batch(
+            eng,
+            leaf,
+            &leaf_rows,
+            &[],
+            ctx.snap,
+            &ctx.all_xids,
+            ctx.session,
+        )?;
     }
     Ok(())
 }
@@ -674,6 +704,229 @@ pub(crate) fn check_update_unique_pairs(
     Ok(())
 }
 
+/// v2.31: overlap (&&) between two range/multirange values in any
+/// combination (PG rangetypes/multirangetypes &&).
+pub(crate) fn values_overlap(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Range(x), Value::Range(y)) => crate::exec::ranges::range_overlaps(x, y),
+        (Value::Range(x), Value::Multirange(y)) => crate::exec::ranges::multi_overlaps(
+            &crate::exec::ranges::multi_from_range((**x).clone()),
+            y,
+        ),
+        (Value::Multirange(x), Value::Range(y)) => crate::exec::ranges::multi_overlaps(
+            x,
+            &crate::exec::ranges::multi_from_range((**y).clone()),
+        ),
+        (Value::Multirange(x), Value::Multirange(y)) => crate::exec::ranges::multi_overlaps(x, y),
+        _ => false,
+    }
+}
+
+/// v2.31: is this value an empty range / empty multirange?
+pub(crate) fn value_is_empty_range(v: &Value) -> bool {
+    match v {
+        Value::Range(r) => r.empty,
+        Value::Multirange(m) => m.ranges.is_empty(),
+        _ => false,
+    }
+}
+
+/// v2.31: the WITHOUT OVERLAPS definitions of a table (PK + UNIQUEs).
+pub(crate) fn wo_defs(t: &Table) -> Vec<&UniqueDef> {
+    let mut out = Vec::new();
+    if let Some(pk) = &t.pkey {
+        if pk.without_overlaps {
+            out.push(pk);
+        }
+    }
+    for u in &t.uniques {
+        if u.without_overlaps {
+            out.push(u);
+        }
+    }
+    out
+}
+
+fn wo_key_text(cols: &[String], pos: &[usize], values: &[Value]) -> String {
+    let names = cols.join(", ");
+    let vals: Vec<String> = pos
+        .iter()
+        .map(|&i| {
+            values
+                .get(i)
+                .and_then(|v| v.to_text())
+                .unwrap_or_else(|| "null".to_string())
+        })
+        .collect();
+    format!("Key ({})=({})", names, vals.join(", "))
+}
+
+/// v2.31: exclusion-semantics check for one WO definition over a
+/// batch of candidate rows (PG19 execIndexing.c): an empty range /
+/// multirange is 23514 (checked BEFORE the NULL bypass); a row with
+/// any NULL key part never conflicts (UNIQUE NULLS DISTINCT; PK
+/// NULLs are rejected by the not-null machinery); otherwise a
+/// conflict is scalar-prefix equality + range overlap, reported as
+/// 23P01. `existing` are the visible rows to test against (already
+/// exclusion-filtered by the caller); in create mode the batch is
+/// empty and `existing` is tested pairwise against itself.
+pub(crate) fn check_one_wo_def(
+    t: &Table,
+    table: &str,
+    def: &UniqueDef,
+    batch: &[Vec<Value>],
+    existing: &[Vec<Value>],
+    create_mode: bool,
+) -> Result<(), ExecError> {
+    let pos: Vec<usize> = def.cols.iter().filter_map(|c| t.column_index(c)).collect();
+    if pos.len() != def.cols.len() || pos.is_empty() {
+        return Ok(());
+    }
+    let (prefix, last) = pos.split_at(pos.len() - 1);
+    let last = last[0];
+    let empty_err = |values: &[Value]| -> ExecError {
+        let _ = values;
+        ExecError {
+            code: "23514",
+            message: format!(
+                "empty WITHOUT OVERLAPS value found in column \"{}\" in relation \"{}\"",
+                def.cols.last().cloned().unwrap_or_default(),
+                table
+            ),
+            detail: None,
+        }
+    };
+    let conflict_err = |new: &[Value], old: &[Value]| -> ExecError {
+        if create_mode {
+            exec_err_detail(
+                "23P01",
+                format!("could not create exclusion constraint \"{}\"", def.name),
+                format!(
+                    "{} conflicts with key {}.",
+                    wo_key_text(&def.cols, &pos, new),
+                    wo_key_text(&def.cols, &pos, old).replacen("Key ", "", 1)
+                ),
+            )
+        } else {
+            exec_err_detail(
+                "23P01",
+                format!(
+                    "conflicting key value violates exclusion constraint \"{}\"",
+                    def.name
+                ),
+                format!(
+                    "{} conflicts with existing key {}.",
+                    wo_key_text(&def.cols, &pos, new),
+                    wo_key_text(&def.cols, &pos, old).replacen("Key ", "", 1)
+                ),
+            )
+        }
+    };
+    let conflicts = |a: &[Value], b: &[Value]| -> bool {
+        prefix.iter().all(|&i| {
+            crate::exec::constraint::fk_key_eq(
+                a.get(i).unwrap_or(&Value::Null),
+                b.get(i).unwrap_or(&Value::Null),
+            )
+        }) && values_overlap(
+            a.get(last).unwrap_or(&Value::Null),
+            b.get(last).unwrap_or(&Value::Null),
+        )
+    };
+    let skippable = |values: &[Value]| -> bool {
+        pos.iter()
+            .any(|&i| matches!(values.get(i), Some(Value::Null) | None))
+    };
+    // Empty-range check runs before any NULL bypass (PG19).
+    for values in batch.iter().chain(existing.iter()) {
+        if value_is_empty_range(values.get(last).unwrap_or(&Value::Null)) {
+            return Err(empty_err(values));
+        }
+    }
+    for (j, values) in batch.iter().enumerate() {
+        if skippable(values) {
+            continue;
+        }
+        for old in existing.iter().chain(batch[..j].iter()) {
+            if skippable(old) {
+                continue;
+            }
+            if conflicts(values, old) {
+                return Err(conflict_err(values, old));
+            }
+        }
+    }
+    if create_mode {
+        for (j, values) in existing.iter().enumerate() {
+            if skippable(values) {
+                continue;
+            }
+            for old in &existing[..j] {
+                if skippable(old) {
+                    continue;
+                }
+                if conflicts(values, old) {
+                    return Err(conflict_err(values, old));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// v2.31: WITHOUT OVERLAPS enforcement for a batch of new rows on
+/// `table` (INSERT / UPDATE final images). `exclude_ids` are row ids
+/// whose current versions the batch replaces (UPDATE). No-op when
+/// the table carries no WO definition.
+pub(crate) fn check_without_overlaps_batch(
+    eng: &Engine,
+    table: &str,
+    batch: &[Vec<Value>],
+    exclude_ids: &[u64],
+    snap: &Snapshot,
+    owns: &[u64],
+    session: u64,
+) -> Result<(), ExecError> {
+    let db = &eng.db;
+    let Some(t) = db.find_table(table, snap, owns, session) else {
+        return Ok(());
+    };
+    let defs = wo_defs(t);
+    if defs.is_empty() {
+        return Ok(());
+    }
+    let existing: Vec<Vec<Value>> = t
+        .rows
+        .iter()
+        .filter(|r| row_visible(r, snap, owns))
+        .filter(|r| !exclude_ids.contains(&r.id))
+        .map(|r| r.values[..].to_vec())
+        .collect();
+    for def in defs {
+        check_one_wo_def(t, table, def, batch, &existing, false)?;
+    }
+    Ok(())
+}
+
+/// v2.31: ADD CONSTRAINT / CREATE INDEX-time validation of the
+/// rows already in `t` for one WO definition (23P01 "could not
+/// create", 23514 on empty values).
+pub(crate) fn validate_without_overlaps_existing(
+    t: &Table,
+    table: &str,
+    def: &UniqueDef,
+    snap: &Snapshot,
+    owns: &[u64],
+) -> Result<(), ExecError> {
+    let existing: Vec<Vec<Value>> = t
+        .rows
+        .iter()
+        .filter(|r| row_visible(r, snap, owns))
+        .map(|r| r.values[..].to_vec())
+        .collect();
+    check_one_wo_def(t, table, def, &[], &existing, true)
+}
+
 /// v1.92: is this candidate index name already taken in the
 /// (temp-aware) relation namespace? Mirrors PG19's
 /// ChooseRelationName check, which considers indexes and tables.
@@ -975,6 +1228,8 @@ pub(crate) fn create_child_index(
         parent_index: Some(parent_def.name.clone()),
         include_names: parent_def.include_names.clone(),
         include_cols,
+        without_overlaps: parent_def.without_overlaps,
+        gist: parent_def.gist,
     };
     let mut ix = Index::new(def.clone());
     if def.planner_usable {
@@ -1131,9 +1386,18 @@ pub(crate) fn exec_create_index(
     concurrently: bool,
     only: bool,
     include: &[String],
+    // v2.31: USING gist (catalog-only index).
+    gist: bool,
 ) -> Result<ExecResult, ExecError> {
     // v0.11: indexing a table needs its owner (or a superuser).
     require_table_owner(eng, ctx, table)?;
+    // v2.31: PG19 indexcmds.c — GiST does not support unique indexes.
+    if gist && unique {
+        return Err(exec_err(
+            "0A000",
+            "access method \"gist\" does not support unique indexes",
+        ));
+    }
     // v2.16: PG19 ComputeIndexAttrs — COLLATE on an index element
     // whose column type has no collation is 42804 (parse_type.c
     // rule, same as column definitions).
@@ -1335,7 +1599,7 @@ pub(crate) fn exec_create_index(
     // v0.88 planner has no expression evaluation or predicate
     // implication, so they are stored but never built, maintained, or
     // consulted by a scan path.
-    let planner_usable = predicate.is_none() && columns.iter().all(|c| c.expr.is_none());
+    let planner_usable = !gist && predicate.is_none() && columns.iter().all(|c| c.expr.is_none());
     // Resolve the table and plain columns (immutable borrows only).
     // Expression key columns carry usize::MAX (no single position).
     let (cols, col_names, descs, nulls_firsts, exprs) = {
@@ -1589,6 +1853,8 @@ pub(crate) fn exec_create_index(
         parent_index: None,
         include_names: include.to_vec(),
         include_cols,
+        without_overlaps: false,
+        gist,
     });
     if planner_usable && mv_rows.is_some() {
         // Matview build: keys come from the rows computed above;

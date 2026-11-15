@@ -294,6 +294,17 @@ pub struct IndexDef {
     /// v2.29: INCLUDE column positions in the indexed table, parallel
     /// to `include_names`.
     pub include_cols: Vec<usize>,
+    /// v2.31: WITHOUT OVERLAPS backing index (PG19 GiST exclusion):
+    /// unique in the exclusion sense (scalar equality + range &&),
+    /// NOT a btree equality index. The tree is never built or
+    /// consulted (planner_usable stays false); enforcement is the
+    /// scan-based check in exec::indexes. Catalog renders it as
+    /// USING gist with indisexclusion/indisunique true.
+    pub without_overlaps: bool,
+    /// v2.31: a standalone `USING gist` index: catalog-only in
+    /// this engine (relam 783, pg_get_indexdef renders gist); no
+    /// btree is built or maintained and the planner never uses it.
+    pub gist: bool,
 }
 
 impl IndexDef {
@@ -328,6 +339,8 @@ impl IndexDef {
             nulls_not_distinct: false,
             parent_index: None,
             include_names: Vec::new(),
+            without_overlaps: false,
+            gist: false,
             include_cols: Vec::new(),
         }
     }

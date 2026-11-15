@@ -136,7 +136,13 @@ pub(crate) fn pg_class_scan(
                     Value::Bool(false),
                     Value::Bool(parents_with_children.contains(d.name.as_str())),
                     Value::Int(2200),
-                    Value::Int(403),
+                    // v2.31: GiST (783) for WITHOUT OVERLAPS and
+                    // standalone USING gist indexes.
+                    Value::Int(if d.without_overlaps || d.gist {
+                        783
+                    } else {
+                        403
+                    }),
                 ]),
                 prov: Vec::new(),
             });
@@ -580,7 +586,7 @@ pub(crate) fn pg_index_scan(
                 Value::Bool(d.unique),
                 Value::Bool(d.nulls_not_distinct),
                 Value::Bool(indisprimary),
-                Value::Bool(false),
+                Value::Bool(d.without_overlaps),
                 Value::Bool(!(d.unique && deferrable)),
                 Value::Bool(indisclustered),
                 Value::Bool(indisvalid),
@@ -646,7 +652,11 @@ pub(crate) fn indexdef_text(d: &IndexDef, partitioned: bool) -> String {
     }
     s.push_str("public.");
     s.push_str(d.table.rsplit('.').next().unwrap_or(d.table.as_str()));
-    s.push_str(" USING btree (");
+    if d.without_overlaps || d.gist {
+        s.push_str(" USING gist (");
+    } else {
+        s.push_str(" USING btree (");
+    }
     let elems: Vec<String> = (0..d.cols.len()).map(|i| index_elem_text(d, i)).collect();
     s.push_str(&elems.join(", "));
     s.push(')');
@@ -5567,6 +5577,8 @@ pub(crate) fn pg_constraint_schema() -> Vec<QCol> {
         ("coninhcount", ColType::SmallInt),
         ("connoinherit", ColType::Bool),
         ("conbin", ColType::Text),
+        // v2.31: PG19 conperiod, appended (existing indices unchanged).
+        ("conperiod", ColType::Bool),
     ]
     .into_iter()
     .map(|(n, ty)| QCol {
@@ -5649,7 +5661,8 @@ pub(crate) fn pg_constraint_scan(
                      validated: bool,
                      conkey: Vec<i64>,
                      lc: (bool, i64, Option<String>),
-                     noinherit: bool|
+                     noinherit: bool,
+                     period: bool|
          -> Vec<Value> {
             vec![
                 Value::text(cname),
@@ -5676,6 +5689,7 @@ pub(crate) fn pg_constraint_scan(
                     Some(b) => Value::text(b),
                     None => Value::Null,
                 },
+                Value::Bool(period),
             ]
         };
         if let Some(pk) = &t.pkey {
@@ -5691,6 +5705,7 @@ pub(crate) fn pg_constraint_scan(
                 attnums(t, &pk.cols),
                 lc,
                 false,
+                pk.without_overlaps,
             )));
             meta.push((name.to_string(), r));
         }
@@ -5707,6 +5722,7 @@ pub(crate) fn pg_constraint_scan(
                 attnums(t, &u.cols),
                 lc,
                 false,
+                u.without_overlaps,
             )));
             meta.push((name.to_string(), r));
         }
@@ -5741,6 +5757,7 @@ pub(crate) fn pg_constraint_scan(
                 conkey,
                 lc,
                 c.no_inherit,
+                false,
             )));
             meta.push((name.to_string(), r));
         }
@@ -5781,6 +5798,7 @@ pub(crate) fn pg_constraint_scan(
                 true,
                 attnums(t, &[col_name.clone()]),
                 lc,
+                false,
                 false,
             )));
             meta.push((name.to_string(), r));
@@ -5829,6 +5847,7 @@ pub(crate) fn pg_constraint_scan(
                 Value::Int(0),
                 Value::Bool(false),
                 Value::Null,
+                Value::Bool(false),
             ]));
             meta.push((
                 name.to_string(),
@@ -5838,15 +5857,28 @@ pub(crate) fn pg_constraint_scan(
         for f in &t.fks {
             let (confrelid, confkey) = match db.find_table(&f.ref_table, snap, &[own], session) {
                 Some(pt) => {
-                    let ref_cols = if f.ref_cols.is_empty() {
+                    let mut ref_cols = if f.ref_cols.is_empty() {
                         pt.pkey.as_ref().map(|p| p.cols.clone()).unwrap_or_default()
                     } else {
                         f.ref_cols.clone()
                     };
+                    // v2.31: confkey carries the PERIOD attnum last.
+                    if let Some(rpc) = &f.ref_period_col {
+                        if !ref_cols.contains(rpc) {
+                            ref_cols.push(rpc.clone());
+                        }
+                    }
                     (pt.oid as i64, int_array(attnums(pt, &ref_cols)))
                 }
                 None => (0, Value::Null),
             };
+            // v2.31: conkey carries the PERIOD attnum last.
+            let mut conkey_cols = f.cols.clone();
+            if let Some(pc) = &f.period_col {
+                if !conkey_cols.contains(pc) {
+                    conkey_cols.push(pc.clone());
+                }
+            }
             let r = super::locality::ConRef::Fk(f.cols.clone(), f.ref_table.clone());
             let lc = loc(&r, None);
             rows.push(mk(vec![
@@ -5865,12 +5897,13 @@ pub(crate) fn pg_constraint_scan(
                 Value::SingleChar(fk_action_char(f.on_update)),
                 Value::SingleChar(fk_action_char(f.on_delete)),
                 Value::SingleChar(if f.match_full { b'f' } else { b's' }),
-                int_array(attnums(t, &f.cols)),
+                int_array(attnums(t, &conkey_cols)),
                 confkey,
                 Value::Bool(lc.0),
                 Value::Int(lc.1),
                 Value::Bool(false),
                 Value::Null,
+                Value::Bool(f.period_col.is_some()),
             ]));
             meta.push((name.to_string(), r));
         }
@@ -5932,6 +5965,46 @@ pub(crate) fn pg_constraint_scan(
             if po != 0 {
                 let mut cells: Vec<Value> = rows[i].cells.iter().cloned().collect();
                 cells[12] = Value::Int(po);
+                rows[i].cells = Row::new(cells);
+            }
+        }
+    }
+    // v2.31: conindid for WITHOUT OVERLAPS PK/UNIQUE rows points at
+    // the backing GiST exclusion index (PG19 sets conindid for
+    // every constraint-backed index; this engine historically
+    // reports 0, and only the WO family is wired because the
+    // without_overlaps suite reads pg_get_indexdef(conindid)).
+    {
+        let oids = index_oid_map(db, snap, own, session);
+        for (i, (tname, _)) in meta.iter().enumerate() {
+            let (Some(t), Value::Text(cname), Value::SingleChar(ct)) = (
+                db.find_table(tname, snap, &[own], session),
+                &rows[i].cells[1],
+                &rows[i].cells[3],
+            ) else {
+                continue;
+            };
+            if !matches!(ct, b'p' | b'u') {
+                continue;
+            }
+            let wo = match ct {
+                b'p' => t
+                    .pkey
+                    .as_ref()
+                    .is_some_and(|pk| pk.name.as_str() == &**cname && pk.without_overlaps),
+                _ => t
+                    .uniques
+                    .iter()
+                    .any(|u| u.name.as_str() == &**cname && u.without_overlaps),
+            };
+            if !wo {
+                continue;
+            }
+            let is_child = t.partition.as_ref().is_some_and(|p| p.parent.is_some());
+            let ix_name = super::partition::constraint_index_name(tname, cname, is_child);
+            if let Some(oid) = oids.get(&ix_name) {
+                let mut cells: Vec<Value> = rows[i].cells.iter().cloned().collect();
+                cells[11] = Value::Int(*oid);
                 rows[i].cells = Row::new(cells);
             }
         }
@@ -6491,6 +6564,13 @@ pub(crate) fn pg_constraintdef_for_oid(
             } else {
                 format!(" INCLUDE ({})", pk.include.join(", "))
             };
+            if pk.without_overlaps {
+                return Some(format!(
+                    "PRIMARY KEY ({} WITHOUT OVERLAPS){}",
+                    pk.cols.join(", "),
+                    inc
+                ));
+            }
             Some(format!("PRIMARY KEY ({}){}", pk.cols.join(", "), inc))
         }
         b'u' => {
@@ -6505,6 +6585,14 @@ pub(crate) fn pg_constraintdef_for_oid(
             } else {
                 format!(" INCLUDE ({})", u.include.join(", "))
             };
+            if u.without_overlaps {
+                return Some(format!(
+                    "UNIQUE{} ({} WITHOUT OVERLAPS){}",
+                    nnd,
+                    u.cols.join(", "),
+                    inc
+                ));
+            }
             Some(format!("UNIQUE{} ({}){}", nnd, u.cols.join(", "), inc))
         }
         b'c' => {
@@ -6520,18 +6608,67 @@ pub(crate) fn pg_constraintdef_for_oid(
         b'n' => Some("NOT NULL".to_string()),
         b'f' => {
             let f = t.fks.iter().find(|f| f.name == cname)?;
-            let ref_cols = if f.ref_cols.is_empty() {
+            let parent_pk = if f.ref_cols.is_empty() {
                 db.find_table(&f.ref_table, snap, &[own], session)
-                    .and_then(|pt| pt.pkey.as_ref().map(|p| p.cols.clone()))
-                    .unwrap_or_default()
+                    .and_then(|pt| pt.pkey.clone())
+            } else {
+                None
+            };
+            // v2.31: an omitted referenced list on a PERIOD foreign
+            // key resolves the PERIOD column from the WITHOUT
+            // OVERLAPS primary key (PG renders it explicitly).
+            let eff_ref_period: Option<String> = f.ref_period_col.clone().or_else(|| {
+                if f.ref_cols.is_empty() && f.period_col.is_some() {
+                    parent_pk
+                        .as_ref()
+                        .filter(|pk| pk.without_overlaps)
+                        .and_then(|pk| pk.cols.last().cloned())
+                } else {
+                    None
+                }
+            });
+            let ref_cols = if f.ref_cols.is_empty() {
+                match &parent_pk {
+                    Some(pk) => {
+                        if eff_ref_period.is_some() && f.ref_period_col.is_none() {
+                            pk.cols[..pk.cols.len().saturating_sub(1)].to_vec()
+                        } else {
+                            pk.cols.clone()
+                        }
+                    }
+                    None => Vec::new(),
+                }
             } else {
                 f.ref_cols.clone()
             };
+            // v2.31: PERIOD rendering (ruleutils.c decompile):
+            // the PERIOD column rides last, prefixed, on both sides.
+            let child_list = match &f.period_col {
+                Some(pc) => format!("{}, PERIOD {}", f.cols.join(", "), pc),
+                None => f.cols.join(", "),
+            };
+            let ref_list = match &eff_ref_period {
+                Some(rpc) => {
+                    let scalar: Vec<&String> = ref_cols.iter().filter(|c| *c != rpc).collect();
+                    if scalar.len() == ref_cols.len() {
+                        format!("{}, PERIOD {}", ref_cols.join(", "), rpc)
+                    } else {
+                        format!(
+                            "{}, PERIOD {}",
+                            scalar
+                                .iter()
+                                .map(|c| c.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            rpc
+                        )
+                    }
+                }
+                None => ref_cols.join(", "),
+            };
             let mut s = format!(
                 "FOREIGN KEY ({}) REFERENCES {}({})",
-                f.cols.join(", "),
-                f.ref_table,
-                ref_cols.join(", ")
+                child_list, f.ref_table, ref_list
             );
             if f.match_full {
                 s.push_str(" MATCH FULL");

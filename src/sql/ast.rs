@@ -2458,6 +2458,10 @@ pub struct UniqueDef {
     /// v2.29: INCLUDE columns of the backing covering index (PG19
     /// index_including): carried by the index, never keys.
     pub include: Vec<String>,
+    /// v2.31: WITHOUT OVERLAPS (PG19): the last key column is a
+    /// range/multirange compared with && (exclusion semantics,
+    /// 23P01) instead of equality. Backed by a GiST exclusion index.
+    pub without_overlaps: bool,
 }
 
 impl UniqueDef {
@@ -2471,6 +2475,7 @@ impl UniqueDef {
             nulls_not_distinct: false,
             is_local: true,
             include: Vec::new(),
+            without_overlaps: false,
         }
     }
 }
@@ -2518,6 +2523,19 @@ pub struct FkDef {
     pub not_valid: bool,
     /// v2.27: PG19 conislocal (see CheckDef::is_local).
     pub is_local: bool,
+    /// v2.31: PERIOD column on the referencing side (PG19
+    /// fk_with_period): the child's range column whose value must be
+    /// contained in the union of the referenced rows' period ranges.
+    pub period_col: Option<String>,
+    /// v2.31: PERIOD column on the referenced side (PG19
+    /// pk_with_period): the WITHOUT OVERLAPS column of the
+    /// referenced PK/UNIQUE.
+    pub ref_period_col: Option<String>,
+    /// v2.31: ON DELETE stayed NO ACTION (omitted or explicit);
+    /// PERIOD FKs reject every other action (0A000).
+    pub on_delete_no_action: bool,
+    /// v2.31: same for ON UPDATE.
+    pub on_update_no_action: bool,
 }
 
 /// v0.9: the full schema of a CREATE TABLE: columns plus constraints.
@@ -3250,13 +3268,23 @@ pub(crate) enum ColCon {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ParsedTableCon {
     /// v2.07: table PRIMARY KEY (cols) + ConstraintAttributeSpec
-    /// results (deferrable, initially_deferred).
-    PKey(Option<String>, Vec<String>, bool, bool, Vec<String>),
+    /// results (deferrable, initially_deferred). v2.31: trailing
+    /// WITHOUT OVERLAPS flag.
+    PKey(Option<String>, Vec<String>, bool, bool, Vec<String>, bool),
     /// v2.06: `PRIMARY KEY USING INDEX name` (ALTER ADD form).
     PKeyUsingIndex(Option<String>, String),
     /// v2.07: table UNIQUE (cols) + ConstraintAttributeSpec results.
     /// v2.08: plus nulls_not_distinct. v2.29: plus INCLUDE columns.
-    Unique(Option<String>, Vec<String>, bool, bool, bool, Vec<String>),
+    /// v2.31: plus WITHOUT OVERLAPS flag.
+    Unique(
+        Option<String>,
+        Vec<String>,
+        bool,
+        bool,
+        bool,
+        Vec<String>,
+        bool,
+    ),
     /// v2.07: `UNIQUE USING INDEX name` (ALTER ADD form).
     UniqueUsingIndex(Option<String>, String),
     /// v2.16: plus NO INHERIT (gram.y ConstraintAttributeSpec).
@@ -3293,6 +3321,18 @@ pub(crate) struct ParsedFkTail {
     pub(crate) enforced: bool,
     /// v2.06: trailing NOT VALID (ALTER ADD CONSTRAINT FK form).
     pub(crate) not_valid: bool,
+    /// v2.31: PERIOD column on the referencing side, parsed from the
+    /// FOREIGN KEY column list (not the tail proper, but carried here
+    /// so every construction site moves it as one unit).
+    pub(crate) period_col: Option<String>,
+    /// v2.31: PERIOD column on the referenced side, from the
+    /// REFERENCES column list.
+    pub(crate) ref_period_col: Option<String>,
+    /// v2.31: true when ON DELETE was omitted or explicitly NO
+    /// ACTION (PG's default); PERIOD FKs reject every other action.
+    pub(crate) on_delete_no_action: bool,
+    /// v2.31: same for ON UPDATE.
+    pub(crate) on_update_no_action: bool,
 }
 
 impl ParsedFkTail {
@@ -3314,6 +3354,10 @@ impl ParsedFkTail {
             enforced: self.enforced,
             not_valid: self.not_valid,
             is_local: true,
+            period_col: self.period_col,
+            ref_period_col: self.ref_period_col,
+            on_delete_no_action: self.on_delete_no_action,
+            on_update_no_action: self.on_update_no_action,
         }
     }
 }
@@ -3462,6 +3506,57 @@ pub(crate) fn def_constraint_name_exists(def: &TableDef, cname: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// v2.31: PG19 parse_utilcmd.c WITHOUT OVERLAPS definition checks
+/// that need only the TableDef: at least two columns (42601), the
+/// last column exists (42703, PG's "named in key" wording), and —
+/// when its type is a plain ColType — is a range/multirange (42804).
+/// Domain- and named-type columns defer the type verdict to exec,
+/// which resolves them against the type catalog.
+pub(crate) fn validate_without_overlaps_def(
+    def: &TableDef,
+    cols: &[String],
+) -> Result<(), SqlError> {
+    if cols.len() < 2 {
+        return Err(SqlError {
+            message: "constraint using WITHOUT OVERLAPS needs at least two columns".to_string(),
+            code: "42601",
+        });
+    }
+    let last = cols.last().expect("len checked");
+    match def.columns.iter().position(|(n, _)| n == last) {
+        None => Err(SqlError {
+            message: format!("column \"{}\" named in key does not exist", last),
+            code: "42703",
+        }),
+        Some(i) => {
+            let plain_ok = matches!(
+                def.columns[i].1,
+                crate::storage::ColType::Range(_) | crate::storage::ColType::Multirange(_)
+            );
+            let deferred = def
+                .domain_types
+                .get(i)
+                .map(|d| d.is_some())
+                .unwrap_or(false)
+                || def
+                    .composite_types
+                    .get(i)
+                    .map(|d| d.is_some())
+                    .unwrap_or(false);
+            if !plain_ok && !deferred {
+                return Err(SqlError {
+                    message: format!(
+                        "column \"{}\" in WITHOUT OVERLAPS is not a range or multirange type",
+                        last
+                    ),
+                    code: "42804",
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
 pub(crate) fn def_add_pkey(
     table: &str,
     def: &mut TableDef,
@@ -3476,7 +3571,12 @@ pub(crate) fn def_add_pkey(
     initially_deferred: bool,
     // v2.29: INCLUDE columns of the backing index.
     include: &[String],
+    // v2.31: WITHOUT OVERLAPS flag.
+    without_overlaps: bool,
 ) -> Result<(), SqlError> {
+    if without_overlaps && !defer_col_check {
+        validate_without_overlaps_def(def, cols)?;
+    }
     if !defer_col_check {
         for c in cols.iter().chain(include.iter()) {
             if !def_col_exists(def, c) {
@@ -3510,6 +3610,7 @@ pub(crate) fn def_add_pkey(
         nulls_not_distinct: false,
         is_local: true,
         include: include.to_vec(),
+        without_overlaps,
     });
     Ok(())
 }
@@ -3531,7 +3632,12 @@ pub(crate) fn def_add_unique(
     nulls_not_distinct: bool,
     // v2.29: INCLUDE columns of the backing index.
     include: &[String],
+    // v2.31: WITHOUT OVERLAPS flag.
+    without_overlaps: bool,
 ) -> Result<(), SqlError> {
+    if without_overlaps && !defer_col_check {
+        validate_without_overlaps_def(def, cols)?;
+    }
     if !defer_col_check {
         for c in cols.iter().chain(include.iter()) {
             if !def_col_exists(def, c) {
@@ -3569,6 +3675,7 @@ pub(crate) fn def_add_unique(
         nulls_not_distinct,
         is_local: true,
         include: include.to_vec(),
+        without_overlaps,
     });
     Ok(())
 }
@@ -3807,6 +3914,7 @@ pub(crate) fn build_table_def(
                             *idf,
                             *nnd,
                             &[],
+                            false,
                         )?,
                         ColCon::PKey(n, df, idf) => def_add_pkey(
                             table,
@@ -3817,6 +3925,7 @@ pub(crate) fn build_table_def(
                             *df,
                             *idf,
                             &[],
+                            false,
                         )?,
                         ColCon::Default(d) => {
                             // v2.28: identity declared earlier in the
@@ -3856,6 +3965,10 @@ pub(crate) fn build_table_def(
                                 on_update: tail.on_update,
                                 on_delete_cols: tail.on_delete_cols.clone(),
                                 on_update_cols: tail.on_update_cols.clone(),
+                                period_col: None,
+                                ref_period_col: tail.ref_period_col.clone(),
+                                on_delete_no_action: tail.on_delete_no_action,
+                                on_update_no_action: tail.on_update_no_action,
                                 match_full: tail.match_full,
                                 deferrable: tail.deferrable,
                                 initially_deferred: tail.initially_deferred,
@@ -3922,7 +4035,7 @@ pub(crate) fn build_table_def(
                         "PRIMARY KEY / UNIQUE USING INDEX is only valid in ALTER TABLE".to_string(),
                     ));
                 }
-                ParsedTableCon::PKey(n, cols, df, idf, inc) => def_add_pkey(
+                ParsedTableCon::PKey(n, cols, df, idf, inc, wo) => def_add_pkey(
                     table,
                     &mut def,
                     n.clone(),
@@ -3931,8 +4044,9 @@ pub(crate) fn build_table_def(
                     *df,
                     *idf,
                     inc,
+                    *wo,
                 )?,
-                ParsedTableCon::Unique(n, cols, df, idf, nnd, inc) => {
+                ParsedTableCon::Unique(n, cols, df, idf, nnd, inc, wo) => {
                     let first = cols[0].clone();
                     def_add_unique(
                         table,
@@ -3945,6 +4059,7 @@ pub(crate) fn build_table_def(
                         *idf,
                         *nnd,
                         inc,
+                        *wo,
                     )?
                 }
                 ParsedTableCon::Check(n, e, nv, enf, noinh) => def_add_check(
@@ -4086,6 +4201,10 @@ pub(crate) fn build_table_def(
                         on_delete: tail.on_delete,
                         on_update: tail.on_update,
                         on_delete_cols: tail.on_delete_cols.clone(),
+                        period_col: tail.period_col.clone(),
+                        ref_period_col: tail.ref_period_col.clone(),
+                        on_delete_no_action: tail.on_delete_no_action,
+                        on_update_no_action: tail.on_update_no_action,
                         on_update_cols: tail.on_update_cols.clone(),
                         match_full: tail.match_full,
                         deferrable: tail.deferrable,
@@ -10452,6 +10571,9 @@ pub enum Stmt {
         /// v2.29: INCLUDE column names (PG19 IndexStmt.accessMethod
         /// includeAttribute list), in written order.
         include: Vec<String>,
+        /// v2.31: `USING gist` — a catalog-only GiST index (no
+        /// btree machinery rides on it in this engine).
+        gist: bool,
     },
     DropIndex {
         names: Vec<String>,

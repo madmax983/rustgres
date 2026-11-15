@@ -983,6 +983,8 @@ impl Enc {
                 nulls_not_distinct,
                 parent_index,
                 include_names,
+                without_overlaps,
+                gist,
                 xmin,
             } => {
                 self.u8(5);
@@ -1024,6 +1026,9 @@ impl Enc {
                     None => self.u8(0),
                 }
                 self.str_list(include_names);
+                // v2.31 (RGSWAL36): WITHOUT OVERLAPS flag, trailing.
+                self.u8(*without_overlaps as u8);
+                self.u8(*gist as u8);
             }
             WalRecord::DropIndex { name, xmax } => {
                 self.u8(6);
@@ -2408,6 +2413,18 @@ impl<'a> Dec<'a> {
                 } else {
                     (None, Vec::new())
                 };
+                // v2.31: WITHOUT OVERLAPS flag rides RGSWAL36+.
+                let without_overlaps = if self.wal_version >= 36 {
+                    self.u8()? != 0
+                } else {
+                    false
+                };
+                // v2.31: gist flag rides RGSWAL37+.
+                let gist = if self.wal_version >= 37 {
+                    self.u8()? != 0
+                } else {
+                    false
+                };
                 Ok(WalRecord::CreateIndex {
                     name,
                     table,
@@ -2423,6 +2440,8 @@ impl<'a> Dec<'a> {
                     nulls_not_distinct,
                     parent_index,
                     include_names,
+                    without_overlaps,
+                    gist,
                     xmin,
                 })
             }

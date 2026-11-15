@@ -1128,7 +1128,8 @@ pub(crate) fn execute_inner(
             concurrently,
             only,
             include,
-        } => exec_create_index(eng, ctx, name, table, columns, *unique, *if_not_exists, predicate.as_deref(), *nulls_not_distinct, *concurrently, *only, include),
+            gist,
+        } => exec_create_index(eng, ctx, name, table, columns, *unique, *if_not_exists, predicate.as_deref(), *nulls_not_distinct, *concurrently, *only, include, *gist),
         Stmt::DropIndex { names, if_exists, concurrently } => exec_drop_index(eng, ctx, names, *if_exists, *concurrently),
         Stmt::Explain {
             stmt, analyze, costs, opts, ..

@@ -5097,12 +5097,23 @@ pub(crate) fn expand_like_clauses(
         // backing indexes are built by the normal create path under
         // per-table names).
         if including(LikeKind::Indexes) {
+            // v2.31: a copied constraint whose name is already the
+            // name of a live index (the source table's backing
+            // index, for an explicitly-named PK/UNIQUE) would make
+            // the create path fail 42P07 — PG keeps the constraint
+            // name and renames only the index, but this engine names
+            // the backing index after the constraint, so the copy
+            // takes a suffixed name instead (only in the case that
+            // otherwise hard-fails).
+            let name_taken = |def: &TableDef, cname: &str| -> bool {
+                def.uniques.iter().any(|x| x.name == cname)
+                    || def.pkey.as_ref().is_some_and(|p| p.name == cname)
+                    || eng.db.find_index(cname, ctx.snap, &ctx.all_xids).is_some()
+            };
             for u in &src.uniques {
                 let mut cname = u.name.clone();
                 let mut n = 1;
-                while def.uniques.iter().any(|x| x.name == cname)
-                    || def.pkey.as_ref().is_some_and(|p| p.name == cname)
-                {
+                while name_taken(def, &cname) {
                     n += 1;
                     cname = format!("{}_{}", u.name, n);
                 }
@@ -5114,18 +5125,26 @@ pub(crate) fn expand_like_clauses(
                     nulls_not_distinct: u.nulls_not_distinct,
                     is_local: true,
                     include: u.include.clone(),
+                    without_overlaps: u.without_overlaps,
                 });
             }
             if def.pkey.is_none() {
                 if let Some(pk) = &src.pkey {
+                    let mut pk_name = pk.name.clone();
+                    let mut n = 1;
+                    while name_taken(def, &pk_name) {
+                        n += 1;
+                        pk_name = format!("{}_{}", pk.name, n);
+                    }
                     def.pkey = Some(UniqueDef {
-                        name: pk.name.clone(),
+                        name: pk_name,
                         cols: pk.cols.clone(),
                         deferrable: pk.deferrable,
                         initially_deferred: pk.initially_deferred,
                         nulls_not_distinct: pk.nulls_not_distinct,
                         is_local: true,
                         include: pk.include.clone(),
+                        without_overlaps: pk.without_overlaps,
                     });
                 }
             }
@@ -6340,6 +6359,45 @@ pub(crate) fn validate_fk_def(
             }
         }
     }
+    // v2.31: PERIOD validation runs BEFORE the arity/type/key
+    // checks — PG diagnoses PERIOD mismatches (42830 family) ahead
+    // of them, and an omitted referenced list resolves the PERIOD
+    // column from a WITHOUT OVERLAPS primary key.
+    let eff_ref_period: Option<String> = fk.ref_period_col.clone().or_else(|| {
+        if fk.ref_cols.is_empty() {
+            parent
+                .pkey
+                .as_ref()
+                .filter(|pk| pk.without_overlaps)
+                .and_then(|pk| pk.cols.last().cloned())
+        } else {
+            None
+        }
+    });
+    if fk.period_col.is_some() || fk.ref_period_col.is_some() {
+        let eff_ref_cols: Vec<String> = if fk.ref_cols.is_empty() && eff_ref_period.is_some() {
+            ref_cols[..ref_cols.len().saturating_sub(1)].to_vec()
+        } else {
+            fk.ref_cols.clone()
+        };
+        validate_fk_period(
+            eng,
+            child_table,
+            child,
+            parent,
+            fk,
+            &eff_ref_cols,
+            eff_ref_period.as_deref(),
+        )?;
+        return Ok(());
+    }
+    if eff_ref_period.is_some() {
+        // No PERIOD on either side, but the omitted referenced
+        // list resolved to a WITHOUT OVERLAPS primary key: PG's
+        // must-use-PERIOD error (42830).
+        validate_fk_period(eng, child_table, child, parent, fk, &ref_cols, None)?;
+        return Ok(());
+    }
     if fk.cols.len() != ref_cols.len() {
         return Err(exec_err(
             "42830",
@@ -6411,8 +6469,21 @@ pub(crate) fn validate_fk_def(
                 && same_key(&idx.def.col_names)
                 && !deferred_backing.contains(&idx.def.name)
         });
+    // v2.31: a WITHOUT OVERLAPS PK/UNIQUE referenced WITH PERIOD
+    // matches on (scalar cols + PERIOD col), not the plain key.
+    let wo_key = fk.ref_period_col.as_ref().is_some_and(|rpc| {
+        parent.pkey.iter().chain(parent.uniques.iter()).any(|u| {
+            u.without_overlaps
+                && u.cols.len() == ref_cols.len() + 1
+                && u.cols.last() == Some(rpc)
+                && u.cols[..u.cols.len() - 1]
+                    .iter()
+                    .all(|c| ref_cols.contains(c))
+        })
+    });
     let is_key = pk_match.is_some_and(|pk| !deferred_only(pk))
         || uq_match.is_some_and(|u| !deferred_only(u))
+        || wo_key
         // v0.75: a standalone unique index also satisfies the FK
         // uniqueness requirement (PG allows FKs to reference unique
         // indexes, not just constraints).
@@ -6442,6 +6513,183 @@ pub(crate) fn validate_fk_def(
                 "there is no unique constraint matching given keys for referenced table \"{}\"",
                 fk.ref_table
             ),
+        ));
+    }
+    // v2.31: PERIOD foreign keys (PG19 tablecmds.c ATAddForeignKeyConstraint
+    // / CheckFKConstraints period rules).
+    validate_fk_period(eng, child_table, child, parent, fk, &ref_cols, None)?;
+    Ok(())
+}
+
+/// v2.31: PG19 PERIOD FK validation. The referenced key must be a
+/// WITHOUT OVERLAPS PK/UNIQUE whose last column is the referenced
+/// PERIOD column; PERIOD must appear on both sides or neither; the
+/// two PERIOD columns must have identical types; only NO ACTION is
+/// supported.
+#[allow(clippy::too_many_arguments)]
+fn validate_fk_period(
+    eng: &Engine,
+    child_name: &str,
+    child: &Table,
+    parent: &Table,
+    fk: &FkDef,
+    ref_cols: &[String],
+    eff_ref_period: Option<&str>,
+) -> Result<(), ExecError> {
+    let fk_period = fk.period_col.is_some();
+    let ref_period = eff_ref_period.is_some();
+    if !fk_period && !ref_period {
+        // Referencing a WITHOUT OVERLAPS key (in full or by its
+        // scalar prefix) without PERIOD is 42830.
+        let wo_hit = parent.pkey.iter().chain(parent.uniques.iter()).any(|u| {
+            u.without_overlaps
+                && !u.cols.is_empty()
+                && (u.cols.len() == ref_cols.len() || u.cols.len() == ref_cols.len() + 1)
+                && u.cols[..ref_cols.len()]
+                    .iter()
+                    .all(|c| ref_cols.contains(c))
+        });
+        if wo_hit {
+            return Err(exec_err(
+                "42830",
+                "foreign key must use PERIOD when referencing a primary key using WITHOUT OVERLAPS",
+            ));
+        }
+        return Ok(());
+    }
+    // Referenced-columns duplicates (PG19: also fires for the
+    // PERIOD column repeated as a plain column).
+    if ref_period {
+        let rpc = eff_ref_period.expect("checked");
+        if ref_cols.iter().any(|c| c == rpc) {
+            return Err(exec_err(
+                "42830",
+                "foreign key referenced-columns list must not contain duplicates",
+            ));
+        }
+        let mut seen: Vec<&String> = Vec::new();
+        for c in ref_cols {
+            if seen.contains(&c) {
+                return Err(exec_err(
+                    "42830",
+                    "foreign key referenced-columns list must not contain duplicates",
+                ));
+            }
+            seen.push(c);
+        }
+    }
+    if fk_period && !ref_period {
+        return Err(exec_err(
+            "42830",
+            "foreign key uses PERIOD on the referencing table but not the referenced table",
+        ));
+    }
+    if !fk_period && ref_period {
+        return Err(exec_err(
+            "42830",
+            "foreign key uses PERIOD on the referenced table but not the referencing table",
+        ));
+    }
+    // Both sides carry PERIOD.
+    let child_pc = fk.period_col.as_ref().expect("checked");
+    let ref_pc = eff_ref_period.expect("checked");
+    let child_pos = child.column_index(child_pc).ok_or_else(|| {
+        exec_err(
+            "42703",
+            format!(
+                "column \"{}\" of relation \"{}\" does not exist",
+                child_pc, child_name
+            ),
+        )
+    })?;
+    let parent_pos = parent.column_index(ref_pc).ok_or_else(|| {
+        exec_err(
+            "42703",
+            format!(
+                "column \"{}\" of relation \"{}\" does not exist",
+                ref_pc, fk.ref_table
+            ),
+        )
+    })?;
+    if fk.cols.contains(child_pc) {
+        return Err(exec_err(
+            "42701",
+            format!("column \"{}\" appears twice in foreign key", child_pc),
+        ));
+    }
+    if fk.cols.len() != ref_cols.len() {
+        return Err(exec_err(
+            "42830",
+            format!(
+                "number of referencing and referenced columns for foreign key \"{}\" must be the same",
+                fk.name
+            ),
+        ));
+    }
+    // The referenced constraint must be the WO PK/UNIQUE whose
+    // scalar columns are ref_cols and whose last column is ref_pc.
+    let wo_ok = parent.pkey.iter().chain(parent.uniques.iter()).any(|u| {
+        u.without_overlaps
+            && u.cols.last().map(|c| c == ref_pc).unwrap_or(false)
+            && u.cols.len() == ref_cols.len() + 1
+            && u.cols[..u.cols.len() - 1]
+                .iter()
+                .all(|c| ref_cols.contains(c))
+    });
+    if !wo_ok {
+        return Err(exec_err(
+            "42830",
+            format!(
+                "there is no unique constraint matching given keys for referenced table \"{}\"",
+                fk.ref_table
+            ),
+        ));
+    }
+    // PERIOD column types must be identical (incl. range subtype
+    // and named type).
+    let type_name = |t: &Table, idx: usize| -> String {
+        if let Some(Some(d)) = t.domain_types.get(idx) {
+            if let Some(st) = eng.db.types.get(d) {
+                if let Some(dom) = &st.domain {
+                    if let Some(bn) = &dom.base_named {
+                        return bn.clone();
+                    }
+                    return dom.base.pg_typname();
+                }
+            }
+            return d.clone();
+        }
+        if let Some(Some(n)) = t.composite_types.get(idx) {
+            return n.clone();
+        }
+        t.columns[idx].1.pg_typname()
+    };
+    let ct = type_name(child, child_pos);
+    let pt = type_name(parent, parent_pos);
+    if ct != pt {
+        return Err(exec_err_detail(
+            "42804",
+            format!(
+                "foreign key constraint \"{}\" cannot be implemented",
+                fk.name
+            ),
+            format!(
+                "Key columns \"{}\" of the referencing table and \"{}\" of the referenced table are of incompatible types: {} and {}.",
+                child_pc, ref_pc, ct, pt
+            ),
+        ));
+    }
+    // Only NO ACTION is supported with PERIOD (PG19 0A000).
+    if !fk.on_update_no_action {
+        return Err(exec_err(
+            "0A000",
+            "unsupported ON UPDATE action for foreign key constraint using PERIOD",
+        ));
+    }
+    if !fk.on_delete_no_action {
+        return Err(exec_err(
+            "0A000",
+            "unsupported ON DELETE action for foreign key constraint using PERIOD",
         ));
     }
     Ok(())
@@ -6481,6 +6729,10 @@ pub(crate) fn create_constraint_index(
     nulls_not_distinct: bool,
     // v2.29: INCLUDE columns of the owning constraint.
     include: &[String],
+    // v2.31: WITHOUT OVERLAPS — the backing index is a catalog-only
+    // GiST exclusion index (no tree, no equality dup check; the
+    // exclusion validation is the caller's scan-based check).
+    without_overlaps: bool,
 ) -> Result<(), ExecError> {
     let t = eng
         .db
@@ -6526,15 +6778,21 @@ pub(crate) fn create_constraint_index(
         ctx.own,
     );
     def.nulls_not_distinct = nulls_not_distinct;
+    if without_overlaps {
+        def.without_overlaps = true;
+        def.planner_usable = false;
+    }
     // v2.29: INCLUDE columns ride the backing index (positions
     // resolved against the same table; unknown names are skipped —
     // the constraint's own validation already rejected them).
     def.include_names = include.to_vec();
     def.include_cols = include.iter().filter_map(|c| t.column_index(c)).collect();
     let mut ix = Index::new(def);
-    for r in &t.rows {
-        let key = ix.key_for(&r.values);
-        ix.insert(key, r.id);
+    if !without_overlaps {
+        for r in &t.rows {
+            let key = ix.key_for(&r.values);
+            ix.insert(key, r.id);
+        }
     }
     // Duplicate check among versions that could still become visible
     // (mirrors CREATE UNIQUE INDEX).

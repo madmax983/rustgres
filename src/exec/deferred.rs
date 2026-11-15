@@ -532,6 +532,51 @@ fn fire_child(
         }
         return Ok(());
     }
+    // v2.31: PERIOD FKs verify coverage of every surviving child
+    // row carrying the queued key, not mere key presence.
+    if let Some(pc) = &fk.period_col {
+        let cppos = meta
+            .column_index(pc)
+            .expect("fk period col validated at DDL");
+        for r in t
+            .rows
+            .iter()
+            .filter(|r| row_visible(r, ctx.snap, &ctx.all_xids))
+        {
+            let matches = child_pos
+                .iter()
+                .zip(key.iter())
+                .all(|(&ci, kv)| fk_key_eq(&r.values[ci], kv));
+            if !matches {
+                continue;
+            }
+            let pval = &r.values[cppos];
+            if matches!(pval, Value::Null) {
+                continue;
+            }
+            let covered = crate::exec::constraint::fk_period_covered(
+                eng,
+                ctx.snap,
+                ctx.own,
+                ctx.session,
+                &fk,
+                key,
+                pval,
+                None,
+                &[],
+            )?;
+            if !covered {
+                return Err(exec_err(
+                    "23503",
+                    format!(
+                        "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
+                        child, fk.name
+                    ),
+                ));
+            }
+        }
+        return Ok(());
+    }
     if !parent_has_key(eng, ctx.snap, ctx.own, ctx.session, &fk, key)? {
         return Err(exec_err(
             "23503",
@@ -583,7 +628,12 @@ fn fire_parent(
     // Key restored (or never actually removed)? Nothing to do. The
     // search goes through the referenced table's whole partition
     // tree (parent_has_key), not just this leaf's rows.
-    if parent_has_key(eng, ctx.snap, ctx.own, ctx.session, &fk, &old_key)? {
+    // v2.31: PERIOD FKs skip the shortcut — a surviving scalar key
+    // can still have lost PERIOD coverage; plan_fk_cascade's
+    // coverage check decides.
+    if fk.period_col.is_none()
+        && parent_has_key(eng, ctx.snap, ctx.own, ctx.session, &fk, &old_key)?
+    {
         return Ok(());
     }
     // The referenced row's current image: still present (an UPDATE

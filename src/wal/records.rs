@@ -127,6 +127,12 @@ pub enum WalRecord {
         /// v2.08 (RGSWAL30): NULLS NOT DISTINCT unique index;
         /// trailing field, present only in RGSWAL30+ images.
         nulls_not_distinct: bool,
+        /// v2.31 (RGSWAL36): WITHOUT OVERLAPS (GiST exclusion)
+        /// backing index; trailing field, RGSWAL36+ only.
+        without_overlaps: bool,
+        /// v2.31 (RGSWAL37): standalone USING gist index;
+        /// trailing field, RGSWAL37+ only.
+        gist: bool,
         /// v2.29 (RGSWAL35): parent partitioned index name for a
         /// physical child index; trailing field, present only in
         /// RGSWAL35+ images.

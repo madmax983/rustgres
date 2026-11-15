@@ -5388,23 +5388,39 @@ pub(crate) fn eval_func(
             let Value::Int(colno) = cn else {
                 return Ok(Value::Null);
             };
-            if !(1..=d.cols.len() as i64).contains(&colno) {
-                return Ok(Value::Null);
+            // v2.31: colno 0 renders the whole definition (PG19
+            // pg_get_indexdef_worker: column == 0 -> full def).
+            if colno != 0 {
+                if !(1..=d.cols.len() as i64).contains(&colno) {
+                    return Ok(Value::Null);
+                }
+                return Ok(Value::text(crate::exec::catalog::index_elem_text(
+                    d,
+                    (colno - 1) as usize,
+                )));
             }
-            return Ok(Value::text(crate::exec::catalog::index_elem_text(
-                d,
-                (colno - 1) as usize,
-            )));
         }
         let partitioned = q
             .eng
             .db
             .find_table(&d.table, q.snap, &q.all_xids, q.session)
             .is_some_and(|t| t.partition.as_ref().is_some_and(|p| p.is_partitioned));
-        return Ok(Value::text(crate::exec::catalog::indexdef_text(
-            d,
-            partitioned,
-        )));
+        let mut text = crate::exec::catalog::indexdef_text(d, partitioned);
+        // v2.31: the pretty form (3rd arg true) renders the table
+        // name unqualified when it sits in the search path (PG19
+        // ruleutils generate_relation_name); public qualifies in
+        // the non-pretty form only.
+        let pretty = args.len() >= 2
+            && matches!(
+                eval_expr(q, scopes, &args[args.len() - 1])?,
+                Value::Bool(true)
+            );
+        if pretty {
+            text = text
+                .replace(" ON ONLY public.", " ON ONLY ")
+                .replace(" ON public.", " ON ");
+        }
+        return Ok(Value::text(text));
     }
     // v2.09/v2.10: pg_trigger_depth() — the live trigger call depth
     // (trigger.c's counter, thread-local here); 0 outside a trigger.

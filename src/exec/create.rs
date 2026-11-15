@@ -2,6 +2,127 @@
 // Zero semantic changes; map in goals/.../hidden_files/refactor-modularize/.
 use super::*;
 
+/// v2.31: catalog-resolved WITHOUT OVERLAPS validation over a
+/// TableDef (CREATE TABLE path): column count (42601), last-column
+/// existence (42703), and last-column type (42804) with domains
+/// unwrapped (PG19 getBaseType) and named range types resolved
+/// through the type catalog.
+pub(crate) fn validate_wo_def_types(eng: &Engine, def: &TableDef) -> Result<(), ExecError> {
+    let mut defs: Vec<&UniqueDef> = Vec::new();
+    if let Some(pk) = &def.pkey {
+        if pk.without_overlaps {
+            defs.push(pk);
+        }
+    }
+    for u in &def.uniques {
+        if u.without_overlaps {
+            defs.push(u);
+        }
+    }
+    wo_validate_defs(
+        eng,
+        &def.columns,
+        &def.domain_types,
+        &def.composite_types,
+        &defs,
+    )
+}
+
+/// v2.31: same validation over a live Table (ALTER ADD CONSTRAINT).
+pub(crate) fn validate_wo_table_types(
+    eng: &Engine,
+    t: &Table,
+    added: &UniqueDef,
+) -> Result<(), ExecError> {
+    if !added.without_overlaps {
+        return Ok(());
+    }
+    wo_validate_defs(
+        eng,
+        &t.columns,
+        &t.domain_types,
+        &t.composite_types,
+        &[added],
+    )
+}
+
+fn wo_validate_defs(
+    eng: &Engine,
+    columns: &[(String, crate::storage::ColType)],
+    domain_types: &[Option<String>],
+    composite_types: &[Option<String>],
+    defs: &[&UniqueDef],
+) -> Result<(), ExecError> {
+    for u in defs {
+        if u.cols.len() < 2 {
+            return Err(exec_err(
+                "42601",
+                "constraint using WITHOUT OVERLAPS needs at least two columns",
+            ));
+        }
+        let last = u.cols.last().expect("len checked");
+        let Some(i) = columns.iter().position(|(n, _)| n == last) else {
+            return Err(exec_err(
+                "42703",
+                format!("column \"{}\" named in key does not exist", last),
+            ));
+        };
+        if !wo_column_is_range(eng, columns, domain_types, composite_types, i) {
+            return Err(exec_err(
+                "42804",
+                format!(
+                    "column \"{}\" in WITHOUT OVERLAPS is not a range or multirange type",
+                    last
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// v2.31: is column `i` (of a def/table column list) a range or
+/// multirange type, resolving domains and named types?
+pub(crate) fn wo_column_is_range(
+    eng: &Engine,
+    columns: &[(String, crate::storage::ColType)],
+    domain_types: &[Option<String>],
+    composite_types: &[Option<String>],
+    i: usize,
+) -> bool {
+    use crate::storage::ColType as CT;
+    if matches!(columns[i].1, CT::Range(_) | CT::Multirange(_)) {
+        return true;
+    }
+    if let Some(Some(d)) = domain_types.get(i) {
+        let mut cur = d.clone();
+        for _ in 0..8 {
+            let Some(st) = eng.db.types.get(&cur) else {
+                return false;
+            };
+            let Some(dom) = &st.domain else {
+                return false;
+            };
+            if matches!(dom.base, CT::Range(_) | CT::Multirange(_)) {
+                return true;
+            }
+            if let Some(bn) = &dom.base_named {
+                if eng.db.types.get(bn).is_some_and(|t| t.range.is_some()) {
+                    return true;
+                }
+            }
+            match &dom.base_domain {
+                Some(inner) => cur = inner.clone(),
+                None => return false,
+            }
+        }
+        return false;
+    }
+    if let Some(Some(n)) = composite_types.get(i) {
+        return eng.db.types.get(n).is_some_and(|t| t.range.is_some());
+    }
+    false
+}
+
 pub(crate) fn exec_create(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -317,6 +438,10 @@ pub(crate) fn exec_create(
             }
         }
     }
+    // v2.31: WITHOUT OVERLAPS type validation against the merged
+    // def (domain / named-range columns resolve through the type
+    // catalog here; the parser-side check covers plain ColTypes).
+    validate_wo_def_types(eng, &eff_def)?;
     // v1.96: ALTER DEFAULT PRIVILEGES for the creating role.
     if !temp {
         apply_default_acl_for_new_table(eng, ctx, name)?;
@@ -326,7 +451,17 @@ pub(crate) fn exec_create(
     // tables get none — the global index map cannot represent them.)
     if !temp {
         if let Some(pk) = &eff_def.pkey {
-            create_constraint_index(eng, ctx, name, &pk.name, &pk.cols, true, false, &pk.include)?;
+            create_constraint_index(
+                eng,
+                ctx,
+                name,
+                &pk.name,
+                &pk.cols,
+                true,
+                false,
+                &pk.include,
+                pk.without_overlaps,
+            )?;
         }
         for u in &eff_def.uniques {
             create_constraint_index(
@@ -338,6 +473,7 @@ pub(crate) fn exec_create(
                 true,
                 u.nulls_not_distinct,
                 &u.include,
+                u.without_overlaps,
             )?;
         }
     }

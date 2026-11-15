@@ -1593,9 +1593,15 @@ impl Parser {
             // column list. v0.89: rustgres only implements btree, so any
             // other access method is 0A000 (feature not supported) rather
             // than silently misbehaving as a btree.
+            let mut gist = false;
             if self.eat_keyword("using") {
                 let method = self.expect_ident()?;
-                if method != "btree" {
+                if method == "gist" {
+                    // v2.31: GiST indexes are catalog-only here
+                    // (they back WITHOUT OVERLAPS rendering and the
+                    // USING INDEX rejection paths).
+                    gist = true;
+                } else if method != "btree" {
                     return Err(SqlError {
                         message: format!("index access method \"{method}\" is not supported"),
                         code: "0A000",
@@ -1738,6 +1744,7 @@ impl Parser {
                 concurrently,
                 only,
                 include,
+                gist,
             });
         }
         // v0.9: CREATE SEQUENCE (CREATE VIEW is intercepted before
@@ -2813,12 +2820,12 @@ impl Parser {
                 let idx = self.expect_ident()?;
                 return Ok(ParsedTableCon::PKeyUsingIndex(cname, idx));
             }
-            let cols = self.parse_col_name_list()?;
+            let (cols, wo) = self.parse_key_col_list()?;
             // v2.29: INCLUDE (cols) rides between the key list and
             // the attribute spec (gram.y IndexElem-less form).
             let inc = self.parse_include_opt()?;
             let (df, idf) = self.parse_unique_attrs()?;
-            Ok(ParsedTableCon::PKey(cname, cols, df, idf, inc))
+            Ok(ParsedTableCon::PKey(cname, cols, df, idf, inc, wo))
         } else if self.eat_keyword("unique") {
             // v2.07: UNIQUE USING INDEX name (ALTER TABLE ADD).
             if self.eat_keyword("using") {
@@ -2829,10 +2836,10 @@ impl Parser {
             // v2.08: gram.y places opt_unique_null_treatment between
             // UNIQUE and the column list for table constraints.
             let nnd = self.parse_nulls_not_distinct()?;
-            let cols = self.parse_col_name_list()?;
+            let (cols, wo) = self.parse_key_col_list()?;
             let inc = self.parse_include_opt()?;
             let (df, idf) = self.parse_unique_attrs()?;
-            Ok(ParsedTableCon::Unique(cname, cols, df, idf, nnd, inc))
+            Ok(ParsedTableCon::Unique(cname, cols, df, idf, nnd, inc, wo))
         } else if self.eat_keyword("check") {
             self.expect(Token::LParen, "'('")?;
             let e = self.parse_or()?;
@@ -2842,9 +2849,10 @@ impl Parser {
             Ok(ParsedTableCon::Check(cname, e, nv, enf, noinh))
         } else if self.eat_keyword("foreign") {
             self.expect_keyword("key")?;
-            let cols = self.parse_col_name_list()?;
+            let (cols, period_col) = self.parse_fk_col_list()?;
             self.expect_keyword("references")?;
-            let tail = self.parse_fk_tail()?;
+            let mut tail = self.parse_fk_tail()?;
+            tail.period_col = period_col;
             Ok(ParsedTableCon::Fk {
                 name: cname,
                 cols,
@@ -2915,6 +2923,70 @@ impl Parser {
         Ok(cols)
     }
 
+    /// v2.31: PG19 key column list for PRIMARY KEY / UNIQUE:
+    /// `(col [, ...] [WITHOUT OVERLAPS])` — the flag rides after the
+    /// last column, inside the parens (gram.y opt_without_overlaps).
+    pub(crate) fn parse_key_col_list(&mut self) -> Result<(Vec<String>, bool), SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let mut cols = Vec::new();
+        let mut wo = false;
+        loop {
+            cols.push(self.expect_ident()?);
+            if matches!(self.peek(), Token::Ident(s) if s == "without") {
+                self.next();
+                self.expect_keyword("overlaps")?;
+                wo = true;
+                self.expect(Token::RParen, "')'")?;
+                break;
+            }
+            match self.next() {
+                Token::Comma => continue,
+                Token::RParen => break,
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected ',' or ')', found {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+        if cols.is_empty() {
+            return Err(err("syntax error: empty column list".to_string()));
+        }
+        Ok((cols, wo))
+    }
+
+    /// v2.31: PG19 FK column list (either side):
+    /// `(col [, ...] [, PERIOD col])` (gram.y optionalPeriodName).
+    pub(crate) fn parse_fk_col_list(&mut self) -> Result<(Vec<String>, Option<String>), SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let mut cols = Vec::new();
+        let mut period = None;
+        loop {
+            if matches!(self.peek(), Token::Ident(s) if s == "period") {
+                self.next();
+                period = Some(self.expect_ident()?);
+                self.expect(Token::RParen, "')'")?;
+                break;
+            }
+            cols.push(self.expect_ident()?);
+            match self.next() {
+                Token::Comma => continue,
+                Token::RParen => break,
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected ',' or ')', found {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+        if cols.is_empty() && period.is_none() {
+            return Err(err("syntax error: empty column list".to_string()));
+        }
+        Ok((cols, period))
+    }
+
     /// `reftable [(refcol [, ...])] [ON DELETE action] [ON UPDATE action]`,
     /// after the REFERENCES keyword.
     pub(crate) fn parse_fk_tail(&mut self) -> Result<ParsedFkTail, SqlError> {
@@ -2922,11 +2994,18 @@ impl Parser {
         // (REFERENCES fkpart7.pkpart).
         let ref_table = self.parse_table_name()?;
         let mut ref_cols = Vec::new();
+        let mut ref_period_col = None;
         if *self.peek() == Token::LParen {
-            ref_cols = self.parse_col_name_list()?;
+            let (rc, rp) = self.parse_fk_col_list()?;
+            ref_cols = rc;
+            ref_period_col = rp;
         }
         let mut on_delete = FkAction::Restrict;
         let mut on_update = FkAction::Restrict;
+        // v2.31: PERIOD FKs accept only NO ACTION (the PG default);
+        // track whether each action stayed NO ACTION.
+        let mut on_delete_no_action = true;
+        let mut on_update_no_action = true;
         // v2.06: opt_foreign_key_match_clause (gram.y): MATCH FULL |
         // PARTIAL | SIMPLE, before the ON actions.
         let mut match_full = false;
@@ -2944,11 +3023,13 @@ impl Parser {
         loop {
             if self.eat_keyword("on") {
                 if self.eat_keyword("delete") {
-                    let (a, c) = self.parse_fk_action()?;
+                    let (a, c, na) = self.parse_fk_action()?;
                     on_delete = a;
                     on_delete_cols = c;
+                    on_delete_no_action = na;
                 } else if self.eat_keyword("update") {
-                    let (a, c) = self.parse_fk_action()?;
+                    let (a, c, na) = self.parse_fk_action()?;
+                    on_update_no_action = na;
                     // PG19 gram.y key_update: a column list is only
                     // supported for ON DELETE actions (0A000).
                     if c.is_some() {
@@ -3069,6 +3150,10 @@ impl Parser {
         Ok(ParsedFkTail {
             ref_table,
             ref_cols,
+            ref_period_col,
+            period_col: None,
+            on_delete_no_action,
+            on_update_no_action,
             on_delete,
             on_update,
             on_delete_cols,
@@ -3208,11 +3293,13 @@ impl Parser {
     /// v2.15: an FK action, plus the optional SET NULL/DEFAULT
     /// column list (PG19 gram.y: `SET NULL (column_list)` /
     /// `SET DEFAULT (column_list)` may follow either action).
-    pub(crate) fn parse_fk_action(&mut self) -> Result<(FkAction, Option<Vec<String>>), SqlError> {
+    pub(crate) fn parse_fk_action(
+        &mut self,
+    ) -> Result<(FkAction, Option<Vec<String>>, bool), SqlError> {
         if self.eat_keyword("cascade") {
-            Ok((FkAction::Cascade, None))
+            Ok((FkAction::Cascade, None, false))
         } else if self.eat_keyword("restrict") {
-            Ok((FkAction::Restrict, None))
+            Ok((FkAction::Restrict, None, false))
         } else if self.eat_keyword("set") {
             let act = if self.eat_keyword("null") {
                 FkAction::SetNull
@@ -3228,10 +3315,10 @@ impl Parser {
             } else {
                 None
             };
-            Ok((act, cols))
+            Ok((act, cols, false))
         } else if self.eat_keyword("no") {
             self.expect_keyword("action")?;
-            Ok((FkAction::Restrict, None))
+            Ok((FkAction::Restrict, None, true))
         } else {
             Err(err(
                 "syntax error: expected CASCADE, RESTRICT, SET NULL, SET DEFAULT or NO ACTION"
@@ -3882,6 +3969,7 @@ impl Parser {
                         nulls_not_distinct: nnd,
                         is_local: true,
                         include: Vec::new(),
+                        without_overlaps: false,
                     }),
                     ColCon::PKey(n, df, idf) => {
                         pkey = Some(UniqueDef {
@@ -3892,6 +3980,7 @@ impl Parser {
                             nulls_not_distinct: false,
                             is_local: true,
                             include: Vec::new(),
+                            without_overlaps: false,
                         });
                         not_null = true;
                     }
@@ -4336,7 +4425,7 @@ impl Parser {
             ParsedTableCon::UniqueUsingIndex(_name, idx) => {
                 Ok(AlterAction::AddUniqueUsingIndex { index: idx })
             }
-            ParsedTableCon::PKey(name, cols, df, idf, inc) => Ok(AlterAction::AddConstraint {
+            ParsedTableCon::PKey(name, cols, df, idf, inc, wo) => Ok(AlterAction::AddConstraint {
                 pkey: Some(UniqueDef {
                     name: name.unwrap_or_default(),
                     cols,
@@ -4345,13 +4434,14 @@ impl Parser {
                     nulls_not_distinct: false,
                     is_local: true,
                     include: inc,
+                    without_overlaps: wo,
                 }),
                 check: None,
                 unique: None,
                 fk: None,
                 notnull: None,
             }),
-            ParsedTableCon::Unique(name, cols, df, idf, nnd, inc) => {
+            ParsedTableCon::Unique(name, cols, df, idf, nnd, inc, wo) => {
                 Ok(AlterAction::AddConstraint {
                     unique: Some(UniqueDef {
                         name: name.unwrap_or_default(),
@@ -4361,6 +4451,7 @@ impl Parser {
                         nulls_not_distinct: nnd,
                         is_local: true,
                         include: inc,
+                        without_overlaps: wo,
                     }),
                     check: None,
                     pkey: None,
@@ -13865,7 +13956,11 @@ impl Parser {
         // (`SET search_path = alt_nsp1, public`), stored in PG's
         // flattened ", "-joined representation. (Other GUCs keep the
         // single-value grammar.)
-        let value = if name == "search_path" && matches!(self.peek(), Token::Comma) {
+        // v2.31: datestyle takes the same var_list form
+        // (`SET datestyle TO ISO, YMD`).
+        let value = if (name == "search_path" || name == "datestyle")
+            && matches!(self.peek(), Token::Comma)
+        {
             let first = match &value {
                 SetValue::Str(s) => s.clone(),
                 _ => {
@@ -20284,6 +20379,10 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
             }
             out.push(')');
         }
+        // v2.31: optional trailing (wo 1) WITHOUT OVERLAPS marker.
+        if u.without_overlaps {
+            out.push_str(" (wo 1)");
+        }
         out.push(')');
     }
     out.push(')');
@@ -20315,6 +20414,9 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
                     sexpr_escape(c, &mut out);
                 }
                 out.push(')');
+            }
+            if pk.without_overlaps {
+                out.push_str(" (wo 1)");
             }
             out.push(')');
         }
@@ -20382,6 +20484,23 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
                 }
             }
             out.push_str("))");
+        }
+        // v2.31: optional (period child ref) section; '-' = absent.
+        if f.period_col.is_some() || f.ref_period_col.is_some() {
+            out.push_str(" (period ");
+            match &f.period_col {
+                Some(c) => sexpr_escape(c, &mut out),
+                None => out.push('-'),
+            }
+            out.push(' ');
+            match &f.ref_period_col {
+                Some(c) => sexpr_escape(c, &mut out),
+                None => out.push('-'),
+            }
+            // v2.31: NO ACTION flags ride the period section.
+            out.push_str(if f.on_delete_no_action { " 1" } else { " 0" });
+            out.push_str(if f.on_update_no_action { " 1" } else { " 0" });
+            out.push(')');
         }
         out.push(')');
     }
@@ -21009,10 +21128,11 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
     // older encodings carry neither or only attrs).
     fn unique_tail(
         p: &mut SexprParser,
-    ) -> Result<(Vec<String>, (bool, bool, bool, bool), Vec<String>), String> {
+    ) -> Result<(Vec<String>, (bool, bool, bool, bool), Vec<String>, bool), String> {
         let mut cols = Vec::new();
         let mut attrs = (false, false, false, true);
         let mut include = Vec::new();
+        let mut wo = false;
         loop {
             p.ws();
             if sexpr_is_close(p) {
@@ -21033,6 +21153,11 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
                 }
                 if head == "include" {
                     include = unique_include(p)?;
+                } else if head == "wo" {
+                    p.open()?;
+                    let _ = p.atom()?;
+                    wo = p.atom()? == "1";
+                    p.close()?;
                 } else {
                     attrs = unique_attrs(p)?;
                 }
@@ -21040,13 +21165,13 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
                 cols.push(p.atom()?);
             }
         }
-        Ok((cols, attrs, include))
+        Ok((cols, attrs, include, wo))
     }
     let mut uniques = Vec::new();
     while !sexpr_is_close(&mut p) {
         p.open()?;
         let name = p.atom()?;
-        let (cols, attrs, include) = unique_tail(&mut p)?;
+        let (cols, attrs, include, wo) = unique_tail(&mut p)?;
         p.close()?;
         uniques.push(UniqueDef {
             name,
@@ -21056,6 +21181,7 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
             nulls_not_distinct: attrs.2,
             is_local: attrs.3,
             include,
+            without_overlaps: wo,
         });
     }
     p.close()?;
@@ -21068,10 +21194,10 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
         None
     } else {
         let name = p.atom()?;
-        let (cols, attrs, include) = if name != "-" {
+        let (cols, attrs, include, wo) = if name != "-" {
             unique_tail(&mut p)?
         } else {
-            (Vec::new(), (false, false, false, true), Vec::new())
+            (Vec::new(), (false, false, false, true), Vec::new(), false)
         };
         Some(UniqueDef {
             name,
@@ -21081,6 +21207,7 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
             nulls_not_distinct: attrs.2,
             is_local: attrs.3,
             include,
+            without_overlaps: wo,
         })
     };
     // Careful: `(pkey -)` encodes absence as the atom "-".
@@ -21162,30 +21289,81 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
             }
             p.close()?;
         }
-        // v2.15: optional (actcols (del ...) (upd ...)) section.
+        // v2.15: optional (actcols (del ...) (upd ...)) section and
+        // v2.31: optional (period child ref delna updna) section.
+        // Either may appear alone (a PERIOD foreign key with no SET
+        // action column lists has period but no actcols), so the
+        // decoder dispatches on the section head.
         let (mut on_delete_cols, mut on_update_cols) = (None, None);
+        let (mut period_col, mut ref_period_col) = (None, None);
+        let (mut on_delete_no_action, mut on_update_no_action) = (true, true);
+        let read_period = |p: &mut SexprParser,
+                           period_col: &mut Option<String>,
+                           ref_period_col: &mut Option<String>,
+                           on_delete_no_action: &mut bool,
+                           on_update_no_action: &mut bool|
+         -> Result<(), String> {
+            let c = p.atom()?;
+            if c != "-" {
+                *period_col = Some(c);
+            }
+            let r = p.atom()?;
+            if r != "-" {
+                *ref_period_col = Some(r);
+            }
+            if !sexpr_is_close(p) {
+                *on_delete_no_action = p.atom()? == "1";
+            }
+            if !sexpr_is_close(p) {
+                *on_update_no_action = p.atom()? == "1";
+            }
+            p.close()
+        };
         if !sexpr_is_close(&mut p) {
             p.open()?;
-            if p.atom()? != "actcols" {
-                return Err("bad fk actcols head".into());
-            }
-            let read_list = |p: &mut SexprParser| -> Result<Option<Vec<String>>, String> {
-                p.open()?;
-                let _head = p.atom()?;
-                let mut items = Vec::new();
-                while !sexpr_is_close(p) {
-                    items.push(p.atom()?);
-                }
+            let head = p.atom()?;
+            if head == "actcols" {
+                let read_list = |p: &mut SexprParser| -> Result<Option<Vec<String>>, String> {
+                    p.open()?;
+                    let _head = p.atom()?;
+                    let mut items = Vec::new();
+                    while !sexpr_is_close(p) {
+                        items.push(p.atom()?);
+                    }
+                    p.close()?;
+                    if items.len() == 1 && items[0] == "-" {
+                        Ok(None)
+                    } else {
+                        Ok(Some(items))
+                    }
+                };
+                on_delete_cols = read_list(&mut p)?;
+                on_update_cols = read_list(&mut p)?;
                 p.close()?;
-                if items.len() == 1 && items[0] == "-" {
-                    Ok(None)
-                } else {
-                    Ok(Some(items))
+                if !sexpr_is_close(&mut p) {
+                    p.open()?;
+                    if p.atom()? != "period" {
+                        return Err("bad fk period head".into());
+                    }
+                    read_period(
+                        &mut p,
+                        &mut period_col,
+                        &mut ref_period_col,
+                        &mut on_delete_no_action,
+                        &mut on_update_no_action,
+                    )?;
                 }
-            };
-            on_delete_cols = read_list(&mut p)?;
-            on_update_cols = read_list(&mut p)?;
-            p.close()?;
+            } else if head == "period" {
+                read_period(
+                    &mut p,
+                    &mut period_col,
+                    &mut ref_period_col,
+                    &mut on_delete_no_action,
+                    &mut on_update_no_action,
+                )?;
+            } else {
+                return Err("bad fk section head".into());
+            }
         }
         p.close()?;
         fks.push(FkDef {
@@ -21203,6 +21381,10 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
             enforced: fk_enforced,
             not_valid: fk_not_valid,
             is_local: fk_is_local,
+            period_col,
+            ref_period_col,
+            on_delete_no_action,
+            on_update_no_action,
         });
     }
     p.close()?;
