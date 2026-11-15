@@ -2,6 +2,78 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `has_family` builds `family_tables`'s full transitive closure just to answer a yes/no question, on every EXPLAIN scan node — baseline — 2026-11-15
+
+**Why this workload**: v2.30 (`247f73b`, 2026-11-14) added `src/exec/mvest.rs`
+and `src/exec/extstats.rs` — extended-statistics consumption for the
+EXPLAIN planner. No prior Bolt round has profiled this new code or a
+many-table schema; every earlier harness in `benches/` uses a schema of
+1-3 tables, where an O(table count) per-call cost is invisible.
+`family_tables` (`src/exec/extstats.rs`) answers "what is `table`'s
+whole inheritance/partition family" by scanning **every** entry of
+`db.tables` (a `HashMap<String, Vec<Table>>`) looking for a child, for
+each frontier element, recursively. It is called from two places, both
+on the EXPLAIN scan-planning path that every `EXPLAIN` (and nothing
+else — confirmed below) runs for every scan node:
+`src/exec/sje.rs:1589` (`has_family`, guarding `family_rel_rows` at
+1591) and `src/exec/explain_nodes.rs:2519`. `has_family`
+(`src/exec/mvest.rs:71`) just calls `family_tables(..).len() > 1` —
+building the full closure (two heap-allocated `Vec<String>`, with
+`table.to_string()` cloned into both, plus a `.contains()` scan per
+candidate) merely to answer a boolean, for the overwhelmingly common
+case where `table` has no partitions or inheritance children at all.
+
+Confirmed EXPLAIN-only: profiling the identical workload as a plain
+(non-EXPLAIN) `SELECT` loop instead showed zero hits anywhere in
+`src/exec/{sje,mvest,extstats}.rs` in the callgrind call graph — a
+plain `SELECT` executes via `src/exec/from.rs`/`join.rs` directly and
+never reaches the cost estimator. EXPLAIN is still a real, public
+wire-protocol entry point (query-plan-caching ORMs, `auto_explain`-
+style tooling, interactive DBA use), not a synthetic microbenchmark of
+the function under test.
+
+A real application database commonly runs to a few hundred tables
+(ORM-managed schemas, migrations, multi-tenant layouts), so
+`benches/profile_manytable_select.py` creates 300 unrelated, empty
+decoy tables alongside the one actually queried, then sends 1500
+single-row point-lookup `EXPLAIN SELECT` statements against it
+(deterministic key sequence, fixed iteration count so two profiling
+runs do identical work regardless of wall-clock jitter under valgrind).
+
+### Profile
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes`),
+`--tables 300 --count 1500 --rows 2000`, 3 runs:
+
+| run | Ir (total) | `has_family` Ir | `family_tables` Ir | `has_family` % of total |
+|---|---|---|---|---|
+| 1 | 3,442,782,023 | 250,012,594 | 248,817,094 | 7.26% |
+| 2 | 3,442,105,965 | 250,016,136 | 248,820,636 | 7.26% |
+| 3 | 3,442,153,101 | 250,017,196 | 248,821,696 | 7.26% |
+
+The three runs agree to within 0.02% — three orders of magnitude
+tighter than the impact floor (5%), so `has_family`'s 7.26% share is
+signal, and well clear of the "under 5%, not worth it" bar.
+`sje::plan_from_item` (the whole EXPLAIN scan-planning function this
+lives inside) is 66.2% of the workload's total Ir; `has_family` is
+nearly 11% of that.
+
+dhat (same workload, one run): 45,660,803 total bytes, 484,509 total
+allocations (lifetime sum over the dhat JSON's `pps`).
+
+**Reproduce**:
+```bash
+cargo build
+python3 benches/profile_manytable_select.py --tables 300 --count 1500 --rows 2000
+# or under valgrind, same as benches/profile.sh's invocation:
+valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out --collect-jumps=yes --cache-sim=yes ./target/debug/rustgres &
+python3 benches/profile_manytable_select.py --tables 300 --count 1500 --rows 2000
+callgrind_annotate --inclusive=yes /tmp/cg.out | grep -E "extstats::family_tables \[|mvest::has_family \["
+```
+
+Before profiles committed:
+`benches/profiles/{callgrind,dhat}.out.hasfamily-base-n300t1500q-2026-11-15`.
+
 ## Bolt: `find_partition_leaf` clones the matched child's `PartitionInfo`/`columns` even when the match is an ordinary leaf — fix — 2026-11-13
 
 Fixes the target identified in the baseline entry immediately below
