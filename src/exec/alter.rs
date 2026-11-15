@@ -2063,18 +2063,30 @@ pub(crate) fn exec_alter_one(
                 .ok_or_else(|| {
                     exec_err("42P01", format!("relation \"{}\" does not exist", name))
                 })?;
-            if !t.columns.iter().any(|(cn, _)| cn == col) {
-                return Err(exec_err(
-                    "42703",
-                    format!("column \"{}\" of relation \"{}\" does not exist", col, name),
-                ));
-            }
+            let ci = t.columns.iter().position(|(cn, _)| cn == col);
+            let ci = match ci {
+                Some(ci) => ci,
+                None => {
+                    return Err(exec_err(
+                        "42703",
+                        format!("column \"{}\" of relation \"{}\" does not exist", col, name),
+                    ));
+                }
+            };
             if *target < -1 || *target > 10000 {
                 return Err(exec_err(
                     "22023",
                     format!("statistics target {} is out of range", target),
                 ));
             }
+            // v2.30: actually record the target (v2.16 validated and
+            // discarded it). ANALYZE's extended-statistics build
+            // consults it: a column at target 0 makes any statistics
+            // object touching it uncomputable (PG19 lookup_var_attr_stats
+            // returns NULL), and plain per-column stats skip it too.
+            let mut next = t.clone();
+            next.set_col_stattarget(ci, *target);
+            alter_swap(eng, ctx, name, None, next, None)?;
             Ok(ExecResult::Command {
                 tag: "ALTER TABLE".to_string(),
             })
@@ -2853,6 +2865,44 @@ pub(crate) fn alter_column_type_ext(
         None
     };
     alter_swap(eng, ctx, name, None, next, Some(new_rows))?;
+    // v2.30: PG19 drops the column's statistics on a type change
+    // (RemoveStatistics in ATExecAlterColumnType) and invalidates
+    // the built payloads of extended statistics objects that
+    // reference the column; the objects themselves survive and
+    // rebuild at the next ANALYZE.
+    {
+        if let Some(ts) = eng.db.stats.get_mut(name) {
+            ts.cols.remove(col);
+        }
+        if let Some(ts) = eng.db.stats_inh.get_mut(name) {
+            ts.cols.remove(col);
+        }
+        let attnum = idx as u16 + 1;
+        let base = stats_base_name(name);
+        for o in eng.db.ext_stats.iter_mut() {
+            if stats_base_name(&o.table) != base {
+                continue;
+            }
+            let refs = o.items.iter().any(|it| match it {
+                crate::storage::ExtStatItem::Column(a) => *a == attnum,
+                crate::storage::ExtStatItem::Expr(_, e) => {
+                    let mut hit = false;
+                    walk_expr(e, &mut |x| {
+                        if let crate::sql::Expr::Column { name: cn, .. } = x {
+                            if cn == col {
+                                hit = true;
+                            }
+                        }
+                    });
+                    hit
+                }
+            });
+            if refs {
+                o.data = crate::storage::ExtStatData::default();
+                o.data_inh = None;
+            }
+        }
+    }
     if let Some((seq_name, st)) = identity_seq {
         let owns = eng
             .db
@@ -3777,6 +3827,10 @@ pub(crate) fn alter_drop_column_ext(
     }
     // v0.37: keep the per-column TOAST storage parallel to `columns`.
     next.col_storage.remove(ci);
+    // v2.30: keep the per-column statistics targets parallel too.
+    if next.col_stattarget.len() > ci {
+        next.col_stattarget.remove(ci);
+    }
     // v2.03: keep generated-column metadata parallel too — leaving
     // it long made later writes index columns[] out of bounds (the
     // testpub_tbl5 crash in the v2.03 schedule run).
@@ -3897,6 +3951,47 @@ pub(crate) fn alter_drop_column_ext(
         });
     }
     alter_swap(eng, ctx, name, None, next, Some(new_rows))?;
+    // v2.30: extended-statistics dependency cleanup (PG19: a
+    // statistics object that references the dropped column — as a
+    // plain item or inside an expression — is an AUTO dependent and
+    // is dropped whole; survivors' plain items above the dropped
+    // position shift down one, and their built payloads are
+    // invalidated because the stored attnums moved).
+    {
+        let dropped_att = (ci + 1) as u16;
+        let tbl_base = crate::exec::extstats::stats_base_name(name);
+        eng.db.ext_stats.retain(|o| {
+            if crate::exec::extstats::stats_base_name(&o.table) != tbl_base {
+                return true;
+            }
+            !o.items.iter().any(|it| match it {
+                crate::storage::ExtStatItem::Column(a) => *a == dropped_att,
+                crate::storage::ExtStatItem::Expr(_, e) => {
+                    let mut refs = Vec::new();
+                    collect_col_refs(e, &mut refs);
+                    refs.iter().any(|(_, r)| r.eq_ignore_ascii_case(col))
+                }
+            })
+        });
+        for o in eng.db.ext_stats.iter_mut() {
+            if crate::exec::extstats::stats_base_name(&o.table) != tbl_base {
+                continue;
+            }
+            let mut shifted = false;
+            for it in o.items.iter_mut() {
+                if let crate::storage::ExtStatItem::Column(a) = it {
+                    if *a > dropped_att {
+                        *a -= 1;
+                        shifted = true;
+                    }
+                }
+            }
+            if shifted {
+                o.data = crate::storage::ExtStatData::default();
+                o.data_inh = None;
+            }
+        }
+    }
     for ShiftedIndex {
         name: ix_name,
         cols,
@@ -6599,11 +6694,21 @@ pub(crate) fn exec_comment_on(
                 .db
                 .ext_stats
                 .iter()
-                .any(|o| o.name == nm && sch.as_ref().is_none_or(|s| &o.schema == s));
-            if !found {
+                .find(|o| o.name == nm && sch.as_ref().is_none_or(|s| &o.schema == s));
+            let Some(obj) = found else {
                 return Err(exec_err(
                     "42P01",
                     format!("statistics object \"{}\" does not exist", nm),
+                ));
+            };
+            // v2.30: PG19 comment.c requires ownership of the
+            // statistics object (42501), like DROP STATISTICS.
+            if obj.owner != ctx.role
+                && !crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own)
+            {
+                return Err(exec_err(
+                    "42501",
+                    format!("must be owner of statistics object {}", obj.name),
                 ));
             }
         }

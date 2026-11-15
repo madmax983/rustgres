@@ -4446,28 +4446,54 @@ fn run_statement(
         Stmt::Move { name, dir } => cursor_fetch(engine, wal, session, name, dir, true),
         Stmt::Vacuum {
             table,
+            table_cols,
             verbose,
             analyze,
+            more_tables,
         } => {
+            // v2.30: multi-table VACUUM — vacuum each named table in
+            // order; the command tag comes from the last one.
+            let mut all_tables: Vec<(String, Vec<String>)> = Vec::new();
+            if let Some(t) = table {
+                all_tables.push((t.clone(), table_cols.clone()));
+            }
+            all_tables.extend(more_tables.iter().cloned());
             let mut vac_notices: Vec<String> = Vec::new();
-            let out = txn_vacuum(
-                engine,
-                session,
-                table.as_deref(),
-                *verbose,
-                &mut vac_notices,
-            )?;
-            let vac_skipped = !vac_notices.is_empty();
+            let mut out;
+            let mut any_vacuumed = all_tables.is_empty();
+            if all_tables.is_empty() {
+                out = txn_vacuum(engine, session, None, *verbose, &mut vac_notices)?;
+            } else {
+                out = txn_vacuum(
+                    engine,
+                    session,
+                    Some(all_tables[0].0.as_str()),
+                    *verbose,
+                    &mut vac_notices,
+                )?;
+                any_vacuumed = vac_notices.is_empty();
+            }
+            for t in &all_tables[if all_tables.is_empty() { 0 } else { 1 }..] {
+                let before = vac_notices.len();
+                out = txn_vacuum(
+                    engine,
+                    session,
+                    Some(t.0.as_str()),
+                    *verbose,
+                    &mut vac_notices,
+                )?;
+                if vac_notices.len() == before {
+                    any_vacuumed = true;
+                }
+            }
+            let vac_skipped = !any_vacuumed;
             session.pending_notices.extend(vac_notices);
             // v0.14: `VACUUM ANALYZE` also collects planner statistics.
             // v1.96: when VACUUM skipped the table (permission
             // warning), PG does not analyze it either.
             if *analyze && !vac_skipped {
                 let a = Stmt::Analyze {
-                    tables: table
-                        .clone()
-                        .map(|t| vec![(t, Vec::new())])
-                        .unwrap_or_default(),
+                    tables: all_tables.clone(),
                 };
                 let (_, notices) = autocommit_execute(
                     engine,

@@ -8546,44 +8546,23 @@ pub(crate) fn regexp_find_all(
     out
 }
 
-/// v0.32: PG `array_out` quoting for text elements — quote when empty,
-/// when containing whitespace or any of `,"\{}` (which would corrupt
-/// parsing), or when equal to NULL in any case. Escapes `"` and `\`.
-pub(crate) fn pg_quote_array_elem(p: &str) -> String {
-    let needs = p.is_empty()
-        || p.chars().any(|c| {
-            c == ',' || c == '"' || c == '\\' || c == '{' || c == '}' || c.is_whitespace()
-        })
-        || p.eq_ignore_ascii_case("null");
-    if !needs {
-        return p.to_string();
-    }
-    let mut out = String::with_capacity(p.len() + 2);
-    out.push('"');
-    for c in p.chars() {
-        if c == '"' || c == '\\' {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out.push('"');
-    out
-}
-
-/// v0.32: build a PG text[] literal; `None` renders as bare NULL.
-pub(crate) fn pg_text_array_literal(elems: &[Option<String>]) -> String {
-    let mut out = String::from("{");
-    for (i, e) in elems.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        match e {
-            None => out.push_str("NULL"),
-            Some(s) => out.push_str(&pg_quote_array_elem(s)),
-        }
-    }
-    out.push('}');
-    out
+/// v2.30: build a real text[] Value from optional elements (the
+/// regexp_match family used to return the array's TEXT LITERAL as a
+/// text value, which broke subscripting and casts downstream).
+pub(crate) fn text_array_value(elems: Vec<Option<String>>) -> Value {
+    let n = elems.len();
+    Value::Array(Box::new(crate::storage::ArrayVal {
+        elem: crate::storage::ArrayElem::Text,
+        dims: if n == 0 { Vec::new() } else { vec![n as i32] },
+        lower: vec![1],
+        elems: elems
+            .into_iter()
+            .map(|e| match e {
+                Some(t) => Value::text(t),
+                None => Value::Null,
+            })
+            .collect(),
+    }))
 }
 
 /// v0.32: port of PG 19 `build_regexp_split_result` in `regexp.c`.
@@ -8613,9 +8592,9 @@ pub(crate) fn regexp_match_result(
     ms: usize,
     me: usize,
     caps: &crate::regex::Captures,
-) -> String {
+) -> Vec<Option<String>> {
     let ngroups = re.group_count();
-    let elems: Vec<Option<String>> = if ngroups == 0 {
+    if ngroups == 0 {
         vec![Some(sc[ms..me].iter().collect::<String>())]
     } else {
         (1..=ngroups)
@@ -8626,8 +8605,7 @@ pub(crate) fn regexp_match_result(
                     .map(|&(gs, ge)| sc[gs..ge].iter().collect::<String>())
             })
             .collect()
-    };
-    pg_text_array_literal(&elems)
+    }
 }
 
 /// v0.32: `regexp_matches(string, pattern [, flags])` as a set-returning
@@ -8658,7 +8636,7 @@ pub(crate) fn regexp_matches_rows(vals: &[Value]) -> Result<Vec<Value>, ExecErro
     let sc: Vec<char> = s.chars().collect();
     Ok(regexp_find_all(&re, &sc, global, false)
         .into_iter()
-        .map(|(ms, me, caps)| Value::text(regexp_match_result(&sc, &re, ms, me, &caps)))
+        .map(|(ms, me, caps)| text_array_value(regexp_match_result(&sc, &re, ms, me, &caps)))
         .collect())
 }
 
@@ -11408,8 +11386,9 @@ pub(crate) fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecErr
             let sc: Vec<char> = s.chars().collect();
             let matches = regexp_find_all(&re, &sc, true, true);
             let parts = regexp_split_result(&sc, &matches);
-            let lit = pg_text_array_literal(&parts.into_iter().map(Some).collect::<Vec<_>>());
-            Ok(Value::text(lit))
+            Ok(text_array_value(
+                parts.into_iter().map(Some).collect::<Vec<_>>(),
+            ))
         }
         "regexp_matches" => {
             // v0.32: scalar context — first match row, or NULL when there
@@ -14933,8 +14912,11 @@ pub(crate) fn func_result_type(
         "regexp_count" | "regexp_instr" => Ok(ColType::Int),
         // v0.80: `GROUPING(...)` returns integer (int4), like PG19.
         "grouping" => Ok(ColType::Int),
-        "regexp_substr" | "regexp_replace" | "regexp_split_to_array" | "regexp_matches"
-        | "regexp_match" => Ok(ColType::Text),
+        "regexp_substr" | "regexp_replace" => Ok(ColType::Text),
+        // v2.30: these three return text[] in PG19.
+        "regexp_split_to_array" | "regexp_matches" | "regexp_match" => {
+            Ok(ColType::Array(crate::storage::ArrayElem::Text))
+        }
         // v0.95: `parse_ident` returns `text[]` (PG19).
         "parse_ident" => Ok(ColType::Array(crate::storage::ArrayElem::Text)),
         "pg_overlaps" => Ok(ColType::Bool),

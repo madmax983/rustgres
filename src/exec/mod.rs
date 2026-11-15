@@ -94,6 +94,7 @@ mod jsonpath;
 mod jsontable;
 mod locality;
 mod merge;
+mod mvest;
 mod opclass;
 mod orderby;
 mod params;
@@ -371,6 +372,9 @@ mod v228_tests;
 #[path = "test_mods/v229_tests.rs"]
 mod v229_tests;
 #[cfg(test)]
+#[path = "test_mods/v230_tests.rs"]
+mod v230_tests;
+#[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;
 
@@ -404,6 +408,7 @@ pub(crate) use info_schema::*;
 pub(crate) use join::*;
 pub(crate) use json::*;
 pub(crate) use merge::*;
+pub(crate) use mvest::*;
 pub(crate) use opclass::*;
 pub(crate) use orderby::*;
 pub(crate) use params::*;

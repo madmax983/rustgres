@@ -425,7 +425,15 @@ pub(crate) fn pg_reorder_cross_join(
         }
         let t = eng.db.find_table(table, snap, &[own], session)?;
         let qual = alias.unwrap_or(table);
-        let rows = est_filtered_rows(&eng.db, table, qual, t, node.rows() as f64, lw.as_ref());
+        // v2.30: unfiltered base (scan nodes store filtered rows).
+        let rows = est_filtered_rows(
+            &eng.db,
+            table,
+            qual,
+            t,
+            est_rel_rows(&eng.db, table, snap, own, session) as f64,
+            lw.as_ref(),
+        );
         let scan = est_heap_pages(t) as f64 * SEQ_PAGE_COST + rows * CPU_TUPLE_COST;
         leaves.push(PgCrossLeaf { node, rows, scan });
     }

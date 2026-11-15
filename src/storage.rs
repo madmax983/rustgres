@@ -5754,6 +5754,12 @@ pub struct Table {
     /// Runtime-only in v2.21 (not WAL-logged / checkpointed; same
     /// durability class as user-defined casts).
     pub col_collations: Vec<Option<String>>,
+    /// v2.30: per-column statistics target (PG19 pg_attribute
+    /// attstattarget), parallel to `columns`; -1 = default. May be
+    /// SHORTER than `columns` — readers use `Table::col_stattarget_at`.
+    /// Runtime-only like `col_collations` (the v2.16 SET STATISTICS
+    /// action previously validated and discarded the value).
+    pub col_stattarget: Vec<i32>,
 }
 
 /// v2.03: replica identity kind (PG19 `relreplident`).
@@ -5831,6 +5837,8 @@ impl Table {
             identity: vec![0; n],
             // v2.21: no explicit column collations by default.
             col_collations: vec![None; n],
+            // v2.30: default per-column statistics targets.
+            col_stattarget: vec![-1; n],
         }
     }
 
@@ -5922,6 +5930,21 @@ impl Table {
             self.col_collations.resize(i + 1, None);
         }
         self.col_collations[i] = coll;
+    }
+
+    /// v2.30: the statistics target of column `i` (-1 = default).
+    /// Tolerant of a short `col_stattarget` vec.
+    pub fn col_stattarget_at(&self, i: usize) -> i32 {
+        self.col_stattarget.get(i).copied().unwrap_or(-1)
+    }
+
+    /// v2.30: set the statistics target of column `i`, growing the
+    /// parallel vec with -1 padding as needed.
+    pub fn set_col_stattarget(&mut self, i: usize, target: i32) {
+        if self.col_stattarget.len() <= i {
+            self.col_stattarget.resize(i + 1, -1);
+        }
+        self.col_stattarget[i] = target;
     }
 
     /// v2.27: is column `i`'s not-null locally defined here?
@@ -6213,6 +6236,12 @@ pub struct Database {
     /// ANALYZE statistics by table name (v0.8). Updated non-transactionally
     /// by ANALYZE, like PostgreSQL; never WAL-logged, rebuilt by ANALYZE.
     pub stats: HashMap<String, TableStats, FxBuildHasher>,
+    /// v2.30: inherited ANALYZE statistics (pg_statistic stxdinherit
+    /// rows / family estimates) by table name — computed over the
+    /// union of a table's inheritance/partition family when ANALYZE
+    /// runs on a table with descendants. Same durability model as
+    /// `stats`.
+    pub stats_inh: HashMap<String, TableStats, FxBuildHasher>,
     /// v2.17: extended-statistics objects (CREATE STATISTICS). Like
     /// `stats`, kept in a non-transactional side registry: the objects
     /// are DDL in PG, but this engine's precedent for analyzer state
@@ -6629,6 +6658,7 @@ impl Database {
             tables: HashMap::default(),
             indexes: HashMap::default(),
             stats: HashMap::default(),
+            stats_inh: HashMap::default(),
             ext_stats: Vec::new(),
             views: HashMap::default(),
             rules: HashMap::default(),
@@ -7542,7 +7572,9 @@ pub enum ExtStatItem {
 #[derive(Clone, Debug, Default)]
 pub struct ExtStatData {
     pub built: bool,
-    /// pg_ndistinct text: {"1, 2": 4, ...} keyed by attnum list.
+    /// pg_ndistinct text (PG19 pg_ndistinct_out format):
+    /// [{"attributes": [1, 2], "ndistinct": 4}, ...] — subsets of
+    /// size >= 2 only, combinations in lexicographic item order.
     pub ndistinct: Option<String>,
     /// pg_dependencies text: [{"attributes": [1], "dependency": 2, "degree": 1.000000}]
     pub dependencies: Option<String>,
@@ -7551,6 +7583,12 @@ pub struct ExtStatData {
     /// Per-expression single-column stats, parallel to the Expr items:
     /// (null_frac, n_distinct, mcv (value, freq) rendered pairs)
     pub expr_stats: Vec<ExtExprStat>,
+    /// v2.30: structured ndistinct items for the planner:
+    /// (attnum set incl. negative expression attnums, estimate).
+    pub ndistinct_items: Vec<(Vec<i32>, f64)>,
+    /// v2.30: structured dependencies for the planner:
+    /// (implying attnums, implied attnum, degree).
+    pub deps_items: Vec<(Vec<i32>, i32, f64)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -7573,10 +7611,15 @@ pub struct ExtStatObj {
     pub items: Vec<ExtStatItem>,
     /// Item source texts as written (deparse for pg_get_statisticsobjdef).
     pub item_texts: Vec<String>,
-    /// Kind letters: 'd' ndistinct, 'f' dependencies, 'm' mcv.
+    /// Kind letters: 'd' ndistinct, 'f' dependencies, 'm' mcv,
+    /// plus 'e' when the object has expression items (PG19 stxkind).
     pub kinds: Vec<char>,
     pub stattarget: Option<i32>,
     pub data: ExtStatData,
+    /// v2.30: inherited build (pg_statistic_ext_data stxdinherit=true)
+    /// over the table's whole inheritance/partition family, computed
+    /// when ANALYZE runs on a table that has descendants.
+    pub data_inh: Option<ExtStatData>,
 }
 
 #[derive(Clone, Debug, Default)]

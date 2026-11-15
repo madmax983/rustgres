@@ -272,7 +272,10 @@ fn v163_conjunct_selectivity_shapes() {
         &db.find_table("sj", &snap, &[9], 0).unwrap().columns,
         &lt,
     );
-    assert!((s - 0.1).abs() < 1e-9, "range selectivity, got {s}");
+    // v2.30: est_range_sel now follows PG19 scalarltsel — with no
+    // histogram the selectivity is DEFAULT_INEQ_SEL (1/3), not the
+    // pre-v2.30 ad-hoc 0.1.
+    assert!((s - 1.0 / 3.0).abs() < 1e-9, "range selectivity, got {s}");
     // Column-vs-column: unestimable -> 1.0.
     let col_b = Expr::Column {
         table: Some("j2".to_string()),

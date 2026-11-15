@@ -2815,6 +2815,12 @@ pub(crate) fn est_eq_sel(ts: Option<&TableStats>, col: &str, v: &Value) -> f64 {
         Some(c) => c,
         None => return 0.1,
     };
+    // v2.30: stadistinct 0 means "unknown" in PG19 (an all-NULL
+    // column at ANALYZE time): eqsel falls back to
+    // DEFAULT_NUM_DISTINCT, not to a zero-frequency remainder.
+    if cs.n_distinct == 0.0 {
+        return 1.0 / 200.0;
+    }
     if let Some((_, f)) = cs
         .mcv
         .iter()
@@ -2830,57 +2836,164 @@ pub(crate) fn est_eq_sel(ts: Option<&TableStats>, col: &str, v: &Value) -> f64 {
 
 /// Range selectivity from the histogram bounds: the fraction of
 /// equal-count intervals overlapping [lo, hi].
+/// v2.30: PG19 scalar conversion for histogram-bin interpolation
+/// (`convert_to_scalar`): numerics directly; text via its leading
+/// numeric prefix, like PG's text-to-scalar path.
+fn est_to_scalar(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(i) => Some(*i as f64),
+        Value::Float(f) => Some(*f),
+        Value::Numeric(n) => Some(n.to_f64()),
+        Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+        Value::Text(t) => {
+            let t = t.trim_start();
+            let bytes = t.as_bytes();
+            let mut end = 0usize;
+            if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
+                end += 1;
+            }
+            let mut digits = false;
+            while end < bytes.len() && (bytes[end].is_ascii_digit() || bytes[end] == b'.') {
+                if bytes[end].is_ascii_digit() {
+                    digits = true;
+                }
+                end += 1;
+            }
+            if digits && end < bytes.len() && (bytes[end] == b'e' || bytes[end] == b'E') {
+                let mut e2 = end + 1;
+                if e2 < bytes.len() && (bytes[e2] == b'+' || bytes[e2] == b'-') {
+                    e2 += 1;
+                }
+                let mut edigits = false;
+                while e2 < bytes.len() && bytes[e2].is_ascii_digit() {
+                    edigits = true;
+                    e2 += 1;
+                }
+                if edigits {
+                    end = e2;
+                }
+            }
+            if digits {
+                t[..end].parse::<f64>().ok()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// v2.30: PG19 `scalarltsel`/`scalargtsel` (var_range_sel +
+/// ineq_histogram_selectivity): MCV selectivity for the comparison
+/// plus the histogram fraction over the non-MCV population, with
+/// in-bin interpolation and the eq_selec bound correction.
+pub(crate) fn est_ineq_sel(ts: Option<&TableStats>, col: &str, op: CmpOp, val: &Value) -> f64 {
+    let cs = match ts.and_then(|t| t.cols.get(col)) {
+        Some(c) => c,
+        None => return 1.0 / 3.0,
+    };
+    let (isgt, iseq) = match op {
+        CmpOp::Lt => (false, false),
+        CmpOp::Le => (false, true),
+        CmpOp::Gt => (true, false),
+        CmpOp::Ge => (true, true),
+        _ => return 1.0 / 3.0,
+    };
+    let satisfies = |dv: &Value| -> bool {
+        let ord = index_key_cmp(dv, val);
+        match (isgt, iseq) {
+            (false, false) => ord == Ordering::Less,
+            (false, true) => ord != Ordering::Greater,
+            (true, false) => ord == Ordering::Greater,
+            (true, true) => ord != Ordering::Less,
+        }
+    };
+    let mcv_selec: f64 = cs
+        .mcv
+        .iter()
+        .filter(|(v, _)| satisfies(v))
+        .map(|(_, f)| f)
+        .sum();
+    let sumcommon: f64 = cs.mcv.iter().map(|(_, f)| f).sum();
+    let rest = (1.0 - cs.null_frac - sumcommon).max(0.0);
+    let bounds = &cs.hist_bounds;
+    let hist_selec = if bounds.len() > 1 {
+        let n = bounds.len();
+        // First bound index past the value: for the <= family the
+        // first bound >= val; for the > family the first bound > val.
+        let lobound = bounds.iter().position(|b| {
+            let ord = index_key_cmp(b, val);
+            if isgt {
+                ord == Ordering::Greater
+            } else {
+                ord != Ordering::Less
+            }
+        });
+        let histfrac = match lobound {
+            None => 1.0,
+            Some(0) => 0.0,
+            Some(i) => {
+                let binfrac = match (
+                    est_to_scalar(val),
+                    est_to_scalar(&bounds[i - 1]),
+                    est_to_scalar(&bounds[i]),
+                ) {
+                    (Some(v), Some(low), Some(high)) => {
+                        if high <= low {
+                            0.5
+                        } else if v <= low {
+                            0.0
+                        } else if v >= high {
+                            1.0
+                        } else {
+                            (v - low) / (high - low)
+                        }
+                    }
+                    _ => 0.5,
+                };
+                let mut hf = ((i - 1) as f64 + binfrac) / (n - 1) as f64;
+                let eq_selec = if i == 1 || isgt == iseq {
+                    let otherdistinct = cs.n_distinct - cs.mcv.len() as f64;
+                    if otherdistinct > 1.0 {
+                        1.0 / otherdistinct
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+                if i == 1 {
+                    hf += eq_selec * (1.0 - binfrac);
+                }
+                if isgt == iseq {
+                    hf -= eq_selec;
+                }
+                hf
+            }
+        };
+        if isgt { 1.0 - histfrac } else { histfrac }
+    } else {
+        0.5
+    };
+    (mcv_selec + rest * hist_selec).clamp(0.0, 1.0)
+}
+
 pub(crate) fn est_range_sel(
     ts: Option<&TableStats>,
     col: &str,
     lo: Option<&Value>,
     hi: Option<&Value>,
 ) -> f64 {
-    let cs = match ts.and_then(|t| t.cols.get(col)) {
-        Some(c) => c,
-        None => return 0.1,
-    };
-    if cs.hist_bounds.len() >= 2 {
-        let iv = cs.hist_bounds.len() - 1;
-        let mut overlap = 0u32;
-        for i in 0..iv {
-            let b0 = &cs.hist_bounds[i];
-            let b1 = &cs.hist_bounds[i + 1];
-            let above_lo = lo.map_or(true, |lv| index_key_cmp(b1, lv) != Ordering::Less);
-            let below_hi = hi.map_or(true, |hv| index_key_cmp(b0, hv) != Ordering::Greater);
-            if above_lo && below_hi {
-                overlap += 1;
-            }
+    match (lo, hi) {
+        (None, None) => 1.0,
+        (None, Some(h)) => est_ineq_sel(ts, col, CmpOp::Le, h),
+        (Some(l), None) => est_ineq_sel(ts, col, CmpOp::Gt, l),
+        (Some(l), Some(h)) => {
+            let below_hi = est_ineq_sel(ts, col, CmpOp::Le, h);
+            let below_lo = est_ineq_sel(ts, col, CmpOp::Le, l);
+            (below_hi - below_lo).clamp(0.0, 1.0)
         }
-        return (overlap as f64 / iv as f64).clamp(0.0001, 1.0);
     }
-    0.1
-}
-
-pub(crate) fn est_index_rows(
-    db: &Database,
-    table: &str,
-    ix: &Index,
-    prefix: &[Value],
-    lo: Option<&Value>,
-    hi: Option<&Value>,
-    snap: &Snapshot,
-    own: u64,
-    session: u64,
-) -> u64 {
-    let rel = est_rel_rows(db, table, snap, own, session) as f64;
-    if rel == 0.0 {
-        return 0;
-    }
-    let ts = db.stats.get(table);
-    let mut sel = 1.0f64;
-    for (i, v) in prefix.iter().enumerate() {
-        sel *= est_eq_sel(ts, &ix.def.col_names[i], v);
-    }
-    if lo.is_some() || hi.is_some() {
-        sel *= est_range_sel(ts, &ix.def.col_names[prefix.len()], lo, hi);
-    }
-    (rel * sel).round().max(1.0) as u64
 }
 
 // --- v1.63: cost-based nestloop side selection -------------------------------
@@ -2906,7 +3019,19 @@ pub(crate) fn est_conjunct_sel(
     columns: &[(String, ColType)],
     c: &Expr,
 ) -> f64 {
-    let ts = db.stats.get(table);
+    est_conjunct_sel_ts(db, table, qual, columns, c, db.stats.get(table))
+}
+
+/// v2.30: `est_conjunct_sel` against an explicit stats source (the
+/// inherited/family stats when the scan covers a whole family).
+pub(crate) fn est_conjunct_sel_ts(
+    _db: &Database,
+    table: &str,
+    qual: &str,
+    columns: &[(String, ColType)],
+    c: &Expr,
+    ts: Option<&TableStats>,
+) -> f64 {
     // `IS [NOT] NULL`: the stats null fraction; without stats, no opinion
     // (PG19's `nulltestsel` likewise needs the column stats).
     if let Expr::IsNull { expr, neg } = c {
@@ -3042,8 +3167,25 @@ pub(crate) fn pg_nestloop_swap(
     };
     // v1.62: heap pages for the I/O term; filtered rows for the CPU term
     // (PG19's `cost_seqscan` charges `cpu_tuple_cost` per *output* row).
-    let rows_a = est_filtered_rows(db, a_table, a_qual, ta, a.rows() as f64, a_where);
-    let rows_b = est_filtered_rows(db, b_table, b_qual, tb, b.rows() as f64, b_where);
+    // v2.30: the base is the UNFILTERED relation estimate — scan
+    // nodes now store filtered rows, so node.rows() would
+    // double-apply the WHERE selectivity.
+    let rows_a = est_filtered_rows(
+        db,
+        a_table,
+        a_qual,
+        ta,
+        est_rel_rows(db, a_table, snap, own, session) as f64,
+        a_where,
+    );
+    let rows_b = est_filtered_rows(
+        db,
+        b_table,
+        b_qual,
+        tb,
+        est_rel_rows(db, b_table, snap, own, session) as f64,
+        b_where,
+    );
     let cost_a = est_heap_pages(ta) as f64 * SEQ_PAGE_COST + rows_a * CPU_TUPLE_COST;
     let cost_b = est_heap_pages(tb) as f64 * SEQ_PAGE_COST + rows_b * CPU_TUPLE_COST;
     if cost_a <= 0.0 || cost_b <= 0.0 {
@@ -3368,7 +3510,15 @@ pub(crate) fn pg_merge_side_ns(
         _ => return None,
     };
     let t = db.find_table(table, snap, &[own], session)?;
-    let base = pg_choice_rows(db, table, t, plan_rows);
+    // v2.30: plan_rows is the node's (now filtered) estimate; the
+    // no-stats choice base must be the unfiltered relation size.
+    let _ = plan_rows;
+    let base = pg_choice_rows(
+        db,
+        table,
+        t,
+        est_rel_rows(db, table, snap, own, session) as f64,
+    );
     let rows = est_filtered_rows(db, table, qual, t, base, where_);
     if rows <= 0.0 {
         return None;

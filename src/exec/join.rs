@@ -782,6 +782,11 @@ pub(crate) fn table_function_col_names(name: &str) -> Result<Vec<String>, ExecEr
     }
     match name {
         "regexp_split_to_table" | "generate_series" => Ok(vec![name.to_string()]),
+        // v2.30: pg_mcv_list_items OUT columns (selfuncs SRF).
+        "pg_mcv_list_items" => Ok(["index", "values", "nulls", "frequency", "base_frequency"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()),
         // v0.79: unnest's single output column is named for the function.
         "unnest" => Ok(vec![name.to_string()]),
         // v0.99: parse_ident as a scalar function in FROM yields one row
@@ -853,6 +858,14 @@ pub(crate) fn table_function_col_types(
     match name {
         "regexp_split_to_table" => Ok(vec![ColType::Text]),
         "pg_input_error_info" => Ok(vec![ColType::Text; 4]),
+        // v2.30: pg_mcv_list_items (int4, text[], bool[], float8, float8).
+        "pg_mcv_list_items" => Ok(vec![
+            ColType::Int,
+            ColType::Array(crate::storage::ArrayElem::Text),
+            ColType::Array(crate::storage::ArrayElem::Bool),
+            ColType::Float,
+            ColType::Float,
+        ]),
         // v1.85: jsonb_path_query returns jsonb rows.
         "jsonb_path_query" | "jsonb_path_query_tz" => Ok(vec![ColType::Jsonb]),
         // v1.84: json/jsonb expansion SRFs.
@@ -1102,6 +1115,30 @@ pub(crate) fn eval_srf_call(
             )
         };
         return Ok((names, types, vec![Row::new(vec![v])], true));
+    }
+    // v2.30: pg_mcv_list_items decodes the stxdmcv payload built by
+    // ANALYZE (strict: a NULL argument yields zero rows).
+    if name == "pg_mcv_list_items" {
+        validate_coldef_for_builtin(name, col_defs)?;
+        let rows: Vec<Row> = match arg_vals.first() {
+            Some(Value::Text(t)) => crate::exec::extstats::mcv_list_items_rows(t)
+                .into_iter()
+                .map(Row::new)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let (names, types) = if col_defs.is_empty() {
+            (
+                table_function_col_names(name)?,
+                table_function_col_types(name, &arg_vals)?,
+            )
+        } else {
+            (
+                col_defs.iter().map(|(n, _, _)| n.clone()).collect(),
+                col_defs.iter().map(|(_, t, _)| *t).collect(),
+            )
+        };
+        return Ok((names, types, rows, true));
     }
     // v2.04: pg_get_publication_tables reads the publication
     // catalog directly (its rows depend on catalog state, not on a

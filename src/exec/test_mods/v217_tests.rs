@@ -67,13 +67,16 @@ fn v217_create_statistics_validation() {
         err_code(&mut eng, "create statistics s1 (bogus) on a, b from est"),
         "42601"
     );
+    // v2.30: PG19 codes — system-column statistics are 0A000 and a
+    // single plain column is 42P17 (the v2.17-era 42601 guesses were
+    // superseded by the statscmds.c gate port).
     assert_eq!(
         err_code(&mut eng, "create statistics s1 on tableoid, a from est"),
-        "42601"
+        "0A000"
     );
     assert_eq!(
         err_code(&mut eng, "create statistics s1 on a from est"),
-        "42601"
+        "42P17"
     );
     assert_eq!(
         err_code(&mut eng, "create statistics s1 on a, zz from est"),
@@ -94,9 +97,10 @@ fn v217_create_statistics_validation() {
         "create statistics s2 (mcv) on (a + b), lower(c) from est",
     );
     assert_eq!(eng.db.ext_stats.len(), 2);
-    // Unnamed form auto-names <table>_<cols>_stats.
+    // Unnamed form auto-names <table>_<cols>_stat (v2.30: PG19 uses
+    // the singular "stat" suffix; the v2.17 "_stats" was wrong).
     ok(&mut eng, "create statistics (ndistinct) on a, c from est");
-    assert!(eng.db.ext_stats.iter().any(|o| o.name == "est_a_c_stats"));
+    assert!(eng.db.ext_stats.iter().any(|o| o.name == "est_a_c_stat"));
 }
 
 #[test]
@@ -134,9 +138,14 @@ fn v217_analyze_builds_ext_stats() {
     let o = &eng.db.ext_stats[0];
     assert!(o.data.built);
     let nd = o.data.ndistinct.clone().unwrap();
-    assert!(nd.contains("\"1\": 4"), "ndistinct: {nd}");
-    assert!(nd.contains("\"2\": 2"), "ndistinct: {nd}");
-    assert!(nd.contains("\"1, 2\": 4"), "ndistinct: {nd}");
+    // v2.30: the payload is PG19's mvdistinct text format — a JSON
+    // array of {"attributes": [...], "ndistinct": N} for subsets of
+    // size >= 2 (the pre-v2.30 internal "attnums: count" map is
+    // gone).
+    assert!(
+        nd.contains("{\"attributes\": [1, 2], \"ndistinct\": 4}"),
+        "ndistinct: {nd}"
+    );
     assert_eq!(o.data.mcv.len(), 4);
     let def = statisticsobjdef(&eng.db, o.oid as i64).unwrap();
     assert_eq!(def, "CREATE STATISTICS public.s1 ON a, b FROM est");

@@ -1439,7 +1439,7 @@ pub(crate) fn exec_explain_dml_analyze(
             match child {
                 Some(plan) => {
                     let ax = dml_ax(eng, ctx, affected);
-                    render_analyze(&plan, &ax, 1, None, true, &mut out);
+                    render_analyze(&plan, &ax, 1, None, true, costs, &mut out);
                 }
                 None => {
                     if rows.len() > 1 {
@@ -1457,7 +1457,7 @@ pub(crate) fn exec_explain_dml_analyze(
                             replaces: None,
                         };
                         let ax = dml_ax(eng, ctx, rows.len() as u64);
-                        render_analyze(&node, &ax, 1, None, true, &mut out);
+                        render_analyze(&node, &ax, 1, None, true, costs, &mut out);
                     }
                 }
             }
@@ -1490,7 +1490,7 @@ pub(crate) fn exec_explain_dml_analyze(
                 affected as f64
             ));
             let ax = dml_ax(eng, ctx, affected);
-            render_analyze(&plan, &ax, 1, None, true, &mut out);
+            render_analyze(&plan, &ax, 1, None, true, costs, &mut out);
         }
         Stmt::Delete {
             table,
@@ -1519,7 +1519,7 @@ pub(crate) fn exec_explain_dml_analyze(
                 affected as f64
             ));
             let ax = dml_ax(eng, ctx, affected);
-            render_analyze(&plan, &ax, 1, None, true, &mut out);
+            render_analyze(&plan, &ax, 1, None, true, costs, &mut out);
         }
         Stmt::Merge {
             table,
@@ -1549,7 +1549,7 @@ pub(crate) fn exec_explain_dml_analyze(
                 affected as f64
             ));
             let ax = dml_ax(eng, ctx, affected);
-            render_analyze(&plan, &ax, 1, None, true, &mut out);
+            render_analyze(&plan, &ax, 1, None, true, costs, &mut out);
         }
         Stmt::CreateTableAs {
             name,
@@ -1586,7 +1586,7 @@ pub(crate) fn exec_explain_dml_analyze(
             if *with_data {
                 let n = affected_of(&res);
                 let ax = dml_ax(eng, ctx, n);
-                render_analyze(&plan, &ax, 0, None, true, &mut out);
+                render_analyze(&plan, &ax, 0, None, true, costs, &mut out);
             } else {
                 render_never_executed(&plan, 0, &mut out);
             }
@@ -1647,7 +1647,7 @@ pub(crate) fn exec_explain_dml_analyze(
             if *with_data {
                 let n = affected_of(&res);
                 let ax = dml_ax(eng, ctx, n);
-                render_analyze(&plan, &ax, 0, None, true, &mut out);
+                render_analyze(&plan, &ax, 0, None, true, costs, &mut out);
             } else {
                 render_never_executed(&plan, 0, &mut out);
             }
@@ -1681,7 +1681,7 @@ pub(crate) fn exec_explain_dml_analyze(
                     })
                     .unwrap_or(0);
                 let ax = dml_ax(eng, ctx, n);
-                render_analyze(&plan, &ax, 0, None, true, &mut out);
+                render_analyze(&plan, &ax, 0, None, true, costs, &mut out);
             } else {
                 render_never_executed(&plan, 0, &mut out);
             }

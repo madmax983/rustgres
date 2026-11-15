@@ -1837,11 +1837,69 @@ impl Parser {
                 (sc, nm, false)
             };
             self.expect_keyword("on")?;
+            // v2.30: PG19 stats_param grammar — each item is a bare
+            // column name, a bare function call, or a parenthesised
+            // expression. Anything else (e.g. `y + z` unparenthesised)
+            // is a 42601 syntax error. Scan the item's token span
+            // (commas only separate at paren depth 0), then validate
+            // the shape.
             let mut items: Vec<String> = Vec::new();
             loop {
                 let start = self.pos;
-                let _e = self.parse_or()?;
-                items.push(tokens_to_sql(&self.tokens[start..self.pos]));
+                let mut depth = 0i32;
+                while self.pos < self.tokens.len() {
+                    match &self.tokens[self.pos] {
+                        Token::LParen => depth += 1,
+                        Token::RParen => depth -= 1,
+                        Token::Comma if depth == 0 => break,
+                        Token::Ident(w)
+                            if depth == 0 && w.eq_ignore_ascii_case("from") && self.pos > start =>
+                        {
+                            break;
+                        }
+                        _ => {}
+                    }
+                    self.pos += 1;
+                }
+                let span = &self.tokens[start..self.pos];
+                let shape_ok = {
+                    // Matching close paren for a '(' at index i.
+                    let match_close = |i: usize| -> Option<usize> {
+                        let mut d = 0i32;
+                        for (j, t) in span.iter().enumerate().skip(i) {
+                            match t {
+                                Token::LParen => d += 1,
+                                Token::RParen => {
+                                    d -= 1;
+                                    if d == 0 {
+                                        return Some(j);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        None
+                    };
+                    match span {
+                        [Token::Ident(_)] => true,
+                        _ if matches!(span.first(), Some(Token::LParen)) => {
+                            match_close(0) == Some(span.len() - 1)
+                        }
+                        _ if matches!(span.first(), Some(Token::Ident(_)))
+                            && matches!(span.get(1), Some(Token::LParen)) =>
+                        {
+                            match_close(1) == Some(span.len() - 1)
+                        }
+                        _ => false,
+                    }
+                };
+                if !shape_ok || span.is_empty() {
+                    return Err(SqlError {
+                        code: "42601",
+                        message: "syntax error in statistics definition".to_string(),
+                    });
+                }
+                items.push(tokens_to_sql(span));
                 if *self.peek() == Token::Comma {
                     self.next();
                 } else {
@@ -1851,8 +1909,9 @@ impl Parser {
             self.expect_keyword("from")?;
             let table = self.parse_table_name()?;
             let name = if auto_name {
-                // PG ChooseExtendedStatisticsName: <table>_<att...>_stats
-                // with expression attributes named "expr".
+                // PG ChooseExtendedStatisticName: <table>_<att...>_stat
+                // (label is the singular "stat") with expression
+                // attributes named "expr".
                 let mut nm = table.rsplit('.').next().unwrap_or(&table).to_string();
                 for it in &items {
                     let part = if it
@@ -1866,7 +1925,7 @@ impl Parser {
                     nm.push('_');
                     nm.push_str(&part);
                 }
-                nm.push_str("_stats");
+                nm.push_str("_stat");
                 nm
             } else {
                 name
@@ -14474,14 +14533,59 @@ impl Parser {
                 }
             }
         }
-        let table = match self.peek() {
-            Token::Ident(_) | Token::QIdent(_) => Some(self.expect_ident()?),
-            _ => None,
+        // v2.30: PG19 VACUUM accepts a comma-separated table list
+        // (`VACUUM ANALYZE t1, t2, t3`), each optionally followed by a
+        // parenthesized column list; the names are captured and the
+        // ANALYZE side validates them (plain VACUUM ignores them, as
+        // in PG).
+        let mut tables: Vec<(String, Vec<String>)> = Vec::new();
+        loop {
+            match self.peek() {
+                Token::Ident(_) | Token::QIdent(_) => {
+                    let tname = self.parse_table_name()?;
+                    // v2.30: capture the optional column list
+                    // (`VACUUM ANALYZE t (a, b)`) instead of skipping
+                    // it — the ANALYZE side validates the names
+                    // (PG19 analyze.c validate_va_cols_list: 42703 /
+                    // 42701), and plain VACUUM ignores them.
+                    let mut cols: Vec<String> = Vec::new();
+                    if *self.peek() == Token::LParen {
+                        self.next();
+                        loop {
+                            match self.next() {
+                                Token::Ident(n) | Token::QIdent(n) => cols.push(n),
+                                Token::Comma => {}
+                                Token::RParen => break,
+                                other => {
+                                    return Err(err(format!(
+                                        "syntax error: unexpected {:?} in column list",
+                                        other
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    tables.push((tname, cols));
+                    if *self.peek() == Token::Comma {
+                        self.next();
+                        continue;
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+        let mut it = tables.into_iter();
+        let (table, table_cols) = match it.next() {
+            Some((t, c)) => (Some(t), c),
+            None => (None, Vec::new()),
         };
         Ok(Stmt::Vacuum {
             table,
+            table_cols,
             verbose,
             analyze,
+            more_tables: it.collect(),
         })
     }
 

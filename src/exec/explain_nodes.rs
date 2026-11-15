@@ -2492,6 +2492,41 @@ pub(crate) fn pg_try_anti_join_simple(
     }))
 }
 
+/// v2.30: PG19 `estimate_num_groups` for an Aggregate/Unique whose
+/// child is a single base-table scan of the statement's only FROM
+/// item; None when the shape doesn't apply (caller keeps the child
+/// row estimate).
+fn single_table_group_rows(
+    eng: &Engine,
+    stmt: &SelectStmt,
+    child: &PlanNode,
+    group_exprs: &[Expr],
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> Option<u64> {
+    let table = match child {
+        PlanNode::SeqScan { table, .. }
+        | PlanNode::IndexScan { table, .. }
+        | PlanNode::IndexOrderScan { table, .. } => table,
+        _ => return None,
+    };
+    let only = match stmt.from.as_slice() {
+        [crate::sql::FromItem::Table { name, only, .. }] if name == table => *only,
+        _ => return None,
+    };
+    let t = eng.db.find_table(table, snap, &[own], session)?;
+    let family = !only && has_family(&eng.db, table, snap, own, session);
+    let src = est_source(&eng.db, table, family);
+    let tuples = if family {
+        family_rel_rows(&eng.db, table, snap, own, session)
+    } else {
+        est_rel_rows(&eng.db, table, snap, own, session) as f64
+    };
+    let est = est_num_groups(&src, t, tuples, child.rows() as f64, group_exprs);
+    Some(est.round().max(1.0) as u64)
+}
+
 pub(crate) fn plan_select(
     eng: &Engine,
     stmt: &SelectStmt,
@@ -2899,7 +2934,14 @@ pub(crate) fn plan_select(
             let rows = if stmt.group_by.is_empty() {
                 1
             } else {
-                node.rows()
+                // v2.30: estimate_num_groups when applicable.
+                match resolve_grouping_sets(stmt) {
+                    Ok(sets) if sets.len() == 1 => {
+                        single_table_group_rows(eng, stmt, &node, &sets[0], snap, own, session)
+                            .unwrap_or_else(|| node.rows())
+                    }
+                    _ => node.rows(),
+                }
             };
             node = PlanNode::Aggregate {
                 rows,
@@ -2959,7 +3001,14 @@ pub(crate) fn plan_select(
         let rows = if stmt.group_by.is_empty() {
             1
         } else {
-            node.rows()
+            // v2.30: estimate_num_groups when applicable.
+            match resolve_grouping_sets(stmt) {
+                Ok(sets) if sets.len() == 1 => {
+                    single_table_group_rows(eng, stmt, &node, &sets[0], snap, own, session)
+                        .unwrap_or_else(|| node.rows())
+                }
+                _ => node.rows(),
+            }
         };
         node = PlanNode::Aggregate {
             rows,
@@ -2968,7 +3017,24 @@ pub(crate) fn plan_select(
             output: top_output(),
         };
     } else if stmt.distinct {
-        let rows = node.rows();
+        // v2.30: DISTINCT estimates the number of distinct target
+        // combinations (estimate_num_groups over the target list).
+        let rows = {
+            let texprs: Vec<Expr> = stmt
+                .items
+                .iter()
+                .filter_map(|it| match it {
+                    crate::sql::SelectItem::Expr { expr, .. } => Some(expr.clone()),
+                    _ => None,
+                })
+                .collect();
+            if texprs.len() == stmt.items.len() && !texprs.is_empty() {
+                single_table_group_rows(eng, stmt, &node, &texprs, snap, own, session)
+                    .unwrap_or_else(|| node.rows())
+            } else {
+                node.rows()
+            }
+        };
         // v1.61: PG19 `LIMIT 1` instead of `Unique` when every DISTINCT
         // key is provably single-valued (`create_distinct_paths`,
         // planner.c:5394-5416; see `pg_distinct_keys_redundant`).

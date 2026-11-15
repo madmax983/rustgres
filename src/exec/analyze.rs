@@ -118,10 +118,28 @@ pub(crate) fn render_analyze(
     depth: usize,
     cap: Option<u64>,
     is_top: bool,
+    costs: bool,
     out: &mut Vec<String>,
 ) {
     let actual = analyze_actual(node, ax, cap, is_top);
-    let tag = format!("(actual rows={:.2} loops=1)", actual as f64);
+    // v2.30: the estimated-rows segment PG prints in its cost
+    // parentheses, reduced to `(rows=N )`: the stats_ext suite's
+    // check_estimated_rows helper regex-extracts
+    // `rows=(\d*) .* rows=(\d*)` (estimated, actual) from the first
+    // EXPLAIN ANALYZE line — PG's line carries the estimate first
+    // with a space after it (`rows=3 width=...`), hence the space
+    // before the closing paren here. The actual-rows rendering is
+    // unchanged.
+    // With COSTS OFF, PG drops the cost parenthetical entirely.
+    let tag = if costs {
+        format!(
+            "(rows={} ) (actual rows={:.2} loops=1)",
+            node.rows(),
+            actual as f64
+        )
+    } else {
+        format!("(actual rows={:.2} loops=1)", actual as f64)
+    };
     let pad = analyze_pad(depth);
     let ppad = " ".repeat(6 * depth + 3);
     match node {
@@ -177,8 +195,8 @@ pub(crate) fn render_analyze(
             if let Some(f) = filter {
                 out.push(format!("{}Filter: {}", ppad, f));
             }
-            render_analyze(outer, ax, depth + 1, None, false, out);
-            render_analyze(inner, ax, depth + 1, None, false, out);
+            render_analyze(outer, ax, depth + 1, None, false, costs, out);
+            render_analyze(inner, ax, depth + 1, None, false, costs, out);
         }
         // v1.64: EXPLAIN ANALYZE rendering for Hash Join (the node is
         // display-only; ANALYZE executes via the executor, so this shapes
@@ -197,9 +215,9 @@ pub(crate) fn render_analyze(
             if let Some(f) = filter {
                 out.push(format!("{}Join Filter: {}", ppad, f));
             }
-            render_analyze(outer, ax, depth + 1, None, false, out);
+            render_analyze(outer, ax, depth + 1, None, false, costs, out);
             out.push(format!("{}Hash {}", pg_pad(depth + 1), tag));
-            render_analyze(inner, ax, depth + 2, None, false, out);
+            render_analyze(inner, ax, depth + 2, None, false, costs, out);
         }
         // v1.69: EXPLAIN ANALYZE rendering for Merge Join (display-only).
         PlanNode::MergeJoin {
@@ -215,21 +233,21 @@ pub(crate) fn render_analyze(
             if let Some(f) = filter {
                 out.push(format!("{}Join Filter: {}", ppad, f));
             }
-            render_analyze(outer, ax, depth + 1, None, false, out);
-            render_analyze(inner, ax, depth + 1, None, false, out);
+            render_analyze(outer, ax, depth + 1, None, false, costs, out);
+            render_analyze(inner, ax, depth + 1, None, false, costs, out);
         }
         // v1.48: PG19 `Materialize` (explain.c `T_Material`).
         PlanNode::Materialize { child, .. } => {
             out.push(format!("{}Materialize {}", pad, tag));
-            render_analyze(child, ax, depth + 1, None, false, out);
+            render_analyze(child, ax, depth + 1, None, false, costs, out);
         }
         PlanNode::Aggregate { child, .. } => {
             out.push(format!("{}Aggregate {}", pad, tag));
-            render_analyze(child, ax, depth + 1, None, false, out);
+            render_analyze(child, ax, depth + 1, None, false, costs, out);
         }
         PlanNode::Unique { child, .. } => {
             out.push(format!("{}Unique {}", pad, tag));
-            render_analyze(child, ax, depth + 1, None, false, out);
+            render_analyze(child, ax, depth + 1, None, false, costs, out);
         }
         PlanNode::Sort { keys, child, .. } => {
             // PG renders "Sort Method: top-N heapsort" when the sort
@@ -248,7 +266,7 @@ pub(crate) fn render_analyze(
                 "{}Sort Method: {}  Memory: {}kB",
                 ppad, method, mem_kb
             ));
-            render_analyze(child, ax, depth + 1, None, false, out);
+            render_analyze(child, ax, depth + 1, None, false, costs, out);
         }
         PlanNode::Limit { n, child, .. } => {
             // PG's analyzed Limit shows no row-count target (unlike the
@@ -256,11 +274,11 @@ pub(crate) fn render_analyze(
             out.push(format!("{}Limit {}", pad, tag));
             let (lim, off) = parse_limit_n(n);
             let child_cap = lim.map(|l| off.saturating_add(l));
-            render_analyze(child, ax, depth + 1, child_cap, false, out);
+            render_analyze(child, ax, depth + 1, child_cap, false, costs, out);
         }
         PlanNode::SubqueryScan { alias, child, .. } => {
             out.push(format!("{}Subquery Scan on {} {}", pad, alias, tag));
-            render_analyze(child, ax, depth + 1, cap, false, out);
+            render_analyze(child, ax, depth + 1, cap, false, costs, out);
         }
         PlanNode::Values { .. } => {
             out.push(format!("{}Values {}", pad, tag));
@@ -299,7 +317,7 @@ pub(crate) fn explain_rows(
             session: q.session,
             top_rows: out.rows.len() as u64,
         };
-        render_analyze(&plan, &ax, 0, None, true, &mut lines);
+        render_analyze(&plan, &ax, 0, None, true, costs, &mut lines);
     } else {
         render_plan(&plan, 0, costs, verbose, &mut lines);
     }
@@ -437,13 +455,64 @@ pub(crate) fn analyze_table(
         .iter()
         .filter(|r| row_visible(r, snap, &[own]))
         .collect();
+    let rows: Vec<&[Value]> = vis.iter().map(|r| -> &[Value] { &r.values }).collect();
+    stats_from_rows(&t.columns, &rows)
+}
+
+/// v2.30: inherited statistics over a table's whole family (the
+/// rows pg_statistic's stxdinherit=true entries describe). Family
+/// members' rows are projected onto the parent's columns by name.
+pub(crate) fn analyze_table_inh(
+    db: &Database,
+    table: &str,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> Option<TableStats> {
+    let fam = extstats::family_tables(db, table, snap, own, session);
+    if fam.len() <= 1 {
+        return None;
+    }
+    let parent = db.find_table(table, snap, &[own], session)?;
+    let mut owned: Vec<Vec<Value>> = Vec::new();
+    for member in &fam {
+        let Some(mt) = db.find_table(member, snap, &[own], session) else {
+            continue;
+        };
+        let proj: Vec<Option<usize>> = parent
+            .columns
+            .iter()
+            .map(|(cn, _)| {
+                mt.columns
+                    .iter()
+                    .position(|(mc, _)| mc.eq_ignore_ascii_case(cn))
+            })
+            .collect();
+        for r in mt.rows.iter().filter(|r| row_visible(r, snap, &[own])) {
+            owned.push(
+                proj.iter()
+                    .map(|p| match p {
+                        Some(i) => r.values.get(*i).cloned().unwrap_or(Value::Null),
+                        None => Value::Null,
+                    })
+                    .collect(),
+            );
+        }
+    }
+    let rows: Vec<&[Value]> = owned.iter().map(|r| r.as_slice()).collect();
+    Some(stats_from_rows(&parent.columns, &rows))
+}
+
+/// The per-column statistics computation shared by analyze_table
+/// and its inherited variant.
+fn stats_from_rows(columns: &[(String, ColType)], vis: &[&[Value]]) -> TableStats {
     let total = vis.len() as f64;
     let mut cols = HashMap::new();
-    for (ci, (cname, _)) in t.columns.iter().enumerate() {
+    for (ci, (cname, _)) in columns.iter().enumerate() {
         let mut nulls = 0u64;
         let mut counts: HashMap<Vec<u8>, (Value, u64)> = HashMap::new();
-        for r in &vis {
-            let v = &r.values[ci];
+        for r in vis {
+            let v = &r[ci];
             if matches!(v, Value::Null) {
                 nulls += 1;
                 continue;
@@ -602,9 +671,36 @@ pub(crate) fn exec_analyze_core(
     };
     // Statistics are not transactional (like Postgres): they are computed
     // and stored without write ops.
-    for n in names {
+    // v2.30: ANALYZE on a partitioned table processes its partitions
+    // recursively (PG19 vacuum.c). Inheritance children are NOT
+    // recursed into.
+    let mut work: Vec<String> = Vec::new();
+    for n in &names {
+        if !work.contains(n) {
+            work.push(n.clone());
+        }
+        let mut frontier = vec![n.clone()];
+        while let Some(cur) = frontier.pop() {
+            if let Some(t) = eng.db.find_table(&cur, snap, &[own], session) {
+                if let Some(p) = &t.partition {
+                    for c in &p.children {
+                        if !work.contains(c) {
+                            work.push(c.clone());
+                            frontier.push(c.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for n in work {
         let stats = analyze_table(&eng.db, &n, snap, own, session);
         eng.db.stats.insert(n.clone(), stats);
+        // v2.30: inherited (family) statistics for pg_statistic's
+        // stxdinherit rows and family-wide estimates.
+        if let Some(inh) = analyze_table_inh(&eng.db, &n, snap, own, session) {
+            eng.db.stats_inh.insert(n.clone(), inh);
+        }
         // v2.17: build extended statistics for objects on this table.
         extstats::build_ext_stats_for_table(eng, snap, own, session, &n);
     }

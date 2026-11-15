@@ -10424,6 +10424,14 @@ pub enum Stmt {
         verbose: bool,
         // v0.14: `VACUUM ANALYZE` also collects planner statistics.
         analyze: bool,
+        // v2.30: the first table's optional column list
+        // (`VACUUM ANALYZE t (a, b)`), validated by the ANALYZE side.
+        table_cols: Vec<String>,
+        // v2.30: additional (table, column list) pairs from a
+        // multi-table list (`VACUUM ANALYZE t1, t2 (a), t3` — PG19
+        // vacuum grammar allows a list; `table` carries the first
+        // entry).
+        more_tables: Vec<(String, Vec<String>)>,
     },
     // --- v0.8: secondary indexes
     CreateIndex {

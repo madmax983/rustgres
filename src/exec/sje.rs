@@ -1332,7 +1332,9 @@ pub(crate) fn plan_from_item(
         }
     };
     match item {
-        FromItem::Table { name, alias, .. } => {
+        FromItem::Table {
+            name, alias, only, ..
+        } => {
             // v0.78: CTEs shadow everything (like Postgres and the
             // executor's build_source). Plan the CTE body as a subquery
             // scan; the body only sees CTEs defined before it (plus
@@ -1580,6 +1582,16 @@ pub(crate) fn plan_from_item(
                 })?;
             let qual = alias.clone().unwrap_or_else(|| name.clone());
             let rel_rows = est_rel_rows(&eng.db, name, snap, own, session);
+            // v2.30: a non-ONLY scan of a table with descendants
+            // covers the whole family (PG's inheritance-expanded
+            // rel): base rows are the family total and estimates use
+            // the inherited statistics.
+            let family = !only && has_family(&eng.db, name, snap, own, session);
+            let base_rows = if family {
+                family_rel_rows(&eng.db, name, snap, own, session)
+            } else {
+                rel_rows as f64
+            };
             // v1.70: PG19 `restriction_is_constant_false` (joinrels.c): a
             // scan WHERE with `col = c1 AND col = c2` on the same qualified
             // column, with provably-different literals, plans as a dummy
@@ -1629,19 +1641,49 @@ pub(crate) fn plan_from_item(
                     // table order for `*` expansion.
                     let table_cols: Vec<String> =
                         t.columns.iter().map(|(n, _)| n.clone()).collect();
+                    // v2.30: PG19 scan rows are the FILTERED estimate
+                    // (clauselist_selectivity over the item's WHERE
+                    // slice, multivariate statistics included). For a
+                    // family scan PG plans an Append: the estimate is
+                    // the SUM of per-member estimates, each from the
+                    // member's OWN statistics (the parent member uses
+                    // its non-inherited objects).
+                    let rows = if family {
+                        family_tables(&eng.db, name, snap, own, session)
+                            .iter()
+                            .map(|m| {
+                                let Some(mt) = eng.db.find_table(m, snap, &[own], session) else {
+                                    return 0;
+                                };
+                                est_scan_rows(
+                                    &eng.db,
+                                    m,
+                                    &qual,
+                                    mt,
+                                    est_rel_rows(&eng.db, m, snap, own, session) as f64,
+                                    where_,
+                                    false,
+                                )
+                                .round() as u64
+                            })
+                            .sum()
+                    } else {
+                        est_scan_rows(&eng.db, name, &qual, t, base_rows, where_, false).round()
+                            as u64
+                    };
                     Ok(PlanNode::SeqScan {
                         table: name.clone(),
                         alias: alias.clone(),
                         filter,
-                        rows: rel_rows,
+                        rows,
                         output: scan_output(name, alias.as_deref(), &table_cols, where_, &[]),
                     })
                 }
                 AccessPath::IndexScan {
                     index,
-                    prefix,
-                    lo,
-                    hi,
+                    prefix: _prefix,
+                    lo: _lo,
+                    hi: _hi,
                     cond,
                     used,
                 } => {
@@ -1653,17 +1695,13 @@ pub(crate) fn plan_from_item(
                         .and_then(|m| m.get(&index))
                         .or_else(|| eng.db.indexes.get(&index))
                         .expect("planned index still present; engine lock held throughout");
-                    let rows = est_index_rows(
-                        &eng.db,
-                        name,
-                        ix,
-                        &prefix,
-                        lo.as_ref().map(|(v, _)| v),
-                        hi.as_ref().map(|(v, _)| v),
-                        snap,
-                        own,
-                        session,
-                    );
+                    // v2.30: PG19 index-path rows are the clauselist
+                    // estimate over ALL the scan's quals (index cond
+                    // plus residual filter), multivariate statistics
+                    // included — the same estimate as the seqscan
+                    // path, not just the index prefix.
+                    let rows = est_scan_rows(&eng.db, name, &qual, t, base_rows, where_, false)
+                        .round() as u64;
                     // v1.08: residual Filter = conjuncts the index
                     // cond did not consume. `used` indexes the reversed
                     // `split_conjuncts` order; map back to source order

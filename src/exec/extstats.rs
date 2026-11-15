@@ -13,7 +13,7 @@ pub(crate) fn split_qname(q: &str) -> (Option<String>, String) {
     }
 }
 
-fn base_name(q: &str) -> &str {
+pub(crate) fn stats_base_name(q: &str) -> &str {
     q.rsplit('.').next().unwrap_or(q)
 }
 
@@ -98,7 +98,7 @@ pub(crate) fn exec_create_statistics(
         None => {
             return Err(exec_err(
                 "42P01",
-                format!("relation \"{}\" does not exist", base_name(table)),
+                format!("relation \"{}\" does not exist", stats_base_name(table)),
             ));
         }
     };
@@ -108,7 +108,7 @@ pub(crate) fn exec_create_statistics(
     {
         return Err(exec_err(
             "42501",
-            format!("must be owner of table {}", base_name(table)),
+            format!("must be owner of table {}", stats_base_name(table)),
         ));
     }
     let obj_schema = schema.clone().unwrap_or_else(|| table_schema(eng, table));
@@ -148,11 +148,13 @@ pub(crate) fn exec_create_statistics(
             "cannot have more than 8 columns in statistics".to_string(),
         ));
     }
-    // PG: auto-generated names get a numeric suffix on collision.
+    // PG: auto-generated names get the label incremented on collision
+    // (ChooseExtendedStatisticName: "stat" -> "stat1" -> "stat2",
+    // appended directly with no separator).
     let name_owned: String = if auto_name && find_obj(&eng.db, &obj_schema, name).is_some() {
         let mut idx = 1u32;
         loop {
-            let candidate = format!("{}_{}", name, idx);
+            let candidate = format!("{}{}", name, idx);
             if find_obj(&eng.db, &obj_schema, &candidate).is_none() {
                 break candidate;
             }
@@ -194,7 +196,7 @@ pub(crate) fn exec_create_statistics(
             if seen_cols.contains(&attnum) {
                 return Err(exec_err(
                     "42701",
-                    format!("column \"{}\" specified more than once", trimmed),
+                    "duplicate column name in statistics definition".to_string(),
                 ));
             }
             seen_cols.push(attnum);
@@ -203,8 +205,8 @@ pub(crate) fn exec_create_statistics(
         }
         if SYSTEM_COLS.contains(&lower.as_str()) {
             return Err(exec_err(
-                "42601",
-                format!("cannot create statistics on system column \"{}\"", lower),
+                "0A000",
+                "statistics creation on system columns is not supported".to_string(),
             ));
         }
         // Expression path: a bare identifier that is not a column is a
@@ -220,17 +222,32 @@ pub(crate) fn exec_create_statistics(
             ));
         }
         // PG19: the same expression twice is an error (statscmds.c:
-        // "duplicate expression in statistics definition").
+        // "duplicate expression in statistics definition", 42701).
         if resolved
             .iter()
             .any(|r| matches!(r, ExtStatItem::Expr(t, _) if t == trimmed))
         {
             return Err(exec_err(
-                "42601",
+                "42701",
                 "duplicate expression in statistics definition".to_string(),
             ));
         }
         let expr = parse_stat_expr(trimmed)?;
+        // v2.30: PG19 statscmds.c — an expression referencing a
+        // system column is rejected like a plain system-column item.
+        {
+            let mut refs: Vec<(Option<String>, String)> = Vec::new();
+            crate::sql::collect_col_refs(&expr, &mut refs);
+            if refs
+                .iter()
+                .any(|(_, r)| SYSTEM_COLS.contains(&r.to_lowercase().as_str()))
+            {
+                return Err(exec_err(
+                    "0A000",
+                    "statistics creation on system columns is not supported".to_string(),
+                ));
+            }
+        }
         // A parenthesized row of columns is not a valid single item.
         if matches!(expr, Expr::Row(_)) {
             return Err(exec_err(
@@ -238,35 +255,129 @@ pub(crate) fn exec_create_statistics(
                 "statistics expressions must not be row-valued".to_string(),
             ));
         }
+        // v2.30: PG19 statscmds.c — a parenthesised bare column
+        // reference (`ON (y)`) is classified as a plain column, not
+        // an expression; it then hits the single-column gate below.
+        if let Expr::Column { name: cn, .. } = &expr {
+            let ci = tbl
+                .columns
+                .iter()
+                .position(|(n, _)| n.eq_ignore_ascii_case(cn))
+                .ok_or_else(|| exec_err("42703", format!("column \"{}\" does not exist", cn)))?;
+            let attnum = (ci + 1) as u16;
+            if seen_cols.contains(&attnum) {
+                return Err(exec_err(
+                    "42701",
+                    "duplicate column name in statistics definition".to_string(),
+                ));
+            }
+            seen_cols.push(attnum);
+            resolved.push(ExtStatItem::Column(attnum));
+            continue;
+        }
         resolved.push(ExtStatItem::Expr(trimmed.to_string(), expr));
     }
-    // PG: at least 2 plain columns for a column-only object; a single
-    // expression is allowed (per-expression statistics).
-    if resolved.len() < 2 && resolved.iter().all(|i| matches!(i, ExtStatItem::Column(_))) {
-        // PG19: a single GENERATED column counts as an expression and
-        // is allowed (the virtual_gen_stats_single cases).
-        let generated_single = match &resolved[0] {
-            ExtStatItem::Column(a) => tbl
-                .gen_cols
-                .get((*a as usize).saturating_sub(1))
-                .is_some_and(|g| g.is_some()),
-            _ => false,
+    // v2.30: PG19 statscmds.c — with more than one item, every
+    // plain column (and every column referenced by an expression
+    // item) must belong to a type with a less-than operator;
+    // otherwise the type has no default btree operator class and
+    // multivariate statistics cannot be built on it (0A000).
+    if resolved.len() > 1 {
+        let type_name = |ty: &ColType| -> String {
+            // PG prints the type's pg_type name (format_type_be).
+            match ty {
+                ColType::Xid => "xid".to_string(),
+                other => format!("{:?}", other).to_lowercase(),
+            }
         };
-        if !generated_single {
-            return Err(exec_err(
-                "42601",
-                "statistics require at least 2 columns".to_string(),
-            ));
+        let check_col = |ci: usize| -> Result<(), ExecError> {
+            let (cname, ty) = &tbl.columns[ci];
+            if matches!(ty, ColType::Xid) {
+                return Err(crate::exec::exec_err_detail(
+                    "0A000",
+                    format!(
+                        "cannot create multivariate statistics on column \"{}\"",
+                        cname
+                    ),
+                    format!(
+                        "The type {} has no default btree operator class.",
+                        type_name(ty)
+                    ),
+                ));
+            }
+            Ok(())
+        };
+        for item in &resolved {
+            match item {
+                ExtStatItem::Column(a) => check_col((*a as usize) - 1)?,
+                ExtStatItem::Expr(_, e) => {
+                    let mut refs: Vec<(Option<String>, String)> = Vec::new();
+                    crate::sql::collect_col_refs(e, &mut refs);
+                    for (_, rn) in &refs {
+                        if let Some(ci) = tbl
+                            .columns
+                            .iter()
+                            .position(|(n, _)| n.eq_ignore_ascii_case(rn))
+                        {
+                            check_col(ci)?;
+                        }
+                    }
+                }
+            }
         }
     }
-    let kinds_final: Vec<char> = if kinds.is_empty() {
-        vec!['d', 'f', 'm']
+    // v2.30: PG19 statscmds.c gates, in PG's order. A single item is
+    // only legal when it is an expression (a virtual generated column
+    // counts as an expression; a stored generated column is a plain
+    // column). Gate 1: single non-virtual column -> 42P17. Gate 2:
+    // kinds specified for a univariate (single-expression) object
+    // -> 0A000.
+    let is_virtual_gen = |a: u16| {
+        tbl.gen_cols
+            .get((a as usize).saturating_sub(1))
+            .is_some_and(|g| matches!(g, Some((_, false))))
+    };
+    let single_is_expr = resolved.len() == 1
+        && match &resolved[0] {
+            ExtStatItem::Expr(_, _) => true,
+            ExtStatItem::Column(a) => is_virtual_gen(*a),
+        };
+    if resolved.len() < 2 && !single_is_expr {
+        return Err(exec_err(
+            "42P17",
+            "cannot create extended statistics on a single non-virtual column".to_string(),
+        ));
+    }
+    if resolved.len() == 1 && single_is_expr && !kinds.is_empty() {
+        return Err(exec_err(
+            "0A000",
+            "cannot specify statistics kinds when building univariate statistics".to_string(),
+        ));
+    }
+    let mut kinds_final: Vec<char> = if kinds.is_empty() {
+        if resolved.len() >= 2 {
+            vec!['d', 'f', 'm']
+        } else {
+            // Single expression: expression statistics only (stxkind {e}).
+            Vec::new()
+        }
     } else {
         let mut k = kinds.to_vec();
         k.sort_unstable();
         k.dedup();
         k
     };
+    // v2.30: PG19 appends kind 'e' (STATS_EXT_EXPRESSIONS) whenever the
+    // object has expression items (a virtual generated column counts),
+    // always in d, f, m, e order. Stored in `kinds` so stxkind renders
+    // verbatim.
+    let has_expr_item = resolved.iter().any(|i| match i {
+        ExtStatItem::Expr(_, _) => true,
+        ExtStatItem::Column(a) => is_virtual_gen(*a),
+    });
+    if has_expr_item {
+        kinds_final.push('e');
+    }
     let oid = eng.db.alloc_oid();
     eng.db.ext_stats.push(ExtStatObj {
         oid,
@@ -279,6 +390,7 @@ pub(crate) fn exec_create_statistics(
         kinds: kinds_final,
         stattarget: None,
         data: ExtStatData::default(),
+        data_inh: None,
     });
     Ok(ExecResult::Command {
         tag: "CREATE STATISTICS".to_string(),
@@ -295,6 +407,23 @@ pub(crate) fn exec_drop_statistics(
     // RESTRICT is the default and also succeeds for a bare object).
     _cascade: bool,
 ) -> Result<ExecResult, ExecError> {
+    // v2.30: PG19 ownership check (aclchk OBJECT_STATISTIC_EXT):
+    // dropping requires owning the object. All names are checked
+    // before any is dropped (statement atomicity; the registry is
+    // mutated directly, not through WriteOps).
+    for (schema, name) in names {
+        if let Some(pos) = resolve_obj(&eng.db, schema, name) {
+            let o = &eng.db.ext_stats[pos];
+            let owns = o.owner == ctx.role
+                || crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own);
+            if !owns {
+                return Err(exec_err(
+                    "42501",
+                    format!("must be owner of statistics object {}", name),
+                ));
+            }
+        }
+    }
     for (schema, name) in names {
         match resolve_obj(&eng.db, schema, name) {
             Some(pos) => {
@@ -427,13 +556,19 @@ pub(crate) fn exec_alter_statistics(
 
 /// Drop statistics objects bound to a table (DROP TABLE hook).
 pub(crate) fn drop_stats_for_table(db: &mut Database, table: &str) {
-    let base = base_name(table).to_string();
-    db.ext_stats.retain(|o| base_name(&o.table) != base);
+    let base = stats_base_name(table).to_string();
+    db.ext_stats.retain(|o| stats_base_name(&o.table) != base);
 }
 
 // ======================================================================
 // ANALYZE build
 // ======================================================================
+
+/// v2.30: the planner-facing attnum of every item of `obj`, in item
+/// order (columns: their stored attnum; expressions: -1, -2, ...).
+pub(crate) fn item_attnums(obj: &ExtStatObj) -> Vec<i32> {
+    (0..obj.items.len()).map(|i| attnum_of(obj, i)).collect()
+}
 
 fn attnum_of(obj: &ExtStatObj, item_idx: usize) -> i32 {
     match &obj.items[item_idx] {
@@ -491,7 +626,7 @@ pub(crate) fn build_ext_stats_for_table(
         .ext_stats
         .iter()
         .enumerate()
-        .filter(|(_, o)| base_name(&o.table) == base_name(table))
+        .filter(|(_, o)| stats_base_name(&o.table) == stats_base_name(table))
         .map(|(i, _)| i)
         .collect();
     if indices.is_empty() {
@@ -518,69 +653,222 @@ pub(crate) fn build_ext_stats_for_table(
             src_ord: i as u32,
         })
         .collect();
-    let mut built: Vec<(usize, ExtStatData)> = Vec::new();
+    let mut built: Vec<(usize, ExtStatData, Option<ExtStatData>)> = Vec::new();
+    // v2.30: the inheritance/partition family of `table` (itself
+    // first), for the inherited (stxdinherit) build. PG computes the
+    // inherited payload from the union of the family's rows when
+    // ANALYZE runs on a table with descendants.
+    let family = family_tables(&eng.db, table, snap, own, session);
     for pos in indices {
         let obj = eng.db.ext_stats[pos].clone();
-        // Evaluate item values for every row.
-        let mut lock_ids: Vec<(String, u64)> = Vec::new();
-        let mut q = Q {
-            eng,
-            snap,
-            own,
-            all_xids: vec![own],
-            session,
-            role: "postgres",
-            read_only: true,
-            depth: 0,
-            lock_ids: &mut lock_ids,
-            ctes: Vec::new(),
-            wctx: None,
-            srf_vals: Vec::new(),
-            priv_scopes: Vec::new(),
-            priv_role_override: None,
-            hashed_exists: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
-            immutable_fn_cache: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
-            plan_fold_memo: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
-            hashed_in: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
-            pending_updates: None,
-            write: None,
-        };
-        let mut item_vals: Vec<Vec<Value>> = vec![Vec::new(); obj.items.len()];
-        let mut ok = true;
-        for r in &vis {
-            let frame = Scope {
-                schema: &schema,
-                row: &r.values,
-                prov: None,
-            };
-            for (ii, item) in obj.items.iter().enumerate() {
-                let v = match item {
-                    ExtStatItem::Column(a) => r
-                        .values
-                        .get((*a as usize).saturating_sub(1))
-                        .cloned()
-                        .unwrap_or(Value::Null),
-                    ExtStatItem::Expr(_, e) => {
-                        match eval_expr(&mut q, std::slice::from_ref(&frame), e) {
-                            Ok(v) => v,
-                            Err(_) => {
-                                ok = false;
-                                Value::Null
-                            }
-                        }
-                    }
-                };
-                item_vals[ii].push(v);
-            }
-        }
-        drop(q);
-        if !ok || vis.is_empty() {
+        // v2.30: PG19 build skips (extended_stats.c
+        // BuildRelationExtStatistics): an object-level statistics
+        // target of 0 leaves existing values untouched; a column at
+        // SET STATISTICS 0 makes the object uncomputable
+        // (lookup_var_attr_stats returns NULL -> no store at all).
+        if obj.stattarget == Some(0) {
             continue;
         }
-        let mut data = ExtStatData {
-            built: true,
-            ..Default::default()
+        let col_target_zero = obj.items.iter().any(|it| match it {
+            ExtStatItem::Column(a) => tbl.col_stattarget_at((*a as usize).saturating_sub(1)) == 0,
+            ExtStatItem::Expr(_, _) => false,
+        });
+        if col_target_zero {
+            continue;
+        }
+        // v2.30: a partitioned parent has no rows of its own; PG
+        // still builds the inherited payload for its objects, so
+        // only the own-data build is skipped when `vis` is empty.
+        let own_data = if vis.is_empty() {
+            None
+        } else {
+            let Some(item_vals) = eval_items(eng, snap, own, session, &obj, &schema, &vis) else {
+                continue;
+            };
+            Some(compute_ext_data(&obj, &item_vals, total))
         };
+        // Inherited build over the family union (only when the table
+        // actually has descendants).
+        let inh = if family.len() > 1 {
+            let mut fam_vals: Vec<Vec<Value>> = vec![Vec::new(); obj.items.len()];
+            let mut fam_total = 0usize;
+            let mut fam_ok = true;
+            for ft_name in &family {
+                let Some(ft) = eng.db.find_table(ft_name, snap, &[own], session).cloned() else {
+                    continue;
+                };
+                let fvis: Vec<&RowVersion> = ft
+                    .rows
+                    .iter()
+                    .filter(|r| row_visible(r, snap, &[own]))
+                    .collect();
+                // Map this family member's columns onto the object's
+                // items by column NAME (children may append columns).
+                let fschema: Vec<QCol> = ft
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (cn, ty))| QCol {
+                        qual: String::new(),
+                        name: cn.clone(),
+                        ty: ty.clone(),
+                        hidden: false,
+                        src_ord: i as u32,
+                    })
+                    .collect();
+                let Some(vals) = eval_items(eng, snap, own, session, &obj, &fschema, &fvis) else {
+                    fam_ok = false;
+                    break;
+                };
+                fam_total += fvis.len();
+                for (ii, col) in vals.into_iter().enumerate() {
+                    fam_vals[ii].extend(col);
+                }
+            }
+            if fam_ok && fam_total > 0 {
+                Some(compute_ext_data(&obj, &fam_vals, fam_total as f64))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        // With no own rows there is no own-data payload to store;
+        // keep whatever was there (PG leaves the non-inherited row
+        // absent for partitioned tables) and record only the
+        // inherited build below.
+        if let Some(data) = own_data {
+            built.push((pos, data, inh));
+        } else if inh.is_some() {
+            if let Some(slot) = eng.db.ext_stats.get_mut(pos) {
+                slot.data_inh = inh;
+            }
+        }
+    }
+    for (pos, data, inh) in built {
+        if let Some(slot) = eng.db.ext_stats.get_mut(pos) {
+            slot.data = data;
+            if inh.is_some() {
+                slot.data_inh = inh;
+            }
+        }
+    }
+}
+
+/// v2.30: all tables in `table`'s family: itself plus transitive
+/// inheritance descendants and partition descendants (by name).
+pub(crate) fn family_tables(
+    db: &Database,
+    table: &str,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> Vec<String> {
+    let mut out: Vec<String> = vec![table.to_string()];
+    let mut frontier: Vec<String> = vec![table.to_string()];
+    while let Some(cur) = frontier.pop() {
+        // Inheritance children: tables whose inherits list names cur.
+        for (k, vs) in db.tables.iter() {
+            let is_child = vs.last().is_some_and(|t| {
+                t.inherits
+                    .iter()
+                    .any(|p| stats_base_name(p) == stats_base_name(&cur))
+            });
+            if is_child && !out.contains(k) {
+                out.push(k.clone());
+                frontier.push(k.clone());
+            }
+        }
+        // Partition children of cur.
+        if let Some(t) = db.find_table(&cur, snap, &[own], session) {
+            if let Some(p) = &t.partition {
+                for c in &p.children {
+                    if !out.iter().any(|x| stats_base_name(x) == stats_base_name(c)) {
+                        out.push(c.clone());
+                        frontier.push(c.clone());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// v2.30: evaluate every item of `obj` over `rows` of table `tbl`
+/// (whose QCol schema is `schema`). None on any expression error.
+fn eval_items(
+    eng: &mut Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    obj: &ExtStatObj,
+    schema: &[QCol],
+    rows: &[&RowVersion],
+) -> Option<Vec<Vec<Value>>> {
+    let mut lock_ids: Vec<(String, u64)> = Vec::new();
+    let mut q = Q {
+        eng,
+        snap,
+        own,
+        all_xids: vec![own],
+        session,
+        role: "postgres",
+        read_only: true,
+        depth: 0,
+        lock_ids: &mut lock_ids,
+        ctes: Vec::new(),
+        wctx: None,
+        srf_vals: Vec::new(),
+        priv_scopes: Vec::new(),
+        priv_role_override: None,
+        hashed_exists: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
+        immutable_fn_cache: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
+        plan_fold_memo: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
+        hashed_in: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        pending_updates: None,
+        write: None,
+    };
+    let mut item_vals: Vec<Vec<Value>> = vec![Vec::new(); obj.items.len()];
+    let mut ok = true;
+    for r in rows {
+        let frame = Scope {
+            schema,
+            row: &r.values,
+            prov: None,
+        };
+        for (ii, item) in obj.items.iter().enumerate() {
+            let v = match item {
+                ExtStatItem::Column(a) => r
+                    .values
+                    .get((*a as usize).saturating_sub(1))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                ExtStatItem::Expr(_, e) => match eval_expr(&mut q, std::slice::from_ref(&frame), e)
+                {
+                    Ok(v) => v,
+                    Err(_) => {
+                        ok = false;
+                        Value::Null
+                    }
+                },
+            };
+            item_vals[ii].push(v);
+        }
+    }
+    drop(q);
+    if ok { Some(item_vals) } else { None }
+}
+
+/// v2.30: compute one ExtStatData payload from evaluated item values
+/// (PG19 statext_*_build ports; full-census sample, so PG's sampling
+/// estimators reduce to exact counts).
+fn compute_ext_data(obj: &ExtStatObj, item_vals: &[Vec<Value>], total: f64) -> ExtStatData {
+    let nrows = item_vals.first().map(|v| v.len()).unwrap_or(0);
+    let mut data = ExtStatData {
+        built: true,
+        ..Default::default()
+    };
+    {
         let n = obj.items.len();
         let key_of = |vals: &[Value]| -> Vec<u8> {
             let mut k = Vec::new();
@@ -590,79 +878,133 @@ pub(crate) fn build_ext_stats_for_table(
             }
             k
         };
-        // ndistinct: every non-empty subset.
+        // Combinations of item indices of size k, lexicographic
+        // (PG's CombinationGenerator order).
+        fn combinations(n: usize, k: usize) -> Vec<Vec<usize>> {
+            let mut out: Vec<Vec<usize>> = Vec::new();
+            if k == 0 || k > n {
+                return out;
+            }
+            let mut idx: Vec<usize> = (0..k).collect();
+            loop {
+                out.push(idx.clone());
+                let mut i = k;
+                loop {
+                    if i == 0 {
+                        return out;
+                    }
+                    i -= 1;
+                    if idx[i] < n - k + i {
+                        idx[i] += 1;
+                        for j in (i + 1)..k {
+                            idx[j] = idx[j - 1] + 1;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        // ndistinct (mvdistinct.c): items for every subset of size
+        // >= 2; the value is the distinct-combination count (PG's
+        // estimate_ndistinct with a full-table sample is exact).
+        // Text form is pg_ndistinct_out's JSON array.
         if obj.kinds.contains(&'d') {
             let mut parts: Vec<String> = Vec::new();
-            for mask in 1usize..(1 << n) {
-                let idxs: Vec<usize> = (0..n).filter(|i| mask & (1 << i) != 0).collect();
-                let mut set: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-                for ri in 0..vis.len() {
-                    let vals: Vec<Value> = idxs.iter().map(|&i| item_vals[i][ri].clone()).collect();
-                    set.insert(key_of(&vals));
+            for k in 2..=n {
+                for combo in combinations(n, k) {
+                    let mut set: std::collections::HashSet<Vec<u8>> =
+                        std::collections::HashSet::new();
+                    for ri in 0..nrows {
+                        let vals: Vec<Value> =
+                            combo.iter().map(|&i| item_vals[i][ri].clone()).collect();
+                        set.insert(key_of(&vals));
+                    }
+                    let atts: Vec<i32> = combo.iter().map(|&i| attnum_of(obj, i)).collect();
+                    let att_txt: Vec<String> = atts.iter().map(|a| a.to_string()).collect();
+                    parts.push(format!(
+                        "{{\"attributes\": [{}], \"ndistinct\": {}}}",
+                        att_txt.join(", "),
+                        set.len()
+                    ));
+                    data.ndistinct_items.push((atts, set.len() as f64));
                 }
-                let atts: Vec<String> = idxs
-                    .iter()
-                    .map(|&i| attnum_of(&obj, i).to_string())
-                    .collect();
-                parts.push(format!("\"{}\": {}", atts.join(", "), set.len()));
             }
-            data.ndistinct = Some(format!("{{{}}}", parts.join(", ")));
+            data.ndistinct = Some(format!("[{}]", parts.join(", ")));
         }
-        // dependencies: ordered (subset -> item) with degree 1.0 kept
-        // plus partial degrees >= 0.5 rendered like PG (degree field).
+        // dependencies (dependencies.c): for each candidate
+        // (antecedent set, implied item), the degree is the fraction
+        // of rows in FULLY consistent antecedent groups (a group
+        // whose implied values are not all equal contributes 0).
+        // Stored iff degree > 0.
         if obj.kinds.contains(&'f') && n >= 2 {
             let mut deps: Vec<String> = Vec::new();
-            for mask in 1usize..(1 << n) {
-                let subset: Vec<usize> = (0..n).filter(|i| mask & (1 << i) != 0).collect();
-                if subset.len() >= n {
-                    continue;
-                }
-                for dep in 0..n {
-                    if subset.contains(&dep) {
-                        continue;
-                    }
-                    // group by subset values; degree = sum of max
-                    // per-group frequency of dep / total.
-                    let mut groups: HashMap<Vec<u8>, HashMap<Vec<u8>, u64>> = HashMap::default();
-                    for ri in 0..vis.len() {
-                        let gk = key_of(
-                            &subset
-                                .iter()
-                                .map(|&i| item_vals[i][ri].clone())
-                                .collect::<Vec<_>>(),
-                        );
-                        let dk = key_of(&[item_vals[dep][ri].clone()]);
-                        *groups.entry(gk).or_default().entry(dk).or_insert(0) += 1;
-                    }
-                    let consistent: u64 = groups
-                        .values()
-                        .map(|m| m.values().max().copied().unwrap_or(0))
-                        .sum();
-                    let degree = if total > 0.0 {
-                        consistent as f64 / total
-                    } else {
-                        0.0
-                    };
-                    if degree >= 0.999999 {
-                        let atts: Vec<String> = subset
-                            .iter()
-                            .map(|&i| attnum_of(&obj, i).to_string())
-                            .collect();
-                        deps.push(format!(
-                            "{{\"attributes\": [{}], \"dependency\": {}, \"degree\": {:.6}}}",
-                            atts.join(", "),
-                            attnum_of(&obj, dep),
-                            degree
-                        ));
+            // PG19 DependencyGenerator order: for each size k, the
+            // antecedent is an ascending (k-1)-combination in
+            // lexicographic order, and the implied item runs over
+            // all remaining items in index order.
+            for k in 2..=n {
+                for subset in combinations(n, k - 1) {
+                    for dep in 0..n {
+                        if subset.contains(&dep) {
+                            continue;
+                        }
+                        let mut groups: HashMap<Vec<u8>, (Vec<u8>, bool, u64)> = HashMap::default();
+                        for ri in 0..nrows {
+                            let gk = key_of(
+                                &subset
+                                    .iter()
+                                    .map(|&i| item_vals[i][ri].clone())
+                                    .collect::<Vec<_>>(),
+                            );
+                            let dk = key_of(&[item_vals[dep][ri].clone()]);
+                            let e = groups.entry(gk).or_insert_with(|| (dk.clone(), true, 0));
+                            if e.0 != dk {
+                                e.1 = false;
+                            }
+                            e.2 += 1;
+                        }
+                        let supporting: u64 = groups
+                            .values()
+                            .filter(|(_, consistent, _)| *consistent)
+                            .map(|(_, _, c)| *c)
+                            .sum();
+                        let degree = if total > 0.0 {
+                            supporting as f64 / total
+                        } else {
+                            0.0
+                        };
+                        if degree > 0.0 {
+                            let atts: Vec<i32> =
+                                subset.iter().map(|&i| attnum_of(obj, i)).collect();
+                            let att_txt: Vec<String> = atts.iter().map(|a| a.to_string()).collect();
+                            deps.push(format!(
+                                "{{\"attributes\": [{}], \"dependency\": {}, \"degree\": {:.6}}}",
+                                att_txt.join(", "),
+                                attnum_of(obj, dep),
+                                degree
+                            ));
+                            data.deps_items.push((atts, attnum_of(obj, dep), degree));
+                        }
                     }
                 }
             }
             data.dependencies = Some(format!("[{}]", deps.join(", ")));
         }
-        // MCV over all items.
+        // MCV over all items (mcv.c): frequency = count/totalrows;
+        // base_frequency = product over dimensions of that
+        // dimension's own frequency for the item's value (NULL
+        // dimensions use the NULL fraction).
         if obj.kinds.contains(&'m') {
+            // Per-dimension value frequencies.
+            let mut dim_counts: Vec<HashMap<Vec<u8>, u64>> = vec![HashMap::default(); n];
+            for d in 0..n {
+                for ri in 0..nrows {
+                    let k = key_of(&[item_vals[d][ri].clone()]);
+                    *dim_counts[d].entry(k).or_insert(0) += 1;
+                }
+            }
             let mut counts: HashMap<Vec<u8>, (Vec<Option<Value>>, u64)> = HashMap::default();
-            for ri in 0..vis.len() {
+            for ri in 0..nrows {
                 let vals: Vec<Value> = (0..n).map(|i| item_vals[i][ri].clone()).collect();
                 let k = key_of(&vals);
                 let e = counts.entry(k).or_insert_with(|| {
@@ -681,8 +1023,6 @@ pub(crate) fn build_ext_stats_for_table(
                 });
                 e.1 += 1;
             }
-            let distinct = counts.len() as f64;
-            let base = if distinct > 0.0 { 1.0 / distinct } else { 0.0 };
             let mut items: Vec<(Vec<Option<Value>>, u64)> =
                 counts.values().map(|(v, c)| (v.clone(), *c)).collect();
             // v2.19 adjudication: frequency ties must be
@@ -710,6 +1050,16 @@ pub(crate) fn build_ext_stats_for_table(
                 .take(100)
                 .map(|(v, c)| {
                     let f = if total > 0.0 { c as f64 / total } else { 0.0 };
+                    let mut base = 1.0f64;
+                    for d in 0..n {
+                        let dv = match &v[d] {
+                            Some(x) => x.clone(),
+                            None => Value::Null,
+                        };
+                        let dk = key_of(&[dv]);
+                        let dc = dim_counts[d].get(&dk).copied().unwrap_or(0);
+                        base *= if total > 0.0 { dc as f64 / total } else { 0.0 };
+                    }
                     (v, f, base)
                 })
                 .collect();
@@ -745,8 +1095,11 @@ pub(crate) fn build_ext_stats_for_table(
                     },
                     avg_width: 4,
                     n_distinct: counts.len() as f64,
+                    // v2.30: expression MCVs keep values seen at
+                    // least twice (see scope.md archaeology note).
                     mcv: by_freq
                         .iter()
+                        .filter(|(_, c)| *c >= 2)
                         .take(100)
                         .map(|(v, c)| {
                             (v.clone(), if total > 0.0 { *c as f64 / total } else { 0.0 })
@@ -755,13 +1108,8 @@ pub(crate) fn build_ext_stats_for_table(
                 });
             }
         }
-        built.push((pos, data));
     }
-    for (pos, data) in built {
-        if let Some(slot) = eng.db.ext_stats.get_mut(pos) {
-            slot.data = data;
-        }
-    }
+    data
 }
 
 // ======================================================================
@@ -867,7 +1215,9 @@ pub(crate) fn pg_statistic_ext_scan(
             Value::Int(relid),
             Value::text(o.name.as_str()),
             Value::Int(if o.schema == "public" { 2200 } else { 0 }),
-            Value::Int(10),
+            // v2.30: the owner's real role OID (was hardcoded 10, so
+            // stxowner::regrole rendered "postgres" for every owner).
+            Value::Int(crate::exec::role_oid(&o.owner) as i64),
             match o.stattarget {
                 Some(t) => Value::Int(t as i64),
                 None => Value::Null,
@@ -878,6 +1228,308 @@ pub(crate) fn pg_statistic_ext_scan(
         ]));
     }
     (schema, rows)
+}
+
+/// v2.30: stxdmcv payload. PG stores an opaque pg_mcv_list bytea
+/// whose text form is `\x<hex>`; the only expansion path is
+/// pg_mcv_list_items(). We serialize the items as JSON inside the
+/// hex so the SRF can decode exactly what ANALYZE built:
+/// {"items":[{"values":["1",null],"nulls":[false,true],
+/// "frequency":0.5,"base_frequency":0.25}, ...]}
+pub(crate) fn mcv_serialize(data: &ExtStatData) -> Option<String> {
+    if data.mcv.is_empty() {
+        return None;
+    }
+    fn esc(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out
+    }
+    let mut items = Vec::new();
+    for (vals, freq, base) in &data.mcv {
+        let vs: Vec<String> = vals
+            .iter()
+            .map(|v| match v {
+                Some(x) => format!("\"{}\"", esc(&value_to_text_cast(x))),
+                None => "null".to_string(),
+            })
+            .collect();
+        let ns: Vec<String> = vals
+            .iter()
+            .map(|v| if v.is_none() { "true" } else { "false" }.to_string())
+            .collect();
+        items.push(format!(
+            "{{\"values\":[{}],\"nulls\":[{}],\"frequency\":{},\"base_frequency\":{}}}",
+            vs.join(","),
+            ns.join(","),
+            fmt_float_full(*freq),
+            fmt_float_full(*base)
+        ));
+    }
+    let json = format!("{{\"items\":[{}]}}", items.join(","));
+    let hex: String = json.bytes().map(|b| format!("{:02x}", b)).collect();
+    Some(format!("\\x{}", hex))
+}
+
+fn fmt_float_full(x: f64) -> String {
+    if x == x.trunc() && x.abs() < 1e15 {
+        format!("{:.1}", x)
+    } else {
+        format!("{}", x)
+    }
+}
+
+/// Minimal JSON value for the mcv payload round-trip.
+enum Json {
+    Null,
+    Bool(bool),
+    Num(f64),
+    Str(String),
+    Arr(Vec<Json>),
+    Obj(Vec<(String, Json)>),
+}
+
+fn parse_json(s: &str) -> Option<Json> {
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    fn ws(b: &[u8], i: &mut usize) {
+        while *i < b.len() && (b[*i] as char).is_whitespace() {
+            *i += 1;
+        }
+    }
+    fn val(b: &[u8], i: &mut usize) -> Option<Json> {
+        ws(b, i);
+        match *b.get(*i)? {
+            b'{' => {
+                *i += 1;
+                let mut kv = Vec::new();
+                ws(b, i);
+                if b.get(*i) == Some(&b'}') {
+                    *i += 1;
+                    return Some(Json::Obj(kv));
+                }
+                loop {
+                    let k = match val(b, i)? {
+                        Json::Str(s) => s,
+                        _ => return None,
+                    };
+                    ws(b, i);
+                    if b.get(*i) != Some(&b':') {
+                        return None;
+                    }
+                    *i += 1;
+                    let v = val(b, i)?;
+                    kv.push((k, v));
+                    ws(b, i);
+                    match b.get(*i) {
+                        Some(b',') => *i += 1,
+                        Some(b'}') => {
+                            *i += 1;
+                            return Some(Json::Obj(kv));
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            b'[' => {
+                *i += 1;
+                let mut vs = Vec::new();
+                ws(b, i);
+                if b.get(*i) == Some(&b']') {
+                    *i += 1;
+                    return Some(Json::Arr(vs));
+                }
+                loop {
+                    vs.push(val(b, i)?);
+                    ws(b, i);
+                    match b.get(*i) {
+                        Some(b',') => *i += 1,
+                        Some(b']') => {
+                            *i += 1;
+                            return Some(Json::Arr(vs));
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            b'"' => {
+                *i += 1;
+                let mut out = String::new();
+                loop {
+                    let c = *b.get(*i)?;
+                    *i += 1;
+                    match c {
+                        b'"' => return Some(Json::Str(out)),
+                        b'\\' => {
+                            let e = *b.get(*i)?;
+                            *i += 1;
+                            match e {
+                                b'"' => out.push('"'),
+                                b'\\' => out.push('\\'),
+                                b'/' => out.push('/'),
+                                b'n' => out.push('\n'),
+                                b't' => out.push('\t'),
+                                b'r' => out.push('\r'),
+                                b'u' => {
+                                    let h = std::str::from_utf8(b.get(*i..*i + 4)?).ok()?;
+                                    let cp = u32::from_str_radix(h, 16).ok()?;
+                                    *i += 4;
+                                    out.push(char::from_u32(cp).unwrap_or('\u{fffd}'));
+                                }
+                                _ => return None,
+                            }
+                        }
+                        _ => {
+                            let start = *i - 1;
+                            let len = if c < 0x80 {
+                                1
+                            } else if c >= 0xf0 {
+                                4
+                            } else if c >= 0xe0 {
+                                3
+                            } else {
+                                2
+                            };
+                            let end = start + len;
+                            out.push_str(std::str::from_utf8(b.get(start..end)?).ok()?);
+                            *i = end;
+                        }
+                    }
+                }
+            }
+            b't' => {
+                if b[*i..].starts_with(b"true") {
+                    *i += 4;
+                    Some(Json::Bool(true))
+                } else {
+                    None
+                }
+            }
+            b'f' => {
+                if b[*i..].starts_with(b"false") {
+                    *i += 5;
+                    Some(Json::Bool(false))
+                } else {
+                    None
+                }
+            }
+            b'n' => {
+                if b[*i..].starts_with(b"null") {
+                    *i += 4;
+                    Some(Json::Null)
+                } else {
+                    None
+                }
+            }
+            _ => {
+                let start = *i;
+                while *i < b.len()
+                    && matches!(b[*i], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+                {
+                    *i += 1;
+                }
+                std::str::from_utf8(b.get(start..*i)?)
+                    .ok()?
+                    .parse::<f64>()
+                    .ok()
+                    .map(Json::Num)
+            }
+        }
+    }
+    let v = val(b, &mut i)?;
+    ws(b, &mut i);
+    if i == b.len() { Some(v) } else { None }
+}
+
+/// v2.30: pg_mcv_list_items(stxdmcv) expansion — rows of
+/// (index int4, values text[], nulls bool[], frequency float8,
+/// base_frequency float8), 1-based index like PG.
+pub(crate) fn mcv_list_items_rows(text: &str) -> Vec<Vec<Value>> {
+    let Some(hex) = text.strip_prefix("\\x") else {
+        return Vec::new();
+    };
+    let mut bytes: Vec<u8> = Vec::new();
+    let hb = hex.as_bytes();
+    let mut j = 0usize;
+    while j + 2 <= hb.len() {
+        let Ok(byte) = u8::from_str_radix(std::str::from_utf8(&hb[j..j + 2]).unwrap_or(""), 16)
+        else {
+            return Vec::new();
+        };
+        bytes.push(byte);
+        j += 2;
+    }
+    let Ok(json) = String::from_utf8(bytes) else {
+        return Vec::new();
+    };
+    let Some(Json::Obj(top)) = parse_json(&json) else {
+        return Vec::new();
+    };
+    let Some(Json::Arr(items)) = top.into_iter().find(|(k, _)| k == "items").map(|(_, v)| v) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for (idx, item) in items.into_iter().enumerate() {
+        let Json::Obj(fields) = item else {
+            continue;
+        };
+        let get = |name: &str| fields.iter().find(|(k, _)| k == name).map(|(_, v)| v);
+        let values = match get("values") {
+            Some(Json::Arr(vs)) => {
+                let elems: Vec<Value> = vs
+                    .iter()
+                    .map(|v| match v {
+                        Json::Str(s) => Value::text(s.as_str()),
+                        _ => Value::Null,
+                    })
+                    .collect();
+                let n = elems.len() as i32;
+                Value::Array(Box::new(crate::storage::ArrayVal {
+                    elem: crate::storage::ArrayElem::Text,
+                    dims: vec![n],
+                    lower: vec![1],
+                    elems,
+                }))
+            }
+            _ => Value::Null,
+        };
+        let nulls = match get("nulls") {
+            Some(Json::Arr(ns)) => {
+                let elems: Vec<Value> = ns
+                    .iter()
+                    .map(|v| match v {
+                        Json::Bool(b) => Value::Bool(*b),
+                        _ => Value::Null,
+                    })
+                    .collect();
+                let n = elems.len() as i32;
+                Value::Array(Box::new(crate::storage::ArrayVal {
+                    elem: crate::storage::ArrayElem::Bool,
+                    dims: vec![n],
+                    lower: vec![1],
+                    elems,
+                }))
+            }
+            _ => Value::Null,
+        };
+        let freq = match get("frequency") {
+            Some(Json::Num(f)) => Value::Float(*f),
+            _ => Value::Null,
+        };
+        let base = match get("base_frequency") {
+            Some(Json::Num(f)) => Value::Float(*f),
+            _ => Value::Null,
+        };
+        rows.push(vec![Value::Int(idx as i64), values, nulls, freq, base]);
+    }
+    rows
 }
 
 pub(crate) fn pg_statistic_ext_data_schema() -> Vec<QCol> {
@@ -895,22 +1547,47 @@ pub(crate) fn pg_statistic_ext_data_scan(db: &Database) -> (Vec<QCol>, Vec<QRow>
     let schema = pg_statistic_ext_data_schema();
     let mut rows = Vec::new();
     for o in &db.ext_stats {
-        if !o.data.built {
-            continue;
+        if o.data.built {
+            rows.push(row(vec![
+                Value::Int(o.oid as i64),
+                Value::Bool(false),
+                match &o.data.ndistinct {
+                    Some(s) => Value::text(s.as_str()),
+                    None => Value::Null,
+                },
+                match &o.data.dependencies {
+                    Some(s) => Value::text(s.as_str()),
+                    None => Value::Null,
+                },
+                // v2.30: stxdmcv renders as the \x-hex pg_mcv_list
+                // payload once an MCV build exists (was always NULL).
+                match mcv_serialize(&o.data) {
+                    Some(s) => Value::text(s),
+                    None => Value::Null,
+                },
+            ]));
         }
-        rows.push(row(vec![
-            Value::Int(o.oid as i64),
-            Value::Bool(false),
-            match &o.data.ndistinct {
-                Some(s) => Value::text(s.as_str()),
-                None => Value::Null,
-            },
-            match &o.data.dependencies {
-                Some(s) => Value::text(s.as_str()),
-                None => Value::Null,
-            },
-            Value::Null,
-        ]));
+        // v2.30: the inherited (family) build row.
+        if let Some(inh) = &o.data_inh {
+            if inh.built {
+                rows.push(row(vec![
+                    Value::Int(o.oid as i64),
+                    Value::Bool(true),
+                    match &inh.ndistinct {
+                        Some(s) => Value::text(s.as_str()),
+                        None => Value::Null,
+                    },
+                    match &inh.dependencies {
+                        Some(s) => Value::text(s.as_str()),
+                        None => Value::Null,
+                    },
+                    match mcv_serialize(inh) {
+                        Some(s) => Value::text(s),
+                        None => Value::Null,
+                    },
+                ]));
+            }
+        }
     }
     (schema, rows)
 }
@@ -1025,7 +1702,7 @@ pub(crate) fn pg_stats_ext_scan(
         };
         rows.push(row(vec![
             Value::text(table_schema_for(db, o).as_str()),
-            Value::text(base_name(&o.table)),
+            Value::text(stats_base_name(&o.table)),
             Value::Int(relid),
             Value::text(o.schema.as_str()),
             Value::text(o.name.as_str()),
@@ -1145,7 +1822,7 @@ pub(crate) fn pg_stats_ext_exprs_scan(
             };
             rows.push(row(vec![
                 Value::text(table_schema_for(db, o).as_str()),
-                Value::text(base_name(&o.table)),
+                Value::text(stats_base_name(&o.table)),
                 Value::Int(relid),
                 Value::text(o.schema.as_str()),
                 Value::text(o.name.as_str()),
@@ -1172,9 +1849,12 @@ pub(crate) fn pg_stats_ext_exprs_scan(
 pub(crate) fn statisticsobjdef(db: &Database, oid: i64) -> Option<String> {
     let o = db.ext_stats.iter().find(|o| o.oid as i64 == oid)?;
     let mut def = format!("CREATE STATISTICS {}.{}", o.schema, o.name);
-    if o.kinds.len() < 3 {
-        let names: Vec<String> = o
-            .kinds
+    // v2.30: ruleutils prints the kinds clause only when the
+    // multivariate set differs from the default {d, f, m} (the 'e'
+    // expression kind is never spelled in the clause).
+    let mv: Vec<char> = o.kinds.iter().copied().filter(|k| *k != 'e').collect();
+    if !mv.is_empty() && mv != ['d', 'f', 'm'] {
+        let names: Vec<String> = mv
             .iter()
             .map(|k| match k {
                 'd' => "ndistinct".to_string(),
@@ -1188,7 +1868,7 @@ pub(crate) fn statisticsobjdef(db: &Database, oid: i64) -> Option<String> {
     def.push_str(&format!(
         " ON {} FROM {}",
         items.join(", "),
-        base_name(&o.table)
+        stats_base_name(&o.table)
     ));
     Some(def)
 }
