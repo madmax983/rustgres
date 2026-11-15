@@ -2,6 +2,114 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `has_family`'s allocations aren't the cost; the O(table count) `db.tables` scan is — negative result + finding — 2026-11-15
+
+Follow-up to the baseline entry immediately below this one. Two things
+to record: a negative result (the allocation-removal fix I actually
+tried, measured and reverted) and a finding (what a real fix would
+require, and why it's a human decision, not a same-round PR).
+
+### Hypothesis tried, and why it failed
+
+Hypothesis: `has_family` (`src/exec/mvest.rs:71`) only needs a
+boolean, but calls `family_tables(..).len() > 1`, which allocates two
+`Vec<String>` (cloning `table` into both via `.to_string()`) and
+recurses through a `frontier`/`out` worklist — all to throw the
+result away except for its length. A single-level, non-allocating
+check (`table` has a family iff it has at least one DIRECT
+inheritance or partition child — any deeper descendant is only
+reachable through one, so one level answers the same question)
+should remove that allocation and recursion overhead.
+
+Tried two implementations, both measured against the baseline
+harness/numbers below (`--tables 300 --count 1500 --rows 2000`,
+callgrind `--collect-jumps=yes --cache-sim=yes`, 3 runs each; dhat 1
+run each):
+
+1. **`db.tables.iter().any(|(k, vs)| ..)`** (idiomatic combinator,
+   inherits-check first, `k != table` guard short-circuited second so
+   it's free in the common case). This was **slower**: total Ir
+   3,536,079,113 avg (3 runs, agree within 0.02%) vs. the baseline's
+   3,442,347,030 avg — **+2.70% worse**, with
+   `has_family` itself *rising* to 343,558,888 avg (9.72% of total, up
+   from the baseline's 7.26%). Cause, confirmed via
+   `callgrind_annotate`: in this project's debug-build profiling
+   convention (every harness here profiles `cargo build`, not
+   `--release` — see `benches/profile.sh`), the generic
+   `Iterator::any` adapter over a `HashMap`'s `Iter` is not inlined
+   down to the same code a hand-rolled loop is; the single line
+   `db.tables.iter().any(|(k, vs)| ..)` alone cost ~289M Ir across the
+   1500-iteration run (~193k Ir per call), versus the handwritten
+   `for` loop below costing ~157k Ir per call doing the identical
+   work. A real effect in this repo's own measurement convention, even
+   though it would vanish under `--release` — worth remembering before
+   trusting any future "trivial" combinator-for-loop rewrite here.
+
+2. **A plain `for (k, vs) in db.tables.iter() { if .. { return true } }`
+   loop**, same short-circuit ordering, matching `family_tables`'s own
+   style. This beat the first attempt and the baseline, but only
+   barely: total Ir 3,428,151,817 avg (3 runs, agree within 0.02%) —
+   **-0.41%** vs. baseline, with `has_family` itself at 235,295,089 avg
+   (6.86% of total) — **-5.89%** on itself. dhat (1 run): 45,558,817
+   total bytes (**-0.22%**) / 478,509 total allocations (**-1.24%**)
+   vs. the baseline's 45,660,803 / 484,509.
+
+Neither clears the impact floor: the total-Ir delta needs ≥5% (got
+0.41%) and the allocation deltas need ≥10% (got 1.24% blocks / 0.22%
+bytes). **Reverted** — `src/exec/mvest.rs` is unchanged from the
+baseline commit; no fix landed on this round.
+
+### Why removing the allocations doesn't move the needle
+
+`family_tables`'s two `Vec<String>` + two `to_string()` clones are a
+real but small fraction of its own cost. The `callgrind_annotate`
+breakdown of the baseline's `family_tables`/`has_family` call
+attributes the overwhelming majority of its Ir to the `db.tables`
+`HashMap` traversal itself (`hashbrown`/`std::collections::hash::map`
+`Iter::next`, `<[Table]>::last`, the per-entry `is_some_and` dispatch)
+— i.e., the **inherent cost of visiting every table in the database to
+ask "does any of you inherit from `table`?"**, which has no index to
+answer faster. Removing the two allocations shaves the bookkeeping
+around that scan (hence the real, reproducible, but small -5.89%
+self-improvement); it cannot touch the scan itself.
+
+### The actual fix is a finding, not a same-round PR
+
+A fix that would move the needle requires one of:
+
+- A reverse index (`parent table → direct child table names`) on
+  `Database`, maintained at every `CREATE TABLE .. INHERITS` and
+  `DROP TABLE`/rename site, turning the inheritance-child lookup into
+  an O(1) hash lookup instead of an O(table count) scan. This is a
+  `Database`-struct / data-structure-ownership change touching every
+  table-mutation call site across `src/exec/{create,alter,drop}.rs`
+  (and ALTER TABLE INHERIT, if it's ever added) — exactly the kind of
+  change this project's own rules ask to be raised, not landed,
+  unprompted.
+- Short of a full index: a cheap `Database`-level cache (e.g. "does
+  any table in this database have a non-empty `inherits`?") that lets
+  `has_family` skip the scan entirely in the common all-plain-tables
+  case. Still a new field to keep in sync at every table-creation/drop
+  site, with the same correctness risk (miss one update site and
+  `has_family` silently goes stale) for a payoff that only shows up in
+  schemas that mix plain and inherited/partitioned tables under one
+  connection's `EXPLAIN` traffic.
+
+Either is a reasonable follow-up, but is an architectural call (new
+persistent state, kept consistent across every mutation path) that
+this round intentionally leaves to a human decision rather than
+landing unreviewed.
+
+**Reproduce**:
+```bash
+cargo build
+python3 benches/profile_manytable_select.py --tables 300 --count 1500 --rows 2000
+```
+Baseline numbers and the harness are committed in the entry below;
+this round made no source changes, so there is nothing new to diff
+against — `git log -p` on this commit shows the `BASELINE.md` addition
+only.
+
 ## Bolt: `has_family` builds `family_tables`'s full transitive closure just to answer a yes/no question, on every EXPLAIN scan node — baseline — 2026-11-15
 
 **Why this workload**: v2.30 (`247f73b`, 2026-11-14) added `src/exec/mvest.rs`
