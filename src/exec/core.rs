@@ -46,11 +46,30 @@ pub struct ExecError {
     /// v0.71: optional PG-style DETAIL line, sent as the `D` field of the
     /// ErrorResponse. `None` for the vast majority of errors.
     pub detail: Option<String>,
+    /// v2.33: optional PG-style HINT line, sent as the `H` field.
+    pub hint: Option<String>,
 }
 
 pub(crate) fn exec_err(code: &'static str, message: impl Into<String>) -> ExecError {
     ExecError {
         detail: None,
+        hint: None,
+        code,
+        message: message.into(),
+    }
+}
+
+/// v2.33: error with a PG-style HINT line (no SQLSTATE — PG raises
+/// some errors, e.g. the stats-import pair errors, with the default
+/// XX000 class; callers pass the code explicitly).
+pub(crate) fn exec_err_hint(
+    code: &'static str,
+    message: impl Into<String>,
+    hint: impl Into<String>,
+) -> ExecError {
+    ExecError {
+        detail: None,
+        hint: Some(hint.into()),
         code,
         message: message.into(),
     }
@@ -85,6 +104,7 @@ pub(crate) fn exec_err_detail(
 ) -> ExecError {
     ExecError {
         detail: Some(detail.into()),
+        hint: None,
         code,
         message: message.into(),
     }

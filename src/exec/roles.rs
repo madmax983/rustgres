@@ -1313,6 +1313,7 @@ pub(crate) fn exec_drop_role(
         if !blockers.is_empty() {
             return Err(ExecError {
                 detail: Some(blockers.join("\n")),
+                hint: None,
                 code: "2BP01",
                 message: format!(
                     "role \"{}\" cannot be dropped because some objects depend on it",

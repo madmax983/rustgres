@@ -18497,7 +18497,18 @@ pub(crate) fn try_split_create_view(text: &str) -> Option<Result<Stmt, SqlError>
     rest = match_kw(rest, "view")?;
     rest = skip_ws_comments(rest);
     // Postgres does not allow IF NOT EXISTS on CREATE VIEW.
-    let (name, r) = split_ident(rest)?;
+    let (name0, r) = split_ident(rest)?;
+    // v2.33: schema-qualified view names (CREATE VIEW s.v AS ...) —
+    // dotted names are stored verbatim, matching the table layer.
+    let (name, r) = if skip_ws_comments(r).starts_with('.') {
+        let after_dot = skip_ws_comments(r)[1..].trim_start();
+        match split_ident(after_dot) {
+            Some((second, r2)) => (format!("{}.{}", name0, second), r2),
+            None => (name0, r),
+        }
+    } else {
+        (name0, r)
+    };
     rest = skip_ws_comments(r);
     // Optional column alias list.
     let mut col_aliases = Vec::new();

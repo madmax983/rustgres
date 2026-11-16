@@ -426,6 +426,13 @@ pub(crate) fn catalog_column_names(q: &Q, name: &str) -> Option<Vec<String>> {
         }
         "pg_class" => Some(names(pg_class_schema())),
         "pg_attribute" => Some(names(pg_attribute_schema())),
+        // v2.33: the statistics catalogs / views.
+        "pg_statistic" => Some(names(pg_statistic_schema())),
+        "pg_stats" => Some(names(pg_stats_schema())),
+        "pg_statistic_ext" => Some(names(pg_statistic_ext_schema())),
+        "pg_statistic_ext_data" => Some(names(pg_statistic_ext_data_schema())),
+        "pg_stats_ext" => Some(names(pg_stats_ext_schema())),
+        "pg_stats_ext_exprs" => Some(names(pg_stats_ext_exprs_schema())),
         _ => None,
     }
 }

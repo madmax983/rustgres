@@ -570,7 +570,7 @@ pub(crate) fn item_attnums(obj: &ExtStatObj) -> Vec<i32> {
     (0..obj.items.len()).map(|i| attnum_of(obj, i)).collect()
 }
 
-fn attnum_of(obj: &ExtStatObj, item_idx: usize) -> i32 {
+pub(crate) fn attnum_of(obj: &ExtStatObj, item_idx: usize) -> i32 {
     match &obj.items[item_idx] {
         ExtStatItem::Column(a) => *a as i32,
         ExtStatItem::Expr(_, _) => {
@@ -1068,43 +1068,29 @@ fn compute_ext_data(obj: &ExtStatObj, item_vals: &[Vec<Value>], total: f64) -> E
         for (ii, item) in obj.items.iter().enumerate() {
             if matches!(item, ExtStatItem::Expr(_, _)) {
                 let vals = &item_vals[ii];
-                let nulls = vals.iter().filter(|v| matches!(v, Value::Null)).count();
-                let mut counts: HashMap<Vec<u8>, (Value, u64)> = HashMap::default();
-                for v in vals {
-                    if matches!(v, Value::Null) {
-                        continue;
-                    }
-                    let mut k = Vec::new();
-                    value_key(v, &mut k);
-                    let e = counts.entry(k).or_insert_with(|| (v.clone(), 0));
-                    e.1 += 1;
-                }
-                let mut by_freq: Vec<(Value, u64)> =
-                    counts.values().map(|(v, c)| (v.clone(), *c)).collect();
-                // v2.19: same deterministic tie-break as the MCV
-                // list above (rendered key ascending).
-                by_freq.sort_by(|a, b| {
-                    b.1.cmp(&a.1)
-                        .then_with(|| value_to_text_cast(&a.0).cmp(&value_to_text_cast(&b.0)))
-                });
+                // v2.33: the full ColStats computation (PG19
+                // pg_statistic shapes for every kind), mapped onto
+                // ExtExprStat. The expression's type is taken from
+                // its first non-null value.
+                let ty = vals
+                    .iter()
+                    .find(|v| !matches!(v, Value::Null))
+                    .map(|v| super::analyze::value_coltype(v))
+                    .unwrap_or(ColType::Text);
+                let cs = super::analyze::col_stats_mcv_min(&ty, vals, 2);
                 data.expr_stats.push(ExtExprStat {
-                    null_frac: if total > 0.0 {
-                        nulls as f64 / total
-                    } else {
-                        0.0
-                    },
-                    avg_width: 4,
-                    n_distinct: counts.len() as f64,
-                    // v2.30: expression MCVs keep values seen at
-                    // least twice (see scope.md archaeology note).
-                    mcv: by_freq
-                        .iter()
-                        .filter(|(_, c)| *c >= 2)
-                        .take(100)
-                        .map(|(v, c)| {
-                            (v.clone(), if total > 0.0 { *c as f64 / total } else { 0.0 })
-                        })
-                        .collect(),
+                    null_frac: cs.null_frac,
+                    avg_width: cs.avg_width,
+                    n_distinct: cs.n_distinct,
+                    mcv: cs.mcv.clone(),
+                    distinct_raw: cs.distinct_raw,
+                    hist_bounds: cs.hist_bounds.clone(),
+                    correlation: cs.correlation,
+                    mcelem: cs.mcelem.clone(),
+                    dechist: cs.dechist.clone(),
+                    range_length_hist: cs.range_length_hist.clone(),
+                    range_empty_frac: cs.range_empty_frac,
+                    bounds_hist: cs.bounds_hist.clone(),
                 });
             }
         }
@@ -1592,12 +1578,12 @@ pub(crate) fn pg_statistic_ext_data_scan(db: &Database) -> (Vec<QCol>, Vec<QRow>
     (schema, rows)
 }
 
-fn mcv_render(o: &ExtStatObj) -> (String, String, String, String) {
-    if o.data.mcv.is_empty() {
+/// v2.33: MCV rendering over an explicit payload (own or inherited).
+fn mcv_render_data(data: &ExtStatData) -> (String, String, String, String) {
+    if data.mcv.is_empty() {
         return ("NULL".into(), "NULL".into(), "NULL".into(), "NULL".into());
     }
-    let vals: Vec<String> = o
-        .data
+    let vals: Vec<String> = data
         .mcv
         .iter()
         .map(|(vals, _, _)| {
@@ -1611,8 +1597,7 @@ fn mcv_render(o: &ExtStatObj) -> (String, String, String, String) {
             format!("{{{}}}", inner.join(","))
         })
         .collect();
-    let nulls: Vec<String> = o
-        .data
+    let nulls: Vec<String> = data
         .mcv
         .iter()
         .map(|(vals, _, _)| {
@@ -1623,8 +1608,8 @@ fn mcv_render(o: &ExtStatObj) -> (String, String, String, String) {
             format!("{{{}}}", inner.join(","))
         })
         .collect();
-    let freqs: Vec<String> = o.data.mcv.iter().map(|(_, f, _)| fmt_float(*f)).collect();
-    let base: Vec<String> = o.data.mcv.iter().map(|(_, _, b)| fmt_float(*b)).collect();
+    let freqs: Vec<String> = data.mcv.iter().map(|(_, f, _)| fmt_float(*f)).collect();
+    let base: Vec<String> = data.mcv.iter().map(|(_, _, b)| fmt_float(*b)).collect();
     (
         format!("{{{}}}", vals.join(",")),
         format!("{{{}}}", nulls.join(",")),
@@ -1692,47 +1677,59 @@ pub(crate) fn pg_stats_ext_scan(
                 _ => None,
             })
             .collect();
-        let (mcv, nulls, freqs, base) = mcv_render(o);
-        let txt = |s: String| {
-            if s == "NULL" {
-                Value::Null
-            } else {
-                Value::text(s.as_str())
-            }
-        };
-        rows.push(row(vec![
-            Value::text(table_schema_for(db, o).as_str()),
-            Value::text(stats_base_name(&o.table)),
-            Value::Int(relid),
-            Value::text(o.schema.as_str()),
-            Value::text(o.name.as_str()),
-            Value::Int(o.oid as i64),
-            Value::text(o.owner.as_str()),
-            if attnames.is_empty() {
-                Value::Null
-            } else {
-                Value::text(format!("{{{}}}", attnames.join(",").as_str()))
-            },
-            if exprs.is_empty() {
-                Value::Null
-            } else {
-                Value::text(exprs.join(", ").as_str())
-            },
-            Value::text(kinds_text(&o.kinds).as_str()),
-            Value::Bool(false),
-            match &o.data.ndistinct {
-                Some(s) => Value::text(s.as_str()),
-                None => Value::Null,
-            },
-            match &o.data.dependencies {
-                Some(s) => Value::text(s.as_str()),
-                None => Value::Null,
-            },
-            txt(mcv),
-            txt(nulls),
-            txt(freqs),
-            txt(base),
-        ]));
+        // v2.33: PG19 pg_stats_ext INNER JOINs pg_statistic_ext_data:
+        // one row per (object, inherited) payload that exists — no
+        // row at all for an object never ANALYZEd.
+        let mut variants: Vec<(&ExtStatData, bool)> = Vec::new();
+        if o.data.built {
+            variants.push((&o.data, false));
+        }
+        if let Some(inh) = &o.data_inh {
+            variants.push((inh, true));
+        }
+        for (data, inherited) in variants {
+            let (mcv, nulls, freqs, base) = mcv_render_data(data);
+            let txt = |s: String| {
+                if s == "NULL" {
+                    Value::Null
+                } else {
+                    Value::text(s.as_str())
+                }
+            };
+            rows.push(row(vec![
+                Value::text(table_schema_for(db, o).as_str()),
+                Value::text(stats_base_name(&o.table)),
+                Value::Int(relid),
+                Value::text(o.schema.as_str()),
+                Value::text(o.name.as_str()),
+                Value::Int(o.oid as i64),
+                Value::text(o.owner.as_str()),
+                if attnames.is_empty() {
+                    Value::Null
+                } else {
+                    Value::text(format!("{{{}}}", attnames.join(",").as_str()))
+                },
+                if exprs.is_empty() {
+                    Value::Null
+                } else {
+                    Value::text(exprs.join(", ").as_str())
+                },
+                Value::text(kinds_text(&o.kinds).as_str()),
+                Value::Bool(inherited),
+                match &data.ndistinct {
+                    Some(s) => Value::text(s.as_str()),
+                    None => Value::Null,
+                },
+                match &data.dependencies {
+                    Some(s) => Value::text(s.as_str()),
+                    None => Value::Null,
+                },
+                txt(mcv),
+                txt(nulls),
+                txt(freqs),
+                txt(base),
+            ]));
+        }
     }
     (schema, rows)
 }
@@ -1760,16 +1757,46 @@ pub(crate) fn pg_stats_ext_exprs_schema() -> Vec<QCol> {
         qc("statistics_owner", ColType::Text, q),
         qc("expr", ColType::Text, q),
         qc("inherited", ColType::Bool, q),
-        qc("null_frac", ColType::Float, q),
+        qc("null_frac", ColType::Float4, q),
         qc("avg_width", ColType::Int, q),
-        qc("n_distinct", ColType::Float, q),
+        qc("n_distinct", ColType::Float4, q),
         qc("most_common_vals", ColType::Text, q),
-        qc("most_common_freqs", ColType::Text, q),
+        qc("most_common_freqs", ColType::Array(ArrayElem::Float4), q),
         qc("histogram_bounds", ColType::Text, q),
-        qc("range_length_histogram", ColType::Text, q),
-        qc("range_empty_frac", ColType::Float, q),
+        qc("correlation", ColType::Float4, q),
+        qc("most_common_elems", ColType::Text, q),
+        qc(
+            "most_common_elem_freqs",
+            ColType::Array(ArrayElem::Float4),
+            q,
+        ),
+        qc("elem_count_histogram", ColType::Array(ArrayElem::Float4), q),
+        qc(
+            "range_length_histogram",
+            ColType::Array(ArrayElem::Float),
+            q,
+        ),
+        qc("range_empty_frac", ColType::Float4, q),
         qc("range_bounds_histogram", ColType::Text, q),
     ]
+}
+
+/// v2.33: an ExtExprStat viewed as a ColStats for slot assembly.
+pub(crate) fn colstats_of_expr(s: &ExtExprStat) -> ColStats {
+    ColStats {
+        null_frac: s.null_frac,
+        n_distinct: s.n_distinct,
+        mcv: s.mcv.clone(),
+        hist_bounds: s.hist_bounds.clone(),
+        avg_width: s.avg_width,
+        distinct_raw: s.distinct_raw,
+        correlation: s.correlation,
+        mcelem: s.mcelem.clone(),
+        dechist: s.dechist.clone(),
+        range_length_hist: s.range_length_hist.clone(),
+        range_empty_frac: s.range_empty_frac,
+        bounds_hist: s.bounds_hist.clone(),
+    }
 }
 
 pub(crate) fn pg_stats_ext_exprs_scan(
@@ -1787,59 +1814,126 @@ pub(crate) fn pg_stats_ext_exprs_scan(
         }
         let t = db.find_table(&o.table, snap, &[own], session);
         let relid = t.map(|t| t.oid as i64).unwrap_or(0);
-        let mut ei = 0usize;
-        for item in &o.items {
-            let ExtStatItem::Expr(txt, _) = item else {
-                continue;
-            };
-            let st = o.data.expr_stats.get(ei);
-            ei += 1;
-            let (nf, aw, nd, mcv, freqs) = match st {
-                Some(s) => {
-                    let mv: Vec<String> = s
-                        .mcv
-                        .iter()
-                        .map(|(v, _)| array_quote(&value_to_text_cast(v)))
-                        .collect();
-                    let fq: Vec<String> = s.mcv.iter().map(|(_, f)| fmt_float(*f)).collect();
-                    (
-                        s.null_frac,
-                        s.avg_width as i64,
-                        s.n_distinct,
-                        if mv.is_empty() {
-                            Value::Null
-                        } else {
-                            Value::text(format!("{{{}}}", mv.join(",").as_str()))
-                        },
-                        if fq.is_empty() {
-                            Value::Null
-                        } else {
-                            Value::text(format!("{{{}}}", fq.join(",").as_str()))
-                        },
-                    )
-                }
-                None => (0.0, 0, 0.0, Value::Null, Value::Null),
-            };
-            rows.push(row(vec![
-                Value::text(table_schema_for(db, o).as_str()),
-                Value::text(stats_base_name(&o.table)),
-                Value::Int(relid),
-                Value::text(o.schema.as_str()),
-                Value::text(o.name.as_str()),
-                Value::Int(o.oid as i64),
-                Value::text(o.owner.as_str()),
-                Value::text(txt.as_str()),
-                Value::Bool(false),
-                Value::Float(nf),
-                Value::Int(aw),
-                Value::Float(nd),
-                mcv,
-                freqs,
-                Value::Null,
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ]));
+        // (payload, inherited): the plain variant always emits rows
+        // (PG19 LEFT JOINs the data), the inherited variant only
+        // when an inherited payload exists.
+        let mut variants: Vec<(Option<&ExtStatData>, bool)> = vec![(Some(&o.data), false)];
+        if let Some(inh) = &o.data_inh {
+            variants.push((Some(inh), true));
+        }
+        for (data, inherited) in variants {
+            let mut ei = 0usize;
+            for item in &o.items {
+                let ExtStatItem::Expr(txt, _) = item else {
+                    continue;
+                };
+                let st = data.and_then(|d| d.expr_stats.get(ei));
+                ei += 1;
+                let base = vec![
+                    Value::text(table_schema_for(db, o).as_str()),
+                    Value::text(stats_base_name(&o.table)),
+                    Value::Int(relid),
+                    Value::text(o.schema.as_str()),
+                    Value::text(o.name.as_str()),
+                    Value::Int(o.oid as i64),
+                    Value::text(o.owner.as_str()),
+                    Value::text(txt.as_str()),
+                    Value::Bool(inherited),
+                ];
+                let cells = match st {
+                    Some(s) => {
+                        let cs = colstats_of_expr(s);
+                        // The expression's type: from its first
+                        // MCV / histogram value when available.
+                        let ty = cs
+                            .mcv
+                            .first()
+                            .map(|(v, _)| super::analyze::value_coltype(v))
+                            .or_else(|| {
+                                cs.hist_bounds
+                                    .first()
+                                    .map(|v| super::analyze::value_coltype(v))
+                            })
+                            .unwrap_or(ColType::Text);
+                        let slots = att_slots(&cs, &ty);
+                        let vals_of = |kind: i16, ety: &ColType| -> Value {
+                            match slot_of_kind(&slots, kind) {
+                                Some(sl) => match &sl.values {
+                                    Some(vals) => anyarray_value(vals, ety),
+                                    None => Value::Null,
+                                },
+                                None => Value::Null,
+                            }
+                        };
+                        let nums_of = |kind: i16| -> Value {
+                            match slot_of_kind(&slots, kind) {
+                                Some(sl) => match &sl.numbers {
+                                    Some(nums) => float4_array(nums),
+                                    None => Value::Null,
+                                },
+                                None => Value::Null,
+                            }
+                        };
+                        let elem_ty = elem_type_of(&ty).map(|(et, _)| et).unwrap_or(ColType::Text);
+                        let corr = match slot_of_kind(&slots, 3) {
+                            Some(sl) => sl
+                                .numbers
+                                .as_ref()
+                                .and_then(|n| n.first())
+                                .map(|f| Value::Float4(*f as f32))
+                                .unwrap_or(Value::Null),
+                            None => Value::Null,
+                        };
+                        let range_len = match slot_of_kind(&slots, 6) {
+                            Some(sl) => match &sl.values {
+                                Some(vals) => float8_array(
+                                    &vals
+                                        .iter()
+                                        .map(|v| match v {
+                                            Value::Float(f) => *f,
+                                            _ => 0.0,
+                                        })
+                                        .collect::<Vec<_>>(),
+                                ),
+                                None => Value::Null,
+                            },
+                            None => Value::Null,
+                        };
+                        let range_empty = match slot_of_kind(&slots, 6) {
+                            Some(sl) => sl
+                                .numbers
+                                .as_ref()
+                                .and_then(|n| n.first())
+                                .map(|f| Value::Float4(*f as f32))
+                                .unwrap_or(Value::Null),
+                            None => Value::Null,
+                        };
+                        let mut cells = base;
+                        cells.extend([
+                            Value::Float4(cs.null_frac as f32),
+                            Value::Int(cs.avg_width as i64),
+                            Value::Float4(cs.distinct_raw as f32),
+                            vals_of(1, &ty),
+                            nums_of(1),
+                            vals_of(2, &ty),
+                            corr,
+                            vals_of(4, &elem_ty),
+                            nums_of(4),
+                            nums_of(5),
+                            range_len,
+                            range_empty,
+                            vals_of(7, &ty),
+                        ]);
+                        cells
+                    }
+                    None => {
+                        let mut cells = base;
+                        cells.extend((0..13).map(|_| Value::Null));
+                        cells
+                    }
+                };
+                rows.push(row(cells));
+            }
         }
     }
     (schema, rows)

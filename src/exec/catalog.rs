@@ -33,6 +33,13 @@ pub(crate) fn pg_class_schema() -> Vec<QCol> {
         ("relhassubclass", ColType::Bool),
         ("relnamespace", ColType::Int),
         ("relam", ColType::Int),
+        // v2.33: appended statistics fields (PG19 pg_class
+        // relpages / reltuples / relallvisible / relallfrozen),
+        // maintained in Database.rel_stats.
+        ("relpages", ColType::Int),
+        ("reltuples", ColType::Float4),
+        ("relallvisible", ColType::Int),
+        ("relallfrozen", ColType::Int),
     ]
     .into_iter()
     .map(|(n, ty)| QCol {
@@ -44,6 +51,34 @@ pub(crate) fn pg_class_schema() -> Vec<QCol> {
         src_ord: 0,
     })
     .collect()
+}
+
+/// v2.33: the four pg_class statistics cells (relpages, reltuples,
+/// relallvisible, relallfrozen) for one pg_class row, from
+/// Database.rel_stats with PG19's per-kind defaults: partitioned
+/// tables report relpages = -1, fresh indexes 1/0/0/0, everything
+/// else 0/-1/0/0.
+fn rel_stats_cells(db: &Database, key: &str, relkind: u8) -> Vec<Value> {
+    let def = match relkind {
+        b'p' => RelStats {
+            relpages: -1,
+            ..RelStats::default()
+        },
+        b'i' | b'I' => RelStats {
+            relpages: 1,
+            reltuples: 0.0,
+            relallvisible: 0,
+            relallfrozen: 0,
+        },
+        _ => RelStats::default(),
+    };
+    let rs = db.rel_stats.get(key).copied().unwrap_or(def);
+    vec![
+        Value::Int(rs.relpages),
+        Value::Float4(rs.reltuples),
+        Value::Int(rs.relallvisible),
+        Value::Int(rs.relallfrozen),
+    ]
 }
 
 pub(crate) fn pg_class_scan(
@@ -94,21 +129,27 @@ pub(crate) fn pg_class_scan(
         // inheritance child makes this relation a superclass.
         let has_subclass = t.partition.as_ref().is_some_and(|p| !p.children.is_empty())
             || superclasses.contains(name.as_str());
+        let kind_byte = match &relkind {
+            Value::SingleChar(b) => *b,
+            _ => b'r',
+        };
+        let mut cells = vec![
+            Value::Int(t.oid as i64),
+            // v2.04: relname is never schema-qualified in PG
+            // (the schema rides in relnamespace); storage keys
+            // here are dotted for schema tables.
+            Value::text(name.rsplit('.').next().unwrap_or(name.as_str())),
+            Value::Int(t.toast_relid as i64),
+            relkind,
+            Value::Bool(t.rls_enabled),
+            Value::Bool(t.rls_forced),
+            Value::Bool(has_subclass),
+            Value::Int(2200),
+            Value::Int(2),
+        ];
+        cells.extend(rel_stats_cells(db, name, kind_byte));
         rows.push(QRow {
-            cells: Row::new(vec![
-                Value::Int(t.oid as i64),
-                // v2.04: relname is never schema-qualified in PG
-                // (the schema rides in relnamespace); storage keys
-                // here are dotted for schema tables.
-                Value::text(name.rsplit('.').next().unwrap_or(name.as_str())),
-                Value::Int(t.toast_relid as i64),
-                relkind,
-                Value::Bool(t.rls_enabled),
-                Value::Bool(t.rls_forced),
-                Value::Bool(has_subclass),
-                Value::Int(2200),
-                Value::Int(2),
-            ]),
+            cells: Row::new(cells),
             prov: Vec::new(),
         });
     }
@@ -126,24 +167,27 @@ pub(crate) fn pg_class_scan(
             let on_partitioned = db
                 .find_table(&d.table, snap, &[own], session)
                 .is_some_and(|t| t.partition.as_ref().is_some_and(|p| p.is_partitioned));
+            let kind_byte = if on_partitioned { b'I' } else { b'i' };
+            let mut cells = vec![
+                Value::Int(oids.get(&d.name).copied().unwrap_or(0)),
+                Value::text(d.name.rsplit('.').next().unwrap_or(d.name.as_str())),
+                Value::Int(0),
+                Value::SingleChar(kind_byte),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Bool(parents_with_children.contains(d.name.as_str())),
+                Value::Int(2200),
+                // v2.31: GiST (783) for WITHOUT OVERLAPS and
+                // standalone USING gist indexes.
+                Value::Int(if d.without_overlaps || d.gist {
+                    783
+                } else {
+                    403
+                }),
+            ];
+            cells.extend(rel_stats_cells(db, &d.name, kind_byte));
             rows.push(QRow {
-                cells: Row::new(vec![
-                    Value::Int(oids.get(&d.name).copied().unwrap_or(0)),
-                    Value::text(d.name.rsplit('.').next().unwrap_or(d.name.as_str())),
-                    Value::Int(0),
-                    Value::SingleChar(if on_partitioned { b'I' } else { b'i' }),
-                    Value::Bool(false),
-                    Value::Bool(false),
-                    Value::Bool(parents_with_children.contains(d.name.as_str())),
-                    Value::Int(2200),
-                    // v2.31: GiST (783) for WITHOUT OVERLAPS and
-                    // standalone USING gist indexes.
-                    Value::Int(if d.without_overlaps || d.gist {
-                        783
-                    } else {
-                        403
-                    }),
-                ]),
+                cells: Row::new(cells),
                 prov: Vec::new(),
             });
         }
@@ -164,18 +208,20 @@ pub(crate) fn pg_class_scan(
             .iter()
             .any(|r| matches!(&r.cells[1], Value::Text(s) if &**s == cname))
         {
+            let mut cells = vec![
+                Value::Int(coid),
+                Value::text(cname),
+                Value::Int(0),
+                Value::SingleChar(b'r'),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Int(11),
+                Value::Int(2),
+            ];
+            cells.extend(rel_stats_cells(db, cname, b'r'));
             rows.push(QRow {
-                cells: Row::new(vec![
-                    Value::Int(coid),
-                    Value::text(cname),
-                    Value::Int(0),
-                    Value::SingleChar(b'r'),
-                    Value::Bool(false),
-                    Value::Bool(false),
-                    Value::Bool(false),
-                    Value::Int(11),
-                    Value::Int(2),
-                ]),
+                cells: Row::new(cells),
                 prov: Vec::new(),
             });
         }
@@ -186,20 +232,22 @@ pub(crate) fn pg_class_scan(
         .iter()
         .any(|r| matches!(&r.cells[1], Value::Text(s) if &**s == "pg_class"))
     {
+        let mut cells = vec![
+            Value::Int(1259),
+            Value::text("pg_class"),
+            Value::Int(0),
+            // v1.00: the virtual pg_class itself is an ordinary
+            // relation ('r').
+            Value::SingleChar(b'r'),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Int(11),
+            Value::Int(2),
+        ];
+        cells.extend(rel_stats_cells(db, "pg_class", b'r'));
         rows.push(QRow {
-            cells: Row::new(vec![
-                Value::Int(1259),
-                Value::text("pg_class"),
-                Value::Int(0),
-                // v1.00: the virtual pg_class itself is an ordinary
-                // relation ('r').
-                Value::SingleChar(b'r'),
-                Value::Bool(false),
-                Value::Bool(false),
-                Value::Bool(false),
-                Value::Int(11),
-                Value::Int(2),
-            ]),
+            cells: Row::new(cells),
             prov: Vec::new(),
         });
         // Keep deterministic order.
@@ -261,6 +309,34 @@ pub(crate) fn pg_attribute_scan(
 ) -> (Vec<QCol>, Vec<QRow>) {
     let schema = pg_attribute_schema();
     let mut rows = Vec::new();
+    // v2.33: attribute rows for the virtual statistics catalogs, so
+    // attrelid = 'pg_catalog.pg_statistic'::regclass (etc.) resolves
+    // the PG19 column counts (31 / 19 / 17 / 22).
+    {
+        let catalogs: Vec<(i64, Vec<QCol>)> = vec![
+            (2619, pg_statistic_schema()),
+            (3996, pg_stats_schema()),
+            (3381, pg_statistic_ext_schema()),
+            (3997, pg_statistic_ext_data_schema()),
+            (3998, pg_stats_ext_schema()),
+            (3999, pg_stats_ext_exprs_schema()),
+        ];
+        for (relid, cols) in catalogs {
+            for (i, c) in cols.iter().enumerate() {
+                rows.push(QRow {
+                    cells: Row::new(vec![
+                        Value::Int(relid),
+                        Value::text(c.name.as_str()),
+                        Value::Int(i as i64 + 1),
+                        Value::Bool(true),
+                        Value::Int(0),
+                        Value::text(""),
+                    ]),
+                    prov: Vec::new(),
+                });
+            }
+        }
+    }
     // Sort by table name for deterministic output.
     let mut names: Vec<&String> = db.tables.keys().collect();
     names.sort();

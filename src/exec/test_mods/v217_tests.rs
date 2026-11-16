@@ -21,6 +21,7 @@ fn run(eng: &mut Engine, sql: &str) -> Result<ExecResult, ExecError> {
         code: e.code,
         message: e.message,
         detail: None,
+        hint: None,
     })?;
     let snap = eng.take_snapshot();
     let mut writes = Vec::new();

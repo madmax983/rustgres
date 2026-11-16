@@ -1622,7 +1622,9 @@ pub(crate) fn plan_from_item(
                     output: scan_output(name, None, &[], where_, &[]),
                 });
             }
-            if name == "pg_stats" && eng.db.find_table(name, snap, &[own], session).is_none() {
+            if virt_catalog_name(&name) == "pg_stats"
+                && eng.db.find_table(name, snap, &[own], session).is_none()
+            {
                 let rows: u64 = eng.db.stats.values().map(|ts| ts.cols.len() as u64).sum();
                 return Ok(PlanNode::SeqScan {
                     table: "pg_stats".to_string(),
@@ -1631,6 +1633,30 @@ pub(crate) fn plan_from_item(
                     rows,
                     // v1.46: VERBOSE `Output:`.
                     output: scan_output("pg_stats", None, &[], where_, &[]),
+                });
+            }
+            // v2.33: pg_statistic is virtual too.
+            if virt_catalog_name(&name) == "pg_statistic"
+                && eng.db.find_table(name, snap, &[own], session).is_none()
+            {
+                let rows: u64 = eng
+                    .db
+                    .stats
+                    .values()
+                    .map(|ts| ts.cols.len() as u64)
+                    .sum::<u64>()
+                    + eng
+                        .db
+                        .stats_inh
+                        .values()
+                        .map(|ts| ts.cols.len() as u64)
+                        .sum::<u64>();
+                return Ok(PlanNode::SeqScan {
+                    table: "pg_statistic".to_string(),
+                    alias: None,
+                    filter: None,
+                    rows,
+                    output: scan_output("pg_statistic", None, &[], where_, &[]),
                 });
             }
             // v0.37: pg_class is virtual (TOAST introspection).

@@ -3233,7 +3233,7 @@ pub(crate) fn build_source(
             }
             // v0.8: the pg_stats system catalog is virtual — a real table
             // by that name takes precedence.
-            if name == "pg_stats"
+            if virt_catalog_name(&name) == "pg_stats"
                 && q.eng
                     .db
                     .find_table(name, q.snap, &q.all_xids, q.session)
@@ -3250,9 +3250,12 @@ pub(crate) fn build_source(
                 return Ok((apply_aliases(schema)?, rows));
             }
             // v2.17: extended-statistics catalogs are virtual.
+            // v2.33: pg_statistic joins the family, and a pg_catalog.
+            // qualifier is accepted for all of them.
             if matches!(
-                name.as_str(),
-                "pg_statistic_ext"
+                virt_catalog_name(&name),
+                "pg_statistic"
+                    | "pg_statistic_ext"
                     | "pg_statistic_ext_data"
                     | "pg_stats_ext"
                     | "pg_stats_ext_exprs"
@@ -3262,7 +3265,8 @@ pub(crate) fn build_source(
                 .find_table(name, q.snap, &q.all_xids, q.session)
                 .is_none()
             {
-                let (raw_schema, rows) = match name.as_str() {
+                let (raw_schema, rows) = match virt_catalog_name(&name) {
+                    "pg_statistic" => pg_statistic_scan(&q.eng.db),
                     "pg_statistic_ext" => {
                         pg_statistic_ext_scan(&q.eng.db, q.snap, q.own, q.session)
                     }

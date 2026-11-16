@@ -794,6 +794,7 @@ pub(crate) fn check_one_wo_def(
                 table
             ),
             detail: None,
+            hint: None,
         }
     };
     let conflict_err = |new: &[Value], old: &[Value]| -> ExecError {
@@ -2298,6 +2299,7 @@ pub(crate) fn exec_alter_index(
                                 child, name
                             ),
                             detail: Some(detail),
+                            hint: None,
                         };
                         if !on_partition {
                             return Err(fail(format!(

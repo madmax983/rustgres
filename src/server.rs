@@ -1186,11 +1186,22 @@ fn queue_warning(session: &mut Session, message: &str) {
 }
 
 /// v0.71: ErrorResponse with an optional PG-style DETAIL (`D`) field.
+/// v2.33: also carries an optional HINT (`H`) field.
 pub(crate) fn send_error_detail(
     stream: &mut Writer,
     code: &str,
     message: &str,
     detail: Option<&str>,
+) -> io::Result<()> {
+    send_error_full(stream, code, message, detail, None)
+}
+
+pub(crate) fn send_error_full(
+    stream: &mut Writer,
+    code: &str,
+    message: &str,
+    detail: Option<&str>,
+    hint: Option<&str>,
 ) -> io::Result<()> {
     let mut b = MsgBuilder::new(b'E');
     b.u8(b'S')
@@ -1204,13 +1215,22 @@ pub(crate) fn send_error_detail(
     if let Some(d) = detail {
         b.u8(b'D').cstr(d);
     }
+    if let Some(h) = hint {
+        b.u8(b'H').cstr(h);
+    }
     b.u8(0);
     b.send(stream)
 }
 
 /// v0.71: send an `ExecError`, including its DETAIL line when present.
 pub(crate) fn send_exec_error(stream: &mut Writer, e: &exec::ExecError) -> io::Result<()> {
-    send_error_detail(stream, e.code, &e.message, e.detail.as_deref())
+    send_error_full(
+        stream,
+        e.code,
+        &e.message,
+        e.detail.as_deref(),
+        e.hint.as_deref(),
+    )
 }
 
 /// Extended-protocol failure: ErrorResponse, then discard input until Sync.
@@ -1501,6 +1521,7 @@ fn copy_to_fetch(
         if t.failed {
             return Err(exec::ExecError {
                 detail: None,
+                hint: None,
                 code: "25P02",
                 message:
                     "current transaction is aborted, commands ignored until end of transaction block"
@@ -1660,6 +1681,7 @@ fn copy_from_ingest(
             }
             return Err(exec::ExecError {
                 detail: None,
+                hint: None,
                 code: "22P04",
                 message: format!("COPY error on line {}: {}", e.line, e.message),
             });
@@ -1753,6 +1775,7 @@ fn copy_from_ingest(
                         auto_vacuum(&mut guard, &writes);
                         return Err(exec::ExecError {
                             detail: None,
+                            hint: None,
                             code: "40001",
                             message: format!(
                                 "could not serialize access due to concurrent update: {}",
@@ -1767,6 +1790,7 @@ fn copy_from_ingest(
                     auto_vacuum(&mut guard, &writes);
                     return Err(exec::ExecError {
                         detail: None,
+                        hint: None,
                         code: "58000",
                         message: format!("WAL write failed: {}", e),
                     });
@@ -1980,6 +2004,7 @@ fn cmd(tag: &str) -> ExecResult {
 fn err_25001(msg: impl Into<String>) -> ExecError {
     ExecError {
         detail: None,
+        hint: None,
         code: "25001",
         message: msg.into(),
     }
@@ -2103,6 +2128,7 @@ fn cursor_declare(
     if session.cursors.contains_key(name) {
         return Err(ExecError {
             detail: None,
+            hint: None,
             code: "42P11",
             message: format!("cursor \"{}\" already exists", name),
         });
@@ -2133,6 +2159,7 @@ fn pl_portal_fetch(name: &str, dir: &FetchDir, is_move: bool) -> Result<ExecResu
         if goes_backward && !p.scroll {
             return Err(ExecError {
                 detail: None,
+                hint: None,
                 code: "55000",
                 message: "cursor can only scan forward".to_string(),
             });
@@ -2150,6 +2177,7 @@ fn pl_portal_fetch(name: &str, dir: &FetchDir, is_move: bool) -> Result<ExecResu
         None => {
             return Err(ExecError {
                 detail: None,
+                hint: None,
                 code: "34000",
                 message: format!("cursor \"{}\" does not exist", name),
             });
@@ -2184,6 +2212,7 @@ fn cursor_fetch(
     let query = {
         let cur = session.cursors.get_mut(name).ok_or_else(|| ExecError {
             detail: None,
+            hint: None,
             code: "34000",
             message: format!("cursor \"{}\" does not exist", name),
         })?;
@@ -2192,6 +2221,7 @@ fn cursor_fetch(
             // world" — it stays present but cannot be run (55000).
             return Err(ExecError {
                 detail: None,
+                hint: None,
                 code: "55000",
                 message: format!("portal \"{}\" cannot be run", name),
             });
@@ -2232,6 +2262,7 @@ fn cursor_fetch(
                 cur.dead = true;
                 return Err(ExecError {
                     detail: None,
+                    hint: None,
                     code: "XX000",
                     message: "internal error: DECLARE query did not return rows".to_string(),
                 });
@@ -2244,6 +2275,7 @@ fn cursor_fetch(
     }
     let cur = session.cursors.get_mut(name).ok_or_else(|| ExecError {
         detail: None,
+        hint: None,
         code: "34000",
         message: format!("cursor \"{}\" does not exist", name),
     })?;
@@ -2274,6 +2306,7 @@ fn cursor_close(session: &mut Session, name: Option<&str>) -> Result<ExecResult,
             if session.cursors.remove(n).is_none() && !crate::exec::pl_portal_remove(n) {
                 return Err(ExecError {
                     detail: None,
+                    hint: None,
                     code: "34000",
                     message: format!("cursor \"{}\" does not exist", n),
                 });
@@ -2585,6 +2618,7 @@ fn stmt_set_transaction(
     let snap_set = t.first_snapshot_set;
     let err_25001 = |msg: &str| ExecError {
         detail: None,
+        hint: None,
         code: "25001",
         message: msg.to_string(),
     };
@@ -2688,12 +2722,14 @@ fn stmt_set_transaction_snapshot(session: &mut Session, id: &str) -> Result<Exec
     {
         return Err(ExecError {
             detail: None,
+            hint: None,
             code: "22023",
             message: format!("invalid snapshot identifier: {:?}", id),
         });
     }
     Err(ExecError {
         detail: None,
+        hint: None,
         code: "42704",
         message: format!("snapshot {:?} does not exist", id),
     })
@@ -2729,6 +2765,7 @@ fn stmt_set_session_authorization(
             if guard.db.find_role(&name, &snap, u64::MAX).is_none() {
                 return Err(ExecError {
                     detail: None,
+                    hint: None,
                     code: "42704",
                     message: format!("role \"{}\" does not exist", name),
                 });
@@ -2747,6 +2784,7 @@ fn stmt_set_session_authorization(
             if !allowed {
                 return Err(ExecError {
                     detail: None,
+                    hint: None,
                     code: "42501",
                     message: format!(
                         "permission denied to set session authorization \"{}\"",
@@ -2785,6 +2823,7 @@ fn stmt_set_role(
             if guard.db.find_role(&name, &snap, u64::MAX).is_none() {
                 return Err(ExecError {
                     detail: None,
+                    hint: None,
                     code: "42704",
                     message: format!("role \"{}\" does not exist", name),
                 });
@@ -2809,6 +2848,7 @@ fn stmt_set_role(
             if !allowed {
                 return Err(ExecError {
                     detail: None,
+                    hint: None,
                     code: "42501",
                     message: format!("permission denied to set role \"{}\"", name),
                 });
@@ -2993,6 +3033,7 @@ fn custom_guc_set_error(name: &str) -> Option<ExecError> {
                 "Custom parameter names must be two or more simple identifiers separated by dots."
                     .to_string(),
             ),
+            hint: None,
             code: "42602",
             message: format!("invalid configuration parameter name \"{}\"", name),
         });
@@ -3000,6 +3041,7 @@ fn custom_guc_set_error(name: &str) -> Option<ExecError> {
     if name.starts_with("plpgsql.") && !is_known_plpgsql_guc(name) {
         return Some(ExecError {
             detail: Some("\"plpgsql\" is a reserved prefix.".to_string()),
+            hint: None,
             code: "42602",
             message: format!("invalid configuration parameter name \"{}\"", name),
         });
@@ -3115,6 +3157,7 @@ fn validate_enum_guc(
     }
     Err(ExecError {
         detail: None,
+        hint: None,
         code: "22023",
         message: format!("invalid value for parameter \"{}\": \"{}\"", name, value),
     })
@@ -3128,6 +3171,7 @@ fn validate_enum_guc(
 fn validate_datestyle(value: &str) -> Result<String, ExecError> {
     let invalid = || ExecError {
         detail: None,
+        hint: None,
         code: "22023",
         message: format!("invalid value for parameter \"datestyle\": \"{}\"", value),
     };
@@ -3253,6 +3297,7 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
     }
     let invalid = || ExecError {
         detail: None,
+        hint: None,
         code: "22023",
         message: format!("invalid value for parameter \"{}\": \"{}\"", name, value),
     };
@@ -3278,6 +3323,7 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
             if !(-15..=3).contains(&i) {
                 return Err(ExecError {
                     detail: None,
+                    hint: None,
                     code: "22023",
                     message: format!(
                         "{} is outside the valid range for parameter \"extra_float_digits\" (-15 .. 3)",
@@ -3292,6 +3338,7 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
             if kb < 64 {
                 return Err(ExecError {
                     detail: None,
+                    hint: None,
                     code: "22023",
                     message: format!(
                         "\"{}\" is outside the valid range for parameter \"work_mem\" (64kB .. 2097151MB)",
@@ -3306,6 +3353,7 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
             if i < 2 {
                 return Err(ExecError {
                     detail: None,
+                    hint: None,
                     code: "22023",
                     message: format!(
                         "{} is outside the valid range for parameter \"geqo_threshold\" (2 .. 2147483647)",
@@ -3320,6 +3368,7 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
             if i < 1 {
                 return Err(ExecError {
                     detail: None,
+                    hint: None,
                     code: "22023",
                     message: format!(
                         "{} is outside the valid range for parameter \"{}\" (1 .. 2147483647)",
@@ -3335,6 +3384,7 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
             if f < min {
                 return Err(ExecError {
                     detail: None,
+                    hint: None,
                     code: "22023",
                     message: format!(
                         "{} is outside the valid range for parameter \"{}\"",
@@ -3353,6 +3403,7 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
             if i < 0 {
                 return Err(ExecError {
                     detail: None,
+                    hint: None,
                     code: "22023",
                     message: format!(
                         "{} is outside the valid range for parameter \"{}\"",
@@ -3368,6 +3419,7 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
             if !(1..=10000).contains(&i) {
                 return Err(ExecError {
                     detail: None,
+                    hint: None,
                     code: "22023",
                     message: format!(
                         "{} is outside the valid range for parameter \"default_statistics_target\" (1 .. 10000)",
@@ -3394,6 +3446,7 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
             if !b {
                 return Err(ExecError {
                     detail: None,
+                    hint: None,
                     code: "0A000",
                     message: "non-standard string literals are not supported".to_string(),
                 });
@@ -3543,6 +3596,7 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
             if !(lo..=hi).contains(&f) {
                 return Err(ExecError {
                     detail: None,
+                    hint: None,
                     code: "22023",
                     message: format!(
                         "{} is outside the valid range for parameter \"{}\"",
@@ -3564,6 +3618,7 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
             if kb < min_kb {
                 return Err(ExecError {
                     detail: None,
+                    hint: None,
                     code: "22023",
                     message: format!(
                         "\"{}\" is outside the valid range for parameter \"{}\"",
@@ -3579,6 +3634,7 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
             if !(0..=1024).contains(&i) {
                 return Err(ExecError {
                     detail: None,
+                    hint: None,
                     code: "22023",
                     message: format!(
                         "{} is outside the valid range for parameter \"{}\" (0 .. 1024)",
@@ -3598,6 +3654,7 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
             if value.is_empty() {
                 return Err(ExecError {
                     detail: Some("\"default_table_access_method\" cannot be empty.".to_string()),
+                    hint: None,
                     code: "22023",
                     message: format!(
                         "invalid value for parameter \"default_table_access_method\": \"{}\"",
@@ -3608,6 +3665,7 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
             if !value.eq_ignore_ascii_case("heap") {
                 return Err(ExecError {
                     detail: Some(format!("Table access method \"{}\" does not exist.", value)),
+                    hint: None,
                     code: "22023",
                     message: format!(
                         "invalid value for parameter \"default_table_access_method\": \"{}\"",
@@ -3619,6 +3677,7 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
         }
         _ => Err(ExecError {
             detail: None,
+            hint: None,
             code: "42704",
             message: format!("unrecognized configuration parameter \"{}\"", name),
         }),
@@ -3716,6 +3775,7 @@ fn stmt_set_guc(
                 SetValue::Default => None,
                 SetValue::Str(s) => Some(parse_bool_guc(s).ok_or_else(|| ExecError {
                     detail: None,
+                    hint: None,
                     code: "22023",
                     message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
                 })?),
@@ -3735,6 +3795,7 @@ fn stmt_set_guc(
                     _ => {
                         return Err(ExecError {
                             detail: None,
+                            hint: None,
                             code: "22023",
                             message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
                         });
@@ -3757,6 +3818,7 @@ fn stmt_set_guc(
                 SetValue::Str(s) => {
                     crate::storage::ToastCompression::from_name(s).ok_or_else(|| ExecError {
                         detail: None,
+                        hint: None,
                         code: "22023",
                         message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
                     })?
@@ -3775,6 +3837,7 @@ fn stmt_set_guc(
                 SetValue::Default => None,
                 SetValue::Str(s) => Some(parse_isolation_guc(s).ok_or_else(|| ExecError {
                     detail: None,
+                    hint: None,
                     code: "22023",
                     message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
                 })?),
@@ -3793,6 +3856,7 @@ fn stmt_set_guc(
                 SetValue::Default => None,
                 SetValue::Str(s) => Some(parse_bool_guc(s).ok_or_else(|| ExecError {
                     detail: None,
+                    hint: None,
                     code: "22023",
                     message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
                 })?),
@@ -3810,6 +3874,7 @@ fn stmt_set_guc(
                 SetValue::Default => None,
                 SetValue::Str(s) => Some(parse_isolation_guc(s).ok_or_else(|| ExecError {
                     detail: None,
+                    hint: None,
                     code: "22023",
                     message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
                 })?),
@@ -3821,6 +3886,7 @@ fn stmt_set_guc(
                 SetValue::Default => None,
                 SetValue::Str(s) => Some(parse_bool_guc(s).ok_or_else(|| ExecError {
                     detail: None,
+                    hint: None,
                     code: "22023",
                     message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
                 })?),
@@ -3832,6 +3898,7 @@ fn stmt_set_guc(
                 SetValue::Default => None,
                 SetValue::Str(s) => Some(parse_bool_guc(s).ok_or_else(|| ExecError {
                     detail: None,
+                    hint: None,
                     code: "22023",
                     message: format!("invalid value for parameter \"{}\": \"{}\"", name, s),
                 })?),
@@ -3869,6 +3936,7 @@ fn stmt_set_guc(
         // changed`), not 42704.
         "server_version" | "server_version_num" => Err(ExecError {
             detail: None,
+            hint: None,
             code: "55P02",
             message: format!("parameter \"{}\" cannot be changed", name),
         }),
@@ -3884,6 +3952,7 @@ fn stmt_set_guc(
         }
         _ => Err(ExecError {
             detail: None,
+            hint: None,
             code: "42704",
             message: format!("unrecognized configuration parameter \"{}\"", name),
         }),
@@ -3911,6 +3980,7 @@ fn stmt_show_guc(session: &Session, name: &str) -> Result<ExecResult, ExecError>
         }),
         None => Err(ExecError {
             detail: None,
+            hint: None,
             code: "42704",
             message: format!("unrecognized configuration parameter \"{}\"", name),
         }),
@@ -3987,6 +4057,7 @@ fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecE
         "transaction_isolation" | "transaction_read_only" | "transaction_deferrable" => {
             Err(ExecError {
                 detail: None,
+                hint: None,
                 code: "0A000",
                 message: format!("parameter \"{}\" cannot be reset", name),
             })
@@ -4029,6 +4100,7 @@ fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecE
         // set_config_option context check fires for every action.
         "server_version" | "server_version_num" => Err(ExecError {
             detail: None,
+            hint: None,
             code: "55P02",
             message: format!("parameter \"{}\" cannot be changed", name),
         }),
@@ -4044,6 +4116,7 @@ fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecE
         }
         _ => Err(ExecError {
             detail: None,
+            hint: None,
             code: "42704",
             message: format!("unrecognized configuration parameter \"{}\"", name),
         }),
@@ -4065,6 +4138,7 @@ fn resolve_sql_execute(
         .cloned()
         .ok_or_else(|| ExecError {
             detail: None,
+            hint: None,
             code: "26000",
             message: format!("prepared statement \"{}\" does not exist", name),
         })?;
@@ -4077,6 +4151,7 @@ fn resolve_sql_execute(
                 prepared.types.len(),
                 args.len()
             )),
+            hint: None,
             code: "42601",
             message: format!(
                 "wrong number of parameters for prepared statement \"{}\"",
@@ -4142,6 +4217,7 @@ fn resolve_ctas_execute(
         }),
         _ => Err(ExecError {
             detail: None,
+            hint: None,
             code: "42601",
             message: "prepared statement is not a SELECT".to_string(),
         }),
@@ -4324,6 +4400,7 @@ fn run_statement(
         if t.failed && !allowed_in_aborted(stmt) {
             return Err(ExecError {
                 detail: None,
+                hint: None,
                 code: "25P02",
                 message:
                     "current transaction is aborted, commands ignored until end of transaction block"
@@ -4348,6 +4425,7 @@ fn run_statement(
             }
             return Err(ExecError {
                 detail: None,
+                hint: None,
                 code: "25006",
                 message: format!("cannot execute {} in a read-only transaction", cmd),
             });
@@ -4389,6 +4467,7 @@ fn run_statement(
             if session.sql_prepared.contains_key(name) {
                 return Err(ExecError {
                     detail: None,
+                    hint: None,
                     code: "42P05",
                     message: format!("prepared statement \"{}\" already exists", name),
                 });
@@ -4413,6 +4492,7 @@ fn run_statement(
                     if session.sql_prepared.remove(n).is_none() {
                         return Err(ExecError {
                             detail: None,
+                            hint: None,
                             code: "26000",
                             message: format!("prepared statement \"{}\" does not exist", n),
                         });
@@ -4431,6 +4511,7 @@ fn run_statement(
         }
         Stmt::Execute { .. } => Err(ExecError {
             detail: None,
+            hint: None,
             code: "XX000",
             message: "internal error: EXECUTE reached the executor unresolved".to_string(),
         }),
@@ -4606,6 +4687,7 @@ fn run_statement(
 fn wal_err(e: io::Error) -> ExecError {
     ExecError {
         detail: None,
+        hint: None,
         code: "58000",
         message: format!("WAL write failed: {}", e),
     }
@@ -4817,6 +4899,7 @@ fn autocommit_execute(
             auto_vacuum(&mut guard, &writes);
             return Err(ExecError {
                 detail: None,
+                hint: None,
                 code: "40001",
                 message: format!(
                     "could not serialize access due to concurrent update: {}",
@@ -5112,6 +5195,7 @@ fn commit_taken_txn(
             session.txn = Some(t);
             return Err(ExecError {
                 detail: None,
+                hint: None,
                 code: "40001",
                 message: format!(
                     "could not serialize access due to concurrent update: {}",
@@ -5204,6 +5288,7 @@ fn txn_commit(
         if chain {
             return Err(ExecError {
                 detail: None,
+                hint: None,
                 code: "25001",
                 message: "COMMIT AND CHAIN can only be used in transaction blocks".to_string(),
             });
@@ -5307,6 +5392,7 @@ fn txn_vacuum(
         {
             return Err(ExecError {
                 detail: None,
+                hint: None,
                 code: "42P01",
                 message: format!("table \"{}\" does not exist", name),
             });
@@ -5525,6 +5611,7 @@ fn txn_rollback_to(
         .rposition(|(n, _, _)| n == name)
         .ok_or_else(|| ExecError {
             detail: None,
+            hint: None,
             code: "3B001",
             message: format!("no such savepoint \"{}\"", name),
         })?;
@@ -5634,6 +5721,7 @@ fn txn_release(session: &mut Session, name: &str) -> Result<ExecResult, ExecErro
         .rposition(|(n, _, _)| n == name)
         .ok_or_else(|| ExecError {
             detail: None,
+            hint: None,
             code: "3B001",
             message: format!("no such savepoint \"{}\"", name),
         })?;
@@ -6033,6 +6121,7 @@ fn describe_prepared(
             Some(cur) => Ok(Some(cur.cols.clone())),
             None => Err(exec::ExecError {
                 detail: None,
+                hint: None,
                 code: "34000",
                 message: format!("cursor \"{}\" does not exist", name),
             }),

@@ -2855,6 +2855,7 @@ pub(crate) fn run_plpgsql_stmts(
                             code,
                             message: msg,
                             detail: None,
+                            hint: None,
                         });
                     }
                 }
@@ -2865,6 +2866,7 @@ pub(crate) fn run_plpgsql_stmts(
                         code: intern_sqlstate(code),
                         message: msg.clone(),
                         detail: None,
+                        hint: None,
                     },
                     None => exec_err(
                         "0A000",
@@ -4396,6 +4398,17 @@ pub(crate) fn builtin_param_names(name: &str) -> Option<&'static [&'static str]>
             "create_missing",
             "null_value_treatment",
         ],
+        // v2.33: the statistics clear functions (pg_proc
+        // proargnames), so `schemaname => ...` notation resolves.
+        "pg_clear_relation_stats" => &["schemaname", "relname"],
+        "pg_clear_attribute_stats" => &["schemaname", "relname", "attname", "attnum", "inherited"],
+        "pg_clear_extended_stats" => &[
+            "schemaname",
+            "relname",
+            "statistics_schemaname",
+            "statistics_name",
+            "inherited",
+        ],
         // v1.85: `jsonb_path_*(target, path, vars, silent)`
         // (pg_proc proargnames; the _tz variants share the shape).
         "jsonb_path_query"
@@ -4418,6 +4431,10 @@ pub(crate) fn builtin_arg_default(name: &str, param: &str) -> Option<Expr> {
     use crate::sql::Literal;
     match (name, param) {
         ("parse_ident", "strict") => Some(Expr::Literal(Literal::Bool(true))),
+        // v2.33: pg_clear_attribute_stats takes attname XOR attnum;
+        // the omitted one arrives as NULL.
+        ("pg_clear_attribute_stats", "attname") => Some(Expr::Literal(Literal::Null)),
+        ("pg_clear_attribute_stats", "attnum") => Some(Expr::Literal(Literal::Null)),
         (_, "vars") if name.starts_with("jsonb_path_") => {
             Some(Expr::Literal(Literal::Text("{}".into())))
         }
@@ -4442,6 +4459,8 @@ pub(crate) fn resolve_named_args(
     name: &str,
     args: &[Expr],
 ) -> Result<Vec<Expr>, ExecError> {
+    // v2.33: pg_catalog.-qualified names resolve as the bare builtin.
+    let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
     let mut positional: Vec<&Expr> = Vec::new();
     let mut named: Vec<(&str, &Expr)> = Vec::new();
     let mut seen_named = false;
@@ -5244,6 +5263,10 @@ pub(crate) fn eval_func(
     args: &[Expr],
     node: *const Expr,
 ) -> Result<Value, ExecError> {
+    // v2.33: a pg_catalog. qualifier resolves to the bare builtin
+    // (pg_catalog is always first on PG's search path; the stats
+    // suites qualify the pg_restore_* calls this way).
+    let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
     // v0.95: resolve `name => expr` named arguments to positional order
     // (PG19 `reorder_function_arguments`). Zero-cost when absent.
     let owned: Vec<Expr>;
@@ -5643,6 +5666,21 @@ pub(crate) fn eval_func(
             vals.push(normalize_func_arg(name, eval_expr(q, scopes, a)?));
         }
         return eval_any_all_array(q, scopes, &vals);
+    }
+    // v2.33: the PG19 statistics import/export functions need
+    // engine access and RAW argument expressions (exact argument
+    // types drive PG's warning semantics), so they cannot go
+    // through the pure eval_func_vals path.
+    if matches!(
+        virt_catalog_name(name),
+        "pg_restore_relation_stats"
+            | "pg_clear_relation_stats"
+            | "pg_restore_attribute_stats"
+            | "pg_clear_attribute_stats"
+            | "pg_restore_extended_stats"
+            | "pg_clear_extended_stats"
+    ) {
+        return eval_stat_restore_func(q, scopes, virt_catalog_name(name), args);
     }
     // v0.9: sequence functions need engine + snapshot + session access;
     // they cannot go through the pure eval_func_vals path.
@@ -14701,6 +14739,8 @@ pub(crate) fn func_result_type(
     outer: &[&[QCol]],
     ctes: &[CteDef],
 ) -> Result<ColType, ExecError> {
+    // v2.33: pg_catalog.-qualified calls type as the bare builtin.
+    let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
     // v1.96: user-defined aggregates — result type is the final
     // function's return type, else the state type.
     {
@@ -15196,6 +15236,15 @@ pub(crate) fn func_result_type(
         // v0.9: sequence functions return bigint (INT here).
         // v0.98: lastval() returns bigint like the other sequence functions.
         "nextval" | "currval" | "setval" | "lastval" => Ok(ColType::Int),
+        // v2.33: the statistics import functions (eval intercepted in
+        // eval_func): restores return boolean; clears return void,
+        // declared Text like setseed (no void ColType).
+        "pg_restore_relation_stats" | "pg_restore_attribute_stats" | "pg_restore_extended_stats" => {
+            Ok(ColType::Bool)
+        }
+        "pg_clear_relation_stats" | "pg_clear_attribute_stats" | "pg_clear_extended_stats" => {
+            Ok(ColType::Text)
+        }
         // v0.14: PostgreSQL internal operator-function aliases return boolean.
         "booleq" | "boolne" | "int4eq" | "texteq" => Ok(ColType::Bool),
         // v0.45: format() returns text.

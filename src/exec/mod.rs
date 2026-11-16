@@ -51,8 +51,8 @@ pub(crate) use crate::sql::{
 pub(crate) use crate::storage::index_visible;
 pub(crate) use crate::storage::{
     ArrayElem, ArrayVal, BigDec, BitString, ColStats, ColType, Database, Engine, MultiVal, Numeric,
-    NumericSpecial, OperDef, RangeElem, RangeVal, Row, RowVersion, Sequence, ShellType, Snapshot,
-    Table, TableStats, Value, ViewDef, WriteOp, row_visible, toast_consts, toast_storage,
+    NumericSpecial, OperDef, RangeElem, RangeVal, RelStats, Row, RowVersion, Sequence, ShellType,
+    Snapshot, Table, TableStats, Value, ViewDef, WriteOp, row_visible, toast_consts, toast_storage,
 };
 pub(crate) use std::cell::RefCell;
 pub(crate) use std::cmp::Ordering;
@@ -112,6 +112,8 @@ mod roles;
 pub(crate) mod rules;
 mod seq;
 mod sje;
+mod statistic;
+mod statrestore;
 pub(crate) mod tsearch;
 mod viewdml;
 mod views;
@@ -382,6 +384,9 @@ mod v231_tests;
 #[path = "test_mods/v232_tests.rs"]
 mod v232_tests;
 #[cfg(test)]
+#[path = "test_mods/v233_tests.rs"]
+mod v233_tests;
+#[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;
 
@@ -432,6 +437,8 @@ pub(crate) use roles::*;
 pub(crate) use rules::*;
 pub(crate) use seq::*;
 pub(crate) use sje::*;
+pub(crate) use statistic::*;
+pub(crate) use statrestore::*;
 pub(crate) use viewdml::*;
 pub(crate) use views::*;
 pub(crate) use window::*;

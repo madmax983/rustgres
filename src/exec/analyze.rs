@@ -525,60 +525,555 @@ pub(crate) fn analyze_table_inh(
 fn stats_from_rows(columns: &[(String, ColType)], vis: &[&[Value]]) -> TableStats {
     let total = vis.len() as f64;
     let mut cols = HashMap::new();
-    for (ci, (cname, _)) in columns.iter().enumerate() {
-        let mut nulls = 0u64;
-        let mut counts: HashMap<Vec<u8>, (Value, u64)> = HashMap::new();
-        for r in vis {
-            let v = &r[ci];
-            if matches!(v, Value::Null) {
-                nulls += 1;
-                continue;
-            }
-            let mut k = Vec::new();
-            value_key(v, &mut k);
-            let e = counts.entry(k).or_insert_with(|| (v.clone(), 0));
-            e.1 += 1;
-        }
-        // Most common values: top 100 by count (ties by index order).
-        let mut by_freq: Vec<(Value, u64)> =
-            counts.values().map(|(v, c)| (v.clone(), *c)).collect();
-        by_freq.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| index_key_cmp(&a.0, &b.0)));
-        let mcv: Vec<(Value, f64)> = by_freq
-            .iter()
-            .take(100)
-            .map(|(v, c)| (v.clone(), if total > 0.0 { *c as f64 / total } else { 0.0 }))
-            .collect();
-        // Histogram bounds: up to 101 evenly spaced distinct values in
-        // index order (5 and 5.0 merge — index ordering, not byte order).
-        let mut distinct: Vec<Value> = counts.values().map(|(v, _)| v.clone()).collect();
-        distinct.sort_by(index_key_cmp);
-        distinct.dedup_by(|a, b| index_key_cmp(a, b) == Ordering::Equal);
-        let n_distinct = distinct.len() as f64;
-        let hist_bounds: Vec<Value> = if distinct.len() <= 101 {
-            distinct
-        } else {
-            (0..101)
-                .map(|i| distinct[i * (distinct.len() - 1) / 100].clone())
-                .collect()
-        };
-        cols.insert(
-            cname.clone(),
-            ColStats {
-                null_frac: if total > 0.0 {
-                    nulls as f64 / total
-                } else {
-                    0.0
-                },
-                n_distinct,
-                mcv,
-                hist_bounds,
-            },
-        );
+    for (ci, (cname, cty)) in columns.iter().enumerate() {
+        let values: Vec<Value> = vis.iter().map(|r| r[ci].clone()).collect();
+        cols.insert(cname.clone(), col_stats_from_values(cty, &values));
     }
     TableStats {
         reltuples: total,
         cols,
     }
+}
+
+/// v2.33: PG19 stawidth approximation — the stored width of one
+/// non-null datum. Fixed-width types report their typlen; varlena
+/// values report data length + 1 (the short varlena header PG's
+/// VARSIZE_ANY reports for values that fit in-line).
+pub(crate) fn datum_width(v: &Value) -> i64 {
+    match v {
+        Value::SmallInt(_) => 2,
+        Value::Int(_) => 4,
+        Value::BigInt(_) => 8,
+        Value::Float4(_) => 4,
+        Value::Float(_) => 8,
+        Value::Bool(_) => 1,
+        Value::Date(_) => 4,
+        Value::Timestamp(_) | Value::Timestamptz(_) | Value::Time(_) => 8,
+        Value::TimeTz(..) => 12,
+        Value::Interval(_) => 16,
+        Value::Uuid(_) => 16,
+        Value::PgLsn(_) => 8,
+        Value::Text(s) | Value::BpChar(s) => s.len() as i64 + 1,
+        Value::Bytea(b) => b.len() as i64 + 1,
+        Value::Numeric(_) => value_to_text_cast(v).len() as i64 + 1,
+        Value::Array(a) => 24 + a.elems.iter().map(|e| datum_width(e) + 4).sum::<i64>(),
+        Value::Record(fs) => 8 + fs.iter().map(|(_, f)| datum_width(f) + 4).sum::<i64>(),
+        Value::Range(r) => {
+            1 + r.lo.as_ref().map(datum_width).unwrap_or(0)
+                + r.hi.as_ref().map(datum_width).unwrap_or(0)
+        }
+        Value::Multirange(m) => {
+            8 + m
+                .ranges
+                .iter()
+                .map(|r| datum_width(&Value::Range(Box::new(r.clone()))))
+                .sum::<i64>()
+        }
+        Value::TsVector(t) => {
+            8 + t
+                .entries
+                .iter()
+                .map(|(lex, pos)| lex.len() as i64 + 2 + pos.len() as i64 * 2)
+                .sum::<i64>()
+        }
+        _ => value_to_text_cast(v).len() as i64 + 1,
+    }
+}
+
+/// v2.33: fixed typlen for stawidth of an all-null column (PG19:
+/// varwidth types report 0, fixed-width types report typlen).
+fn type_len(ty: &ColType) -> i64 {
+    match ty {
+        ColType::SmallInt => 2,
+        ColType::Int | ColType::Date | ColType::Float4 | ColType::Oid | ColType::Regclass => 4,
+        ColType::BigInt
+        | ColType::Float
+        | ColType::Timestamp
+        | ColType::Timestamptz
+        | ColType::Time
+        | ColType::PgLsn => 8,
+        ColType::Bool | ColType::SingleChar => 1,
+        ColType::Uuid => 16,
+        ColType::Interval => 16,
+        _ => 0,
+    }
+}
+
+/// v2.33: equal-population histogram bounds over a sorted multiset
+/// given as (value, count) pairs in ascending order. PG19 picks up
+/// to `max_bins` bounds spanning the multiset, first = min and
+/// last = max; fewer than 2 distinct values yields no histogram.
+fn weighted_hist_bounds(sorted_counts: &[(Value, u64)], max_bins: usize) -> Vec<Value> {
+    let distinct = sorted_counts.len();
+    if distinct < 2 {
+        return Vec::new();
+    }
+    let total: u64 = sorted_counts.iter().map(|(_, c)| *c).sum();
+    if total == 0 {
+        return Vec::new();
+    }
+    let nbins = distinct.min(max_bins).max(2);
+    let mut bounds: Vec<Value> = Vec::with_capacity(nbins);
+    for k in 0..nbins {
+        let rank = (k as u64 * (total - 1)) / (nbins as u64 - 1);
+        let mut acc = 0u64;
+        for (v, c) in sorted_counts {
+            acc += *c;
+            if rank < acc {
+                if bounds.last() != Some(v) {
+                    bounds.push(v.clone());
+                }
+                break;
+            }
+        }
+    }
+    if bounds.len() < 2 {
+        return Vec::new();
+    }
+    bounds
+}
+
+/// v2.33: the elements of one array / tsvector datum, for MCELEM /
+/// DECHIST statistics. The second return reports whether the row
+/// contained at least one NULL element (arrays only).
+fn datum_elements(v: &Value) -> (Vec<Value>, bool) {
+    match v {
+        Value::Array(a) => {
+            let mut has_null = false;
+            let mut out = Vec::new();
+            for e in &a.elems {
+                if matches!(e, Value::Null) {
+                    has_null = true;
+                } else {
+                    out.push(e.clone());
+                }
+            }
+            (out, has_null)
+        }
+        Value::TsVector(t) => (
+            t.entries
+                .iter()
+                .map(|(lex, _)| Value::text(lex.as_str()))
+                .collect(),
+            false,
+        ),
+        _ => (Vec::new(), false),
+    }
+}
+
+/// v2.33: numeric length of a non-empty range (PG's range subdiff
+/// rendered as float8). Unbounded sides yield +Infinity.
+fn range_length(r: &crate::storage::RangeVal) -> f64 {
+    let lo = r.lo.as_ref().map(numeric_of_value);
+    let hi = r.hi.as_ref().map(numeric_of_value);
+    match (lo, hi) {
+        (Some(l), Some(h)) => {
+            let mut len = h - l;
+            if r.hi_inc && r.elem.discrete() {
+                len += 1.0;
+            }
+            len.max(0.0)
+        }
+        _ => f64::INFINITY,
+    }
+}
+
+fn numeric_of_value(v: &Value) -> f64 {
+    match v {
+        Value::SmallInt(i) => *i as f64,
+        Value::Int(i) => *i as f64,
+        Value::BigInt(i) => *i as f64,
+        Value::Float4(f) => *f as f64,
+        Value::Float(f) => *f,
+        Value::Date(d) => *d as f64,
+        Value::Timestamp(t) | Value::Timestamptz(t) => *t as f64,
+        Value::Numeric(_) => value_to_text_cast(v).parse::<f64>().unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+/// v2.33: full per-column statistics over one column's values in
+/// physical (storage) order — the ANALYZE census. Computes the
+/// planner fields (null_frac / n_distinct / mcv / hist_bounds) in
+/// their PG19 shapes plus the pg_statistic payload fields
+/// (avg_width, distinct_raw, correlation, MCELEM / DECHIST, range
+/// histograms). Shared by table ANALYZE and the extended-statistics
+/// expression build.
+pub(crate) fn col_stats_from_values(cty: &ColType, values: &[Value]) -> ColStats {
+    col_stats_mcv_min(cty, values, 1)
+}
+
+/// v2.33: `mcv_min_count` is the MCV admission threshold: 1 for plain
+/// columns and index expressions (PG19 compute_scalar_stats keeps
+/// the whole tracked list for a fully-sampled table), 2 for CREATE
+/// STATISTICS expression items (PG19's extended-statistics
+/// expression build drops singleton values — the v2.30 rule).
+pub(crate) fn col_stats_mcv_min(cty: &ColType, values: &[Value], mcv_min_count: u64) -> ColStats {
+    let total = values.len() as f64;
+    let mut nulls = 0u64;
+    let mut counts: HashMap<Vec<u8>, (Value, u64)> = HashMap::new();
+    let mut nonnull: Vec<(usize, Value)> = Vec::new();
+    let mut total_width: i64 = 0;
+    for (i, v) in values.iter().enumerate() {
+        if matches!(v, Value::Null) {
+            nulls += 1;
+            continue;
+        }
+        total_width += datum_width(v);
+        nonnull.push((i, v.clone()));
+        let mut k = Vec::new();
+        value_key(v, &mut k);
+        let e = counts.entry(k).or_insert_with(|| (v.clone(), 0));
+        e.1 += 1;
+    }
+    let null_frac = if total > 0.0 {
+        nulls as f64 / total
+    } else {
+        0.0
+    };
+    let mut distinct: Vec<(Value, u64)> = counts.values().map(|(v, c)| (v.clone(), *c)).collect();
+    distinct.sort_by(|a, b| index_key_cmp(&a.0, &b.0));
+    let n_distinct = distinct.len() as f64;
+    // PG19 stadistinct raw form.
+    let distinct_raw = if nonnull.is_empty() || total == 0.0 {
+        0.0
+    } else if distinct.len() == nonnull.len() {
+        -(1.0 - null_frac)
+    } else if n_distinct > 0.1 * total {
+        -(n_distinct / total)
+    } else {
+        n_distinct
+    };
+    let avg_width = if nonnull.is_empty() {
+        type_len(cty) as i32
+    } else {
+        (total_width / nonnull.len() as i64) as i32
+    };
+    let is_range_ty = matches!(cty, ColType::Range(_) | ColType::Multirange(_));
+    // MCV: PG19's analyze_mcv_list keeps the whole tracked list when
+    // the sample is the entire table (samplerows == totalrows), which
+    // is always the case for this engine's exact census; the list is
+    // most-frequent first, capped at the statistics target (100).
+    // Range types get no scalar MCV in PG19 (their typanalyze
+    // replaces the scalar one).
+    let mut by_freq: Vec<(Value, u64)> = distinct
+        .iter()
+        .filter(|(_, c)| *c >= mcv_min_count)
+        .map(|(v, c)| (v.clone(), *c))
+        .collect();
+    by_freq.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| index_key_cmp(&a.0, &b.0)));
+    let mcv: Vec<(Value, f64)> = if is_range_ty {
+        Vec::new()
+    } else {
+        by_freq
+            .iter()
+            .take(100)
+            .map(|(v, c)| (v.clone(), if total > 0.0 { *c as f64 / total } else { 0.0 }))
+            .collect()
+    };
+    // Histogram: PG19 builds it over the non-MCV values.
+    let mcv_keys: std::collections::HashSet<Vec<u8>> = by_freq
+        .iter()
+        .take(100)
+        .map(|(v, _)| {
+            let mut k = Vec::new();
+            value_key(v, &mut k);
+            k
+        })
+        .collect();
+    let nonmcv: Vec<(Value, u64)> = distinct
+        .iter()
+        .filter(|(v, _)| {
+            let mut k = Vec::new();
+            value_key(v, &mut k);
+            !mcv_keys.contains(&k)
+        })
+        .map(|(v, c)| (v.clone(), *c))
+        .collect();
+    let hist_bounds: Vec<Value> = if is_range_ty {
+        Vec::new()
+    } else {
+        weighted_hist_bounds(&nonmcv, 101)
+    };
+    // Correlation: Spearman rank coefficient of physical vs sorted
+    // order (PG19 compute_scalar_stats).
+    let correlation = if nonnull.len() > 1 && !is_range_ty {
+        let n = nonnull.len() as f64;
+        let mut order: Vec<usize> = (0..nonnull.len()).collect();
+        order.sort_by(|&a, &b| {
+            index_key_cmp(&nonnull[a].1, &nonnull[b].1)
+                .then_with(|| nonnull[a].0.cmp(&nonnull[b].0))
+        });
+        let mut xysum = 0.0f64;
+        for (rank, &oi) in order.iter().enumerate() {
+            xysum += rank as f64 * oi as f64;
+        }
+        let xsum = n * (n - 1.0) / 2.0;
+        let x2sum = (n - 1.0) * n * (2.0 * n - 1.0) / 6.0;
+        let denom = n * x2sum - xsum * xsum;
+        if denom > 0.0 {
+            Some((n * xysum - xsum * xsum) / denom)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let (mcelem, dechist) = if matches!(cty, ColType::Array(_) | ColType::TsVector) {
+        compute_elem_stats(&nonnull)
+    } else {
+        (None, None)
+    };
+    let (range_length_hist, range_empty_frac, bounds_hist) = if is_range_ty {
+        compute_range_stats(&nonnull)
+    } else {
+        (None, None, None)
+    };
+    ColStats {
+        null_frac,
+        n_distinct,
+        mcv,
+        hist_bounds,
+        avg_width,
+        distinct_raw,
+        correlation,
+        mcelem,
+        dechist,
+        range_length_hist,
+        range_empty_frac,
+        bounds_hist,
+    }
+}
+
+/// v2.33: MCELEM + DECHIST over the non-null values of an array /
+/// tsvector column. Frequencies are fractions of the non-null rows.
+fn compute_elem_stats(
+    nonnull: &[(usize, Value)],
+) -> (Option<(Vec<Value>, Vec<f64>)>, Option<Vec<f64>>) {
+    if nonnull.is_empty() {
+        return (None, None);
+    }
+    let rows = nonnull.len() as f64;
+    let mut elem_rows: HashMap<Vec<u8>, (Value, u64)> = HashMap::new();
+    let mut null_elem_rows = 0u64;
+    let mut distinct_counts: Vec<u64> = Vec::with_capacity(nonnull.len());
+    for (_, v) in nonnull {
+        let (elems, has_null) = datum_elements(v);
+        if has_null {
+            null_elem_rows += 1;
+        }
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for e in &elems {
+            let mut k = Vec::new();
+            value_key(e, &mut k);
+            if seen.insert(k.clone()) {
+                let ent = elem_rows.entry(k).or_insert_with(|| (e.clone(), 0));
+                ent.1 += 1;
+            }
+        }
+        distinct_counts.push(seen.len() as u64);
+    }
+    let mcelem = if elem_rows.is_empty() {
+        None
+    } else {
+        let mut all: Vec<(Value, f64)> = elem_rows
+            .values()
+            .map(|(v, c)| (v.clone(), *c as f64 / rows))
+            .collect();
+        let maxfreq = all.iter().map(|(_, f)| *f).fold(0.0f64, f64::max);
+        all.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| index_key_cmp(&a.0, &b.0))
+        });
+        let kept: Vec<(Value, f64)> = all.iter().take(100).cloned().collect();
+        let minfreq = if all.len() > kept.len() {
+            all[kept.len()].1
+        } else {
+            kept.iter().map(|(_, f)| *f).fold(f64::INFINITY, f64::min)
+        };
+        let mut kept_sorted = kept.clone();
+        kept_sorted.sort_by(|a, b| index_key_cmp(&a.0, &b.0));
+        let vals: Vec<Value> = kept_sorted.iter().map(|(v, _)| v.clone()).collect();
+        let mut numbers: Vec<f64> = kept_sorted.iter().map(|(_, f)| *f).collect();
+        numbers.push(minfreq);
+        numbers.push(maxfreq);
+        numbers.push(null_elem_rows as f64 / rows);
+        Some((vals, numbers))
+    };
+    let dechist = {
+        let mut sorted = distinct_counts.clone();
+        sorted.sort_unstable();
+        let mut dc: Vec<(Value, u64)> = Vec::new();
+        for c in sorted {
+            if let Some(last) = dc
+                .last_mut()
+                .filter(|(v, _)| matches!(v, Value::Int(i) if *i == c as i64))
+            {
+                last.1 += 1;
+            } else {
+                dc.push((Value::Int(c as i64), 1));
+            }
+        }
+        let avg = distinct_counts.iter().sum::<u64>() as f64 / rows;
+        if dc.len() >= 2 {
+            let bounds = weighted_hist_bounds(&dc, 101);
+            if bounds.len() >= 2 {
+                let mut nums: Vec<f64> = bounds
+                    .iter()
+                    .map(|v| match v {
+                        Value::Int(i) => *i as f64,
+                        _ => 0.0,
+                    })
+                    .collect();
+                nums.push(avg);
+                Some(nums)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    (mcelem, dechist)
+}
+
+/// v2.33: range / multirange statistics over the non-null values:
+/// (range-length histogram bounds, empty-range fraction, bounds
+/// histogram). Multiranges contribute each constituent range.
+fn compute_range_stats(
+    nonnull: &[(usize, Value)],
+) -> (Option<Vec<f64>>, Option<f64>, Option<Vec<Value>>) {
+    if nonnull.is_empty() {
+        return (None, None, None);
+    }
+    let mut ranges: Vec<crate::storage::RangeVal> = Vec::new();
+    let mut empty_rows = 0u64;
+    for (_, v) in nonnull {
+        match v {
+            Value::Range(r) => {
+                if r.empty {
+                    empty_rows += 1;
+                } else {
+                    ranges.push((**r).clone());
+                }
+            }
+            Value::Multirange(m) => {
+                if m.ranges.is_empty() {
+                    empty_rows += 1;
+                } else {
+                    ranges.extend(m.ranges.iter().cloned());
+                }
+            }
+            _ => {}
+        }
+    }
+    let empty_frac = empty_rows as f64 / nonnull.len() as f64;
+    let length_hist = if ranges.len() < 2 {
+        Some(Vec::new())
+    } else {
+        let mut lens: Vec<f64> = ranges.iter().map(range_length).collect();
+        lens.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+        let mut pairs: Vec<(f64, u64)> = Vec::new();
+        for l in lens {
+            if let Some(last) = pairs.last_mut().filter(|(x, _)| *x == l) {
+                last.1 += 1;
+            } else {
+                pairs.push((l, 1));
+            }
+        }
+        if pairs.len() < 2 {
+            Some(Vec::new())
+        } else {
+            let total: u64 = pairs.iter().map(|(_, c)| *c).sum();
+            let nbins = pairs.len().min(101).max(2);
+            let mut bounds: Vec<f64> = Vec::new();
+            for k in 0..nbins {
+                let rank = (k as u64 * (total - 1)) / (nbins as u64 - 1);
+                let mut acc = 0u64;
+                for (l, c) in &pairs {
+                    acc += *c;
+                    if rank < acc {
+                        if bounds.last() != Some(l) {
+                            bounds.push(*l);
+                        }
+                        break;
+                    }
+                }
+            }
+            if bounds.len() >= 2 {
+                Some(bounds)
+            } else {
+                Some(Vec::new())
+            }
+        }
+    };
+    let bounds_hist = if ranges.len() < 2 {
+        None
+    } else {
+        let mut lowers: Vec<(Value, bool)> = Vec::new();
+        let mut uppers: Vec<(Value, bool)> = Vec::new();
+        for r in &ranges {
+            if let Some(lo) = &r.lo {
+                lowers.push((lo.clone(), r.lo_inc));
+            }
+            if let Some(hi) = &r.hi {
+                uppers.push((hi.clone(), r.hi_inc));
+            }
+        }
+        let hist_of = |side: &[(Value, bool)]| -> Vec<(Value, bool)> {
+            let mut sorted: Vec<(Value, bool)> = side.to_vec();
+            sorted.sort_by(|a, b| index_key_cmp(&a.0, &b.0));
+            let mut sc: Vec<(Value, u64)> = Vec::new();
+            for (v, _) in &sorted {
+                if let Some(last) = sc
+                    .last_mut()
+                    .filter(|(x, _)| index_key_cmp(x, v) == Ordering::Equal)
+                {
+                    last.1 += 1;
+                } else {
+                    sc.push((v.clone(), 1));
+                }
+            }
+            let bounds = weighted_hist_bounds(&sc, 101);
+            bounds
+                .iter()
+                .map(|b| {
+                    let inc = sorted
+                        .iter()
+                        .find(|(v, _)| index_key_cmp(v, b) == Ordering::Equal)
+                        .map(|(_, i)| *i)
+                        .unwrap_or(true);
+                    (b.clone(), inc)
+                })
+                .collect()
+        };
+        let lo_h = hist_of(&lowers);
+        let hi_h = hist_of(&uppers);
+        if lo_h.len() >= 2 && hi_h.len() >= 2 && lo_h.len() == hi_h.len() {
+            let elem = ranges[0].elem;
+            let name = ranges[0].name.clone();
+            let paired: Vec<Value> = lo_h
+                .iter()
+                .zip(hi_h.iter())
+                .map(|((lo, lo_inc), (hi, hi_inc))| {
+                    Value::Range(Box::new(crate::storage::RangeVal {
+                        elem,
+                        name: name.clone(),
+                        empty: false,
+                        lo: Some(lo.clone()),
+                        lo_inc: *lo_inc,
+                        hi: Some(hi.clone()),
+                        hi_inc: *hi_inc,
+                    }))
+                })
+                .collect();
+            Some(paired)
+        } else {
+            None
+        }
+    };
+    (length_hist, Some(empty_frac), bounds_hist)
 }
 
 /// v1.01: ANALYZE core shared by the top-level `ANALYZE` statement and
@@ -712,16 +1207,171 @@ pub(crate) fn exec_analyze_core(
     }
     for n in work {
         let stats = analyze_table(&eng.db, &n, snap, own, session);
+        let nrows = stats.reltuples;
         eng.db.stats.insert(n.clone(), stats);
+        // v2.33: pg_class statistics fields. A partitioned parent
+        // has no heap of its own: relpages stays -1 (PG19) while
+        // reltuples records the family's row count; a heap relation
+        // gets reltuples = live rows and relpages >= 1 once it holds
+        // rows (0 while empty).
+        {
+            let is_partitioned = eng
+                .db
+                .find_table(&n, snap, &[own], session)
+                .is_some_and(|t| t.partition.as_ref().is_some_and(|p| p.is_partitioned));
+            let family_rows = if is_partitioned {
+                analyze_table_inh(&eng.db, &n, snap, own, session)
+                    .map(|s| s.reltuples)
+                    .unwrap_or(nrows)
+            } else {
+                nrows
+            };
+            let e = eng.db.rel_stats.entry(n.clone()).or_default();
+            if is_partitioned {
+                e.relpages = -1;
+                e.reltuples = family_rows as f32;
+            } else {
+                e.reltuples = nrows as f32;
+                e.relpages = if nrows > 0.0 {
+                    (nrows as i64).max(1)
+                } else {
+                    0
+                };
+            }
+        }
         // v2.30: inherited (family) statistics for pg_statistic's
         // stxdinherit rows and family-wide estimates.
         if let Some(inh) = analyze_table_inh(&eng.db, &n, snap, own, session) {
             eng.db.stats_inh.insert(n.clone(), inh);
         }
+        // v2.33: statistics for index expressions (PG19 stores them
+        // in pg_statistic under the index's own relid). Plain key
+        // columns get no row — they ride on the table's statistics.
+        analyze_index_exprs(eng, snap, own, session, &n);
         // v2.17: build extended statistics for objects on this table.
         extstats::build_ext_stats_for_table(eng, snap, own, session, &n);
     }
     Ok(())
+}
+
+/// v2.33: compute pg_statistic rows for the expression columns of
+/// every index on `table`, stored in db.stats under the index name
+/// with "expr:<attnum>" column keys (attname renders as "expr").
+/// Evaluation failures skip that index silently (ANALYZE must not
+/// fail on an expression this engine cannot evaluate).
+fn analyze_index_exprs(eng: &mut Engine, snap: &Snapshot, own: u64, session: u64, table: &str) {
+    let defs: Vec<IndexDef> = crate::exec::catalog::visible_index_defs(&eng.db, snap, own, session)
+        .into_iter()
+        .filter(|d| d.table == table && d.exprs.iter().any(|e| e.is_some()))
+        .collect();
+    if defs.is_empty() {
+        return;
+    }
+    let Some(tbl) = eng.db.find_table(table, snap, &[own], session).cloned() else {
+        return;
+    };
+    let vis: Vec<&RowVersion> = tbl
+        .rows
+        .iter()
+        .filter(|r| row_visible(r, snap, &[own]))
+        .collect();
+    let schema: Vec<QCol> = tbl
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, (cn, ty))| QCol {
+            qual: String::new(),
+            name: cn.clone(),
+            ty: ty.clone(),
+            hidden: false,
+            src_ord: i as u32,
+        })
+        .collect();
+    for def in defs {
+        let mut cols: HashMap<String, ColStats> = HashMap::new();
+        for (ai, esrc) in def.exprs.iter().enumerate() {
+            let Some(src) = esrc else { continue };
+            let Ok(expr) = crate::sql::parse_expr_str(src) else {
+                continue;
+            };
+            let mut lock_ids: Vec<(String, u64)> = Vec::new();
+            let mut q = Q {
+                eng,
+                snap,
+                own,
+                all_xids: vec![own],
+                session,
+                role: "postgres",
+                read_only: true,
+                depth: 0,
+                lock_ids: &mut lock_ids,
+                ctes: Vec::new(),
+                wctx: None,
+                srf_vals: Vec::new(),
+                priv_scopes: Vec::new(),
+                priv_role_override: None,
+                hashed_exists: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
+                immutable_fn_cache: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
+                plan_fold_memo: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
+                hashed_in: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+                pending_updates: None,
+                write: None,
+            };
+            let mut vals: Vec<Value> = Vec::with_capacity(vis.len());
+            let mut ok = true;
+            for r in &vis {
+                let frame = Scope {
+                    schema: &schema,
+                    row: &r.values,
+                    prov: None,
+                };
+                match eval_expr(&mut q, std::slice::from_ref(&frame), &expr) {
+                    Ok(v) => vals.push(v),
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            drop(q);
+            if !ok || vals.is_empty() && vis.is_empty() {
+                // Keep parity with table columns: an empty index
+                // still records a pristine entry (filtered at scan).
+                if !ok {
+                    continue;
+                }
+            }
+            let ty = vals
+                .iter()
+                .find(|v| !matches!(v, Value::Null))
+                .map(value_coltype)
+                .unwrap_or(ColType::Bool);
+            let cs = col_stats_from_values(&ty, &vals);
+            cols.insert(format!("expr:{}", ai + 1), cs);
+        }
+        if !cols.is_empty() {
+            eng.db.stats.insert(
+                def.name.clone(),
+                TableStats {
+                    reltuples: vis.len() as f64,
+                    cols,
+                },
+            );
+            // The index's own pg_class reltuples follows the table's
+            // analyzed row count in PG19.
+            let e = eng
+                .db
+                .rel_stats
+                .entry(def.name.clone())
+                .or_insert(RelStats {
+                    relpages: 1,
+                    reltuples: 0.0,
+                    relallvisible: 0,
+                    relallfrozen: 0,
+                });
+            e.reltuples = vis.len() as f32;
+        }
+    }
 }
 
 /// v0.8: `ANALYZE [table]` — top-level statement wrapper around
@@ -745,67 +1395,14 @@ pub(crate) fn exec_analyze(
     })
 }
 
-/// The pg_stats system catalog table (virtual): one row per analyzed table
-/// column. A real table named pg_stats takes precedence (checked by the
-/// caller).
+/// The pg_stats system catalog table (virtual): one row per analyzed
+/// table column. A real table named pg_stats takes precedence
+/// (checked by the caller). v2.33: the PG19 19-column schema and
+/// slot-derived contents live in statistic.rs.
 pub(crate) fn pg_stats_schema() -> Vec<QCol> {
-    [
-        ("schemaname", ColType::Text),
-        ("tablename", ColType::Text),
-        ("attname", ColType::Text),
-        ("null_frac", ColType::Float),
-        ("n_distinct", ColType::Float),
-        ("most_common_vals", ColType::Text),
-        ("most_common_freqs", ColType::Text),
-    ]
-    .into_iter()
-    .map(|(n, ty)| QCol {
-        qual: "pg_stats".to_string(),
-        name: n.to_string(),
-        ty,
-
-        hidden: false,
-        src_ord: 0,
-    })
-    .collect()
+    pg_stats_schema_v233()
 }
 
 pub(crate) fn pg_stats_scan(db: &Database) -> (Vec<QCol>, Vec<QRow>) {
-    let schema = pg_stats_schema();
-    let mut table_names: Vec<&String> = db.stats.keys().collect();
-    table_names.sort();
-    let mut rows = Vec::new();
-    for tn in table_names {
-        let ts = &db.stats[tn];
-        let mut col_names: Vec<&String> = ts.cols.keys().collect();
-        col_names.sort();
-        for cn in col_names {
-            let cs = &ts.cols[cn];
-            let vals = cs
-                .mcv
-                .iter()
-                .map(|(v, _)| value_to_text_cast(v))
-                .collect::<Vec<_>>()
-                .join(",");
-            let freqs = cs
-                .mcv
-                .iter()
-                .map(|(_, f)| format!("{:.4}", f))
-                .collect::<Vec<_>>()
-                .join(",");
-            rows.push(QRow {
-                cells: Row::new(vec![
-                    Value::text("public"),
-                    Value::text(tn.as_str()),
-                    Value::text(cn.as_str()),
-                    Value::Float(cs.null_frac),
-                    Value::Float(cs.n_distinct),
-                    Value::text(format!("{{{}}}", vals)),
-                    Value::text(format!("{{{}}}", freqs)),
-                ]),
-                prov: Vec::new(),
-            });
-        }
-    }
-    (schema, rows)
+    pg_stats_scan_v233(db)
 }

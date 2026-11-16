@@ -1002,6 +1002,7 @@ pub(crate) fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<V
         // Keep the parameter number in the message for debuggability.
         ExecError {
             detail: None,
+            hint: None,
             code: e.code,
             message: format!("parameter ${}: {}", n, e.message),
         }

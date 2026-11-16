@@ -618,12 +618,17 @@ def t_analyze():
         check("pg_stats rows", codes == [] and [r[0] for r in rows] == ["a", "b"], f"{rows}")
         by_att = {r[0]: r for r in rows}
         check("null_frac for a", abs(float(by_att["a"][1]) - 0.2) < 1e-9, f"{by_att}")
-        check("n_distinct for a", by_att["a"][2] == "3", f"{by_att}")
-        check("n_distinct for b", by_att["b"][2] == "3", f"{by_att}")
+        # v2.33: PG19 stadistinct storage rule — an estimate above
+        # 10% of the row count is stored as a negative fraction
+        # (3 distinct of 5 rows -> -0.6), exactly as PG19 renders it.
+        check("n_distinct for a", by_att["a"][2] == "-0.6", f"{by_att}")
+        check("n_distinct for b", by_att["b"][2] == "-0.6", f"{by_att}")
 
         _, rows, _ = c.q("SELECT most_common_vals, most_common_freqs FROM pg_stats WHERE tablename='s' AND attname='a'")
+        # v2.33: PG19 keeps the full MCV list for a fully-sampled
+        # table and renders float4 freqs in shortest form.
         check("mcv lists 1 as most common",
-              rows[0][0] == "{1,2,3}" and "0.4000" in rows[0][1], f"{rows}")
+              rows[0][0] == "{1,2,3}" and rows[0][1] == "{0.4,0.2,0.2}", f"{rows}")
 
         # ANALYZE updates EXPLAIN estimates
         # v1.62: seed `s` past one heap page (then re-ANALYZE) so the

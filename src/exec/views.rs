@@ -221,6 +221,10 @@ pub(crate) fn exec_create_view(
     }
     // Every referenced relation must exist (as a table or view).
     // v2.18: a sequence is also a legal view source in PG19.
+    // v2.33: the virtual catalog relations the FROM source builder
+    // serves (join.rs) are legal view sources too — the stats_import
+    // suite's scaffolding views read pg_stats / pg_statistic /
+    // pg_stats_ext(_exprs) through CREATE VIEW.
     for d in &deps {
         let is_table = eng
             .db
@@ -228,7 +232,48 @@ pub(crate) fn exec_create_view(
             .is_some();
         let is_view = eng.db.find_view(d, ctx.snap, ctx.own).is_some();
         let is_seq = eng.db.sequences.contains_key(d.as_str());
-        if !is_table && !is_view && !is_seq {
+        let is_virtual = matches!(
+            virt_catalog_name(d),
+            "pg_aios"
+                | "pg_attribute"
+                | "pg_auth_members"
+                | "pg_authid"
+                | "pg_backend_memory_contexts"
+                | "pg_class"
+                | "pg_collation"
+                | "pg_constraint"
+                | "pg_database"
+                | "pg_default_acl"
+                | "pg_index"
+                | "pg_indexes"
+                | "pg_inherits"
+                | "pg_largeobject"
+                | "pg_largeobject_metadata"
+                | "pg_namespace"
+                | "pg_policies"
+                | "pg_policy"
+                | "pg_publication"
+                | "pg_publication_namespace"
+                | "pg_publication_rel"
+                | "pg_publication_sequences"
+                | "pg_publication_tables"
+                | "pg_rewrite"
+                | "pg_roles"
+                | "pg_rules"
+                | "pg_sequences"
+                | "pg_shdepend"
+                | "pg_shmem_allocations"
+                | "pg_stat_activity"
+                | "pg_statistic"
+                | "pg_statistic_ext"
+                | "pg_statistic_ext_data"
+                | "pg_stats"
+                | "pg_stats_ext"
+                | "pg_stats_ext_exprs"
+                | "pg_trigger"
+                | "pg_user"
+        );
+        if !is_table && !is_view && !is_seq && !is_virtual {
             return Err(exec_err(
                 "42P01",
                 format!("relation \"{}\" does not exist", d),

@@ -1220,6 +1220,13 @@ pub(crate) fn catalog_name_oid(name: &str) -> Option<u32> {
         "pg_operator" => 2617,
         "pg_rewrite" => 2618,
         "pg_statistic" => 2619,
+        // v2.33: extended-statistics catalogs (PG19 oids) and the
+        // statistics views (synthetic, stable within the engine).
+        "pg_statistic_ext" => 3381,
+        "pg_statistic_ext_data" => 3997,
+        "pg_stats" => 3996,
+        "pg_stats_ext" => 3998,
+        "pg_stats_ext_exprs" => 3999,
         "pg_trigger" => 2620,
         "pg_foreign_data_wrapper" => 2328,
         "pg_foreign_server" => 1417,

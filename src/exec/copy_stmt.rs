@@ -36,6 +36,7 @@ pub fn copy_ncols(
                     code: "42P10",
                     message: format!("column \"{}\" is a generated column", n),
                     detail: Some("Generated columns cannot be used in COPY.".to_string()),
+                    hint: None,
                 });
             }
         }
@@ -74,6 +75,7 @@ pub fn copy_to_rows(
     );
     let stmt = crate::sql::parse_statement(&sql).map_err(|e| ExecError {
         detail: None,
+        hint: None,
         code: e.code,
         message: e.message,
     })?;
@@ -81,6 +83,7 @@ pub fn copy_to_rows(
         ExecResult::Select { columns, rows } => Ok((columns, rows)),
         _ => Err(ExecError {
             detail: None,
+            hint: None,
             code: "XX000",
             message: "internal error: COPY TO did not return rows".to_string(),
         }),

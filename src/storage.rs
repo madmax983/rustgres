@@ -6242,6 +6242,11 @@ pub struct Database {
     /// runs on a table with descendants. Same durability model as
     /// `stats`.
     pub stats_inh: HashMap<String, TableStats, FxBuildHasher>,
+    /// v2.33: pg_class statistics fields (relpages / reltuples /
+    /// relallvisible / relallfrozen) by relation name — tables under
+    /// their storage key, indexes under the index name. Same
+    /// non-transactional durability model as `stats`.
+    pub rel_stats: HashMap<String, RelStats, FxBuildHasher>,
     /// v2.17: extended-statistics objects (CREATE STATISTICS). Like
     /// `stats`, kept in a non-transactional side registry: the objects
     /// are DDL in PG, but this engine's precedent for analyzer state
@@ -6659,6 +6664,7 @@ impl Database {
             indexes: HashMap::default(),
             stats: HashMap::default(),
             stats_inh: HashMap::default(),
+            rel_stats: HashMap::default(),
             ext_stats: Vec::new(),
             views: HashMap::default(),
             rules: HashMap::default(),
@@ -7556,6 +7562,65 @@ pub struct ColStats {
     /// Sorted distinct-value bounds for range selectivity (a coarse
     /// histogram: consecutive pairs bracket ~equal row counts).
     pub hist_bounds: Vec<Value>,
+    /// v2.33: PG19 pg_statistic.stawidth — average stored width of
+    /// non-null values, in bytes.
+    pub avg_width: i32,
+    /// v2.33: PG19 pg_statistic.stadistinct in its raw stored form
+    /// (0 = unknown, >0 = absolute count, <0 = -(fraction of rows)).
+    /// The planner-facing count stays in `n_distinct`; the catalog
+    /// surfaces (pg_statistic / pg_stats) render this raw value, and
+    /// pg_restore_attribute_stats writes it verbatim.
+    pub distinct_raw: f64,
+    /// v2.33: PG19 STATISTIC_KIND_CORRELATION coefficient (physical
+    /// vs logical order), when the column has a `<` operator and
+    /// more than one non-null value was analyzed.
+    pub correlation: Option<f64>,
+    /// v2.33: PG19 STATISTIC_KIND_MCELEM for array / tsvector
+    /// columns: (most common elements in element order, stanumbers —
+    /// per-element frequencies followed by the trailing extras
+    /// [minfreq, maxfreq, null-element frequency]).
+    pub mcelem: Option<(Vec<Value>, Vec<f64>)>,
+    /// v2.33: PG19 STATISTIC_KIND_DECHIST stanumbers: histogram
+    /// bounds over per-row distinct-element counts, with the average
+    /// distinct count appended as the last element.
+    pub dechist: Option<Vec<f64>>,
+    /// v2.33: PG19 STATISTIC_KIND_RANGE_LENGTH_HISTOGRAM stavalues:
+    /// histogram bounds over non-empty range lengths (float8).
+    pub range_length_hist: Option<Vec<f64>>,
+    /// v2.33: PG19 STATISTIC_KIND_RANGE_LENGTH_HISTOGRAM
+    /// stanumbers[1]: fraction of empty ranges.
+    pub range_empty_frac: Option<f64>,
+    /// v2.33: PG19 STATISTIC_KIND_BOUNDS_HISTOGRAM stavalues: range
+    /// values whose lower bounds form the lower-bound histogram and
+    /// whose upper bounds form the upper-bound histogram.
+    pub bounds_hist: Option<Vec<Value>>,
+}
+
+/// v2.33: pg_class relpages / reltuples / relallvisible /
+/// relallfrozen for one relation (table or index), as maintained by
+/// ANALYZE / CREATE INDEX and the pg_restore_relation_stats /
+/// pg_clear_relation_stats functions. Kept in the same
+/// non-transactional side registry as `stats` (PG updates these
+/// in-place in pg_class; this engine's stats durability model is
+/// in-memory, see `stats`).
+#[derive(Clone, Copy, Debug)]
+pub struct RelStats {
+    pub relpages: i64,
+    pub reltuples: f32,
+    pub relallvisible: i64,
+    pub relallfrozen: i64,
+}
+
+impl Default for RelStats {
+    /// PG19 defaults for a newly created heap relation.
+    fn default() -> Self {
+        RelStats {
+            relpages: 0,
+            reltuples: -1.0,
+            relallvisible: 0,
+            relallfrozen: 0,
+        }
+    }
 }
 
 /// v2.17: one item of a CREATE STATISTICS definition: a plain column
@@ -7597,6 +7662,24 @@ pub struct ExtExprStat {
     pub avg_width: i32,
     pub n_distinct: f64,
     pub mcv: Vec<(Value, f64)>,
+    /// v2.33: PG19 pg_statistic form of n_distinct (raw stadistinct)
+    /// for the pg_stats_ext_exprs rendering; the planner-facing
+    /// count stays in `n_distinct`.
+    pub distinct_raw: f64,
+    /// v2.33: histogram bounds (STATISTIC_KIND_HISTOGRAM stavalues).
+    pub hist_bounds: Vec<Value>,
+    /// v2.33: correlation coefficient, when computed.
+    pub correlation: Option<f64>,
+    /// v2.33: MCELEM payload, shaped like ColStats::mcelem.
+    pub mcelem: Option<(Vec<Value>, Vec<f64>)>,
+    /// v2.33: DECHIST stanumbers.
+    pub dechist: Option<Vec<f64>>,
+    /// v2.33: range-length histogram bounds (float8).
+    pub range_length_hist: Option<Vec<f64>>,
+    /// v2.33: fraction of empty ranges.
+    pub range_empty_frac: Option<f64>,
+    /// v2.33: bounds-histogram range values.
+    pub bounds_hist: Option<Vec<Value>>,
 }
 
 /// v2.17: a CREATE STATISTICS object (pg_statistic_ext row + data).

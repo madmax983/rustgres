@@ -244,7 +244,9 @@ pub(crate) fn from_schema_item(
             }
             // v0.8: the pg_stats system catalog is virtual — a real table
             // by that name takes precedence.
-            if name == "pg_stats" && eng.db.find_table(name, snap, &[own], session).is_none() {
+            if virt_catalog_name(&name) == "pg_stats"
+                && eng.db.find_table(name, snap, &[own], session).is_none()
+            {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());
                 let schema: Vec<QCol> = pg_stats_schema()
                     .into_iter()
@@ -257,15 +259,19 @@ pub(crate) fn from_schema_item(
                 return Ok(());
             }
             // v2.17: extended-statistics catalogs are virtual.
+            // v2.33: pg_statistic joins the family; pg_catalog.
+            // qualifiers are accepted.
             if matches!(
-                name.as_str(),
-                "pg_statistic_ext"
+                virt_catalog_name(&name),
+                "pg_statistic"
+                    | "pg_statistic_ext"
                     | "pg_statistic_ext_data"
                     | "pg_stats_ext"
                     | "pg_stats_ext_exprs"
             ) && eng.db.find_table(name, snap, &[own], session).is_none()
             {
-                let base_schema = match name.as_str() {
+                let base_schema = match virt_catalog_name(&name) {
+                    "pg_statistic" => pg_statistic_schema(),
                     "pg_statistic_ext" => pg_statistic_ext_schema(),
                     "pg_statistic_ext_data" => pg_statistic_ext_data_schema(),
                     "pg_stats_ext" => pg_stats_ext_schema(),
@@ -1227,7 +1233,9 @@ pub(crate) fn expr_col_name_strength(e: &Expr) -> (String, u8) {
         Expr::Func { name, .. } if name == "__tsquery_phrase" || name == "__tsquery_not" => {
             ("?column?".to_string(), 0)
         }
-        Expr::Func { name, .. } => (name.clone(), 2),
+        // v2.33: PG names the column by the bare function name — a
+        // schema qualifier in the call is not part of it.
+        Expr::Func { name, .. } => (name.rsplit('.').next().unwrap_or(name).to_string(), 2),
         // v0.55: PG names an unaliased CASE output column "case".
         // v1.96 (parse_target.c T_CaseExpr): the name comes from the
         // ELSE result when it carries one (strength > 1), else "case"
