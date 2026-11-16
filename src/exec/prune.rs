@@ -2196,6 +2196,10 @@ fn hash_survivor(
     Some(routed)
 }
 
+/// `(child name, is_default, bound)` triples, as fetched once via
+/// `find_table` per child.
+type OrderedChildren = Vec<(String, bool, Option<PartBound>)>;
+
 /// Children of a partitioned parent in PG19 Append order (see
 /// pruned_children). Falls back to creation order when a bound cannot
 /// be read.
@@ -2206,7 +2210,7 @@ fn ordered_children(
     snap: &Snapshot,
     own: u64,
     session: u64,
-) -> Vec<String> {
+) -> Result<OrderedChildren, Vec<String>> {
     let mut items: Vec<(String, bool, Option<PartBound>)> = Vec::new();
     for child_name in &pinfo.children {
         match db.find_table(child_name, snap, &[own], session) {
@@ -2218,7 +2222,7 @@ fn ordered_children(
                     cinfo.and_then(|c| c.bound.clone()),
                 ));
             }
-            None => return pinfo.children.clone(),
+            None => return Err(pinfo.children.clone()),
         }
     }
     let _ = parent;
@@ -2277,7 +2281,7 @@ fn ordered_children(
             _ => Ordering::Equal,
         }
     });
-    items.into_iter().map(|(n, _, _)| n).collect()
+    Ok(items)
 }
 
 /// v2.32: the surviving direct children of a partitioned parent under
@@ -2426,13 +2430,34 @@ pub(crate) fn pruned_children(
     // LIST by bound values (NULL-valued partition after all valued
     // ones), RANGE by lower bound, HASH by remainder; the DEFAULT
     // partition always sorts last.
-    let ordered = ordered_children(db, parent, pinfo, snap, own, session);
+    let ordered_result = ordered_children(db, parent, pinfo, snap, own, session);
     if !pruning {
-        return Some(ordered);
+        return Some(match &ordered_result {
+            Ok(items) => items.iter().map(|(n, _, _)| n.clone()).collect(),
+            Err(names) => names.clone(),
+        });
     }
     let where_ = match where_ {
         Some(w) => w,
-        None => return Some(ordered),
+        None => {
+            return Some(match &ordered_result {
+                Ok(items) => items.iter().map(|(n, _, _)| n.clone()).collect(),
+                Err(names) => names.clone(),
+            });
+        }
+    };
+    // A child that failed to resolve mid-sort would fail the same
+    // find_table lookup again below (same snapshot/session) for the
+    // LIST/RANGE default-coverage path, so match the original
+    // "give up, caller treats the whole table as unprunable" result;
+    // HASH routing below never re-resolves children, so it can still
+    // use the unsorted names.
+    let ordered = match ordered_result {
+        Ok(items) => items,
+        Err(names) if pinfo.method == PartMethod::Hash => {
+            names.into_iter().map(|n| (n, false, None)).collect()
+        }
+        Err(_) => return None,
     };
     // v2.32: when this table is itself a partition, OR groups that
     // contradict the table's OWN bound can never reach its subtree
@@ -2488,17 +2513,21 @@ pub(crate) fn pruned_children(
             session,
             eff_where,
         ) {
-            return Some(ordered.into_iter().filter(|c| routed.contains(c)).collect());
+            return Some(
+                ordered
+                    .into_iter()
+                    .filter(|(n, _, _)| routed.contains(n))
+                    .map(|(n, _, _)| n)
+                    .collect(),
+            );
         }
-        return Some(ordered);
+        return Some(ordered.into_iter().map(|(n, _, _)| n).collect());
     }
-    // Sibling bounds for the default-coverage test.
-    let mut child_tables: Vec<(String, bool, Option<PartBound>)> = Vec::new();
-    for child_name in &ordered {
-        let child = db.find_table(child_name, snap, &[own], session)?;
-        let cinfo = child.partition.as_ref()?;
-        child_tables.push((child_name.clone(), cinfo.is_default, cinfo.bound.clone()));
-    }
+    // Sibling bounds for the default-coverage test: reuse the
+    // (name, is_default, bound) triples ordered_children already
+    // fetched via find_table, instead of looking every child up a
+    // second time.
+    let child_tables: OrderedChildren = ordered;
     let sib_bounds: Vec<&PartBound> = child_tables
         .iter()
         .filter(|(_, is_def, _)| !is_def)
