@@ -91,6 +91,10 @@ pub(crate) fn analyze_actual(
         }
         PlanNode::SubqueryScan { child, .. } => analyze_actual(child, ax, cap, false),
         PlanNode::Values { rows, .. } => *rows,
+        // v2.32: an Append's actual is the sum of its children's.
+        PlanNode::Append { children, .. } => {
+            bounded(children.iter().map(|c| analyze_actual(c, ax, None, false)).sum())
+        }
     }
 }
 
@@ -282,6 +286,19 @@ pub(crate) fn render_analyze(
         }
         PlanNode::Values { .. } => {
             out.push(format!("{}Values {}", pad, tag));
+        }
+        // v2.32: PG19 `Append` under EXPLAIN ANALYZE, with the
+        // runtime-pruning property when pruning removed subplans.
+        PlanNode::Append {
+            children, removed, ..
+        } => {
+            out.push(format!("{}Append {}", pad, tag));
+            if *removed > 0 {
+                out.push(format!("{}Subplans Removed: {}", ppad, removed));
+            }
+            for child in children {
+                render_analyze(child, ax, depth + 1, None, false, costs, out);
+            }
         }
     }
 }

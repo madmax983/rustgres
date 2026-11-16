@@ -222,6 +222,19 @@ pub(crate) fn infer_expr_key_type(expr: &Expr, parent: &Table) -> ColType {
         Expr::Collate { expr, .. } | Expr::Cast { expr, .. } | Expr::CastNamed { expr, .. } => {
             infer_expr_key_type(expr, parent)
         }
+        // v2.32: boolean NOT of a bool column is a bool key (the
+        // iboolpart `(not a)` shape): the old Int default made bound
+        // literals like 'true' fail coercion with 22P02, so the
+        // partitions were never created at all.
+        Expr::Not(inner) => {
+            let t = infer_expr_key_type(inner, parent);
+            if t == ColType::Bool {
+                ColType::Bool
+            } else {
+                ColType::Int
+            }
+        }
+        Expr::IsBool { .. } | Expr::IsNull { .. } | Expr::Cmp { .. } => ColType::Bool,
         _ => ColType::Int,
     }
 }
@@ -236,6 +249,26 @@ pub(crate) fn unwrap_bound_collate(e: &Expr) -> &Expr {
             unwrap_bound_collate(expr)
         }
         other => other,
+    }
+}
+
+/// v2.32: a partition-bound literal, accepting a unary minus/plus on
+/// a numeric literal (PG19 gram.y: bound elements are `AexprConst`,
+/// and `-2` is a valid constant there; the parser keeps it as
+/// `Neg(Literal)`).
+pub(crate) fn bound_literal(e: &Expr) -> Option<Literal> {
+    match unwrap_bound_collate(e) {
+        Expr::Literal(l) => Some(l.clone()),
+        Expr::Neg(inner) => match inner.as_ref() {
+            Expr::Literal(Literal::Int(i)) => Some(Literal::Int(-i)),
+            Expr::Literal(Literal::BigInt(i)) => Some(Literal::BigInt(-i)),
+            Expr::Literal(Literal::SmallInt(i)) => Some(Literal::SmallInt(-i)),
+            Expr::Literal(Literal::Float(f)) => Some(Literal::Float(-f)),
+            Expr::Literal(Literal::Real(f)) => Some(Literal::Real(-f)),
+            Expr::Literal(Literal::Decimal(s)) => Some(Literal::Decimal(format!("-{s}"))),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -265,16 +298,16 @@ pub(crate) fn convert_part_bound(
             let mut values = Vec::new();
             let mut has_null = false;
             for e in exprs {
-                match unwrap_bound_collate(e) {
-                    Expr::Literal(Literal::Null) => has_null = true,
-                    Expr::Literal(l) => {
+                match bound_literal(e) {
+                    Some(Literal::Null) => has_null = true,
+                    Some(l) => {
                         // Coerce to the first key column's type (list keys
                         // are single-column in the corpus; multi-column
                         // list keys aren't supported by PG anyway).
                         let ty = key_types.first().copied().unwrap_or(ColType::Int);
-                        values.push(coerce_literal(l, &ty, &parent.columns[0].0)?);
+                        values.push(coerce_literal(&l, &ty, &parent.columns[0].0)?);
                     }
-                    _ => {
+                    None => {
                         return Err(exec_err(
                             "42601",
                             "partition bound must be a literal".to_string(),
@@ -355,9 +388,9 @@ pub(crate) fn convert_range_bound(
     match b {
         RangeBoundDef::Min => Ok(RangeBound::Min),
         RangeBoundDef::Max => Ok(RangeBound::Max),
-        RangeBoundDef::Val(e) => match unwrap_bound_collate(e) {
-            Expr::Literal(l) => Ok(RangeBound::Val(coerce_literal(l, ty, &columns[0].0)?)),
-            _ => Err(exec_err(
+        RangeBoundDef::Val(e) => match bound_literal(e) {
+            Some(l) => Ok(RangeBound::Val(coerce_literal(&l, ty, &columns[0].0)?)),
+            None => Err(exec_err(
                 "42601",
                 "partition bound must be a literal".to_string(),
             )),
@@ -2179,6 +2212,19 @@ fn infer_key_type_from_cols(expr: &Expr, cols: &[(String, ColType)]) -> ColType 
         Expr::Collate { expr, .. } | Expr::Cast { expr, .. } | Expr::CastNamed { expr, .. } => {
             infer_key_type_from_cols(expr, cols)
         }
+        // v2.32: boolean NOT of a bool column is a bool key (the
+        // iboolpart `(not a)` shape): the old Int default made bound
+        // literals like 'true' fail coercion with 22P02, so the
+        // partitions were never created at all.
+        Expr::Not(inner) => {
+            let t = infer_key_type_from_cols(inner, cols);
+            if t == ColType::Bool {
+                ColType::Bool
+            } else {
+                ColType::Int
+            }
+        }
+        Expr::IsBool { .. } | Expr::IsNull { .. } | Expr::Cmp { .. } => ColType::Bool,
         _ => ColType::Int,
     }
 }

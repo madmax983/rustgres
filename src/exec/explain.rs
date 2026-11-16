@@ -147,7 +147,16 @@ pub(crate) fn pg_type_label(ty: ColType) -> Option<String> {
 /// coercing an unknown-type literal to the comparison column's type and
 /// `get_const_expr` deparsing the result. `None` = no faithful spelling.
 pub(crate) fn pg_coerced_text(s: &str, ty: ColType) -> Option<String> {
-    let label = pg_type_label(ty)?;
+    // v2.32: PG19 deparses a coerced unknown literal's bpchar/varchar
+    // const with typmod -1 (the comparison coercion does not carry
+    // the column's typmod into the Const), so the labels are the
+    // typmod-less spellings `bpchar` / `character varying` — never
+    // `character(1)` / `character varying(3)`.
+    let label = match ty {
+        ColType::Char(_) => "bpchar".to_string(),
+        ColType::Varchar(_) => "character varying".to_string(),
+        _ => pg_type_label(ty)?,
+    };
     match ty {
         // Character types: quoted with a label.
         ColType::Text
@@ -516,6 +525,11 @@ pub(crate) fn pg_cast_const_literal(lit: &Literal, to: ColType) -> Option<Litera
     }
     match (lit, to) {
         (Literal::Text(_), ColType::Text) => Some(lit.clone()),
+        // v2.32: exact integer widening casts fold in PG19
+        // (`length(...)::int8` in the suite's hash functions).
+        (Literal::SmallInt(v), ColType::Int) => Some(Literal::Int(i64::from(*v))),
+        (Literal::SmallInt(v), ColType::BigInt) => Some(Literal::BigInt(i64::from(*v))),
+        (Literal::Int(v), ColType::BigInt) => Some(Literal::BigInt(*v)),
         (Literal::Int(i) | Literal::BigInt(i), ColType::Float) if i.unsigned_abs() < (1 << 53) => {
             Some(Literal::Float(*i as f64))
         }
@@ -960,6 +974,40 @@ pub(crate) fn pg_fold_const_item(e: &Expr, fc: &mut PgConstFold) -> Option<Liter
                 "sin" => f64::sin,
                 "cos" => f64::cos,
                 "tan" => f64::tan,
+                // v2.32: total builtins PG19 folds at plan time
+                // (the partition-prune opclass hash functions are
+                // built from these: `length(coalesce(value, ''))`).
+                "coalesce" => {
+                    for a in args {
+                        let lit = pg_fold_const_item(a, fc)?;
+                        if !matches!(lit, Literal::Null) {
+                            return Some(lit);
+                        }
+                    }
+                    return Some(Literal::Null);
+                }
+                "length" | "char_length" | "character_length" => {
+                    if args.len() != 1 {
+                        return None;
+                    }
+                    return match pg_fold_const_item(&args[0], fc)? {
+                        Literal::Text(t) => Some(Literal::Int(t.chars().count() as i64)),
+                        Literal::Null => Some(Literal::Null),
+                        _ => None,
+                    };
+                }
+                "abs" => {
+                    if args.len() != 1 {
+                        return None;
+                    }
+                    return match pg_fold_const_item(&args[0], fc)? {
+                        Literal::SmallInt(v) => v.checked_abs().map(Literal::SmallInt),
+                        Literal::Int(v) => v.checked_abs().map(Literal::Int),
+                        Literal::BigInt(v) => v.checked_abs().map(Literal::BigInt),
+                        Literal::Null => Some(Literal::Null),
+                        _ => None,
+                    };
+                }
                 // v1.60: anything else may be an immutable user function
                 // with constant args (PG19 `simplify_function`,
                 // clauses.c:5205-5297); STABLE/VOLATILE never fold.
@@ -987,6 +1035,57 @@ pub(crate) fn pg_fold_const_item(e: &Expr, fc: &mut PgConstFold) -> Option<Liter
         Expr::Cast { expr, to, .. } => {
             let lit = pg_fold_const_item(expr, fc)?;
             pg_cast_const_literal(&lit, *to)
+        }
+        // v2.32: integer arithmetic over folded literals (PG19
+        // eval_const_expressions folds it; the partition-prune
+        // opclass hash functions are `value + seed` shaped).
+        // Checked arithmetic only: overflow / division by zero fail
+        // closed (PG would raise, and a failed fold must never
+        // invent a value). Float/decimal stay unfolded — PG's
+        // numeric arithmetic is exact and f64 folding could diverge.
+        Expr::Arith { op, left, right } => {
+            let a = pg_fold_const_item(left, fc)?;
+            let b = pg_fold_const_item(right, fc)?;
+            let (x, wide) = match &a {
+                Literal::SmallInt(v) => (i64::from(*v), false),
+                Literal::Int(v) => (*v, false),
+                Literal::BigInt(v) => (*v, true),
+                _ => return None,
+            };
+            let (y, ywide) = match &b {
+                Literal::SmallInt(v) => (i64::from(*v), false),
+                Literal::Int(v) => (*v, false),
+                Literal::BigInt(v) => (*v, true),
+                _ => return None,
+            };
+            let r = match op {
+                ArithOp::Add => x.checked_add(y)?,
+                ArithOp::Sub => x.checked_sub(y)?,
+                ArithOp::Mul => x.checked_mul(y)?,
+                ArithOp::Div => {
+                    if y == 0 {
+                        return None;
+                    }
+                    x.checked_div(y)?
+                }
+                ArithOp::Mod => {
+                    if y == 0 {
+                        return None;
+                    }
+                    x.checked_rem(y)?
+                }
+                _ => return None,
+            };
+            // PG's result type follows the wider operand (int2 op
+            // int2 stays int2 in PG, but the literal's exact width
+            // only matters for display in const contexts that print
+            // a cast; pruning compares by value. Keep int4 unless a
+            // side was int8.
+            Some(if wide || ywide {
+                Literal::BigInt(r)
+            } else {
+                Literal::Int(r)
+            })
         }
         _ => None,
     }
@@ -1143,8 +1242,10 @@ pub(crate) fn pg_rewrite_coercions(e: &Expr, pctx: &PgPlanCtx) -> Option<Expr> {
 ///   case no coercion exists and none deparses.
 ///
 /// Known limitation: a hand-written `x = v1 OR x = v2` (not via IN) has
-/// the same shape and folds too; PG would deparse the OR form. No
-/// conformance statement has that shape (verified 2026-10-01).
+/// the same shape and folds too; PG would deparse the OR form. (The
+/// 2026-10-01 "no conformance statement has that shape" note was
+/// falsified by partition_prune in v2.32: its written-OR filters stay
+/// mismatched on this text while pruning itself is correct.)
 pub(crate) fn pg_fold_in_any(e: &Expr, pctx: &PgPlanCtx, qualify: bool) -> Option<String> {
     // Flatten the left-deep Or spine the parser builds, back into source
     // order. Anything right-nested fails the Cmp check below.
@@ -1270,6 +1371,18 @@ pub(crate) fn pg_fold_in_any(e: &Expr, pctx: &PgPlanCtx, qualify: bool) -> Optio
         "({lhs_text} = ANY ({}::{label}))",
         pg_quote_literal(&arr)
     ))
+}
+
+/// v2.32: the `<> ALL` form of the same fold, for `NOT (x IN (...))`
+/// — PG19 analyzes NOT IN as a ScalarArrayOpExpr with useOr=false and
+/// deparses it `x <> ALL ('{...}'::label)`, never `(NOT (x = ANY ...))`.
+pub(crate) fn pg_fold_not_in_all(e: &Expr, pctx: &PgPlanCtx, qualify: bool) -> Option<String> {
+    let any = pg_fold_in_any(e, pctx, qualify)?;
+    let all = any.replacen(" = ANY (", " <> ALL (", 1);
+    if all == any {
+        return None;
+    }
+    Some(all)
 }
 
 /// v1.56: rank within PG's implicit-upcast integer hierarchy
@@ -1413,7 +1526,9 @@ pub(crate) fn pg_array_quote_elem(s: &str) -> String {
 
 /// v1.56: the `::elemtype[]` label for an IN-list array constant.
 /// Typmods are dropped — PG's `format_type_with_typemod` on the array
-/// type shows the bare element name (`character[]`, `numeric[]`).
+/// type shows the bare element name (`numeric[]`). v2.32: bpchar's
+/// bare name is `bpchar` (`bpchar[]`), not `character[]` — no PG
+/// expected output in the vendored corpus spells it `character[]`.
 pub(crate) fn pg_any_array_label(elem: ColType) -> Option<String> {
     let e = match elem {
         ColType::Int => "integer",
@@ -1424,7 +1539,7 @@ pub(crate) fn pg_any_array_label(elem: ColType) -> Option<String> {
         ColType::Numeric(_) => "numeric",
         ColType::Text => "text",
         ColType::Name => "name",
-        ColType::Char(_) => "character",
+        ColType::Char(_) => "bpchar",
         ColType::Varchar(_) => "character varying",
         ColType::SingleChar => "\"char\"",
         ColType::Bool => "boolean",
@@ -1436,6 +1551,38 @@ pub(crate) fn pg_any_array_label(elem: ColType) -> Option<String> {
         _ => return None,
     };
     Some(format!("{e}[]"))
+}
+
+/// v2.32: PG19's simplify_boolean_equality (clauses.c) rewrites a
+/// boolean equality before planning, and ruleutils deparses the
+/// simplified form: `key = true` -> `key`, `key = false` ->
+/// `(NOT key)`, `key <> true` -> `(NOT key)`, `key <> false` ->
+/// `key`. Returns (side text, truth value of the comparison when the
+/// side is TRUE) for a Cmp against a bool literal on a bool column.
+fn pg_bool_cmp_parts(
+    op: &CmpOp,
+    left: &Expr,
+    right: &Expr,
+    pctx: &PgPlanCtx,
+    qualify: bool,
+) -> Option<(String, bool)> {
+    if !matches!(op, CmpOp::Eq | CmpOp::Ne) {
+        return None;
+    }
+    let (side, b) = match (left, right) {
+        (s, Expr::Literal(Literal::Bool(b))) => (s, *b),
+        (Expr::Literal(Literal::Bool(b)), s) => (s, *b),
+        _ => return None,
+    };
+    let Expr::Column { table, name } = side else {
+        return None;
+    };
+    if pctx.col_type(table.as_deref(), name) != Some(ColType::Bool) {
+        return None;
+    }
+    let text = pg_expr_text(side, pctx, qualify)?;
+    let truth = if matches!(op, CmpOp::Eq) { b } else { !b };
+    Some((text, truth))
 }
 
 /// `pg_expr_text` with a coercion target for a top-level untyped string
@@ -1458,6 +1605,10 @@ pub(crate) fn pg_expr_target(
         Expr::Literal(l) => pg_literal_text(l, target),
         Expr::Param(n) => Some(format!("${n}")),
         Expr::Cmp { op, left, right } => {
+            // v2.32: boolean equality deparses in simplified form.
+            if let Some((side, truth)) = pg_bool_cmp_parts(op, left, right, pctx, qualify) {
+                return Some(if truth { side } else { format!("(NOT {side})") });
+            }
             // Untyped string literal takes the other side's column type
             // (PG19 parser coercion of unknown-type literals). The target
             // goes to the LITERAL side, not the column side.
@@ -1536,20 +1687,50 @@ pub(crate) fn pg_expr_target(
             parts.reverse();
             Some(format!("({})", parts.join(" AND ")))
         }
-        Expr::Or(a, b) => {
+        Expr::Or(..) => {
             // v1.56: the parser desugars `x IN (v1, v2, ...)` to a left-deep
             // Or of `=` comparisons; PG19 deparses that shape as
             // `x = ANY ('{...}'::elemtype[])`.
             if let Some(any) = pg_fold_in_any(e, pctx, qualify) {
                 return Some(any);
             }
-            Some(format!(
-                "({} OR {})",
-                pg_expr_text(a, pctx, qualify)?,
-                pg_expr_text(b, pctx, qualify)?
-            ))
+            // v2.32: PG renders a BoolExpr OR as a flat list, like AND.
+            let mut parts: Vec<String> = Vec::new();
+            let mut stack: Vec<&Expr> = vec![e];
+            while let Some(x) = stack.pop() {
+                match x {
+                    Expr::Or(a2, b2) => {
+                        stack.push(a2.as_ref());
+                        stack.push(b2.as_ref());
+                    }
+                    _ => {
+                        parts.push(pg_expr_text(x, pctx, qualify)?);
+                    }
+                }
+            }
+            parts.reverse();
+            Some(format!("({})", parts.join(" OR ")))
         }
-        Expr::Not(x) => Some(format!("(NOT {})", pg_expr_text(x, pctx, qualify)?)),
+        Expr::Not(x) => {
+            // v2.32: `x NOT IN (...)` deparses as `x <> ALL (...)`.
+            if let Some(all) = pg_fold_not_in_all(x, pctx, qualify) {
+                return Some(all);
+            }
+            // NOT of a boolean equality: the double simplification
+            // collapses to the bare qual or its negation.
+            if let Expr::Cmp { op, left, right } = &**x {
+                if let Some((side, truth)) = pg_bool_cmp_parts(op, left, right, pctx, qualify) {
+                    return Some(if truth { format!("(NOT {side})") } else { side });
+                }
+            }
+            Some(format!("(NOT {})", pg_expr_text(x, pctx, qualify)?))
+        }
+        // v2.32: PG19 CollateExpr deparse: `arg COLLATE "name"`.
+        Expr::Collate { expr, name } => Some(format!(
+            "{} COLLATE \"{}\"",
+            pg_expr_text(expr, pctx, qualify)?,
+            name.replace('"', "\"\"")
+        )),
         Expr::IsNull { expr, neg } => Some(format!(
             "({} IS {}NULL)",
             pg_expr_text(expr, pctx, qualify)?,
@@ -1614,6 +1795,73 @@ pub(crate) fn pg_expr_target(
             }
         }
         Expr::Func { name, args } => {
+            // v2.32: quantified array comparison (`x = ANY ('{...}')`,
+            // parser-desugared to the hidden builtin). PG19 deparses
+            // the ScalarArrayOpExpr directly; the array literal text
+            // rides in args[3] (a text literal, or an ARRAY[...] ctor
+            // under a cast).
+            if name == "__any_all_array" && args.len() == 4 {
+                let lit_text = |x: &Expr| -> Option<String> {
+                    match x {
+                        Expr::Literal(Literal::Text(t)) => Some(t.to_string()),
+                        _ => None,
+                    }
+                };
+                if let (Some(op), Some(quant)) = (lit_text(&args[1]), lit_text(&args[2])) {
+                    let arr_expr = match &args[3] {
+                        Expr::Cast { expr, .. } => expr.as_ref(),
+                        other => other,
+                    };
+                    let (arr_text, cast_label) = match arr_expr {
+                        Expr::Literal(Literal::Text(t)) => (t.clone(), None),
+                        // ARRAY[...] ctor form: fail closed (the
+                        // suite's quantified comparisons all use the
+                        // text-literal array form handled above).
+                        _ => return None,
+                    };
+                    // Element label: the array cast's target when the
+                    // parser kept one, else the LHS column type (with
+                    // varchar folding to text, as the operator's
+                    // argument coercion does).
+                    let label = match cast_label {
+                        Some(l) => Some(l),
+                        None => match &args[0] {
+                            Expr::Column { table, name } => {
+                                match pctx.col_type(table.as_deref(), name) {
+                                    Some(ColType::Varchar(_)) => Some("text".to_string()),
+                                    Some(ct) => pg_any_array_label(ct),
+                                    None => None,
+                                }
+                            }
+                            _ => None,
+                        },
+                    };
+                    if let Some(label) = label {
+                        let lhs = pg_expr_text(&args[0], pctx, qualify)?;
+                        // A varchar/char LHS compared against a text
+                        // array deparses with the coercion shown.
+                        let lhs = match &args[0] {
+                            Expr::Column { table, name }
+                                if label == "text"
+                                    && matches!(
+                                        pctx.col_type(table.as_deref(), name),
+                                        Some(ColType::Varchar(_))
+                                    ) =>
+                            {
+                                format!("({lhs})::text")
+                            }
+                            _ => lhs,
+                        };
+                        return Some(format!(
+                            "({lhs} {op} {} ('{}'::{}[]))",
+                            quant.to_ascii_uppercase(),
+                            arr_text.replace('\'', "''"),
+                            label
+                        ));
+                    }
+                }
+                return None;
+            }
             // v1.08: SIMILAR TO is desugared by the parser to similar_to();
             // PG deparses it as a POSIX regex match (f1 ~ 'regex'::text).
             if name.eq_ignore_ascii_case("similar_to") && (2..=3).contains(&args.len()) {
@@ -1924,6 +2172,7 @@ pub(crate) fn plan_has_filter(node: &PlanNode) -> bool {
         | PlanNode::Limit { child, .. }
         | PlanNode::SubqueryScan { child, .. } => plan_has_filter(child),
         PlanNode::IndexOrderScan { .. } | PlanNode::Values { .. } => false,
+        PlanNode::Append { children, .. } => children.iter().any(plan_has_filter),
     }
 }
 
@@ -2678,6 +2927,22 @@ pub(crate) enum PlanNode {
         // v1.46: VERBOSE `Output:` entries.
         output: Vec<String>,
     },
+    /// v2.32: PG19 `Append` over the surviving partitions of a
+    /// partitioned table (partprune.c plan-time pruning applied by
+    /// `plan_partition_append`). Display-only like every PlanNode.
+    /// VERBOSE prints no `Output:` for Append (explain.c skips it),
+    /// so `output` stays empty.
+    Append {
+        rows: u64,
+        children: Vec<PlanNode>,
+        /// v2.32: partitions removed by pruning (total children minus
+        /// survivors). Only EXPLAIN ANALYZE renders it (`Subplans
+        /// Removed: N`, PG19's runtime-pruning property); plain
+        /// EXPLAIN never shows it.
+        removed: u64,
+        // v1.46: VERBOSE `Output:` entries (always empty, see above).
+        output: Vec<String>,
+    },
 }
 
 impl PlanNode {
@@ -2699,6 +2964,7 @@ impl PlanNode {
             // through (PG19 sizes the material path like the subpath).
             | PlanNode::Materialize { rows, .. } => *rows,
             PlanNode::Values { rows, .. } => *rows,
+            PlanNode::Append { rows, .. } => *rows,
         }
     }
 
@@ -2760,7 +3026,8 @@ impl PlanNode {
             // v1.48: Materialize does not project; its targetlist is the
             // child's.
             | PlanNode::Materialize { output, .. }
-            | PlanNode::Values { output, .. } => output,
+            | PlanNode::Values { output, .. }
+            | PlanNode::Append { output, .. } => output,
         }
     }
 
@@ -2781,7 +3048,8 @@ impl PlanNode {
             | PlanNode::SubqueryScan { output, .. }
             // v1.48: see `output()` above.
             | PlanNode::Materialize { output, .. }
-            | PlanNode::Values { output, .. } => *output = o,
+            | PlanNode::Values { output, .. }
+            | PlanNode::Append { output, .. } => *output = o,
         }
     }
 }

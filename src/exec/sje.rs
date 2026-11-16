@@ -1297,6 +1297,207 @@ pub(crate) fn sje_stmt_refs_qual(stmt: &SelectStmt, q: &str) -> bool {
     }
     false
 }
+/// v2.32: collect the surviving LEAF partitions under `level_name`
+/// in PG19 Append order, applying plan-time pruning at every level
+/// of the partition tree. PG19 builds one flat Append over leaves —
+/// sub-partitioned intermediates contribute their leaves, never a
+/// nested Append (for a plain scan of the root). `root_qual` is the
+/// root item's qualifier, which the WHERE clauses may reference at
+/// every level. With `pruning` false every leaf is collected (the
+/// total used for EXPLAIN ANALYZE's `Subplans Removed` count).
+#[allow(clippy::too_many_arguments)]
+fn collect_pruned_leaves(
+    eng: &Engine,
+    level_name: &str,
+    root_qual: &str,
+    where_: Option<&Expr>,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    pruning: bool,
+    out: &mut Vec<String>,
+) -> Result<(), ExecError> {
+    let survivors = match pruned_children(
+        &eng.db,
+        level_name,
+        Some(root_qual),
+        snap,
+        own,
+        session,
+        where_,
+        pruning,
+    ) {
+        Some(s) => s,
+        None => {
+            out.push(level_name.to_string());
+            return Ok(());
+        }
+    };
+    for child_name in &survivors {
+        let child = eng
+            .db
+            .find_table(child_name, snap, &[own], session)
+            .ok_or_else(|| {
+                exec_err(
+                    "42P01",
+                    format!("relation \"{}\" does not exist", child_name),
+                )
+            })?;
+        let is_intermediate = child
+            .partition
+            .as_ref()
+            .map(|p| p.is_partitioned && !p.children.is_empty())
+            .unwrap_or(false);
+        if is_intermediate {
+            collect_pruned_leaves(
+                eng, child_name, root_qual, where_, snap, own, session, pruning, out,
+            )?;
+        } else if child
+            .partition
+            .as_ref()
+            .map(|p| p.is_partitioned)
+            .unwrap_or(false)
+        {
+            // A childless partitioned table holds no rows: PG lists
+            // no scan for it.
+        } else {
+            out.push(child_name.clone());
+        }
+    }
+    Ok(())
+}
+
+/// v2.32: plan a partitioned parent as PG19 does (PG-text mode only):
+/// a flat `Append` over the leaf partitions surviving plan-time
+/// pruning (prune.rs), a bare leaf scan (aliased with the parent's
+/// RTE name) when exactly one leaf survives, and the dummy `Result`
+/// when none do. Returns None when `name` is not a partitioned table
+/// with children (the caller then plans the ordinary single scan).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_partition_append(
+    eng: &Engine,
+    name: &str,
+    alias: Option<&str>,
+    qual: &str,
+    where_: Option<&Expr>,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    ctes: &[CteDef],
+    pctx: Option<&PgPlanCtx>,
+    stmt: &SelectStmt,
+) -> Result<Option<PlanNode>, ExecError> {
+    let t = match eng.db.find_table(name, snap, &[own], session) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    match &t.partition {
+        Some(p) if p.is_partitioned && !p.children.is_empty() => {}
+        _ => return Ok(None),
+    }
+    // v2.32: a self-refuted qual (PG19 predicate_refuted_by) plans
+    // the dummy Result regardless of pruning.
+    if let Some(w) = where_ {
+        if where_refuted(&eng.db, t.partition.as_ref().unwrap(), t, name, alias, w) {
+            return Ok(Some(PlanNode::Result {
+                rows: 1,
+                filter: None,
+                output: Vec::new(),
+                one_time_filter: true,
+                replaces: Some(format!("Scan on {qual}")),
+            }));
+        }
+    }
+    let pruning = !matches!(
+        installed_guc("enable_partition_pruning")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("off") | Some("false") | Some("no") | Some("0")
+    );
+    // v2.32: the scanned table may itself be a partition (rlp3
+    // scanned directly): PG19 folds the table's own bound into the
+    // plan as a constraint, so a WHERE contradicting the bound
+    // prunes the whole subtree (`rlp3 WHERE a = 20` -> dummy Result).
+    if pruning {
+        if let (Some(parent_name), Some(bound)) = (
+            t.partition.as_ref().and_then(|p| p.parent.clone()),
+            t.partition.as_ref().and_then(|p| p.bound.clone()),
+        ) {
+            let w = where_
+                .cloned()
+                .unwrap_or(Expr::Literal(Literal::Bool(true)));
+            if where_may_match_bound(&eng.db, &parent_name, snap, own, session, &bound, &w)
+                == Some(false)
+            {
+                return Ok(Some(PlanNode::Result {
+                    rows: 1,
+                    filter: None,
+                    output: Vec::new(),
+                    one_time_filter: true,
+                    replaces: Some(format!("Scan on {qual}")),
+                }));
+            }
+        }
+    }
+    let mut leaves = Vec::new();
+    collect_pruned_leaves(
+        eng,
+        name,
+        qual,
+        where_,
+        snap,
+        own,
+        session,
+        pruning,
+        &mut leaves,
+    )?;
+    if leaves.is_empty() {
+        return Ok(Some(PlanNode::Result {
+            rows: 1,
+            filter: None,
+            output: Vec::new(),
+            one_time_filter: true,
+            replaces: Some(format!("Scan on {qual}")),
+        }));
+    }
+    let base = alias.unwrap_or(name);
+    if leaves.len() == 1 {
+        let item = FromItem::Table {
+            name: leaves[0].clone(),
+            alias: Some(base.to_string()),
+            col_aliases: Vec::new(),
+            only: false,
+        };
+        return plan_from_item(eng, &item, where_, snap, own, session, ctes, pctx, stmt).map(Some);
+    }
+    let removed = if pruning {
+        let mut all = Vec::new();
+        collect_pruned_leaves(eng, name, qual, where_, snap, own, session, false, &mut all)?;
+        (all.len() - leaves.len()) as u64
+    } else {
+        0
+    };
+    let mut children = Vec::new();
+    for (i, leaf_name) in leaves.iter().enumerate() {
+        let item = FromItem::Table {
+            name: leaf_name.clone(),
+            alias: Some(format!("{base}_{}", i + 1)),
+            col_aliases: Vec::new(),
+            only: false,
+        };
+        children.push(plan_from_item(
+            eng, &item, where_, snap, own, session, ctes, pctx, stmt,
+        )?);
+    }
+    let rows = children.iter().map(|c| c.rows()).sum();
+    Ok(Some(PlanNode::Append {
+        rows,
+        children,
+        removed,
+        output: Vec::new(),
+    }))
+}
+
 pub(crate) fn plan_from_item(
     eng: &Engine,
     item: &FromItem,
@@ -1581,6 +1782,28 @@ pub(crate) fn plan_from_item(
                     exec_err("42P01", format!("relation \"{}\" does not exist", name))
                 })?;
             let qual = alias.clone().unwrap_or_else(|| name.clone());
+            // v2.32: PG19 partitioned-table planning — in PG-text
+            // mode a partitioned parent plans as an Append of its
+            // surviving partitions (plan-time pruning in prune.rs);
+            // a single survivor renders as a bare scan under the
+            // parent's alias, zero survivors as the dummy Result.
+            if pctx.is_some() && !only {
+                if let Some(node) = plan_partition_append(
+                    eng,
+                    name,
+                    alias.as_deref(),
+                    &qual,
+                    where_,
+                    snap,
+                    own,
+                    session,
+                    ctes,
+                    pctx,
+                    stmt,
+                )? {
+                    return Ok(node);
+                }
+            }
             let rel_rows = est_rel_rows(&eng.db, name, snap, own, session);
             // v2.30: a non-ONLY scan of a table with descendants
             // covers the whole family (PG's inheritance-expanded

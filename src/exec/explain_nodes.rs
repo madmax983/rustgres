@@ -3354,6 +3354,14 @@ pub(crate) fn render_plan(
             out.push(format!("{pad}Values Scan"));
             push_output(out);
         }
+        // v2.32: PG19 `Append` (explain.c T_Append). No `Output:`
+        // line even in VERBOSE (show_plan_tlist skips Append).
+        PlanNode::Append { children, .. } => {
+            out.push(format!("{pad}Append"));
+            for child in children {
+                render_plan(child, depth + 1, costs, verbose, out);
+            }
+        }
     }
 }
 
@@ -3493,6 +3501,13 @@ pub(crate) fn render_plan_costs_on(node: &PlanNode, depth: usize, out: &mut Vec<
         }
         PlanNode::Values { rows, .. } => {
             out.push(format!("{pad}Values (rows={rows})"));
+        }
+        // v2.32: Append in the legacy COSTS ON rendering.
+        PlanNode::Append { rows, children, .. } => {
+            out.push(format!("{pad}Append (rows={rows})"));
+            for child in children {
+                render_plan_costs_on(child, depth + 1, out);
+            }
         }
     }
 }

@@ -103,6 +103,7 @@ mod pg_input;
 mod privfuncs;
 mod privilege;
 mod project;
+mod prune;
 mod publication;
 pub(crate) mod ranges;
 mod reorder;
@@ -378,6 +379,9 @@ mod v230_tests;
 #[path = "test_mods/v231_tests.rs"]
 mod v231_tests;
 #[cfg(test)]
+#[path = "test_mods/v232_tests.rs"]
+mod v232_tests;
+#[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;
 
@@ -420,6 +424,7 @@ pub(crate) use pg_input::*;
 pub(crate) use privfuncs::*;
 pub(crate) use privilege::*;
 pub(crate) use project::*;
+pub(crate) use prune::*;
 pub(crate) use publication::*;
 pub(crate) use reorder::*;
 pub(crate) use rls::*;
