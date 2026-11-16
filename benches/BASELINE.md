@@ -2,6 +2,60 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `ordered_children` reuses its own `find_table` lookups instead of `pruned_children` repeating them — fix — 2026-11-16
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec/prune.rs`: `ordered_children` now returns
+`Result<Vec<(String, bool, Option<PartBound>)>, Vec<String>>`
+(aliased `OrderedChildren`) instead of `Vec<String>` — the
+`(is_default, bound)` it already fetches via `find_table` per child
+while sorting into PG19 Append order, instead of discarding it.
+`pruned_children`'s RANGE/LIST default-coverage path (`child_tables`)
+now reuses those triples directly rather than calling `find_table` on
+every child a second time. The `Result`/`Err` split preserves the
+original fallback behavior exactly: a child that fails to resolve
+mid-sort still makes the whole table "unprunable" (returns `None`) for
+the RANGE/LIST path, same as the old code re-hitting the same failing
+`find_table` call a second time; `!pruning`, no-WHERE and HASH
+routing never needed the second lookup and are unaffected either way.
+No behavior change — all 10 `v232_tests` and the full suite (1410
+tests) pass unchanged.
+
+### Measurement
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`), 3 runs before / 3 runs after,
+`benches/profile_prune_select.py --parts 50 --queries 100`:
+
+| metric | before (avg of 3) | after (avg of 3) | delta |
+|---|---|---|---|
+| Ir, total | 421,326,845 | 395,530,171 | **-6.12%** |
+| Ir, `pruned_children` (inclusive, 1 run) | 174,314,399 (41.36%) | 148,729,690 (37.62%) | -14.68% on itself |
+| Ir, `find_table` (inclusive, 1 run) | 148,057,961 (35.13%) | 137,693,297 (34.83%) | -7.00% on itself |
+
+dhat (1 run before / 1 run after, same workload):
+
+| metric | before | after | delta |
+|---|---|---|---|
+| total bytes allocated | 18,273,820 | 16,216,620 | **-11.25%** |
+| total allocations (blocks) | 155,018 | 139,418 | **-10.06%** |
+
+Both the total-Ir delta (floor: ≥5%) and the allocation deltas (floor:
+≥10%) clear the impact floor. Profiles committed:
+`benches/profiles/{callgrind,dhat}.out.pruneselect-after-n50q100-2026-11-16`
+(baseline profiles in the entry below).
+
+Reproduce:
+```bash
+cargo build
+python3 benches/profile_prune_select.py --tool callgrind --parts 50 --queries 100 --variant prune
+python3 benches/profile_prune_select.py --tool dhat --parts 50 --queries 100 --variant prune
+```
+
 ## Bolt: `pruned_children` re-resolves every child a second time via `find_table` — baseline — 2026-11-16
 
 New harness: `benches/profile_prune_select.py` — a RANGE-partitioned
