@@ -2,6 +2,68 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `pruned_children` re-resolves every child a second time via `find_table` — baseline — 2026-11-16
+
+New harness: `benches/profile_prune_select.py` — a RANGE-partitioned
+table (`--parts` leaves, no overrides, the same production shape as
+`benches/profile_manypart_insert.py`), then `--queries` point-lookup
+`EXPLAIN (COSTS OFF) SELECT * FROM bench_prune WHERE a = N` statements
+over the real wire protocol, each landing in exactly one leaf.
+`EXPLAIN (COSTS OFF)`, not plain `EXPLAIN` or plain `SELECT`: v2.32's
+plan-time pruning engine (`sje::plan_partition_append` ->
+`prune::pruned_children` -> `prune::collect_pruned_leaves`) only runs
+in PG-text mode (`pg: bool`, true only for `COSTS OFF` —
+`explain_nodes.rs:2541`); plain `EXPLAIN` renders this engine's own
+native plan format and never reaches `plan_partition_append` at all
+(confirmed by hand: `EXPLAIN SELECT * FROM t1 WHERE a = 5` prints an
+undifferentiated "Seq Scan on t1"; `EXPLAIN (COSTS OFF) ...` prints
+the pruned leaf, "Seq Scan on t1_p0 t1"), and plain `SELECT` execution
+never calls into `sje.rs`/`prune.rs` either — the same EXPLAIN-only
+shape as v2.30's `has_family` (issue #79). Reproduce:
+```bash
+cargo build
+python3 benches/profile_prune_select.py --tool callgrind --parts 50 --queries 100 --variant prune
+python3 benches/profile_prune_select.py --tool callgrind --parts 50 --queries 100 --variant plain
+python3 benches/profile_prune_select.py --tool dhat --parts 50 --queries 100 --variant prune
+```
+
+### Profile
+
+Callgrind (3 runs, agree within 0.1%), `--parts 50 --queries 100`:
+`pruned_children` (prune.rs:2409, inclusive) is **41.36%** of total Ir;
+`Database::find_table` (inclusive, mostly reached from inside
+`pruned_children`/`ordered_children`) is **35.13%**. The `plain`
+control (identical row volume, no partitioning) is 56,050,441 Ir vs.
+421,326,845 Ir for `prune` — pruning-related cost is roughly **87%**
+of the partitioned workload's total Ir. dhat (1 run): 18,273,820 total
+bytes / 155,018 total allocations.
+
+| metric | value |
+|---|---|
+| Ir, total, `prune` (avg of 3) | 421,326,845 |
+| Ir, total, `plain` (avg of 1) | 56,050,441 |
+| Ir, `pruned_children` (inclusive, 1 run) | 174,314,399 (41.36%) |
+| Ir, `find_table` (inclusive, 1 run) | 148,057,961 (35.13%) |
+| dhat total bytes | 18,273,820 |
+| dhat total allocations | 155,018 |
+
+### Hypothesis
+
+`ordered_children` (prune.rs, called once per `pruned_children` call)
+already resolves every child via `find_table` to read `(is_default,
+bound)` for sorting into PG19 Append order, then discards everything
+but the name. `pruned_children`'s own RANGE/LIST default-coverage path
+(the common case — HASH routes directly and returns earlier) then
+builds `child_tables: Vec<(String, bool, Option<PartBound>)>` by
+calling `find_table` on every child **again**, re-fetching the exact
+same `(is_default, bound)` `ordered_children` just threw away. Since
+`ordered_children` is the only caller site, returning its already-
+sorted triples instead of bare names lets `pruned_children` reuse them
+directly, cutting the per-query `find_table` call count for this path
+roughly in half.
+
+Baseline profiles committed: `benches/profiles/{callgrind,dhat}.out.pruneselect-base-n50q100-2026-11-16`.
+
 ## Bolt: `find_partition_leaf` clones the matched child's `PartitionInfo`/`columns` even when the match is an ordinary leaf — fix — 2026-11-13
 
 Fixes the target identified in the baseline entry immediately below
