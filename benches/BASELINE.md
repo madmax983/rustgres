@@ -2,6 +2,61 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `index_oid_map_from` lets catalog scans fetch `visible_index_defs` once instead of twice — fix — 2026-11-17
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec/catalog.rs`: new `index_oid_map_from(defs: &[IndexDef])`
+builds the synthetic-OID `HashMap` directly from an already-fetched,
+already-sorted `visible_index_defs` slice instead of calling
+`visible_index_defs` itself; `index_oid_map` is now a thin wrapper
+(`index_oid_map_from(&visible_index_defs(...))`) for the four call
+sites that only need the OID map. `pg_class_scan`, `pg_index_scan`,
+and `pg_inherits_scan`'s index-partition-link block — the three
+sites that need both the OID map and the defs — now call
+`visible_index_defs` exactly once and derive the OID map from that
+same reference via `index_oid_map_from`, instead of each calling
+`visible_index_defs` a second time. `index_oid_map_from`'s OID
+assignment (`40000 + position in the passed-in slice`) is identical
+to the old `index_oid_map`'s as long as the slice is the untouched,
+name-sorted output of `visible_index_defs` — true at all three call
+sites — so this is a pure call-count reduction with no behavior
+change. All 1410 tests pass unchanged.
+
+### Measurement
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`), 3 runs before / 3 runs after,
+`benches/profile_catalog_scan.py --tables 40 --indexes-per-table 4 --queries 50`:
+
+| metric | before (avg of 3) | after (avg of 3) | delta |
+|---|---|---|---|
+| Ir, total | 2,045,493,891 | 1,744,518,885 | **-14.71%** |
+| Ir, `visible_index_defs` (inclusive, 1 run) | 610,527,129 (29.86%) | 364,703,075 (20.87%) | -40.26% on itself |
+
+dhat (1 run before / 1 run after, same workload):
+
+| metric | before | after | delta |
+|---|---|---|---|
+| total bytes allocated | 105,638,558 | 79,554,758 | **-24.70%** |
+| total allocations (blocks) | 977,458 | 796,658 | **-18.49%** |
+
+Both the total-Ir delta (floor: ≥5%) and the allocation deltas
+(floor: ≥10%) clear the impact floor by a wide margin. Profiles
+committed:
+`benches/profiles/{callgrind,dhat}.out.catalogscan-after-n40i4q50-2026-11-17`
+(baseline profiles in the entry below).
+
+Reproduce:
+```bash
+cargo build
+python3 benches/profile_catalog_scan.py --tool callgrind --tables 40 --indexes-per-table 4 --queries 50
+python3 benches/profile_catalog_scan.py --tool dhat --tables 40 --indexes-per-table 4 --queries 50
+```
+
 ## Bolt: `pg_class`/`pg_index`/`pg_inherits` scans call `visible_index_defs` twice each — baseline — 2026-11-17
 
 New harness: `benches/profile_catalog_scan.py` — builds `--tables`
