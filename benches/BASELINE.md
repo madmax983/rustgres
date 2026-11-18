@@ -2,6 +2,121 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `index_oid_map_from` lets catalog scans fetch `visible_index_defs` once instead of twice — fix — 2026-11-17
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Change
+
+`src/exec/catalog.rs`: new `index_oid_map_from(defs: &[IndexDef])`
+builds the synthetic-OID `HashMap` directly from an already-fetched,
+already-sorted `visible_index_defs` slice instead of calling
+`visible_index_defs` itself; `index_oid_map` is now a thin wrapper
+(`index_oid_map_from(&visible_index_defs(...))`) for the four call
+sites that only need the OID map. `pg_class_scan`, `pg_index_scan`,
+and `pg_inherits_scan`'s index-partition-link block — the three
+sites that need both the OID map and the defs — now call
+`visible_index_defs` exactly once and derive the OID map from that
+same reference via `index_oid_map_from`, instead of each calling
+`visible_index_defs` a second time. `index_oid_map_from`'s OID
+assignment (`40000 + position in the passed-in slice`) is identical
+to the old `index_oid_map`'s as long as the slice is the untouched,
+name-sorted output of `visible_index_defs` — true at all three call
+sites — so this is a pure call-count reduction with no behavior
+change. All 1410 tests pass unchanged.
+
+### Measurement
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`), 3 runs before / 3 runs after,
+`benches/profile_catalog_scan.py --tables 40 --indexes-per-table 4 --queries 50`:
+
+| metric | before (avg of 3) | after (avg of 3) | delta |
+|---|---|---|---|
+| Ir, total | 2,045,493,891 | 1,744,518,885 | **-14.71%** |
+| Ir, `visible_index_defs` (inclusive, 1 run) | 610,527,129 (29.86%) | 364,703,075 (20.87%) | -40.26% on itself |
+
+dhat (1 run before / 1 run after, same workload):
+
+| metric | before | after | delta |
+|---|---|---|---|
+| total bytes allocated | 105,638,558 | 79,554,758 | **-24.70%** |
+| total allocations (blocks) | 977,458 | 796,658 | **-18.49%** |
+
+Both the total-Ir delta (floor: ≥5%) and the allocation deltas
+(floor: ≥10%) clear the impact floor by a wide margin. Profiles
+committed:
+`benches/profiles/{callgrind,dhat}.out.catalogscan-after-n40i4q50-2026-11-17`
+(baseline profiles in the entry below).
+
+Reproduce:
+```bash
+cargo build
+python3 benches/profile_catalog_scan.py --tool callgrind --tables 40 --indexes-per-table 4 --queries 50
+python3 benches/profile_catalog_scan.py --tool dhat --tables 40 --indexes-per-table 4 --queries 50
+```
+
+## Bolt: `pg_class`/`pg_index`/`pg_inherits` scans call `visible_index_defs` twice each — baseline — 2026-11-17
+
+New harness: `benches/profile_catalog_scan.py` — builds `--tables`
+tables with `--indexes-per-table` secondary btree indexes each (plus
+the implicit PK index), then drives `--queries` rounds of `SELECT *
+FROM pg_class`, `SELECT * FROM pg_index`, `SELECT * FROM pg_indexes`
+over the real wire protocol. This is the same schema-introspection
+shape ORM reflection, `psql \d`, migration tools, and
+Hasura/PostgREST metadata loads all use: enumerate tables via
+`pg_class`, then their indexes via `pg_index`/`pg_indexes`.
+
+### Profile
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`, 3 runs agree within 0.3%), `--tables 40
+--indexes-per-table 4 --queries 50` (160 indexes total, 150 catalog
+queries):
+
+| metric | value |
+|---|---|
+| Ir, total (avg of 3) | 2,045,493,891 |
+| Ir, `catalog::visible_index_defs` (inclusive, 1 run) | 610,527,129 (29.86%) |
+| Ir, `catalog::pg_index_scan` (inclusive, 1 run) | 596,662,613 (29.18%) |
+| Ir, `catalog::pg_class_scan` (inclusive, 1 run) | 449,211,201 (21.97%) |
+| Ir, `catalog::index_oid_map` (inclusive, 1 run) | 352,692,475 (17.25%) |
+| Ir, `catalog::pg_indexes_scan` (inclusive, 1 run) | 319,741,552 (15.64%) |
+| Ir, `storage::Database::find_table` (inclusive, 1 run) | 87,531,570 (4.28%) |
+
+dhat (1 run): 105,638,558 total bytes allocated, 977,458 total
+allocations (blocks).
+
+### Hypothesis
+
+`src/exec/catalog.rs`'s `pg_class_scan`, `pg_index_scan`, and the
+index-partition-link block of `pg_inherits_scan` each need both the
+synthetic index-OID map (`index_oid_map`) and the full
+`visible_index_defs` list in the same scan. `index_oid_map` already
+calls `visible_index_defs` internally (to assign OIDs 40000+n in
+name-sorted order) and discards the defs once it has the names;
+every one of those three call sites then calls `visible_index_defs`
+a **second** time to get the defs it just threw away. `IndexDef` is
+a wide struct (`cols`, `col_names`, `desc`, `nulls_first`, `exprs`,
+`collates`, `opclasses`, each `Vec<String>`/`Vec<Option<String>>`),
+so `visible_index_defs`'s `.clone()` per index plus the trailing sort
+is not free, and three of the busiest catalog scans pay for it
+twice per query. Fix: let `index_oid_map` take an already-fetched
+`&[IndexDef]` (as `index_oid_map_from`) so a caller that needs both
+the defs and the OID map fetches `visible_index_defs` exactly once
+and derives the map from that reference.
+
+Baseline profiles committed:
+`benches/profiles/{callgrind,dhat}.out.catalogscan-base-n40i4q50-2026-11-17`.
+
+Reproduce:
+```bash
+cargo build
+python3 benches/profile_catalog_scan.py --tool callgrind --tables 40 --indexes-per-table 4 --queries 50
+python3 benches/profile_catalog_scan.py --tool dhat --tables 40 --indexes-per-table 4 --queries 50
+```
+
 ## Bolt: `ordered_children` reuses its own `find_table` lookups instead of `pruned_children` repeating them — fix — 2026-11-16
 
 Fixes the target identified in the baseline entry immediately below

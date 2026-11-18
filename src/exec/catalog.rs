@@ -157,8 +157,8 @@ pub(crate) fn pg_class_scan(
     // index). OIDs come from the shared synthetic index_oid_map so
     // pg_index.indexrelid and pg_inherits links join exactly.
     {
-        let oids = index_oid_map(db, snap, own, session);
         let defs = visible_index_defs(db, snap, own, session);
+        let oids = index_oid_map_from(&defs);
         let parents_with_children: std::collections::HashSet<&str> = defs
             .iter()
             .filter_map(|d| d.parent_index.as_deref())
@@ -411,6 +411,18 @@ pub(crate) fn visible_index_defs(
     defs
 }
 
+/// v2.29: synthetic OID per visible index name (40000-based), from an
+/// already-fetched `visible_index_defs` list. A caller that also
+/// needs the defs themselves should fetch them once and pass a
+/// reference here, instead of letting [`index_oid_map`] fetch its
+/// own (identically sorted) copy a second time.
+pub(crate) fn index_oid_map_from(defs: &[IndexDef]) -> std::collections::HashMap<String, i64> {
+    defs.iter()
+        .enumerate()
+        .map(|(i, d)| (d.name.clone(), 40000 + i as i64))
+        .collect()
+}
+
 /// v2.29: synthetic OID per visible index name (40000-based).
 pub(crate) fn index_oid_map(
     db: &Database,
@@ -418,11 +430,7 @@ pub(crate) fn index_oid_map(
     own: u64,
     session: u64,
 ) -> std::collections::HashMap<String, i64> {
-    visible_index_defs(db, snap, own, session)
-        .into_iter()
-        .enumerate()
-        .map(|(i, d)| (d.name, 40000 + i as i64))
-        .collect()
+    index_oid_map_from(&visible_index_defs(db, snap, own, session))
 }
 
 /// v2.29: PG19's hard-wired btree opclass oid for a named opclass,
@@ -569,8 +577,8 @@ pub(crate) fn pg_index_scan(
     session: u64,
 ) -> (Vec<QCol>, Vec<QRow>) {
     let schema = pg_index_schema();
-    let oids = index_oid_map(db, snap, own, session);
     let defs = visible_index_defs(db, snap, own, session);
+    let oids = index_oid_map_from(&defs);
     let mut rows = Vec::new();
     for d in &defs {
         let Some(t) = db.find_table(&d.table, snap, &[own], session) else {
@@ -865,8 +873,9 @@ pub(crate) fn pg_inherits_scan(
     // v2.29: index partition links (child index -> parent index)
     // under the shared synthetic index OIDs.
     {
-        let oids = index_oid_map(db, snap, own, session);
-        for d in visible_index_defs(db, snap, own, session) {
+        let defs = visible_index_defs(db, snap, own, session);
+        let oids = index_oid_map_from(&defs);
+        for d in &defs {
             if let Some(parent) = &d.parent_index {
                 if let (Some(&child_oid), Some(&parent_oid)) = (oids.get(&d.name), oids.get(parent))
                 {
