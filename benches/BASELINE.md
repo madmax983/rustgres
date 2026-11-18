@@ -10248,3 +10248,130 @@ Memcheck runs again). Callgrind: no Rust function above ~5% self-cost; libc
 `memcpy` leads at 18.45% (row materialization inherent to nested-loop joins),
 so per the measure-first rule no optimization was made. DHAT: 9.6 MB total
 heap, 577 KB peak, 226 KB at exit — no leak growth.
+
+## ANALYZE census (v2.33 pg_statistic) — 2026-11-18
+
+### Workload
+
+v2.33 added ~2,800 lines of new statistics-gathering code
+(`src/exec/analyze.rs`, `src/exec/statistic.rs`, `src/exec/statrestore.rs`)
+for `ANALYZE` / `pg_statistic` and had never been profiled. New harness
+`benches/profile_analyze.py` (self-contained callgrind/dhat driver,
+same pattern as `profile_catalog_scan.py`): a table with a realistic
+column mix — a low-cardinality `cat` text column and `flag` bool (MCV
+path), a mostly-unique `name` text column (histogram/avg_width), a
+`numeric` `amount` column (distinct_raw/correlation), and an `int[]`
+`tags` column (MCELEM/DECHIST — v2.33's element-statistics code,
+exercised nowhere else in `benches/`), plus an expression index
+`((cat || name))` to drive `analyze_index_exprs` (also new in v2.33).
+`--rounds` repeats `ANALYZE bench_analyze` against the same static
+data (ANALYZE does not mutate rows, so this is exact replicated work,
+the same trick `profile_catalog_scan.py`'s `--queries` loop uses).
+
+Reproduce:
+```bash
+cargo build
+python3 benches/profile_analyze.py --tool callgrind --sizes --rounds 10
+python3 benches/profile_analyze.py --tool dhat --rows 4000 --rounds 10
+```
+
+### Profile
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`), `--rows 4000 --rounds 5`, kept log
+`benches/profiles/callgrind.out.analyzecensus-base-n4000r5-2026-11-18`:
+`col_stats_mcv_min` (the per-column census shared by table ANALYZE
+and index-expression statistics) is **77.58%** of total `Ir`
+(inclusive); `analyze_table`/`stats_from_rows` together are 65%,
+`analyze_index_exprs` 17.47%. Growth across row counts (`--sizes`,
+`--rounds 10`) is linear, not superlinear (1.78x then 1.91x per
+doubling), so this is inherent-cost-shaped, not an algorithmic blowup
+— the question is whether the inherent per-column census work itself
+can be made cheaper.
+
+`callgrind_annotate --auto=yes` line annotation of `col_stats_mcv_min`
+and `compute_elem_stats` (`src/exec/analyze.rs`) showed four
+`HashMap<Vec<u8>, _>` / `HashSet<Vec<u8>>` collections — `counts` (the
+per-distinct-value frequency table), `mcv_keys` (the top-100 MCV
+exclusion set used to build the histogram's non-MCV population),
+`elem_rows`, and per-row `seen` (both in `compute_elem_stats`, the
+MCELEM/DECHIST path) — all keyed by `value_key(v, &mut k)`-serialized
+bytes and all hashed with the default `SipHash13`. Direct children of
+`col_stats_mcv_min` by inclusive Ir: `HashMap::entry` (140,000 calls)
+869M (16.22%), `sort_by` (35 calls) 626M (11.69%), `compute_elem_stats`
+(5 calls) 590M (11.02%). Line-level annotation pinpointed
+`mcv_keys.contains(&k)` alone at 231.8M Ir (4.33% of the whole
+profile) over 68,610 calls — ~3,379 Ir per call, almost all of it
+`HashSet<Vec<u8>>::contains`'s `SipHash13` mix rounds on a short byte
+key, not genuine lookup cost. Flat (self-cost) ranking shows
+`Sip13Rounds::c_rounds`/`d_rounds`/`Hasher::write`/`u8to64_le` summing
+to ~361M Ir (6.7% of the whole profile) on their own.
+
+### Hypothesis
+
+`SipHash13` (`std`'s default `HashMap`/`HashSet` hasher) is designed
+to resist an attacker who controls the keys and can measure
+hash-flooding DoS; `src/fxhash.rs` already exists in this codebase for
+exactly this situation — "probed many times per query" maps keyed by
+data this engine's own authenticated session supplies — and is already
+used throughout `Database` (`tables`, `indexes`, `stats`, `row_index`,
+etc. in `src/storage.rs`) via `HashMap<K, V, FxBuildHasher>`. The four
+`Vec<u8>`-keyed collections in the ANALYZE census are the same shape
+(short, non-adversarial keys, probed heavily in a hot loop) and were
+simply never switched when v2.33 added them. Swapping their hasher to
+the existing `FxBuildHasher` should remove the `SipHash13` mix-round
+cost without changing which bytes are hashed or any ordering/behavior.
+
+### Change
+
+`src/exec/analyze.rs`: `counts`, `mcv_keys` (in `col_stats_mcv_min`)
+and `elem_rows`, `seen` (in `compute_elem_stats`) now declare
+`FxBuildHasher` (`use crate::fxhash::FxBuildHasher;`) instead of the
+default `RandomState`/`SipHash13`, constructed via `HashMap::default()`
+/ `HashSet::default()` — the same pattern already used for every
+`FxBuildHasher`-keyed map in `src/storage.rs`. No other logic changed:
+same keys, same values, same iteration/sort order (`FxBuildHasher` is
+deterministic per-process but does not need to match `RandomState`'s
+iteration order anywhere this code relies on it, since every ordering
+the function returns is produced by explicit `sort_by` calls, not
+hashmap iteration order). Reusing an existing in-tree module, not a
+new dependency. Full suite (1416 tests) passes unchanged.
+
+### Measurement
+
+Callgrind (`Ir`), `benches/profile_analyze.py --tool callgrind`:
+
+| rows | rounds | base `Ir` | after `Ir` | delta |
+|---|---|---|---|---|
+| 1000 | 10 | 2,887,123,611 | 2,420,909,506 | **-16.16%** |
+| 2000 | 10 | 5,145,329,831 | 4,301,729,895 | **-16.39%** |
+| 4000 | 10 | 9,816,175,227 | 8,250,719,724 | **-15.95%** |
+| 4000 | 5 (kept log) | 5,360,086,497 | 4,580,591,170 | -14.54% |
+
+`callgrind_annotate --auto=no` on the kept `rows=4000, rounds=5` logs:
+every `Sip13Rounds`/`sip::Hasher::write`/`u8to64_le` frame drops out of
+the top-cost list entirely after the change (none appear in the top
+~30 self-cost entries; before, they summed to ~6.7% of total `Ir`).
+
+dhat (`benches/profiles/dhat.out.analyzecensus-{base,after}-n4000r10-2026-11-18`,
+`rows=4000 --rounds 10`, summed over all program points):
+
+| metric | base | after | delta |
+|---|---|---|---|
+| total bytes allocated | 299,749,486 | 299,749,486 | 0.00% |
+| total allocations (blocks) | 2,603,304 | 2,603,304 | 0.00% |
+
+Allocation counts are identical, as expected — this changes which
+hash function mixes the key bytes, not how many allocations the
+census performs. The claim here is instruction count only, and the
+-15..16% `Ir` delta clears the floor on its own.
+
+### Reproduce
+
+```bash
+cargo build
+python3 benches/profile_analyze.py --tool callgrind --sizes --rounds 10
+python3 benches/profile_analyze.py --tool callgrind --rows 4000 --rounds 5 \
+    --keep-log /tmp/cg.out
+callgrind_annotate --auto=no /tmp/cg.out | head -30
+```
