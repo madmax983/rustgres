@@ -1,6 +1,7 @@
 // v1.78 mechanical split: moved verbatim from src/exec.rs (22012-22620).
 // Zero semantic changes; map in goals/.../hidden_files/refactor-modularize/.
 use super::*;
+use crate::fxhash::FxBuildHasher;
 
 // ============================================================================
 // v1.03: EXPLAIN ANALYZE - execute the inner SELECT once and render
@@ -711,7 +712,7 @@ pub(crate) fn col_stats_from_values(cty: &ColType, values: &[Value]) -> ColStats
 pub(crate) fn col_stats_mcv_min(cty: &ColType, values: &[Value], mcv_min_count: u64) -> ColStats {
     let total = values.len() as f64;
     let mut nulls = 0u64;
-    let mut counts: HashMap<Vec<u8>, (Value, u64)> = HashMap::new();
+    let mut counts: HashMap<Vec<u8>, (Value, u64), FxBuildHasher> = HashMap::default();
     let mut nonnull: Vec<(usize, Value)> = Vec::new();
     let mut total_width: i64 = 0;
     for (i, v) in values.iter().enumerate() {
@@ -772,7 +773,7 @@ pub(crate) fn col_stats_mcv_min(cty: &ColType, values: &[Value], mcv_min_count: 
             .collect()
     };
     // Histogram: PG19 builds it over the non-MCV values.
-    let mcv_keys: std::collections::HashSet<Vec<u8>> = by_freq
+    let mcv_keys: std::collections::HashSet<Vec<u8>, FxBuildHasher> = by_freq
         .iter()
         .take(100)
         .map(|(v, _)| {
@@ -854,7 +855,7 @@ fn compute_elem_stats(
         return (None, None);
     }
     let rows = nonnull.len() as f64;
-    let mut elem_rows: HashMap<Vec<u8>, (Value, u64)> = HashMap::new();
+    let mut elem_rows: HashMap<Vec<u8>, (Value, u64), FxBuildHasher> = HashMap::default();
     let mut null_elem_rows = 0u64;
     let mut distinct_counts: Vec<u64> = Vec::with_capacity(nonnull.len());
     for (_, v) in nonnull {
@@ -862,7 +863,7 @@ fn compute_elem_stats(
         if has_null {
             null_elem_rows += 1;
         }
-        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<Vec<u8>, FxBuildHasher> = HashSet::default();
         for e in &elems {
             let mut k = Vec::new();
             value_key(e, &mut k);
