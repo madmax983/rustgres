@@ -448,8 +448,10 @@ pub(crate) fn exec_create(
     }
     // Backing unique indexes for PRIMARY KEY / UNIQUE constraints. The
     // table is empty, so no duplicate check is needed. (v0.22: temp
-    // tables get none — the global index map cannot represent them.)
-    if !temp {
+    // tables got none — the global index map cannot represent them;
+    // v2.34: they now land in the session-local temp index map via
+    // create_constraint_index's temp branch.)
+    {
         if let Some(pk) = &eff_def.pkey {
             create_constraint_index(
                 eng,

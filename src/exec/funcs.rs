@@ -3848,6 +3848,20 @@ pub(crate) fn call_user_function(
     // v2.22: call-site argument collations parallel to `args`.
     arg_colls: &[Option<String>],
 ) -> Result<Value, ExecError> {
+    // v2.34: pg_stat function-call counting (track_functions GUC;
+    // 'pl' counts plpgsql only, 'all' counts every user function).
+    {
+        let mode = track_functions_mode();
+        let count_it =
+            mode == "all" || (mode == "pl" && fdef.lang == crate::sql::FuncLang::Plpgsql);
+        if count_it {
+            let oid = func_oid_map(&q.eng.db, q.snap, q.own)
+                .get(&fdef.name)
+                .copied()
+                .unwrap_or(0);
+            record_function_call(q.eng, q.session, q.own, &fdef.name, oid);
+        }
+    }
     if fdef.lang == crate::sql::FuncLang::Internal {
         return eval_internal_function(&fdef.body, args);
     }
@@ -3975,6 +3989,19 @@ pub(crate) fn call_table_function(
     args: &[Value],
     col_defs: &[(String, ColType, Option<String>)],
 ) -> Result<(Vec<String>, Vec<ColType>, Vec<Row>), ExecError> {
+    // v2.34: pg_stat function-call counting (see call_user_function).
+    {
+        let mode = track_functions_mode();
+        let count_it =
+            mode == "all" || (mode == "pl" && fdef.lang == crate::sql::FuncLang::Plpgsql);
+        if count_it {
+            let oid = func_oid_map(&q.eng.db, q.snap, q.own)
+                .get(&fdef.name)
+                .copied()
+                .unwrap_or(0);
+            record_function_call(q.eng, q.session, q.own, &fdef.name, oid);
+        }
+    }
     if fdef.lang == crate::sql::FuncLang::Internal {
         return Err(exec_err(
             "0A000",
@@ -5682,6 +5709,12 @@ pub(crate) fn eval_func(
     ) {
         return eval_stat_restore_func(q, scopes, virt_catalog_name(name), args);
     }
+    // v2.34: the pg_stat_* scalar family (counter accessors,
+    // resets, snapshot control) needs engine access; it cannot go
+    // through the pure eval_func_vals path.
+    if let Some(r) = eval_pgstat_func(q, virt_catalog_name(name), args, scopes) {
+        return r;
+    }
     // v0.9: sequence functions need engine + snapshot + session access;
     // they cannot go through the pure eval_func_vals path.
     if matches!(name, "nextval" | "currval" | "setval" | "lastval") {
@@ -6178,38 +6211,39 @@ pub(crate) fn pg_column_compression_value(
 /// Returns `(typlen, align_bytes)`; `typlen == -1` marks a varlena.
 pub(crate) fn pg_typlen_align(ty: &ColType) -> (i32, usize) {
     match ty {
-        ColType::Bool => (1, 1),        // 'c'
-        ColType::SingleChar => (1, 1),  // "char": 1/'c'
-        ColType::SmallInt => (2, 2),    // int2: 2/'s'
-        ColType::Int => (4, 4),         // int4: 4/'i'
-        ColType::BigInt => (8, 8),      // int8: 8/'d'
-        ColType::Float4 => (4, 4),      // float4: 4/'i'
-        ColType::Float => (8, 8),       // float8: 8/'d'
-        ColType::Numeric(_) => (-1, 4), // numeric: -1/'i'
-        ColType::Text => (-1, 4),       // text: -1/'i'
-        ColType::Char(_) => (-1, 4),    // bpchar: -1/'i'
-        ColType::Varchar(_) => (-1, 4), // varchar: -1/'i'
-        ColType::Bytea => (-1, 4),      // bytea: -1/'i'
-        ColType::Bit => (-1, 4),        // varbit: -1/'i'
-        ColType::Json => (-1, 4),       // json: -1/'i'
-        ColType::Jsonb => (-1, 4),      // jsonb: -1/'i' (v1.83)
-        ColType::Jsonpath => (-1, 4),   // jsonpath: -1/'i' (v1.85)
-        ColType::Array(_) => (-1, 4),   // array types: 'i'
-        ColType::Date => (4, 4),        // date: 4/'i'
-        ColType::Timestamp => (8, 8),   // timestamp: 8/'d'
-        ColType::Timestamptz => (8, 8), // timestamptz: 8/'d'
-        ColType::Time => (8, 8),        // time: 8/'d' (v1.86)
-        ColType::TimeTz => (12, 8),     // timetz: 12/'d' (v1.86)
-        ColType::Interval => (16, 8),   // interval: 16/'d' (v1.86)
-        ColType::Uuid => (16, 1),       // uuid: 16/'c'
-        ColType::Name => (64, 1),       // name: 64/'c'
-        ColType::Regclass => (4, 4),    // regclass: 4/'i'
-        ColType::Regproc => (4, 4),     // regproc: 4/'i' (v2.14)
-        ColType::Xid => (4, 4),         // xid: 4/'i'
-        ColType::Oid => (4, 4),         // oid: 4/'i' (v2.15)
-        ColType::Inet => (-1, 4),       // inet: varlena (v2.15)
-        ColType::PgLsn => (8, 8),       // pg_lsn: 8/'d'
-        ColType::Tid => (6, 2),         // tid: 6/'s'
+        ColType::Bool => (1, 1),         // 'c'
+        ColType::SingleChar => (1, 1),   // "char": 1/'c'
+        ColType::SmallInt => (2, 2),     // int2: 2/'s'
+        ColType::Int => (4, 4),          // int4: 4/'i'
+        ColType::BigInt => (8, 8),       // int8: 8/'d'
+        ColType::Float4 => (4, 4),       // float4: 4/'i'
+        ColType::Float => (8, 8),        // float8: 8/'d'
+        ColType::Numeric(_) => (-1, 4),  // numeric: -1/'i'
+        ColType::Text => (-1, 4),        // text: -1/'i'
+        ColType::Char(_) => (-1, 4),     // bpchar: -1/'i'
+        ColType::Varchar(_) => (-1, 4),  // varchar: -1/'i'
+        ColType::Bytea => (-1, 4),       // bytea: -1/'i'
+        ColType::Bit => (-1, 4),         // varbit: -1/'i'
+        ColType::Json => (-1, 4),        // json: -1/'i'
+        ColType::Jsonb => (-1, 4),       // jsonb: -1/'i' (v1.83)
+        ColType::Jsonpath => (-1, 4),    // jsonpath: -1/'i' (v1.85)
+        ColType::Array(_) => (-1, 4),    // array types: 'i'
+        ColType::Date => (4, 4),         // date: 4/'i'
+        ColType::Timestamp => (8, 8),    // timestamp: 8/'d'
+        ColType::Timestamptz => (8, 8),  // timestamptz: 8/'d'
+        ColType::Time => (8, 8),         // time: 8/'d' (v1.86)
+        ColType::TimeTz => (12, 8),      // timetz: 12/'d' (v1.86)
+        ColType::Interval => (16, 8),    // interval: 16/'d' (v1.86)
+        ColType::Uuid => (16, 1),        // uuid: 16/'c'
+        ColType::Name => (64, 1),        // name: 64/'c'
+        ColType::Regclass => (4, 4),     // regclass: 4/'i'
+        ColType::Regproc => (4, 4),      // regproc: 4/'i' (v2.14)
+        ColType::Regprocedure => (4, 4), // regprocedure: 4/'i' (v2.34)
+        ColType::Xid => (4, 4),          // xid: 4/'i'
+        ColType::Oid => (4, 4),          // oid: 4/'i' (v2.15)
+        ColType::Inet => (-1, 4),        // inet: varlena (v2.15)
+        ColType::PgLsn => (8, 8),        // pg_lsn: 8/'d'
+        ColType::Tid => (6, 2),          // tid: 6/'s'
         // v1.88: ranges are varlena; int/num/date align 'i',
         // ts/tstz/int8 align 'd' (pg_type.dat).
         ColType::Range(e) | ColType::Multirange(e) => match e {
@@ -9076,6 +9110,10 @@ pub(crate) fn is_builtin_srf(name: &str) -> bool {
             // multirange_minus_multi -> SETOF anymultirange).
             | "range_minus_multi"
             | "multirange_minus_multi"
+            // v2.34: pg_stat_get_backend_* SRFs (pgstat.rs).
+            | "pg_stat_get_backend_io"
+            | "pg_stat_get_backend_idset"
+            | "pg_stat_get_backend_wal"
     )
 }
 
@@ -9092,6 +9130,46 @@ pub(crate) fn eval_srf_vals(
 ) -> Result<Vec<Value>, ExecError> {
     check_builtin_arity(name, vals)?;
     match name {
+        // v2.34: pg_stat_get_backend_* SRFs in target-list position.
+        "pg_stat_get_backend_idset" => {
+            let rows = eval_pgstat_srf_vals(q, name, vals)?;
+            rows.into_iter()
+                .map(|r| {
+                    r.into_cells().pop().ok_or_else(|| {
+                        exec_err(
+                            "XX000",
+                            "pg_stat_get_backend_idset returned a row with no columns".to_string(),
+                        )
+                    })
+                })
+                .collect()
+        }
+        "pg_stat_get_backend_io" | "pg_stat_get_backend_wal" => {
+            let rows = eval_pgstat_srf_vals(q, name, vals)?;
+            let names: Vec<&str> = if name == "pg_stat_get_backend_io" {
+                IO_SPEC.iter().map(|(n, _)| *n).collect()
+            } else {
+                vec![
+                    "wal_records",
+                    "wal_fpi",
+                    "wal_bytes",
+                    "wal_fpi_bytes",
+                    "wal_buffers_full",
+                ]
+            };
+            Ok(rows
+                .into_iter()
+                .map(|r| {
+                    Value::Record(
+                        names
+                            .iter()
+                            .zip(r.iter())
+                            .map(|(n, v)| (n.to_string(), v.clone()))
+                            .collect(),
+                    )
+                })
+                .collect())
+        }
         "regexp_matches" => regexp_matches_rows(vals),
         // v0.79: unnest reuses the FROM-clause table-function core,
         // flattened to one value per row — PG19's unnest returns a
@@ -15245,6 +15323,61 @@ pub(crate) fn func_result_type(
         "pg_clear_relation_stats" | "pg_clear_attribute_stats" | "pg_clear_extended_stats" => {
             Ok(ColType::Text)
         }
+        // v2.34: pg_stat_* scalar family (eval intercepted in
+        // eval_func / pgstat.rs). Void-returning control functions
+        // declare Text like the clears above.
+        "pg_stat_get_snapshot_timestamp" | "pg_stat_get_last_vacuum_time"
+        | "pg_stat_get_last_autovacuum_time" | "pg_stat_get_last_analyze_time"
+        | "pg_stat_get_last_autoanalyze_time" | "pg_stat_get_lastscan"
+        | "pg_stat_get_stat_reset_time" | "pg_stat_get_function_stat_reset_time"
+        | "pg_stat_get_db_stat_reset_time" | "pg_stat_get_db_checksum_last_failure" => {
+            Ok(ColType::Timestamptz)
+        }
+        "pg_stat_get_function_total_time" | "pg_stat_get_function_self_time"
+        | "pg_stat_get_xact_function_total_time" | "pg_stat_get_xact_function_self_time"
+        | "pg_stat_get_total_vacuum_time" | "pg_stat_get_total_autovacuum_time"
+        | "pg_stat_get_total_analyze_time" | "pg_stat_get_total_autoanalyze_time"
+        | "pg_stat_get_db_blk_read_time" | "pg_stat_get_db_blk_write_time"
+        | "pg_stat_get_db_session_time" | "pg_stat_get_db_active_time"
+        | "pg_stat_get_db_idle_in_transaction_time" => Ok(ColType::Float),
+        "pg_stat_have_stats" => Ok(ColType::Bool),
+        "pg_stat_get_db_numbackends" | "pg_backend_pid" | "pg_stat_get_backend_pid" => {
+            Ok(ColType::Int)
+        }
+        "pg_stat_get_numscans" | "pg_stat_get_tuples_returned" | "pg_stat_get_tuples_fetched"
+        | "pg_stat_get_tuples_inserted" | "pg_stat_get_tuples_updated"
+        | "pg_stat_get_tuples_deleted" | "pg_stat_get_tuples_hot_updated"
+        | "pg_stat_get_tuples_newpage_updated" | "pg_stat_get_live_tuples"
+        | "pg_stat_get_dead_tuples" | "pg_stat_get_mod_since_analyze"
+        | "pg_stat_get_ins_since_vacuum" | "pg_stat_get_vacuum_count"
+        | "pg_stat_get_autovacuum_count" | "pg_stat_get_analyze_count"
+        | "pg_stat_get_autoanalyze_count" | "pg_stat_get_blocks_fetched"
+        | "pg_stat_get_blocks_hit" | "pg_stat_get_xact_numscans"
+        | "pg_stat_get_xact_tuples_returned" | "pg_stat_get_xact_tuples_fetched"
+        | "pg_stat_get_xact_tuples_inserted" | "pg_stat_get_xact_tuples_updated"
+        | "pg_stat_get_xact_tuples_deleted" | "pg_stat_get_xact_tuples_hot_updated"
+        | "pg_stat_get_xact_tuples_newpage_updated" | "pg_stat_get_xact_blocks_fetched"
+        | "pg_stat_get_xact_blocks_hit" | "pg_stat_get_function_calls"
+        | "pg_stat_get_xact_function_calls" | "pg_stat_get_db_xact_commit"
+        | "pg_stat_get_db_xact_rollback" | "pg_stat_get_db_blocks_fetched"
+        | "pg_stat_get_db_blocks_hit" | "pg_stat_get_db_tuples_returned"
+        | "pg_stat_get_db_tuples_fetched" | "pg_stat_get_db_tuples_inserted"
+        | "pg_stat_get_db_tuples_updated" | "pg_stat_get_db_tuples_deleted"
+        | "pg_stat_get_db_conflict_all" | "pg_stat_get_db_conflict_tablespace"
+        | "pg_stat_get_db_conflict_lock" | "pg_stat_get_db_conflict_snapshot"
+        | "pg_stat_get_db_conflict_bufferpin" | "pg_stat_get_db_conflict_startup_deadlock"
+        | "pg_stat_get_db_conflict_logicalslot" | "pg_stat_get_db_temp_files"
+        | "pg_stat_get_db_temp_bytes" | "pg_stat_get_db_deadlocks"
+        | "pg_stat_get_db_checksum_failures" | "pg_stat_get_db_sessions"
+        | "pg_stat_get_db_sessions_abandoned" | "pg_stat_get_db_sessions_fatal"
+        | "pg_stat_get_db_sessions_killed" | "pg_stat_get_db_parallel_workers_to_launch"
+        | "pg_stat_get_db_parallel_workers_launched" => Ok(ColType::BigInt),
+        "pg_stat_force_next_flush" | "pg_stat_clear_snapshot" | "pg_stat_reset"
+        | "pg_stat_reset_shared" | "pg_stat_reset_slru"
+        | "pg_stat_reset_single_table_counters" | "pg_stat_reset_single_function_counters"
+        | "pg_stat_reset_backend_stats" | "pg_stat_get_replication_slot"
+        | "pg_stat_get_subscription_stats" => Ok(ColType::Text),
+        "current_schemas" => Ok(ColType::Array(ArrayElem::Text)),
         // v0.14: PostgreSQL internal operator-function aliases return boolean.
         "booleq" | "boolne" | "int4eq" | "texteq" => Ok(ColType::Bool),
         // v0.45: format() returns text.
@@ -15270,6 +15403,35 @@ pub(crate) fn func_result_type(
                 }
             }
             Ok(ty)
+        }
+        // v2.34: pg_stat_get_backend_* SRFs (pgstat.rs): idset is a
+        // single int4 column; io/wal return OUT-parameter composites.
+        "pg_stat_get_backend_idset" => {
+            if !args.is_empty() {
+                return Err(exec_err(
+                    "42883",
+                    "function pg_stat_get_backend_idset() does not exist".to_string(),
+                ));
+            }
+            Ok(ColType::Int)
+        }
+        "pg_stat_get_backend_io" => {
+            if args.len() != 1 {
+                return Err(exec_err(
+                    "42883",
+                    "function pg_stat_get_backend_io() does not exist".to_string(),
+                ));
+            }
+            Ok(ColType::Composite)
+        }
+        "pg_stat_get_backend_wal" => {
+            if args.len() != 1 {
+                return Err(exec_err(
+                    "42883",
+                    "function pg_stat_get_backend_wal() does not exist".to_string(),
+                ));
+            }
+            Ok(ColType::Composite)
         }
         // v1.84: SELECT-list json SRFs type by their OUT columns:
         // array_elements(_text) and object_keys are scalar-typed;

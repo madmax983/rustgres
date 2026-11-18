@@ -1263,6 +1263,17 @@ pub(crate) fn regclass_display(q: &Q, oid: u32) -> String {
             return n.clone();
         }
     }
+    // v2.34: synthetic sequence OIDs (60000 + name-sorted
+    // position, pgstat::list_sequences) render as the name.
+    if oid >= 60000 {
+        let mut names: Vec<&String> = q.eng.db.sequences.keys().collect();
+        names.sort();
+        if let Some(n) = names.get((oid - 60000) as usize) {
+            if q.eng.db.find_sequence(n, q.snap, q.own).is_some() {
+                return (*n).clone();
+            }
+        }
+    }
     // v2.04: view stand-in oids (name hash) render as the view name.
     for (vname, v) in &q.eng.db.views {
         if v.iter().any(|vd| vd.dropped_xmax == 0) && crate::exec::catalog::name_oid(vname) == oid {
@@ -1351,6 +1362,15 @@ pub(crate) fn eval_regclass_cast(q: &mut Q, v: &Value) -> Result<Value, ExecErro
                 // oid in this engine, so the deterministic name
                 // hash stands in (regclass_display mirrors it).
                 crate::exec::catalog::name_oid(s)
+            } else if q.eng.db.find_sequence(s, q.snap, q.own).is_some() {
+                // v2.34: sequences resolve as regclass too (PG gives
+                // every pg_class entry an oid); sequences carry no
+                // allocated oid here, so use the pgstat synthesis
+                // (60000 + name-sorted index) consistently.
+                let mut names: Vec<&String> = q.eng.db.sequences.keys().collect();
+                names.sort();
+                let pos = names.iter().position(|n| n.as_str() == s.as_ref());
+                60000 + pos.unwrap_or(0) as u32
             } else {
                 // A relation name: must resolve, like PG (42P01).
                 return Err(exec_err(
@@ -1542,8 +1562,19 @@ pub(crate) fn eval_cast_named(q: &mut Q, v: &Value, name: &str) -> Result<Value,
     // the catalog/table maps; digit strings parse directly (oidin).
     if name == "oid" {
         return match v {
-            Value::Int(i) | Value::BigInt(i) => Ok(Value::Int(*i)),
-            Value::SmallInt(i) => Ok(Value::Int(*i as i64)),
+            // PG19 pg_cast: int8 -> oid runs i8tooid, which
+            // range-checks (22003 "OID out of range"); int4 ->
+            // oid is a binary coercion (reinterpret as uint32);
+            // int2 -> oid goes through int4 first.
+            Value::BigInt(i) => {
+                if *i < 0 || *i > u32::MAX as i64 {
+                    Err(exec_err("22003", "OID out of range".to_string()))
+                } else {
+                    Ok(Value::Int(*i))
+                }
+            }
+            Value::Int(i) => Ok(Value::Int((*i as u32) as i64)),
+            Value::SmallInt(i) => Ok(Value::Int(((*i as i32) as u32) as i64)),
             Value::Text(s) | Value::BpChar(s) => {
                 let raw = s.to_string();
                 if raw == "-" {
@@ -1555,6 +1586,31 @@ pub(crate) fn eval_cast_named(q: &mut Q, v: &Value, name: &str) -> Result<Value,
                 if let Some(oid) = catalog_name_oid(&raw) {
                     return Ok(Value::Int(oid as i64));
                 }
+                // v2.34: a regprocedure display / signature text
+                // ('name()'::regprocedure::oid) resolves to the
+                // function's OID; so does a regproc display name
+                // ('name'::regproc::oid).
+                if raw.contains('(') {
+                    if let Ok(oid) = regprocedure_resolve(&q.eng.db, &raw) {
+                        return Ok(Value::Int(oid as i64));
+                    }
+                }
+                if let Some(oid) = func_oid_by_name(&q.eng.db, &raw) {
+                    return Ok(Value::Int(oid as i64));
+                }
+                // v2.34: an index's or sequence's regclass display
+                // resolves back to its oid (pgstat's enumeration
+                // carries both kinds).
+                let idx_seq_oid = crate::exec::list_indexes(&q.eng.db, q.snap, q.own, q.session)
+                    .iter()
+                    .find(|ix| ix.indexrelname == raw || ix.key == raw)
+                    .map(|ix| ix.oid)
+                    .or_else(|| {
+                        crate::exec::list_sequences(&q.eng.db, q.snap, q.own)
+                            .iter()
+                            .find(|sq| sq.relname == raw || sq.key == raw)
+                            .map(|sq| sq.oid)
+                    });
                 match q.eng.db.find_table(&raw, q.snap, &q.all_xids, q.session) {
                     Some(t) => Ok(Value::Int(t.oid as i64)),
                     // v2.04: a view's regclass display resolves back
@@ -1568,15 +1624,35 @@ pub(crate) fn eval_cast_named(q: &mut Q, v: &Value, name: &str) -> Result<Value,
                     {
                         Ok(Value::Int(crate::exec::catalog::name_oid(&raw) as i64))
                     }
-                    None => Err(exec_err(
-                        "22P02",
-                        format!("invalid input syntax for type oid: \"{}\"", raw),
-                    )),
+                    None => match idx_seq_oid {
+                        Some(oid) => Ok(Value::Int(oid)),
+                        None => Err(exec_err(
+                            "22P02",
+                            format!("invalid input syntax for type oid: \"{}\"", raw),
+                        )),
+                    },
                 }
             }
             other => Err(exec_err(
                 "42846",
                 format!("cannot cast type {} to oid", other.type_name()),
+            )),
+        };
+    }
+    // v2.34: regprocedure (regproc.c regprocedurein/out). The value
+    // rides as its signature display text; an OID input renders the
+    // signature, a signature/bare-name input resolves to it.
+    if name == "regprocedure" {
+        return match v {
+            Value::Int(i) | Value::BigInt(i) => Ok(Value::text(regprocedure_display(q, *i as u32))),
+            Value::SmallInt(i) => Ok(Value::text(regprocedure_display(q, *i as u32))),
+            Value::Text(s) | Value::BpChar(s) => {
+                let oid = regprocedure_resolve(&q.eng.db, s)?;
+                Ok(Value::text(regprocedure_display(q, oid)))
+            }
+            other => Err(exec_err(
+                "42846",
+                format!("cannot cast type {} to regprocedure", other.type_name()),
             )),
         };
     }
@@ -2291,6 +2367,8 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
         ColType::Regclass => Err(cast_err(v, "regclass")),
         // v2.14: regproc is handled in eval_expr (needs catalog access).
         ColType::Regproc => Err(cast_err(v, "regproc")),
+        // v2.34: regprocedure likewise rides the named path.
+        ColType::Regprocedure => Err(cast_err(v, "regprocedure")),
         // v0.57: casts to `name` go through namein (name.c, PG19):
         // text/bpchar input is silently truncated at 63 bytes; any
         // other source goes through its text form first. Total: never
@@ -2392,6 +2470,89 @@ pub(crate) fn regproc_display(q: &Q, oid: u32) -> String {
         }
     }
     oid.to_string()
+}
+
+/// v2.34: the user-function OID for a bare function name (the
+/// 40000 + name-sorted-index scheme of regproc_display), if the
+/// name denotes at least one user function.
+pub(crate) fn func_oid_by_name(db: &crate::storage::Database, name: &str) -> Option<u32> {
+    if !db.functions.contains_key(name) {
+        return None;
+    }
+    let mut names: Vec<&String> = db.functions.keys().collect();
+    names.sort();
+    names
+        .iter()
+        .position(|n| n.as_str() == name)
+        .map(|i| 40000 + i as u32)
+}
+
+/// v2.34: regprocedure display (PG19 regprocedureout): the function
+/// name plus its argument types, `name(type, ...)`. Overloads share
+/// the name-level OID scheme, so the first overload's signature is
+/// rendered.
+pub(crate) fn regprocedure_display(q: &Q, oid: u32) -> String {
+    if oid >= 40000 {
+        let mut names: Vec<&String> = q.eng.db.functions.keys().collect();
+        names.sort();
+        if let Some(n) = names.get((oid - 40000) as usize) {
+            if let Some(def) = q.eng.db.functions[*n].first() {
+                return format!("{}({})", n, def.arg_types.join(", "));
+            }
+            return format!("{n}()");
+        }
+    }
+    oid.to_string()
+}
+
+/// v2.34: resolve regprocedure INPUT text (PG19 regprocedurein):
+/// a signature `name(type, ...)` selects the matching overload, a
+/// bare name must denote a function, a number is the OID itself.
+/// Returns the function OID; 42883 when nothing matches.
+pub(crate) fn regprocedure_resolve(
+    db: &crate::storage::Database,
+    raw: &str,
+) -> Result<u32, ExecError> {
+    let s = raw.trim().trim_matches('"');
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+        return Ok(s.parse::<u32>().unwrap_or(0));
+    }
+    if let Some(open) = s.find('(') {
+        let name = s[..open].trim();
+        let base = name.rsplit('.').next().unwrap_or(name);
+        let inner = s[open + 1..].trim_end_matches(')').trim();
+        let want: Vec<String> = if inner.is_empty() {
+            Vec::new()
+        } else {
+            inner.split(',').map(|a| a.trim().to_lowercase()).collect()
+        };
+        if let Some(defs) = db.functions.get(base) {
+            let norm = |a: &str| -> String {
+                crate::sql::coltype_by_name(&a.to_lowercase())
+                    .map(|c| c.pg_typname())
+                    .unwrap_or_else(|_| a.to_lowercase())
+            };
+            let hit = defs.iter().any(|d| {
+                d.arg_types.len() == want.len()
+                    && d.arg_types
+                        .iter()
+                        .zip(&want)
+                        .all(|(have, w)| norm(have) == norm(w))
+            });
+            if hit {
+                return func_oid_by_name(db, base).ok_or_else(|| {
+                    exec_err("42883", format!("function \"{}\" does not exist", s))
+                });
+            }
+        }
+        return Err(exec_err(
+            "42883",
+            format!("function \"{}\" does not exist", s),
+        ));
+    }
+    let base = s.rsplit('.').next().unwrap_or(s);
+    func_oid_by_name(db, base)
+        .ok_or_else(|| exec_err("42883", format!("function \"{}\" does not exist", s)))
 }
 
 /// v2.14: `CAST(x AS regproc)`, like PG19's regprocin: a number is

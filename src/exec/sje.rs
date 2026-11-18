@@ -1659,6 +1659,18 @@ pub(crate) fn plan_from_item(
                     output: scan_output("pg_statistic", None, &[], where_, &[]),
                 });
             }
+            // v2.34: pg_stat_* monitoring views are virtual.
+            if is_pgstat_view(virt_catalog_name(&name))
+                && eng.db.find_table(name, snap, &[own], session).is_none()
+            {
+                return Ok(PlanNode::SeqScan {
+                    table: virt_catalog_name(&name).to_string(),
+                    alias: None,
+                    filter: None,
+                    rows: 100,
+                    output: scan_output(virt_catalog_name(&name), None, &[], where_, &[]),
+                });
+            }
             // v0.37: pg_class is virtual (TOAST introspection).
             if name == "pg_class" && eng.db.find_table(name, snap, &[own], session).is_none() {
                 return Ok(PlanNode::SeqScan {

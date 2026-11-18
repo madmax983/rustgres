@@ -800,6 +800,23 @@ pub(crate) fn table_function_col_names(name: &str) -> Result<Vec<String>, ExecEr
             .iter()
             .map(|s| s.to_string())
             .collect()),
+        // v2.34: pg_stat_get_backend_* SRFs (pgstat.rs IO_SPEC /
+        // backend_wal shapes).
+        "pg_stat_get_backend_idset" => Ok(vec!["pg_stat_get_backend_idset".to_string()]),
+        "pg_stat_get_backend_io" => Ok(crate::exec::IO_SPEC
+            .iter()
+            .map(|(n, _)| n.to_string())
+            .collect()),
+        "pg_stat_get_backend_wal" => Ok([
+            "wal_records",
+            "wal_fpi",
+            "wal_bytes",
+            "wal_fpi_bytes",
+            "wal_buffers_full",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()),
         // v1.85: jsonb_path_query's single column is named after it.
         "jsonb_path_query" | "jsonb_path_query_tz" => Ok(vec![name.to_string()]),
         // v1.84: json/jsonb expansion SRFs.
@@ -881,6 +898,16 @@ pub(crate) fn table_function_col_types(
         | "jsonb_object_keys" => Ok(json_srf_col_types(name)),
         // v0.99: parse_ident returns text[] (see eval_str_func).
         "parse_ident" => Ok(vec![ColType::Array(crate::storage::ArrayElem::Text)]),
+        // v2.34: pg_stat_get_backend_* SRF types (pgstat.rs).
+        "pg_stat_get_backend_idset" => Ok(vec![ColType::Int]),
+        "pg_stat_get_backend_io" => Ok(crate::exec::IO_SPEC.iter().map(|(_, ty)| *ty).collect()),
+        "pg_stat_get_backend_wal" => Ok(vec![
+            ColType::BigInt,
+            ColType::BigInt,
+            ColType::Numeric(None),
+            ColType::BigInt,
+            ColType::BigInt,
+        ]),
         // v2.18: updatability introspection result types.
         "pg_relation_is_updatable" => Ok(vec![ColType::Int]),
         "pg_column_is_updatable" => Ok(vec![ColType::Bool]),
@@ -1115,6 +1142,26 @@ pub(crate) fn eval_srf_call(
             )
         };
         return Ok((names, types, vec![Row::new(vec![v])], true));
+    }
+    // v2.34: pg_stat_get_backend_* SRFs read the engine's stats
+    // state (pgstat.rs).
+    if is_pgstat_srf(base_name) {
+        validate_coldef_for_builtin(base_name, col_defs)?;
+        let (schema, qrows) =
+            eval_pgstat_srf(q, base_name, args, scopes).expect("is_pgstat_srf gate")?;
+        let (names, types) = if col_defs.is_empty() {
+            (
+                schema.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+                schema.iter().map(|c| c.ty).collect::<Vec<_>>(),
+            )
+        } else {
+            (
+                col_defs.iter().map(|(n, _, _)| n.clone()).collect(),
+                col_defs.iter().map(|(_, t, _)| *t).collect(),
+            )
+        };
+        let rows: Vec<Row> = qrows.into_iter().map(|r| r.cells).collect();
+        return Ok((names, types, rows, true));
     }
     // v2.30: pg_mcv_list_items decodes the stxdmcv payload built by
     // ANALYZE (strict: a NULL argument yields zero rows).
@@ -2802,10 +2849,25 @@ pub(crate) fn srf_static_schema(
         vec![ty]
     } else if is_json_expansion_srf(name) {
         json_srf_col_types(name)
+    } else if crate::exec::is_pgstat_srf(name) {
+        // v2.34: real OUT types, mirroring pgstat.rs schemas.
+        match name {
+            "pg_stat_get_backend_idset" => vec![ColType::Int],
+            "pg_stat_get_backend_io" => crate::exec::IO_SPEC.iter().map(|(_, ty)| *ty).collect(),
+            _ => vec![
+                ColType::BigInt,
+                ColType::BigInt,
+                ColType::Numeric(None),
+                ColType::BigInt,
+                ColType::BigInt,
+            ],
+        }
     } else {
         vec![ColType::Text; out_names.len()]
     };
-    let authoritative = is_json_expansion_srf(name) || name == "pg_input_error_info";
+    let authoritative = is_json_expansion_srf(name)
+        || name == "pg_input_error_info"
+        || crate::exec::is_pgstat_srf(name);
     Ok((out_names, col_types, authoritative))
 }
 
@@ -3285,6 +3347,26 @@ pub(crate) fn build_source(
                     .collect();
                 return Ok((apply_aliases(schema)?, rows));
             }
+            // v2.34: the pg_stat_* monitoring views + pg_settings
+            // are virtual (pgstat.rs), with pg_catalog. qualifiers
+            // accepted like the statistic family.
+            if is_pgstat_view(virt_catalog_name(&name))
+                && q.eng
+                    .db
+                    .find_table(name, q.snap, &q.all_xids, q.session)
+                    .is_none()
+            {
+                let (raw_schema, rows) =
+                    pgstat_scan(q.eng, q.snap, q.own, q.session, virt_catalog_name(&name));
+                let schema: Vec<QCol> = raw_schema
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                return Ok((apply_aliases(schema)?, rows));
+            }
             // v0.37: pg_class is virtual too (TOAST introspection).
             if name == "pg_class"
                 && q.eng
@@ -3629,6 +3711,12 @@ pub(crate) fn build_source(
             // provenance so the UPDATE overlay can match rows by
             // (table, row-version id), even when not FOR UPDATE.
             let prov_for_overlay = q.pending_updates.is_some();
+            // v2.34: pg_stat scan counting — (table, index, rows)
+            // per access path taken below, applied after the block
+            // (PG19 pgstat counts executor scans; EXPLAIN without
+            // ANALYZE never reaches build_source).
+            let mut pgstat_scans: Vec<(String, Option<String>, i64)> = Vec::new();
+            let mut pgstat_lock_excess: i64 = 0;
             let (schema, rows) = {
                 let t = q
                     .eng
@@ -3694,8 +3782,16 @@ pub(crate) fn build_source(
                 let rows: Vec<QRow> = if is_partitioned_parent {
                     // Collect all leaves recursively.
                     let leaves = collect_partition_leaves(db, name, snap, own, q.session);
+                    // v2.34: pg_stat_lock fastpath model — one
+                    // statement locking more relations than the
+                    // fastpath capacity (16) exceeds it by the
+                    // remainder (applied after the scan below).
+                    if leaves.len() > 16 {
+                        pgstat_lock_excess = (leaves.len() - 16) as i64;
+                    }
                     let mut all_rows = Vec::new();
                     for leaf_name in leaves {
+                        let leaf_rows_before = all_rows.len();
                         let lt = db
                             .find_table(&leaf_name, snap, &[own], q.session)
                             .expect("leaf still visible");
@@ -3725,6 +3821,11 @@ pub(crate) fn build_source(
                                 },
                             });
                         }
+                        pgstat_scans.push((
+                            leaf_name.clone(),
+                            None,
+                            (all_rows.len() - leaf_rows_before) as i64,
+                        ));
                     }
                     all_rows
                 } else if !inherit_children.is_empty() {
@@ -3738,6 +3839,7 @@ pub(crate) fn build_source(
                     let mut tables: Vec<&str> = vec![name.as_str()];
                     tables.extend(inherit_children.iter().map(|s| s.as_str()));
                     for tname in tables {
+                        let tname_rows_before = all_rows.len();
                         let ct = db
                             .find_table(tname, snap, &[own], q.session)
                             .expect("inheritance child still visible");
@@ -3770,6 +3872,11 @@ pub(crate) fn build_source(
                                 },
                             });
                         }
+                        pgstat_scans.push((
+                            tname.to_string(),
+                            None,
+                            (all_rows.len() - tname_rows_before) as i64,
+                        ));
                     }
                     all_rows
                 } else if let Some(hint) = order_hint {
@@ -3783,7 +3890,7 @@ pub(crate) fn build_source(
                         .and_then(|m| m.get(&hint.index))
                         .or_else(|| db.indexes.get(&hint.index))
                         .expect("planned index still present; engine lock held throughout");
-                    index_order_rows(
+                    let rs = index_order_rows(
                         ix,
                         t,
                         name,
@@ -3793,26 +3900,36 @@ pub(crate) fn build_source(
                         own,
                         need_prov || prov_for_overlay,
                         early_limit,
-                    )
+                    );
+                    pgstat_scans.push((
+                        name.to_string(),
+                        Some(hint.index.clone()),
+                        rs.len() as i64,
+                    ));
+                    rs
                 } else {
                     match plan_access_path(db, t, name, &qual, where_, snap, own, q.session) {
-                        AccessPath::SeqScan => t
-                            .rows
-                            .iter()
-                            .filter(|r| row_visible(r, snap, &all_xids))
-                            .map(|r| QRow {
-                                cells: r.values.clone(),
-                                prov: if need_prov || prov_for_overlay {
-                                    vec![RowProv {
-                                        qual: qual.clone(),
-                                        table: name.clone(),
-                                        row_id: r.id,
-                                    }]
-                                } else {
-                                    Vec::new()
-                                },
-                            })
-                            .collect(),
+                        AccessPath::SeqScan => {
+                            let rs: Vec<QRow> = t
+                                .rows
+                                .iter()
+                                .filter(|r| row_visible(r, snap, &all_xids))
+                                .map(|r| QRow {
+                                    cells: r.values.clone(),
+                                    prov: if need_prov || prov_for_overlay {
+                                        vec![RowProv {
+                                            qual: qual.clone(),
+                                            table: name.clone(),
+                                            row_id: r.id,
+                                        }]
+                                    } else {
+                                        Vec::new()
+                                    },
+                                })
+                                .collect();
+                            pgstat_scans.push((name.to_string(), None, rs.len() as i64));
+                            rs
+                        }
                         AccessPath::IndexScan {
                             index,
                             prefix,
@@ -3853,12 +3970,38 @@ pub(crate) fn build_source(
                                     }
                                 }
                             }
+                            pgstat_scans.push((
+                                name.to_string(),
+                                Some(index.clone()),
+                                rows.len() as i64,
+                            ));
                             rows
                         }
                     }
                 };
                 (schema, rows)
             };
+            if pgstat_lock_excess > 0 {
+                record_lock_fastpath(q.eng, pgstat_lock_excess);
+            }
+            // v2.34: apply the pg_stat scan counts recorded above.
+            for (tname, idx, n) in pgstat_scans {
+                let key = rel_key(&q.eng.db, q.snap, q.own, q.session, &tname);
+                let ikey = idx.as_ref().map(|i| {
+                    if q.eng
+                        .db
+                        .temp_indexes
+                        .get(&q.session)
+                        .map(|m| m.contains_key(i))
+                        .unwrap_or(false)
+                    {
+                        pgstat_temp_key(q.session, i)
+                    } else {
+                        i.clone()
+                    }
+                });
+                record_scan(q.eng, q.session, q.own, &key, ikey.as_deref(), n);
+            }
             // v1.95: row-level security — filter the base table's rows
             // through the SELECT USING group (plus the UPDATE group for
             // FOR UPDATE scans, rowsecurity.c). Applies to every access

@@ -364,6 +364,57 @@ pub(crate) fn execute_inner(
             exec_comment_publication(eng, ctx, name, comment)
         }
         // v1.96: schema / maintenance / aggregate statement surface.
+        Stmt::CreateTablespace {
+            name,
+            location,
+            options,
+        } => {
+            // v2.34: PG19 DefineTablespace validation (placement
+            // itself is not modeled; the name registers).
+            for o in options {
+                if !matches!(
+                    o.as_str(),
+                    "seq_page_cost" | "random_page_cost" | "effective_io_concurrency"
+                ) {
+                    return Err(exec_err(
+                        "22023",
+                        format!("unrecognized parameter \"{}\"", o),
+                    ));
+                }
+            }
+            let in_place = location.is_empty()
+                && matches!(
+                    installed_guc("allow_in_place_tablespaces")
+                        .as_deref()
+                        .map(|v| v.trim().to_ascii_lowercase()),
+                    Some(ref v) if v == "on" || v == "true" || v == "yes" || v == "1"
+                );
+            if location.is_empty() && !in_place {
+                return Err(exec_err(
+                    "42704",
+                    "tablespace location must be an absolute path".to_string(),
+                ));
+            }
+            if !location.is_empty() && !location.starts_with('/') {
+                return Err(exec_err(
+                    "42704",
+                    "tablespace location must be an absolute path".to_string(),
+                ));
+            }
+            if !location.is_empty()
+                && location.starts_with('/')
+                && !std::path::Path::new(location).is_dir()
+            {
+                return Err(exec_err(
+                    "58P01",
+                    format!("directory \"{}\" does not exist", location),
+                ));
+            }
+            eng.db.tablespaces.insert(name.clone());
+            Ok(ExecResult::Command {
+                tag: "CREATE TABLESPACE".to_string(),
+            })
+        }
         Stmt::CreateSchema {
             name,
             if_not_exists,
@@ -1207,7 +1258,7 @@ pub(crate) fn execute_inner(
         | Stmt::Savepoint { .. }
         | Stmt::RollbackTo { .. }
         | Stmt::Release { .. }
-        | Stmt::Checkpoint
+        | Stmt::Checkpoint { .. }
         | Stmt::Vacuum { .. }
         // v0.17: SET/SHOW/RESET and transaction-characteristic statements
         // are intercepted by server.rs; reaching here is a session bug.

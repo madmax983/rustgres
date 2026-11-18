@@ -1188,11 +1188,22 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
 ///
 /// Returns `Err` on a commit-time serialization conflict (SQLSTATE 40001
 /// at the call site).
+///
+/// v2.34: `family` is the committing transaction's full xid family
+/// (top xid plus every sub-xid it allocated, released or not). Row
+/// versions are stamped with the CURRENT sub-xid at statement time
+/// (`write_xid`), so the DML arms below must test membership in the
+/// family, not equality with the top xid: before this fix, an INSERT
+/// made under a savepoint was silently dropped from the WAL (the row
+/// vanished on restart) and a TRUNCATE under a savepoint followed by
+/// an INSERT failed the commit with a spurious "concurrent update"
+/// 40001 (found by the stats suite's truncate/savepoint flows).
 pub fn records_for_commit(
     eng: &Engine,
     own: u64,
     writes: &[WriteOp],
     session: u64,
+    family: &[u64],
 ) -> Result<Vec<WalRecord>, String> {
     let mut out: Vec<WalRecord> = Vec::new();
     // v1.80: CreateTable/AlterTable ops and the table versions they push
@@ -1246,7 +1257,7 @@ pub fn records_for_commit(
                     i += 1;
                     continue;
                 }
-                let Some((values, toast, table_live)) = own_row(eng, own, *row_id) else {
+                let Some((values, toast, table_live)) = own_row(eng, family, *row_id) else {
                     i += 1;
                     continue;
                 };
@@ -1259,14 +1270,10 @@ pub fn records_for_commit(
                 // statement-time check ran; committing would create a
                 // duplicate key. Fail the commit (40001 at the call site)
                 // instead of corrupting the unique index.
-                if let Some(cname) = eng.db.committed_unique_violation(
-                    &eng.txns,
-                    table,
-                    &values,
-                    *row_id,
-                    &[own],
-                    session,
-                ) {
+                if let Some(cname) = eng
+                    .db
+                    .committed_unique_violation(&eng.txns, table, &values, *row_id, family, session)
+                {
                     return Err(format!(
                         "duplicate key value violates unique constraint \"{}\" \
                          (committed by a concurrent transaction)",
@@ -1301,7 +1308,7 @@ pub fn records_for_commit(
                     i += 1;
                     continue;
                 };
-                if v.xmax != own {
+                if !family.contains(&v.xmax) {
                     // Our delete was overwritten by a concurrent txn
                     // (last-writer-wins). If the next op is our INSERT
                     // successor (an UPDATE pair), committing would leave
@@ -1371,13 +1378,14 @@ pub fn records_for_commit(
                     i += 1;
                     continue;
                 };
-                if v.xmax != own {
+                if !family.contains(&v.xmax) {
                     return Err(format!(
                         "concurrent update on row id {} in table \"{}\"",
                         old_id, table
                     ));
                 }
-                let Some((new_values, new_toast, table_live)) = own_row(eng, own, *new_id) else {
+                let Some((new_values, new_toast, table_live)) = own_row(eng, family, *new_id)
+                else {
                     i += 1;
                     continue;
                 };
@@ -2135,18 +2143,18 @@ pub fn records_for_commit(
 /// the row is gone or no longer ours.
 /// v0.39: also returns the row version's per-cell toast flags, so the
 /// commit path can WAL-log them (and the value-id provenance).
-pub(crate) fn own_row(eng: &Engine, own: u64, row_id: u64) -> Option<(Row, Vec<u32>, bool)> {
+pub(crate) fn own_row(eng: &Engine, family: &[u64], row_id: u64) -> Option<(Row, Vec<u32>, bool)> {
     for versions in eng.db.tables.values() {
         for t in versions {
             if let Some(pos) = t.row_pos(row_id) {
                 let v = &t.rows[pos];
-                if v.xmin != own {
+                if !family.contains(&v.xmin) {
                     // Not our row version (e.g. an old table version with
                     // reused row ids after ALTER); keep searching.
                     continue;
                 }
                 let dropped = t.dropped_xmax != 0
-                    && t.dropped_xmax != own
+                    && !family.contains(&t.dropped_xmax)
                     && eng.xid_committed(t.dropped_xmax);
                 return Some((v.values.clone(), v.toast.clone(), !dropped));
             }

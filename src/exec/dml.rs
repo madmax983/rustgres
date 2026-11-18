@@ -1842,6 +1842,15 @@ pub(crate) fn exec_create_table_as(
             inserts.push((eng.alloc_row_id(), row));
         }
         apply_row_inserts(eng, ctx, name, &inserts)?;
+        // v2.34: CTAS rows are real inserts for pg_stat (the
+        // apply_row_inserts fast path bypasses exec_insert's
+        // hooks), and PG counts their extends under the
+        // bulkwrite IO context (BAS_BULKWRITE).
+        if n > 0 {
+            let key = rel_key(&eng.db, ctx.snap, ctx.own, ctx.session, name);
+            record_insert(eng, ctx.session, ctx.own, &key, n as i64);
+            record_bulkwrite_extends(eng, ctx.session, &key, n as i64);
+        }
     }
     Ok(ExecResult::Command {
         tag: format!("SELECT {}", n),
@@ -2801,6 +2810,35 @@ pub(crate) fn is_bare_default_expr(e: &Expr) -> bool {
     matches!(e, Expr::Column { table: None, name } if name == "default")
 }
 
+/// v2.34: pg_stat counting helpers — the wrappers below count
+/// completed DML from the ExecResult tag (PG19 pgstat counts at
+/// executor end; partitioned parents are skipped here because PG
+/// attributes the counts to the leaf relations).
+fn pgstat_dml_count(res: &ExecResult) -> i64 {
+    let tag = match res {
+        ExecResult::Dml { tag, .. } => tag,
+        ExecResult::Command { tag } => tag,
+        _ => return 0,
+    };
+    tag.rsplit(' ')
+        .next()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+fn pgstat_count_key(eng: &Engine, ctx: &StmtCtx, table: &str) -> Option<String> {
+    let t = eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)?;
+    if t.partition
+        .as_ref()
+        .is_some_and(|p| p.is_partitioned && !p.children.is_empty())
+    {
+        return None;
+    }
+    Some(rel_key(&eng.db, ctx.snap, ctx.own, ctx.session, table))
+}
+
 pub(crate) fn exec_insert(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -2814,7 +2852,7 @@ pub(crate) fn exec_insert(
     on_conflict: &Option<OnConflict>,
     returning: &[SelectItem],
 ) -> Result<ExecResult, ExecError> {
-    if let Some(r) = crate::exec::rules::try_fire_insert(
+    let out = match crate::exec::rules::try_fire_insert(
         eng,
         ctx,
         table,
@@ -2826,20 +2864,29 @@ pub(crate) fn exec_insert(
         on_conflict,
         returning,
     ) {
-        return r;
+        Some(r) => r,
+        None => exec_insert_inner(
+            eng,
+            ctx,
+            table,
+            overriding,
+            columns,
+            rows,
+            select,
+            with,
+            on_conflict,
+            returning,
+        ),
+    };
+    if let Ok(res) = &out {
+        let n = pgstat_dml_count(res);
+        if n > 0 {
+            if let Some(key) = pgstat_count_key(eng, ctx, table) {
+                record_insert(eng, ctx.session, ctx.own, &key, n);
+            }
+        }
     }
-    exec_insert_inner(
-        eng,
-        ctx,
-        table,
-        overriding,
-        columns,
-        rows,
-        select,
-        with,
-        on_conflict,
-        returning,
-    )
+    out
 }
 
 pub(crate) fn exec_insert_inner(
@@ -4724,12 +4771,45 @@ pub(crate) fn exec_update(
     with: &[CteDef],
     returning: &[SelectItem],
 ) -> Result<ExecResult, ExecError> {
-    if let Some(r) = crate::exec::rules::try_fire_update(
+    let out = match crate::exec::rules::try_fire_update(
         eng, ctx, table, alias, sets, from, where_, with, returning,
     ) {
-        return r;
+        Some(r) => r,
+        None => exec_update_inner(eng, ctx, table, alias, sets, from, where_, with, returning),
+    };
+    if let Ok(res) = &out {
+        let n = pgstat_dml_count(res);
+        if n > 0 {
+            if let Some(key) = pgstat_count_key(eng, ctx, table) {
+                // HOT iff no SET column is indexed (PG19
+                // heap_update: a HOT chain stays on one page when
+                // no indexed column changes).
+                let set_cols: std::collections::HashSet<&str> =
+                    sets.iter().map(|(c, _)| c.as_str()).collect();
+                let mut indexed: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for d in visible_index_defs(&eng.db, ctx.snap, ctx.own, ctx.session) {
+                    if d.table == table {
+                        indexed.extend(d.col_names.iter().cloned());
+                    }
+                }
+                if let Some(tm) = eng.db.temp_indexes.get(&ctx.session) {
+                    for ix in tm.values() {
+                        if ix.def.table == table {
+                            indexed.extend(ix.def.col_names.iter().cloned());
+                        }
+                    }
+                }
+                let hot = if set_cols.iter().any(|c| indexed.contains(*c)) {
+                    0
+                } else {
+                    n
+                };
+                record_update(eng, ctx.session, ctx.own, &key, n, hot, 0);
+            }
+        }
     }
-    exec_update_inner(eng, ctx, table, alias, sets, from, where_, with, returning)
+    out
 }
 
 pub(crate) fn exec_update_inner(
@@ -6088,12 +6168,21 @@ pub(crate) fn exec_delete(
     with: &[CteDef],
     returning: &[SelectItem],
 ) -> Result<ExecResult, ExecError> {
-    if let Some(r) =
-        crate::exec::rules::try_fire_delete(eng, ctx, table, alias, using, where_, with, returning)
-    {
-        return r;
+    let out = match crate::exec::rules::try_fire_delete(
+        eng, ctx, table, alias, using, where_, with, returning,
+    ) {
+        Some(r) => r,
+        None => exec_delete_inner(eng, ctx, table, alias, using, where_, with, returning),
+    };
+    if let Ok(res) = &out {
+        let n = pgstat_dml_count(res);
+        if n > 0 {
+            if let Some(key) = pgstat_count_key(eng, ctx, table) {
+                record_delete(eng, ctx.session, ctx.own, &key, n);
+            }
+        }
     }
-    exec_delete_inner(eng, ctx, table, alias, using, where_, with, returning)
+    out
 }
 
 pub(crate) fn exec_delete_inner(
@@ -6917,6 +7006,17 @@ pub(crate) fn exec_truncate(
             });
         }
     }
+    // v2.34: pg_stat — each truncated relation starts a new
+    // counter generation in this transaction.
+    {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for name in targets.iter().chain(tables.iter()) {
+            let key = rel_key(&eng.db, ctx.snap, ctx.own, ctx.session, name);
+            if seen.insert(key.clone()) {
+                record_truncate(eng, ctx.session, ctx.own, &key);
+            }
+        }
+    }
     Ok(ExecResult::Command {
         tag: "TRUNCATE TABLE".to_string(),
     })
@@ -6962,6 +7062,12 @@ pub(crate) fn exec_drop(
     // are dependencies of the relation).
     for name in &dropped {
         crate::exec::rules::clear_rules(ctx, eng, name);
+    }
+    // v2.34: pg_stat — dropped relations lose their xact stats
+    // entry now and their committed entry at commit (pgstat.rs).
+    for name in &dropped {
+        let key = rel_key(&eng.db, ctx.snap, ctx.own, ctx.session, name);
+        note_drop_rel(eng, ctx.session, ctx.own, &key);
     }
     Ok(ExecResult::Command {
         tag: "DROP TABLE".to_string(),
@@ -7105,6 +7211,41 @@ pub(crate) fn drop_one_table(
         // indexes" by table name would delete a same-named permanent
         // table's indexes — that block was removed for exactly this
         // reason.
+        // v2.34: temp tables DO own session-local indexes now
+        // (explicit CREATE INDEX since v0.87, constraint indexes
+        // since v2.34) in temp_indexes[session]; they die with
+        // the table, marked + logged exactly like DROP INDEX.
+        let temp_ix_names: Vec<String> = eng
+            .db
+            .temp_indexes
+            .get(&ctx.session)
+            .map(|m| {
+                m.iter()
+                    .filter(|(_, ix)| ix.def.table == name)
+                    .map(|(n, _)| n.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for ix_name in temp_ix_names {
+            let snapshot = eng
+                .db
+                .temp_indexes
+                .get(&ctx.session)
+                .and_then(|m| m.get(&ix_name))
+                .cloned();
+            if let Some(snapshot) = snapshot {
+                if let Some(m) = eng.db.temp_indexes.get_mut(&ctx.session) {
+                    if let Some(ix) = m.get_mut(&ix_name) {
+                        ix.def.dropped_xmax = ctx.own;
+                    }
+                }
+                ctx.writes.push(WriteOp::DropTempIndex {
+                    session: ctx.session,
+                    name: ix_name,
+                    index: snapshot,
+                });
+            }
+        }
         // v0.72: record the statement-level drop (multi-name DROP).
         dropped.insert(name.to_string());
         return Ok(());

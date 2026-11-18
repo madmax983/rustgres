@@ -100,6 +100,7 @@ mod orderby;
 mod params;
 mod partition;
 mod pg_input;
+mod pgstat;
 mod privfuncs;
 mod privilege;
 mod project;
@@ -387,6 +388,9 @@ mod v232_tests;
 #[path = "test_mods/v233_tests.rs"]
 mod v233_tests;
 #[cfg(test)]
+#[path = "test_mods/v234_tests.rs"]
+mod v234_tests;
+#[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;
 
@@ -426,6 +430,7 @@ pub(crate) use orderby::*;
 pub(crate) use params::*;
 pub(crate) use partition::*;
 pub(crate) use pg_input::*;
+pub(crate) use pgstat::*;
 pub(crate) use privfuncs::*;
 pub(crate) use privilege::*;
 pub(crate) use project::*;

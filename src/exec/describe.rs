@@ -288,6 +288,22 @@ pub(crate) fn from_schema_item(
                 out.push(apply_aliases(schema)?);
                 return Ok(());
             }
+            // v2.34: the pg_stat_* monitoring views + pg_settings
+            // are virtual (pgstat.rs).
+            if is_pgstat_view(virt_catalog_name(&name))
+                && eng.db.find_table(name, snap, &[own], session).is_none()
+            {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let schema: Vec<QCol> = pgstat_schema(virt_catalog_name(&name))
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                out.push(apply_aliases(schema)?);
+                return Ok(());
+            }
             // v0.37: pg_class is virtual too (TOAST introspection).
             if name == "pg_class" && eng.db.find_table(name, snap, &[own], session).is_none() {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());
@@ -1462,6 +1478,10 @@ pub(crate) fn expr_type(
             match name.as_str() {
                 "aclitem" => return Ok(ColType::Text),
                 "regrole" => return Ok(ColType::Int),
+                // v2.34: `::oid` rides the named path (v2.15) so its
+                // result type is oid; regprocedure likewise.
+                "oid" => return Ok(ColType::Oid),
+                "regprocedure" => return Ok(ColType::Regprocedure),
                 _ => {}
             }
             match eng.db.types.get(name) {

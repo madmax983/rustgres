@@ -398,6 +398,7 @@ pub(crate) fn dummy_value_of(ty: &ColType) -> Value {
         ColType::PgLsn => Value::PgLsn(1),
         ColType::Regclass => Value::text("x"),
         ColType::Regproc => Value::text("x"),
+        ColType::Regprocedure => Value::text("x"), // v2.34: rides as text
         ColType::Xid => Value::Int(1),
         ColType::Oid => Value::Int(1),
         ColType::Inet => Value::text("0.0.0.0"),
@@ -2084,6 +2085,11 @@ pub(crate) fn exec_drop_function(
             prev_type_owners,
         });
         forget_obj_schema(eng, ctx, name);
+    }
+    // v2.34: pg_stat — a fully dropped function's stats entry is
+    // removed when this transaction commits (pgstat.rs).
+    if !eng.db.functions.contains_key(name) {
+        note_drop_func(eng, ctx.session, ctx.own, name);
     }
     ctx.writes.push(WriteOp::DropFunction {
         name: name.to_string(),

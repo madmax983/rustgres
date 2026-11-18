@@ -1662,6 +1662,10 @@ pub(crate) fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, 
             if *to == ColType::Regproc {
                 return eval_regproc_cast(q, &v);
             }
+            // v2.34: regprocedure cast resolves signatures by name.
+            if *to == ColType::Regprocedure {
+                return eval_cast_named(q, &v, "regprocedure");
+            }
             // v1.96: an array-to-array cast runs the ELEMENT cast
             // function; PG checks EXECUTE on it (REVOKE ALL ON
             // FUNCTION int8(integer) FROM PUBLIC denies the cast).

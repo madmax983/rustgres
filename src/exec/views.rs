@@ -273,6 +273,9 @@ pub(crate) fn exec_create_view(
                 | "pg_trigger"
                 | "pg_user"
         );
+        // v2.34: the pg_stat_* monitoring views + pg_settings are
+        // virtual too (pgstat.rs).
+        let is_virtual = is_virtual || is_pgstat_view(virt_catalog_name(d));
         if !is_table && !is_view && !is_seq && !is_virtual {
             return Err(exec_err(
                 "42P01",

@@ -250,6 +250,13 @@ struct Txn {
         std::collections::HashMap<(String, String), bool>,
         usize,
     )>,
+    /// v2.34: pg_stat_* xact-counter snapshots in lockstep with
+    /// `savepoints` — ROLLBACK TO applies the pgstat generation /
+    /// dead-tuple rules against the named mark, like PG19's
+    /// pgstat_xact stack.
+    pgstat_marks: Vec<
+        std::collections::HashMap<String, crate::storage::PgXactRel, crate::fxhash::FxBuildHasher>,
+    >,
 }
 
 impl Txn {
@@ -746,6 +753,11 @@ fn run_connection(
 
     // ReadyForQuery (idle)
     let mut session = Session::new(role_name.clone());
+    // v2.34: pg_stat_database.sessions counts this backend.
+    {
+        let mut guard = lock_engine(&engine);
+        exec::record_session_start(&mut guard);
+    }
 
     // v0.13: `replication=true` connections speak the walsender protocol
     // instead of SQL (ParameterStatus/BackendKeyData above are shared).
@@ -780,6 +792,8 @@ fn run_connection(
     {
         let mut guard = lock_engine(&engine);
         guard.db.drop_session_temps(session.sid);
+        // v2.34: pg_stat temp/per-backend state dies with the session.
+        exec::pgstat_session_cleanup(&mut guard, session.sid);
     }
     result
 }
@@ -1760,6 +1774,7 @@ fn copy_from_ingest(
                     if let Err(e) = exec::flush_deferred_fk(&mut guard, &mut ctx, None) {
                         drop(ctx);
                         undo_all(&mut guard, &[xid], &writes);
+                        exec::pgstat_abort(&mut guard, session.sid, xid);
                         exec::deferred_clear(&mut guard, session.sid);
                         retire_txn(&mut guard, xid);
                         auto_vacuum(&mut guard, &writes);
@@ -1767,25 +1782,28 @@ fn copy_from_ingest(
                     }
                 }
                 exec::deferred_clear(&mut guard, session.sid);
-                let records = match wal::records_for_commit(&guard, xid, &writes, session.sid) {
-                    Ok(r) => r,
-                    Err(msg) => {
-                        undo_all(&mut guard, &[xid], &writes);
-                        retire_txn(&mut guard, xid);
-                        auto_vacuum(&mut guard, &writes);
-                        return Err(exec::ExecError {
-                            detail: None,
-                            hint: None,
-                            code: "40001",
-                            message: format!(
-                                "could not serialize access due to concurrent update: {}",
-                                msg
-                            ),
-                        });
-                    }
-                };
+                let records =
+                    match wal::records_for_commit(&guard, xid, &writes, session.sid, &[xid]) {
+                        Ok(r) => r,
+                        Err(msg) => {
+                            undo_all(&mut guard, &[xid], &writes);
+                            exec::pgstat_abort(&mut guard, session.sid, xid);
+                            retire_txn(&mut guard, xid);
+                            auto_vacuum(&mut guard, &writes);
+                            return Err(exec::ExecError {
+                                detail: None,
+                                hint: None,
+                                code: "40001",
+                                message: format!(
+                                    "could not serialize access due to concurrent update: {}",
+                                    msg
+                                ),
+                            });
+                        }
+                    };
                 if let Err(e) = lock_wal(wal).append_batch(&records) {
                     undo_all(&mut guard, &[xid], &writes);
+                    exec::pgstat_abort(&mut guard, session.sid, xid);
                     retire_txn(&mut guard, xid);
                     auto_vacuum(&mut guard, &writes);
                     return Err(exec::ExecError {
@@ -1795,12 +1813,15 @@ fn copy_from_ingest(
                         message: format!("WAL write failed: {}", e),
                     });
                 }
+                // v2.34: pg_stat — COPY's counts commit with it.
+                exec::pgstat_commit(&mut guard, session.sid, xid);
                 retire_txn(&mut guard, xid);
                 auto_vacuum(&mut guard, &writes);
                 Ok(n)
             }
             Err(e) => {
                 undo_all(&mut guard, &[xid], &writes);
+                exec::pgstat_abort(&mut guard, session.sid, xid);
                 retire_txn(&mut guard, xid);
                 auto_vacuum(&mut guard, &writes);
                 Err(e)
@@ -2951,6 +2972,20 @@ fn is_generic_guc(name: &str) -> bool {
             | "intervalstyle"
             | "session_replication_role"
             | "stats_fetch_consistency"
+            // v2.34: pg_stat family GUCs.
+            | "track_counts"
+            | "track_functions"
+            | "track_activities"
+            | "track_io_timing"
+            | "track_wal_io_timing"
+            | "temp_buffers"
+            | "wal_skip_threshold"
+            | "synchronous_commit"
+            | "max_locks_per_transaction"
+            | "block_size"
+            | "fsync"
+            | "wal_sync_method"
+            | "allow_in_place_tablespaces"
             | "password_encryption"
             | "datestyle"
             | "client_encoding"
@@ -3098,6 +3133,20 @@ fn guc_default(name: &str) -> &'static str {
         "intervalstyle" => "postgres",
         "session_replication_role" => "origin",
         "stats_fetch_consistency" => "cache",
+        // v2.34: PG19 boot_vals for the pg_stat family.
+        "track_counts" => "on",
+        "track_functions" => "none",
+        "track_activities" => "on",
+        "track_io_timing" => "off",
+        "track_wal_io_timing" => "off",
+        "temp_buffers" => "8MB",
+        "wal_skip_threshold" => "2GB",
+        "synchronous_commit" => "on",
+        "max_locks_per_transaction" => "64",
+        "block_size" => "8192",
+        "fsync" => "on",
+        "wal_sync_method" => "fdatasync",
+        "allow_in_place_tablespaces" => "off",
         "password_encryption" => "scram-sha-256",
         "datestyle" => "ISO, MDY",
         "client_encoding" => "UTF8",
@@ -3566,6 +3615,88 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
                 ("snapshot", "snapshot"),
             ],
         ),
+        // v2.34: pg_stat family GUC validation (PG19 guc_tables).
+        "track_functions" => validate_enum_guc(
+            name,
+            value,
+            &[("none", "none"), ("pl", "pl"), ("all", "all")],
+        ),
+        "synchronous_commit" => validate_enum_guc(
+            name,
+            value,
+            &[
+                ("on", "on"),
+                ("off", "off"),
+                ("local", "local"),
+                ("remote_write", "remote_write"),
+                ("remote_apply", "remote_apply"),
+                ("true", "on"),
+                ("yes", "on"),
+                ("1", "on"),
+                ("false", "off"),
+                ("no", "off"),
+                ("0", "off"),
+            ],
+        ),
+        "temp_buffers" | "wal_skip_threshold" => {
+            let bare = value.trim().chars().all(|c| c.is_ascii_digit());
+            let kb = if name == "temp_buffers" && bare {
+                value
+                    .trim()
+                    .parse::<i64>()
+                    .map(|b| b * 8)
+                    .map_err(|_| invalid())?
+            } else {
+                parse_memory_kb(value).ok_or_else(invalid)?
+            };
+            let min_kb = if name == "temp_buffers" { 800 } else { 0 };
+            if kb < min_kb {
+                return Err(ExecError {
+                    detail: None,
+                    hint: None,
+                    code: "22023",
+                    message: format!(
+                        "\"{}\" is outside the valid range for parameter \"{}\"",
+                        value, name
+                    ),
+                });
+            }
+            Ok(format!("{}kB", kb))
+        }
+        "wal_sync_method" => {
+            let v = value.trim().trim_matches('\'').to_ascii_lowercase();
+            match v.as_str() {
+                "open_sync" | "open_datasync" | "fdatasync" | "fsync"
+                | "fsync_writethrough" => Ok(v),
+                _ => Err(ExecError {
+                    detail: None,
+                    hint: Some(
+                        "Available values: open_sync, open_datasync, fdatasync, fsync, fsync_writethrough."
+                            .to_string(),
+                    ),
+                    code: "22023",
+                    message: format!(
+                        "invalid value for parameter \"wal_sync_method\": \"{}\"",
+                        value.trim().trim_matches('\'')
+                    ),
+                }),
+            }
+        }
+        "max_locks_per_transaction" => {
+            let i: i64 = value.trim().parse().map_err(|_| invalid())?;
+            if !(10..=2147483647).contains(&i) {
+                return Err(ExecError {
+                    detail: None,
+                    hint: None,
+                    code: "22023",
+                    message: format!(
+                        "{} is outside the valid range for parameter \"max_locks_per_transaction\" (10 .. 2147483647)",
+                        value
+                    ),
+                });
+            }
+            Ok(i.to_string())
+        }
         "password_encryption" => validate_enum_guc(
             name,
             value,
@@ -3581,6 +3712,12 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
         | "enable_material"
         | "enable_partitionwise_aggregate"
         | "enable_partition_pruning"
+        | "track_counts"
+        | "track_activities"
+        | "track_io_timing"
+        | "track_wal_io_timing"
+        | "fsync"
+        | "allow_in_place_tablespaces"
         | "enable_incremental_sort" => parse_bool_guc(value)
             .map(|b| (if b { "on" } else { "off" }).to_string())
             .ok_or_else(invalid),
@@ -3725,6 +3862,19 @@ fn name_to_static(name: &str) -> &'static str {
         "intervalstyle" => "intervalstyle",
         "session_replication_role" => "session_replication_role",
         "stats_fetch_consistency" => "stats_fetch_consistency",
+        "track_counts" => "track_counts",
+        "track_functions" => "track_functions",
+        "track_activities" => "track_activities",
+        "track_io_timing" => "track_io_timing",
+        "track_wal_io_timing" => "track_wal_io_timing",
+        "temp_buffers" => "temp_buffers",
+        "wal_skip_threshold" => "wal_skip_threshold",
+        "synchronous_commit" => "synchronous_commit",
+        "max_locks_per_transaction" => "max_locks_per_transaction",
+        "block_size" => "block_size",
+        "fsync" => "fsync",
+        "wal_sync_method" => "wal_sync_method",
+        "allow_in_place_tablespaces" => "allow_in_place_tablespaces",
         "password_encryption" => "password_encryption",
         "datestyle" => "datestyle",
         "client_encoding" => "client_encoding",
@@ -3905,6 +4055,19 @@ fn stmt_set_guc(
             };
             stmt_set_transaction(session, None, None, d, None, local)
         }
+        // v2.34: read-only (PGC_INTERNAL) GUCs are checked BEFORE
+        // the generic arm: block_size is a known generic name (so
+        // SHOW works) but SET on it is 55P02 like server_version.
+        "server_version" | "server_version_num" | "block_size"
+            if matches!(value, SetValue::Str(_)) =>
+        {
+            Err(ExecError {
+                detail: None,
+                hint: None,
+                code: "55P02",
+                message: format!("parameter \"{}\" cannot be changed", name),
+            })
+        }
         // v1.07: validated-but-unmodeled GUCs (planner knobs,
         // `extra_float_digits`, `work_mem`, ...): PG19-validated and
         // stored; RESET restores the compiled default. `SET ... TO
@@ -3934,7 +4097,7 @@ fn stmt_set_guc(
         // parameters, so SET on them is 55P02
         // ERRCODE_CANT_CHANGE_RUNTIME_PARAM (`parameter "x" cannot be
         // changed`), not 42704.
-        "server_version" | "server_version_num" => Err(ExecError {
+        "server_version" | "server_version_num" | "block_size" => Err(ExecError {
             detail: None,
             hint: None,
             code: "55P02",
@@ -4098,7 +4261,7 @@ fn stmt_reset_guc(session: &mut Session, name: &str) -> Result<ExecResult, ExecE
         }
         // v0.68: RESET on a read-only GUC is 55P02 too — PG19's
         // set_config_option context check fires for every action.
-        "server_version" | "server_version_num" => Err(ExecError {
+        "server_version" | "server_version_num" | "block_size" => Err(ExecError {
             detail: None,
             hint: None,
             code: "55P02",
@@ -4459,7 +4622,7 @@ fn run_statement(
         Stmt::Savepoint { name } => txn_savepoint(engine, session, name),
         Stmt::RollbackTo { name } => txn_rollback_to(engine, session, name),
         Stmt::Release { name } => txn_release(session, name),
-        Stmt::Checkpoint => txn_checkpoint(engine, wal, session),
+        Stmt::Checkpoint { options } => txn_checkpoint(engine, wal, session, options),
         // v0.74: SQL-level PREPARE / DEALLOCATE are session-state writes
         // (the statement text was already parsed); EXECUTE is resolved
         // to the bound inner statement before the match.
@@ -4531,7 +4694,42 @@ fn run_statement(
             verbose,
             analyze,
             more_tables,
+            buffer_usage_limit_kb,
+            buffer_usage_overflow,
+            buffer_usage_full,
         } => {
+            // v2.34: PG19 vacuum.c BUFFER_USAGE_LIMIT validation.
+            if *buffer_usage_overflow {
+                return Err(ExecError {
+                    detail: None,
+                    hint: Some("Value exceeds integer range.".to_string()),
+                    code: "22023",
+                    message:
+                        "BUFFER_USAGE_LIMIT option must be 0 or between 128 kB and 16777216 kB"
+                            .to_string(),
+                });
+            }
+            if let Some(kb) = buffer_usage_limit_kb {
+                if *buffer_usage_full {
+                    return Err(ExecError {
+                        detail: None,
+                        hint: None,
+                        code: "22023",
+                        message: "BUFFER_USAGE_LIMIT cannot be specified for VACUUM FULL"
+                            .to_string(),
+                    });
+                }
+                if *kb != 0 && !(128..=16777216).contains(kb) {
+                    return Err(ExecError {
+                        detail: None,
+                        hint: None,
+                        code: "22023",
+                        message:
+                            "BUFFER_USAGE_LIMIT option must be 0 or between 128 kB and 16777216 kB"
+                                .to_string(),
+                    });
+                }
+            }
             // v2.30: multi-table VACUUM — vacuum each named table in
             // order; the command tag comes from the last one.
             let mut all_tables: Vec<(String, Vec<String>)> = Vec::new();
@@ -4843,6 +5041,7 @@ fn autocommit_execute(
         Ok(r) => r,
         Err(e) => {
             undo_all(&mut guard, &[xid], &writes);
+            exec::pgstat_abort(&mut guard, sid, xid);
             exec::deferred_clear(&mut guard, sid);
             retire_txn(&mut guard, xid);
             return Err(e);
@@ -4878,6 +5077,7 @@ fn autocommit_execute(
             Err(e) => {
                 drop(ctx);
                 undo_all(&mut guard, &[xid], &writes);
+                exec::pgstat_abort(&mut guard, sid, xid);
                 exec::deferred_clear(&mut guard, sid);
                 retire_txn(&mut guard, xid);
                 return Err(e);
@@ -4891,10 +5091,11 @@ fn autocommit_execute(
     // A commit-time serialization conflict (e.g. a concurrent CREATE
     // TABLE of the same name won the race) aborts the statement: undo
     // the staged writes and retire the xid.
-    let records = match wal::records_for_commit(&guard, xid, &writes, sid) {
+    let records = match wal::records_for_commit(&guard, xid, &writes, sid, &[xid]) {
         Ok(r) => r,
         Err(msg) => {
             undo_all(&mut guard, &[xid], &writes);
+            exec::pgstat_abort(&mut guard, sid, xid);
             retire_txn(&mut guard, xid);
             auto_vacuum(&mut guard, &writes);
             return Err(ExecError {
@@ -4911,10 +5112,14 @@ fn autocommit_execute(
     // Lock order is always engine -> wal.
     if let Err(e) = lock_wal(wal).append_batch(&records) {
         undo_all(&mut guard, &[xid], &writes);
+        exec::pgstat_abort(&mut guard, sid, xid);
         retire_txn(&mut guard, xid);
         auto_vacuum(&mut guard, &writes);
         return Err(wal_err(e));
     }
+    // v2.34: pg_stat — the autocommit statement's counters commit
+    // with it (recorded under its ephemeral xid by the DML hooks).
+    exec::pgstat_commit(&mut guard, sid, xid);
     retire_txn(&mut guard, xid);
     auto_vacuum(&mut guard, &writes);
     Ok((result, notices))
@@ -5070,6 +5275,7 @@ fn begin_implicit_txn(engine: &Arc<Mutex<Engine>>, session: &mut Session) {
         guc_marks: Vec::new(),
         txn_char_marks: Vec::new(),
         deferred_marks: Vec::new(),
+        pgstat_marks: Vec::new(),
     });
 }
 
@@ -5083,6 +5289,7 @@ fn abort_implicit_txn(engine: &Arc<Mutex<Engine>>, session: &mut Session) {
         debug_assert!(t.implicit, "abort_implicit_txn on explicit txn");
         let mut guard = lock_engine(engine);
         undo_all(&mut guard, &t.all_xids(), &t.writes);
+        exec::pgstat_abort(&mut guard, session.sid, t.xid);
         retire_txn_family_sid(&mut guard, &t, session.sid);
         auto_vacuum(&mut guard, &t.writes);
         drop(guard);
@@ -5127,6 +5334,7 @@ fn commit_taken_txn(
     if t.failed {
         // COMMIT of an aborted transaction rolls back (v0.3 behavior).
         undo_all(&mut guard, &t.all_xids(), &t.writes);
+        exec::pgstat_abort(&mut guard, session.sid, t.xid);
         retire_txn_family_sid(&mut guard, &t, session.sid);
         auto_vacuum(&mut guard, &t.writes);
         drop(guard);
@@ -5172,6 +5380,7 @@ fn commit_taken_txn(
             Err(e) => {
                 drop(ctx);
                 undo_all(&mut guard, &t.all_xids(), &t.writes);
+                exec::pgstat_abort(&mut guard, session.sid, t.xid);
                 retire_txn_family_sid(&mut guard, &t, session.sid);
                 auto_vacuum(&mut guard, &t.writes);
                 drop(guard);
@@ -5186,24 +5395,33 @@ fn commit_taken_txn(
     // the commit returns. The in-memory versions are already stamped with
     // our xid; retiring the xid (below) is what publishes them.
     // A commit-time serialization conflict aborts the transaction, like
-    // Postgres: hand it back marked failed so the client can ROLLBACK.
-    let records = match wal::records_for_commit(&guard, t.xid, &t.writes, session.sid) {
-        Ok(r) => r,
-        Err(msg) => {
-            let mut t = t;
-            t.failed = true;
-            session.txn = Some(t);
-            return Err(ExecError {
-                detail: None,
-                hint: None,
-                code: "40001",
-                message: format!(
-                    "could not serialize access due to concurrent update: {}",
-                    msg
-                ),
-            });
-        }
-    };
+    // Postgres: PG rolls the transaction back and ENDS it (the next
+    // BEGIN starts fresh), so undo the staged writes and retire the
+    // family here instead of handing back a zombie failed transaction
+    // (v2.34; the deferred-FK failure path above already does this).
+    let records =
+        match wal::records_for_commit(&guard, t.xid, &t.writes, session.sid, &t.all_xids()) {
+            Ok(r) => r,
+            Err(msg) => {
+                undo_all(&mut guard, &t.all_xids(), &t.writes);
+                exec::pgstat_abort(&mut guard, session.sid, t.xid);
+                retire_txn_family_sid(&mut guard, &t, session.sid);
+                auto_vacuum(&mut guard, &t.writes);
+                drop(guard);
+                session.cursors.clear();
+                crate::exec::pl_portals_clear();
+                revert_guc_stack(session, t.guc_stack, false);
+                return Err(ExecError {
+                    detail: None,
+                    hint: None,
+                    code: "40001",
+                    message: format!(
+                        "could not serialize access due to concurrent update: {}",
+                        msg
+                    ),
+                });
+            }
+        };
     // Lock order is always engine -> wal.
     if let Err(e) = lock_wal(wal).append_batch(&records) {
         // Not durable: the transaction cannot commit. Hand it back marked
@@ -5214,6 +5432,8 @@ fn commit_taken_txn(
         session.txn = Some(t);
         return Err(wal_err(e));
     }
+    // v2.34: pg_stat — merge the transaction's counters.
+    exec::pgstat_commit(&mut guard, session.sid, t.xid);
     retire_txn_family_sid(&mut guard, &t, session.sid);
     auto_vacuum(&mut guard, &t.writes);
     drop(guard);
@@ -5270,6 +5490,7 @@ fn txn_begin(
         guc_marks: Vec::new(),
         txn_char_marks: Vec::new(),
         deferred_marks: Vec::new(),
+        pgstat_marks: Vec::new(),
     });
     Ok(cmd("BEGIN"))
 }
@@ -5337,14 +5558,63 @@ fn txn_checkpoint(
     engine: &Arc<Mutex<Engine>>,
     wal: &Arc<Mutex<Wal>>,
     session: &Session,
+    options: &[(String, Option<String>)],
 ) -> Result<ExecResult, ExecError> {
     if session.txn.is_some() {
         return Err(err_25001(
             "CHECKPOINT cannot be executed inside a transaction block",
         ));
     }
-    let guard = lock_engine(engine);
+    // v2.34: PG19 ExecCheckpoint option validation (42601).
+    for (opt_name, opt_val) in options {
+        if opt_name.eq_ignore_ascii_case("mode") {
+            match opt_val.as_deref() {
+                Some("spread") | Some("fast") => {}
+                Some(v) => {
+                    return Err(ExecError {
+                        detail: None,
+                        hint: None,
+                        code: "42601",
+                        message: format!(
+                            "unrecognized value for CHECKPOINT option \"mode\": \"{v}\""
+                        ),
+                    });
+                }
+                None => {
+                    return Err(ExecError {
+                        detail: None,
+                        hint: None,
+                        code: "42601",
+                        message: "CHECKPOINT option \"mode\" requires a parameter".to_string(),
+                    });
+                }
+            }
+        } else if opt_name.eq_ignore_ascii_case("flush_unlogged") {
+            match opt_val.as_deref() {
+                None | Some("true") | Some("false") | Some("on") | Some("off") | Some("yes")
+                | Some("no") | Some("1") | Some("0") => {}
+                Some(_) => {
+                    return Err(ExecError {
+                        detail: None,
+                        hint: None,
+                        code: "42601",
+                        message: "flush_unlogged requires a Boolean value".to_string(),
+                    });
+                }
+            }
+        } else {
+            return Err(ExecError {
+                detail: None,
+                hint: None,
+                code: "42601",
+                message: format!("unrecognized CHECKPOINT option \"{opt_name}\""),
+            });
+        }
+    }
+    let mut guard = lock_engine(engine);
     lock_wal(wal).checkpoint(&guard).map_err(wal_err)?;
+    // v2.34: pg_stat checkpointer counters.
+    exec::record_checkpoint(&mut guard);
     Ok(cmd("CHECKPOINT"))
 }
 
@@ -5421,6 +5691,9 @@ fn txn_vacuum(
         match table {
             Some(name) => {
                 vacuum_one(&mut guard, session.sid, name);
+                // v2.34: pg_stat vacuum stamps.
+                let key = exec::rel_key(&guard.db, &snap, u64::MAX, session.sid, name);
+                exec::record_vacuum(&mut guard, &key);
             }
             None => {
                 // Plain VACUUM only touches tables this role owns
@@ -5434,6 +5707,8 @@ fn txn_vacuum(
                     .collect();
                 for n in owned {
                     guard.vacuum_table(&n);
+                    let key = exec::rel_key(&guard.db, &snap, u64::MAX, session.sid, &n);
+                    exec::record_vacuum(&mut guard, &key);
                 }
             }
         }
@@ -5443,6 +5718,8 @@ fn txn_vacuum(
     match table {
         Some(name) => {
             let n = vacuum_one(&mut guard, session.sid, name);
+            let key = exec::rel_key(&guard.db, &snap, u64::MAX, session.sid, name);
+            exec::record_vacuum(&mut guard, &key);
             rows.push(Row::new(vec![Value::text(format!(
                 "table \"{}\": removed {} dead row version(s)",
                 name, n
@@ -5450,6 +5727,8 @@ fn txn_vacuum(
         }
         None => {
             for (name, n) in guard.vacuum_all() {
+                let key = exec::rel_key(&guard.db, &snap, u64::MAX, session.sid, &name);
+                exec::record_vacuum(&mut guard, &key);
                 rows.push(Row::new(vec![Value::text(format!(
                     "table \"{}\": removed {} dead row version(s)",
                     name, n
@@ -5495,6 +5774,7 @@ fn txn_rollback(
             .expect("implicit transaction checked above");
         let mut guard = lock_engine(engine);
         undo_all(&mut guard, &t.all_xids(), &t.writes);
+        exec::pgstat_abort(&mut guard, session.sid, t.xid);
         retire_txn_family_sid(&mut guard, &t, session.sid);
         auto_vacuum(&mut guard, &t.writes);
         drop(guard);
@@ -5512,6 +5792,7 @@ fn txn_rollback(
         let chained = (t.level, t.read_only, t.deferrable);
         let mut guard = lock_engine(engine);
         undo_all(&mut guard, &t.all_xids(), &t.writes);
+        exec::pgstat_abort(&mut guard, session.sid, t.xid);
         retire_txn_family_sid(&mut guard, &t, session.sid);
         auto_vacuum(&mut guard, &t.writes);
         // v0.16: ROLLBACK closes every cursor, including WITH HOLD ones.
@@ -5561,6 +5842,8 @@ fn txn_savepoint(
             // possible ROLLBACK TO (PG19 discards after-trigger
             // events queued inside the subtransaction).
             let dmark = exec::deferred_mark(&guard, session.sid);
+            // v2.34: pg_stat xact-counter snapshot for ROLLBACK TO.
+            let pmark = exec::pgstat_mark(&guard, session.sid, xid);
             let locks = guard.txn_lock_count(xid);
             // v1.21: the new savepoint scope gets its own sub-xid (PG19
             // AssignTransactionId, eager — the burn is unobservable).
@@ -5575,6 +5858,7 @@ fn txn_savepoint(
             // v0.66: a ROLLBACK TO SAVEPOINT also cancels SET/SET LOCAL
             // effects made after the savepoint (PG19).
             t.guc_marks.push(t.guc_stack.len());
+            t.pgstat_marks.push(pmark);
             // v1.07: record the transaction characteristics for PG19's
             // savepoint restore (both ROLLBACK TO and RELEASE).
             t.txn_char_marks.push((t.read_only, t.level, t.deferrable));
@@ -5641,6 +5925,13 @@ fn txn_rollback_to(
         exec::deferred_restore(&mut guard, session.sid, &dmark);
     }
     t.deferred_marks.truncate(idx + 1);
+    // v2.34: pg_stat — apply the generation / dead-tuple rules
+    // against the savepoint's counter snapshot (pgstat.rs).
+    {
+        let pmark = t.pgstat_marks[idx].clone();
+        exec::pgstat_rollback_to(&mut guard, session.sid, xid, &pmark);
+    }
+    t.pgstat_marks.truncate(idx + 1);
     // Row locks taken after the savepoint are released, like Postgres;
     // locks from before it stay held.
     guard.release_locks_after(xid, keep_locks);
@@ -5739,6 +6030,8 @@ fn txn_release(session: &mut Session, name: &str) -> Result<ExecResult, ExecErro
     // stacked GUC changes are NOT canceled by RELEASE (PG >= 8.3):
     // they still revert at transaction end.
     t.guc_marks.truncate(idx);
+    // v2.34: pg_stat marks die with their savepoints too.
+    t.pgstat_marks.truncate(idx);
     // v1.07: PG19 restores the parent transaction's characteristics on
     // RELEASE SAVEPOINT (subcommit restores XactReadOnly etc.), even
     // though the generic GUC changes survive.
@@ -6446,6 +6739,7 @@ mod tests {
                 guc_marks: Vec::new(),
                 txn_char_marks: Vec::new(),
                 deferred_marks: Vec::new(),
+                pgstat_marks: Vec::new(),
             }),
         };
         (engine, session)
@@ -6545,7 +6839,9 @@ mod tests {
         let rb = Stmt::Rollback { chain: false };
         let rbt = Stmt::RollbackTo { name: "sp".into() };
         let commit = Stmt::Commit { chain: false };
-        let sel = Stmt::Checkpoint;
+        let sel = Stmt::Checkpoint {
+            options: Vec::new(),
+        };
         assert!(allowed_in_aborted(&rb));
         assert!(allowed_in_aborted(&rbt));
         assert!(allowed_in_aborted(&commit));

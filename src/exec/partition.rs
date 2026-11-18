@@ -5993,6 +5993,9 @@ pub(crate) fn create_table_from_def(
                 parent_link_child(eng, ctx, &parent_name, name, true);
             }
         }
+        // v2.34: the session's temp namespace now exists (PG:
+        // it persists for the session's life once created).
+        eng.db.temp_schema_sessions.insert(ctx.session);
         ctx.writes.push(WriteOp::CreateTempTable {
             session: ctx.session,
             name: name.to_string(),
@@ -6788,7 +6791,27 @@ pub(crate) fn create_constraint_index(
     // `constraint_index_name`).
     let is_child = t.partition.as_ref().is_some_and(|p| p.parent.is_some());
     let ix_name = constraint_index_name(table, cname, is_child);
-    if eng
+    // v2.34: temp tables get real backing indexes too, in the
+    // session-local map (the v0.22 scan-only enforcement stays as a
+    // backstop). PG gives temp relations ordinary indexes; without
+    // one, no index scan / pg_stat index counters can ever exist for
+    // a temp table's PRIMARY KEY (the stats suite's test_last_scan
+    // flow depends on it).
+    let is_temp = eng.db.is_temp_table(ctx.session, table);
+    if is_temp {
+        if eng
+            .db
+            .temp_indexes
+            .get(&ctx.session)
+            .and_then(|m| m.get(&ix_name))
+            .is_some_and(|ix| index_visible(&ix.def, ctx.snap, &ctx.all_xids))
+        {
+            return Err(exec_err(
+                "42P07",
+                format!("relation \"{}\" already exists", ix_name),
+            ));
+        }
+    } else if eng
         .db
         .find_index(&ix_name, ctx.snap, &ctx.all_xids)
         .is_some()
@@ -6856,8 +6879,20 @@ pub(crate) fn create_constraint_index(
             ));
         }
     }
-    eng.db.indexes.insert(ix_name.clone(), ix);
-    ctx.writes.push(WriteOp::CreateIndex { name: ix_name });
+    if is_temp {
+        eng.db
+            .temp_indexes
+            .entry(ctx.session)
+            .or_default()
+            .insert(ix_name.clone(), ix);
+        ctx.writes.push(WriteOp::CreateTempIndex {
+            session: ctx.session,
+            name: ix_name,
+        });
+    } else {
+        eng.db.indexes.insert(ix_name.clone(), ix);
+        ctx.writes.push(WriteOp::CreateIndex { name: ix_name });
+    }
     Ok(())
 }
 

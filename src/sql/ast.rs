@@ -2863,6 +2863,12 @@ pub enum AlterAction {
     SetLogged {
         logged: bool,
     },
+    /// v2.34: `ALTER TABLE name SET TABLESPACE ts` (PG19
+    /// AT_SetTableSpace). Placement is not modeled; exec
+    /// validates the tablespace name against the registry.
+    SetTablespace {
+        tablespace: String,
+    },
     /// v2.16: `ALTER TABLE name CLUSTER ON index_name` /
     /// `SET WITHOUT CLUSTER` (PG19). The mark is recorded in
     /// Database::cluster_marks (runtime-only, like v1.96).
@@ -9613,6 +9619,16 @@ pub enum ExplainFormat {
 
 #[derive(Clone, Debug)]
 pub enum Stmt {
+    /// v2.34: CREATE TABLESPACE name LOCATION 'path' (PG19).
+    /// Only the name is modeled (the registry in Database);
+    /// location + option names ride along for the PG19
+    /// validation in dispatch (absolute path / in-place GUC /
+    /// directory existence / recognized parameters).
+    CreateTablespace {
+        name: String,
+        location: String,
+        options: Vec<String>,
+    },
     CreateTable {
         name: String,
         def: TableDef,
@@ -10536,7 +10552,11 @@ pub enum Stmt {
         name: String,
     },
     // --- v0.4: checkpoint (handled by the session, not the executor)
-    Checkpoint,
+    // v2.34: PG19 utility options (MODE / FLUSH_UNLOGGED), validated
+    // at execution like ExecCheckpoint.
+    Checkpoint {
+        options: Vec<(String, Option<String>)>,
+    },
     // --- v0.5: vacuum (handled by the session, not the executor)
     Vacuum {
         table: Option<String>,
@@ -10551,6 +10571,14 @@ pub enum Stmt {
         // vacuum grammar allows a list; `table` carries the first
         // entry).
         more_tables: Vec<(String, Vec<String>)>,
+        // v2.34: BUFFER_USAGE_LIMIT option value in kB (bare
+        // integers are kB; strings carry units), whether the
+        // literal overflowed int4, and whether FULL appeared in
+        // the same option list (PG19 vacuum.c validation runs at
+        // execution).
+        buffer_usage_limit_kb: Option<i64>,
+        buffer_usage_overflow: bool,
+        buffer_usage_full: bool,
     },
     // --- v0.8: secondary indexes
     CreateIndex {

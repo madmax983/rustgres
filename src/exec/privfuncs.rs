@@ -349,17 +349,46 @@ pub(crate) fn is_catalog_relation(name: &str) -> bool {
             | "pg_stat_checkpointer"
             | "pg_stat_database"
             | "pg_stat_database_conflicts"
+            | "pg_stat_gssapi"
             | "pg_stat_io"
+            | "pg_stat_lock"
+            | "pg_stat_progress_analyze"
+            | "pg_stat_progress_basebackup"
+            | "pg_stat_progress_cluster"
+            | "pg_stat_progress_copy"
+            | "pg_stat_progress_create_index"
+            | "pg_stat_progress_data_checksums"
+            | "pg_stat_progress_repack"
+            | "pg_stat_progress_vacuum"
+            | "pg_stat_recovery"
+            | "pg_stat_recovery_prefetch"
             | "pg_stat_replication"
+            | "pg_stat_replication_slots"
             | "pg_stat_slru"
+            | "pg_stat_ssl"
             | "pg_stat_statements"
             | "pg_stat_subscription"
+            | "pg_stat_subscription_stats"
+            | "pg_stat_sys_indexes"
+            | "pg_stat_sys_tables"
             | "pg_stat_user_functions"
             | "pg_stat_user_indexes"
             | "pg_stat_user_tables"
             | "pg_stat_wal"
+            | "pg_stat_wal_receiver"
+            | "pg_stat_xact_all_tables"
+            | "pg_stat_xact_sys_tables"
             | "pg_stat_xact_user_functions"
             | "pg_stat_xact_user_tables"
+            | "pg_statio_all_indexes"
+            | "pg_statio_all_sequences"
+            | "pg_statio_all_tables"
+            | "pg_statio_sys_indexes"
+            | "pg_statio_sys_sequences"
+            | "pg_statio_sys_tables"
+            | "pg_statio_user_indexes"
+            | "pg_statio_user_sequences"
+            | "pg_statio_user_tables"
             | "pg_statistic"
             | "pg_statistic_ext"
             | "pg_stats"
@@ -433,6 +462,8 @@ pub(crate) fn catalog_column_names(q: &Q, name: &str) -> Option<Vec<String>> {
         "pg_statistic_ext_data" => Some(names(pg_statistic_ext_data_schema())),
         "pg_stats_ext" => Some(names(pg_stats_ext_schema())),
         "pg_stats_ext_exprs" => Some(names(pg_stats_ext_exprs_schema())),
+        // v2.34: the pg_stat_* monitoring views + pg_settings.
+        _ if is_pgstat_view(name) => Some(names(pgstat_schema(name))),
         _ => None,
     }
 }
@@ -943,6 +974,21 @@ pub(crate) fn current_setting_value(q: &Q, name: &str) -> Option<String> {
         "transaction_isolation" => Some("read committed".to_string()),
         "max_parallel_workers_per_gather" => Some("2".to_string()),
         "standard_conforming_strings" => Some("on".to_string()),
+        // v2.34: pg_stat family GUC boot values (current_setting
+        // must answer before any SET, like PG).
+        "track_counts" => Some("on".to_string()),
+        "track_functions" => Some("none".to_string()),
+        "track_activities" => Some("on".to_string()),
+        "track_io_timing" => Some("off".to_string()),
+        "track_wal_io_timing" => Some("off".to_string()),
+        "temp_buffers" => Some("8MB".to_string()),
+        "wal_skip_threshold" => Some("2GB".to_string()),
+        "synchronous_commit" => Some("on".to_string()),
+        "max_locks_per_transaction" => Some("64".to_string()),
+        "block_size" => Some("8192".to_string()),
+        "fsync" => Some("on".to_string()),
+        "wal_sync_method" => Some("fdatasync".to_string()),
+        "stats_fetch_consistency" => Some("cache".to_string()),
         _ => None,
     }
 }

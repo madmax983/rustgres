@@ -305,7 +305,7 @@ fn records_for_commit_groups_inserts() {
             row_id: 3,
         },
     ];
-    let recs = records_for_commit(&eng, xid, &writes, 0).unwrap();
+    let recs = records_for_commit(&eng, xid, &writes, 0, &[xid]).unwrap();
     assert_eq!(recs.len(), 1);
     match &recs[0] {
         WalRecord::InsertRows { table, rows } => {
@@ -330,7 +330,7 @@ fn records_for_commit_rejects_lost_create_race() {
         .unwrap()
         .push(Table::new(vec![("a".into(), ColType::Int)], xid));
     let writes = vec![WriteOp::CreateTable { name: "t".into() }];
-    let err = records_for_commit(&eng, xid, &writes, 0).unwrap_err();
+    let err = records_for_commit(&eng, xid, &writes, 0, &[xid]).unwrap_err();
     assert!(err.contains("already exists"), "got: {}", err);
 }
 
@@ -348,7 +348,7 @@ fn records_for_commit_skips_overwritten_delete() {
         row_id: 1,
         prev_xmax: 0,
     }];
-    let recs = records_for_commit(&eng, xid, &writes, 0).unwrap();
+    let recs = records_for_commit(&eng, xid, &writes, 0, &[xid]).unwrap();
     assert!(recs.is_empty());
 }
 
@@ -379,7 +379,7 @@ fn v226_drop_index_removed_outright_still_reaches_wal() {
         name: "t_b_key".into(),
         index: snapshot,
     }];
-    let recs = records_for_commit(&eng, xid, &writes, 0).unwrap();
+    let recs = records_for_commit(&eng, xid, &writes, 0, &[xid]).unwrap();
     assert_eq!(recs.len(), 1);
     match &recs[0] {
         WalRecord::DropIndex { name, xmax } => {
@@ -409,7 +409,7 @@ fn v226_drop_index_removed_outright_still_reaches_wal() {
         name: "t_b_key".into(),
         index: snap2,
     }];
-    let recs2 = records_for_commit(&eng2, xid2, &writes2, 0).unwrap();
+    let recs2 = records_for_commit(&eng2, xid2, &writes2, 0, &[xid2]).unwrap();
     assert!(recs2.is_empty(), "rival drop must win, got {recs2:?}");
 }
 
@@ -442,7 +442,7 @@ fn records_for_commit_fails_lost_update() {
             row_id: 2,
         },
     ];
-    let err = records_for_commit(&eng, xid, &writes, 0).unwrap_err();
+    let err = records_for_commit(&eng, xid, &writes, 0, &[xid]).unwrap_err();
     assert!(err.contains("concurrent update"), "got: {}", err);
 }
 
@@ -589,7 +589,7 @@ fn v105_set_toast_relid_apply_and_emit() {
         toast_relid: 16385,
         prev: 0,
     }];
-    let recs = records_for_commit(&eng, 9, &writes, 0).unwrap();
+    let recs = records_for_commit(&eng, 9, &writes, 0, &[9]).unwrap();
     assert_eq!(
         recs,
         vec![WalRecord::SetToastRelid {
@@ -606,7 +606,7 @@ fn v105_set_toast_relid_apply_and_emit() {
         .last_mut()
         .unwrap()
         .toast_relid = 0;
-    let recs = records_for_commit(&eng, 9, &writes, 0).unwrap();
+    let recs = records_for_commit(&eng, 9, &writes, 0, &[9]).unwrap();
     assert!(recs.is_empty());
 }
 

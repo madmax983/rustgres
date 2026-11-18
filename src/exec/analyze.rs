@@ -1390,6 +1390,21 @@ pub(crate) fn exec_analyze(
         tables,
         &mut ctx.notices,
     )?;
+    // v2.34: pg_stat — ANALYZE stamps last_analyze / analyze_count
+    // and zeroes n_mod_since_analyze per analyzed table (an empty
+    // table list means the whole database in PG).
+    if tables.is_empty() {
+        let names: Vec<String> = eng.db.tables.keys().cloned().collect();
+        for name in names {
+            let key = rel_key(&eng.db, ctx.snap, ctx.own, ctx.session, &name);
+            record_analyze(eng, &key);
+        }
+    } else {
+        for (name, _) in tables {
+            let key = rel_key(&eng.db, ctx.snap, ctx.own, ctx.session, name);
+            record_analyze(eng, &key);
+        }
+    }
     Ok(ExecResult::Command {
         tag: "ANALYZE".to_string(),
     })

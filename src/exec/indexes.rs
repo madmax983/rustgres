@@ -2213,11 +2213,16 @@ pub(crate) fn exec_alter_index(
                 options.iter().map(|o| (o.clone(), String::new())).collect();
             validate_index_reloptions(&pairs)?;
         }
-        AlterIndexAction::SetTablespace { .. } => {
+        AlterIndexAction::SetTablespace { tablespace } => {
             // Tablespaces are not modeled as storage locations in
-            // this engine; accepted (PG validates the tablespace
-            // exists — the built-in pg_default/pg_global and any
-            // CREATE TABLESPACE name are not tracked for indexes).
+            // this engine; v2.34: the name IS validated against
+            // the registry, as PG does.
+            if !tablespace_exists(&eng.db, tablespace) {
+                return Err(exec_err(
+                    "42704",
+                    format!("tablespace \"{}\" does not exist", tablespace),
+                ));
+            }
         }
         AlterIndexAction::AttachPartition { child } => {
             let child_found = eng.db.find_index(child, ctx.snap, &ctx.all_xids).is_some()
@@ -2408,6 +2413,20 @@ pub(crate) fn exec_drop_index(
             exec_drop_one_index(eng, ctx, member, true)?;
         }
         exec_drop_one_index(eng, ctx, name, if_exists)?;
+        // v2.34: pg_stat — the index's stats entry follows the
+        // table-drop lifecycle (pgstat.rs note_drop_rel).
+        let key = if eng
+            .db
+            .temp_indexes
+            .get(&ctx.session)
+            .map(|m| m.contains_key(name))
+            .unwrap_or(false)
+        {
+            pgstat_temp_key(ctx.session, name)
+        } else {
+            name.clone()
+        };
+        note_drop_rel(eng, ctx.session, ctx.own, &key);
     }
     Ok(ExecResult::Command {
         tag: "DROP INDEX".to_string(),
@@ -2762,8 +2781,30 @@ pub(crate) fn plan_access_path(
     // index exists (e.g. join.out's `sj`, 4 rows on 1 page). The scan
     // choice never changes results — both scans return the same rows
     // and the full predicate is always re-applied — only the plan.
+    // v2.34: the enable_*scan GUCs override the cost choice, like
+    // PG's disable-cost mechanism: enable_seqscan=off makes even a
+    // 1-page index path win; enable_indexscan=off together with
+    // enable_bitmapscan=off forbids the index path entirely (this
+    // engine has no separate bitmap path — the index path stands in
+    // for it when only bitmap scans are enabled).
+    let guc_off = |name: &str| {
+        crate::exec::installed_guc(name)
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "off" | "false" | "no" | "0"
+                )
+            })
+            .unwrap_or(false)
+    };
+    let seq_off = guc_off("enable_seqscan");
+    let idx_off = guc_off("enable_indexscan");
+    let bmp_off = guc_off("enable_bitmapscan");
     match best {
-        Some(AccessPath::IndexScan { .. }) if est_heap_pages(t) <= 1 => AccessPath::SeqScan,
+        Some(AccessPath::IndexScan { .. }) if idx_off && bmp_off => AccessPath::SeqScan,
+        Some(AccessPath::IndexScan { .. }) if est_heap_pages(t) <= 1 && !seq_off => {
+            AccessPath::SeqScan
+        }
         Some(path) => path,
         None => AccessPath::SeqScan,
     }

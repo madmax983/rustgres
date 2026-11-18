@@ -306,7 +306,7 @@ fn v204_publications_wal_round_trip() {
     ] {
         let (r, writes) = run_collect(&mut eng, sql);
         r.unwrap_or_else(|e| panic!("{sql}: {e:?}"));
-        let recs = crate::wal::records_for_commit(&eng, 42, &writes, 0).expect("records");
+        let recs = crate::wal::records_for_commit(&eng, 42, &writes, 0, &[42]).expect("records");
         records.extend(recs);
     }
     // Encode/decode every record at the current WAL version, then

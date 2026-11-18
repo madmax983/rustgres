@@ -158,7 +158,7 @@ pub(crate) fn pg_class_scan(
     // pg_index.indexrelid and pg_inherits links join exactly.
     {
         let defs = visible_index_defs(db, snap, own, session);
-        let oids = index_oid_map_from(&defs);
+        let oids = index_oid_map_from(db, &defs);
         let parents_with_children: std::collections::HashSet<&str> = defs
             .iter()
             .filter_map(|d| d.parent_index.as_deref())
@@ -416,10 +416,19 @@ pub(crate) fn visible_index_defs(
 /// needs the defs themselves should fetch them once and pass a
 /// reference here, instead of letting [`index_oid_map`] fetch its
 /// own (identically sorted) copy a second time.
-pub(crate) fn index_oid_map_from(defs: &[IndexDef]) -> std::collections::HashMap<String, i64> {
+pub(crate) fn index_oid_map_from(
+    db: &Database,
+    defs: &[IndexDef],
+) -> std::collections::HashMap<String, i64> {
     defs.iter()
         .enumerate()
-        .map(|(i, d)| (d.name.clone(), 40000 + i as i64))
+        .map(|(i, d)| {
+            // v2.34: REINDEX assigns a fresh OID in PG; the
+            // per-index generation offsets the positional OID
+            // (generation 0 keeps the plain 40000 + position).
+            let gen_n = db.index_oid_gen.get(&d.name).copied().unwrap_or(0);
+            (d.name.clone(), 40000 + i as i64 + gen_n * 100000)
+        })
         .collect()
 }
 
@@ -430,7 +439,7 @@ pub(crate) fn index_oid_map(
     own: u64,
     session: u64,
 ) -> std::collections::HashMap<String, i64> {
-    index_oid_map_from(&visible_index_defs(db, snap, own, session))
+    index_oid_map_from(db, &visible_index_defs(db, snap, own, session))
 }
 
 /// v2.29: PG19's hard-wired btree opclass oid for a named opclass,
@@ -578,7 +587,7 @@ pub(crate) fn pg_index_scan(
 ) -> (Vec<QCol>, Vec<QRow>) {
     let schema = pg_index_schema();
     let defs = visible_index_defs(db, snap, own, session);
-    let oids = index_oid_map_from(&defs);
+    let oids = index_oid_map_from(db, &defs);
     let mut rows = Vec::new();
     for d in &defs {
         let Some(t) = db.find_table(&d.table, snap, &[own], session) else {
@@ -874,7 +883,7 @@ pub(crate) fn pg_inherits_scan(
     // under the shared synthetic index OIDs.
     {
         let defs = visible_index_defs(db, snap, own, session);
-        let oids = index_oid_map_from(&defs);
+        let oids = index_oid_map_from(db, &defs);
         for d in &defs {
             if let Some(parent) = &d.parent_index {
                 if let (Some(&child_oid), Some(&parent_oid)) = (oids.get(&d.name), oids.get(parent))
@@ -1631,6 +1640,21 @@ pub(crate) fn eval_wholerow(scopes: &[Scope], qual: &str) -> Result<Value, ExecE
         let idx = qual_star_order(sc.schema, qual);
         if idx.is_empty() {
             continue;
+        }
+        // PG19: a whole-row reference to a FUNCTION scan whose
+        // result is a scalar (setof int etc.) is the scalar
+        // itself, not a one-field record — e.g.
+        // `FROM pg_stat_get_backend_idset() beid` with bare
+        // `beid` in expressions. Composite sources keep the
+        // record shape.
+        if idx.len() == 1 {
+            let c = &sc.schema[idx[0]];
+            if matches!(
+                c.name.as_str(),
+                "pg_stat_get_backend_idset" | "generate_series"
+            ) {
+                return Ok(sc.row[idx[0]].clone());
+            }
         }
         let fields: Vec<(String, Value)> = idx
             .into_iter()

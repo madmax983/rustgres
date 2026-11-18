@@ -74,6 +74,10 @@ pub enum ColType {
     // displays as the function name. Values are represented by
     // their display text, like regclass.
     Regproc, // OID 24
+    // v2.34: PG's regprocedure type (OID 2202) — a function OID
+    // that displays as the full signature `name(argtypes)`.
+    // Values ride as display text, like regproc.
+    Regprocedure, // OID 2202
     // v2.15: PG's `oid` type (OID 26) — an unsigned 32-bit object
     // identifier; values carried as Value::Int like Xid.
     Oid, // OID 26
@@ -435,6 +439,8 @@ impl ArrayElem {
             ColType::Regclass => ArrayElem::Regclass,
             // v2.14: regproc[] is not representable yet; degrade.
             ColType::Regproc => ArrayElem::Record,
+            // v2.34: regprocedure[] degrades the same way.
+            ColType::Regprocedure => ArrayElem::Record,
             ColType::Oid => ArrayElem::Int,
             ColType::Inet => ArrayElem::Text,
             ColType::Json => ArrayElem::Json,
@@ -658,35 +664,36 @@ impl ColType {
     /// PostgreSQL type OID used in RowDescription.
     pub fn oid(&self) -> i32 {
         match self {
-            ColType::Int => 23,           // INT4
-            ColType::BigInt => 20,        // INT8
-            ColType::SmallInt => 21,      // INT2
-            ColType::Text => 25,          // TEXT
-            ColType::Char(_) => 1042,     // BPCHAR (v0.35)
-            ColType::Varchar(_) => 1043,  // VARCHAR (v0.35)
-            ColType::SingleChar => 18,    // "char" (v0.36)
-            ColType::PgLsn => 3220,       // PG_LSN (v0.64)
-            ColType::Xid => 28,           // XID (v1.17)
-            ColType::Tid => 27,           // TID (v1.40)
-            ColType::Bool => 16,          // BOOL
-            ColType::Float => 701,        // FLOAT8
-            ColType::Float4 => 700,       // FLOAT4
-            ColType::Numeric(..) => 1700, // NUMERIC
-            ColType::Date => 1082,        // DATE
-            ColType::Timestamp => 1114,   // TIMESTAMP
-            ColType::Timestamptz => 1184, // TIMESTAMPTZ
-            ColType::Time => 1083,        // TIME (v1.86)
-            ColType::TimeTz => 1266,      // TIMETZ (v1.86)
-            ColType::Interval => 1186,    // INTERVAL (v1.86)
-            ColType::Bytea => 17,         // BYTEA
-            ColType::Bit => 1560,         // BIT (v1.39)
-            ColType::Uuid => 2950,        // UUID
-            ColType::Regclass => 2205,    // REGCLASS (v0.37)
-            ColType::Regproc => 24,       // REGPROC (v2.14)
-            ColType::Oid => 26,           // OID (v2.15)
-            ColType::Inet => 869,         // INET (v2.15)
-            ColType::Name => 19,          // NAME (v0.57)
-            ColType::Record => 2249,      // RECORD (v0.73)
+            ColType::Int => 23,            // INT4
+            ColType::BigInt => 20,         // INT8
+            ColType::SmallInt => 21,       // INT2
+            ColType::Text => 25,           // TEXT
+            ColType::Char(_) => 1042,      // BPCHAR (v0.35)
+            ColType::Varchar(_) => 1043,   // VARCHAR (v0.35)
+            ColType::SingleChar => 18,     // "char" (v0.36)
+            ColType::PgLsn => 3220,        // PG_LSN (v0.64)
+            ColType::Xid => 28,            // XID (v1.17)
+            ColType::Tid => 27,            // TID (v1.40)
+            ColType::Bool => 16,           // BOOL
+            ColType::Float => 701,         // FLOAT8
+            ColType::Float4 => 700,        // FLOAT4
+            ColType::Numeric(..) => 1700,  // NUMERIC
+            ColType::Date => 1082,         // DATE
+            ColType::Timestamp => 1114,    // TIMESTAMP
+            ColType::Timestamptz => 1184,  // TIMESTAMPTZ
+            ColType::Time => 1083,         // TIME (v1.86)
+            ColType::TimeTz => 1266,       // TIMETZ (v1.86)
+            ColType::Interval => 1186,     // INTERVAL (v1.86)
+            ColType::Bytea => 17,          // BYTEA
+            ColType::Bit => 1560,          // BIT (v1.39)
+            ColType::Uuid => 2950,         // UUID
+            ColType::Regclass => 2205,     // REGCLASS (v0.37)
+            ColType::Regproc => 24,        // REGPROC (v2.14)
+            ColType::Regprocedure => 2202, // REGPROCEDURE (v2.34)
+            ColType::Oid => 26,            // OID (v2.15)
+            ColType::Inet => 869,          // INET (v2.15)
+            ColType::Name => 19,           // NAME (v0.57)
+            ColType::Record => 2249,       // RECORD (v0.73)
             // v0.81: named composite; PG uses the rowtype OID, we use record's.
             ColType::Composite => 2249,
             ColType::Json => 114,      // JSON (v0.73)
@@ -756,8 +763,9 @@ impl ColType {
             ColType::Tid => "tid",      // v1.40
             ColType::Regclass => "regclass",
             ColType::Regproc => "regproc",
-            ColType::Oid => "oid",   // v2.15
-            ColType::Inet => "inet", // v2.15
+            ColType::Regprocedure => "regprocedure", // v2.34
+            ColType::Oid => "oid",                   // v2.15
+            ColType::Inet => "inet",                 // v2.15
             ColType::Name => "name",
             ColType::Record => "record", // v0.73
             // v0.81: resolved to the actual name at execution time.
@@ -824,8 +832,9 @@ impl ColType {
             ColType::Tid => "tid",      // v1.40
             ColType::Regclass => "regclass",
             ColType::Regproc => "regproc",
-            ColType::Oid => "oid",   // v2.15
-            ColType::Inet => "inet", // v2.15
+            ColType::Regprocedure => "regprocedure", // v2.34
+            ColType::Oid => "oid",                   // v2.15
+            ColType::Inet => "inet",                 // v2.15
             ColType::Name => "name",
             ColType::Record => "record", // v0.73
             // v0.81: resolved to the actual name at execution time.
@@ -6229,6 +6238,13 @@ pub struct Database {
     /// are session-scoped for temp tables) and are dropped when the
     /// session ends. Never checkpointed, never WAL-logged.
     pub temp_indexes: HashMap<u64, HashMap<String, Index, FxBuildHasher>, FxBuildHasher>,
+    /// v2.34: sessions that have created a temp object at least
+    /// once. PG creates the backend's temp namespace (pg_temp_N)
+    /// on first use and it persists for the session's life —
+    /// current_schemas(true) lists it even after every temp
+    /// table is dropped. Cleared when the session ends (the
+    /// temp-state cleanup in storage.rs removes the entry).
+    pub temp_schema_sessions: std::collections::HashSet<u64>,
     /// Secondary indexes by index name (v0.8). DDL is transactional: each
     /// definition carries creator/deleter xids, and entries for
     /// uncommitted row versions are filtered by visibility at scan time.
@@ -6247,6 +6263,27 @@ pub struct Database {
     /// their storage key, indexes under the index name. Same
     /// non-transactional durability model as `stats`.
     pub rel_stats: HashMap<String, RelStats, FxBuildHasher>,
+    /// v2.34: pg_stat_* monitoring counters by relation storage key
+    /// (temp tables under a `temp:<session>:<name>` key). Same
+    /// in-memory durability model as `rel_stats`.
+    pub pgstat_rel: HashMap<String, PgRelStat, FxBuildHasher>,
+    /// v2.34: database-level + shared pg_stat_* counters.
+    pub pgstat_shared: PgSharedStat,
+    /// v2.34: committed function statistics by function name.
+    pub pgstat_func: HashMap<String, PgFuncStat, FxBuildHasher>,
+    /// v2.34: COMMENT ON DATABASE text (pg_shdescription for the
+    /// one database this engine hosts; shobj_description reads it).
+    pub db_comment: Option<String>,
+    /// v2.34: CREATE TABLESPACE registry (names only; tablespace
+    /// placement is not modeled — SET TABLESPACE validates against
+    /// this set plus the built-in pg_default / pg_global).
+    /// In-memory like db_comment.
+    pub tablespaces: std::collections::HashSet<String>,
+    /// v2.34: per-index REINDEX generation. PG assigns a fresh
+    /// OID on REINDEX; this engine's index OIDs are positional
+    /// (40000 + name-sorted index), so the generation offsets
+    /// them (see catalog::index_oid_map). In-memory only.
+    pub index_oid_gen: HashMap<String, i64, FxBuildHasher>,
     /// v2.17: extended-statistics objects (CREATE STATISTICS). Like
     /// `stats`, kept in a non-transactional side registry: the objects
     /// are DDL in PG, but this engine's precedent for analyzer state
@@ -6665,6 +6702,12 @@ impl Database {
             stats: HashMap::default(),
             stats_inh: HashMap::default(),
             rel_stats: HashMap::default(),
+            pgstat_rel: HashMap::default(),
+            pgstat_shared: PgSharedStat::default(),
+            pgstat_func: HashMap::default(),
+            db_comment: None,
+            tablespaces: std::collections::HashSet::new(),
+            index_oid_gen: HashMap::default(),
             ext_stats: Vec::new(),
             views: HashMap::default(),
             rules: HashMap::default(),
@@ -6695,6 +6738,7 @@ impl Database {
             // v0.22: session-local TEMP tables live here, keyed by session id.
             temp_tables: HashMap::default(),
             temp_indexes: HashMap::default(),
+            temp_schema_sessions: std::collections::HashSet::new(),
             // v0.22: bounded shell-type registry.
             types: HashMap::default(),
             // v0.86: user-defined functions and operators.
@@ -6892,6 +6936,7 @@ impl Database {
     /// `def.table` equals a temp table's name belongs to a same-named
     /// permanent table, and deleting it would corrupt that table.
     pub fn drop_session_temps(&mut self, session: u64) {
+        self.temp_schema_sessions.remove(&session);
         self.temp_tables.remove(&session);
         // v0.87: drop the session's temp indexes too.
         self.temp_indexes.remove(&session);
@@ -7117,6 +7162,36 @@ impl Database {
     /// indexes with an entry no permanent-table scan could resolve.
     pub fn index_insert_row(&mut self, table: &str, row_id: u64, values: &[Value], session: u64) {
         if self.is_temp_table(session, table) {
+            // v2.34: temp indexes are real maintained trees now
+            // (constraint indexes on temp tables exist since the
+            // pg_stat family needed them visible); the v0.22
+            // no-op predates them. Constraint ENFORCEMENT stays
+            // scan-based (temp_scan_constraint); the trees serve
+            // planner index scans.
+            let targets: Vec<(String, Vec<usize>)> = self
+                .temp_indexes
+                .get(&session)
+                .map(|m| {
+                    m.values()
+                        .filter(|ix| {
+                            ix.def.table == table
+                                && ix.def.dropped_xmax == 0
+                                && ix.def.planner_usable
+                        })
+                        .map(|ix| (ix.def.name.clone(), ix.def.cols.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (name, cols) in targets {
+                let key = IndexKey(cols.iter().map(|&c| values[c].clone()).collect());
+                if let Some(ix) = self
+                    .temp_indexes
+                    .get_mut(&session)
+                    .and_then(|m| m.get_mut(&name))
+                {
+                    ix.insert(key, row_id);
+                }
+            }
             return;
         }
         let targets: Vec<(String, Vec<usize>)> = self
@@ -7623,6 +7698,281 @@ impl Default for RelStats {
     }
 }
 
+/// v2.34: committed cumulative-statistics counters for one relation
+/// (the pg_stat_* monitoring family; PG19 pgstat_relation.c shared
+/// entries). One struct serves tables, indexes and sequences: tables
+/// use the tuple/scan fields, indexes the idx_* fields, sequences
+/// only the block fields. In-memory only, like `stats` (a restart
+/// resets the counters — v2.34 hold-back, same class as v2.33's
+/// statistics persistence hold-back).
+#[derive(Clone, Debug)]
+pub struct PgRelStat {
+    /// v2.34: temp-relation local-buffer eviction high-water
+    /// mark (estimated pages beyond temp_buffers already
+    /// counted as evicted/written; see pgstat::temp_pressure).
+    pub temp_evict_hwm: i64,
+    pub n_tup_ins: i64,
+    pub n_tup_upd: i64,
+    pub n_tup_del: i64,
+    pub n_tup_hot_upd: i64,
+    pub n_tup_newpage_upd: i64,
+    pub n_live_tup: i64,
+    pub n_dead_tup: i64,
+    pub seq_scan: i64,
+    pub last_seq_scan: Option<i64>,
+    pub seq_tup_read: i64,
+    pub tup_fetched: i64,
+    pub idx_scan: i64,
+    pub last_idx_scan: Option<i64>,
+    pub idx_tup_read: i64,
+    pub idx_tup_fetch: i64,
+    pub blks_read: i64,
+    pub blks_hit: i64,
+    pub n_mod_since_analyze: i64,
+    pub n_ins_since_vacuum: i64,
+    pub last_vacuum: Option<i64>,
+    pub last_autovacuum: Option<i64>,
+    pub last_analyze: Option<i64>,
+    pub last_autoanalyze: Option<i64>,
+    pub vacuum_count: i64,
+    pub autovacuum_count: i64,
+    pub analyze_count: i64,
+    pub autoanalyze_count: i64,
+    pub stats_reset: Option<i64>,
+}
+
+impl Default for PgRelStat {
+    fn default() -> Self {
+        PgRelStat {
+            temp_evict_hwm: 0,
+            n_tup_ins: 0,
+            n_tup_upd: 0,
+            n_tup_del: 0,
+            n_tup_hot_upd: 0,
+            n_tup_newpage_upd: 0,
+            n_live_tup: 0,
+            n_dead_tup: 0,
+            seq_scan: 0,
+            last_seq_scan: None,
+            seq_tup_read: 0,
+            tup_fetched: 0,
+            idx_scan: 0,
+            last_idx_scan: None,
+            idx_tup_read: 0,
+            idx_tup_fetch: 0,
+            blks_read: 0,
+            blks_hit: 0,
+            n_mod_since_analyze: 0,
+            n_ins_since_vacuum: 0,
+            last_vacuum: None,
+            last_autovacuum: None,
+            last_analyze: None,
+            last_autoanalyze: None,
+            vacuum_count: 0,
+            autovacuum_count: 0,
+            analyze_count: 0,
+            autoanalyze_count: 0,
+            stats_reset: None,
+        }
+    }
+}
+
+/// v2.34: one generation of a transaction's relation counters
+/// (PG19 pgstat_xact.c: a TRUNCATE starts a new generation; only
+/// the current generation merges at commit, the first at abort).
+#[derive(Clone, Debug, Default)]
+pub struct PgGenCounts {
+    pub ins: i64,
+    pub upd: i64,
+    pub del: i64,
+    pub hot: i64,
+    pub newpage: i64,
+    /// Net live-tuple change inside this generation.
+    pub live_delta: i64,
+}
+
+/// v2.34: a transaction's pending counters for one relation.
+#[derive(Clone, Debug)]
+pub struct PgXactRel {
+    /// v2.34: DROP TABLE/INDEX executed in this transaction.
+    /// The entry is kept (a rollback must be able to merge its
+    /// counts, PG19-style) but xact accessors and the xact views
+    /// treat it as gone until the transaction ends.
+    pub dropped: bool,
+    pub gens: Vec<PgGenCounts>,
+    /// Live inserts rolled back by ROLLBACK TO SAVEPOINT; they
+    /// become dead tuples when the transaction ends.
+    pub dead_from_rollback: i64,
+    pub seq_scan: i64,
+    pub seq_tup_read: i64,
+    pub idx_scan: i64,
+    pub idx_tup_fetch: i64,
+}
+
+impl Default for PgXactRel {
+    fn default() -> Self {
+        PgXactRel {
+            dropped: false,
+            gens: vec![PgGenCounts::default()],
+            dead_from_rollback: 0,
+            seq_scan: 0,
+            seq_tup_read: 0,
+            idx_scan: 0,
+            idx_tup_fetch: 0,
+        }
+    }
+}
+
+impl PgXactRel {
+    pub fn cur(&mut self) -> &mut PgGenCounts {
+        self.gens.last_mut().expect("gens never empty")
+    }
+    pub fn cur_ref(&self) -> &PgGenCounts {
+        self.gens.last().expect("gens never empty")
+    }
+    /// Cumulative xact counts over all generations (the
+    /// pg_stat_get_xact_* accessors sum the xact stack in PG for
+    /// the current relfilenode generation; generations before a
+    /// truncate belong to a dead filenode, so the accessors read
+    /// the current generation — except that ROLLBACK TO keeps the
+    /// pre-savepoint cumulative counts, which live in the same
+    /// generation entry).
+    pub fn xact_ins(&self) -> i64 {
+        self.cur_ref().ins
+    }
+    pub fn xact_upd(&self) -> i64 {
+        self.cur_ref().upd
+    }
+    pub fn xact_del(&self) -> i64 {
+        self.cur_ref().del
+    }
+    pub fn xact_hot(&self) -> i64 {
+        self.cur_ref().hot
+    }
+    pub fn xact_newpage(&self) -> i64 {
+        self.cur_ref().newpage
+    }
+}
+
+/// v2.34: committed function statistics for one function name
+/// (PG19 pgstat_function.c; function stats are NOT transactional).
+#[derive(Clone, Debug, Default)]
+pub struct PgFuncStat {
+    /// The regproc-scheme OID recorded at first call (40000 +
+    /// name-sorted index), so oid accessors keep answering while
+    /// a DROP is uncommitted.
+    pub oid: i64,
+    pub calls: i64,
+    pub total_time: f64,
+    pub self_time: f64,
+    pub stats_reset: Option<i64>,
+}
+
+/// v2.34: one pg_stat_io counter cell (PG19 pgstat_io.c counts,
+/// keyed by (backend_type, object, context) at scan time).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PgIoCounts {
+    pub reads: i64,
+    pub read_bytes: i64,
+    pub writes: i64,
+    pub write_bytes: i64,
+    pub writebacks: i64,
+    pub extends: i64,
+    pub extend_bytes: i64,
+    pub hits: i64,
+    pub evictions: i64,
+    pub reuses: i64,
+    pub fsyncs: i64,
+}
+
+/// v2.34: database-level + shared cumulative statistics (the
+/// pg_stat_database / pg_stat_wal / pg_stat_checkpointer /
+/// pg_stat_bgwriter / pg_stat_archiver / pg_stat_slru /
+/// pg_stat_lock / pg_stat_io singletons).
+#[derive(Clone, Debug)]
+pub struct PgSharedStat {
+    pub sessions: i64,
+    pub xact_commit: i64,
+    pub xact_rollback: i64,
+    pub deadlocks: i64,
+    pub db_stats_reset: Option<i64>,
+    pub wal_records: i64,
+    pub wal_fpi: i64,
+    pub wal_bytes: i64,
+    pub wal_buffers_full: i64,
+    pub wal_stats_reset: Option<i64>,
+    pub ckpt_timed: i64,
+    pub ckpt_requested: i64,
+    pub ckpt_done: i64,
+    pub ckpt_stats_reset: Option<i64>,
+    pub bgwriter_clean: i64,
+    pub bgwriter_maxwritten: i64,
+    pub buf_alloc: i64,
+    pub bgwriter_stats_reset: Option<i64>,
+    pub archiver_count: i64,
+    pub archiver_failed: i64,
+    pub archiver_stats_reset: Option<i64>,
+    pub recovery_prefetch_stats_reset: Option<i64>,
+    pub lock_fastpath_exceeded: i64,
+    /// v2.34: OIDs of functions whose DROP has committed. The
+    /// name-sorted function-OID scheme would reassign a dead
+    /// function's OID to a survivor; the pg_stat_get_function_*
+    /// accessors answer NULL for retired OIDs (PG never
+    /// reassigns OIDs).
+    pub func_retired_oids: std::collections::HashSet<i64>,
+    pub lock_stats_reset: Option<i64>,
+    pub io_stats_reset: Option<i64>,
+    /// Per-SLRU stats_reset (name -> micros); counters stay zero.
+    pub slru_stats_reset: std::collections::HashMap<String, Option<i64>>,
+    /// (backend_type, object, context) -> counts.
+    pub io: std::collections::HashMap<(String, String, String), PgIoCounts>,
+    /// Per-backend IO for the current client pid space: this
+    /// engine serves one backend at a time per session; backend
+    /// IO is tracked globally per session id.
+    pub backend_io: std::collections::HashMap<
+        u64,
+        std::collections::HashMap<(String, String, String), PgIoCounts>,
+    >,
+    pub backend_wal_bytes: std::collections::HashMap<u64, i64>,
+}
+
+impl Default for PgSharedStat {
+    fn default() -> Self {
+        PgSharedStat {
+            sessions: 0,
+            xact_commit: 0,
+            xact_rollback: 0,
+            deadlocks: 0,
+            db_stats_reset: None,
+            wal_records: 0,
+            wal_fpi: 0,
+            wal_bytes: 0,
+            wal_buffers_full: 0,
+            wal_stats_reset: None,
+            ckpt_timed: 0,
+            ckpt_requested: 0,
+            ckpt_done: 0,
+            ckpt_stats_reset: None,
+            bgwriter_clean: 0,
+            bgwriter_maxwritten: 0,
+            buf_alloc: 0,
+            bgwriter_stats_reset: None,
+            archiver_count: 0,
+            archiver_failed: 0,
+            archiver_stats_reset: None,
+            recovery_prefetch_stats_reset: None,
+            lock_fastpath_exceeded: 0,
+            func_retired_oids: std::collections::HashSet::new(),
+            lock_stats_reset: None,
+            io_stats_reset: None,
+            slru_stats_reset: std::collections::HashMap::new(),
+            io: std::collections::HashMap::new(),
+            backend_io: std::collections::HashMap::new(),
+            backend_wal_bytes: std::collections::HashMap::new(),
+        }
+    }
+}
+
 /// v2.17: one item of a CREATE STATISTICS definition: a plain column
 /// (attnum, 1-based) or an expression (source text + parsed form).
 #[derive(Clone, Debug)]
@@ -7874,6 +8224,29 @@ pub struct Engine {
     /// (relation, event) while its rules are being applied is
     /// 42P17 "infinite recursion detected in rules". Runtime-only.
     pub rule_stack: Vec<(String, u8)>,
+    /// v2.34: per-transaction pg_stat_* counters, keyed by
+    /// (session id, top-level xid) then relation key. Merged into
+    /// `Database::pgstat_rel` by the server's transaction-end
+    /// hooks (commit/abort), with savepoint snapshots taken by
+    /// the SAVEPOINT hook. Runtime-only.
+    pub pgstat_xact: HashMap<(u64, u64), HashMap<String, PgXactRel, FxBuildHasher>, FxBuildHasher>,
+    /// v2.34: unflushed function-call counts by function name
+    /// (PG: function stats are not transactional; they merge
+    /// into `Database::pgstat_func` on pg_stat_force_next_flush).
+    pub pgstat_func_pending: HashMap<String, i64, FxBuildHasher>,
+    /// v2.34: per-transaction function-call counts, keyed like
+    /// `pgstat_xact` (never decremented by subxact rollback).
+    pub pgstat_func_xact: HashMap<(u64, u64), HashMap<String, i64, FxBuildHasher>, FxBuildHasher>,
+    /// v2.34: stats snapshot timestamps, keyed like `pgstat_xact`
+    /// (micros since epoch of the first stats access in the xact).
+    pub pgstat_snapshot: HashMap<(u64, u64), i64, FxBuildHasher>,
+    /// v2.34: relations / functions dropped by an open transaction
+    /// (session, top xid, key-or-name). PG drops their stats
+    /// entries only when the drop commits; the commit hook in
+    /// pgstat.rs performs the removal, the abort hook just clears
+    /// the marks.
+    pub pgstat_dropped_rel: std::collections::HashSet<(u64, u64, String)>,
+    pub pgstat_dropped_func: std::collections::HashSet<(u64, u64, String)>,
 }
 
 impl Engine {
@@ -7898,6 +8271,12 @@ impl Engine {
             catalog_epoch: 0,
             // v2.19: rule-firing recursion stack.
             rule_stack: Vec::new(),
+            pgstat_xact: HashMap::default(),
+            pgstat_func_pending: HashMap::default(),
+            pgstat_func_xact: HashMap::default(),
+            pgstat_snapshot: HashMap::default(),
+            pgstat_dropped_rel: std::collections::HashSet::new(),
+            pgstat_dropped_func: std::collections::HashSet::new(),
         }
     }
 

@@ -3483,6 +3483,37 @@ pub(crate) fn exec_reindex(
         }
         _ => {}
     }
+    // v2.34: PG assigns fresh OIDs to reindexed indexes; bump the
+    // per-index generation so catalog::index_oid_map (and every
+    // regclass / pg_stat consumer of it) sees new OIDs.
+    match kind {
+        'i' => {
+            if let Some(n) = name.as_deref() {
+                *eng.db.index_oid_gen.entry(n.to_string()).or_insert(0) += 1;
+            }
+        }
+        't' => {
+            if let Some(n) = name.as_deref() {
+                let names: Vec<String> = eng
+                    .db
+                    .indexes
+                    .values()
+                    .filter(|ix| ix.def.table == n)
+                    .map(|ix| ix.def.name.clone())
+                    .collect();
+                for n2 in names {
+                    *eng.db.index_oid_gen.entry(n2).or_insert(0) += 1;
+                }
+            }
+        }
+        'd' => {
+            let names: Vec<String> = eng.db.indexes.keys().cloned().collect();
+            for n2 in names {
+                *eng.db.index_oid_gen.entry(n2).or_insert(0) += 1;
+            }
+        }
+        _ => {}
+    }
     Ok(ExecResult::Command {
         tag: "REINDEX".to_string(),
     })

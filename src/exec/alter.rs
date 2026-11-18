@@ -1866,6 +1866,36 @@ pub(crate) fn exec_alter_one(
             res
         }
         AlterAction::SetSchema { schema } => alter_set_schema(eng, ctx, name, schema),
+        AlterAction::SetTablespace { tablespace } => {
+            // v2.34: placement is not modeled; PG validates the
+            // table and the tablespace name.
+            if eng
+                .db
+                .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                .is_none()
+            {
+                return Err(exec_err(
+                    "42P01",
+                    format!("relation \"{}\" does not exist", name),
+                ));
+            }
+            if !tablespace_exists(&eng.db, tablespace) {
+                return Err(exec_err(
+                    "42704",
+                    format!("tablespace \"{}\" does not exist", tablespace),
+                ));
+            }
+            // v2.34: PG rewrites the relation into the new
+            // tablespace; for a temp relation the rewrite writes
+            // every page through the local buffer pool.
+            if eng.db.is_temp_table(ctx.session, name) {
+                let key = rel_key(&eng.db, ctx.snap, ctx.own, ctx.session, name);
+                record_temp_rewrite(eng, ctx.session, &key);
+            }
+            Ok(ExecResult::Command {
+                tag: "ALTER TABLE".to_string(),
+            })
+        }
         AlterAction::SetLogged { logged } => {
             // v2.16: PG19 ATExecSetRelPersistence +
             // ATPrepChangePersistence, with persistence tracked in
@@ -5242,6 +5272,46 @@ fn set_not_null_impl(
     })
 }
 
+/// v2.34: rebuild every maintained index on `tname` from the
+/// table's current rows. A generated-column rewrite (SET/DROP
+/// EXPRESSION) changes stored values in place; index trees keyed
+/// on the old values would otherwise go stale (PG rebuilds the
+/// affected indexes as part of the rewrite). Mirrors the undo
+/// path's rebuild in storage.rs, plus the temp index map.
+fn rebuild_table_indexes(eng: &mut Engine, ctx: &StmtCtx, tname: &str) {
+    let Some(t) = eng
+        .db
+        .find_table(tname, ctx.snap, &ctx.all_xids, ctx.session)
+        .cloned()
+    else {
+        return;
+    };
+    let rows: Vec<(Row, u64)> = t.rows.iter().map(|r| (r.values.clone(), r.id)).collect();
+    if eng.db.is_temp_table(ctx.session, tname) {
+        if let Some(m) = eng.db.temp_indexes.get_mut(&ctx.session) {
+            for ix in m.values_mut() {
+                if ix.def.table == tname && ix.def.dropped_xmax == 0 && ix.def.planner_usable {
+                    ix.tree.clear();
+                    for (values, id) in &rows {
+                        let key = ix.key_for(values);
+                        ix.insert(key, *id);
+                    }
+                }
+            }
+        }
+        return;
+    }
+    for ix in eng.db.indexes.values_mut() {
+        if ix.def.table == tname && ix.def.dropped_xmax == 0 && ix.def.planner_usable {
+            ix.tree.clear();
+            for (values, id) in &rows {
+                let key = ix.key_for(values);
+                ix.insert(key, *id);
+            }
+        }
+    }
+}
+
 /// v2.05: ALTER COLUMN c SET EXPRESSION AS (expr) / DROP EXPRESSION
 /// [IF EXISTS] (PG19 tablecmds.c AT_SetExpression /
 /// AT_DropExpression). A non-generated column is 55000
@@ -5366,7 +5436,14 @@ pub(crate) fn alter_column_expression(
                 new_rows.push(rv.clone());
             }
         }
-        alter_swap(eng, ctx, tname, None, swap_def, Some(new_rows))
+        let r = alter_swap(eng, ctx, tname, None, swap_def, Some(new_rows));
+        if r.is_ok() {
+            // v2.34: the rewrite changed stored generated values;
+            // index trees keyed on them must be rebuilt (PG does
+            // this as part of the table rewrite).
+            rebuild_table_indexes(eng, ctx, tname);
+        }
+        r
     }
     if new_expr.is_some() && stored {
         // SET on STORED: recompute with the NEW expression.
@@ -6765,13 +6842,32 @@ pub(crate) fn exec_comment_on(
                 ));
             }
         }
+        // v2.34: COMMENT ON DATABASE stores the text — it is the
+        // one comment the pg_stat family reads back
+        // (shobj_description(oid, 'pg_database')). The hosted
+        // database is "postgres"; other names are 42704 like PG.
+        // (In-memory only, like the stats registries: a rolled-back
+        // COMMENT leaks, a documented divergence.)
+        "database" => {
+            if name != "postgres" {
+                return Err(exec_err(
+                    "42704",
+                    format!("database \"{}\" does not exist", name),
+                ));
+            }
+            eng.db.db_comment = _comment.map(|c| c.to_string());
+        }
         _ => {
-            // collation, conversion, database, server,
+            // collation, conversion, server,
             // subscription, extension, language, policy,
             // event_trigger, fdw, large_object,
             // text_search_*: no catalog modeled — accept.
         }
     }
+    // v2.34: COMMENT ON writes a pg_shdescription row in PG —
+    // count it as an update on the shared-description catalog
+    // (pg_stat_all_tables tracks pg_shdescription itself).
+    record_update(eng, ctx.session, ctx.own, SHOBJ_KEY, 1, 0, 0);
     Ok(ExecResult::Command {
         tag: "COMMENT".to_string(),
     })

@@ -438,7 +438,7 @@ fn v191_companion_create_type_reaches_wal() {
         .filter(|w| matches!(w, WriteOp::CreateType { .. }))
         .count();
     assert_eq!(n_create_type, 2, "range + companion CreateType ops");
-    let recs = crate::wal::records_for_commit(&eng, 9, &writes, 0).unwrap();
+    let recs = crate::wal::records_for_commit(&eng, 9, &writes, 0, &[9]).unwrap();
     assert_eq!(recs.len(), 2, "both CreateType ops must reach the WAL");
     match &recs[1] {
         crate::wal::WalRecord::CreateType { name, range, .. } => {

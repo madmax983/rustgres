@@ -20,6 +20,24 @@ pub(crate) struct Parser {
     pub(crate) last_bit_typmod: Option<(i32, bool)>,
 }
 
+/// v2.34: BUFFER_USAGE_LIMIT string form ('512 kB', '1MB') to
+/// kB, PG19-style (unit-less strings are kB).
+fn parse_buffer_usage_str(s: &str) -> Option<i64> {
+    let v = s.trim().to_ascii_lowercase().replace(' ', "");
+    let (num, mult) = if let Some(n) = v.strip_suffix("kb") {
+        (n, 1i64)
+    } else if let Some(n) = v.strip_suffix("mb") {
+        (n, 1024)
+    } else if let Some(n) = v.strip_suffix("gb") {
+        (n, 1024 * 1024)
+    } else if let Some(n) = v.strip_suffix('b') {
+        return n.parse::<i64>().ok().map(|b| b / 1024);
+    } else {
+        (v.as_str(), 1)
+    };
+    num.parse::<i64>().ok().map(|n| n * mult)
+}
+
 impl Parser {
     pub(crate) fn peek(&self) -> &Token {
         self.tokens.get(self.pos).unwrap_or(&Token::EOF)
@@ -457,7 +475,52 @@ impl Parser {
                 Ok(Stmt::Commit { chain })
             }
             // --- v0.4: CHECKPOINT (snapshot + WAL truncation)
-            "checkpoint" => Ok(Stmt::Checkpoint),
+            // v2.34: PG19 CHECKPOINT [(option ...)] — the option
+            // list is collected here and validated at execution
+            // (ExecCheckpoint, checkpointer.c), so its 42601 errors
+            // carry PG's exact texts without a parse-error prefix.
+            "checkpoint" => {
+                let mut options: Vec<(String, Option<String>)> = Vec::new();
+                if matches!(self.peek(), Token::LParen) {
+                    self.next();
+                    loop {
+                        let opt_name = match self.next() {
+                            Token::Ident(s) | Token::QIdent(s) => s,
+                            other => {
+                                return Err(err(format!(
+                                    "syntax error: unexpected {:?} in CHECKPOINT options",
+                                    other
+                                )));
+                            }
+                        };
+                        let opt_val: Option<String> = match self.peek() {
+                            Token::Number(_)
+                            | Token::Str(_)
+                            | Token::Ident(_)
+                            | Token::QIdent(_) => match self.next() {
+                                Token::Number(n) => Some(n),
+                                Token::Str(s) => Some(s),
+                                Token::Ident(id) => Some(id),
+                                Token::QIdent(id) => Some(id),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        options.push((opt_name, opt_val));
+                        match self.next() {
+                            Token::Comma => continue,
+                            Token::RParen => break,
+                            other => {
+                                return Err(err(format!(
+                                    "syntax error: unexpected {:?} in CHECKPOINT options",
+                                    other
+                                )));
+                            }
+                        }
+                    }
+                }
+                Ok(Stmt::Checkpoint { options })
+            }
             "rollback" | "abort" => {
                 if self.eat_keyword("to") {
                     // ROLLBACK TO [SAVEPOINT] name
@@ -791,6 +854,12 @@ impl Parser {
             }
             "analyze" => {
                 // v2.17: ANALYZE [table [(cols)] [, ...]] (PG19 forms).
+                // v2.34: ANALYZE (options) — the parenthesized
+                // option group is accepted and discarded (the
+                // options have no effect in this engine).
+                if *self.peek() == Token::LParen {
+                    self.skip_paren_group()?;
+                }
                 let mut tables: Vec<(String, Vec<String>)> = Vec::new();
                 match self.peek() {
                     Token::EOF | Token::Semi => {}
@@ -1287,10 +1356,11 @@ impl Parser {
             "uuid" => Ok(ColType::Uuid),
             "regclass" => Ok(ColType::Regclass),
             "regproc" => Ok(ColType::Regproc),
-            "pg_lsn" => Ok(ColType::PgLsn), // v0.64
-            "xid" => Ok(ColType::Xid),      // v1.17
-            "oid" => Ok(ColType::Oid),      // v2.15
-            "inet" => Ok(ColType::Inet),    // v2.15
+            "regprocedure" => Ok(ColType::Regprocedure), // v2.34
+            "pg_lsn" => Ok(ColType::PgLsn),              // v0.64
+            "xid" => Ok(ColType::Xid),                   // v1.17
+            "oid" => Ok(ColType::Oid),                   // v2.15
+            "inet" => Ok(ColType::Inet),                 // v2.15
             // v2.13: PG's internal array type names (`_int4` is the
             // int4[] type, pg_type typarray naming) — they appear in
             // column definition lists (`AS x(ia _int4)`) and casts.
@@ -1328,6 +1398,10 @@ impl Parser {
             Some(name)
         } else if base == ColType::Oid {
             Some("oid".to_string())
+        } else if base == ColType::Regprocedure {
+            // v2.34: like oid, a regprocedure cast must resolve its
+            // signature text through the catalog (eval_cast_named).
+            Some("regprocedure".to_string())
         } else {
             None
         };
@@ -1479,6 +1553,61 @@ impl Parser {
                 if_not_exists,
                 authorization,
                 elements,
+            });
+        }
+        // v2.34: CREATE TABLESPACE name [OWNER r] LOCATION 'p'
+        // [OPTIONS (...)]. Only the name is modeled.
+        if matches!(self.peek(), Token::Ident(s) if s == "tablespace") {
+            self.next();
+            let name = self.expect_ident()?;
+            let mut location = String::new();
+            let mut options: Vec<String> = Vec::new();
+            loop {
+                if self.eat_keyword("owner") {
+                    self.expect_keyword("to")?;
+                    self.expect_ident()?;
+                } else if self.eat_keyword("location") {
+                    match self.next() {
+                        Token::Str(sv) => location = sv,
+                        other => {
+                            return Err(err(format!(
+                                "syntax error: expected string literal for LOCATION, found {:?}",
+                                other
+                            )));
+                        }
+                    }
+                } else if self.eat_keyword("options") || self.eat_keyword("with") {
+                    if *self.peek() == Token::LParen {
+                        self.next();
+                        loop {
+                            match self.next() {
+                                Token::Ident(n) | Token::QIdent(n) => {
+                                    options.push(n.to_ascii_lowercase());
+                                    // Optional `= value`.
+                                    if matches!(self.peek(), Token::Eq) {
+                                        self.next();
+                                        self.next();
+                                    }
+                                }
+                                Token::Comma => {}
+                                Token::RParen => break,
+                                other => {
+                                    return Err(err(format!(
+                                        "syntax error: unexpected {:?} in tablespace options",
+                                        other
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+            return Ok(Stmt::CreateTablespace {
+                name,
+                location,
+                options,
             });
         }
         // v1.96: CREATE AGGREGATE name (args) (sfunc = f, stype = t [, ...]).
@@ -3857,6 +3986,10 @@ impl Parser {
             if self.eat_keyword("schema") {
                 let schema = self.expect_ident()?;
                 return Ok(AlterAction::SetSchema { schema });
+            }
+            if self.eat_keyword("tablespace") {
+                let tablespace = self.expect_ident()?;
+                return Ok(AlterAction::SetTablespace { tablespace });
             }
             if self.eat_keyword("logged") {
                 return Ok(AlterAction::SetLogged { logged: true });
@@ -14584,6 +14717,9 @@ impl Parser {
         // verbose) are honored; others are accepted and ignored.
         let mut verbose = self.eat_keyword("verbose");
         let mut analyze = self.eat_keyword("analyze");
+        let mut bul_kb: Option<i64> = None;
+        let mut bul_overflow = false;
+        let mut bul_full = false;
         if *self.peek() == Token::LParen {
             self.next();
             loop {
@@ -14593,14 +14729,31 @@ impl Parser {
                     verbose = true;
                 } else {
                     // Skip unknown option: `name [value]`.
-                    let _ = self.expect_ident();
-                    // Optional value (boolean, number, or string).
-                    if matches!(self.peek(), Token::Ident(_))
-                        && !matches!(self.peek(), Token::Ident(s) if s == "analyze" || s == "verbose")
-                    {
-                        // Could be a value; peek ahead for comma or ')'.
-                        // Simpler: if next is comma or ')', it was a flag.
-                        // We already consumed the ident; check what's next.
+                    let oname = self.expect_ident().unwrap_or_default().to_ascii_lowercase();
+                    if oname == "full" {
+                        bul_full = true;
+                    }
+                    // v2.34: numeric / string option values
+                    // (PARALLEL 0, BUFFER_USAGE_LIMIT 128, ...)
+                    // are consumed here; ident values fall through
+                    // to the separator match below.
+                    // BUFFER_USAGE_LIMIT is captured for the
+                    // execution-time PG19 range validation.
+                    if matches!(self.peek(), Token::Number(_) | Token::Str(_)) {
+                        let vtok = self.next();
+                        if oname == "buffer_usage_limit" {
+                            match vtok {
+                                Token::Number(n) => match n.parse::<i64>() {
+                                    Ok(v) if v > i32::MAX as i64 => bul_overflow = true,
+                                    Ok(v) => bul_kb = Some(v),
+                                    Err(_) => bul_overflow = true,
+                                },
+                                Token::Str(sv) => {
+                                    bul_kb = parse_buffer_usage_str(&sv);
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
                 match self.next() {
@@ -14681,6 +14834,9 @@ impl Parser {
             verbose,
             analyze,
             more_tables: it.collect(),
+            buffer_usage_limit_kb: bul_kb,
+            buffer_usage_overflow: bul_overflow,
+            buffer_usage_full: bul_full,
         })
     }
 
