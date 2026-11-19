@@ -144,6 +144,18 @@ impl Parser {
             self.pos += 1;
             return true;
         }
+        // v2.35: `LATERAL schema.func_name (` — a qualified function
+        // name (PG19 func_table takes a qualified func_name); the
+        // unqualified check above misses the Dot and "lateral" fell
+        // back to a table name, dying at the Dot.
+        if matches!(self.tokens.get(j), Some(Token::Ident(_)))
+            && matches!(self.tokens.get(j + 1), Some(Token::Dot))
+            && matches!(self.tokens.get(j + 2), Some(Token::Ident(_)))
+            && matches!(self.tokens.get(j + 3), Some(Token::LParen))
+        {
+            self.pos += 1;
+            return true;
+        }
         false
     }
 
@@ -1052,14 +1064,31 @@ impl Parser {
         }
         let name = self.expect_ident()?;
         // v0.75: schema-qualified type name (`pg_catalog.int4`,
-        // `information_schema.sql_identifier`); the schema qualifier is
-        // accepted and ignored.
-        let name = if *self.peek() == Token::Dot && matches!(self.peek2(), Token::Ident(_)) {
+        // `information_schema.sql_identifier`).
+        // v2.35: the qualifier is PRESERVED for non-builtin names:
+        // types are stored under their dotted CREATE name, so a bare
+        // marker missed the registry (the stats_import root). Builtin
+        // names still resolve through the bare name in
+        // parse_type_name_rest; parse_type_name_rest_with_schema
+        // reattaches the qualifier when the result is a named
+        // (composite/domain) type.
+        if *self.peek() == Token::Dot && matches!(self.peek2(), Token::Ident(_)) {
             self.next(); // '.'
-            self.expect_ident()?
-        } else {
-            name
-        };
+            let bare = self.expect_ident()?;
+            let schema = name;
+            let (ty, marker) = self.parse_type_name_rest(bare.clone())?;
+            // Only the named-type (Composite) marker carries the
+            // qualifier; the oid/regprocedure named-cast markers keep
+            // their canonical bare spellings.
+            let marker = marker.map(|m| {
+                if ty == ColType::Composite && m == bare {
+                    format!("{}.{}", schema, m)
+                } else {
+                    m
+                }
+            });
+            return Ok((ty, marker));
+        }
         self.parse_type_name_rest(name)
     }
 
@@ -1078,6 +1107,22 @@ impl Parser {
                 ));
             }
             return Ok((ColType::SingleChar, None));
+        }
+        // v2.35: `"schema"."type"` — a quoted first part followed by
+        // a dot and a second name part is a qualified type name.
+        if *self.peek() == Token::Dot && matches!(self.peek2(), Token::Ident(_) | Token::QIdent(_))
+        {
+            self.next(); // '.'
+            let bare = self.expect_ident()?;
+            let (ty, marker) = self.parse_type_name_rest(bare.clone())?;
+            let marker = marker.map(|m| {
+                if ty == ColType::Composite && m == bare {
+                    format!("{}.{}", name, m)
+                } else {
+                    m
+                }
+            });
+            return Ok((ty, marker));
         }
         self.parse_type_name_rest(name)
     }
@@ -1357,6 +1402,7 @@ impl Parser {
             "regclass" => Ok(ColType::Regclass),
             "regproc" => Ok(ColType::Regproc),
             "regprocedure" => Ok(ColType::Regprocedure), // v2.34
+            "regnamespace" => Ok(ColType::Regnamespace), // v2.35
             "pg_lsn" => Ok(ColType::PgLsn),              // v0.64
             "xid" => Ok(ColType::Xid),                   // v1.17
             "oid" => Ok(ColType::Oid),                   // v2.15
@@ -1402,6 +1448,10 @@ impl Parser {
             // v2.34: like oid, a regprocedure cast must resolve its
             // signature text through the catalog (eval_cast_named).
             Some("regprocedure".to_string())
+        } else if base == ColType::Regnamespace {
+            // v2.35: like regprocedure, a regnamespace cast resolves
+            // its schema-name text through the catalog.
+            Some("regnamespace".to_string())
         } else {
             None
         };
@@ -1712,12 +1762,15 @@ impl Parser {
                 }
                 String::new()
             } else {
-                self.expect_ident()?
+                // v2.35: the index name may be schema-qualified.
+                self.parse_table_name()?
             };
             self.expect_keyword("on")?;
             // v2.29: optional ONLY before the table name.
             let only = self.eat_keyword("only");
-            let table = self.expect_ident()?;
+            // v2.35: the table name may be schema-qualified
+            // (`CREATE INDEX i ON s.t (...)`).
+            let table = self.parse_table_name()?;
             // v0.88: `USING btree` may appear between the table and the
             // column list. v0.89: rustgres only implements btree, so any
             // other access method is 0A000 (feature not supported) rather
@@ -2269,6 +2322,14 @@ impl Parser {
         } else {
             None
         };
+        // v2.35: trailing reloptions `WITH (...)` (PG19
+        // PartitionBoundSpec + OptWith: `PARTITION OF p FOR VALUES ...
+        // WITH (autovacuum_enabled = false)`).
+        let part_reloptions = if self.eat_keyword("with") {
+            self.parse_reloptions()?
+        } else {
+            Vec::new()
+        };
         // The child inherits the parent's method and key; a trailing
         // `PARTITION BY` makes it a sub-partitioned intermediate.
         let (method, keys) = match sub {
@@ -2304,7 +2365,7 @@ impl Parser {
                 bound: Some(bound),
             }),
             likes: Vec::new(),
-            reloptions: Vec::new(),
+            reloptions: part_reloptions,
             inherits: Vec::new(),
             deferred_not_null: Vec::new(),
             of_type: None,
@@ -4654,7 +4715,8 @@ impl Parser {
         } else {
             false
         };
-        let name = self.expect_ident()?;
+        // v2.35: sequence names may be schema-qualified.
+        let name = self.parse_table_name()?;
         let opts = self.parse_sequence_opts()?;
         Ok(Stmt::CreateSequence {
             name,
@@ -5415,9 +5477,12 @@ impl Parser {
     /// function arguments generally.
     pub(crate) fn parse_func_type_name(&mut self) -> Result<String, SqlError> {
         let mut name = self.expect_ident()?;
+        // v2.35: keep the schema qualifier (types/functions store
+        // dotted names; resolvers strip pg_catalog. themselves).
         if *self.peek() == Token::Dot && matches!(self.peek2(), Token::Ident(_)) {
             self.next(); // '.'
-            name = self.expect_ident()?;
+            let bare = self.expect_ident()?;
+            name = format!("{}.{}", name, bare);
         }
         while *self.peek() == Token::LBracket {
             self.next(); // '['
@@ -9268,6 +9333,45 @@ impl Parser {
         Ok(InsertTarget { name, indirection })
     }
 
+    /// v2.35: `(expr).*` at the head of a select item — token-shape
+    /// probe (matching-paren scan, then Dot Star). On a match the
+    /// item is consumed and returned; otherwise nothing is consumed.
+    pub(crate) fn try_parse_composite_star(&mut self) -> Option<Result<SelectItem, SqlError>> {
+        if *self.peek() != Token::LParen {
+            return None;
+        }
+        let mut depth = 0i32;
+        let mut j = self.pos;
+        let close = loop {
+            match self.tokens.get(j) {
+                Some(Token::LParen) => depth += 1,
+                Some(Token::RParen) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break Some(j);
+                    }
+                }
+                Some(_) => {}
+                None => break None,
+            }
+            j += 1;
+        }?;
+        if !matches!(self.tokens.get(close + 1), Some(Token::Dot))
+            || !matches!(self.tokens.get(close + 2), Some(Token::Star))
+        {
+            return None;
+        }
+        let parsed = (|| {
+            self.next(); // '('
+            let inner = self.parse_or()?;
+            self.expect(Token::RParen, "')'")?;
+            self.next(); // '.'
+            self.next(); // '*'
+            Ok(SelectItem::CompositeStar(inner))
+        })();
+        Some(parsed)
+    }
+
     /// v0.10: `RETURNING * | expr [, ...]` after INSERT/UPDATE/DELETE.
     /// Empty when the keyword is absent.
     pub(crate) fn parse_returning(&mut self) -> Result<Vec<SelectItem>, SqlError> {
@@ -9276,7 +9380,9 @@ impl Parser {
         }
         let mut items = Vec::new();
         loop {
-            if *self.peek() == Token::Star {
+            if let Some(cs) = self.try_parse_composite_star() {
+                items.push(cs?);
+            } else if *self.peek() == Token::Star {
                 self.next();
                 items.push(SelectItem::All);
             } else if let Some(q) = self.peek_ident() {
@@ -14913,8 +15019,11 @@ impl Parser {
             if items.is_empty() && self.select_core_follows() {
                 break;
             }
-            // `*`
-            if *self.peek() == Token::Star {
+            // v2.35: `(expr).*` composite star.
+            if let Some(cs) = self.try_parse_composite_star() {
+                items.push(cs?);
+            } else if *self.peek() == Token::Star {
+                // `*`
                 self.next();
                 items.push(SelectItem::All);
             } else if let Some(q) = self.peek_ident() {

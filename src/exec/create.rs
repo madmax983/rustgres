@@ -96,7 +96,7 @@ pub(crate) fn wo_column_is_range(
     if let Some(Some(d)) = domain_types.get(i) {
         let mut cur = d.clone();
         for _ in 0..8 {
-            let Some(st) = eng.db.types.get(&cur) else {
+            let Some(st) = eng.db.find_type(&cur) else {
                 return false;
             };
             let Some(dom) = &st.domain else {
@@ -106,7 +106,7 @@ pub(crate) fn wo_column_is_range(
                 return true;
             }
             if let Some(bn) = &dom.base_named {
-                if eng.db.types.get(bn).is_some_and(|t| t.range.is_some()) {
+                if eng.db.find_type(bn).is_some_and(|t| t.range.is_some()) {
                     return true;
                 }
             }
@@ -118,7 +118,7 @@ pub(crate) fn wo_column_is_range(
         return false;
     }
     if let Some(Some(n)) = composite_types.get(i) {
-        return eng.db.types.get(n).is_some_and(|t| t.range.is_some());
+        return eng.db.find_type(n).is_some_and(|t| t.range.is_some());
     }
     false
 }
@@ -215,7 +215,7 @@ pub(crate) fn exec_create(
     let expanded;
     let def = if let Some(tname) = &def.of_type {
         check_type_usage(eng, ctx, tname)?;
-        let st = match eng.db.types.get(tname) {
+        let st = match eng.db.find_type(tname) {
             Some(st) => st,
             None => {
                 return Err(exec_err(
@@ -287,7 +287,7 @@ pub(crate) fn exec_create(
             let mut comp = None;
             let mut dom = None;
             if let Some(n) = named {
-                match eng.db.types.get(n) {
+                match eng.db.find_type(n) {
                     Some(s2) if s2.domain.is_some() => dom = Some(n.clone()),
                     _ => comp = Some(n.clone()),
                 }

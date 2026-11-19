@@ -83,7 +83,7 @@ pub(crate) fn jt_static_leaf_type(
     let _ = (snap, own, session);
     match (ty, named) {
         (_, Some(name)) => {
-            if let Some(st) = eng.db.types.get(name) {
+            if let Some(st) = eng.db.find_type(name) {
                 if let Some(dom) = &st.domain {
                     return Ok(match &dom.base {
                         ColType::Composite => ColType::Composite,
@@ -314,7 +314,7 @@ pub(crate) fn jt_convert_item(
     // item to a domain through IO conversion, unlike a plain string
     // column, which receives boolout's 't'/'f' (see the scalar arm).
     if let Some(name) = named {
-        if let Some(dom) = q.eng.db.types.get(name).and_then(|st| st.domain.clone()) {
+        if let Some(dom) = q.eng.db.find_type(name).and_then(|st| st.domain.clone()) {
             let (bty, bnamed) = match &dom.base {
                 ColType::Composite => (ColType::Composite, dom.base_named.clone()),
                 b => (*b, dom.base_domain.clone()),
@@ -565,7 +565,7 @@ fn jt_convert_bool(
     bit_len: Option<i32>,
 ) -> Result<Value, ExecError> {
     if let Some(name) = named {
-        if let Some(dom) = q.eng.db.types.get(name).and_then(|st| st.domain.clone()) {
+        if let Some(dom) = q.eng.db.find_type(name).and_then(|st| st.domain.clone()) {
             let (bty, bnamed) = match &dom.base {
                 ColType::Composite => (ColType::Composite, dom.base_named.clone()),
                 b => (*b, dom.base_domain.clone()),

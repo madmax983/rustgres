@@ -2572,7 +2572,7 @@ pub(crate) fn exec_grant_revoke(
             // v1.96: ON DOMAIN requires the name to be a domain
             // (PG19 42809 wrong object type).
             if matches!(object, GrantObject::Domain(_)) {
-                if let Some(st) = eng.db.types.get(name) {
+                if let Some(st) = eng.db.find_type(name) {
                     if st.domain.is_none() {
                         return Err(exec_err(
                             "42809",

@@ -5255,7 +5255,17 @@ pub(crate) fn create_table_from_def(
         let ty = like_def.columns[i].1.clone();
         if ty == ColType::Composite {
             let tname: Option<String> = like_def.composite_types.get(i).and_then(|o| o.clone());
-            let st = tname.as_deref().and_then(|n| eng.db.types.get(n)).cloned();
+            // v2.35: canonicalize the recorded name to the registry
+            // key find_type resolves to, so stored column metadata
+            // always matches the type's storage key exactly.
+            let tname: Option<String> = match &tname {
+                Some(n) => eng.db.type_key(n).or_else(|| tname.clone()),
+                None => None,
+            };
+            if tname.is_some() {
+                like_def.composite_types[i] = tname.clone();
+            }
+            let st = tname.as_deref().and_then(|n| eng.db.find_type(n)).cloned();
             match st {
                 Some(st) if st.composite.is_some() => {}
                 // v1.88: a user-defined range type column stores as the
@@ -5293,7 +5303,7 @@ pub(crate) fn create_table_from_def(
             // array of the domain's base; the domain applies per array
             // element.
             let tname: Option<String> = like_def.composite_types.get(i).and_then(|o| o.clone());
-            let st = tname.as_deref().and_then(|n| eng.db.types.get(n)).cloned();
+            let st = tname.as_deref().and_then(|n| eng.db.find_type(n)).cloned();
             if let Some(st) = st {
                 if let Some(dom) = st.domain.clone() {
                     like_def.columns[i].1 = ColType::Array(ArrayElem::of(&dom.base));
@@ -5358,6 +5368,12 @@ pub(crate) fn create_table_from_def(
         // column definition resolves them (PG19's bogus-marker
         // pass in DefineRelation).
         let mut merged_gen: Vec<Option<(crate::sql::Expr, bool)>> = Vec::new();
+        // v2.35: declared collation per merged column, parallel to
+        // merged.columns (TableDef merging does not track it):
+        // PG19 MergeAttributes requires an exact collation match
+        // across parents and against the child's own definition
+        // (42P21).
+        let mut merged_colls: Vec<Option<String>> = Vec::new();
         // v2.28: identity is NOT inherited (PG19 MergeAttributes):
         // inherited slots stay None and their nextval defaults are
         // stripped; only a child's own declaration sets the slot.
@@ -5457,6 +5473,25 @@ pub(crate) fn create_table_from_def(
                             format!("column \"{}\" has a type conflict", col),
                         ));
                     }
+                    // v2.35: collations must also match exactly
+                    // across parents (PG19 MergeAttributes, 42P21).
+                    if crate::sql::col_type_collatable(
+                        ty,
+                        parent
+                            .domain_types
+                            .get(i)
+                            .cloned()
+                            .unwrap_or(None)
+                            .as_deref(),
+                    ) {
+                        let pcoll = parent.col_collation(i).map(|s| s.to_string());
+                        if merged_colls.get(pos).cloned().unwrap_or(None) != pcoll {
+                            return Err(exec_err(
+                                "42P21",
+                                format!("inherited column \"{}\" has a collation conflict", col),
+                            ));
+                        }
+                    }
                     // v2.16: generation conflicts across parents
                     // (PG19 MergeChildAttribute / DefineRelation).
                     let pgen = parent.gen_cols.get(i).cloned().unwrap_or(None);
@@ -5520,6 +5555,7 @@ pub(crate) fn create_table_from_def(
                     continue;
                 }
                 merged.columns.push((col.clone(), ty.clone()));
+                merged_colls.push(parent.col_collation(i).map(|s| s.to_string()));
                 // v0.81: inherit the composite type name too.
                 merged
                     .composite_types
@@ -5600,6 +5636,26 @@ pub(crate) fn create_table_from_def(
                     "42804",
                     format!("column \"{}\" has a type conflict", col),
                 ));
+            }
+            // v2.35: the child's own collation must match the
+            // inherited collation exactly (PG19
+            // MergeChildAttribute, 42P21).
+            if crate::sql::col_type_collatable(
+                ty,
+                like_def
+                    .domain_types
+                    .get(i)
+                    .cloned()
+                    .unwrap_or(None)
+                    .as_deref(),
+            ) {
+                let lcoll = like_def.collations.get(i).cloned().unwrap_or(None);
+                if merged_colls.get(pos).cloned().unwrap_or(None) != lcoll {
+                    return Err(exec_err(
+                        "42P21",
+                        format!("column \"{}\" has a collation conflict", col),
+                    ));
+                }
             }
             // v2.16: the child's own column vs the inherited
             // generation kind (PG19 MergeChildAttribute, 42804).
@@ -6256,7 +6312,7 @@ pub(crate) fn fk_types_compatible(eng: &Engine, child: &Table, fk: &FkDef, paren
     // Domains resolve to their base type (PG getBaseType).
     let eff = |t: &Table, idx: usize| -> (CT, Option<String>) {
         if let Some(Some(d)) = t.domain_types.get(idx) {
-            if let Some(st) = eng.db.types.get(d) {
+            if let Some(st) = eng.db.find_type(d) {
                 if let Some(dom) = &st.domain {
                     return (dom.base.clone(), None);
                 }
@@ -6698,7 +6754,7 @@ fn validate_fk_period(
     // and named type).
     let type_name = |t: &Table, idx: usize| -> String {
         if let Some(Some(d)) = t.domain_types.get(idx) {
-            if let Some(st) = eng.db.types.get(d) {
+            if let Some(st) = eng.db.find_type(d) {
                 if let Some(dom) = &st.domain {
                     if let Some(bn) = &dom.base_named {
                         return bn.clone();

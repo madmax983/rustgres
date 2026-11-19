@@ -1893,6 +1893,11 @@ pub enum SelectItem {
     All,
     /// `qualifier.*`
     AllOf(String),
+    /// v2.35: `(expr).*` — composite-value star expansion (PG19
+    /// gram.y target_el: `a_expr '.' '*'` where the a_expr is a
+    /// parenthesized composite/row value). Expanded at describe and
+    /// projection time from the value's rowtype fields.
+    CompositeStar(Expr),
     Expr {
         expr: Expr,
         alias: Option<String>,
@@ -11344,7 +11349,7 @@ pub(crate) fn cte_width(s: &SelectStmt) -> Option<usize> {
     for item in &s.items {
         match item {
             SelectItem::Expr { .. } => n += 1,
-            SelectItem::All | SelectItem::AllOf(_) => return None,
+            SelectItem::All | SelectItem::AllOf(_) | SelectItem::CompositeStar(_) => return None,
         }
     }
     Some(n)

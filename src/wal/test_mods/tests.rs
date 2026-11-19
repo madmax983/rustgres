@@ -1254,6 +1254,62 @@ fn v200_alter_replay_copy_rows_rebuilds_row_index() {
 }
 
 #[test]
+fn v235_alter_replay_multi_action_copies_immediate_predecessor() {
+    // One transaction, two AlterTable records with the SAME xmin (5):
+    // a row-rewriting ADD COLUMN (copy_rows=false; the rewritten rows
+    // arrive as InsertRows), then a metadata action (copy_rows=true).
+    // The copy must take the REWRITTEN version's rows — the immediate
+    // predecessor. Before the fix, the copy searched by
+    // dropped_xmax == xmin after superseding and found the ORIGINAL
+    // version (also marked with xmin 5), leaving 2-wide rows in the
+    // live 3-column version; the next checkpoint wrote them verbatim
+    // and load_checkpoint refused to start ("row/column count
+    // mismatch"). Reproduced end-to-end on the v2.34 base with
+    // identity.sql's itest3 sequence (ADD COLUMN ... AS IDENTITY,
+    // ALTER COLUMN ... SET GENERATED ALWAYS in one statement,
+    // crash, replay, CHECKPOINT, restart refused).
+    let mut eng = v200_engine();
+    apply_record(&mut eng, &v200_alter(&["a", "f", "c"], false, 5)).unwrap();
+    let rows: Vec<WalRow> = (1..=3u64)
+        .map(|id| WalRow {
+            id,
+            xmin: 5,
+            values: Row::new(vec![
+                Value::Int(id as i64),
+                Value::Int(id as i64 * 10),
+                Value::Int(id as i64 * 100),
+            ]),
+            toast: vec![0; 3],
+            toast_meta: vec![],
+        })
+        .collect();
+    apply_record(
+        &mut eng,
+        &WalRecord::InsertRows {
+            table: "t".into(),
+            rows,
+        },
+    )
+    .unwrap();
+    apply_record(&mut eng, &v200_alter(&["a", "f", "c"], true, 5)).unwrap();
+    let live = eng.db.tables["t"]
+        .iter()
+        .find(|t| t.dropped_xmax == 0)
+        .expect("live version");
+    assert_eq!(live.columns.len(), 3);
+    assert_eq!(live.rows.len(), 3);
+    for r in &live.rows {
+        assert_eq!(
+            r.values.len(),
+            3,
+            "row id {} must carry the rewritten width",
+            r.id
+        );
+        assert_eq!(r.values[2], Value::Int(r.id as i64 * 100));
+    }
+}
+
+#[test]
 fn v200_alter_replay_create_index_entries_resolve() {
     // A CreateIndex replayed after an AlterTable replay builds its
     // entries from the new version's rows; every entry id must resolve

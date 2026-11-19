@@ -564,8 +564,23 @@ pub(crate) fn from_schema_item(
             // against the enclosing query's schemas (PG19); same-level
             // FROM siblings stay invisible (they are not in
             // `outer_schemas`).
-            let cols =
-                describe_select_outer(eng, snap, own, session, sub, visible, &[], outer_schemas)?;
+            // v2.35: thread the materialized CTE bindings through —
+            // at execution time a set-op branch is described on its
+            // own (describe_select with the carrier's bindings), so
+            // dropping them here lost every enclosing CTE reference
+            // inside a derived table (42P01 "relation aset does not
+            // exist" for WITH ... SELECT ... FROM (SELECT ... FROM
+            // aset) ... UNION ALL ...).
+            let cols = describe_select_outer(
+                eng,
+                snap,
+                own,
+                session,
+                sub,
+                visible,
+                bindings,
+                outer_schemas,
+            )?;
             // v0.23: more column aliases than output columns is 42601.
             check_col_alias_arity(alias, cols.len(), col_aliases)?;
             out.push(
@@ -1016,6 +1031,29 @@ pub(crate) fn describe_set_op(
         bindings,
         outer_schemas,
     )?;
+    // v2.35: PG19 select_common_type treats a bare NULL literal arm
+    // as type `unknown`, which coerces to the other arm's type; the
+    // engine types a bare NULL as Text, which made
+    // `... ::composite UNION ALL SELECT NULL ...` fail 42804
+    // (Composite vs Text). Track per-column "only unknown arms so
+    // far" from the branch item shapes.
+    fn null_cols(stmt: &SelectStmt, n: usize) -> Option<Vec<bool>> {
+        if stmt.set_op.is_some() || stmt.items.len() != n {
+            return None;
+        }
+        let mut v = Vec::with_capacity(n);
+        for it in &stmt.items {
+            v.push(matches!(
+                it,
+                SelectItem::Expr {
+                    expr: Expr::Literal(Literal::Null),
+                    ..
+                }
+            ));
+        }
+        Some(v)
+    }
+    let mut unknown_only: Option<Vec<bool>> = null_cols(&root.left, out.len());
     for b in &root.chain {
         let op_name = match b.op {
             SetOpKind::Union => "UNION",
@@ -1038,13 +1076,26 @@ pub(crate) fn describe_set_op(
                 format!("each {op_name} query must have the same number of columns"),
             ));
         }
+        let branch_nulls = null_cols(&b.right, out.len());
         let mut resolved: Vec<ColType> = Vec::with_capacity(out.len());
-        for ((_, lty), (_, rty)) in out.iter().zip(r.iter()) {
-            resolved.push(common_supertype(op_name, lty, rty)?);
+        for (i, ((_, lty), (_, rty))) in out.iter().zip(r.iter()).enumerate() {
+            let left_unknown = unknown_only.as_ref().map(|v| v[i]).unwrap_or(false);
+            let right_unknown = branch_nulls.as_ref().map(|v| v[i]).unwrap_or(false);
+            if left_unknown && !right_unknown {
+                resolved.push(*rty);
+            } else if right_unknown && !left_unknown {
+                resolved.push(*lty);
+            } else {
+                resolved.push(common_supertype(op_name, lty, rty)?);
+            }
         }
         for (i, ty) in resolved.into_iter().enumerate() {
             out[i].1 = ty;
         }
+        unknown_only = match (unknown_only.take(), branch_nulls) {
+            (Some(a), Some(bn)) => Some(a.iter().zip(bn.iter()).map(|(x, y)| *x && *y).collect()),
+            _ => None,
+        };
     }
     Ok(out)
 }
@@ -1052,6 +1103,130 @@ pub(crate) fn describe_set_op(
 /// v0.10: `outer` holds the CTE definitions visible from enclosing query
 /// levels (innermost last); the query's own WITH list is appended, so a
 /// CTE body only sees outer CTEs and earlier siblings.
+/// v2.35: the (name, type) field list of a named rowtype — a
+/// composite type, a table's rowtype, or a view's rowtype — or None
+/// when the name does not resolve to one.
+pub(crate) fn composite_fields_of_type_name(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    name: &str,
+) -> Option<Vec<(String, ColType)>> {
+    if let Some(st) = eng.db.find_type(name) {
+        if st.domain.is_none() {
+            if let Some(fields) = &st.composite {
+                return Some(
+                    fields
+                        .iter()
+                        .map(|(n, ct, _)| (n.clone(), ct.clone()))
+                        .collect(),
+                );
+            }
+        }
+        return None;
+    }
+    if let Some(t) = eng.db.find_table(name, snap, &[own], session) {
+        return Some(
+            t.columns
+                .iter()
+                .map(|(n, ct)| (n.clone(), ct.clone()))
+                .collect(),
+        );
+    }
+    if eng.db.find_view(name, snap, own).is_some() {
+        if let Ok(cols) = super::viewdml::view_columns_of_db(eng, snap, own, session, name) {
+            return Some(cols);
+        }
+    }
+    None
+}
+
+/// v2.35: field list for a `(expr).*` composite-star item, resolved
+/// from the expression's shape: an explicit named cast, a whole-row
+/// reference, a composite column produced by a RETURNS TABLE
+/// function (its declared column type names), or a direct composite
+/// function call. None when the shape is not statically resolvable.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn composite_star_fields(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    schemas: &[&[QCol]],
+    expr: &Expr,
+) -> Option<Vec<(String, ColType)>> {
+    match expr {
+        Expr::CastNamed { name, .. } => {
+            composite_fields_of_type_name(eng, snap, own, session, name)
+        }
+        Expr::WholeRow { qual } => {
+            let cols: Vec<(String, ColType)> = schemas
+                .iter()
+                .flat_map(|s| s.iter())
+                .filter(|c| &c.qual == qual && !c.hidden)
+                .map(|c| (c.name.clone(), c.ty.clone()))
+                .collect();
+            if cols.is_empty() { None } else { Some(cols) }
+        }
+        Expr::Column { table, name } => {
+            let qual = table.clone().unwrap_or_default();
+            // A RETURNS TABLE function's declared column types carry
+            // the composite type name the QCol itself dropped.
+            for defs in eng.db.functions.values() {
+                for def in defs {
+                    if !qual.is_empty()
+                        && def.name != qual
+                        && def.name.rsplit('.').next().unwrap_or(&def.name) != qual.as_str()
+                    {
+                        continue;
+                    }
+                    for (cn, tn) in &def.table_cols {
+                        if cn == name {
+                            if let Some(f) =
+                                composite_fields_of_type_name(eng, snap, own, session, tn)
+                            {
+                                return Some(f);
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        }
+        Expr::Func { name, .. } => {
+            for defs in eng.db.functions.values() {
+                for def in defs {
+                    if def.name == *name
+                        || def.name.rsplit('.').next().unwrap_or(&def.name) == name.as_str()
+                    {
+                        if !def.table_cols.is_empty() {
+                            let mut out = Vec::new();
+                            for (cn, tn) in &def.table_cols {
+                                let ct = super::ddl_func::resolve_func_type_name(
+                                    eng, snap, own, session, tn,
+                                )
+                                .unwrap_or(ColType::Text);
+                                out.push((cn.clone(), ct));
+                            }
+                            return Some(out);
+                        }
+                        return composite_fields_of_type_name(
+                            eng,
+                            snap,
+                            own,
+                            session,
+                            &def.ret_type,
+                        );
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn describe_select_outer(
     eng: &Engine,
     snap: &Snapshot,
@@ -1117,6 +1292,31 @@ pub(crate) fn describe_select_outer(
                         "42P01",
                         format!("missing FROM-clause entry for table \"{}\"", qual),
                     ));
+                }
+            }
+            SelectItem::CompositeStar(expr) => {
+                // v2.35: `(expr).*` expands to the rowtype's fields.
+                match composite_star_fields(eng, snap, own, session, &refs, expr) {
+                    Some(fields) => out.extend(fields),
+                    None => {
+                        let ty = expr_type(
+                            eng,
+                            snap,
+                            own,
+                            session,
+                            &refs,
+                            outer_schemas,
+                            &visible,
+                            expr,
+                        )?;
+                        return Err(exec_err(
+                            "42804",
+                            format!(
+                                "column notation .star applied to type {}, which is not a composite type",
+                                ty.sql_name()
+                            ),
+                        ));
+                    }
                 }
             }
             SelectItem::Expr { expr, alias } => {
@@ -1477,14 +1677,21 @@ pub(crate) fn expr_type(
             // eval_cast_named (aclitem rides as text; regrole as oid).
             match name.as_str() {
                 "aclitem" => return Ok(ColType::Text),
+                // v2.35: PG's statistics payload types ride as text
+                // (their input validators live in pg_input.rs).
+                "pg_ndistinct"
+                | "pg_dependencies"
+                | "pg_catalog.pg_ndistinct"
+                | "pg_catalog.pg_dependencies" => return Ok(ColType::Text),
                 "regrole" => return Ok(ColType::Int),
                 // v2.34: `::oid` rides the named path (v2.15) so its
                 // result type is oid; regprocedure likewise.
                 "oid" => return Ok(ColType::Oid),
                 "regprocedure" => return Ok(ColType::Regprocedure),
+                "regnamespace" => return Ok(ColType::Regnamespace),
                 _ => {}
             }
-            match eng.db.types.get(name) {
+            match eng.db.find_type(name) {
                 Some(st) if st.composite.is_some() => Ok(ColType::Composite),
                 // v1.88: casts to user-defined range types.
                 Some(st) if st.range.is_some() => {
@@ -1514,6 +1721,10 @@ pub(crate) fn expr_type(
                     // v0.86: table rowtypes (PG19: every table has a
                     // composite rowtype).
                     if eng.db.find_table(name, snap, &[own], session).is_some() {
+                        return Ok(ColType::Composite);
+                    }
+                    // v2.35: view rowtypes likewise.
+                    if eng.db.find_view(name, snap, own).is_some() {
                         return Ok(ColType::Composite);
                     }
                     Err(exec_err(

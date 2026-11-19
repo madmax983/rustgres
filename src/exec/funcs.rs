@@ -4177,7 +4177,7 @@ pub(crate) fn func_rowtype_fields(
         let types = t.columns.iter().map(|(_, c)| c.clone()).collect();
         return Ok((names, types));
     }
-    if let Some(st) = q.eng.db.types.get(type_name) {
+    if let Some(st) = q.eng.db.find_type(type_name) {
         if let Some(fields) = &st.composite {
             let names = fields.iter().map(|(n, _, _)| n.clone()).collect();
             let types = fields.iter().map(|(_, c, _)| c.clone()).collect();
@@ -4769,7 +4769,7 @@ pub(crate) fn ctor_cat_of_expr(
     }
     match e {
         Expr::CastNamed { name, .. } => {
-            if let Some(st) = q.eng.db.types.get(name) {
+            if let Some(st) = q.eng.db.find_type(name) {
                 if let Some(d) = &st.domain {
                     return (super::json::ctor_cat_of_coltype(d.base), Some(name.clone()));
                 }
@@ -5648,7 +5648,7 @@ pub(crate) fn eval_func(
     }
     // v1.88: constructors of user-defined range types
     // (CREATE TYPE ... AS RANGE) resolve through the type catalog.
-    if let Some((elem, multi)) = q.eng.db.types.get(name).and_then(|st| st.range) {
+    if let Some((elem, multi)) = q.eng.db.find_type(name).and_then(|st| st.range) {
         let mut vals = Vec::with_capacity(args.len());
         for a in args {
             vals.push(eval_expr(q, scopes, a)?);
@@ -6071,7 +6071,7 @@ pub(crate) fn eval_func(
                             | crate::storage::ColType::Composite
                             | crate::storage::ColType::Record
                     ),
-                    Expr::CastNamed { name: n, .. } => match q.eng.db.types.get(n.as_str()) {
+                    Expr::CastNamed { name: n, .. } => match q.eng.db.find_type(n.as_str()) {
                         // A composite type name, or a domain over a
                         // composite / json / array base. A domain over
                         // a scalar base is a legal key.
@@ -6239,6 +6239,7 @@ pub(crate) fn pg_typlen_align(ty: &ColType) -> (i32, usize) {
         ColType::Regclass => (4, 4),     // regclass: 4/'i'
         ColType::Regproc => (4, 4),      // regproc: 4/'i' (v2.14)
         ColType::Regprocedure => (4, 4), // regprocedure: 4/'i' (v2.34)
+        ColType::Regnamespace => (4, 4), // regnamespace: 4/'i' (v2.35)
         ColType::Xid => (4, 4),          // xid: 4/'i'
         ColType::Oid => (4, 4),          // oid: 4/'i' (v2.15)
         ColType::Inet => (-1, 4),        // inet: varlena (v2.15)
@@ -7880,7 +7881,7 @@ pub(crate) fn pop_fields_for_type(q: &mut Q, type_name: &str) -> Result<Vec<PopF
             })
             .collect());
     }
-    if let Some(st) = q.eng.db.types.get(type_name) {
+    if let Some(st) = q.eng.db.find_type(type_name) {
         if let Some(fields) = &st.composite {
             return Ok(fields
                 .iter()
@@ -7916,7 +7917,7 @@ pub(crate) fn pop_fields_static(
                 .collect(),
         );
     }
-    eng.db.types.get(type_name).and_then(|st| {
+    eng.db.find_type(type_name).and_then(|st| {
         st.composite.as_ref().map(|fields| {
             fields
                 .iter()
@@ -8057,7 +8058,7 @@ pub(crate) fn populate_fields(
                 Some(b) => b.clone(),
                 None => {
                     let is_domain = f.named.as_ref().is_some_and(|n| {
-                        q.eng.db.types.get(n).is_some_and(|st| st.domain.is_some())
+                        q.eng.db.find_type(n).is_some_and(|st| st.domain.is_some())
                     });
                     if is_domain {
                         populate_typed(q, f, None, &JsonbVal::Null)?
@@ -8074,7 +8075,7 @@ pub(crate) fn populate_fields(
                 let is_domain = f
                     .named
                     .as_ref()
-                    .is_some_and(|n| q.eng.db.types.get(n).is_some_and(|st| st.domain.is_some()));
+                    .is_some_and(|n| q.eng.db.find_type(n).is_some_and(|st| st.domain.is_some()));
                 if is_domain {
                     populate_typed(q, f, base_val, &JsonbVal::Null)?
                 } else {
@@ -8102,7 +8103,7 @@ pub(crate) fn populate_typed(
     // value (PG19 populate_domain: NOT NULL and CHECKs run; the
     // _valid variant turns the error into false).
     if let Some(n) = &f.named {
-        let is_domain = q.eng.db.types.get(n).is_some_and(|st| st.domain.is_some());
+        let is_domain = q.eng.db.find_type(n).is_some_and(|st| st.domain.is_some());
         if is_domain {
             crate::exec::constraint::check_domain_value(q, n, &v, false)?;
         }
@@ -14796,7 +14797,7 @@ pub(crate) fn ctor_spec_result_type_named(eng: &Engine, spec: &str) -> ColType {
             if let Some(t) = super::json::ctor_spec_coltype(spec) {
                 return t;
             }
-            if let Some(st) = eng.db.types.get(spec) {
+            if let Some(st) = eng.db.find_type(spec) {
                 if let Some(d) = &st.domain {
                     return d.base;
                 }
@@ -15450,7 +15451,7 @@ pub(crate) fn func_result_type(
         _ => {
             // v1.88: user-defined range type constructors type as
             // their range / multirange type.
-            if let Some((elem, multi)) = eng.db.types.get(name).and_then(|st| st.range) {
+            if let Some((elem, multi)) = eng.db.find_type(name).and_then(|st| st.range) {
                 return Ok(if multi {
                     ColType::Multirange(elem)
                 } else {

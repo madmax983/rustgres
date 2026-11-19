@@ -65,7 +65,7 @@ pub(crate) fn hint_type(
         // v1.91: casts to named types hint the catalog type (a VALUES
         // column of `'...'::textrange` rows is a textrange column, not
         // text — PG resolves the common type from the cast targets).
-        Expr::CastNamed { name, .. } => match eng.db.types.get(name) {
+        Expr::CastNamed { name, .. } => match eng.db.find_type(name) {
             Some(st) if st.composite.is_some() => Some(ColType::Composite),
             Some(st) if st.range.is_some() => {
                 let (elem, multi) = st.range.expect("range branch");
@@ -951,6 +951,7 @@ pub(crate) fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<V
         ColType::Regclass => Err(bad("invalid input syntax for type regclass".into())),
         ColType::Regproc => Err(bad("invalid input syntax for type regproc".into())),
         ColType::Regprocedure => Err(bad("invalid input syntax for type regprocedure".into())),
+        ColType::Regnamespace => Err(bad("invalid input syntax for type regnamespace".into())),
         // v0.73: record input is not supported (no composite input
         // function); json accepts its text form.
         ColType::Record => Err(bad("invalid input syntax for type record".into())),
@@ -1164,8 +1165,10 @@ pub(crate) fn subst_returning(
     params: &[Option<Value>],
 ) -> Result<(), ExecError> {
     for item in returning {
-        if let SelectItem::Expr { expr, .. } = item {
-            subst_expr(expr, params)?;
+        match item {
+            SelectItem::Expr { expr, .. } => subst_expr(expr, params)?,
+            SelectItem::CompositeStar(expr) => subst_expr(expr, params)?,
+            _ => {}
         }
     }
     Ok(())
@@ -1206,8 +1209,10 @@ pub(crate) fn subst_select(s: &mut SelectStmt, params: &[Option<Value>]) -> Resu
         return Ok(());
     }
     for item in &mut s.items {
-        if let SelectItem::Expr { expr, .. } = item {
-            subst_expr(expr, params)?;
+        match item {
+            SelectItem::Expr { expr, .. } => subst_expr(expr, params)?,
+            SelectItem::CompositeStar(expr) => subst_expr(expr, params)?,
+            _ => {}
         }
     }
     for f in &mut s.from {
@@ -1546,6 +1551,7 @@ pub(crate) fn dummy_value(t: &ColType) -> Value {
         ColType::Regclass => Value::Text("".into()),
         ColType::Regproc => Value::Text("".into()),
         ColType::Regprocedure => Value::Text("".into()), // v2.34
+        ColType::Regnamespace => Value::Int(0),          // v2.35
         ColType::Name => Value::text(""),                // v0.57
         ColType::PgLsn => Value::PgLsn(0),               // v0.64
         // v1.17: xids are carried as Value::Int.

@@ -779,6 +779,21 @@ pub(crate) fn table_function_col_names(name: &str) -> Result<Vec<String>, ExecEr
         if base == "pg_relation_is_updatable" || base == "pg_column_is_updatable" {
             return Ok(vec![base.to_string()]);
         }
+        // v2.35: the statistics import/clear functions are scalar
+        // builtins; in FROM (e.g. LATERAL pg_restore_attribute_stats)
+        // a scalar function is a one-row, one-column table whose
+        // column is named for the function (PG19 func_table).
+        if matches!(
+            base,
+            "pg_restore_relation_stats"
+                | "pg_restore_attribute_stats"
+                | "pg_restore_extended_stats"
+                | "pg_clear_relation_stats"
+                | "pg_clear_attribute_stats"
+                | "pg_clear_extended_stats"
+        ) {
+            return Ok(vec![base.to_string()]);
+        }
     }
     match name {
         "regexp_split_to_table" | "generate_series" => Ok(vec![name.to_string()]),
@@ -873,6 +888,14 @@ pub(crate) fn table_function_col_types(
         }
     }
     match name {
+        // v2.35: statistics import returns bool; the clears return
+        // void (declared Text, the engine's void stand-in).
+        "pg_restore_relation_stats"
+        | "pg_restore_attribute_stats"
+        | "pg_restore_extended_stats" => Ok(vec![ColType::Bool]),
+        "pg_clear_relation_stats" | "pg_clear_attribute_stats" | "pg_clear_extended_stats" => {
+            Ok(vec![ColType::Text])
+        }
         "regexp_split_to_table" => Ok(vec![ColType::Text]),
         "pg_input_error_info" => Ok(vec![ColType::Text; 4]),
         // v2.30: pg_mcv_list_items (int4, text[], bool[], float8, float8).
@@ -1031,7 +1054,7 @@ pub(crate) fn is_named_composite_ret(
     if ret_type.eq_ignore_ascii_case("record") {
         return false;
     }
-    if let Some(st) = eng.db.types.get(ret_type) {
+    if let Some(st) = eng.db.find_type(ret_type) {
         return st.composite.is_some() && st.domain.is_none();
     }
     eng.db.find_table(ret_type, snap, &[own], session).is_some()
@@ -1134,6 +1157,37 @@ pub(crate) fn eval_srf_call(
             (
                 table_function_col_names(name)?,
                 table_function_col_types(name, &arg_vals)?,
+            )
+        } else {
+            (
+                col_defs.iter().map(|(n, _, _)| n.clone()).collect(),
+                col_defs.iter().map(|(_, t, _)| *t).collect(),
+            )
+        };
+        return Ok((names, types, vec![Row::new(vec![v])], true));
+    }
+    // v2.35: the statistics import/clear functions are scalar
+    // builtins — in FROM they evaluate once per (lateral) input row
+    // through the scalar machinery and yield one row.
+    if matches!(
+        base_name,
+        "pg_restore_relation_stats"
+            | "pg_restore_attribute_stats"
+            | "pg_restore_extended_stats"
+            | "pg_clear_relation_stats"
+            | "pg_clear_attribute_stats"
+            | "pg_clear_extended_stats"
+    ) {
+        validate_coldef_for_builtin(base_name, col_defs)?;
+        let call = Expr::Func {
+            name: base_name.to_string(),
+            args: args.to_vec(),
+        };
+        let v = eval_expr(q, scopes, &call)?;
+        let (names, types) = if col_defs.is_empty() {
+            (
+                table_function_col_names(base_name)?,
+                table_function_col_types(base_name, &arg_vals)?,
             )
         } else {
             (
@@ -2531,7 +2585,7 @@ fn named_composite_fields(
     session: u64,
     type_name: &str,
 ) -> Option<Vec<(String, ColType, Option<String>)>> {
-    if let Some(st) = eng.db.types.get(type_name) {
+    if let Some(st) = eng.db.find_type(type_name) {
         if let Some(fields) = &st.composite {
             return Some(fields.clone());
         }
@@ -2647,11 +2701,23 @@ pub(crate) fn static_rowtype_fields(
             t.columns.iter().map(|(_, c)| c.clone()).collect(),
         ));
     }
-    if let Some(st) = eng.db.types.get(ret_type) {
+    if let Some(st) = eng.db.find_type(ret_type) {
         if let Some(fields) = &st.composite {
             return Some((
                 fields.iter().map(|(n, _, _)| n.clone()).collect(),
                 fields.iter().map(|(_, c, _)| c.clone()).collect(),
+            ));
+        }
+    }
+    // v2.35: a view's rowtype (RETURNS SETOF <view>) — the view's
+    // output columns are the fields.
+    if eng.db.find_view(ret_type, snap, own).is_some() {
+        if let Ok(cols) =
+            crate::exec::viewdml::view_columns_of_db(eng, snap, own, session, ret_type)
+        {
+            return Some((
+                cols.iter().map(|(n, _)| n.clone()).collect(),
+                cols.iter().map(|(_, c)| c.clone()).collect(),
             ));
         }
     }
@@ -4214,7 +4280,7 @@ pub(crate) fn build_source(
             alias,
             col_aliases,
         } => {
-            let (lschema0, lrows0) = build_source(
+            let (lschema0, mut lrows0) = build_source(
                 q, outer, left, where_, need_prov, for_update, any_lock, None, None, prefix,
             )?;
             // v1.10: LATERAL evaluation. PG19 (`LATERAL_P
@@ -4295,6 +4361,24 @@ pub(crate) fn build_source(
                 }),
                 _ => None,
             };
+            // v2.35: PG19 pushes single-side WHERE quals below a
+            // LATERAL join (the qual only references the left
+            // relation), so the lateral item is never evaluated for
+            // rows the qual rejects — observable when the item errors
+            // on other rows' values (the stats_import pg_stats copy:
+            // pg_restore_attribute_stats 42703s on attnames of
+            // relations the WHERE excludes). For CROSS/INNER joins
+            // pre-filtering the left side by left-only conjuncts is
+            // result-identical; the full WHERE still applies after
+            // the join as before.
+            if lateral_right.is_some() && matches!(kind, JoinKind::Cross | JoinKind::Inner) {
+                let quals: HashSet<String> = lschema0.iter().map(|c| c.qual.clone()).collect();
+                let no_quals: HashSet<String> = HashSet::new();
+                let push = pushdown_for(&q.eng.db, where_, &quals, &no_quals, &lschema0, &[]);
+                if !push.is_empty() {
+                    lrows0 = filter_rows(q, outer, &lschema0, lrows0, &push)?;
+                }
+            }
             if let Some(lr) = lateral_right {
                 // v1.10: PG19 forbids a CORRELATED lateral reference on
                 // RIGHT/FULL joins ("The combining JOIN type must be

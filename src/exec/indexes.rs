@@ -2982,7 +2982,7 @@ pub(crate) fn plan_order_scan(
                             return None;
                         }
                     }
-                    SelectItem::All | SelectItem::AllOf(_) => {}
+                    SelectItem::All | SelectItem::AllOf(_) | SelectItem::CompositeStar(_) => {}
                 }
             }
         }

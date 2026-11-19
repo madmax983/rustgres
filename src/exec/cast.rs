@@ -1323,6 +1323,7 @@ pub(crate) fn eval_regclass_cast(q: &mut Q, v: &Value) -> Result<Value, ExecErro
                 let schema = schema.trim_matches('"');
                 let known = schema == "pg_catalog"
                     || schema == "public"
+                    || schema == "pg_temp"
                     || q.eng.db.schemas.iter().any(|x| x == schema);
                 if !known {
                     return Err(exec_err(
@@ -1345,7 +1346,14 @@ pub(crate) fn eval_regclass_cast(q: &mut Q, v: &Value) -> Result<Value, ExecErro
                 crate::exec::catalog::index_oid_map(&q.eng.db, q.snap, q.own, q.session)
                     .iter()
                     .find(|(n, _)| {
-                        n.as_str() == s.as_ref() || n.rsplit('.').next() == Some(s.as_ref())
+                        // v2.35: index names are stored bare; a
+                        // schema-qualified spelling (`s.test_i`)
+                        // matches on the bare suffix (the index's
+                        // schema is its table's, checked loosely like
+                        // the pre-existing rsplit comparison).
+                        n.as_str() == s.as_ref()
+                            || n.rsplit('.').next() == Some(s.as_ref())
+                            || Some(n.as_str()) == s.rsplit('.').next()
                     })
             {
                 // v2.29: index names resolve to their synthetic OID.
@@ -1456,6 +1464,112 @@ pub(crate) fn apply_binary_cast(q: &Q, v: &Value, name: &str) -> Result<Option<V
     }
 }
 
+/// v2.35: PG's pg_dependencies_out rendering of an already
+/// validated payload: `[{"attributes": [a, b], "dependency": d,
+/// "degree": %f}, ...]` with PG snprintf float style.
+fn render_pg_dependencies(text: &str) -> Option<String> {
+    let parsed = super::json::parse_jsonb(text).ok()?;
+    let JsonbVal::Array(items) = parsed else {
+        return None;
+    };
+    let get = |obj: &JsonbVal, key: &str| -> Option<JsonbVal> {
+        let JsonbVal::Object(pairs) = obj else {
+            return None;
+        };
+        pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    };
+    let num = |v: &JsonbVal| -> Option<f64> {
+        match v {
+            JsonbVal::Number(n) => Some(n.to_f64()),
+            JsonbVal::Str(s) => s.trim().parse::<f64>().ok().or_else(|| {
+                match s.trim().to_ascii_lowercase().as_str() {
+                    "inf" | "infinity" | "+inf" | "+infinity" => Some(f64::INFINITY),
+                    "-inf" | "-infinity" => Some(f64::NEG_INFINITY),
+                    "nan" => Some(f64::NAN),
+                    _ => None,
+                }
+            }),
+            _ => None,
+        }
+    };
+    let mut out = String::from("[");
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let attrs = get(item, "attributes")?;
+        let JsonbVal::Array(attrs) = attrs else {
+            return None;
+        };
+        let attr_txt: Vec<String> = attrs
+            .iter()
+            .map(|a| match a {
+                JsonbVal::Number(n) => Some(format!("{}", n.to_f64() as i64)),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let dep = num(&get(item, "dependency")?)?;
+        let degree = num(&get(item, "degree")?)?;
+        let degree_txt = if degree.is_nan() {
+            "NaN".to_string()
+        } else if degree == f64::INFINITY {
+            "Infinity".to_string()
+        } else if degree == f64::NEG_INFINITY {
+            "-Infinity".to_string()
+        } else {
+            format!("{:.6}", degree)
+        };
+        out.push_str(&format!(
+            "{{\"attributes\": [{}], \"dependency\": {}, \"degree\": {}}}",
+            attr_txt.join(", "),
+            dep as i64,
+            degree_txt
+        ));
+    }
+    out.push(']');
+    Some(out)
+}
+
+/// v2.35: PG's pg_ndistinct_out rendering of an already
+/// validated payload: `[{"attributes": [a, b], "ndistinct": n},
+/// ...]`.
+fn render_pg_ndistinct(text: &str) -> Option<String> {
+    let parsed = super::json::parse_jsonb(text).ok()?;
+    let JsonbVal::Array(items) = parsed else {
+        return None;
+    };
+    let mut out = String::from("[");
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let JsonbVal::Object(pairs) = item else {
+            return None;
+        };
+        let get = |key: &str| pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v);
+        let Some(JsonbVal::Array(attrs)) = get("attributes") else {
+            return None;
+        };
+        let attr_txt: Vec<String> = attrs
+            .iter()
+            .map(|a| match a {
+                JsonbVal::Number(n) => Some(format!("{}", n.to_f64() as i64)),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let Some(JsonbVal::Number(nd)) = get("ndistinct") else {
+            return None;
+        };
+        out.push_str(&format!(
+            "{{\"attributes\": [{}], \"ndistinct\": {}}}",
+            attr_txt.join(", "),
+            nd.to_f64() as i64
+        ));
+    }
+    out.push(']');
+    Some(out)
+}
+
 pub(crate) fn eval_cast_named(q: &mut Q, v: &Value, name: &str) -> Result<Value, ExecError> {
     // v1.96: an array-to-array cast runs the ELEMENT cast function
     // (pg_cast entry for the element pair); PG checks EXECUTE on it
@@ -1478,7 +1592,7 @@ pub(crate) fn eval_cast_named(q: &mut Q, v: &Value, name: &str) -> Result<Value,
     // the domain's constraints (PG19 coerce_to_domain). NULL still goes
     // through so NOT NULL domains can reject it (23502); plain casts
     // return NULL unchanged.
-    let dom = q.eng.db.types.get(name).and_then(|st| st.domain.clone());
+    let dom = q.eng.db.find_type(name).and_then(|st| st.domain.clone());
     if let Some(dom) = dom {
         if v == &Value::Null {
             return check_domain_value(q, name, v, false);
@@ -1499,6 +1613,53 @@ pub(crate) fn eval_cast_named(q: &mut Q, v: &Value, name: &str) -> Result<Value,
     }
     if v == &Value::Null {
         return Ok(Value::Null);
+    }
+    // v2.35: PG's statistics payload types (pg_ndistinct /
+    // pg_dependencies): validate the text through the pg_input ports
+    // and keep it as text (statrestore parses the payload itself).
+    {
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        if bare == "pg_ndistinct" || bare == "pg_dependencies" {
+            let text = match v {
+                Value::Text(t) | Value::BpChar(t) => t.to_string(),
+                other => {
+                    return Err(exec_err(
+                        "42846",
+                        format!(
+                            "cannot cast type {} to {}",
+                            other.type_name().to_lowercase(),
+                            bare
+                        ),
+                    ));
+                }
+            };
+            let valid = if bare == "pg_ndistinct" {
+                super::pg_input::pg_input_validate_ndistinct(&text)
+            } else {
+                super::pg_input::pg_input_validate_dependencies(&text)
+            };
+            if let Err(f) = valid {
+                return Err(match f {
+                    PgInputFailure::Soft(e) => exec_err(e.code, e.message),
+                    PgInputFailure::Hard(e) => e,
+                });
+            }
+            // v2.35: store the CANONICAL rendering (PG's
+            // pg_ndistinct_out / pg_dependencies_out), not the
+            // input text: attributes joined ", ", degrees via
+            // %f (PG snprintf float style: NaN / Infinity /
+            // -Infinity, finite values with 6 decimals). The
+            // canonical form is deliberately not always valid
+            // input (a bare -Infinity token is not JSON), which
+            // is exactly why PG's ::text::pg_dependencies chain
+            // errors on funky degrees.
+            let rendered = if bare == "pg_ndistinct" {
+                render_pg_ndistinct(&text)
+            } else {
+                render_pg_dependencies(&text)
+            };
+            return Ok(Value::text(rendered.unwrap_or(text)));
+        }
     }
     // v1.96: aclitem input (acl.c aclparse): validate and re-render
     // in canonical form. An aclitem rides as its text rendering.
@@ -1639,6 +1800,42 @@ pub(crate) fn eval_cast_named(q: &mut Q, v: &Value, name: &str) -> Result<Value,
             )),
         };
     }
+    // v2.35: regnamespace (regproc.c regnamespacein/out). The value
+    // rides as the schema OID (Value::Int, matching pg_class's
+    // relnamespace representation); a name input must name a known
+    // schema (3F000 otherwise, like PG).
+    if name == "regnamespace" {
+        return match v {
+            Value::Int(i) | Value::BigInt(i) => Ok(Value::Int(*i)),
+            Value::SmallInt(i) => Ok(Value::Int(*i as i64)),
+            Value::Text(s) | Value::BpChar(s) => {
+                let raw = s.to_string();
+                let base = raw
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&raw)
+                    .trim_matches('"')
+                    .to_string();
+                let known = matches!(
+                    base.as_str(),
+                    "pg_catalog" | "public" | "information_schema" | "pg_toast" | "pg_temp"
+                ) || q.eng.db.schemas.iter().any(|x| x == &base)
+                    || q.eng.db.obj_schema.values().any(|x| x == &base);
+                if known {
+                    Ok(Value::Int(crate::exec::catalog::schema_oid(&base)))
+                } else {
+                    Err(exec_err(
+                        "3F000",
+                        format!("schema \"{}\" does not exist", base),
+                    ))
+                }
+            }
+            other => Err(exec_err(
+                "42846",
+                format!("cannot cast type {} to regnamespace", other.type_name()),
+            )),
+        };
+    }
     // v2.34: regprocedure (regproc.c regprocedurein/out). The value
     // rides as its signature display text; an OID input renders the
     // signature, a signature/bare-name input resolves to it.
@@ -1658,7 +1855,7 @@ pub(crate) fn eval_cast_named(q: &mut Q, v: &Value, name: &str) -> Result<Value,
     }
     // v1.88: cast to a user-defined range / multirange type
     // (CREATE TYPE ... AS RANGE registration in the type catalog).
-    if let Some((elem, multi)) = q.eng.db.types.get(name).and_then(|st| st.range) {
+    if let Some((elem, multi)) = q.eng.db.find_type(name).and_then(|st| st.range) {
         let tname = Some(name.to_string());
         return match (multi, v) {
             (false, Value::Text(t)) | (false, Value::BpChar(t)) => {
@@ -1763,7 +1960,7 @@ pub(crate) fn eval_cast_composite_inner(
     // v0.86: every table has a rowtype (PG19) — resolve table names to
     // their columns when the name isn't a catalog composite type.
     let table_fields: Vec<(String, ColType, Option<String>)>;
-    let fields: &[(String, ColType, Option<String>)] = match q.eng.db.types.get(name) {
+    let fields: &[(String, ColType, Option<String>)] = match q.eng.db.find_type(name) {
         Some(st) => st
             .composite
             .as_ref()
@@ -1778,10 +1975,21 @@ pub(crate) fn eval_cast_composite_inner(
                 &table_fields
             }
             None => {
-                return Err(exec_err(
-                    "42704",
-                    format!("type \"{}\" does not exist", name),
-                ));
+                // v2.35: view rowtypes cast like table rowtypes.
+                match crate::exec::viewdml::view_columns_of_db(
+                    q.eng, q.snap, q.own, q.session, name,
+                ) {
+                    Ok(cols) => {
+                        table_fields = cols.into_iter().map(|(n, c)| (n, c, None)).collect();
+                        &table_fields
+                    }
+                    Err(_) => {
+                        return Err(exec_err(
+                            "42704",
+                            format!("type \"{}\" does not exist", name),
+                        ));
+                    }
+                }
             }
         },
     };
@@ -2369,6 +2577,7 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
         ColType::Regproc => Err(cast_err(v, "regproc")),
         // v2.34: regprocedure likewise rides the named path.
         ColType::Regprocedure => Err(cast_err(v, "regprocedure")),
+        ColType::Regnamespace => Err(cast_err(v, "regnamespace")), // v2.35
         // v0.57: casts to `name` go through namein (name.c, PG19):
         // text/bpchar input is silently truncated at 63 bytes; any
         // other source goes through its text form first. Total: never

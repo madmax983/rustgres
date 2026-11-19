@@ -658,6 +658,7 @@ pub(crate) fn unbound_bare_columns(
                     }
                 }
             }
+            SelectItem::CompositeStar(_) => {}
             SelectItem::All => {
                 for (ci, c) in schema.iter().enumerate() {
                     if c.hidden {
@@ -1033,6 +1034,46 @@ pub(crate) fn grouped_project_item(
                         qual.as_str(),
                         &c.name,
                     )?);
+                }
+            }
+        }
+        SelectItem::CompositeStar(expr) => {
+            // v2.35: splice the composite value's fields (NULL
+            // composite -> one NULL per field).
+            let refs: Vec<&[QCol]> = vec![schema];
+            let fields = super::describe::composite_star_fields(
+                q.eng, q.snap, q.own, q.session, &refs, expr,
+            )
+            .ok_or_else(|| {
+                exec_err(
+                    "42804",
+                    "column notation .star applied to a non-composite type".to_string(),
+                )
+            })?;
+            if is_null_item(ii) {
+                for _ in &fields {
+                    vals.push(Value::Null);
+                }
+            } else {
+                let v = eval_grouped(
+                    q, outer, gscope, schema, rows_eff, idxs, key_vals, group_keys, expr,
+                )?;
+                match v {
+                    Value::Record(cells) => vals.extend(cells.into_iter().map(|(_, v)| v)),
+                    Value::Null => {
+                        for _ in &fields {
+                            vals.push(Value::Null);
+                        }
+                    }
+                    other => {
+                        return Err(exec_err(
+                            "42804",
+                            format!(
+                                "column notation .star applied to type {}, which is not a composite type",
+                                other.type_name()
+                            ),
+                        ));
+                    }
                 }
             }
         }

@@ -77,7 +77,7 @@ pub(crate) fn exec_create_type(
         for (_, fty, nested) in fields {
             if *fty == ColType::Composite {
                 let nested_name = nested.as_deref().unwrap_or(name);
-                match eng.db.types.get(nested_name) {
+                match eng.db.find_type(nested_name) {
                     // v1.96: a field may be of composite OR domain
                     // type (both ride the Composite marker).
                     Some(st) if st.composite.is_some() || st.domain.is_some() => {}
@@ -203,7 +203,7 @@ pub(crate) fn exec_create_range_type(
     let mut elem = RangeElem::of_coltype(&subty);
     if elem.is_none() {
         if let Some(sn) = sub_named {
-            if let Some(st) = eng.db.types.get(sn) {
+            if let Some(st) = eng.db.find_type(sn) {
                 if let Some(dom) = &st.domain {
                     elem = RangeElem::of_coltype(&dom.base);
                 }
@@ -319,7 +319,7 @@ pub(crate) fn exec_drop_type(
                     if removed.contains(&tn) {
                         continue;
                     }
-                    let st = eng.db.types.get(&tn).expect("key");
+                    let st = eng.db.find_type(&tn).expect("key");
                     let depends = match &st.domain {
                         Some(dom) => {
                             dom.base_named.as_ref().is_some_and(|b| removed.contains(b))
@@ -417,7 +417,7 @@ pub(crate) fn type_phys_repr(eng: &Engine, name: &str) -> Option<(i16, bool, cha
                 _ => None,
             };
         }
-        match eng.db.types.get(cur) {
+        match eng.db.find_type(cur) {
             Some(st) => match &st.like_base {
                 Some(base) => cur = base,
                 // Shell (or composite/domain/unknown-base LIKE): no
@@ -437,7 +437,7 @@ pub(crate) fn cast_type_key(eng: &Engine, name: &str) -> Option<String> {
     if let Ok(ct) = crate::sql::coltype_by_name(name) {
         return Some(ct.sql_name().to_string());
     }
-    match eng.db.types.get(name) {
+    match eng.db.find_type(name) {
         Some(st) if st.like_base.is_some() => Some(name.to_string()),
         _ => None,
     }
@@ -515,7 +515,7 @@ pub(crate) fn exec_create_cast(
     // PG19: no pseudo-types. rustgres shells are the pseudo-type
     // analogue here (a placeholder with no representation).
     for (which, name) in [("source", src), ("target", dst)] {
-        if let Some(st) = eng.db.types.get(name) {
+        if let Some(st) = eng.db.find_type(name) {
             if st.like_base.is_none() && st.composite.is_none() && st.domain.is_none() {
                 return Err(exec_err(
                     "42809",
@@ -665,7 +665,7 @@ pub(crate) fn composite_type_contains(
         return true;
     }
     // Composite attributes from CREATE TYPE definitions.
-    if let Some(st) = db.types.get(root) {
+    if let Some(st) = db.find_type(root) {
         if let Some(attrs) = &st.composite {
             for (_, _, nested) in attrs {
                 if let Some(n) = nested {
@@ -703,14 +703,14 @@ pub(crate) fn composite_type_contains(
 pub(crate) fn domain_base_composite(db: &crate::storage::Database, dname: &str) -> Option<String> {
     let mut cur = dname.to_string();
     for _ in 0..16 {
-        let st = db.types.get(&cur)?;
+        let st = db.find_type(&cur)?;
         let dom = st.domain.as_ref()?;
         if let Some(inner) = &dom.base_domain {
             cur = inner.clone();
             continue;
         }
         return match &dom.base_named {
-            Some(n) if db.types.get(n).is_some_and(|t| t.composite.is_some()) => Some(n.clone()),
+            Some(n) if db.find_type(n).is_some_and(|t| t.composite.is_some()) => Some(n.clone()),
             _ => None,
         };
     }
@@ -726,10 +726,10 @@ pub(crate) fn column_effective_composite(
     i: usize,
 ) -> Option<String> {
     if let Some(Some(n)) = t.composite_types.get(i) {
-        if db.types.get(n).is_some_and(|st| st.composite.is_some()) {
+        if db.find_type(n).is_some_and(|st| st.composite.is_some()) {
             return Some(n.clone());
         }
-        if db.types.get(n).is_some_and(|st| st.domain.is_some()) {
+        if db.find_type(n).is_some_and(|st| st.domain.is_some()) {
             return domain_base_composite(db, n);
         }
     }
@@ -1161,7 +1161,7 @@ fn sample_value_for(
         ColType::Char(_) => Value::BpChar("x".into()),
         ColType::Bool => Value::Bool(true),
         ColType::Date => Value::Date(0),
-        ColType::Composite => match named.and_then(|n| db.types.get(n)) {
+        ColType::Composite => match named.and_then(|n| db.find_type(n)) {
             Some(st) => match &st.composite {
                 Some(fields) => Value::Record(
                     fields
@@ -1205,7 +1205,7 @@ pub(crate) fn exec_alter_type(
     actions: &[crate::sql::AlterTypeAction],
 ) -> Result<ExecResult, ExecError> {
     use crate::sql::AlterTypeAction;
-    let orig = match eng.db.types.get(name) {
+    let orig = match eng.db.find_type(name) {
         Some(st) => st.clone(),
         None => {
             return Err(exec_err(
@@ -1401,7 +1401,7 @@ pub(crate) fn exec_alter_type(
                     if domain_base_composite(&eng.db, dname).as_deref() != Some(name) {
                         continue;
                     }
-                    if let Some(dom) = eng.db.types.get(dname).and_then(|st| st.domain.clone()) {
+                    if let Some(dom) = eng.db.find_type(dname).and_then(|st| st.domain.clone()) {
                         if dom
                             .checks
                             .iter()
@@ -1479,7 +1479,7 @@ pub(crate) fn exec_alter_type(
                     }
                     // CASCADE: drop the dependent definitions.
                     for dname in &dom_refs {
-                        let prev = eng.db.types.get(dname).expect("domain").clone();
+                        let prev = eng.db.find_type(dname).expect("domain").clone();
                         let mut dom = prev.domain.clone().expect("domain");
                         dom.checks.retain(|c| !expr_field_ref(&c.expr, attr, None));
                         eng.db.types.insert(
@@ -1570,7 +1570,7 @@ pub(crate) fn exec_alter_type(
                     if domain_base_composite(&eng.db, dname).as_deref() != Some(name) {
                         continue;
                     }
-                    let prev = eng.db.types.get(dname).expect("type").clone();
+                    let prev = eng.db.find_type(dname).expect("type").clone();
                     if let Some(mut dom) = prev.domain.clone() {
                         let mut changed = false;
                         for c in &mut dom.checks {
@@ -1912,7 +1912,7 @@ pub(crate) fn exec_create_domain(
     }
     let (base_ty, resolved_named, base_domain) = match base_named {
         None => (base.clone(), None, None),
-        Some(bn) => match eng.db.types.get(bn) {
+        Some(bn) => match eng.db.find_type(bn) {
             Some(st) if st.composite.is_some() => {
                 if *base != ColType::Composite {
                     return Err(exec_err(
@@ -2088,7 +2088,7 @@ fn composites_containing_domain(db: &crate::storage::Database, dname: &str) -> V
             if out.contains(&n) {
                 continue;
             }
-            let Some(fields) = db.types.get(&n).and_then(|st| st.composite.clone()) else {
+            let Some(fields) = db.find_type(&n).and_then(|st| st.composite.clone()) else {
                 continue;
             };
             let hit = fields.iter().any(|(_, _, named)| match named {

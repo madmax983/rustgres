@@ -2031,6 +2031,10 @@ pub(crate) fn describe_merge_returning(
     let mut expanded: Vec<SelectItem> = Vec::new();
     for item in returning {
         match item {
+            SelectItem::CompositeStar(_) => {
+                // v2.35: expanded at projection time.
+                expanded.push(item.clone());
+            }
             SelectItem::All => {
                 for (n, _) in &tgt_cols {
                     expanded.push(SelectItem::Expr {
@@ -2265,6 +2269,10 @@ fn describe_merge_returning_with_schemas(
     let mut expanded: Vec<SelectItem> = Vec::new();
     for item in returning {
         match item {
+            SelectItem::CompositeStar(_) => {
+                // v2.35: expanded at projection time.
+                expanded.push(item.clone());
+            }
             SelectItem::All => {
                 for c in tgt_schema {
                     expanded.push(SelectItem::Expr {

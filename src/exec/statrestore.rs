@@ -266,6 +266,10 @@ struct Target {
     /// Domain name per `cols` entry (the column's declared domain,
     /// for PG's getBaseType unwrap); parallel to `cols`.
     domains: Vec<Option<String>>,
+    /// Composite type name per `cols` entry (the column's declared
+    /// composite type, for record_in parsing of MCV/histogram text);
+    /// parallel to `cols`.
+    composites: Vec<Option<String>>,
 }
 
 impl Target {
@@ -297,6 +301,12 @@ impl Target {
         let pos = self.cols.iter().position(|(a, _, _)| *a == attnum)?;
         self.domains.get(pos).cloned().flatten()
     }
+    /// The declared composite type name of the column with
+    /// `attnum`, if any.
+    fn composite_for(&self, attnum: i64) -> Option<String> {
+        let pos = self.cols.iter().position(|(a, _, _)| *a == attnum)?;
+        self.composites.get(pos).cloned().flatten()
+    }
     /// The stats-map key for one column: column name for tables,
     /// `expr:<attnum>` for index expression columns, the column
     /// name for index key columns.
@@ -312,10 +322,12 @@ impl Target {
 fn table_target(key: &str, t: &Table, schema: &str) -> Target {
     let mut cols = Vec::new();
     let mut domains = Vec::new();
+    let mut composites = Vec::new();
     for (i, (cn, ty)) in t.columns.iter().enumerate() {
         let attnum = t.attnums.get(i).copied().unwrap_or(i as i16 + 1) as i64;
         cols.push((attnum, cn.clone(), ty.clone()));
         domains.push(t.domain_types.get(i).cloned().flatten());
+        composites.push(t.composite_types.get(i).cloned().flatten());
     }
     Target {
         key: key.to_string(),
@@ -327,6 +339,7 @@ fn table_target(key: &str, t: &Table, schema: &str) -> Target {
         owner: t.owner.clone(),
         cols,
         domains,
+        composites,
     }
 }
 
@@ -373,11 +386,13 @@ fn resolve_target(q: &Q, schema: &str, name: &str) -> Option<Target> {
         let table = db.find_table(&def.table, q.snap, &q.all_xids, q.session);
         let mut cols = Vec::new();
         let mut domains = Vec::new();
+        let mut composites = Vec::new();
         for (i, cn) in def.col_names.iter().enumerate() {
             let attnum = i as i64 + 1;
             if def.exprs.get(i).and_then(|e| e.as_ref()).is_some() {
                 cols.push((attnum, "expr".to_string(), ColType::Text));
                 domains.push(None);
+                composites.push(None);
             } else {
                 let ty = table
                     .and_then(|t| def.cols.get(i).and_then(|p| t.columns.get(*p)))
@@ -388,6 +403,11 @@ fn resolve_target(q: &Q, schema: &str, name: &str) -> Option<Target> {
                     def.cols
                         .get(i)
                         .and_then(|p| t.domain_types.get(*p).cloned().flatten())
+                }));
+                composites.push(table.and_then(|t| {
+                    def.cols
+                        .get(i)
+                        .and_then(|p| t.composite_types.get(*p).cloned().flatten())
                 }));
             }
         }
@@ -403,6 +423,7 @@ fn resolve_target(q: &Q, schema: &str, name: &str) -> Option<Target> {
             owner: table.map(|t| t.owner.clone()).unwrap_or_default(),
             cols,
             domains,
+            composites,
         });
     }
     None
@@ -653,7 +674,7 @@ fn unwrap_domain(db: &Database, ct: &ColType, dom: Option<&str>) -> ColType {
         return ct.clone();
     };
     for _ in 0..8 {
-        let Some(d) = db.types.get(&name).and_then(|st| st.domain.as_ref()) else {
+        let Some(d) = db.find_type(&name).and_then(|st| st.domain.as_ref()) else {
             return ct.clone();
         };
         if let Some(inner) = &d.base_domain {
@@ -667,7 +688,174 @@ fn unwrap_domain(db: &Database, ct: &ColType, dom: Option<&str>) -> ColType {
 
 /// Parse a 1-D array literal of `ty` elements (PG's array_in via
 /// statatt_build_stavalues). Errors carry PG's input messages.
+/// v2.35: array_in for a statistics column. A composite-typed
+/// column's elements are record literals: parse the literal as
+/// text elements and run each through record_in against the
+/// column's declared composite type (PG's array_in over the
+/// composite's input function). Everything else defers to
+/// array_in_typed.
+fn array_in_column(
+    db: &Database,
+    text: &str,
+    ty: &ColType,
+    comp: Option<&str>,
+) -> Result<Vec<Value>, ExecError> {
+    if matches!(ty, ColType::Composite) {
+        if let Some(name) = comp {
+            if let Some(st) = db.find_type(name) {
+                if let Some(fields) = &st.composite {
+                    let av = parse_array_literal(text, crate::storage::ArrayElem::Text)?;
+                    if av.dims.len() > 1 {
+                        return Err(exec_err(
+                            "22P02",
+                            "could not parse array: incorrect number of dimensions".to_string(),
+                        ));
+                    }
+                    let mut out = Vec::with_capacity(av.elems.len());
+                    for e in &av.elems {
+                        match e {
+                            Value::Null => out.push(Value::Null),
+                            Value::Text(s) => {
+                                let vals =
+                                    super::eval::parse_record_literal(s, name, fields, &db.types)?;
+                                out.push(Value::Record(
+                                    fields.iter().map(|(n, _, _)| n.clone()).zip(vals).collect(),
+                                ));
+                            }
+                            _ => {
+                                return Err(exec_err(
+                                    "22P02",
+                                    "could not parse array: element is not text".to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    return Ok(out);
+                }
+            }
+        }
+    }
+    array_in_typed(text, ty)
+}
+
 fn array_in_typed(text: &str, ty: &ColType) -> Result<Vec<Value>, ExecError> {
+    // v2.35: range/multirange elements have no ArrayElem variant
+    // (ArrayElem::of maps them to Record, and text->record casts
+    // fail); parse the literal as text elements and run each through
+    // the range input function, like PG's array_in over range_in.
+    if let ColType::Range(e) | ColType::Multirange(e) = ty {
+        let e = *e;
+        let av = parse_array_literal(text, crate::storage::ArrayElem::Text)?;
+        if av.dims.len() > 1 {
+            return Err(exec_err(
+                "22P02",
+                "could not parse array: incorrect number of dimensions".to_string(),
+            ));
+        }
+        let mut out = Vec::with_capacity(av.elems.len());
+        for el in &av.elems {
+            match el {
+                Value::Null => out.push(Value::Null),
+                Value::Text(t) | Value::BpChar(t) => {
+                    if matches!(ty, ColType::Range(_)) {
+                        out.push(Value::range(super::ranges::parse_range(
+                            e,
+                            None,
+                            &t.to_string(),
+                        )?));
+                    } else {
+                        out.push(Value::multirange(super::ranges::parse_multirange(
+                            e,
+                            None,
+                            &t.to_string(),
+                        )?));
+                    }
+                }
+                _ => {
+                    return Err(exec_err(
+                        "22P02",
+                        "could not parse array: element is not text".to_string(),
+                    ));
+                }
+            }
+        }
+        return Ok(out);
+    }
+    // v2.35: an array-typed column's statistics literal is a
+    // multi-dimensional array datum (PG array_in over the column
+    // type): parse with the SCALAR element kind and regroup the
+    // flat row-major elements into one sub-array Value per
+    // top-level element (e.g. histogram bounds of an int[]
+    // expression: {"{1,1}","{2,1}"} -> two int[] values).
+    if let ColType::Array(scalar) = ty {
+        let av = match parse_array_literal(text, *scalar) {
+            Ok(av) => av,
+            Err(e) => {
+                // v2.35: the quoted sub-array form array_out emits
+                // for multi-dimensional data ({"{1,1}","{2,1}"}):
+                // the scalar parse chokes on "{1,1}" as an integer.
+                // Parse structurally as text; when every element is
+                // itself an array literal, parse each as a sub-array
+                // (PG array_in treats it as the nested datum).
+                let regrouped: Option<Vec<Value>> = (|| {
+                    let tav = parse_array_literal(text, crate::storage::ArrayElem::Text).ok()?;
+                    if tav.dims.len() != 1 || tav.elems.is_empty() {
+                        return None;
+                    }
+                    if !tav.elems.iter().all(|v| {
+                        matches!(v, Value::Null)
+                            || matches!(v, Value::Text(t) if t.trim_start().starts_with('{'))
+                    }) {
+                        return None;
+                    }
+                    let mut out = Vec::with_capacity(tav.elems.len());
+                    let mut sub_dims: Option<Vec<i32>> = None;
+                    for el in &tav.elems {
+                        match el {
+                            Value::Null => out.push(Value::Null),
+                            Value::Text(t) => {
+                                let sub = parse_array_literal(t.as_ref(), *scalar).ok()?;
+                                if let Some(d) = &sub_dims {
+                                    if *d != sub.dims {
+                                        return None;
+                                    }
+                                } else {
+                                    sub_dims = Some(sub.dims.clone());
+                                }
+                                out.push(Value::Array(Box::new(sub)));
+                            }
+                            _ => return None,
+                        }
+                    }
+                    Some(out)
+                })();
+                match regrouped {
+                    Some(out) => return Ok(out),
+                    None => return Err(e),
+                }
+            }
+        };
+        if av.dims.len() > 1 {
+            let sub: usize = av.dims[1..].iter().map(|d| *d as usize).product();
+            if sub == 0 || av.elems.len() % sub != 0 {
+                return Err(exec_err(
+                    "22P02",
+                    "could not parse array: incorrect number of dimensions".to_string(),
+                ));
+            }
+            let mut out = Vec::with_capacity(av.elems.len() / sub);
+            for chunk in av.elems.chunks(sub) {
+                out.push(Value::Array(Box::new(crate::storage::ArrayVal {
+                    elem: av.elem,
+                    dims: av.dims[1..].to_vec(),
+                    lower: av.lower[1..].to_vec(),
+                    elems: chunk.to_vec(),
+                })));
+            }
+            return Ok(out);
+        }
+        return Ok(av.elems);
+    }
     let av = parse_array_literal(text, crate::storage::ArrayElem::of(ty))?;
     if av.dims.len() > 1 {
         return Err(exec_err(
@@ -729,6 +917,7 @@ fn import_att_kinds(
     attname: &str,
     ty: &ColType,
     dom: Option<&str>,
+    comp: Option<&str>,
     filled: &Filled,
     cs: &mut ColStats,
 ) -> bool {
@@ -764,7 +953,7 @@ fn import_att_kinds(
         ok = false;
     } else if has_vals {
         let text = filled.text("most_common_vals").unwrap();
-        match array_in_typed(&text, &base_ty) {
+        match array_in_column(db, &text, &base_ty, comp) {
             Err(e) => {
                 warn(e.message.clone());
                 ok = false;
@@ -788,7 +977,7 @@ fn import_att_kinds(
     }
     // Histogram.
     if let Some(text) = filled.text("histogram_bounds") {
-        match array_in_typed(&text, &base_ty) {
+        match array_in_column(db, &text, &base_ty, comp) {
             Err(e) => {
                 warn(e.message.clone());
                 ok = false;
@@ -839,10 +1028,12 @@ fn import_att_kinds(
                         if freqs.iter().any(|f| f.is_none()) {
                             warn("could not parse array \"most_common_elem_freqs\": NULL value found".into());
                             ok = false;
-                        } else if freqs.len() != vals.len() + 3 {
-                            warn("could not parse \"most_common_elems\": incorrect number of elements (same as \"most_common_elem_freqs\" required)".into());
-                            ok = false;
                         } else {
+                            // v2.35: PG19 imposes NO length relation
+                            // between most_common_elems and its freqs
+                            // (tsvector freqs legitimately carry extra
+                            // entries); the old vals+3 rule rejected
+                            // valid restores (stats_import test_dom_ts).
                             cs.mcelem = Some((vals, freqs.iter().map(|f| f.unwrap()).collect()));
                         }
                     }
@@ -945,7 +1136,7 @@ fn resolve_att_col(
     attname: Option<&str>,
     attnum: Option<i64>,
     clear: bool,
-) -> Result<(i64, String, ColType, Option<String>), ExecError> {
+) -> Result<(i64, String, ColType, Option<String>, Option<String>), ExecError> {
     if attname.is_some() && attnum.is_some() {
         return Err(exec_err(
             "22023",
@@ -968,7 +1159,8 @@ fn resolve_att_col(
         }
         if let Some(c) = target.col_by_name(an) {
             let dom = target.domain_for(c.0);
-            return Ok((c.0, c.1.clone(), c.2.clone(), dom));
+            let comp = target.composite_for(c.0);
+            return Ok((c.0, c.1.clone(), c.2.clone(), dom, comp));
         }
         return Err(exec_err(
             "42703",
@@ -1009,7 +1201,8 @@ fn resolve_att_col(
     }
     if let Some(c) = target.col_by_num(an) {
         let dom = target.domain_for(c.0);
-        return Ok((c.0, c.1.clone(), c.2.clone(), dom));
+        let comp = target.composite_for(c.0);
+        return Ok((c.0, c.1.clone(), c.2.clone(), dom, comp));
     }
     Err(exec_err(
         "42703",
@@ -1031,7 +1224,7 @@ fn restore_attribute_stats(q: &mut Q, scopes: &[Scope], args: &[Expr]) -> Result
         Some(Value::SmallInt(n)) => Some(*n as i64),
         _ => None,
     };
-    let (attnum_v, attname_v, ty, dom) =
+    let (attnum_v, attname_v, ty, dom, comp) =
         resolve_att_col(&target, attname.as_deref(), attnum, false)?;
     let inherited = required_bool(&filled, "inherited")?;
     let skey = target.stats_key_of(attnum_v, &attname_v);
@@ -1049,7 +1242,15 @@ fn restore_attribute_stats(q: &mut Q, scopes: &[Scope], args: &[Expr]) -> Result
             .cloned()
             .unwrap_or_default()
     };
-    let kinds_ok = import_att_kinds(&q.eng.db, &attname_v, &ty, dom.as_deref(), &filled, &mut cs);
+    let kinds_ok = import_att_kinds(
+        &q.eng.db,
+        &attname_v,
+        &ty,
+        dom.as_deref(),
+        comp.as_deref(),
+        &filled,
+        &mut cs,
+    );
     let map = if inherited {
         &mut q.eng.db.stats_inh
     } else {
@@ -1121,7 +1322,8 @@ fn clear_attribute_stats(q: &mut Q, scopes: &[Scope], args: &[Expr]) -> Result<V
     };
     let target = resolve_for_stats(q, &schema, &relname, false)?;
     check_maintain(q, &target)?;
-    let (attnum_v, attname_v, _, _) = resolve_att_col(&target, attname.as_deref(), attnum, true)?;
+    let (attnum_v, attname_v, _, _, _) =
+        resolve_att_col(&target, attname.as_deref(), attnum, true)?;
     let skey = target.stats_key_of(attnum_v, &attname_v);
     let map = if inherited {
         &mut q.eng.db.stats_inh
@@ -1323,6 +1525,96 @@ fn fmt_num(f: f64) -> String {
     }
 }
 
+/// v2.35: targeted static typing for statistics expressions,
+/// covering the shapes expr_type cannot resolve because QCol
+/// schemas do not carry composite type NAMES: field access on a
+/// composite-typed column of the target table (via
+/// TableDef.composite_types) or on a named cast, and array
+/// constructors over those. Anything else returns None and the
+/// caller falls back to expr_type / first-row evaluation.
+fn statics_expr_type(q: &Q, t: &Table, e: &Expr) -> Option<ColType> {
+    match e {
+        Expr::Column { name, .. } => t
+            .columns
+            .iter()
+            .find(|(cn, _)| cn == name)
+            .map(|(_, ty)| ty.clone()),
+        Expr::FieldAccess { expr, field } => {
+            let type_name: Option<String> = match &**expr {
+                Expr::Column { name, .. } => t
+                    .columns
+                    .iter()
+                    .position(|(cn, _)| cn == name)
+                    .and_then(|i| t.composite_types.get(i).cloned().flatten()),
+                Expr::CastNamed { name, .. } => Some(name.clone()),
+                _ => None,
+            };
+            let st = q.eng.db.find_type(&type_name?)?;
+            let fields = st.composite.as_ref()?;
+            fields
+                .iter()
+                .find(|(fname, _, _)| fname == field)
+                .map(|(_, fty, _)| fty.clone())
+        }
+        Expr::ArrayCtor { elems, .. } => {
+            let schema: Vec<QCol> = t
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, (cn, ty))| QCol {
+                    qual: String::new(),
+                    name: cn.clone(),
+                    ty: ty.clone(),
+                    hidden: false,
+                    src_ord: i as u32,
+                })
+                .collect();
+            let mut acc: Option<ColType> = None;
+            for el in elems {
+                if matches!(el, Expr::Literal(Literal::Null)) {
+                    continue;
+                }
+                let et = statics_expr_type(q, t, el).or_else(|| {
+                    super::describe::expr_type(
+                        &q.eng,
+                        q.snap,
+                        q.own,
+                        q.session,
+                        &[schema.as_slice()],
+                        &[],
+                        &[],
+                        el,
+                    )
+                    .ok()
+                })?;
+                acc = Some(match acc {
+                    None => et,
+                    Some(prev) => {
+                        if prev == et {
+                            prev
+                        } else {
+                            return None;
+                        }
+                    }
+                });
+            }
+            acc.map(|et| ColType::Array(crate::storage::ArrayElem::of(&et)))
+        }
+        Expr::Cast { to, .. } => Some(to.clone()),
+        Expr::CastNamed { name, .. } => {
+            let st = q.eng.db.find_type(name)?;
+            if st.composite.is_some() {
+                Some(ColType::Composite)
+            } else if let Some(dom) = &st.domain {
+                Some(dom.base.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// The result type of one statistics expression item, for the
 /// exprs import validation: a CAST's target type when the item is
 /// a cast, else the type of the value the expression produces on
@@ -1334,13 +1626,56 @@ fn expr_item_type(q: &mut Q, target: &Target, item: &ExtStatItem) -> ColType {
     if let Expr::Cast { to, .. } = ast {
         return to.clone();
     }
-    // Evaluate over the first live row, mirroring the ANALYZE
-    // build's evaluation pattern (analyze_index_exprs / eval_items).
     let tbl = q
         .eng
         .db
         .find_table(&target.table_key, q.snap, &q.all_xids, q.session)
         .cloned();
+    // v2.35: type the expression STATICALLY against the table
+    // schema first — the first-row evaluation below yields no type
+    // for an EMPTY table (the stats_import clone tables), and the
+    // Text fallback then accepted invalid MCV/histogram payloads
+    // (BADMCV / BADHIST) that PG rejects.
+    if let Some(t) = &tbl {
+        let schema: Vec<QCol> = t
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, (cn, ty))| QCol {
+                qual: String::new(),
+                name: cn.clone(),
+                ty: ty.clone(),
+                hidden: false,
+                src_ord: i as u32,
+            })
+            .collect();
+        let typed = super::describe::expr_type(
+            &q.eng,
+            q.snap,
+            q.own,
+            q.session,
+            &[schema.as_slice()],
+            &[],
+            &[],
+            ast,
+        );
+        match typed {
+            Ok(ty) if !matches!(ty, ColType::Record) => return ty,
+            _ => {
+                // v2.35: expr_type cannot name composite fields
+                // (QCol carries no type name) — it returns Record
+                // for `(comp).a` and errors inside ARRAY[...].
+                if let Some(ty) = statics_expr_type(q, t, ast) {
+                    return ty;
+                }
+                if let Ok(ty) = typed {
+                    return ty;
+                }
+            }
+        }
+    }
+    // Evaluate over the first live row, mirroring the ANALYZE
+    // build's evaluation pattern (analyze_index_exprs / eval_items).
     if let Some(t) = tbl {
         let first = t.rows.iter().find(|r| row_visible(r, q.snap, &q.all_xids));
         if let Some(row) = first {
@@ -1388,6 +1723,28 @@ fn import_one_expr(
         ));
         return None;
     };
+    // v2.35 (PG19 import_pg_statistic): the three range statistics
+    // must be all strings or all nulls in an expression's object —
+    // any disagreement fails the whole expression (and with it the
+    // restore's return value). The attribute-stats path only pairs
+    // length<->empty; the trio rule is exprs-only.
+    {
+        let found = |k: &str| {
+            pairs
+                .iter()
+                .any(|(n, v)| n == k && matches!(v, JsonbVal::Str(_)))
+        };
+        let len_f = found("range_length_histogram");
+        let empty_f = found("range_empty_frac");
+        let bounds_f = found("range_bounds_histogram");
+        if len_f != empty_f || len_f != bounds_f {
+            warn(format!(
+                "could not parse \"exprs\": invalid element in expression {}",
+                exprnum
+            ));
+            return None;
+        }
+    }
     // Translate the JSON object into a Filled of typed values,
     // applying the attribute arginfo types to the string payloads.
     let mut filled = Filled {
@@ -1451,8 +1808,16 @@ fn import_one_expr(
         filled.map.insert(k.clone(), typed);
     }
     let ty = expr_item_type(q, target, item);
-    let mut cs = colstats_of_expr(existing);
-    if !import_att_kinds(&q.eng.db, "expr", &ty, None, &filled, &mut cs) {
+    // v2.35 (PG19 import_pg_statistic): an expression's datum is
+    // built FRESH (statatt_init_empty_tuple) — fields absent from
+    // the JSON become NULL, REPLACING the previous statistics
+    // wholesale (the older-version dump emulation in stats_import
+    // restores with all range fields absent and expects them NULL
+    // afterwards). The attribute-stats path merges into the
+    // existing tuple instead; that asymmetry is PG's own.
+    let _ = existing;
+    let mut cs = ColStats::default();
+    if !import_att_kinds(&q.eng.db, "expr", &ty, None, None, &filled, &mut cs) {
         return None;
     }
     Some(expr_stat_of_colstats(&cs))
@@ -1633,6 +1998,17 @@ fn restore_extended_stats(q: &mut Q, scopes: &[Scope], args: &[Expr]) -> Result<
                                 continue;
                             };
                             let existing = data.expr_stats[ei].clone();
+                            // v2.35 (PG19 import_expressions): a JSON
+                            // null element is a valid placeholder —
+                            // it counts as imported (the expression
+                            // simply has no statistics) and does NOT
+                            // fail the restore.
+                            if matches!(elems[ei], JsonbVal::Null) {
+                                data.expr_stats[ei] = ExtExprStat::default();
+                                applied = true;
+                                ei += 1;
+                                continue;
+                            }
                             match import_one_expr(q, &target, item, &elems[ei], ei + 1, &existing) {
                                 Some(new) => {
                                     data.expr_stats[ei] = new;

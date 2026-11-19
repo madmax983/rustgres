@@ -3599,6 +3599,7 @@ pub(crate) fn coltype_typ_string(ct: &ColType) -> String {
         ColType::Regclass => "regclass".into(),
         ColType::Regproc => "regproc".into(),
         ColType::Regprocedure => "regprocedure".into(),
+        ColType::Regnamespace => "regnamespace".into(),
         ColType::Name => "name".into(),
         ColType::PgLsn => "pg_lsn".into(),
         ColType::Xid => "xid".into(),
@@ -4174,7 +4175,7 @@ fn multi_operator(name: &str) -> bool {
 
 fn type_exists(q: &Q, name: &str) -> bool {
     builtin_type_exists(name)
-        || q.eng.db.types.contains_key(name)
+        || q.eng.db.find_type(name).is_some()
         || q.eng
             .db
             .find_table(name, q.snap, &q.all_xids, q.session)
@@ -4188,7 +4189,13 @@ fn relation_exists(q: &Q, name: &str) -> bool {
         .is_some()
         || q.eng.db.views.contains_key(name)
         || q.eng.db.sequences.contains_key(name)
-        || q.eng.db.types.contains_key(name)
+        || q.eng.db.find_type(name).is_some()
+        // v2.35: indexes are relations for regclass purposes; their
+        // names are stored bare, so a qualified spelling matches on
+        // the bare suffix.
+        || crate::exec::catalog::index_oid_map(&q.eng.db, q.snap, q.own, q.session)
+            .keys()
+            .any(|n| n == name || Some(n.as_str()) == name.rsplit('.').next())
 }
 
 /// Split a `name(args)` regprocedure/regoperator specification.
@@ -4510,7 +4517,7 @@ pub(crate) fn pg_input_validate_catalog(
     }
     let base = parts.base.clone();
     // User-defined types from the catalog.
-    let shell = q.eng.db.types.get(&base).cloned();
+    let shell = q.eng.db.find_type(&base).cloned();
     if let Some(st) = &shell {
         if let Some(dom) = &st.domain {
             return validate_domain(q, fn_name, input, &base, dom);

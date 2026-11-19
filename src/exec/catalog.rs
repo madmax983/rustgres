@@ -81,6 +81,20 @@ fn rel_stats_cells(db: &Database, key: &str, relkind: u8) -> Vec<Value> {
     ]
 }
 
+/// v2.35: a relation storage key's namespace OID — the schema the
+/// key was created under (obj_schema attribution, else the dotted
+/// prefix, else public), via the shared schema_oid mapping that
+/// `'name'::regnamespace` also uses, so the two compare equal.
+fn relnamespace_oid(db: &Database, key: &str) -> i64 {
+    if let Some(s) = db.obj_schema.get(key) {
+        return schema_oid(s);
+    }
+    if let Some((sch, _)) = key.rsplit_once('.') {
+        return schema_oid(sch);
+    }
+    2200
+}
+
 pub(crate) fn pg_class_scan(
     db: &Database,
     snap: &Snapshot,
@@ -144,7 +158,7 @@ pub(crate) fn pg_class_scan(
             Value::Bool(t.rls_enabled),
             Value::Bool(t.rls_forced),
             Value::Bool(has_subclass),
-            Value::Int(2200),
+            Value::Int(relnamespace_oid(db, name)),
             Value::Int(2),
         ];
         cells.extend(rel_stats_cells(db, name, kind_byte));
@@ -152,6 +166,32 @@ pub(crate) fn pg_class_scan(
             cells: Row::new(cells),
             prov: Vec::new(),
         });
+    }
+    // v2.35: this session's temp tables are pg_class relations too
+    // (relkind 'r'; relnamespace is the temp schema's oid — the
+    // engine's schema_oid("pg_temp") stand-in).
+    if let Some(tmps) = db.temp_tables.get(&session) {
+        let mut tnames: Vec<&String> = tmps.keys().collect();
+        tnames.sort();
+        for name in tnames {
+            let Some(t) = tmps.get(name) else { continue };
+            let mut cells = vec![
+                Value::Int(t.oid as i64),
+                Value::text(name.rsplit('.').next().unwrap_or(name.as_str())),
+                Value::Int(t.toast_relid as i64),
+                Value::SingleChar(b'r'),
+                Value::Bool(t.rls_enabled),
+                Value::Bool(t.rls_forced),
+                Value::Bool(false),
+                Value::Int(crate::exec::catalog::schema_oid("pg_temp")),
+                Value::Int(2),
+            ];
+            cells.extend(rel_stats_cells(db, name, b'r'));
+            rows.push(QRow {
+                cells: Row::new(cells),
+                prov: Vec::new(),
+            });
+        }
     }
     // v2.29: index rows (relkind 'i', or 'I' for a partitioned
     // index). OIDs come from the shared synthetic index_oid_map so
@@ -176,7 +216,7 @@ pub(crate) fn pg_class_scan(
                 Value::Bool(false),
                 Value::Bool(false),
                 Value::Bool(parents_with_children.contains(d.name.as_str())),
-                Value::Int(2200),
+                Value::Int(relnamespace_oid(db, &d.table)),
                 // v2.31: GiST (783) for WITHOUT OVERLAPS and
                 // standalone USING gist indexes.
                 Value::Int(if d.without_overlaps || d.gist {
@@ -3893,8 +3933,33 @@ pub(crate) fn combine_set_branches(
     }
     // Resolve a common type per column; names come from the left branch.
     let mut out_cols: Vec<(String, ColType)> = Vec::with_capacity(left.columns.len());
-    for ((lname, lty), (_, rty)) in left.columns.iter().zip(right.columns.iter()) {
-        let common = common_supertype(op_name, lty, rty)?;
+    for (ci, ((lname, lty), (_, rty))) in left.columns.iter().zip(right.columns.iter()).enumerate()
+    {
+        let common = match common_supertype(op_name, lty, rty) {
+            Ok(c) => c,
+            Err(e) => {
+                // v2.35: PG types a bare NULL literal `unknown`, which
+                // coerces to the other branch's type. The engine types
+                // it Text at describe time, so when unification fails
+                // and one branch's column is entirely NULL values,
+                // that branch is unconstrained: adopt the other type.
+                let left_all_null = left
+                    .rows
+                    .iter()
+                    .all(|r| matches!(r.get(ci), Some(Value::Null) | None));
+                let right_all_null = right
+                    .rows
+                    .iter()
+                    .all(|r| matches!(r.get(ci), Some(Value::Null) | None));
+                if left_all_null && !right_all_null {
+                    *rty
+                } else if right_all_null && !left_all_null {
+                    *lty
+                } else {
+                    return Err(e);
+                }
+            }
+        };
         out_cols.push((lname.clone(), common));
     }
     let left_rows = coerce_set_rows(left.rows, &out_cols)?;
@@ -4452,6 +4517,7 @@ pub(crate) fn check_select_col_privs(q: &Q, stmt: &SelectStmt) -> Result<(), Exe
         match item {
             SelectItem::All => star = true,
             SelectItem::AllOf(qual) => star_quals.push(qual.clone()),
+            SelectItem::CompositeStar(expr) => crate::sql::collect_col_refs(expr, &mut refs),
             SelectItem::Expr { expr, .. } => crate::sql::collect_col_refs(expr, &mut refs),
         }
     }

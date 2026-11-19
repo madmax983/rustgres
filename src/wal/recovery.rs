@@ -843,16 +843,36 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             xmin,
         } => {
             let versions = eng.db.tables.entry(name.clone()).or_default();
+            // v2.35: capture the previous LIVE version's position BEFORE
+            // superseding it. Every AlterTable record of one transaction
+            // carries the same xmin, so once the supersede below marks
+            // this version with it, a search by dropped_xmax == xmin
+            // matches EVERY version this transaction superseded — and
+            // iter().find() returns the OLDEST, not the immediate
+            // predecessor. A multi-action ALTER whose last action is
+            // metadata-only (copy_rows) then copied the FIRST version's
+            // stale-width rows into the final version, orphaning the
+            // rewriting action's InsertRows-built version; the next
+            // checkpoint wrote the mismatched rows verbatim and
+            // load_checkpoint refused to start ("row/column count
+            // mismatch" — the itest3 brick, reproduced on the v2.34
+            // base: ADD COLUMN ... IDENTITY + ALTER COLUMN SET
+            // GENERATED in one statement, crash, replay, CHECKPOINT).
+            let prev_idx = versions.iter().rposition(|v| v.dropped_xmax == 0);
             // The previous live version is superseded.
-            if let Some(prev) = versions.iter_mut().find(|v| v.dropped_xmax == 0) {
-                prev.dropped_xmax = *xmin;
+            if let Some(i) = prev_idx {
+                versions[i].dropped_xmax = *xmin;
             }
             // v2.00: the previous live version's column layout, for the
             // rename-following pass after the push below.
-            let prev_cols: Vec<String> = versions
-                .iter()
-                .find(|v| v.dropped_xmax == *xmin)
-                .map(|v| v.columns.iter().map(|(n, _)| n.clone()).collect())
+            let prev_cols: Vec<String> = prev_idx
+                .map(|i| {
+                    versions[i]
+                        .columns
+                        .iter()
+                        .map(|(n, _)| n.clone())
+                        .collect()
+                })
                 .unwrap_or_default();
             let mut t = Table::new(columns.clone(), *xmin);
             // v1.80: partition metadata (ATTACH, PARTITION OF, DROP COLUMN
@@ -891,10 +911,12 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                 }
             }
             // Pure-metadata alters carry the rows forward; ADD/DROP COLUMN
-            // rewrites them via InsertRows records.
+            // rewrites them via InsertRows records. v2.35: the rows come
+            // from the immediate predecessor captured above (prev_idx),
+            // never from a by-xmin search — see the comment there.
             if *copy_rows {
-                if let Some(prev) = versions.iter().find(|v| v.dropped_xmax == *xmin) {
-                    t.rows = prev.rows.clone();
+                if let Some(i) = prev_idx {
+                    t.rows = versions[i].rows.clone();
                     // v2.00: the bulk assignment bypasses push_version,
                     // the only maintainer of row_index; without a rebuild
                     // the new version's row_pos misses every copied id,

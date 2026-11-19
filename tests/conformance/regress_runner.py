@@ -658,8 +658,14 @@ def parse_expected_block(lines, pos, null_display):
     while pos < n and lines[pos].strip() == "":
         pos += 1
     # skip NOTICE/WARNING/INFO lines that may precede the real output
+    # (v2.35: a psql warning may carry DETAIL:/HINT: continuation
+    # lines before the result table — e.g. pg_restore_attribute_stats
+    # range-kind warnings in stats_import.out — consume those too,
+    # or the block parses as noresult and the real set reads "extra")
     while pos < n and re.match(r"^(NOTICE|WARNING|INFO):", lines[pos]):
         pos += 1
+        while pos < n and re.match(r"^(DETAIL|HINT):", lines[pos]):
+            pos += 1
         while pos < n and lines[pos].strip() == "":
             pos += 1
     if pos >= n:

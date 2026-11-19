@@ -682,7 +682,19 @@ def run_suite(session, name, failed_objects, verbose=False):
             actual["sets"] = []
 
         err_msg = (actual.get("err_msgs") or [""])[0]
-        if session.expanded and not actual["err_codes"] and not any(
+        # v2.35: a trailing \gx meta item makes THIS statement's
+        # output expanded (psql one-shot); the runner does not parse
+        # expanded output, so like \x mode it is executed but
+        # unscored. The \gx item itself is consumed here so it does
+        # not toggle persistent state.
+        gx_next = (
+            idx_item + 1 < len(items)
+            and items[idx_item + 1][0] == "meta"
+            and items[idx_item + 1][1].strip() == "\\gx"
+        )
+        if gx_next:
+            resume_at = max(resume_at, idx_item + 2)
+        if (session.expanded or gx_next) and not actual["err_codes"] and not any(
                 b.kind == "error" for b in blocks):
             results.append((stmt, rr.Verdict("SKIP", "expanded (\\x) output not parsed"), ""))
             continue

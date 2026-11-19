@@ -2330,7 +2330,7 @@ pub(crate) fn alter_of_type(
     type_name: &str,
 ) -> Result<ExecResult, ExecError> {
     check_type_usage(eng, ctx, type_name)?;
-    let st = match eng.db.types.get(type_name) {
+    let st = match eng.db.find_type(type_name) {
         Some(st) => st,
         None => {
             return Err(exec_err(
@@ -2645,7 +2645,7 @@ pub(crate) fn alter_column_type_ext(
         next.domain_types[idx] = None;
     }
     let named_is_domain = match named_type {
-        Some(n) => match eng.db.types.get(n) {
+        Some(n) => match eng.db.find_type(n) {
             Some(st) if st.domain.is_some() => {
                 if idx < next.domain_types.len() {
                     next.domain_types[idx] = Some(n.to_string());
@@ -6711,7 +6711,7 @@ pub(crate) fn exec_comment_on(
             }
         }
         "domain" => {
-            let is_domain = eng.db.types.get(name).is_some_and(|st| st.domain.is_some());
+            let is_domain = eng.db.find_type(name).is_some_and(|st| st.domain.is_some());
             if !is_domain {
                 return Err(exec_err(
                     "42704",
@@ -6723,7 +6723,7 @@ pub(crate) fn exec_comment_on(
             // COMMENT ON CONSTRAINT name ON DOMAIN dom: validate
             // the domain and the named check on it.
             let dom_name = sub.unwrap_or_default();
-            let dom = eng.db.types.get(dom_name).and_then(|st| st.domain.as_ref());
+            let dom = eng.db.find_type(dom_name).and_then(|st| st.domain.as_ref());
             let Some(dom) = dom else {
                 return Err(exec_err(
                     "42704",

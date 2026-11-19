@@ -2770,7 +2770,7 @@ fn jsonbval_of_sql_value(v: &Value) -> JsonbVal {
 fn sj_domain_not_null(eng: &Engine, name: &str) -> bool {
     let mut cur = Some(name);
     while let Some(n) = cur {
-        match eng.db.types.get(n).and_then(|st| st.domain.as_ref()) {
+        match eng.db.find_type(n).and_then(|st| st.domain.as_ref()) {
             Some(d) => {
                 if d.not_null {
                     return true;
@@ -3659,7 +3659,7 @@ fn sqljson_query_behavior(
                 let is_domain = t
                     .named
                     .as_deref()
-                    .is_some_and(|n| q.eng.db.types.get(n).is_some_and(|st| st.domain.is_some()));
+                    .is_some_and(|n| q.eng.db.find_type(n).is_some_and(|st| st.domain.is_some()));
                 let representable = !is_domain
                     && matches!(
                         expr_val,
@@ -4836,7 +4836,7 @@ pub(crate) fn ctor_cat_shallow(db: &Database, e: &Expr) -> CtorCat {
     match e {
         Expr::NamedArg { expr, .. } => ctor_cat_shallow(db, expr),
         Expr::Cast { to, .. } => ctor_cat_of_coltype(*to),
-        Expr::CastNamed { name, .. } => match db.types.get(name) {
+        Expr::CastNamed { name, .. } => match db.find_type(name) {
             Some(st) => match &st.domain {
                 Some(d) => ctor_cat_of_coltype(d.base),
                 None => CtorCat::Other,

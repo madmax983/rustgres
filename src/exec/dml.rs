@@ -475,6 +475,10 @@ pub(crate) fn describe_returning(
     let mut expanded: Vec<SelectItem> = Vec::with_capacity(returning.len());
     for item in returning {
         match item {
+            SelectItem::CompositeStar(_) => {
+                // v2.35: expanded at projection time (project_item_values).
+                expanded.push(item.clone());
+            }
             SelectItem::All => {
                 for (n, _) in &t.columns {
                     expanded.push(SelectItem::Expr {

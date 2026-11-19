@@ -190,6 +190,9 @@ pub(crate) fn pg_scan_output(
                     }
                 }
             }
+            SelectItem::CompositeStar(expr) => {
+                collect(expr, &mut needed)?;
+            }
             SelectItem::Expr { expr, .. } => {
                 let before = needed.len();
                 collect(expr, &mut needed)?;
@@ -282,6 +285,7 @@ pub(crate) fn pg_subquery_col_names(
     let mut names = Vec::new();
     for item in &sub.items {
         match item {
+            SelectItem::CompositeStar(_) => return None,
             SelectItem::Expr { expr, alias } => {
                 names.push(alias.clone().unwrap_or_else(|| expr_col_name(expr)));
             }
@@ -492,6 +496,9 @@ pub(crate) fn pg_top_select_output(
     for item in &stmt.items {
         match item {
             // Whole-row refs have no per-column spelling modeled here.
+            SelectItem::CompositeStar(expr) => {
+                out.push(format!("({}).*", pg_expr_text(expr, px, qualify)?))
+            }
             SelectItem::Expr { expr, .. } => out.push(pg_expr_text(expr, px, qualify)?),
             SelectItem::All => {
                 for it in orig_from {

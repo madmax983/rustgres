@@ -295,6 +295,21 @@ pub(crate) fn exec_create_view(
             }
         }
     }
+    // v2.35 (PG19 view.c DefineView +
+    // RangeVarAdjustRelationPersistence): a plain view whose
+    // query uses a temporary object silently becomes a temporary
+    // view — unless its name carries an explicit schema other
+    // than pg_temp, which is 42P16.
+    if !matview {
+        if let Some((schema, _)) = name.rsplit_once('.') {
+            if schema != "pg_temp" && deps.iter().any(|d| eng.db.is_temp_table(ctx.session, d)) {
+                return Err(exec_err(
+                    "42P16",
+                    "cannot create temporary relation in non-temporary schema".to_string(),
+                ));
+            }
+        }
+    }
     // v1.96 finishing pass: a materialized view created WITH DATA
     // is populated at creation in PG19 — the query runs now and
     // its errors (division by zero, bad casts, ...) fail the
@@ -1376,6 +1391,13 @@ fn select_output_renamed(sel: &SelectStmt, qualifiers: &[String], old: &str) -> 
     };
     for item in &items_owner.items {
         match item {
+            SelectItem::CompositeStar(expr) => {
+                let mut refs = Vec::new();
+                crate::sql::collect_col_refs(expr, &mut refs);
+                if refs.iter().any(|(_, n)| n == old) {
+                    return true;
+                }
+            }
             SelectItem::All => return true,
             SelectItem::AllOf(q) => {
                 if qualifiers.iter().any(|x| x == q) {

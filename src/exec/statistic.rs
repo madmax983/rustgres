@@ -351,6 +351,30 @@ fn resolve_stat_rel(db: &Database, name: &str, ts: &TableStats) -> Option<StatRe
             });
         }
     }
+    // v2.35: temp-table path — stats restored under schemaname
+    // 'pg_temp' are keyed by the bare temp-table name; the table
+    // itself lives in a session's temp map (the scan is
+    // session-agnostic, so any session's map may hold it).
+    for tm in db.temp_tables.values() {
+        if let Some(t) = tm.get(name) {
+            let mut cols: Vec<(i64, String, ColType, ColStats)> = Vec::new();
+            for (i, (cn, ty)) in t.columns.iter().enumerate() {
+                if let Some(cs) = ts.cols.get(cn) {
+                    if col_stats_pristine(cs) {
+                        continue;
+                    }
+                    let attnum = t.attnums.get(i).copied().unwrap_or(i as i16 + 1) as i64;
+                    cols.push((attnum, cn.clone(), ty.clone(), cs.clone()));
+                }
+            }
+            return Some(StatRel {
+                oid: t.oid as i64,
+                name: name.rsplit('.').next().unwrap_or(name).to_string(),
+                schema: "pg_temp".to_string(),
+                cols,
+            });
+        }
+    }
     // Index path: expression statistics stored under the index name.
     if let Some(ix) = db.indexes.get(name) {
         let def = &ix.def;

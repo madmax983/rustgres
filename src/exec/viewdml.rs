@@ -333,6 +333,16 @@ fn classify_view_xd(
     let mut cols: Vec<VCol> = Vec::new();
     for item in &sel.items {
         match item {
+            // v2.35: `(base).*` in a view definition expands like `*`.
+            SelectItem::CompositeStar(_) => {
+                for (pos, real) in real_cols.iter().enumerate() {
+                    let e = Expr::Column {
+                        table: None,
+                        name: real.clone(),
+                    };
+                    cols.push(map_inner(pos, real, e));
+                }
+            }
             SelectItem::All => {
                 for (pos, real) in real_cols.iter().enumerate() {
                     let e = Expr::Column {
@@ -1313,7 +1323,7 @@ fn capture_returning(
 
 fn returning_needs_capture(returning: &[SelectItem]) -> bool {
     returning.iter().any(|item| match item {
-        SelectItem::All | SelectItem::AllOf(_) => true,
+        SelectItem::All | SelectItem::AllOf(_) | SelectItem::CompositeStar(_) => true,
         SelectItem::Expr { expr, .. } => {
             let mut need = false;
             walk_expr(expr, &mut |x| match x {
@@ -1352,6 +1362,7 @@ fn expand_capture_items(view: &str, av: &AutoView, returning: &[SelectItem]) -> 
     let mut out = Vec::new();
     for item in returning {
         match item {
+            SelectItem::CompositeStar(_) => out.push(item.clone()),
             SelectItem::All => out.extend(col_items(view)),
             SelectItem::AllOf(q) if q == view || q == "old" || q == "new" => {
                 out.extend(col_items(q))

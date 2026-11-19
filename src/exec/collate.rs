@@ -342,7 +342,7 @@ pub(crate) fn collation_is_nondeterministic(
 pub(crate) fn domain_collation(db: &crate::storage::Database, dname: &str) -> Option<String> {
     let mut cur = dname.to_string();
     for _ in 0..16 {
-        let st = db.types.get(&cur)?;
+        let st = db.find_type(&cur)?;
         let dom = st.domain.as_ref()?;
         if let Some(c) = &dom.collation {
             return Some(c.clone());
@@ -498,6 +498,16 @@ pub(crate) fn stmt_output_states(
                 if let Some(qc) = env.quals.iter().find(|q| &q.qual == qual) {
                     out.extend(qc.cols.iter().cloned());
                 }
+            }
+            SelectItem::CompositeStar(expr) => {
+                // v2.35: field-level collation states are not modeled;
+                // the composite contributes its own (default) state.
+                let state = derive(ctx, &env, expr)?;
+                out.push(EnvCol {
+                    name: "?column?".to_string(),
+                    ty: lite_type(ctx, &env, expr),
+                    state,
+                });
             }
             SelectItem::Expr { expr, alias } => {
                 let state = derive(ctx, &env, expr)?;
@@ -1906,6 +1916,9 @@ pub(crate) fn check_recursive_cte(
     } else {
         for item in &right.items {
             match item {
+                SelectItem::CompositeStar(expr) => {
+                    right_states.push(derive(ctx, &env, expr)?);
+                }
                 SelectItem::Expr { expr, .. } => {
                     right_states.push(derive(ctx, &env, expr)?);
                 }
