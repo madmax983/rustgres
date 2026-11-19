@@ -2,6 +2,109 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: pgstat UPDATE hook filters indexes by table instead of scanning the whole database — fix — 2026-11-19
+
+### Workload
+
+`benches/profile_pgstat_update.py`: an application-shaped schema
+(`--tables` tables x `--indexes-per-table` secondary indexes + an
+implicit PK index each), then `--updates` single-row `UPDATE ...
+SET val = $i WHERE id = 1` statements against ONE table (`pt0`) on a
+never-indexed column — the common counter-bump / status-flag OLTP
+pattern. New feature (v2.34, `src/exec/pgstat.rs`): every completed
+UPDATE now runs a pgstat hook (`src/exec/dml.rs::exec_update`) that
+decides HOT vs. non-HOT for `pg_stat_*_tables.n_tup_hot_upd` by
+checking whether any `SET` column is indexed. It did this by calling
+`catalog::visible_index_defs()`, which clones and sorts **every**
+visible index definition in the whole database, then threw away
+every entry whose `table` didn't match — cost proportional to total
+schema index count, not to the updated table's own (5, fixed) index
+count.
+
+### Profile
+
+Isolating the per-UPDATE cost from one-time schema setup (subtracting
+a `--updates 0` run at the same table count, callgrind, debug build):
+
+| tables (x5 indexes each) | setup-only Ir | +50 updates Ir | update-loop Ir | Ir/update |
+|---|---|---|---|---|
+| 10 | 27,773,267 | 108,600,239 | 80,826,972 | 1,616,539 |
+| 40 | 110,615,955 | 337,531,236 | 226,915,281 | 4,538,306 |
+
+Per-UPDATE cost against the exact same single row on the exact same
+table grew **2.8x** when unrelated schema index count grew 4x (40
+vs. 10 tables) — the update-loop cost is >67% of the full-profile Ir
+at `tables=40`, and essentially all of its growth is the
+`visible_index_defs` scan, since nothing else in the UPDATE path
+depends on schema size.
+
+### Hypothesis
+
+`visible_index_defs` builds and sorts a `Vec<IndexDef>` (cloning
+every field, including `Vec<String>` column names) for every index
+in `db.indexes`, a `HashMap` covering the whole database — then the
+hook's own loop filters that down to `d.table == table`. Filtering
+`db.indexes.values()` directly by `table` (the idiom already used by
+`storage.rs`'s per-table index-maintenance scans, e.g.
+`storage.rs:7202`) does the same filtering without cloning or
+sorting the unrelated entries, and without allocating a throwaway
+`Vec<IndexDef>` at all.
+
+### Change
+
+`src/exec/dml.rs::exec_update`'s pgstat hook now iterates
+`eng.db.indexes.values()` directly, keeping only indexes where
+`ix.def.table == table && index_visible(&ix.def, snap, &[own])` —
+the same visibility check `visible_index_defs` used internally — and
+extends `indexed` from `ix.def.col_names` without ever cloning an
+`IndexDef` or sorting anything. The temp-index branch below it was
+already filtering by table directly and is unchanged. Pure
+call-site change, no behavior change: `n_tup_upd`/`n_tup_hot_upd`
+accounting is identical (verified manually — an UPDATE on a
+non-indexed column still counts HOT, an UPDATE on an indexed column
+still counts non-HOT). All 1427 tests pass unchanged; clippy finds
+zero new warnings on `dml.rs` (86 before, 86 after, same positions).
+
+### Measurement
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`), `--indexes-per-table 4 --updates 50`:
+
+| tables | Ir before | Ir after | delta |
+|---|---|---|---|
+| 10 | 108,600,239 | 75,823,518 | **-30.18%** |
+| 25 | 220,002,885 | 129,159,947 | **-41.29%** |
+| 40 | 337,531,236 | 186,911,930 | **-44.62%** |
+
+The improvement grows with schema size (the asymptotic fix: update
+cost no longer scales with total database index count). Isolating
+the update-loop-only cost (subtracting `--updates 0`) at `tables=40`:
+4,538,306 -> 1,526,694 Ir/update (**-66.4%**); at `tables=10`:
+1,616,539 -> 960,578 Ir/update (**-40.6%**). A residual, much smaller
+scaling with schema size remains (iterating `db.indexes.values()` is
+still O(total indexes), just no longer cloning/sorting them) —
+eliminating that fully would need a per-table index index, a larger
+structural change left for a human call.
+
+dhat (1 run before / 1 run after, `tables=40 indexes-per-table=4 updates=50`):
+
+| metric | before | after | delta |
+|---|---|---|---|
+| total bytes allocated | 20,212,943 | 7,097,543 | **-64.9%** |
+| total allocations (blocks) | 169,472 | 69,072 | **-59.25%** |
+
+Both the total-Ir delta (floor: >=5%) and the allocation deltas
+(floor: >=10%) clear the impact floor by a wide margin, at every
+schema size tested. Profiles committed:
+`benches/profiles/{callgrind,dhat}.out.pgstatupdate-{base,after}-n40i4u50-2026-11-19`.
+
+Reproduce:
+```bash
+cargo build
+python3 benches/profile_pgstat_update.py --tool callgrind --sizes
+python3 benches/profile_pgstat_update.py --tool dhat --tables 40 --indexes-per-table 4 --updates 50
+```
+
 ## Bolt: `index_oid_map_from` lets catalog scans fetch `visible_index_defs` once instead of twice — fix — 2026-11-17
 
 Fixes the target identified in the baseline entry immediately below
