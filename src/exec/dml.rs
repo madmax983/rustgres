@@ -4788,9 +4788,17 @@ pub(crate) fn exec_update(
                     sets.iter().map(|(c, _)| c.as_str()).collect();
                 let mut indexed: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
-                for d in visible_index_defs(&eng.db, ctx.snap, ctx.own, ctx.session) {
-                    if d.table == table {
-                        indexed.extend(d.col_names.iter().cloned());
+                // v2.34 fix: visible_index_defs() clones and sorts every
+                // visible index in the whole database just to throw away
+                // every entry not on `table`. Filter by table directly
+                // instead (same idiom as storage.rs's per-table index
+                // scans) so this hook's cost depends on the updated
+                // table's own index count, not the schema's.
+                for ix in eng.db.indexes.values() {
+                    if ix.def.table == table
+                        && crate::storage::index_visible(&ix.def, ctx.snap, &[ctx.own])
+                    {
+                        indexed.extend(ix.def.col_names.iter().cloned());
                     }
                 }
                 if let Some(tm) = eng.db.temp_indexes.get(&ctx.session) {
