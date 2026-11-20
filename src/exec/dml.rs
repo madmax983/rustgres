@@ -4001,18 +4001,21 @@ pub(crate) fn exec_insert_inner(
                 {
                     let defs = crate::exec::indexes::wo_defs(t);
                     if !defs.is_empty() {
-                        let mut existing: Vec<Vec<Value>> = t
+                        // v2.31 fix: clone the (Arc-backed) Row itself
+                        // instead of deep-copying its cells -- see
+                        // check_without_overlaps_batch in indexes.rs.
+                        let mut existing: Vec<Row> = t
                             .rows
                             .iter()
                             .filter(|r| crate::storage::row_visible(r, ctx.snap, &ctx.all_xids))
-                            .map(|r| r.values[..].to_vec())
+                            .map(|r| r.values.clone())
                             .collect();
                         for (pid, prow) in &latest {
                             if !partitioned_upsert
                                 || planned_leaf.get(pid).map(|l| l.as_str())
                                     == Some(ctable.as_str())
                             {
-                                existing.push(prow[..].to_vec());
+                                existing.push(prow.clone());
                             }
                         }
                         for def in defs {
