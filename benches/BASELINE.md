@@ -2,6 +2,58 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: WITHOUT OVERLAPS exclusion check deep-clones every visible row on every INSERT/UPDATE — baseline — 2026-11-20
+
+### Workload
+
+v2.31 added WITHOUT OVERLAPS (temporal PK/UNIQUE exclusion
+constraints — room bookings, price history, entitlement periods) and
+had never been profiled. New harness `benches/profile_wo_insert.py`
+(self-contained callgrind/dhat driver, same pattern as
+`profile_pgstat_update.py`/`profile_analyze.py`): a temporal PK table
+(`PRIMARY KEY (id, valid_at WITHOUT OVERLAPS)`) pre-populated with
+`--rows` settled, non-conflicting rows, then `--inserts` further
+single-row INSERTs each on a brand-new scalar key — the common
+steady-state append workload (not the 23P01 error path). Every
+completed INSERT (and, per `src/exec/dml.rs`, every UPDATE final
+image and every ON CONFLICT probe) into a table with a WITHOUT
+OVERLAPS constraint runs `check_without_overlaps_batch`
+(`src/exec/indexes.rs`), which has no backing GiST index to scan — it
+is a from-scratch brute-force exclusion check — so its O(existing)
+scan cost is itself inherent to this engine's design. What is not
+inherent is how that scan collects its inputs.
+
+### Profile
+
+`check_without_overlaps_batch` collects every visible existing row
+via `.map(|r| r.values[..].to_vec())`: `r.values` is a `Row`
+(`Arc<Vec<Value>>`, already cheaply shareable), but indexing through
+it with `[..]` and calling `.to_vec()` deep-clones every cell into a
+brand-new `Vec<Value>` — including, for this workload's range-typed
+columns, a further heap allocation per cell to clone the boxed
+`RangeVal` behind `Value::Range`. dhat on `--rows 1500 --inserts 10`
+(`benches/profiles/dhat.out.woinsert-base-r1500i10-2026-11-20`)
+attributes 62,133 of 181,741 total allocations (34.2%) and 8,630,528
+of 19,993,010 total bytes (43.2%) to the
+`check_without_overlaps_batch`/`check_one_wo_def` subtree. Callgrind
+on the same workload shows the cost is super-linear in table size
+(500/1000/2000 settled rows -> 359M/1,060M/3,549M total `Ir` for a
+20-INSERT run, each INSERT scanning the whole settled set) —
+expected for the brute-force exclusion scan itself (O(inserts x
+rows)), but isolating the per-INSERT loop from setup (subtracting an
+`--inserts 0` run at the same `--rows`) shows the row-clone alone
+makes up roughly half of that per-INSERT cost, not just the
+comparison scan PG's own GiST-backed exclusion check would also have
+to pay.
+
+### Reproduce
+
+```bash
+cargo build
+python3 benches/profile_wo_insert.py --tool callgrind --sizes --inserts 20
+python3 benches/profile_wo_insert.py --tool dhat --rows 1500 --inserts 10
+```
+
 ## Bolt: `index_oid_map_from` lets catalog scans fetch `visible_index_defs` once instead of twice — fix — 2026-11-17
 
 Fixes the target identified in the baseline entry immediately below
