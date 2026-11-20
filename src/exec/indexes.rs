@@ -775,7 +775,7 @@ pub(crate) fn check_one_wo_def(
     table: &str,
     def: &UniqueDef,
     batch: &[Vec<Value>],
-    existing: &[Vec<Value>],
+    existing: &[Row],
     create_mode: bool,
 ) -> Result<(), ExecError> {
     let pos: Vec<usize> = def.cols.iter().filter_map(|c| t.column_index(c)).collect();
@@ -838,8 +838,19 @@ pub(crate) fn check_one_wo_def(
         pos.iter()
             .any(|&i| matches!(values.get(i), Some(Value::Null) | None))
     };
-    // Empty-range check runs before any NULL bypass (PG19).
-    for values in batch.iter().chain(existing.iter()) {
+    // Empty-range check runs before any NULL bypass (PG19). Two plain
+    // loops (batch, then existing) instead of one chained/mapped
+    // iterator: `existing` is now `&[Row]` rather than `&[Vec<Value>]`
+    // (see check_without_overlaps_batch below), and in a debug build
+    // an extra `Iterator::map` adaptor per side is real per-item call
+    // overhead, not something the compiler folds away.
+    for values in batch.iter() {
+        if value_is_empty_range(values.get(last).unwrap_or(&Value::Null)) {
+            return Err(empty_err(values));
+        }
+    }
+    for row in existing.iter() {
+        let values = &row[..];
         if value_is_empty_range(values.get(last).unwrap_or(&Value::Null)) {
             return Err(empty_err(values));
         }
@@ -848,7 +859,16 @@ pub(crate) fn check_one_wo_def(
         if skippable(values) {
             continue;
         }
-        for old in existing.iter().chain(batch[..j].iter()) {
+        for old in existing.iter() {
+            let old = &old[..];
+            if skippable(old) {
+                continue;
+            }
+            if conflicts(values, old) {
+                return Err(conflict_err(values, old));
+            }
+        }
+        for old in &batch[..j] {
             if skippable(old) {
                 continue;
             }
@@ -896,12 +916,18 @@ pub(crate) fn check_without_overlaps_batch(
     if defs.is_empty() {
         return Ok(());
     }
-    let existing: Vec<Vec<Value>> = t
+    // v2.31 fix: Row is Arc<Vec<Value>>, so cloning the Row itself is
+    // a refcount bump, not a per-cell deep copy -- unlike the
+    // previous `r.values[..].to_vec()`, which copied every cell
+    // (including a fresh heap allocation per boxed Range value) of
+    // every visible row, on every single INSERT/UPDATE into a WO
+    // table, regardless of batch size.
+    let existing: Vec<Row> = t
         .rows
         .iter()
         .filter(|r| row_visible(r, snap, owns))
         .filter(|r| !exclude_ids.contains(&r.id))
-        .map(|r| r.values[..].to_vec())
+        .map(|r| r.values.clone())
         .collect();
     for def in defs {
         check_one_wo_def(t, table, def, batch, &existing, false)?;
@@ -919,11 +945,11 @@ pub(crate) fn validate_without_overlaps_existing(
     snap: &Snapshot,
     owns: &[u64],
 ) -> Result<(), ExecError> {
-    let existing: Vec<Vec<Value>> = t
+    let existing: Vec<Row> = t
         .rows
         .iter()
         .filter(|r| row_visible(r, snap, owns))
-        .map(|r| r.values[..].to_vec())
+        .map(|r| r.values.clone())
         .collect();
     check_one_wo_def(t, table, def, &[], &existing, true)
 }

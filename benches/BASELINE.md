@@ -2,6 +2,115 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `check_without_overlaps_batch` clones every visible row to compare it, instead of borrowing the already-shared `Row` — fix — 2026-11-20
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Hypothesis
+
+`Row` (`src/storage.rs`) is `Arc<Vec<Value>>`: cloning a `Row` is an
+atomic refcount bump, not a deep copy. `check_without_overlaps_batch`
+and `validate_without_overlaps_existing` instead built their
+`existing` comparison set via `r.values[..].to_vec()` — indexing
+through the `Arc` to get a `&[Value]` slice and deep-cloning every
+cell into a fresh `Vec<Value>` (plus, for a range/multirange column,
+a further heap allocation per cell to clone the boxed `RangeVal`) —
+for every visible row, on every single INSERT/UPDATE into a table
+carrying a WITHOUT OVERLAPS constraint, regardless of batch size.
+Collecting `Vec<Row>` instead of `Vec<Vec<Value>>` (`r.values.clone()`
+instead of `r.values[..].to_vec()`) does the same comparison work
+without ever deep-copying a row that already lives behind a shared
+pointer.
+
+### Change
+
+`src/exec/indexes.rs`: `check_without_overlaps_batch` and
+`validate_without_overlaps_existing` now collect `existing: Vec<Row>`
+via `r.values.clone()`; `check_one_wo_def`'s `existing` parameter is
+`&[Row]` instead of `&[Vec<Value>]` (`Row: Deref<Target = [Value]>`,
+so every existing comparison/skip call site is unchanged other than
+an explicit `&row[..]` deref). The two iteration sites that used to
+`.chain()` `batch` and `existing` directly (same element type before
+this change) are split into two plain loops instead of one chained,
+`.map()`-adapted iterator: in a debug build an extra `Iterator::map`
+per side is real per-item call overhead in the O(existing x batch)
+comparison scan, not something the compiler folds away, and a first
+version of this fix that kept the single chained loop measured as a
+net Ir *regression* on large multi-row INSERTs (see Measurement) even
+though it still cut allocations — the two-loop form avoids that
+while keeping the same allocation win. `src/exec/dml.rs`'s ON
+CONFLICT WITHOUT-OVERLAPS probe (`exec_update`'s neighbor in
+`exec_insert`) gets the same treatment: `existing: Vec<Row>`,
+`prow.clone()` instead of `prow[..].to_vec()` for the in-batch rows
+already materialized in `latest: HashMap<u64, Row>`. Pure
+call-site/collection-type change: the comparison logic, iteration
+order (first-conflict-wins semantics unchanged), and every error path
+are identical — only how the inputs to that comparison get collected
+changed. All 1429 tests pass unchanged; clippy warning count/positions
+on both files are unchanged modulo the added lines (103 before, 103
+after, same findings at shifted line numbers).
+
+### Measurement
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`), `benches/profile_wo_insert.py`, isolating the
+10/20-INSERT measured loop from one-time schema+settled-row setup by
+subtracting an `--inserts 0` run at the same `--rows` (same trick as
+the pgstat-UPDATE and ANALYZE entries below): every measured INSERT
+is a single new row on a brand-new scalar key against the existing
+settled rows (the common steady-state append shape for a WITHOUT
+OVERLAPS table — booking systems, price/entitlement history), `Ir`
+averaged over 3 runs per cell:
+
+| rows | full run Ir (before) | full run Ir (after) | loop-only Ir (before) | loop-only Ir (after) | loop-only delta |
+|---|---|---|---|---|---|
+| 500  | 359,017,850   | 313,254,649   | 75,355,363  | 39,257,547  | **-47.9%** |
+| 1000 | 1,060,079,495 | 952,620,990   | 139,105,995 | 67,630,498  | **-51.4%** |
+| 2000 | 3,549,453,029 | 3,262,107,971 | 266,721,521 | 124,012,920 | **-53.5%** |
+
+(`--inserts 0` Ir, same `--rows`, averaged: before 283,662,487 /
+920,973,500 / 3,282,731,508; after 273,997,102 / 884,990,492 /
+3,138,095,051 — setup got *faster* too, because the chunked
+multi-row INSERTs during setup also run
+`check_without_overlaps_batch`.) The clone being removed accounts
+for roughly half of the measured per-INSERT `Ir` at every table size
+tested, growing with table size as expected for an O(existing) cost.
+The abandoned single-chained-loop version of this fix (see Change)
+measured `--inserts 0` Ir *higher* than baseline at `rows=1000`
+(941,393,528 vs. 920,973,500, +2.2%) — a real regression from
+`Iterator::map` overhead in the O(existing x batch) scan during
+large-batch setup INSERTs, caught by profiling the fix the same way
+as the target, not assumed away.
+
+dhat (`benches/profiles/dhat.out.woinsert-{base,after}-r1500i10-2026-11-20`,
+`--rows 1500 --inserts 10`):
+
+| metric | before | after | delta |
+|---|---|---|---|
+| total bytes allocated | 19,993,010 | 11,817,746 | **-40.9%** |
+| total allocations (blocks) | 181,741 | 119,806 | **-34.1%** |
+
+62,133 of the 181,741 baseline allocations (34.2%) and 8,630,528 of
+the 19,993,010 baseline bytes (43.2%) traced directly to the
+`check_without_overlaps_batch`/`check_one_wo_def` subtree in that
+dhat profile — the target this fix removes. Both the loop-only `Ir`
+delta (floor: >=5%, on a benchmark where the target was >=5% of the
+measured cost) and the allocation deltas (floor: >=10%) clear the
+impact floor by a wide margin. Profiles committed:
+`benches/profiles/{callgrind,dhat}.out.woinsert-after-r1500i10-2026-11-20`
+(baseline profiles in the entry below).
+
+### Reproduce
+
+```bash
+cargo build
+python3 benches/profile_wo_insert.py --tool callgrind --sizes --inserts 20
+python3 benches/profile_wo_insert.py --tool callgrind --rows 1000 --inserts 0   # isolate setup-only cost
+python3 benches/profile_wo_insert.py --tool dhat --rows 1500 --inserts 10
+```
+
+
 ## Bolt: WITHOUT OVERLAPS exclusion check deep-clones every visible row on every INSERT/UPDATE — baseline — 2026-11-20
 
 ### Workload
