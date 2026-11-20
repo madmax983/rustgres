@@ -3229,6 +3229,19 @@ pub(crate) fn build_source(
                     .collect();
                 return Ok((apply_aliases(schema)?, rows));
             }
+            // v2.36: information_schema foreign-data views.
+            if is_foreign_info_view(name) {
+                let (schema, rows) =
+                    info_foreign_scan(&q.eng.db, q.snap, q.own, q.session, &q.role, name);
+                let schema: Vec<QCol> = schema
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                return Ok((apply_aliases(schema)?, rows));
+            }
             // v1.96: information_schema privilege views.
             if name == "information_schema.table_privileges"
                 || name == "information_schema.role_table_grants"
@@ -3432,6 +3445,43 @@ pub(crate) fn build_source(
                     })
                     .collect();
                 return Ok((apply_aliases(schema)?, rows));
+            }
+            // v2.36: the foreign-data catalogs are virtual.
+            if matches!(
+                virt_catalog_name(&name),
+                "pg_foreign_data_wrapper"
+                    | "pg_foreign_server"
+                    | "pg_foreign_table"
+                    | "pg_user_mapping"
+                    | "pg_user_mappings"
+            ) && q
+                .eng
+                .db
+                .find_table(name, q.snap, &q.all_xids, q.session)
+                .is_none()
+            {
+                let (raw_schema, rows) = match virt_catalog_name(&name) {
+                    "pg_foreign_data_wrapper" => pg_foreign_data_wrapper_scan(&q.eng.db),
+                    "pg_foreign_server" => pg_foreign_server_scan(&q.eng.db),
+                    "pg_foreign_table" => {
+                        pg_foreign_table_scan(&q.eng.db, q.snap, q.own, q.session)
+                    }
+                    "pg_user_mapping" => pg_user_mapping_scan(&q.eng.db),
+                    _ => pg_user_mappings_scan(&q.eng.db, q.snap, q.own, q.role),
+                };
+                let schema: Vec<QCol> = raw_schema
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                return Ok((apply_aliases(schema)?, rows));
+            }
+            // v2.36: scanning a foreign table reaches the wrapper —
+            // every wrapper here is handler-less (55000).
+            if let Some(e) = foreign_scan_error(&q.eng.db, name) {
+                return Err(e);
             }
             // v0.37: pg_class is virtual too (TOAST introspection).
             if name == "pg_class"

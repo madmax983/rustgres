@@ -510,6 +510,8 @@ pub(crate) fn eval_priv_func(
         | "has_sequence_privilege"
         | "has_database_privilege"
         | "has_schema_privilege"
+        | "has_foreign_data_wrapper_privilege"
+        | "has_server_privilege"
         | "has_function_privilege"
         | "has_type_privilege"
         | "has_parameter_privilege"
@@ -615,6 +617,8 @@ fn eval_priv_func_inner(
         "has_sequence_privilege" => has_sequence_privilege(q, &vals),
         "has_database_privilege" => has_database_privilege(q, &vals),
         "has_schema_privilege" => has_schema_privilege(q, &vals),
+        "has_foreign_data_wrapper_privilege" => has_fdw_privilege(q, &vals, false),
+        "has_server_privilege" => has_fdw_privilege(q, &vals, true),
         "has_function_privilege" => has_function_privilege(q, &vals),
         "has_type_privilege" => has_type_privilege(q, &vals),
         "has_parameter_privilege" => {
@@ -1363,6 +1367,116 @@ fn has_database_privilege(q: &mut Q, vals: &[Value]) -> Result<Value, ExecError>
         }
     }
     Ok(Value::Bool(have & bits == bits))
+}
+
+/// v2.36: has_foreign_data_wrapper_privilege / has_server_privilege
+/// (PG19 acl.c: only USAGE exists; name form errors 42704 on a
+/// missing object, OID form returns NULL; the privilege-string
+/// parse runs BEFORE the object lookup).
+fn has_fdw_privilege(q: &mut Q, vals: &[Value], is_server: bool) -> Result<Value, ExecError> {
+    let fname = if is_server {
+        "has_server_privilege"
+    } else {
+        "has_foreign_data_wrapper_privilege"
+    };
+    let (role_v, obj_v, priv_v) = match vals.len() {
+        2 => (None, &vals[0], &vals[1]),
+        3 => (Some(&vals[0]), &vals[1], &vals[2]),
+        _ => {
+            return Err(exec_err(
+                "42883",
+                format!("function {}() does not exist", fname),
+            ));
+        }
+    };
+    if obj_v == &Value::Null || priv_v == &Value::Null {
+        return Ok(Value::Null);
+    }
+    let role = match role_v {
+        Some(rv) => {
+            if rv == &Value::Null {
+                return Ok(Value::Null);
+            }
+            match resolve_role_arg(q, rv)? {
+                Some(r) => r,
+                None => return Ok(Value::Bool(false)),
+            }
+        }
+        None => q.role.to_string(),
+    };
+    // Privilege string first (PG19 converts text -> AclMode before
+    // the catalog lookup).
+    let priv_s = str_of(priv_v).unwrap_or_default();
+    let (bits, want_go) = parse_named_priv(&priv_s, &[("USAGE", PRIV_USAGE)])?;
+    let db = &q.eng.db;
+    let (owner, acl): (String, Vec<crate::storage::AclEntry>) = match obj_v {
+        Value::Text(s) | Value::BpChar(s) => {
+            let nm = s.to_string();
+            let found = if is_server {
+                db.foreign_servers
+                    .iter()
+                    .find(|x| x.name == nm)
+                    .map(|x| (x.owner.clone(), x.acl.clone()))
+            } else {
+                db.fdws
+                    .iter()
+                    .find(|x| x.name == nm)
+                    .map(|x| (x.owner.clone(), x.acl.clone()))
+            };
+            match found {
+                Some(v) => v,
+                None => {
+                    return Err(exec_err(
+                        "42704",
+                        if is_server {
+                            format!("server \"{}\" does not exist", nm)
+                        } else {
+                            format!("foreign-data wrapper \"{}\" does not exist", nm)
+                        },
+                    ));
+                }
+            }
+        }
+        Value::Int(i) | Value::BigInt(i) => {
+            let oid = *i as u32;
+            let found = if is_server {
+                db.foreign_servers
+                    .iter()
+                    .find(|x| x.oid == oid)
+                    .map(|x| (x.owner.clone(), x.acl.clone()))
+            } else {
+                db.fdws
+                    .iter()
+                    .find(|x| x.oid == oid)
+                    .map(|x| (x.owner.clone(), x.acl.clone()))
+            };
+            match found {
+                Some(v) => v,
+                None => return Ok(Value::Null),
+            }
+        }
+        _ => return Ok(Value::Null),
+    };
+    let mut have = 0u32;
+    let mut have_go = 0u32;
+    if crate::storage::is_superuser_snap(db, &role, q.snap, q.own) || role == owner {
+        have = PRIV_USAGE;
+        have_go = PRIV_USAGE;
+    } else {
+        let closure = crate::storage::role_closure(db, &role, q.snap, q.own);
+        for e in &acl {
+            if e.role == "public" || closure.iter().any(|n| n == &e.role) {
+                have |= e.privs;
+                have_go |= e.grant_option;
+            }
+        }
+    }
+    let ok = if want_go {
+        have_go & bits == bits
+    } else {
+        have & bits == bits
+    };
+    Ok(Value::Bool(ok))
 }
 
 fn has_schema_privilege(q: &mut Q, vals: &[Value]) -> Result<Value, ExecError> {

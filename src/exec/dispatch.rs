@@ -259,7 +259,17 @@ pub(crate) fn execute_inner(
             for n in names {
                 extstats::drop_stats_for_table(&mut eng.db, n);
             }
-            exec_drop(eng, ctx, names, *if_exists, *cascade)
+            let r = exec_drop(eng, ctx, names, *if_exists, *cascade);
+            if r.is_ok() {
+                // v2.36: dropping a foreign table through the plain
+                // DROP TABLE spelling also drops its FDW metadata.
+                for n in names {
+                    eng.db.foreign_tables.remove(n);
+                    let base = n.rsplit('.').next().unwrap_or(n);
+                    eng.db.foreign_tables.remove(base);
+                }
+            }
+            r
         }
         // --- v0.9: constraints / ALTER / views / sequences
         Stmt::AlterTable {
@@ -363,6 +373,108 @@ pub(crate) fn execute_inner(
         Stmt::CommentPublication { name, comment } => {
             exec_comment_publication(eng, ctx, name, comment)
         }
+        // v2.36: FOREIGN DATA family (fdw.rs).
+        Stmt::CreateFdw {
+            name,
+            handler,
+            validator,
+            connection,
+            options,
+        } => exec_create_fdw(eng, ctx, name, handler, validator, connection, options),
+        Stmt::AlterFdw {
+            name,
+            handler,
+            validator,
+            connection,
+            options,
+        } => exec_alter_fdw(eng, ctx, name, handler, validator, connection, options),
+        Stmt::AlterFdwOwner { name, new_owner } => {
+            exec_alter_fdw_owner(eng, ctx, name, new_owner)
+        }
+        Stmt::AlterFdwRename { name, new_name } => {
+            exec_alter_fdw_rename(eng, ctx, name, new_name)
+        }
+        Stmt::DropFdw {
+            names,
+            if_exists,
+            cascade,
+        } => exec_drop_fdw(eng, ctx, names, *if_exists, *cascade),
+        Stmt::CreateServer {
+            name,
+            if_not_exists,
+            srvtype,
+            srvversion,
+            fdw,
+            options,
+        } => exec_create_server(
+            eng,
+            ctx,
+            name,
+            *if_not_exists,
+            srvtype,
+            srvversion,
+            fdw,
+            options,
+        ),
+        Stmt::AlterServer {
+            name,
+            srvversion,
+            options,
+        } => exec_alter_server(eng, ctx, name, srvversion, options),
+        Stmt::AlterServerOwner { name, new_owner } => {
+            exec_alter_server_owner(eng, ctx, name, new_owner)
+        }
+        Stmt::AlterServerRename { name, new_name } => {
+            exec_alter_server_rename(eng, ctx, name, new_name)
+        }
+        Stmt::DropServer {
+            names,
+            if_exists,
+            cascade,
+        } => exec_drop_server(eng, ctx, names, *if_exists, *cascade),
+        Stmt::CreateUserMapping {
+            if_not_exists,
+            user,
+            server,
+            options,
+        } => exec_create_user_mapping(eng, ctx, *if_not_exists, user, server, options),
+        Stmt::AlterUserMapping {
+            user,
+            server,
+            options,
+        } => exec_alter_user_mapping(eng, ctx, user, server, options),
+        Stmt::DropUserMapping {
+            if_exists,
+            user,
+            server,
+        } => exec_drop_user_mapping(eng, ctx, *if_exists, user, server),
+        Stmt::CreateForeignTable {
+            name,
+            def,
+            server,
+            options,
+            col_options,
+            if_not_exists,
+        } => exec_create_foreign_table(
+            eng,
+            ctx,
+            name,
+            def,
+            server,
+            options,
+            col_options,
+            *if_not_exists,
+        ),
+        Stmt::DropForeignTable {
+            names,
+            if_exists,
+            cascade,
+        } => exec_drop_foreign_table(eng, ctx, names, *if_exists, *cascade),
+        Stmt::ImportForeignSchema {
+            remote_schema: _remote_schema,
+            server,
+            into_schema: _into_schema,
+        } => exec_import_foreign_schema(eng, ctx, server),
         // v1.96: schema / maintenance / aggregate statement surface.
         Stmt::CreateTablespace {
             name,

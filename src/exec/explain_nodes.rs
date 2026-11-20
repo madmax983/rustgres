@@ -3538,6 +3538,11 @@ pub(crate) fn exec_explain(
         Stmt::Select(s) => s,
         _ => unreachable!("non-SELECT routed to exec_explain_dml above"),
     };
+    // v2.36: planning a foreign scan consults the FDW handler
+    // (55000 for the handler-less wrappers modeled here).
+    if let Some(e) = explain_foreign_check(&eng.db, sel) {
+        return Err(e);
+    }
     // v1.98: full analysis — planning-only EXPLAIN validates the query
     // like PG19 parse analysis (privileges, operator/function/type
     // resolution) before rendering a plan. See `validate_explain_select`.

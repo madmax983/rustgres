@@ -5553,6 +5553,49 @@ pub(crate) fn eval_func(
                     _ => Value::Null,
                 });
             }
+            // v2.36: FDW registry comments.
+            if cat.as_ref() == "pg_foreign_data_wrapper" {
+                return Ok(match &v0 {
+                    Value::Int(oid) => q
+                        .eng
+                        .db
+                        .fdws
+                        .iter()
+                        .find(|f| f.oid as i64 == *oid)
+                        .and_then(|f| f.comment.clone())
+                        .map(|c| Value::text(c))
+                        .unwrap_or(Value::Null),
+                    _ => Value::Null,
+                });
+            }
+            if cat.as_ref() == "pg_foreign_server" {
+                return Ok(match &v0 {
+                    Value::Int(oid) => q
+                        .eng
+                        .db
+                        .foreign_servers
+                        .iter()
+                        .find(|s| s.oid as i64 == *oid)
+                        .and_then(|s| s.comment.clone())
+                        .map(|c| Value::text(c))
+                        .unwrap_or(Value::Null),
+                    _ => Value::Null,
+                });
+            }
+            if cat.as_ref() == "pg_class" {
+                if let Value::Int(oid) = &v0 {
+                    for (k, meta) in &q.eng.db.foreign_tables {
+                        if let Some(t) = q.eng.db.find_table(k, q.snap, &q.all_xids, q.session) {
+                            if t.oid as i64 == *oid {
+                                return Ok(match &meta.comment {
+                                    Some(c) => Value::text(c.clone()),
+                                    None => Value::Null,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
         }
         // Other catalogs keep the pre-v2.04 behavior (fall through).
     }
@@ -15258,7 +15301,8 @@ pub(crate) fn func_result_type(
         "has_table_privilege" | "has_column_privilege" | "has_sequence_privilege"
         | "has_database_privilege" | "has_schema_privilege" | "has_function_privilege"
         | "has_type_privilege" | "has_parameter_privilege" | "has_any_column_privilege"
-        | "has_largeobject_privilege" | "pg_has_role" | "aclcontains" => Ok(ColType::Bool),
+        | "has_largeobject_privilege" | "pg_has_role" | "aclcontains"
+        | "has_foreign_data_wrapper_privilege" | "has_server_privilege" => Ok(ColType::Bool),
         "current_setting" | "makeaclitem" | "pg_get_userbyid" => Ok(ColType::Text),
         // v2.04: catalog description helpers used by the publication
         // suite (pg_get_expr deparses our stored filter text form).

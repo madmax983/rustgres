@@ -134,6 +134,9 @@ pub(crate) fn pg_class_scan(
         // named `pg_toast.pg_toast_<oid>` (see toast_table_name).
         let relkind = if t.partition.as_ref().is_some_and(|p| p.is_partitioned) {
             Value::SingleChar(b'p')
+        } else if db.foreign_tables.contains_key(name.as_str()) {
+            // v2.36: foreign tables report relkind 'f'.
+            Value::SingleChar(b'f')
         } else if name.starts_with("pg_toast.pg_toast_") {
             Value::SingleChar(b't')
         } else {
@@ -360,6 +363,11 @@ pub(crate) fn pg_attribute_scan(
             (3997, pg_statistic_ext_data_schema()),
             (3998, pg_stats_ext_schema()),
             (3999, pg_stats_ext_exprs_schema()),
+            // v2.36: the foreign-data catalogs.
+            (2328, pg_foreign_data_wrapper_schema()),
+            (1417, pg_foreign_server_schema()),
+            (3118, pg_foreign_table_schema()),
+            (1418, pg_user_mapping_schema()),
         ];
         for (relid, cols) in catalogs {
             for (i, c) in cols.iter().enumerate() {
@@ -5126,6 +5134,36 @@ pub(crate) fn pg_shdepend_scan(
             role_oid_pub(&d.grantee) as i64,
             b'a',
         );
+    }
+    // v2.36: FDW / server owner rows are SHARED dependencies
+    // (dbid = 0 in PG).
+    for f in &db.fdws {
+        rows.push(QRow {
+            cells: Row::new(vec![
+                Value::Int(0),
+                Value::Int(2328),
+                Value::Int(f.oid as i64),
+                Value::Int(0),
+                Value::Int(1260),
+                Value::Int(role_oid_pub(&f.owner) as i64),
+                Value::SingleChar(b'o'),
+            ]),
+            prov: Vec::new(),
+        });
+    }
+    for s in &db.foreign_servers {
+        rows.push(QRow {
+            cells: Row::new(vec![
+                Value::Int(0),
+                Value::Int(1417),
+                Value::Int(s.oid as i64),
+                Value::Int(0),
+                Value::Int(1260),
+                Value::Int(role_oid_pub(&s.owner) as i64),
+                Value::SingleChar(b'o'),
+            ]),
+            prov: Vec::new(),
+        });
     }
     (schema, rows)
 }

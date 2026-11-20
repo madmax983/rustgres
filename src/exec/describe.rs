@@ -190,6 +190,19 @@ pub(crate) fn from_schema_item(
                 out.push(apply_aliases(schema)?);
                 return Ok(());
             }
+            // v2.36: information_schema foreign-data views.
+            if is_foreign_info_view(name) {
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let schema: Vec<QCol> = info_foreign_schema(name)
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                out.push(apply_aliases(schema)?);
+                return Ok(());
+            }
             // v1.96: information_schema privilege views.
             let priv_view_schema = match name.as_str() {
                 "information_schema.table_privileges" => Some(info_table_privileges_schema()),
@@ -295,6 +308,34 @@ pub(crate) fn from_schema_item(
             {
                 let qual = alias.clone().unwrap_or_else(|| name.clone());
                 let schema: Vec<QCol> = pgstat_schema(virt_catalog_name(&name))
+                    .into_iter()
+                    .map(|mut c| {
+                        c.qual = qual.clone();
+                        c
+                    })
+                    .collect();
+                out.push(apply_aliases(schema)?);
+                return Ok(());
+            }
+            // v2.36: the foreign-data catalogs are virtual.
+            if matches!(
+                virt_catalog_name(&name),
+                "pg_foreign_data_wrapper"
+                    | "pg_foreign_server"
+                    | "pg_foreign_table"
+                    | "pg_user_mapping"
+                    | "pg_user_mappings"
+            ) && eng.db.find_table(name, snap, &[own], session).is_none()
+            {
+                let base_schema = match virt_catalog_name(&name) {
+                    "pg_foreign_data_wrapper" => pg_foreign_data_wrapper_schema(),
+                    "pg_foreign_server" => pg_foreign_server_schema(),
+                    "pg_foreign_table" => pg_foreign_table_schema(),
+                    "pg_user_mapping" => pg_user_mapping_schema(),
+                    _ => pg_user_mappings_schema(),
+                };
+                let qual = alias.clone().unwrap_or_else(|| name.clone());
+                let schema: Vec<QCol> = base_schema
                     .into_iter()
                     .map(|mut c| {
                         c.qual = qual.clone();

@@ -2370,6 +2370,18 @@ pub(crate) fn exec_create_trigger(
         .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?
         .clone();
+    // v2.36 PG19 trigger.c: on a FOREIGN table, INSTEAD OF triggers
+    // and constraint triggers are both 42809 ("\"ft\" is a foreign
+    // table"); ordinary row/statement triggers are allowed.
+    if foreign_meta_key(&eng.db, table).is_some()
+        && (timing == crate::sql::TriggerTiming::InsteadOf || is_constraint)
+    {
+        let base = table.rsplit('.').next().unwrap_or(table);
+        return Err(exec_err(
+            "42809",
+            format!("\"{}\" is a foreign table", base),
+        ));
+    }
     // v2.14 PG19 trigger.c: INSTEAD OF on a table is 42809.
     if timing == crate::sql::TriggerTiming::InsteadOf {
         return Err(exec_err("42809", format!("\"{}\" is a table", table)));

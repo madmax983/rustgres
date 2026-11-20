@@ -1176,6 +1176,12 @@ pub(crate) fn create_child_index(
     else {
         return Ok(None);
     };
+    // v2.36: foreign partitions never gain a physical child index
+    // (PG19 DefineIndex skips them; unique parents are rejected
+    // before propagation).
+    if foreign_meta_key(&eng.db, child_table).is_some() {
+        return Ok(None);
+    }
     // Map key columns by name; expression keys keep usize::MAX.
     let mut cols: Vec<usize> = Vec::with_capacity(parent_def.cols.len());
     for (i, cn) in parent_def.col_names.iter().enumerate() {
@@ -1418,6 +1424,33 @@ pub(crate) fn exec_create_index(
 ) -> Result<ExecResult, ExecError> {
     // v0.11: indexing a table needs its owner (or a superuser).
     require_table_owner(eng, ctx, table)?;
+    // v2.36: PG19 DefineIndex — indexes are not supported on
+    // foreign tables (42809 + DETAIL).
+    if foreign_meta_key(&eng.db, table).is_some() {
+        let base = table.rsplit('.').next().unwrap_or(table);
+        let mut e = exec_err(
+            "42809",
+            format!("cannot create index on relation \"{}\"", base),
+        );
+        e.detail = Some("This operation is not supported for foreign tables.".to_string());
+        return Err(e);
+    }
+    // v2.36: PG19 DefineIndex — a UNIQUE index on a partitioned
+    // table whose subtree contains foreign tables is rejected.
+    if unique {
+        let t = eng
+            .db
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+            .cloned();
+        if let Some(t) = t {
+            if t.partition.as_ref().is_some_and(|p| p.is_partitioned)
+                && subtree_has_foreign(&eng.db, ctx.snap, ctx.own, ctx.session, table)
+            {
+                let base = table.rsplit('.').next().unwrap_or(table);
+                return Err(unique_index_foreign_err(base));
+            }
+        }
+    }
     // v2.31: PG19 indexcmds.c — GiST does not support unique indexes.
     if gist && unique {
         return Err(exec_err(

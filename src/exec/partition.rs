@@ -720,7 +720,10 @@ pub(crate) fn commit_table_version(
     }
     next.created_xmin = ctx.own;
     next.dropped_xmax = 0;
-    let versions = eng.db.tables.get_mut(name).expect("table still visible");
+    // v2.36: resolve the storage key (schema-attributed tables
+    // live under their bare key; the raw spelling panicked).
+    let key = eng.db.table_storage_key(name);
+    let versions = eng.db.tables.get_mut(&key).expect("table still visible");
     let old_live = versions
         .iter_mut()
         .find(|t| crate::storage::table_visible(t, ctx.snap, &ctx.all_xids))
@@ -731,7 +734,7 @@ pub(crate) fn commit_table_version(
     old_live.rebuild_row_index();
     versions.push(next);
     ctx.writes.push(WriteOp::AlterTable {
-        name: name.to_string(),
+        name: key,
         prev,
         renamed_to: None,
         rewrite_rows: false,
@@ -1058,6 +1061,66 @@ pub(crate) fn attach_partition(
                         "constraint \"{}\" conflicts with non-inherited constraint on child table \"{}\"",
                         cc.name, child_name
                     ),
+                ));
+            }
+        }
+    }
+    // v2.36: PG19 ATExecAttachPartition runs the same attribute /
+    // constraint merge validation as INHERIT — the parent's NOT
+    // NULL columns must be NOT NULL in the child and the parent's
+    // CHECK constraints must already exist there (42804). (Only
+    // the row-level bound validation is skipped for foreign
+    // partitions; these schema checks are not.)
+    {
+        let parent_t = eng
+            .db
+            .find_table(parent_name, ctx.snap, &ctx.all_xids, ctx.session)
+            .expect("parent resolved above");
+        let child_t = eng
+            .db
+            .find_table(child_name, ctx.snap, &ctx.all_xids, ctx.session)
+            .expect("child resolved above");
+        for (pi, (pname, _)) in parent_t.columns.iter().enumerate() {
+            if parent_t.not_null.get(pi) != Some(&true) {
+                continue;
+            }
+            let nn_no_inherit = parent_t.checks.iter().any(|c| {
+                c.kind == crate::sql::CheckKind::NotNull && c.no_inherit && {
+                    let mut refs: Vec<(Option<String>, String)> = Vec::new();
+                    crate::sql::collect_col_refs(&c.expr, &mut refs);
+                    refs.iter().any(|(_, r)| r == pname)
+                }
+            });
+            if nn_no_inherit {
+                continue;
+            }
+            let ci = child_t
+                .columns
+                .iter()
+                .position(|(n, _)| n == pname)
+                .expect("column compatibility checked above");
+            if child_t.not_null.get(ci) != Some(&true) {
+                return Err(exec_err(
+                    "42804",
+                    format!(
+                        "column \"{}\" in child table \"{}\" must be marked NOT NULL",
+                        pname, child_name
+                    ),
+                ));
+            }
+        }
+        for pc in &parent_t.checks {
+            if pc.kind != crate::sql::CheckKind::Check || pc.no_inherit {
+                continue;
+            }
+            let pexpr = format!("{:?}", pc.expr);
+            let found = child_t.checks.iter().any(|cc| {
+                cc.kind == crate::sql::CheckKind::Check && format!("{:?}", cc.expr) == pexpr
+            });
+            if !found {
+                return Err(exec_err(
+                    "42804",
+                    format!("child table is missing constraint \"{}\"", pc.name),
                 ));
             }
         }
@@ -1654,8 +1717,11 @@ pub(crate) fn alter_inherit(
         // v1.97: PG19 MergeCheckConstraint — every parent CHECK
         // constraint must already exist in the child (matched by
         // definition), else INHERIT fails (42804).
+        // v2.36: NO INHERIT constraints never merge (PG19 marks
+        // them connoinherit and MergeInheritedConstraint skips
+        // them), so they are exempt from the requirement.
         for pc in &parent.checks {
-            if pc.kind != crate::sql::CheckKind::Check {
+            if pc.kind != crate::sql::CheckKind::Check || pc.no_inherit {
                 continue;
             }
             let pexpr = format!("{:?}", pc.expr);
@@ -5288,13 +5354,38 @@ pub(crate) fn create_table_from_def(
                     like_def.domain_elem[i] = false;
                 }
                 _ => {
-                    return Err(exec_err(
-                        "42704",
-                        format!(
-                            "type \"{}\" does not exist",
-                            tname.as_deref().unwrap_or("<unknown>")
-                        ),
-                    ));
+                    // v2.36: PG19 — every relation has a row type, and
+                    // it is usable as a column type (foreign_data's
+                    // `CREATE TABLE use_ft1_column_type (x ft1)`; the
+                    // same holds for ordinary tables). The type
+                    // registry holds only standalone types, so fall
+                    // back to a visible relation or view of that
+                    // name, mirroring the cast path
+                    // (eval_cast_composite_inner). The recorded name
+                    // stays as written; value paths resolve it the
+                    // same way.
+                    let rel_ok = tname.as_deref().is_some_and(|n| {
+                        eng.db
+                            .find_table(n, ctx.snap, &ctx.all_xids, ctx.session)
+                            .is_some()
+                            || crate::exec::viewdml::view_columns_of_db(
+                                eng,
+                                ctx.snap,
+                                ctx.own,
+                                ctx.session,
+                                n,
+                            )
+                            .is_ok()
+                    });
+                    if !rel_ok {
+                        return Err(exec_err(
+                            "42704",
+                            format!(
+                                "type \"{}\" does not exist",
+                                tname.as_deref().unwrap_or("<unknown>")
+                            ),
+                        ));
+                    }
                 }
             }
         } else if ty == ColType::Array(ArrayElem::Record) {

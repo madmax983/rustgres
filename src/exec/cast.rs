@@ -1230,6 +1230,8 @@ pub(crate) fn catalog_name_oid(name: &str) -> Option<u32> {
         "pg_trigger" => 2620,
         "pg_foreign_data_wrapper" => 2328,
         "pg_foreign_server" => 1417,
+        "pg_foreign_table" => 3118,
+        "pg_user_mapping" => 1418,
         "pg_shdescription" => 2396,
         "pg_largeobject_metadata" => 2995,
         "pg_extension" => 3079,
@@ -2668,8 +2670,16 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
 /// User-function OIDs follow the pg_trigger scan scheme (40000 +
 /// name-sorted index); builtin trigger functions carry real OIDs.
 pub(crate) fn regproc_display(q: &Q, oid: u32) -> String {
+    // PG19 regprocout: InvalidOid renders as "-".
+    if oid == 0 {
+        return "-".to_string();
+    }
     if oid == 1291 {
         return "suppress_redundant_updates_trigger".to_string();
+    }
+    // v2.36: the built-in FDW validator (pg_proc 2316).
+    if oid == 2316 {
+        return "postgresql_fdw_validator".to_string();
     }
     if oid >= 40000 {
         let mut names: Vec<&String> = q.eng.db.functions.keys().collect();

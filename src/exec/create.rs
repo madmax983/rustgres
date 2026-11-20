@@ -144,6 +144,42 @@ pub(crate) fn exec_create(
                 ),
             ));
         }
+        // v2.36: PG19 DefineRelation — persistence must match the
+        // parent's: a permanent relation cannot be a partition of a
+        // temporary relation, nor the reverse (42809).
+        let parent_temp = eng.db.is_temp_table(ctx.session, parent);
+        let parent_base = parent.rsplit('.').next().unwrap_or(parent);
+        if parent_temp && !temp {
+            return Err(exec_err(
+                "42809",
+                format!(
+                    "cannot create a permanent relation as partition of temporary relation \"{}\"",
+                    parent_base
+                ),
+            ));
+        }
+        if !parent_temp && temp {
+            return Err(exec_err(
+                "42809",
+                format!(
+                    "cannot create a temporary relation as partition of permanent relation \"{}\"",
+                    parent_base
+                ),
+            ));
+        }
+    }
+    // v2.36: PG19 — a permanent relation cannot INHERIT from a
+    // temporary one either (42809).
+    if !temp {
+        for parent_name in &def.inherits {
+            if eng.db.is_temp_table(ctx.session, parent_name) {
+                let base = parent_name.rsplit('.').next().unwrap_or(parent_name);
+                return Err(exec_err(
+                    "42809",
+                    format!("cannot inherit from temporary relation \"{}\"", base),
+                ));
+            }
+        }
     }
     // v2.03: generation expressions are validated at CREATE (PG19
     // cookDefault): immutable, own non-generated columns only.
@@ -603,7 +639,25 @@ pub(crate) fn create_serial_sequence(
     eng.db.sequences.entry(name.clone()).or_default().push(seq);
     ctx.writes
         .push(WriteOp::CreateSequence { name: name.clone() });
-    note_obj_schema(eng, ctx, &name, &name);
+    // v2.36: an owned (serial) sequence lives in its TABLE's
+    // schema (PG19), not in the ambient creation schema — the
+    // ADD COLUMN ... serial path on an already-moved table
+    // previously attributed the sequence to public, stranding it
+    // past DROP SCHEMA ... CASCADE (foreign_data's ft1_c11_seq).
+    {
+        let table_base = table.rsplit('.').next().unwrap_or(table);
+        let sch = eng
+            .db
+            .obj_schema
+            .get(table_base)
+            .cloned()
+            .unwrap_or_else(|| create_schema_of(eng, ctx, table));
+        if eng.db.obj_schema.get(&name) != Some(&sch) {
+            let prev = eng.db.obj_schema.clone();
+            eng.db.obj_schema.insert(name.clone(), sch);
+            ctx.writes.push(WriteOp::ObjSchemaSet { prev });
+        }
+    }
     Ok(name)
 }
 
@@ -659,7 +713,22 @@ pub(crate) fn create_identity_sequence(
     eng.db.sequences.entry(name.clone()).or_default().push(seq);
     ctx.writes
         .push(WriteOp::CreateSequence { name: name.clone() });
-    note_obj_schema(eng, ctx, &name, &name);
+    // v2.36: identity sequences share the serial rule — they live
+    // in the owning table's schema.
+    {
+        let table_base = table.rsplit('.').next().unwrap_or(table);
+        let sch = eng
+            .db
+            .obj_schema
+            .get(table_base)
+            .cloned()
+            .unwrap_or_else(|| create_schema_of(eng, ctx, table));
+        if eng.db.obj_schema.get(&name) != Some(&sch) {
+            let prev = eng.db.obj_schema.clone();
+            eng.db.obj_schema.insert(name.clone(), sch);
+            ctx.writes.push(WriteOp::ObjSchemaSet { prev });
+        }
+    }
     Ok(name)
 }
 

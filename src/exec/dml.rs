@@ -2906,6 +2906,11 @@ pub(crate) fn exec_insert_inner(
     on_conflict: &Option<OnConflict>,
     returning: &[SelectItem],
 ) -> Result<ExecResult, ExecError> {
+    // v2.36: DML on a foreign table reaches the wrapper (55000
+    // for the handler-less wrappers modeled here).
+    if let Some(e) = foreign_scan_error(&eng.db, table) {
+        return Err(e);
+    }
     // v2.14: INSERT into a view with INSTEAD OF triggers.
     if eng
         .db
@@ -4830,6 +4835,11 @@ pub(crate) fn exec_update_inner(
     with: &[CteDef],
     returning: &[SelectItem],
 ) -> Result<ExecResult, ExecError> {
+    // v2.36: DML on a foreign table reaches the wrapper (55000
+    // for the handler-less wrappers modeled here).
+    if let Some(e) = foreign_scan_error(&eng.db, table) {
+        return Err(e);
+    }
     // v2.14: UPDATE on a view with INSTEAD OF triggers.
     if eng
         .db
@@ -6202,6 +6212,11 @@ pub(crate) fn exec_delete_inner(
     with: &[CteDef],
     returning: &[SelectItem],
 ) -> Result<ExecResult, ExecError> {
+    // v2.36: DML on a foreign table reaches the wrapper (55000
+    // for the handler-less wrappers modeled here).
+    if let Some(e) = foreign_scan_error(&eng.db, table) {
+        return Err(e);
+    }
     // v2.14: DELETE on a view with INSTEAD OF triggers.
     if eng
         .db
