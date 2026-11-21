@@ -34,6 +34,9 @@ pub fn format_row(fields: &[String], is_null: &[bool], out: &mut Vec<u8>, option
     match options.format {
         CopyFormat::Text => format_text_row(fields, is_null, out, options),
         CopyFormat::Csv => format_csv_row(fields, is_null, out, options),
+        // JSON rows are rendered by the server (typed values), never
+        // through the text row formatter.
+        CopyFormat::Json => format_text_row(fields, is_null, out, options),
     }
 }
 
@@ -84,7 +87,10 @@ fn format_csv_row(fields: &[String], is_null: &[bool], out: &mut Vec<u8>, option
             let needs_quote = f
                 .bytes()
                 .any(|b| b == options.delimiter || b == options.quote || b == b'\n' || b == b'\r')
-                || *f == options.null;
+                || *f == options.null
+                // v2.37: FORCE_QUOTE columns are always quoted.
+                || options.force_quote_all
+                || options.force_quote_pos.get(i).copied().unwrap_or(false);
             if needs_quote {
                 out.push(options.quote);
                 for b in f.bytes() {
@@ -112,6 +118,12 @@ pub fn parse_rows(
     match options.format {
         CopyFormat::Text => parse_text_rows(data, options, ncols),
         CopyFormat::Csv => parse_csv_rows(data, options, ncols),
+        // COPY FROM in JSON mode is rejected when the statement is
+        // parsed (22023); defensive arm only.
+        CopyFormat::Json => Err(CopyParseError::at(
+            1,
+            "COPY FORMAT JSON is not supported for COPY FROM".to_string(),
+        )),
     }
 }
 
@@ -143,7 +155,12 @@ fn parse_text_rows(
 ) -> Result<Vec<Vec<CopyField>>, CopyParseError> {
     let mut rows = Vec::new();
     let lines = split_lines(data);
-    let skip = if options.header { 1 } else { 0 };
+    // MATCH (-1) and true (1) both skip exactly one line.
+    let skip = if options.header_lines == -1 {
+        1
+    } else {
+        options.header_lines.max(0) as usize
+    };
     for (li, line) in lines.iter().enumerate() {
         let lineno = li + 1;
         if li < skip {
@@ -262,7 +279,24 @@ fn parse_csv_rows(
             // field (a plain assignment trips `unused_assignments` on the
             // final iteration).
             let was_quoted = std::mem::replace(&mut field_quoted, false);
-            let f = if !was_quoted && field == options.null.as_bytes() {
+            // v2.37: PG19 copyfrom.c CSV NULL rules — a field equal
+            // to the null string is NULL when unquoted, or when
+            // quoted and the column is in FORCE_NULL; FORCE_NOT_NULL
+            // columns are never NULL (the value is the string).
+            let col_idx = row.len();
+            let fnn = options.force_not_null_all
+                || options
+                    .force_not_null_pos
+                    .get(col_idx)
+                    .copied()
+                    .unwrap_or(false);
+            let fnull = options.force_null_all
+                || options
+                    .force_null_pos
+                    .get(col_idx)
+                    .copied()
+                    .unwrap_or(false);
+            let f = if !fnn && field == options.null.as_bytes() && (!was_quoted || fnull) {
                 CopyField::Null
             } else {
                 let s = String::from_utf8(std::mem::take(&mut field))
@@ -286,7 +320,7 @@ fn parse_csv_rows(
         }};
     }
 
-    let skip_header = options.header;
+    let skip_header = options.header_lines != 0;
     let mut rows_skipped = 0;
 
     macro_rules! flush_run {
@@ -332,7 +366,10 @@ fn parse_csv_rows(
         } else if b == b'\n' {
             flush_run!();
             end_row!();
-            if skip_header && rows_skipped == 0 && !rows.is_empty() {
+            if skip_header
+                && rows_skipped < options.header_lines.max(1) as usize
+                && !rows.is_empty()
+            {
                 rows.pop();
                 rows_skipped += 1;
             }
@@ -361,7 +398,7 @@ fn parse_csv_rows(
     flush_run!();
     if !field.is_empty() || !row.is_empty() || field_quoted {
         end_row!();
-        if skip_header && rows_skipped == 0 {
+        if skip_header && (rows_skipped as i32) < options.header_lines.max(1) {
             rows.pop();
         }
     }

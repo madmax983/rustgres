@@ -1573,6 +1573,16 @@ fn render_pg_ndistinct(text: &str) -> Option<String> {
 }
 
 pub(crate) fn eval_cast_named(q: &mut Q, v: &Value, name: &str) -> Result<Value, ExecError> {
+    // v2.37: a cast to the `record` pseudo-type is the identity
+    // (PG19: any composite value is already a record).
+    if name
+        .rsplit('.')
+        .next()
+        .unwrap_or(name)
+        .eq_ignore_ascii_case("record")
+    {
+        return Ok(v.clone());
+    }
     // v1.96: an array-to-array cast runs the ELEMENT cast function
     // (pg_cast entry for the element pair); PG checks EXECUTE on it
     // at parse time — REVOKE ALL ON FUNCTION int8(integer) FROM

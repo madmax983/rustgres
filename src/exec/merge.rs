@@ -612,7 +612,7 @@ pub(crate) fn exec_merge(
         {
             let mut kept = Vec::with_capacity(vis.len());
             for entry in vis {
-                if rls_row_visible(&mut q, &tgt_schema, &entry.4, &groups)? {
+                if rls_row_visible(&mut q, table, &tgt_schema, &entry.4, &groups)? {
                     kept.push(entry);
                 }
             }
@@ -2278,6 +2278,17 @@ fn describe_merge_returning_with_schemas(
                     expanded.push(SelectItem::Expr {
                         expr: Expr::Column {
                             table: Some(qual.to_string()),
+                            name: c.name.clone(),
+                        },
+                        alias: None,
+                    });
+                }
+                // v2.37: PG19 MERGE RETURNING * covers the source
+                // relation too (target first, then source).
+                for c in src_schema.iter().filter(|c| !c.hidden) {
+                    expanded.push(SelectItem::Expr {
+                        expr: Expr::Column {
+                            table: Some(c.qual.clone()),
                             name: c.name.clone(),
                         },
                         alias: None,

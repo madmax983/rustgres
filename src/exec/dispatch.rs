@@ -829,9 +829,21 @@ pub(crate) fn execute_inner(
             volatility,
             strict,
             security_definer,
+            leakproof,
             procedure,
             table_cols,
-        } => exec_create_function(
+        } => {
+            // v2.37: PG19 functioncmds.c — only a superuser may
+            // define a LEAKPROOF function (42501).
+            if *leakproof
+                && !crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own)
+            {
+                return Err(exec_err(
+                    "42501",
+                    "only superuser can define a leakproof function".to_string(),
+                ));
+            }
+            exec_create_function(
             eng,
             ctx,
             name,
@@ -846,7 +858,8 @@ pub(crate) fn execute_inner(
             *security_definer,
             *procedure,
             table_cols,
-        ),
+            )
+        }
         Stmt::DropFunction {
             name,
             arg_types,

@@ -2613,8 +2613,20 @@ pub(crate) fn plan_select(
     // `remove_useless_joins_from`, mirroring PG19 planmain.c order.
     // v1.77: the nested-inner-join extension runs when the top-level
     // shape does not apply (disjoint shapes; one pair per milestone).
+    // v2.37: gated by the enable_self_join_elimination GUC (PG19
+    // query_planner skips remove_useless_self_joins when it is off).
+    let sje_off = crate::exec::installed_guc("enable_self_join_elimination")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "off" | "false" | "no" | "0"
+            )
+        })
+        .unwrap_or(false);
     let stmt_owned_sje;
-    let stmt: &SelectStmt =
+    let stmt: &SelectStmt = if sje_off {
+        stmt
+    } else {
         match remove_useless_self_joins_from(eng, &stmt.from, stmt, snap, own, session) {
             Some(rewritten) => {
                 stmt_owned_sje = rewritten;
@@ -2629,7 +2641,8 @@ pub(crate) fn plan_select(
                 }
                 None => stmt,
             },
-        };
+        }
+    };
     // v1.08: PG-text name/type context for this query level, plus the
     // WHERE clause distributed over the FROM items (per-item slices and
     // the join-level remainder).

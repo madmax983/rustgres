@@ -43,6 +43,45 @@ pub(crate) fn set_session_user(name: &str) {
     SESSION_USER.with(|s| *s.borrow_mut() = Some(name.to_string()));
 }
 
+thread_local! {
+    /// v2.37: tables whose policy expressions are currently being
+    /// evaluated on this thread (PG19 rewriteHandler.c `activeRIRs`).
+    /// A policy qual that (transitively, including through views)
+    /// scans a table already on the stack is infinite recursion:
+    /// 42P17, PG's exact message. Sequential scans never nest, so
+    /// ordinary self-joins and repeated scans of one RLS table in a
+    /// single statement are unaffected.
+    static POLICY_EVAL_TABLES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// RAII entry into policy-expression evaluation for `table`.
+pub(crate) struct PolicyEvalGuard;
+
+pub(crate) fn enter_policy_eval(table_name: &str) -> Result<PolicyEvalGuard, ExecError> {
+    POLICY_EVAL_TABLES.with(|s| {
+        let mut stack = s.borrow_mut();
+        if stack.iter().any(|t| t == table_name) {
+            return Err(exec_err(
+                "42P17",
+                format!(
+                    "infinite recursion detected in policy for relation \"{}\"",
+                    table_name
+                ),
+            ));
+        }
+        stack.push(table_name.to_string());
+        Ok(PolicyEvalGuard)
+    })
+}
+
+impl Drop for PolicyEvalGuard {
+    fn drop(&mut self) {
+        POLICY_EVAL_TABLES.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
 pub(crate) fn session_user_name(fallback: &str) -> String {
     SESSION_USER.with(|s| s.borrow().clone().unwrap_or_else(|| fallback.to_string()))
 }
@@ -60,6 +99,14 @@ pub fn set_current_settings(map: std::collections::HashMap<String, String>) {
 
 pub(crate) fn installed_guc(name: &str) -> Option<String> {
     CURRENT_SETTINGS.with(|c| c.borrow().get(name).cloned())
+}
+
+/// v2.37: set_config() writes into the statement-scoped snapshot so
+/// current_setting() later in the same statement observes it.
+pub(crate) fn set_installed_guc(name: &str, value: &str) {
+    CURRENT_SETTINGS.with(|c| {
+        c.borrow_mut().insert(name.to_string(), value.to_string());
+    });
 }
 
 /// Install the session's `row_security` GUC for one statement
@@ -133,16 +180,50 @@ fn applicable_policies<'t>(
 /// policy. An empty permissive set is default-deny (false). A policy
 /// whose picked expr is absent counts as `true` (PG19: a NULL qual is
 /// unrestricted).
+/// v2.37: PG19 evaluates a policy's qual against the policy's own
+/// RTE — the row is addressable under the table's own (bare) name
+/// regardless of the alias the query gave the table (parse analysis
+/// binds policy vars to the RTE, not to the query's range table).
+/// When the incoming binding uses a different qualifier, append a
+/// hidden copy of the columns qualified by the bare table name so
+/// whole-row (`t`) and qualified (`t.col`) references in policy
+/// expressions resolve. Returns the (possibly augmented) pair.
+fn policy_scope_augment<'a>(
+    table_name: &str,
+    schema: &'a [QCol],
+    cells: &'a [Value],
+) -> (std::borrow::Cow<'a, [QCol]>, std::borrow::Cow<'a, [Value]>) {
+    let bare = table_name.rsplit('.').next().unwrap_or(table_name);
+    if schema.iter().any(|c| c.qual == bare) {
+        return (
+            std::borrow::Cow::Borrowed(schema),
+            std::borrow::Cow::Borrowed(cells),
+        );
+    }
+    let mut s2: Vec<QCol> = schema.to_vec();
+    for c in schema {
+        let mut c2 = c.clone();
+        c2.qual = bare.to_string();
+        c2.hidden = true;
+        s2.push(c2);
+    }
+    let mut v2: Vec<Value> = cells.to_vec();
+    v2.extend_from_slice(cells);
+    (std::borrow::Cow::Owned(s2), std::borrow::Cow::Owned(v2))
+}
+
 fn eval_group(
     q: &mut Q,
+    table_name: &str,
     schema: &[QCol],
     cells: &[Value],
     policies: &[&PolicyDef],
     expr_of: impl Fn(&PolicyDef) -> Option<&Expr>,
 ) -> Result<bool, ExecError> {
+    let (schema2, cells2) = policy_scope_augment(table_name, schema, cells);
     let frame = Scope {
-        schema,
-        row: cells,
+        schema: &schema2,
+        row: &cells2,
         prov: None,
     };
     let scopes = [frame];
@@ -188,6 +269,7 @@ pub(crate) fn rls_filter_qrows(
     if !rls_applies(q.eng, q.snap, q.own, t, table_name, q.role)? {
         return Ok(rows);
     }
+    let _policy_guard = enter_policy_eval(table_name)?;
     let groups: Vec<Vec<&PolicyDef>> = cmds
         .iter()
         .map(|c| applicable_policies(q.eng, q.snap, q.own, t, *c, q.role))
@@ -196,7 +278,9 @@ pub(crate) fn rls_filter_qrows(
     for row in rows {
         let mut keep = true;
         for g in &groups {
-            if !eval_group(q, schema, &row.cells, g, |p| p.using_expr.as_ref())? {
+            if !eval_group(q, table_name, schema, &row.cells, g, |p| {
+                p.using_expr.as_ref()
+            })? {
                 keep = false;
                 break;
             }
@@ -237,12 +321,14 @@ pub(crate) fn rls_visibility_groups<'t>(
 /// collection in dml.rs, which builds its own Q).
 pub(crate) fn rls_row_visible(
     q: &mut Q,
+    table_name: &str,
     schema: &[QCol],
     cells: &[Value],
     groups: &[Vec<&PolicyDef>],
 ) -> Result<bool, ExecError> {
+    let _policy_guard = enter_policy_eval(table_name)?;
     for g in groups {
-        if !eval_group(q, schema, cells, g, |p| p.using_expr.as_ref())? {
+        if !eval_group(q, table_name, schema, cells, g, |p| p.using_expr.as_ref())? {
             return Ok(false);
         }
     }
@@ -327,9 +413,11 @@ fn check_one_group(
     conflict_flavor: bool,
     expr_of: impl Fn(&PolicyDef) -> Option<&Expr>,
 ) -> Result<(), ExecError> {
+    let _policy_guard = enter_policy_eval(table_name)?;
+    let (schema2, cells2) = policy_scope_augment(table_name, schema, cells);
     let frame = Scope {
-        schema,
-        row: cells,
+        schema: &schema2,
+        row: &cells2,
         prov: None,
     };
     let scopes = [frame];
@@ -513,6 +601,7 @@ pub(crate) fn rls_check_merge_using(
     if !rls_applies(q.eng, q.snap, q.own, t, table_name, q.role)? {
         return Ok(());
     }
+    let _policy_guard = enter_policy_eval(table_name)?;
     let group = applicable_policies(q.eng, q.snap, q.own, t, cmd, q.role);
     let fail = |name: Option<&str>| -> ExecError {
         let msg = match name {
@@ -527,9 +616,10 @@ pub(crate) fn rls_check_merge_using(
         };
         exec_err("42501", msg)
     };
+    let (schema2, cells2) = policy_scope_augment(table_name, schema, cells);
     let frame = Scope {
-        schema,
-        row: cells,
+        schema: &schema2,
+        row: &cells2,
         prov: None,
     };
     let scopes = [frame];
@@ -644,6 +734,23 @@ fn validate_policy_shape(
     for r in roles {
         if eng.db.find_role(r, ctx.snap, ctx.own).is_none() {
             return Err(exec_err("42704", format!("role \"{}\" does not exist", r)));
+        }
+    }
+    // v2.37: PG19 rejects aggregates and window functions in policy
+    // expressions at CREATE/ALTER POLICY (rewriteHandler via
+    // checkExprHasAgg / window walker over the qual).
+    for e in [using_expr, check_expr].into_iter().flatten() {
+        if crate::exec::contains_agg(e) {
+            return Err(exec_err(
+                "42803",
+                "aggregate functions are not allowed in policy expressions".to_string(),
+            ));
+        }
+        if crate::exec::contains_window(e) {
+            return Err(exec_err(
+                "42P20",
+                "window functions are not allowed in policy expressions".to_string(),
+            ));
         }
     }
     match cmd {
@@ -831,6 +938,105 @@ pub(crate) fn exec_drop_policy(
     Ok(ExecResult::Command {
         tag: "DROP POLICY".to_string(),
     })
+}
+
+/// v2.37: does this policy qual SQL reference relation `bare` as a
+/// FROM/JOIN target? Token-level scan of the stored qual text —
+/// PG19 records the same fact in pg_depend at parse-analysis time
+/// (find_expr_references_walker over the qual's range table).
+fn qual_references_rel(sql: &str, bare: &str) -> bool {
+    let Ok(toks) = crate::sql::tokenize(sql) else {
+        return false;
+    };
+    let mut i = 0;
+    while i < toks.len() {
+        if let crate::sql::Token::Ident(w) = &toks[i] {
+            if w == "from" || w == "join" {
+                // Exactly one dotted name: Ident (Dot Ident)* — an
+                // alias or following keyword is NOT part of it.
+                let mut j = i + 1;
+                let mut last: Option<&str> = None;
+                if j < toks.len() {
+                    if let crate::sql::Token::Ident(n) | crate::sql::Token::QIdent(n) = &toks[j] {
+                        last = Some(n);
+                        j += 1;
+                        while j + 1 < toks.len() && toks[j] == crate::sql::Token::Dot {
+                            if let crate::sql::Token::Ident(n) | crate::sql::Token::QIdent(n) =
+                                &toks[j + 1]
+                            {
+                                last = Some(n);
+                            }
+                            j += 2;
+                        }
+                    }
+                }
+                if last == Some(bare) {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// v2.37: (table, policy) pairs whose quals reference relation
+/// `target` — the pg_depend edges PG19 checks on DROP TABLE / DROP
+/// VIEW: RESTRICT fails 2BP01, CASCADE drops the policies. The
+/// target's own policies are excluded (they die with the relation).
+pub(crate) fn policies_referencing_rel(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    target: &str,
+) -> Vec<(String, String)> {
+    let bare = target.rsplit('.').next().unwrap_or(target);
+    let mut out = Vec::new();
+    for tname in eng.db.tables.keys() {
+        if tname.rsplit('.').next().unwrap_or(tname) == bare {
+            continue;
+        }
+        let Some(t) = eng
+            .db
+            .find_table(tname, ctx.snap, &ctx.all_xids, ctx.session)
+        else {
+            continue;
+        };
+        for p in &t.policies {
+            let hit = [p.using_sql.as_deref(), p.check_sql.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|sql| qual_references_rel(sql, bare));
+            if hit {
+                out.push((tname.clone(), p.name.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// v2.37: remove a policy without the DROP POLICY ownership checks
+/// (CASCADE drops from DROP TABLE / DROP VIEW drive it).
+pub(crate) fn drop_policy_internal(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table: &str,
+    policy: &str,
+) -> Result<(), ExecError> {
+    let Some(t) = eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+        .cloned()
+    else {
+        return Ok(());
+    };
+    if !t.policies.iter().any(|p| p.name == policy) {
+        return Ok(());
+    }
+    let prev = t.clone();
+    let mut next = t;
+    next.policies.retain(|p| p.name != policy);
+    commit_table_version(eng, ctx, table, prev, next);
+    Ok(())
 }
 
 /// v1.95: ALTER TABLE {ENABLE|DISABLE|FORCE|NO FORCE} ROW LEVEL

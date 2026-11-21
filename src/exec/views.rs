@@ -448,6 +448,23 @@ pub(crate) fn exec_drop_view(
                 ),
             ));
         }
+        // v2.37: policies whose quals reference this view are
+        // dependencies too (PG19 pg_depend): RESTRICT fails, CASCADE
+        // drops the policies with the view.
+        let pol_refs = crate::exec::policies_referencing_rel(eng, ctx, name);
+        if !pol_refs.is_empty() && !cascade {
+            let (t, p) = &pol_refs[0];
+            return Err(exec_err(
+                "2BP01",
+                format!(
+                    "cannot drop view {} because policy {} on table {} depends on it",
+                    name, p, t
+                ),
+            ));
+        }
+        for (t, p) in &pol_refs {
+            crate::exec::drop_policy_internal(eng, ctx, t, p)?;
+        }
         for dep in &dependents {
             drop_view_internal(eng, ctx, dep)?;
         }
@@ -713,6 +730,27 @@ pub(crate) fn mutate_view_def(
         name: name.to_string(),
     });
     Ok(())
+}
+
+/// v2.37: ALTER VIEW ... OWNER TO (PG19: only the current owner or
+/// a superuser may do this; the new owner must exist, 42704).
+pub(crate) fn exec_alter_view_owner_to(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    new_owner: &str,
+) -> Result<ExecResult, ExecError> {
+    require_view_owner(eng, ctx, name)?;
+    if eng.db.find_role(new_owner, ctx.snap, ctx.own).is_none() {
+        return Err(exec_err(
+            "42704",
+            format!("role \"{}\" does not exist", new_owner),
+        ));
+    }
+    mutate_view_def(eng, ctx, name, |d| d.owner = new_owner.to_string())?;
+    Ok(ExecResult::Command {
+        tag: "ALTER VIEW".to_string(),
+    })
 }
 
 /// v2.18: ALTER VIEW SET/RESET (reloptions) for the view options

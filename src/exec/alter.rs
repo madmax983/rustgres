@@ -931,6 +931,13 @@ pub(crate) fn exec_alter_stmt(
         {
             return exec_alter_view_reloptions(eng, ctx, name, actions);
         }
+        // v2.37: ALTER VIEW ... OWNER TO (PG19 AlterTableStmt on a
+        // view changes pg_class.relowner).
+        if is_view && actions.len() == 1 && matches!(actions[0], AlterAction::OwnerTo { .. }) {
+            if let AlterAction::OwnerTo { new_owner } = &actions[0] {
+                return exec_alter_view_owner_to(eng, ctx, name, new_owner);
+            }
+        }
         if is_view
             && !actions.is_empty()
             && actions

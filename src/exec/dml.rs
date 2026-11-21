@@ -264,6 +264,19 @@ pub(crate) fn coerce_value(
     if matches!(v, Value::Record(_)) && matches!(col_type, ColType::Composite) {
         return Ok(v);
     }
+    // v2.37: reg* values ride as their text output form (the named
+    // casts in eval_expr produce Text for regclass & friends), so a
+    // text value assigning to a reg* target is already in target
+    // form. Set-op branch coercion hits this (tableoid::regclass
+    // UNION branches failed 42804 before).
+    if matches!(v, Value::Text(_) | Value::BpChar(_))
+        && matches!(
+            col_type,
+            ColType::Regclass | ColType::Regproc | ColType::Regprocedure | ColType::Regnamespace
+        )
+    {
+        return Ok(v);
+    }
     // v0.65: narrowing integer assignments (PG's assignment casts, e.g.
     // nextval()'s bigint into a serial integer column). Overflow is
     // PG19's 22003, not a type mismatch.
@@ -489,6 +502,21 @@ pub(crate) fn describe_returning(
                         alias: None,
                     });
                 }
+                // v2.37: PG19 expands RETURNING * over the whole
+                // range table — the target first, then the UPDATE
+                // FROM / DELETE USING relations in FROM order
+                // (parse_target.c expandRTE over the rtable).
+                for s in extra {
+                    for c in s.iter().filter(|c| !c.hidden) {
+                        expanded.push(SelectItem::Expr {
+                            expr: Expr::Column {
+                                table: Some(c.qual.clone()),
+                                name: c.name.clone(),
+                            },
+                            alias: None,
+                        });
+                    }
+                }
             }
             SelectItem::AllOf(q) if q == qual => {
                 for (n, _) in &t.columns {
@@ -501,11 +529,27 @@ pub(crate) fn describe_returning(
                     });
                 }
             }
-            SelectItem::AllOf(_) => {
-                return Err(exec_err(
-                    "42601",
-                    "RETURNING qual.* for a non-target table is not supported",
-                ));
+            SelectItem::AllOf(q) => {
+                // v2.37: RETURNING src.* over a FROM/USING relation.
+                let mut matched = false;
+                for s in extra {
+                    for c in s.iter().filter(|c| !c.hidden && &c.qual == q) {
+                        matched = true;
+                        expanded.push(SelectItem::Expr {
+                            expr: Expr::Column {
+                                table: Some(c.qual.clone()),
+                                name: c.name.clone(),
+                            },
+                            alias: None,
+                        });
+                    }
+                }
+                if !matched {
+                    return Err(exec_err(
+                        "42601",
+                        "RETURNING qual.* for a non-target table is not supported",
+                    ));
+                }
             }
             SelectItem::Expr { .. } => expanded.push(item.clone()),
         }
@@ -4895,18 +4939,28 @@ pub(crate) fn exec_update_inner(
             }
         }
     }
-    // v1.20: PostgreSQL rejects UPDATE...FROM when the target table's
-    // name appears among the FROM items (42712 "table name specified
-    // more than once"), even under LATERAL or with an alias — the check
-    // is on the relation name, not the alias. Without this we would
-    // wrongly succeed (e.g. `update xx1 ... from xx1, lateral ...`).
-    // Note: parse_from folds comma-separated items into a single
-    // Cross Join, so walk the Join tree to find plain Table items.
+    // v1.20: PostgreSQL rejects UPDATE...FROM when the target's
+    // effective range name reappears among the FROM items (42712
+    // "table name specified more than once"). v2.37 correction: PG19
+    // checkNameSpaceConflicts keys on the aliasname (explicit alias
+    // else relation name), so an aliased self-join is legal; the
+    // unaliased form (e.g. `update xx1 ... from xx1, lateral ...`)
+    // still errors. Note: parse_from folds comma-separated items
+    // into a single Cross Join, so walk the Join tree for Table items.
     if !from.is_empty() {
+        // v2.37: PG19 checkNameSpaceConflicts keys the conflict on
+        // the effective range name (explicit alias, else the bare
+        // relation name) — `UPDATE t2 t2_1 ... FROM t2 t2_2` is
+        // legal; only a repeated effective name is 42712.
         fn collect_table_names(item: &FromItem, out: &mut Vec<String>) {
             match item {
-                FromItem::Table { name, .. } => {
-                    out.push(name.rsplit('.').next().unwrap_or(name).to_string());
+                FromItem::Table { name, alias, .. } => {
+                    out.push(
+                        alias
+                            .clone()
+                            .unwrap_or_else(|| name.rsplit('.').next().unwrap_or(name).to_string())
+                            .to_lowercase(),
+                    );
                 }
                 FromItem::Join { left, right, .. } => {
                     collect_table_names(left, out);
@@ -4915,13 +4969,16 @@ pub(crate) fn exec_update_inner(
                 _ => {}
             }
         }
-        let target = table.rsplit('.').next().unwrap_or(table);
+        let target = alias
+            .clone()
+            .unwrap_or_else(|| table.rsplit('.').next().unwrap_or(table).to_string())
+            .to_lowercase();
         let mut names = Vec::new();
         for item in from {
             collect_table_names(item, &mut names);
         }
         for from_name in names {
-            if from_name.eq_ignore_ascii_case(target) {
+            if from_name.eq_ignore_ascii_case(&target) {
                 return Err(exec_err(
                     "42712",
                     format!("table name \"{}\" specified more than once", from_name),
@@ -5099,7 +5156,7 @@ pub(crate) fn exec_update_inner(
                 if let Some(groups) = rls_visibility_groups(&mut q, &tdef, table, &cmds)? {
                     let mut kept = Vec::with_capacity(vis.len());
                     for entry in vis {
-                        if rls_row_visible(&mut q, &schema, &entry.4, &groups)? {
+                        if rls_row_visible(&mut q, table, &schema, &entry.4, &groups)? {
                             kept.push(entry);
                         }
                     }
@@ -6375,7 +6432,7 @@ pub(crate) fn exec_delete_inner(
                     Some(groups) => {
                         let mut kept = Vec::with_capacity(vis.len());
                         for entry in vis {
-                            if rls_row_visible(&mut q, &schema, &entry.3, &groups)? {
+                            if rls_row_visible(&mut q, table, &schema, &entry.3, &groups)? {
                                 kept.push(entry);
                             }
                         }
@@ -7068,6 +7125,31 @@ pub(crate) fn exec_drop(
     for name in names {
         for d in crate::exec::alter::partition_descendants(eng, ctx, name) {
             stmt_set.insert(d);
+        }
+    }
+    // v2.37: policies on OTHER tables whose quals reference a table
+    // being dropped are pg_depend dependencies (PG19): RESTRICT
+    // fails 2BP01; CASCADE drops the policies first.
+    for name in names {
+        let refs = crate::exec::policies_referencing_rel(eng, ctx, name);
+        let external: Vec<&(String, String)> =
+            refs.iter().filter(|(t, _)| !stmt_set.contains(t)).collect();
+        if !external.is_empty() {
+            if !cascade {
+                let (t, p) = external[0];
+                return Err(exec_err(
+                    "2BP01",
+                    format!(
+                        "cannot drop table {} because policy {} on table {} depends on it",
+                        name.rsplit('.').next().unwrap_or(name),
+                        p,
+                        t
+                    ),
+                ));
+            }
+            for (t, p) in external {
+                crate::exec::drop_policy_internal(eng, ctx, t, p)?;
+            }
         }
     }
     for name in names {

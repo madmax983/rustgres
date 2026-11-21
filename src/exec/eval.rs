@@ -3280,12 +3280,33 @@ pub(crate) fn eval_row_cmp(op: CmpOp, l: &[Value], r: &[Value]) -> Result<Option
 /// type name canonically equals the declared parameter type. Falls back
 /// to the first arity match (the call site coerces). Returns None if no
 /// overload has the right arity.
+/// v2.37: function lookup by call name — exact key first, then the
+/// bare name for public./pg_catalog.-qualified calls (PG resolves
+/// those schemas to the stored function; rustgres keys functions by
+/// their creation name, normally bare).
+pub(crate) fn lookup_functions<'a>(
+    eng: &'a Engine,
+    name: &str,
+) -> Option<&'a Vec<crate::storage::FuncDef>> {
+    if let Some(o) = eng.db.functions.get(name) {
+        return Some(o);
+    }
+    let bare = name
+        .strip_prefix("pg_catalog.")
+        .or_else(|| name.strip_prefix("public."))
+        .unwrap_or(name);
+    if bare != name {
+        return eng.db.functions.get(bare);
+    }
+    None
+}
+
 pub(crate) fn resolve_function_overload(
     eng: &Engine,
     name: &str,
     arg_vals: &[Value],
 ) -> Option<crate::storage::FuncDef> {
-    let overloads = eng.db.functions.get(name)?;
+    let overloads = lookup_functions(eng, name)?;
     let mut arity_match: Option<&crate::storage::FuncDef> = None;
     let mut plain_match: Option<&crate::storage::FuncDef> = None;
     let mut variadic_match: Option<&crate::storage::FuncDef> = None;
@@ -3370,7 +3391,7 @@ pub(crate) fn overload_for_argc(
     name: &str,
     argc: usize,
 ) -> Option<crate::storage::FuncDef> {
-    let ovs = eng.db.functions.get(name)?;
+    let ovs = lookup_functions(eng, name)?;
     let n_in = |f: &crate::storage::FuncDef| {
         (0..f.arg_types.len())
             .filter(|i| f.arg_mode(*i).is_input())
@@ -3401,7 +3422,7 @@ pub(crate) fn find_function_by_signature(
     name: &str,
     arg_types: &[String],
 ) -> Option<crate::storage::FuncDef> {
-    let overloads = eng.db.functions.get(name)?;
+    let overloads = lookup_functions(eng, name)?;
     for fdef in overloads {
         let inputs = fdef.input_arg_types();
         let cand: &[String] = if inputs.len() == arg_types.len() {

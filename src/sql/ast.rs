@@ -9218,6 +9218,7 @@ pub fn parse_trigger_body(body: &str) -> Result<TriggerBody, SqlError> {
         unnamed_seq: 0,
         allow_similar_to: true,
         last_bit_typmod: None,
+        select_into: None,
     };
     p.parse_trigger_body_stmts()
 }
@@ -10088,6 +10089,8 @@ pub enum Stmt {
         strict: bool,
         /// v1.96: SECURITY DEFINER (body runs as the function owner).
         security_definer: bool,
+        /// v2.37: LEAKPROOF (PG19: only a superuser may define one).
+        leakproof: bool,
         /// v1.96: CREATE PROCEDURE (stored as a void function flagged
         /// as a procedure; PG keeps a separate namespace).
         procedure: bool,
@@ -10730,6 +10733,9 @@ pub enum Stmt {
         /// true = `TO STDOUT`, false = `FROM STDIN`.
         to_stdout: bool,
         options: CopyOptions,
+        /// v2.37: `COPY (query) TO STDOUT` — the parenthesized query
+        /// form (table/columns unused when present).
+        query: Option<Box<SelectStmt>>,
     },
     // --- v0.3: transaction control (handled by the session, not the executor)
     Begin {
@@ -11040,9 +11046,31 @@ pub struct CopyOptions {
     pub format: CopyFormat,
     pub delimiter: u8,
     pub null: String,
-    pub header: bool,
+    /// v2.37: PG19 COPY HEADER: -1 = MATCH, 0 = off, 1 = on/true,
+    /// n > 1 = skip n lines (FROM only).
+    pub header_lines: i32,
     pub quote: u8,
     pub escape: u8,
+    /// v2.37: FORCE_NOT_NULL column names / star (CSV FROM semantics).
+    pub force_not_null: Vec<String>,
+    pub force_not_null_all: bool,
+    /// v2.37: FORCE_NULL column names / star (CSV FROM semantics).
+    pub force_null: Vec<String>,
+    pub force_null_all: bool,
+    /// v2.37: FORCE_QUOTE column names / star (CSV TO semantics).
+    pub force_quote: Vec<String>,
+    pub force_quote_all: bool,
+    /// v2.37: FORCE_ARRAY (JSON TO output wraps rows in an array).
+    pub force_array: bool,
+    /// v2.37: ON_ERROR value as written (stop/ignore/set_null),
+    /// validated at parse; ingest soft-error semantics are not
+    /// modeled (bad rows still abort the COPY).
+    pub on_error: Option<String>,
+    /// v2.37: force flags resolved to COPY column positions by the
+    /// server (the parser knows names, not positions). Empty = unset.
+    pub force_not_null_pos: Vec<bool>,
+    pub force_null_pos: Vec<bool>,
+    pub force_quote_pos: Vec<bool>,
 }
 
 /// v0.10: `COPY` data format (BINARY is not supported).
@@ -11050,6 +11078,8 @@ pub struct CopyOptions {
 pub enum CopyFormat {
     Text,
     Csv,
+    /// v2.37: PG19 COPY FORMAT JSON (output only).
+    Json,
 }
 
 impl Default for CopyOptions {
@@ -11058,9 +11088,20 @@ impl Default for CopyOptions {
             format: CopyFormat::Text,
             delimiter: b'\t',
             null: "\\N".to_string(),
-            header: false,
+            header_lines: 0,
             quote: b'"',
             escape: b'"',
+            force_not_null: Vec::new(),
+            force_not_null_all: false,
+            force_null: Vec::new(),
+            force_null_all: false,
+            force_quote: Vec::new(),
+            force_quote_all: false,
+            force_array: false,
+            on_error: None,
+            force_not_null_pos: Vec::new(),
+            force_null_pos: Vec::new(),
+            force_quote_pos: Vec::new(),
         }
     }
 }

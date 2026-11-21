@@ -18,6 +18,11 @@ pub(crate) struct Parser {
     /// carries no typmod, so RETURNING specs and JSON_TABLE columns
     /// read it from here.
     pub(crate) last_bit_typmod: Option<(i32, bool)>,
+    /// v2.37: `SELECT ... INTO name` captured by parse_select_core
+    /// (the INTO clause sits between the target list and FROM, deep
+    /// inside query parsing); parse_top_kw converts the statement
+    /// to CreateTableAs when this is set.
+    pub(crate) select_into: Option<(String, bool)>,
 }
 
 /// v2.34: BUFFER_USAGE_LIMIT string form ('512 kB', '1MB') to
@@ -413,7 +418,22 @@ impl Parser {
         match kw.as_str() {
             "create" => self.parse_create(),
             "insert" => self.parse_insert(),
-            "select" => Ok(Stmt::Select(self.parse_select_query()?)),
+            "select" => {
+                let sel = self.parse_select_query()?;
+                // v2.37: SELECT ... INTO (captured in parse_select_core).
+                if let Some((name, temp)) = self.select_into.take() {
+                    return Ok(Stmt::CreateTableAs {
+                        name,
+                        col_aliases: Vec::new(),
+                        select: Box::new(sel),
+                        temp,
+                        if_not_exists: false,
+                        with_data: true,
+                        execute: None,
+                    });
+                }
+                Ok(Stmt::Select(sel))
+            }
             // v0.54: PG19 `simple_select: values_clause | TABLE relation_expr`
             // — VALUES and TABLE are full top-level queries, not just
             // FROM items. Both desugar to the SELECT the executor
@@ -2656,6 +2676,15 @@ impl Parser {
                     ));
                 }
             }
+        } else if matches!(self.peek(), Token::Ident(s) if s == "values") {
+            // v2.37: CREATE TABLE AS VALUES (PG19 PreparableStmt
+            // includes VALUES; rowsecurity's coll_t/tbl1 shapes).
+            self.next(); // VALUES
+            self.parse_values_query()?
+        } else if matches!(self.peek(), Token::Ident(s) if s == "table") {
+            // v2.37: CREATE TABLE AS TABLE name (== SELECT * FROM).
+            self.next(); // TABLE
+            self.parse_table_query()?
         } else {
             self.expect_keyword("select")?;
             self.parse_select_query()?
@@ -3781,6 +3810,18 @@ impl Parser {
             self.expect_keyword("to")?;
             let new = self.expect_ident()?;
             return Ok(Stmt::AlterViewRenameColumn { name, old, new });
+        }
+        // v2.37: ALTER VIEW name OWNER TO role (PG19 AlterTableStmt
+        // on the view; routed like the other view AlterTable forms).
+        if self.eat_keyword("owner") {
+            self.expect_keyword("to")?;
+            let new_owner = self.expect_ident()?;
+            return Ok(Stmt::AlterTable {
+                name: tname,
+                actions: vec![AlterAction::OwnerTo { new_owner }],
+                if_exists: false,
+                only: false,
+            });
         }
         // v2.18: ALTER VIEW name ALTER COLUMN c SET/DROP DEFAULT
         // (PG19 AT_AlterColumnDefault on the view).
@@ -5176,6 +5217,7 @@ impl Parser {
         let mut body: Option<String> = None;
         let mut volatility = FuncVolatility::Volatile;
         let mut strict = false;
+        let mut leakproof = false;
         let mut security_definer = false;
         loop {
             // v1.96: SECURITY DEFINER | SECURITY INVOKER.
@@ -5315,6 +5357,67 @@ impl Parser {
                         code: "0A000",
                     });
                 }
+            } else if self.eat_keyword("leakproof") {
+                // v2.37: LEAKPROOF (PG19 gram.y function option). The
+                // executor has no leakproof qual ordering; the flag is
+                // carried for the superuser-only creation rule.
+                leakproof = true;
+                continue;
+            } else if self.eat_keyword("not") {
+                // v2.37: NOT LEAKPROOF (the default).
+                self.expect_keyword("leakproof")?;
+                leakproof = false;
+                continue;
+            } else if self.eat_keyword("called") {
+                // v2.37: CALLED ON NULL INPUT == not strict (PG19).
+                self.expect_keyword("on")?;
+                self.expect_keyword("null")?;
+                self.expect_keyword("input")?;
+                strict = false;
+            } else if matches!(self.peek(), Token::Ident(w) if w == "returns")
+                && matches!(self.peek2(), Token::Ident(w2) if w2 == "null")
+            {
+                // v2.37: RETURNS NULL ON NULL INPUT == STRICT (PG19).
+                // Only when followed by NULL: the RETURNS <type>
+                // clause was already consumed before this loop.
+                self.next();
+                self.expect_keyword("null")?;
+                self.expect_keyword("on")?;
+                self.expect_keyword("null")?;
+                self.expect_keyword("input")?;
+                strict = true;
+            } else if self.eat_keyword("return") {
+                // PG19: AS ... RETURN ... (or RETURN twice) is a
+                // duplicate body.
+                if body.is_some() {
+                    return Err(SqlError {
+                        message: "duplicate function body specified".to_string(),
+                        code: "42601",
+                    });
+                }
+                // v2.37: SQL-standard function body (PG19 gram.y
+                // func_body: RETURN func_return). The tail of the
+                // definition is the return query or expression; an
+                // expression body is stored as the equivalent SELECT
+                // body (the SQL-body executor's shape), a query body
+                // verbatim. Implies LANGUAGE SQL (the default below).
+                let tail = tokens_to_sql(&self.tokens[self.pos..]);
+                self.pos = self.tokens.len();
+                let first = tail
+                    .split(|c: char| c.is_whitespace() || c == '(')
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                body = Some(
+                    if matches!(
+                        first.as_str(),
+                        "select" | "with" | "values" | "table" | "insert" | "update" | "delete"
+                    ) {
+                        tail
+                    } else {
+                        format!("SELECT {}", tail)
+                    },
+                );
             } else if self.eat_keyword("as") {
                 match self.next() {
                     Token::Str(s) => {
@@ -5404,6 +5507,7 @@ impl Parser {
             volatility,
             strict,
             security_definer,
+            leakproof,
             procedure: false,
             table_cols,
         })
@@ -5488,6 +5592,7 @@ impl Parser {
             volatility: FuncVolatility::Volatile,
             strict: false,
             security_definer,
+            leakproof: false,
             procedure: true,
             table_cols: Vec::new(),
         })
@@ -7970,6 +8075,7 @@ impl Parser {
             unnamed_seq: 0,
             allow_similar_to: true,
             last_bit_typmod: None,
+            select_into: None,
         };
         if let Ok(mut e) = ep.parse_or() {
             let rest: Vec<Token> = ep.tokens[ep.pos..].to_vec();
@@ -9851,6 +9957,20 @@ impl Parser {
         }
     }
 
+    /// v2.37: PG19 gram.y — an INTO clause captured while parsing a
+    /// query that is not the statement's outermost SELECT is a
+    /// syntax error ("INTO is not allowed here", 42601). Consumers
+    /// that parse sub-context queries call this after parsing.
+    pub(crate) fn reject_captured_into(&mut self) -> Result<(), SqlError> {
+        if self.select_into.take().is_some() {
+            return Err(SqlError {
+                message: "INTO is not allowed here".to_string(),
+                code: "42601",
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn parse_insert(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("into")?;
         let table = self.parse_table_name()?;
@@ -9911,9 +10031,11 @@ impl Parser {
             (vec![Vec::new()], None)
         } else if self.eat_keyword("select") {
             let sel = self.parse_select_query()?;
+            self.reject_captured_into()?;
             (Vec::new(), Some(sel))
         } else if *self.peek() == Token::LParen {
             let sel = self.parse_select_query_not_consumed()?;
+            self.reject_captured_into()?;
             (Vec::new(), Some(sel))
         } else {
             self.expect_keyword("values")?;
@@ -10429,6 +10551,18 @@ impl Parser {
             "select" => {
                 let mut sel = self.parse_select_query()?;
                 sel.with = ctes;
+                // v2.37: WITH ... SELECT ... INTO.
+                if let Some((name, temp)) = self.select_into.take() {
+                    return Ok(Stmt::CreateTableAs {
+                        name,
+                        col_aliases: Vec::new(),
+                        select: Box::new(sel),
+                        temp,
+                        if_not_exists: false,
+                        with_data: true,
+                        execute: None,
+                    });
+                }
                 Ok(Stmt::Select(sel))
             }
             "insert" => {
@@ -10593,6 +10727,49 @@ impl Parser {
 
     /// v0.10: `COPY table [(cols)] FROM STDIN | TO STDOUT [WITH (...)]`.
     pub(crate) fn parse_copy(&mut self) -> Result<Stmt, SqlError> {
+        // v2.37: COPY (query) TO STDOUT (PG19 CopyStmt with a
+        // SelectStmt instead of a relation). TO-only; the query is
+        // parenthesized. Falls through to the shared option parsing.
+        if *self.peek() == Token::LParen {
+            let q = self.parse_select_query_not_consumed()?;
+            self.reject_captured_into()?;
+            if !self.eat_keyword("to") {
+                return Err(err(
+                    "syntax error: expected TO after COPY (query)".to_string()
+                ));
+            }
+            if !self.eat_keyword("stdout") {
+                return Err(SqlError {
+                    message: "COPY TO a file is not supported; use COPY TO STDOUT".to_string(),
+                    code: "0A000",
+                });
+            }
+            let (mut options, delimiter_set, null_set, quote_set, escape_set) =
+                self.parse_copy_options()?;
+            self.validate_copy_options(
+                &options,
+                true,
+                delimiter_set,
+                null_set,
+                quote_set,
+                escape_set,
+            )?;
+            if options.format == CopyFormat::Csv {
+                if !delimiter_set {
+                    options.delimiter = b',';
+                }
+                if !null_set {
+                    options.null = String::new();
+                }
+            }
+            return Ok(Stmt::Copy {
+                table: String::new(),
+                columns: None,
+                to_stdout: true,
+                options,
+                query: Some(Box::new(q)),
+            });
+        }
         let table = self.expect_ident()?;
         let columns = if *self.peek() == Token::LParen {
             self.next();
@@ -10635,19 +10812,318 @@ impl Parser {
                 self.peek()
             )));
         };
+        let (mut options, delimiter_set, null_set, quote_set, escape_set) =
+            self.parse_copy_options()?;
+        self.validate_copy_options(
+            &options,
+            to_stdout,
+            delimiter_set,
+            null_set,
+            quote_set,
+            escape_set,
+        )?;
+        // v0.10: CSV defaults (like Postgres): comma delimiter and
+        // empty-string NULL unless explicitly set.
+        if options.format == CopyFormat::Csv {
+            if !delimiter_set {
+                options.delimiter = b',';
+            }
+            if !null_set {
+                options.null = String::new();
+            }
+        }
+        Ok(Stmt::Copy {
+            table,
+            columns,
+            to_stdout,
+            options,
+            query: None,
+        })
+    }
+
+    /// v2.37: the COPY option list in either syntax — legacy
+    /// unparenthesized options, a bare WITH, or WITH (...). Returns
+    /// (options, delimiter_was_set, null_was_set) for CSV defaulting.
+    /// v2.37: a FORCE_* column specification: `*`, `(a, b, *)`, or
+    /// one bare column name (legacy syntax). Returns (names, star).
+    pub(crate) fn parse_force_cols(&mut self) -> Result<(Vec<String>, bool), SqlError> {
+        let mut names = Vec::new();
+        let mut all = false;
+        if *self.peek() == Token::LParen {
+            self.next();
+            loop {
+                if *self.peek() == Token::Star {
+                    self.next();
+                    all = true;
+                } else {
+                    names.push(self.expect_ident()?);
+                }
+                if *self.peek() == Token::Comma {
+                    self.next();
+                    continue;
+                }
+                break;
+            }
+            self.expect(Token::RParen, "')'")?;
+        } else if *self.peek() == Token::Star {
+            self.next();
+            all = true;
+        } else {
+            names.push(self.expect_ident()?);
+        }
+        Ok((names, all))
+    }
+
+    /// v2.37: PG19 ProcessCopyOptions cross-checks, in PG's order:
+    /// JSON-mode prohibitions, CSV-only options, direction rules.
+    pub(crate) fn validate_copy_options(
+        &self,
+        options: &CopyOptions,
+        to_stdout: bool,
+        delimiter_set: bool,
+        null_set: bool,
+        quote_set: bool,
+        escape_set: bool,
+    ) -> Result<(), SqlError> {
+        let na = |code: &'static str, message: String| SqlError { message, code };
+        if options.format == CopyFormat::Json {
+            if delimiter_set {
+                return Err(na(
+                    "0A000",
+                    "cannot specify DELIMITER in JSON mode".to_string(),
+                ));
+            }
+            if null_set {
+                return Err(na("0A000", "cannot specify NULL in JSON mode".to_string()));
+            }
+            if options.header_lines != 0 {
+                return Err(na(
+                    "0A000",
+                    "cannot specify HEADER in JSON mode".to_string(),
+                ));
+            }
+        }
+        if options.format != CopyFormat::Csv {
+            if quote_set {
+                return Err(na("0A000", "COPY QUOTE requires CSV mode".to_string()));
+            }
+            if escape_set {
+                return Err(na("0A000", "COPY ESCAPE requires CSV mode".to_string()));
+            }
+            if options.force_quote_all || !options.force_quote.is_empty() {
+                return Err(na(
+                    "0A000",
+                    "COPY FORCE_QUOTE requires CSV mode".to_string(),
+                ));
+            }
+            if options.force_not_null_all || !options.force_not_null.is_empty() {
+                return Err(na(
+                    "0A000",
+                    "COPY FORCE_NOT_NULL requires CSV mode".to_string(),
+                ));
+            }
+            if options.force_null_all || !options.force_null.is_empty() {
+                return Err(na("0A000", "COPY FORCE_NULL requires CSV mode".to_string()));
+            }
+        }
+        if !options.force_quote.is_empty() || options.force_quote_all {
+            if !to_stdout {
+                return Err(na(
+                    "0A000",
+                    "COPY FORCE_QUOTE cannot be used with COPY FROM".to_string(),
+                ));
+            }
+        }
+        if !options.force_not_null.is_empty() || options.force_not_null_all {
+            if to_stdout {
+                return Err(na(
+                    "22023",
+                    "COPY FORCE_NOT_NULL cannot be used with COPY TO".to_string(),
+                ));
+            }
+        }
+        if !options.force_null.is_empty() || options.force_null_all {
+            if to_stdout {
+                return Err(na(
+                    "22023",
+                    "COPY FORCE_NULL cannot be used with COPY TO".to_string(),
+                ));
+            }
+        }
+        if options.format == CopyFormat::Json && !to_stdout {
+            return Err(na(
+                "22023",
+                "COPY FORMAT JSON is not supported for COPY FROM".to_string(),
+            ));
+        }
+        if options.force_array && options.format != CopyFormat::Json {
+            return Err(na(
+                "22023",
+                "COPY FORCE_ARRAY can only be used with JSON mode".to_string(),
+            ));
+        }
+        // PG19 defGetCopyHeaderOption: MATCH and multi-line headers
+        // are FROM-only.
+        if to_stdout && options.header_lines == -1 {
+            return Err(na(
+                "0A000",
+                "cannot use \"match\" with HEADER in COPY TO".to_string(),
+            ));
+        }
+        if to_stdout && options.header_lines > 1 {
+            return Err(na(
+                "0A000",
+                "cannot use multi-line header in COPY TO".to_string(),
+            ));
+        }
+        if let Some(v) = &options.on_error {
+            if !matches!(v.as_str(), "stop" | "ignore" | "set_null") {
+                return Err(na(
+                    "22023",
+                    format!("COPY ON_ERROR \"{}\" not recognized", v),
+                ));
+            }
+            if to_stdout {
+                return Err(na(
+                    "0A000",
+                    "COPY ON_ERROR cannot be used with COPY TO".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn parse_copy_options(
+        &mut self,
+    ) -> Result<(CopyOptions, bool, bool, bool, bool), SqlError> {
         let mut options = CopyOptions::default();
         let mut delimiter_set = false;
         let mut null_set = false;
-        if self.eat_keyword("with") {
+        let mut quote_set = false;
+        let mut escape_set = false;
+        if matches!(self.peek(), Token::Ident(w) if w == "with")
+            && !matches!(self.peek2(), Token::LParen)
+        {
+            self.next(); // WITH
+            // v2.37: legacy pre-9.0 COPY option syntax (PG19 gram.y
+            // copy_opt_list): `WITH DELIMITER ','`, `WITH NULL 'x'`,
+            // `WITH CSV HEADER`, or a bare `WITH` with no options at
+            // all (`COPY t FROM stdin WITH ;` in rowsecurity.sql).
+            loop {
+                let Token::Ident(opt) = self.peek().clone() else {
+                    break;
+                };
+                match opt.as_str() {
+                    "delimiter" => {
+                        self.next();
+                        let _ = self.eat_keyword("as");
+                        options.delimiter = self.parse_copy_char("DELIMITER")?;
+                        delimiter_set = true;
+                    }
+                    "null" => {
+                        self.next();
+                        let _ = self.eat_keyword("as");
+                        options.null = self.parse_copy_string("NULL")?;
+                        null_set = true;
+                    }
+                    "header" => {
+                        self.next();
+                        options.header_lines = 1;
+                    }
+                    "quote" => {
+                        self.next();
+                        let _ = self.eat_keyword("as");
+                        options.quote = self.parse_copy_char("QUOTE")?;
+                    }
+                    "escape" => {
+                        self.next();
+                        let _ = self.eat_keyword("as");
+                        options.escape = self.parse_copy_char("ESCAPE")?;
+                    }
+                    "csv" => {
+                        self.next();
+                        options.format = CopyFormat::Csv;
+                    }
+                    "json" => {
+                        // v2.37: `COPY t TO STDOUT json` (PG19 legacy
+                        // format word).
+                        self.next();
+                        options.format = CopyFormat::Json;
+                    }
+                    "oids" | "freeze" => {
+                        // Planner/storage hints with no executor
+                        // meaning here; consumed (an optional boolean
+                        // word may follow OIDS in the old syntax).
+                        self.next();
+                        if opt == "oids" {
+                            let _ = self.eat_keyword("true") || self.eat_keyword("false");
+                        }
+                    }
+                    "encoding" => {
+                        self.next();
+                        let _ = self.parse_copy_string("ENCODING")?;
+                    }
+                    "force" => {
+                        // v2.37: FORCE QUOTE / FORCE NOT NULL / FORCE
+                        // NULL <col list | * | col> — recorded like the
+                        // parenthesized form (validated by the caller).
+                        self.next();
+                        enum FK {
+                            Quote,
+                            NotNull,
+                            Null,
+                        }
+                        let kind = if self.eat_keyword("not") {
+                            self.expect_keyword("null")?;
+                            FK::NotNull
+                        } else if self.eat_keyword("quote") {
+                            FK::Quote
+                        } else {
+                            self.expect_keyword("null")?;
+                            FK::Null
+                        };
+                        let (names, all) = self.parse_force_cols()?;
+                        match kind {
+                            FK::Quote => {
+                                options.force_quote = names;
+                                options.force_quote_all = all;
+                            }
+                            FK::NotNull => {
+                                options.force_not_null = names;
+                                options.force_not_null_all = all;
+                            }
+                            FK::Null => {
+                                options.force_null = names;
+                                options.force_null_all = all;
+                            }
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        } else if self.eat_keyword("with") || *self.peek() == Token::LParen {
+            // PG19 gram.y copy_options: WITH '(' list ')' or a bare
+            // '(' list ')' — both are the modern option list.
             self.expect(Token::LParen, "'('")?;
+            let mut seen_opts: Vec<String> = Vec::new();
             loop {
                 let opt = self.expect_ident()?;
+                // PG19 ProcessCopyOptions: ANY option supplied
+                // twice is "conflicting or redundant options" (42601).
+                if seen_opts.iter().any(|o| o == &opt) {
+                    return Err(SqlError {
+                        message: "conflicting or redundant options".to_string(),
+                        code: "42601",
+                    });
+                }
+                seen_opts.push(opt.clone());
                 match opt.as_str() {
                     "format" => {
                         let fmt = self.expect_ident()?;
                         options.format = match fmt.as_str() {
                             "text" => CopyFormat::Text,
                             "csv" => CopyFormat::Csv,
+                            "json" => CopyFormat::Json,
                             "binary" => {
                                 return Err(SqlError {
                                     message: "COPY FORMAT BINARY is not supported".to_string(),
@@ -10671,24 +11147,118 @@ impl Parser {
                         null_set = true;
                     }
                     "header" => {
-                        // `HEADER` or `HEADER true|false`.
-                        options.header = match self.peek() {
-                            Token::Ident(v) if v == "true" => {
+                        // PG19 defGetCopyHeaderOption: bare (true), a
+                        // boolean, a non-negative integer (lines to
+                        // skip), a numeric string, or "match".
+                        options.header_lines = match self.peek().clone() {
+                            Token::Ident(w) if w == "true" || w == "on" => {
                                 self.next();
-                                true
+                                1
                             }
-                            Token::Ident(v) if v == "false" => {
+                            Token::Ident(w) if w == "false" || w == "off" => {
                                 self.next();
-                                false
+                                0
                             }
-                            _ => true,
+                            Token::Ident(w) if w == "match" => {
+                                self.next();
+                                -1
+                            }
+                            Token::Ident(_) => {
+                                return Err(SqlError {
+                                    message: "header requires a Boolean value, an integer value greater than or equal to zero, or the string \"match\"".to_string(),
+                                    code: "42601",
+                                });
+                            }
+                            Token::Number(n) => {
+                                self.next();
+                                let v: i64 = n
+                                    .parse()
+                                    .map_err(|_| err("invalid HEADER value".to_string()))?;
+                                if v < 0 {
+                                    return Err(SqlError {
+                                        message: "a negative integer value cannot be specified for HEADER".to_string(),
+                                        code: "22023",
+                                    });
+                                }
+                                v as i32
+                            }
+                            Token::Str(v) => {
+                                self.next();
+                                match v.to_ascii_lowercase().as_str() {
+                                    "true" | "on" => 1,
+                                    "false" | "off" => 0,
+                                    "match" => -1,
+                                    num => match num.parse::<i64>() {
+                                        Ok(v) if v >= 0 => v as i32,
+                                        Ok(_) => {
+                                            return Err(SqlError {
+                                                message: "a negative integer value cannot be specified for HEADER".to_string(),
+                                                code: "22023",
+                                            });
+                                        }
+                                        Err(_) => {
+                                            return Err(SqlError {
+                                                message: "header requires a Boolean value, an integer value greater than or equal to zero, or the string \"match\"".to_string(),
+                                                code: "42601",
+                                            });
+                                        }
+                                    },
+                                }
+                            }
+                            _ => 1,
                         };
                     }
                     "quote" => {
                         options.quote = self.parse_copy_char("QUOTE")?;
+                        quote_set = true;
                     }
                     "escape" => {
                         options.escape = self.parse_copy_char("ESCAPE")?;
+                        escape_set = true;
+                    }
+                    // v2.37: PG19 parenthesized options with no
+                    // executor meaning in this engine — consumed and
+                    // ignored (FREEZE/OIDS are storage hints; ENCODING
+                    // is always UTF8 here; FORCE_* shape CSV quoting,
+                    // which the bounded CSV writer does not model).
+                    "freeze" => {}
+                    "oids" => {
+                        let _ = self.eat_keyword("true") || self.eat_keyword("false");
+                    }
+                    "encoding" => {
+                        let _ = self.parse_copy_string("ENCODING")?;
+                    }
+                    "force_quote" | "force_not_null" | "force_null" => {
+                        let (names, all) = self.parse_force_cols()?;
+                        match opt.as_str() {
+                            "force_quote" => {
+                                options.force_quote = names;
+                                options.force_quote_all = all;
+                            }
+                            "force_not_null" => {
+                                options.force_not_null = names;
+                                options.force_not_null_all = all;
+                            }
+                            _ => {
+                                options.force_null = names;
+                                options.force_null_all = all;
+                            }
+                        }
+                    }
+                    "force_array" => {
+                        // `FORCE_ARRAY [true|false]` (PG19 defGetBoolean
+                        // shape; a bare option means true here).
+                        options.force_array =
+                            if self.eat_keyword("false") || self.eat_keyword("off") {
+                                false
+                            } else {
+                                let _ = self.eat_keyword("true") || self.eat_keyword("on");
+                                true
+                            };
+                    }
+                    "on_error" => {
+                        let v = self.expect_ident()?;
+                        options.on_error = Some(v.to_ascii_lowercase());
                     }
                     _ => {
                         return Err(err(format!(
@@ -10705,22 +11275,7 @@ impl Parser {
             }
             self.expect(Token::RParen, "')'")?;
         }
-        // v0.10: CSV defaults (like Postgres): comma delimiter and
-        // empty-string NULL unless explicitly set.
-        if options.format == CopyFormat::Csv {
-            if !delimiter_set {
-                options.delimiter = b',';
-            }
-            if !null_set {
-                options.null = String::new();
-            }
-        }
-        Ok(Stmt::Copy {
-            table,
-            columns,
-            to_stdout,
-            options,
-        })
+        Ok((options, delimiter_set, null_set, quote_set, escape_set))
     }
 
     /// v0.10: one single-character COPY option value: `'c'` or `E'c'`.
@@ -12009,6 +12564,7 @@ impl Parser {
                     Token::Ident(s) if s == "select" => {
                         self.next();
                         let sub = self.parse_select_query()?;
+                        self.reject_captured_into()?;
                         self.expect(Token::RParen, "')'")?;
                         Ok(Expr::ScalarSub(Box::new(sub)))
                     }
@@ -15748,6 +16304,24 @@ impl Parser {
         if (distinct || !distinct_on.is_empty()) && items.is_empty() {
             return Err(err("syntax error at or near \"from\"".to_string()));
         }
+        // v2.37: `SELECT ... INTO [TEMP|UNLOGGED] [TABLE] name`
+        // (PG19 into_clause sits between the target list and FROM).
+        // Captured on the parser; parse_top_kw converts the finished
+        // statement to CreateTableAs. (PG rejects INTO inside
+        // subqueries; this parser only ever converts the outermost
+        // statement, and a subquery INTO would set the same field —
+        // a bounded deviation on SQL PG rejects outright.)
+        if matches!(self.peek(), Token::Ident(k) if k == "into")
+            && !matches!(self.peek2(), Token::LParen)
+            && !PLPGSQL_DYNAMIC_PARSE.with(|c| c.get())
+        {
+            self.next(); // INTO
+            let temp = self.eat_keyword("temp") || self.eat_keyword("temporary");
+            let _unlogged = self.eat_keyword("unlogged");
+            let _ = self.eat_keyword("table");
+            let name = self.parse_table_name()?;
+            self.select_into = Some((name, temp));
+        }
         let from = if self.eat_keyword("from") {
             self.parse_from()?
         } else {
@@ -16623,6 +17197,7 @@ impl Parser {
                 let left = self.parse_set_operand()?;
                 let carrier = self.parse_set_chain(left, 1)?;
                 let sub = self.finish_select_query(carrier)?;
+                self.reject_captured_into()?;
                 self.expect(Token::RParen, "')'")?;
                 FromItem::Derived {
                     sub: Box::new(sub),
@@ -16656,6 +17231,7 @@ impl Parser {
                     // supported (PG19). Parse via parse_select_query_not_consumed
                     // which handles the leading WITH.
                     let sub = self.parse_select_query_not_consumed()?;
+                    self.reject_captured_into()?;
                     FromItem::Derived {
                         sub: Box::new(sub),
                         alias: String::new(),
@@ -19783,6 +20359,7 @@ pub(crate) fn expr_from_tokens(toks: &[Token]) -> Result<Expr, SqlError> {
         unnamed_seq: 0,
         allow_similar_to: true,
         last_bit_typmod: None,
+        select_into: None,
     };
     let e = p.parse_or()?;
     match p.next() {
@@ -20000,6 +20577,27 @@ pub(crate) fn split_trailing_collate(toks: &[Token]) -> (&[Token], Option<String
     (toks, None)
 }
 
+thread_local! {
+    /// v2.37: set while plpgsql parses a DYNAMIC statement string
+    /// (EXECUTE / RETURN QUERY EXECUTE / OPEN FOR). Inside plpgsql,
+    /// SELECT ... INTO binds plpgsql variables — it must never be
+    /// read as the SQL-level SELECT INTO table form (PG19 plpgsql
+    /// gram.y strips INTO before SPI parsing).
+    pub(crate) static PLPGSQL_DYNAMIC_PARSE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// v2.37: run `f` with the plpgsql-dynamic parse gate set (restored
+/// on exit, nesting-safe).
+pub(crate) fn with_plpgsql_dynamic_parse<T>(f: impl FnOnce() -> T) -> T {
+    PLPGSQL_DYNAMIC_PARSE.with(|c| {
+        let prev = c.replace(true);
+        let r = f();
+        c.set(prev);
+        r
+    })
+}
+
 /// Parse one statement from already-trimmed text (no view interception).
 pub(crate) fn parse_statement_inner(text: &str) -> Result<Stmt, SqlError> {
     let tokens = tokenize(text)?;
@@ -20009,6 +20607,7 @@ pub(crate) fn parse_statement_inner(text: &str) -> Result<Stmt, SqlError> {
         unnamed_seq: 0,
         allow_similar_to: true,
         last_bit_typmod: None,
+        select_into: None,
     };
     let stmt = p.parse_top()?;
     match p.next() {
@@ -20118,6 +20717,7 @@ pub(crate) fn parse_expr_str(text: &str) -> Result<Expr, SqlError> {
         unnamed_seq: 0,
         allow_similar_to: true,
         last_bit_typmod: None,
+        select_into: None,
     };
     p.parse_or()
 }
@@ -21307,6 +21907,7 @@ pub(crate) fn coltype_from_sql_spelling(name: &str) -> Result<ColType, String> {
         unnamed_seq: 0,
         allow_similar_to: true,
         last_bit_typmod: None,
+        select_into: None,
     };
     let (ty, named) = p
         .parse_type_name()
