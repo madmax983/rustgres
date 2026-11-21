@@ -2,6 +2,83 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `Database::find_type`'s bare-name resolution allocates and rescans the whole type registry on every cast — baseline — 2026-11-21
+
+### Workload
+
+v2.35 added `Database::find_type` (schema-qualified type-name
+resolution for composite/domain/range types) and had never been
+profiled. New harness `benches/profile_qualified_cast.py`
+(self-contained callgrind/dhat driver, same pattern as
+`profile_wo_insert.py`): a composite type created under a non-public
+schema (`CREATE SCHEMA s; CREATE TYPE s.pt AS (x int, y int)`) — the
+textbook "organize types under a schema" pattern v2.35 exists to
+support — referenced by its *bare* name in a cast evaluated once per
+row of a table (`SELECT ROW(x,y)::pt FROM t`). Confirmed to be a real,
+reachable, end-to-end-correct path with a manual probe before writing
+the harness (not just a code path that happens to execute and then
+error out): `SELECT ROW(x,y)::pt FROM t` returns the same rows as the
+fully qualified `::s.pt` spelling. (The domain equivalent of this
+probe, `CREATE DOMAIN s.posint AS int CHECK (VALUE > 0)` then `SELECT
+v::posint FROM t`, turned up a separate, pre-existing *correctness*
+bug — `eval_cast_named`'s domain branch resolves the name through
+`find_type` but then re-looks it up with a raw `self.types.get(name)`
+in `check_domain_value`, which only matches the bare name for an
+*unqualified* domain — that bug is out of scope here (Bolt profiles
+and fixes performance, not correctness) and is left for a human to
+triage; it does mean the composite-cast shape, not the domain one, is
+this entry's realistic workload.)
+
+### Profile
+
+`eval_cast_named` (`src/exec/cast.rs`) calls `find_type(name)` up to
+**four times** per cast evaluation before reaching the composite
+branch that actually resolves `"pt"` — a domain-check probe (line
+1597), a range-type probe (line 1860), a binary-cast-key probe
+(`apply_binary_cast` -> `cast_type_key`, line 1896), and the composite
+resolution itself (`eval_cast_composite_inner`, line 1932) — and every
+one of those four misses the exact-key fast path identically, because
+`"pt"` is stored under the dotted key `"s.pt"`. Each miss falls into
+`find_type`'s bare-reference branch:
+
+```rust
+let suffix = format!(".{name}");           // allocates, every call
+for (k, st) in self.types.iter() {          // O(len(self.types)), every call
+    if k.ends_with(&suffix) { ... }
+}
+```
+
+dhat on `--rows 2000 --decoys 50`
+(`benches/profiles/dhat.out.qualcast-before-r2000d50-2026-11-21`)
+attributes 16,004 of 104,046 total allocations (15.4%) and 80,020 of
+10,860,831 total bytes (0.7%) to this `format!` call site, split
+across exactly the four call-sites above (plus two negligible
+parse-time probes from `COLLATE`/`DESCRIBE` validation, 2 allocations
+each). Callgrind on the same shape shows the cost scaling with *both*
+axes that make this realistic — more rows (more cast evaluations) and
+more types sharing the schema (a longer scan per evaluation): at
+`rows=1000`, `find_type` plus the `HashMap<String, ShellType>`
+iteration machinery it drives (`hashbrown::map::Iter::next`,
+`RawIterRange::next_impl`, and their monomorphized helpers — all
+exclusive to this one loop in this workload) account for **at least
+33.6%** of total `Ir` with 200 decoy types in the schema (a
+conservative sum of only the frames whose generic parameters name
+`ShellType` or this exact `HashMap` instantiation; the true share is
+higher once the shared `str::ends_with`/`memcmp` frames the scan also
+drives are counted). That is far above the "under 5%, not worth it"
+floor this file's process requires before touching code — this is
+the dominant cost of evaluating the cast at all once a database has
+more than a handful of schema-organized types.
+
+### Reproduce
+
+```bash
+cargo build
+python3 benches/profile_qualified_cast.py --tool callgrind --rows 1000 --decoy-sizes
+python3 benches/profile_qualified_cast.py --tool dhat --rows 2000 --decoys 50
+callgrind_annotate --auto=yes benches/profiles/callgrind.out.qualcast-before-r1000d200-2026-11-21 | head -60
+```
+
 ## Bolt: `check_without_overlaps_batch` clones every visible row to compare it, instead of borrowing the already-shared `Row` — fix — 2026-11-20
 
 Fixes the target identified in the baseline entry immediately below
