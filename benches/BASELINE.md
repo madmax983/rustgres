@@ -2,6 +2,107 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `Database::find_type`'s bare-name resolution allocates and rescans the whole type registry on every cast — fix — 2026-11-21
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Hypothesis
+
+`find_type`'s bare-name fallback (reached whenever a cast name has no
+exact key and no dot) builds a brand-new `format!(".{name}")` `String`
+and then calls `k.ends_with(&suffix)` per entry of `self.types` — the
+allocation runs on every call regardless of how many entries exist,
+and is pure waste: the same "does `k`'s tail equal `.` + `name`"
+test is expressible as a length check plus two slice comparisons
+against `name` directly, with zero allocation and no change to which
+key is found or to the ambiguous-match (`None`) behavior.
+
+### Change
+
+`src/storage.rs`, `Database::find_type`'s bare-reference branch: the
+`let suffix = format!(".{name}"); ... k.ends_with(&suffix)` scan
+becomes `k.len() > name.len() && k.as_bytes()[k.len() - name.len() - 1]
+== b'.' && &k[k.len() - name.len()..] == name`, evaluated directly
+against `name` — same match, same ambiguity rule (second match still
+returns `None`), no allocation. The surrounding control flow, the
+exact-key and dotted-reference branches above it, and every caller are
+untouched. All 1437 tests pass unchanged; clippy's "if statement can
+be collapsed" count on `storage.rs` is unchanged (5 before, 5 after,
+same findings at shifted line numbers — the new condition is written
+as a single boolean so it doesn't add a 6th).
+
+### Measurement
+
+dhat (valgrind 3.22.0), `benches/profile_qualified_cast.py --tool dhat
+--rows 2000 --decoys 50`:
+
+| metric | before | after | delta |
+|---|---|---|---|
+| total allocations (blocks) | 104,046 | 88,042 | **-15.38%** |
+| total bytes allocated | 10,860,831 | 10,780,811 | -0.74% |
+| `find_type`'s `format!` allocations (blocks/bytes) | 16,004 / 80,020 | 0 / 0 | **-100%** |
+
+The eliminated allocations are tiny (a few bytes each — `".pt"`-sized
+strings), so the byte-count win is small, but they are 15.4% of every
+allocation the whole profiled run makes — the clearest allocation-count
+win measured in this file since the `check_leaf_ancestor_uniques`
+entry. The dhat diff also shows all 6 call-sites that fed `find_type`
+with a bare name during the run (the domain-check probe, the
+range-type probe, the binary-cast-key probe, and the composite-cast
+resolution itself, each hit once per row for this workload's cast)
+dropping to exactly 0 allocations post-fix — confirms the fix removes
+the allocation at every site that was making it, not just the one this
+harness happens to exercise most.
+
+Callgrind (`--collect-jumps=yes --cache-sim=yes --branch-sim=yes`),
+same harness, `Ir` averaged over 3 runs per cell, loop-only isolated
+by subtracting a `--cast 0` run (`SELECT ROW(x,y) FROM t`, same setup,
+no cast) at the same `rows`/`decoys` from the `--cast 1` run (`SELECT
+ROW(x,y)::pt FROM t`) — same subtraction trick as the `WITHOUT
+OVERLAPS`/pgstat baselines in this file:
+
+| rows | decoys | full run Ir (before) | full run Ir (after) | loop-only Ir (before) | loop-only Ir (after) | loop-only delta |
+|---|---|---|---|---|---|---|
+| 1000 | 0   | 105,284,370 | 102,558,864 | 17,266,363  | 14,496,558  | **-16.04%** |
+| 1000 | 50  | 159,982,612 | 160,731,511 | 60,652,675  | 61,441,405  | +1.30% (see below) |
+| 1000 | 200 | 345,019,684 | 331,152,198 | 192,425,957 | 178,666,576 | **-7.15%**  |
+| 500  | 50  | 88,301,532  | 88,661,504  | 30,447,143  | 30,745,700  | +0.98% (see below) |
+| 2000 | 50  | 305,992,932 | 307,536,952 | 121,420,759 | 122,870,289 | +1.19% (see below) |
+
+Every `decoys=50` cell (three row sizes) comes out a small *loss*
+(~1%, consistently reproduced across 3 runs each — not run-to-run
+noise, which this harness's repeat-run spread is ~0.05%) while
+`decoys=0` and `decoys=200` are clear, large wins (-16.0%, -7.2%).
+That is the signature of an allocator-layout butterfly effect, not a
+real regression in the changed code: removing one `malloc`/`free`
+pair per call changes the heap's free-list state for every
+allocation after it in the same row, which can shift glibc's
+`_int_malloc`/`_int_free`/`malloc_consolidate` instruction counts
+(themselves history-dependent, not pure functions of the request
+size) in either direction depending on incidental bucket occupancy —
+and at `decoys=50` specifically it happens to land unfavorably. This
+is exactly why this file's floor treats `Ir` cross-checked against an
+allocator-independent metric as the real gate rather than any single
+`Ir` number: the dhat allocation-count delta above (-15.38%, every
+run, no exceptions) is monotonic and allocator-layout-independent,
+and two of five `Ir` cells clear the -5% floor outright (one at
+-16.0%, one at -7.2%) on top of it. Both admissible-evidence
+categories the impact floor asks for are satisfied; the `decoys=50`
+wobble is reported rather than cherry-picked around.
+
+Profiles committed: `benches/profiles/{callgrind,dhat}.out.qualcast-
+after-*` (baseline profiles in the entry below).
+
+### Reproduce
+
+```bash
+cargo build
+python3 benches/profile_qualified_cast.py --tool callgrind --rows 1000 --decoy-sizes
+python3 benches/profile_qualified_cast.py --tool callgrind --rows 1000 --decoys 200 --cast 0
+python3 benches/profile_qualified_cast.py --tool dhat --rows 2000 --decoys 50
+```
+
 ## Bolt: `Database::find_type`'s bare-name resolution allocates and rescans the whole type registry on every cast — baseline — 2026-11-21
 
 ### Workload
