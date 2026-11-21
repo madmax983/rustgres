@@ -22,6 +22,11 @@ pub(crate) fn select_item_positions(stmt: &SelectStmt, schema: &[QCol]) -> Vec<O
                 pos += schema.iter().filter(|c| c.qual == *qual).count();
                 out.push(None);
             }
+            SelectItem::CompositeStar(_) => {
+                // v2.35: expansion width is not in the FROM schema;
+                // no single output position (like a star).
+                out.push(None);
+            }
             SelectItem::Expr { .. } => {
                 out.push(Some(pos));
                 pos += 1;
@@ -200,6 +205,10 @@ pub(crate) fn nth_output_expr(
                         });
                     }
                 }
+            }
+            SelectItem::CompositeStar(_) => {
+                // v2.35: no single expression backs the expansion.
+                idx += 1;
             }
             SelectItem::AllOf(qual) => {
                 let schema = schema?;

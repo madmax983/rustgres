@@ -18,6 +18,11 @@ pub(crate) struct Parser {
     /// carries no typmod, so RETURNING specs and JSON_TABLE columns
     /// read it from here.
     pub(crate) last_bit_typmod: Option<(i32, bool)>,
+    /// v2.37: `SELECT ... INTO name` captured by parse_select_core
+    /// (the INTO clause sits between the target list and FROM, deep
+    /// inside query parsing); parse_top_kw converts the statement
+    /// to CreateTableAs when this is set.
+    pub(crate) select_into: Option<(String, bool)>,
 }
 
 /// v2.34: BUFFER_USAGE_LIMIT string form ('512 kB', '1MB') to
@@ -140,6 +145,18 @@ impl Parser {
         // `LATERAL func_name (` — the noise-word case.
         if matches!(self.tokens.get(j), Some(Token::Ident(_)))
             && matches!(self.tokens.get(j + 1), Some(Token::LParen))
+        {
+            self.pos += 1;
+            return true;
+        }
+        // v2.35: `LATERAL schema.func_name (` — a qualified function
+        // name (PG19 func_table takes a qualified func_name); the
+        // unqualified check above misses the Dot and "lateral" fell
+        // back to a table name, dying at the Dot.
+        if matches!(self.tokens.get(j), Some(Token::Ident(_)))
+            && matches!(self.tokens.get(j + 1), Some(Token::Dot))
+            && matches!(self.tokens.get(j + 2), Some(Token::Ident(_)))
+            && matches!(self.tokens.get(j + 3), Some(Token::LParen))
         {
             self.pos += 1;
             return true;
@@ -401,7 +418,22 @@ impl Parser {
         match kw.as_str() {
             "create" => self.parse_create(),
             "insert" => self.parse_insert(),
-            "select" => Ok(Stmt::Select(self.parse_select_query()?)),
+            "select" => {
+                let sel = self.parse_select_query()?;
+                // v2.37: SELECT ... INTO (captured in parse_select_core).
+                if let Some((name, temp)) = self.select_into.take() {
+                    return Ok(Stmt::CreateTableAs {
+                        name,
+                        col_aliases: Vec::new(),
+                        select: Box::new(sel),
+                        temp,
+                        if_not_exists: false,
+                        with_data: true,
+                        execute: None,
+                    });
+                }
+                Ok(Stmt::Select(sel))
+            }
             // v0.54: PG19 `simple_select: values_clause | TABLE relation_expr`
             // — VALUES and TABLE are full top-level queries, not just
             // FROM items. Both desugar to the SELECT the executor
@@ -439,6 +471,60 @@ impl Parser {
             }
             // --- v2.04: COMMENT ON PUBLICATION
             "comment" => self.parse_comment(),
+            // --- v2.36: IMPORT FOREIGN SCHEMA (PG19 ImportForeignSchemaStmt)
+            "import" => {
+                self.expect_keyword("foreign")?;
+                self.expect_keyword("schema")?;
+                let remote_schema = self.expect_ident()?;
+                // LIMIT TO (names) | EXCEPT (names) — parsed and
+                // discarded: execution never gets past the handler
+                // check in this engine.
+                if self.eat_keyword("limit") {
+                    self.expect_keyword("to")?;
+                    self.expect(Token::LParen, "'('")?;
+                    loop {
+                        let _ = self.parse_table_name()?;
+                        match self.next() {
+                            Token::Comma => continue,
+                            Token::RParen => break,
+                            other => {
+                                return Err(err(format!(
+                                    "syntax error: expected ',' or ')' in LIMIT TO list, found {:?}",
+                                    other
+                                )));
+                            }
+                        }
+                    }
+                } else if self.eat_keyword("except") {
+                    self.expect(Token::LParen, "'('")?;
+                    loop {
+                        let _ = self.parse_table_name()?;
+                        match self.next() {
+                            Token::Comma => continue,
+                            Token::RParen => break,
+                            other => {
+                                return Err(err(format!(
+                                    "syntax error: expected ',' or ')' in EXCEPT list, found {:?}",
+                                    other
+                                )));
+                            }
+                        }
+                    }
+                }
+                self.expect_keyword("from")?;
+                self.expect_keyword("server")?;
+                let server = self.expect_ident()?;
+                self.expect_keyword("into")?;
+                let into_schema = self.expect_ident()?;
+                if self.eat_keyword("options") {
+                    let _ = self.parse_generic_option_list(false)?;
+                }
+                Ok(Stmt::ImportForeignSchema {
+                    remote_schema,
+                    server,
+                    into_schema,
+                })
+            }
             // --- v0.74: PREPARE / EXECUTE / DEALLOCATE
             "prepare" => self.parse_prepare(),
             "execute" => self.parse_execute(),
@@ -893,6 +979,21 @@ impl Parser {
             }
             // --- v0.9: ALTER TABLE / ALTER SEQUENCE
             "alter" => match self.peek() {
+                // v2.36: ALTER FOREIGN DATA WRAPPER / ALTER FOREIGN
+                // TABLE / ALTER SERVER / ALTER USER MAPPING.
+                Token::Ident(s) if s == "foreign" => {
+                    if matches!(self.peek2(), Token::Ident(t) if t == "data") {
+                        self.parse_alter_fdw()
+                    } else {
+                        self.parse_alter_foreign_table()
+                    }
+                }
+                Token::Ident(s) if s == "server" => self.parse_alter_server(),
+                Token::Ident(s)
+                    if s == "user" && matches!(self.peek2(), Token::Ident(t) if t == "mapping") =>
+                {
+                    self.parse_alter_user_mapping()
+                }
                 Token::Ident(s) if s == "table" => self.parse_alter(),
                 Token::Ident(s) if s == "index" => self.parse_alter_index(),
                 Token::Ident(s) if s == "statistics" => self.parse_alter_statistics(),
@@ -1052,14 +1153,31 @@ impl Parser {
         }
         let name = self.expect_ident()?;
         // v0.75: schema-qualified type name (`pg_catalog.int4`,
-        // `information_schema.sql_identifier`); the schema qualifier is
-        // accepted and ignored.
-        let name = if *self.peek() == Token::Dot && matches!(self.peek2(), Token::Ident(_)) {
+        // `information_schema.sql_identifier`).
+        // v2.35: the qualifier is PRESERVED for non-builtin names:
+        // types are stored under their dotted CREATE name, so a bare
+        // marker missed the registry (the stats_import root). Builtin
+        // names still resolve through the bare name in
+        // parse_type_name_rest; parse_type_name_rest_with_schema
+        // reattaches the qualifier when the result is a named
+        // (composite/domain) type.
+        if *self.peek() == Token::Dot && matches!(self.peek2(), Token::Ident(_)) {
             self.next(); // '.'
-            self.expect_ident()?
-        } else {
-            name
-        };
+            let bare = self.expect_ident()?;
+            let schema = name;
+            let (ty, marker) = self.parse_type_name_rest(bare.clone())?;
+            // Only the named-type (Composite) marker carries the
+            // qualifier; the oid/regprocedure named-cast markers keep
+            // their canonical bare spellings.
+            let marker = marker.map(|m| {
+                if ty == ColType::Composite && m == bare {
+                    format!("{}.{}", schema, m)
+                } else {
+                    m
+                }
+            });
+            return Ok((ty, marker));
+        }
         self.parse_type_name_rest(name)
     }
 
@@ -1078,6 +1196,22 @@ impl Parser {
                 ));
             }
             return Ok((ColType::SingleChar, None));
+        }
+        // v2.35: `"schema"."type"` — a quoted first part followed by
+        // a dot and a second name part is a qualified type name.
+        if *self.peek() == Token::Dot && matches!(self.peek2(), Token::Ident(_) | Token::QIdent(_))
+        {
+            self.next(); // '.'
+            let bare = self.expect_ident()?;
+            let (ty, marker) = self.parse_type_name_rest(bare.clone())?;
+            let marker = marker.map(|m| {
+                if ty == ColType::Composite && m == bare {
+                    format!("{}.{}", name, m)
+                } else {
+                    m
+                }
+            });
+            return Ok((ty, marker));
         }
         self.parse_type_name_rest(name)
     }
@@ -1357,6 +1491,7 @@ impl Parser {
             "regclass" => Ok(ColType::Regclass),
             "regproc" => Ok(ColType::Regproc),
             "regprocedure" => Ok(ColType::Regprocedure), // v2.34
+            "regnamespace" => Ok(ColType::Regnamespace), // v2.35
             "pg_lsn" => Ok(ColType::PgLsn),              // v0.64
             "xid" => Ok(ColType::Xid),                   // v1.17
             "oid" => Ok(ColType::Oid),                   // v2.15
@@ -1402,6 +1537,10 @@ impl Parser {
             // v2.34: like oid, a regprocedure cast must resolve its
             // signature text through the catalog (eval_cast_named).
             Some("regprocedure".to_string())
+        } else if base == ColType::Regnamespace {
+            // v2.35: like regprocedure, a regnamespace cast resolves
+            // its schema-name text through the catalog.
+            Some("regnamespace".to_string())
         } else {
             None
         };
@@ -1519,6 +1658,24 @@ impl Parser {
     }
 
     pub(crate) fn parse_create(&mut self) -> Result<Stmt, SqlError> {
+        // v2.36: CREATE FOREIGN DATA WRAPPER / CREATE FOREIGN TABLE /
+        // CREATE SERVER / CREATE USER MAPPING.
+        if matches!(self.peek(), Token::Ident(s) if s == "foreign") {
+            if matches!(self.peek2(), Token::Ident(s) if s == "data") {
+                return self.parse_create_fdw();
+            }
+            if matches!(self.peek2(), Token::Ident(s) if s == "table") {
+                return self.parse_create_foreign_table();
+            }
+        }
+        if matches!(self.peek(), Token::Ident(s) if s == "server") {
+            return self.parse_create_server();
+        }
+        if matches!(self.peek(), Token::Ident(s) if s == "user")
+            && matches!(self.peek2(), Token::Ident(s) if s == "mapping")
+        {
+            return self.parse_create_user_mapping();
+        }
         // v1.96: CREATE SCHEMA [IF NOT EXISTS] name [AUTHORIZATION r]
         // (also CREATE SCHEMA AUTHORIZATION r).
         if matches!(self.peek(), Token::Ident(s) if s == "schema") {
@@ -1712,12 +1869,15 @@ impl Parser {
                 }
                 String::new()
             } else {
-                self.expect_ident()?
+                // v2.35: the index name may be schema-qualified.
+                self.parse_table_name()?
             };
             self.expect_keyword("on")?;
             // v2.29: optional ONLY before the table name.
             let only = self.eat_keyword("only");
-            let table = self.expect_ident()?;
+            // v2.35: the table name may be schema-qualified
+            // (`CREATE INDEX i ON s.t (...)`).
+            let table = self.parse_table_name()?;
             // v0.88: `USING btree` may appear between the table and the
             // column list. v0.89: rustgres only implements btree, so any
             // other access method is 0A000 (feature not supported) rather
@@ -2269,6 +2429,14 @@ impl Parser {
         } else {
             None
         };
+        // v2.35: trailing reloptions `WITH (...)` (PG19
+        // PartitionBoundSpec + OptWith: `PARTITION OF p FOR VALUES ...
+        // WITH (autovacuum_enabled = false)`).
+        let part_reloptions = if self.eat_keyword("with") {
+            self.parse_reloptions()?
+        } else {
+            Vec::new()
+        };
         // The child inherits the parent's method and key; a trailing
         // `PARTITION BY` makes it a sub-partitioned intermediate.
         let (method, keys) = match sub {
@@ -2304,7 +2472,7 @@ impl Parser {
                 bound: Some(bound),
             }),
             likes: Vec::new(),
-            reloptions: Vec::new(),
+            reloptions: part_reloptions,
             inherits: Vec::new(),
             deferred_not_null: Vec::new(),
             of_type: None,
@@ -2508,6 +2676,15 @@ impl Parser {
                     ));
                 }
             }
+        } else if matches!(self.peek(), Token::Ident(s) if s == "values") {
+            // v2.37: CREATE TABLE AS VALUES (PG19 PreparableStmt
+            // includes VALUES; rowsecurity's coll_t/tbl1 shapes).
+            self.next(); // VALUES
+            self.parse_values_query()?
+        } else if matches!(self.peek(), Token::Ident(s) if s == "table") {
+            // v2.37: CREATE TABLE AS TABLE name (== SELECT * FROM).
+            self.next(); // TABLE
+            self.parse_table_query()?
         } else {
             self.expect_keyword("select")?;
             self.parse_select_query()?
@@ -2762,6 +2939,12 @@ impl Parser {
                 // v2.26: COLLATE is a ColQualList item in PG19.
                 let qn = self.parse_table_name()?;
                 qual_collate = Some(qn.rsplit('.').next().unwrap_or(&qn).to_string());
+            } else if cname.is_none() && self.eat_keyword("options") {
+                // v2.36: foreign-table column OPTIONS (PG19
+                // columnOptions ride the ColQualList for foreign
+                // tables). Carried as a ColCon; consumers strip it.
+                let opts = self.parse_generic_option_list(false)?;
+                cons.push(ColCon::FdwOptions(opts));
             } else if self.eat_keyword("unique") {
                 let nnd = self.parse_nulls_not_distinct()?;
                 let (df, idf) = self.parse_unique_attrs()?;
@@ -3628,6 +3811,18 @@ impl Parser {
             let new = self.expect_ident()?;
             return Ok(Stmt::AlterViewRenameColumn { name, old, new });
         }
+        // v2.37: ALTER VIEW name OWNER TO role (PG19 AlterTableStmt
+        // on the view; routed like the other view AlterTable forms).
+        if self.eat_keyword("owner") {
+            self.expect_keyword("to")?;
+            let new_owner = self.expect_ident()?;
+            return Ok(Stmt::AlterTable {
+                name: tname,
+                actions: vec![AlterAction::OwnerTo { new_owner }],
+                if_exists: false,
+                only: false,
+            });
+        }
         // v2.18: ALTER VIEW name ALTER COLUMN c SET/DROP DEFAULT
         // (PG19 AT_AlterColumnDefault on the view).
         if matches!(self.peek(), Token::Ident(k) if k == "alter") {
@@ -3837,6 +4032,12 @@ impl Parser {
     }
 
     pub(crate) fn parse_alter_action(&mut self) -> Result<AlterAction, SqlError> {
+        // v2.36: ALTER [FOREIGN] TABLE t OPTIONS (alter list) —
+        // foreign-table FDW options (PG19 AT_AlterFdwOptions).
+        if self.eat_keyword("options") {
+            let options = self.parse_generic_option_list(true)?;
+            return Ok(AlterAction::ForeignOptions { options });
+        }
         // v2.03: ALTER TABLE t REPLICA IDENTITY {DEFAULT|FULL|NOTHING|
         // USING INDEX name} (PG19 ReplicaIdentityStmt).
         if self.eat_keyword("replica") {
@@ -4052,6 +4253,7 @@ impl Parser {
             let mut uniques = Vec::new();
             let mut pkey = None;
             let mut fks = Vec::new();
+            let mut fdw_options: Vec<FdwOpt> = Vec::new();
             // v0.65: serial implies NOT NULL (an explicit NULL conflicts,
             // like PG's 42601).
             if col.serial.is_some() {
@@ -4169,6 +4371,7 @@ impl Parser {
                         n.unwrap_or_else(|| format!("{}_fkey", col.name)),
                         vec![col.name.clone()],
                     )),
+                    ColCon::FdwOptions(opts) => fdw_options.extend(opts),
                 }
             }
             return Ok(AlterAction::AddColumn {
@@ -4188,6 +4391,7 @@ impl Parser {
                 uniques,
                 pkey,
                 fks,
+                fdw_options,
             });
         }
         if self.eat_keyword("drop") {
@@ -4279,6 +4483,16 @@ impl Parser {
             }
             self.eat_keyword("column");
             let cname = self.expect_ident()?;
+            // v2.36: ALTER COLUMN c OPTIONS (alter list) — foreign
+            // table per-column FDW options (PG19 AT_AlterFdwOptions
+            // with a subid).
+            if self.eat_keyword("options") {
+                let options = self.parse_generic_option_list(true)?;
+                return Ok(AlterAction::AlterColumnOptions {
+                    name: cname,
+                    options,
+                });
+            }
             // v2.28: ALTER COLUMN c ADD GENERATED {ALWAYS|BY DEFAULT}
             // AS IDENTITY [(seq opts)] (PG19 AT_AddIdentity).
             if self.eat_keyword("add") {
@@ -4654,7 +4868,8 @@ impl Parser {
         } else {
             false
         };
-        let name = self.expect_ident()?;
+        // v2.35: sequence names may be schema-qualified.
+        let name = self.parse_table_name()?;
         let opts = self.parse_sequence_opts()?;
         Ok(Stmt::CreateSequence {
             name,
@@ -5002,6 +5217,7 @@ impl Parser {
         let mut body: Option<String> = None;
         let mut volatility = FuncVolatility::Volatile;
         let mut strict = false;
+        let mut leakproof = false;
         let mut security_definer = false;
         loop {
             // v1.96: SECURITY DEFINER | SECURITY INVOKER.
@@ -5141,6 +5357,67 @@ impl Parser {
                         code: "0A000",
                     });
                 }
+            } else if self.eat_keyword("leakproof") {
+                // v2.37: LEAKPROOF (PG19 gram.y function option). The
+                // executor has no leakproof qual ordering; the flag is
+                // carried for the superuser-only creation rule.
+                leakproof = true;
+                continue;
+            } else if self.eat_keyword("not") {
+                // v2.37: NOT LEAKPROOF (the default).
+                self.expect_keyword("leakproof")?;
+                leakproof = false;
+                continue;
+            } else if self.eat_keyword("called") {
+                // v2.37: CALLED ON NULL INPUT == not strict (PG19).
+                self.expect_keyword("on")?;
+                self.expect_keyword("null")?;
+                self.expect_keyword("input")?;
+                strict = false;
+            } else if matches!(self.peek(), Token::Ident(w) if w == "returns")
+                && matches!(self.peek2(), Token::Ident(w2) if w2 == "null")
+            {
+                // v2.37: RETURNS NULL ON NULL INPUT == STRICT (PG19).
+                // Only when followed by NULL: the RETURNS <type>
+                // clause was already consumed before this loop.
+                self.next();
+                self.expect_keyword("null")?;
+                self.expect_keyword("on")?;
+                self.expect_keyword("null")?;
+                self.expect_keyword("input")?;
+                strict = true;
+            } else if self.eat_keyword("return") {
+                // PG19: AS ... RETURN ... (or RETURN twice) is a
+                // duplicate body.
+                if body.is_some() {
+                    return Err(SqlError {
+                        message: "duplicate function body specified".to_string(),
+                        code: "42601",
+                    });
+                }
+                // v2.37: SQL-standard function body (PG19 gram.y
+                // func_body: RETURN func_return). The tail of the
+                // definition is the return query or expression; an
+                // expression body is stored as the equivalent SELECT
+                // body (the SQL-body executor's shape), a query body
+                // verbatim. Implies LANGUAGE SQL (the default below).
+                let tail = tokens_to_sql(&self.tokens[self.pos..]);
+                self.pos = self.tokens.len();
+                let first = tail
+                    .split(|c: char| c.is_whitespace() || c == '(')
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                body = Some(
+                    if matches!(
+                        first.as_str(),
+                        "select" | "with" | "values" | "table" | "insert" | "update" | "delete"
+                    ) {
+                        tail
+                    } else {
+                        format!("SELECT {}", tail)
+                    },
+                );
             } else if self.eat_keyword("as") {
                 match self.next() {
                     Token::Str(s) => {
@@ -5230,6 +5507,7 @@ impl Parser {
             volatility,
             strict,
             security_definer,
+            leakproof,
             procedure: false,
             table_cols,
         })
@@ -5314,6 +5592,7 @@ impl Parser {
             volatility: FuncVolatility::Volatile,
             strict: false,
             security_definer,
+            leakproof: false,
             procedure: true,
             table_cols: Vec::new(),
         })
@@ -5415,9 +5694,12 @@ impl Parser {
     /// function arguments generally.
     pub(crate) fn parse_func_type_name(&mut self) -> Result<String, SqlError> {
         let mut name = self.expect_ident()?;
+        // v2.35: keep the schema qualifier (types/functions store
+        // dotted names; resolvers strip pg_catalog. themselves).
         if *self.peek() == Token::Dot && matches!(self.peek2(), Token::Ident(_)) {
             self.next(); // '.'
-            name = self.expect_ident()?;
+            let bare = self.expect_ident()?;
+            name = format!("{}.{}", name, bare);
         }
         while *self.peek() == Token::LBracket {
             self.next(); // '['
@@ -5933,7 +6215,9 @@ impl Parser {
         };
         let name = self.expect_ident()?;
         self.expect_keyword("on")?;
-        let table = self.expect_ident()?;
+        // v2.36: the table may be schema-qualified (PG19
+        // DROP TRIGGER name ON qualified_name).
+        let table = self.expect_qualified_ident()?;
         let cascade = if self.eat_keyword("cascade") {
             true
         } else {
@@ -6560,8 +6844,577 @@ impl Parser {
 
     /// v2.04: `COMMENT ON PUBLICATION name IS 'text' | NULL`.
     /// Other COMMENT ON targets stay 42601 (pre-v2.04 behavior).
+    // -----------------------------------------------------------------
+    // v2.36: FOREIGN DATA family (PG19 foreigncmds.c grammar).
+    // -----------------------------------------------------------------
+
+    /// An option name (PG19 ColLabel): an identifier or quoted
+    /// identifier, taken verbatim (unquoted idents arrive folded).
+    pub(crate) fn parse_fdw_opt_name(&mut self) -> Result<String, SqlError> {
+        match self.next() {
+            Token::Ident(s) | Token::QIdent(s) => Ok(s),
+            other => Err(err(format!(
+                "syntax error: expected option name, found {:?}",
+                other
+            ))),
+        }
+    }
+
+    /// `'(' generic_option_list ')'` — the '(' is NOT yet consumed.
+    /// `alter` selects alter_generic_option_list (ADD/SET/DROP
+    /// prefixes allowed); otherwise create_generic_options (bare
+    /// `name 'value'` entries only).
+    pub(crate) fn parse_generic_option_list(
+        &mut self,
+        alter: bool,
+    ) -> Result<Vec<FdwOpt>, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let mut out = Vec::new();
+        if *self.peek() == Token::RParen {
+            self.next();
+            return Ok(out);
+        }
+        loop {
+            let mut action = OptAction::Bare;
+            if alter {
+                if self.eat_keyword("add") {
+                    action = OptAction::Add;
+                } else if self.eat_keyword("set") {
+                    action = OptAction::Set;
+                } else if self.eat_keyword("drop") {
+                    action = OptAction::Drop;
+                }
+            }
+            let name = self.parse_fdw_opt_name()?;
+            let value = if action == OptAction::Drop {
+                None
+            } else {
+                match self.next() {
+                    Token::Str(v) => Some(v),
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected string literal for option value, found {:?}",
+                            other
+                        )));
+                    }
+                }
+            };
+            out.push(FdwOpt {
+                action,
+                name,
+                value,
+            });
+            match self.next() {
+                Token::Comma => continue,
+                Token::RParen => break,
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected ',' or ')' in OPTIONS list, found {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The fdw_options sequence of CREATE / ALTER FOREIGN DATA
+    /// WRAPPER: HANDLER f | NO HANDLER | VALIDATOR f | NO VALIDATOR
+    /// | CONNECTION f | NO CONNECTION, concatenated without commas.
+    /// A repeated clause is PG19's 42601 "conflicting or redundant
+    /// options". Stops at the first token that starts none of these
+    /// (OPTIONS / OWNER / RENAME / end).
+    pub(crate) fn parse_fdw_clauses(
+        &mut self,
+    ) -> Result<(Option<FdwClause>, Option<FdwClause>, Option<FdwClause>), SqlError> {
+        let mut handler: Option<FdwClause> = None;
+        let mut validator: Option<FdwClause> = None;
+        let mut connection: Option<FdwClause> = None;
+        loop {
+            let slot = match self.peek() {
+                Token::Ident(s) if s == "handler" => &mut handler,
+                Token::Ident(s) if s == "validator" => &mut validator,
+                Token::Ident(s) if s == "connection" => &mut connection,
+                Token::Ident(s) if s == "no" => {
+                    // NO HANDLER / NO VALIDATOR / NO CONNECTION.
+                    let save = self.pos;
+                    self.next(); // 'no'
+                    let slot = match self.peek() {
+                        Token::Ident(s) if s == "handler" => &mut handler,
+                        Token::Ident(s) if s == "validator" => &mut validator,
+                        Token::Ident(s) if s == "connection" => &mut connection,
+                        _ => {
+                            self.pos = save;
+                            break;
+                        }
+                    };
+                    self.next(); // the noun
+                    if slot.is_some() {
+                        return Err(SqlError {
+                            message: "conflicting or redundant options".to_string(),
+                            code: "42601",
+                        });
+                    }
+                    *slot = Some(FdwClause::Clear);
+                    continue;
+                }
+                _ => break,
+            };
+            self.next(); // the noun
+            if slot.is_some() {
+                return Err(SqlError {
+                    message: "conflicting or redundant options".to_string(),
+                    code: "42601",
+                });
+            }
+            let qn = self.parse_table_name()?;
+            let base = qn.rsplit('.').next().unwrap_or(&qn).to_string();
+            *slot = Some(FdwClause::Set(base));
+        }
+        Ok((handler, validator, connection))
+    }
+
+    /// CREATE FOREIGN DATA WRAPPER ... ('foreign' not yet consumed).
+    pub(crate) fn parse_create_fdw(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("foreign")?;
+        self.expect_keyword("data")?;
+        self.expect_keyword("wrapper")?;
+        let name = self.expect_ident()?;
+        let (handler, validator, connection) = self.parse_fdw_clauses()?;
+        let options = if self.eat_keyword("options") {
+            self.parse_generic_option_list(false)?
+        } else {
+            Vec::new()
+        };
+        Ok(Stmt::CreateFdw {
+            name,
+            handler,
+            validator,
+            connection,
+            options,
+        })
+    }
+
+    /// CREATE SERVER ... ('server' not yet consumed).
+    pub(crate) fn parse_create_server(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("server")?;
+        let if_not_exists = if self.eat_keyword("if") {
+            self.expect_keyword("not")?;
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.expect_ident()?;
+        let mut srvtype: Option<String> = None;
+        let mut srvversion: Option<String> = None;
+        loop {
+            if self.eat_keyword("type") {
+                match self.next() {
+                    Token::Str(v) => srvtype = Some(v),
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected string literal for TYPE, found {:?}",
+                            other
+                        )));
+                    }
+                }
+            } else if self.eat_keyword("version") {
+                match self.next() {
+                    Token::Str(v) => srvversion = Some(v),
+                    Token::Ident(s) if s == "null" => srvversion = None,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected string literal for VERSION, found {:?}",
+                            other
+                        )));
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        self.expect_keyword("foreign")?;
+        self.expect_keyword("data")?;
+        self.expect_keyword("wrapper")?;
+        let fdw = self.expect_ident()?;
+        let options = if self.eat_keyword("options") {
+            self.parse_generic_option_list(false)?
+        } else {
+            Vec::new()
+        };
+        Ok(Stmt::CreateServer {
+            name,
+            if_not_exists,
+            srvtype,
+            srvversion,
+            fdw,
+            options,
+        })
+    }
+
+    /// The auth_ident of a USER MAPPING statement: a role name,
+    /// PUBLIC, USER / CURRENT_USER / CURRENT_ROLE, SESSION_USER.
+    pub(crate) fn parse_mapping_user(&mut self) -> Result<MappingUser, SqlError> {
+        match self.peek().clone() {
+            Token::Ident(s) if s == "public" => {
+                self.next();
+                Ok(MappingUser::Public)
+            }
+            Token::Ident(s) if s == "user" || s == "current_user" || s == "current_role" => {
+                self.next();
+                Ok(MappingUser::CurrentUser)
+            }
+            Token::Ident(s) if s == "session_user" => {
+                self.next();
+                Ok(MappingUser::SessionUser)
+            }
+            _ => Ok(MappingUser::Role(self.expect_ident()?)),
+        }
+    }
+
+    /// CREATE USER MAPPING ... ('user' not yet consumed).
+    pub(crate) fn parse_create_user_mapping(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("user")?;
+        self.expect_keyword("mapping")?;
+        let if_not_exists = if self.eat_keyword("if") {
+            self.expect_keyword("not")?;
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        self.expect_keyword("for")?;
+        let user = self.parse_mapping_user()?;
+        self.expect_keyword("server")?;
+        let server = self.expect_ident()?;
+        let options = if self.eat_keyword("options") {
+            self.parse_generic_option_list(false)?
+        } else {
+            Vec::new()
+        };
+        Ok(Stmt::CreateUserMapping {
+            if_not_exists,
+            user,
+            server,
+            options,
+        })
+    }
+
+    /// CREATE FOREIGN TABLE ... ('foreign' not yet consumed).
+    pub(crate) fn parse_create_foreign_table(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("foreign")?;
+        self.expect_keyword("table")?;
+        let if_not_exists = if self.eat_keyword("if") {
+            self.expect_keyword("not")?;
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_table_name()?;
+        // PARTITION OF form: reuse the ordinary partition-of parser
+        // for the bound machinery, then take its def.
+        if matches!(self.peek(), Token::Ident(s) if s == "partition") {
+            let save = self.pos;
+            self.next();
+            let is_of = matches!(self.peek(), Token::Ident(s) if s == "of");
+            self.pos = save;
+            if is_of {
+                let stmt = self.parse_create_partition_of(name.clone(), false)?;
+                let def = match stmt {
+                    Stmt::CreateTable { def, .. } => def,
+                    _ => unreachable!(),
+                };
+                self.expect_keyword("server")?;
+                let server = self.expect_ident()?;
+                let options = if self.eat_keyword("options") {
+                    self.parse_generic_option_list(false)?
+                } else {
+                    Vec::new()
+                };
+                return Ok(Stmt::CreateForeignTable {
+                    name,
+                    def,
+                    server,
+                    options,
+                    col_options: Vec::new(),
+                    if_not_exists,
+                });
+            }
+        }
+        self.expect(Token::LParen, "'('")?;
+        let mut items: Vec<TableItem> = Vec::new();
+        if *self.peek() == Token::RParen {
+            self.next();
+        } else {
+            loop {
+                if matches!(self.peek(), Token::Ident(s) if s == "like") {
+                    items.push(TableItem::Like(self.parse_like_clause()?));
+                } else if self.is_table_constraint_start() {
+                    items.push(TableItem::TableCon(self.parse_table_constraint()?));
+                } else {
+                    items.push(TableItem::Col(self.parse_column_def()?));
+                }
+                match self.next() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')', found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+        }
+        let mut inherits: Vec<String> = Vec::new();
+        if self.eat_keyword("inherits") {
+            self.expect(Token::LParen, "'('")?;
+            loop {
+                inherits.push(self.expect_ident()?);
+                match self.next() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')' in INHERITS list, found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+        }
+        // v2.36: a foreign table may itself be partitioned
+        // (PARTITION BY ... before SERVER, PG19 gram.y).
+        let partition_by = if matches!(self.peek(), Token::Ident(s) if s == "partition") {
+            let save = self.pos;
+            self.next();
+            let is_by = matches!(self.peek(), Token::Ident(s) if s == "by");
+            self.pos = save;
+            if is_by {
+                Some(self.parse_partition_by()?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        self.expect_keyword("server")?;
+        let server = self.expect_ident()?;
+        let options = if self.eat_keyword("options") {
+            self.parse_generic_option_list(false)?
+        } else {
+            Vec::new()
+        };
+        // Harvest per-column OPTIONS (carried as ColCon::FdwOptions)
+        // by column name and strip them from the item stream.
+        let mut col_options: Vec<(String, Vec<FdwOpt>)> = Vec::new();
+        for item in items.iter_mut() {
+            if let TableItem::Col(c) = item {
+                let mut taken: Vec<FdwOpt> = Vec::new();
+                c.cons.retain(|con| {
+                    if let ColCon::FdwOptions(opts) = con {
+                        taken.extend(opts.iter().cloned());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if !taken.is_empty() {
+                    col_options.push((c.name.clone(), taken));
+                }
+            }
+        }
+        let mut def = build_table_def(&name, items, &inherits)?;
+        def.inherits = inherits;
+        if let Some((method, keys)) = partition_by {
+            def.partition = Some(PartitionDef {
+                method,
+                keys,
+                parent: None,
+                bound: None,
+            });
+        }
+        Ok(Stmt::CreateForeignTable {
+            name,
+            def,
+            server,
+            options,
+            col_options,
+            if_not_exists,
+        })
+    }
+
+    /// ALTER FOREIGN DATA WRAPPER ... ('foreign' not yet consumed).
+    pub(crate) fn parse_alter_fdw(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("foreign")?;
+        self.expect_keyword("data")?;
+        self.expect_keyword("wrapper")?;
+        let name = self.expect_ident()?;
+        if self.eat_keyword("owner") {
+            self.expect_keyword("to")?;
+            let new_owner = self.expect_ident()?;
+            return Ok(Stmt::AlterFdwOwner { name, new_owner });
+        }
+        if self.eat_keyword("rename") {
+            self.expect_keyword("to")?;
+            let new_name = self.expect_ident()?;
+            return Ok(Stmt::AlterFdwRename { name, new_name });
+        }
+        let (handler, validator, connection) = self.parse_fdw_clauses()?;
+        let options = if self.eat_keyword("options") {
+            Some(self.parse_generic_option_list(true)?)
+        } else {
+            None
+        };
+        if handler.is_none() && validator.is_none() && connection.is_none() && options.is_none() {
+            return Err(err("syntax error at or near \";\"".to_string()));
+        }
+        Ok(Stmt::AlterFdw {
+            name,
+            handler,
+            validator,
+            connection,
+            options,
+        })
+    }
+
+    /// ALTER SERVER ... ('server' not yet consumed).
+    pub(crate) fn parse_alter_server(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("server")?;
+        let name = self.expect_ident()?;
+        if self.eat_keyword("owner") {
+            self.expect_keyword("to")?;
+            let new_owner = self.expect_ident()?;
+            return Ok(Stmt::AlterServerOwner { name, new_owner });
+        }
+        if self.eat_keyword("rename") {
+            self.expect_keyword("to")?;
+            let new_name = self.expect_ident()?;
+            return Ok(Stmt::AlterServerRename { name, new_name });
+        }
+        let mut srvversion: Option<Option<String>> = None;
+        if self.eat_keyword("version") {
+            match self.next() {
+                Token::Str(v) => srvversion = Some(Some(v)),
+                Token::Ident(s) if s == "null" => srvversion = Some(None),
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected string literal for VERSION, found {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+        let options = if self.eat_keyword("options") {
+            Some(self.parse_generic_option_list(true)?)
+        } else {
+            None
+        };
+        if srvversion.is_none() && options.is_none() {
+            return Err(err("syntax error at or near \";\"".to_string()));
+        }
+        Ok(Stmt::AlterServer {
+            name,
+            srvversion,
+            options,
+        })
+    }
+
+    /// ALTER USER MAPPING ... ('user' not yet consumed).
+    pub(crate) fn parse_alter_user_mapping(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("user")?;
+        self.expect_keyword("mapping")?;
+        self.expect_keyword("for")?;
+        let user = self.parse_mapping_user()?;
+        self.expect_keyword("server")?;
+        let server = self.expect_ident()?;
+        self.expect_keyword("options")?;
+        let options = self.parse_generic_option_list(true)?;
+        Ok(Stmt::AlterUserMapping {
+            user,
+            server,
+            options,
+        })
+    }
+
+    /// ALTER FOREIGN TABLE: the ordinary ALTER TABLE action list on
+    /// a foreign table (PG19 AlterTableStmt OBJECT_FOREIGN_TABLE).
+    pub(crate) fn parse_alter_foreign_table(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("foreign")?;
+        self.expect_keyword("table")?;
+        let if_exists = if matches!(self.peek(), Token::Ident(s) if s == "if") {
+            self.next();
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        let only = self.eat_keyword("only");
+        let name = self.parse_table_name()?;
+        if *self.peek() == Token::Star {
+            self.next();
+        }
+        let mut actions = Vec::new();
+        loop {
+            actions.push(self.parse_alter_action()?);
+            if *self.peek() == Token::Comma {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        Ok(Stmt::AlterTable {
+            name,
+            actions,
+            if_exists,
+            only,
+        })
+    }
+
     pub(crate) fn parse_comment(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("on")?;
+        // v2.36: COMMENT ON FOREIGN DATA WRAPPER / FOREIGN TABLE /
+        // SERVER (PG19 CommentStmt OBJECT_FDW / OBJECT_FOREIGN_TABLE
+        // / OBJECT_FOREIGN_SERVER).
+        if matches!(self.peek(), Token::Ident(s) if s == "foreign") {
+            let save = self.pos;
+            self.next(); // 'foreign'
+            if self.eat_keyword("data") {
+                self.expect_keyword("wrapper")?;
+                let name = self.expect_ident()?;
+                let comment = self.parse_comment_text()?;
+                return Ok(Stmt::CommentOn {
+                    target: "foreign_data_wrapper".to_string(),
+                    name,
+                    sub: None,
+                    comment,
+                });
+            }
+            if self.eat_keyword("table") {
+                let name = self.parse_table_name()?;
+                let comment = self.parse_comment_text()?;
+                return Ok(Stmt::CommentOn {
+                    target: "foreign_table".to_string(),
+                    name,
+                    sub: None,
+                    comment,
+                });
+            }
+            self.pos = save;
+        }
+        if matches!(self.peek(), Token::Ident(s) if s == "server") {
+            self.next(); // 'server'
+            let name = self.expect_ident()?;
+            let comment = self.parse_comment_text()?;
+            return Ok(Stmt::CommentOn {
+                target: "server".to_string(),
+                name,
+                sub: None,
+                comment,
+            });
+        }
         // v2.14: COMMENT ON TRIGGER name ON table IS ...
         if matches!(self.peek(), Token::Ident(s) if s == "trigger") {
             self.next();
@@ -7222,6 +8075,7 @@ impl Parser {
             unnamed_seq: 0,
             allow_similar_to: true,
             last_bit_typmod: None,
+            select_into: None,
         };
         if let Ok(mut e) = ep.parse_or() {
             let rest: Vec<Token> = ep.tokens[ep.pos..].to_vec();
@@ -9103,6 +9957,20 @@ impl Parser {
         }
     }
 
+    /// v2.37: PG19 gram.y — an INTO clause captured while parsing a
+    /// query that is not the statement's outermost SELECT is a
+    /// syntax error ("INTO is not allowed here", 42601). Consumers
+    /// that parse sub-context queries call this after parsing.
+    pub(crate) fn reject_captured_into(&mut self) -> Result<(), SqlError> {
+        if self.select_into.take().is_some() {
+            return Err(SqlError {
+                message: "INTO is not allowed here".to_string(),
+                code: "42601",
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn parse_insert(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("into")?;
         let table = self.parse_table_name()?;
@@ -9163,9 +10031,11 @@ impl Parser {
             (vec![Vec::new()], None)
         } else if self.eat_keyword("select") {
             let sel = self.parse_select_query()?;
+            self.reject_captured_into()?;
             (Vec::new(), Some(sel))
         } else if *self.peek() == Token::LParen {
             let sel = self.parse_select_query_not_consumed()?;
+            self.reject_captured_into()?;
             (Vec::new(), Some(sel))
         } else {
             self.expect_keyword("values")?;
@@ -9268,6 +10138,45 @@ impl Parser {
         Ok(InsertTarget { name, indirection })
     }
 
+    /// v2.35: `(expr).*` at the head of a select item — token-shape
+    /// probe (matching-paren scan, then Dot Star). On a match the
+    /// item is consumed and returned; otherwise nothing is consumed.
+    pub(crate) fn try_parse_composite_star(&mut self) -> Option<Result<SelectItem, SqlError>> {
+        if *self.peek() != Token::LParen {
+            return None;
+        }
+        let mut depth = 0i32;
+        let mut j = self.pos;
+        let close = loop {
+            match self.tokens.get(j) {
+                Some(Token::LParen) => depth += 1,
+                Some(Token::RParen) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break Some(j);
+                    }
+                }
+                Some(_) => {}
+                None => break None,
+            }
+            j += 1;
+        }?;
+        if !matches!(self.tokens.get(close + 1), Some(Token::Dot))
+            || !matches!(self.tokens.get(close + 2), Some(Token::Star))
+        {
+            return None;
+        }
+        let parsed = (|| {
+            self.next(); // '('
+            let inner = self.parse_or()?;
+            self.expect(Token::RParen, "')'")?;
+            self.next(); // '.'
+            self.next(); // '*'
+            Ok(SelectItem::CompositeStar(inner))
+        })();
+        Some(parsed)
+    }
+
     /// v0.10: `RETURNING * | expr [, ...]` after INSERT/UPDATE/DELETE.
     /// Empty when the keyword is absent.
     pub(crate) fn parse_returning(&mut self) -> Result<Vec<SelectItem>, SqlError> {
@@ -9276,7 +10185,9 @@ impl Parser {
         }
         let mut items = Vec::new();
         loop {
-            if *self.peek() == Token::Star {
+            if let Some(cs) = self.try_parse_composite_star() {
+                items.push(cs?);
+            } else if *self.peek() == Token::Star {
                 self.next();
                 items.push(SelectItem::All);
             } else if let Some(q) = self.peek_ident() {
@@ -9640,6 +10551,18 @@ impl Parser {
             "select" => {
                 let mut sel = self.parse_select_query()?;
                 sel.with = ctes;
+                // v2.37: WITH ... SELECT ... INTO.
+                if let Some((name, temp)) = self.select_into.take() {
+                    return Ok(Stmt::CreateTableAs {
+                        name,
+                        col_aliases: Vec::new(),
+                        select: Box::new(sel),
+                        temp,
+                        if_not_exists: false,
+                        with_data: true,
+                        execute: None,
+                    });
+                }
                 Ok(Stmt::Select(sel))
             }
             "insert" => {
@@ -9804,6 +10727,49 @@ impl Parser {
 
     /// v0.10: `COPY table [(cols)] FROM STDIN | TO STDOUT [WITH (...)]`.
     pub(crate) fn parse_copy(&mut self) -> Result<Stmt, SqlError> {
+        // v2.37: COPY (query) TO STDOUT (PG19 CopyStmt with a
+        // SelectStmt instead of a relation). TO-only; the query is
+        // parenthesized. Falls through to the shared option parsing.
+        if *self.peek() == Token::LParen {
+            let q = self.parse_select_query_not_consumed()?;
+            self.reject_captured_into()?;
+            if !self.eat_keyword("to") {
+                return Err(err(
+                    "syntax error: expected TO after COPY (query)".to_string()
+                ));
+            }
+            if !self.eat_keyword("stdout") {
+                return Err(SqlError {
+                    message: "COPY TO a file is not supported; use COPY TO STDOUT".to_string(),
+                    code: "0A000",
+                });
+            }
+            let (mut options, delimiter_set, null_set, quote_set, escape_set) =
+                self.parse_copy_options()?;
+            self.validate_copy_options(
+                &options,
+                true,
+                delimiter_set,
+                null_set,
+                quote_set,
+                escape_set,
+            )?;
+            if options.format == CopyFormat::Csv {
+                if !delimiter_set {
+                    options.delimiter = b',';
+                }
+                if !null_set {
+                    options.null = String::new();
+                }
+            }
+            return Ok(Stmt::Copy {
+                table: String::new(),
+                columns: None,
+                to_stdout: true,
+                options,
+                query: Some(Box::new(q)),
+            });
+        }
         let table = self.expect_ident()?;
         let columns = if *self.peek() == Token::LParen {
             self.next();
@@ -9846,19 +10812,318 @@ impl Parser {
                 self.peek()
             )));
         };
+        let (mut options, delimiter_set, null_set, quote_set, escape_set) =
+            self.parse_copy_options()?;
+        self.validate_copy_options(
+            &options,
+            to_stdout,
+            delimiter_set,
+            null_set,
+            quote_set,
+            escape_set,
+        )?;
+        // v0.10: CSV defaults (like Postgres): comma delimiter and
+        // empty-string NULL unless explicitly set.
+        if options.format == CopyFormat::Csv {
+            if !delimiter_set {
+                options.delimiter = b',';
+            }
+            if !null_set {
+                options.null = String::new();
+            }
+        }
+        Ok(Stmt::Copy {
+            table,
+            columns,
+            to_stdout,
+            options,
+            query: None,
+        })
+    }
+
+    /// v2.37: the COPY option list in either syntax — legacy
+    /// unparenthesized options, a bare WITH, or WITH (...). Returns
+    /// (options, delimiter_was_set, null_was_set) for CSV defaulting.
+    /// v2.37: a FORCE_* column specification: `*`, `(a, b, *)`, or
+    /// one bare column name (legacy syntax). Returns (names, star).
+    pub(crate) fn parse_force_cols(&mut self) -> Result<(Vec<String>, bool), SqlError> {
+        let mut names = Vec::new();
+        let mut all = false;
+        if *self.peek() == Token::LParen {
+            self.next();
+            loop {
+                if *self.peek() == Token::Star {
+                    self.next();
+                    all = true;
+                } else {
+                    names.push(self.expect_ident()?);
+                }
+                if *self.peek() == Token::Comma {
+                    self.next();
+                    continue;
+                }
+                break;
+            }
+            self.expect(Token::RParen, "')'")?;
+        } else if *self.peek() == Token::Star {
+            self.next();
+            all = true;
+        } else {
+            names.push(self.expect_ident()?);
+        }
+        Ok((names, all))
+    }
+
+    /// v2.37: PG19 ProcessCopyOptions cross-checks, in PG's order:
+    /// JSON-mode prohibitions, CSV-only options, direction rules.
+    pub(crate) fn validate_copy_options(
+        &self,
+        options: &CopyOptions,
+        to_stdout: bool,
+        delimiter_set: bool,
+        null_set: bool,
+        quote_set: bool,
+        escape_set: bool,
+    ) -> Result<(), SqlError> {
+        let na = |code: &'static str, message: String| SqlError { message, code };
+        if options.format == CopyFormat::Json {
+            if delimiter_set {
+                return Err(na(
+                    "0A000",
+                    "cannot specify DELIMITER in JSON mode".to_string(),
+                ));
+            }
+            if null_set {
+                return Err(na("0A000", "cannot specify NULL in JSON mode".to_string()));
+            }
+            if options.header_lines != 0 {
+                return Err(na(
+                    "0A000",
+                    "cannot specify HEADER in JSON mode".to_string(),
+                ));
+            }
+        }
+        if options.format != CopyFormat::Csv {
+            if quote_set {
+                return Err(na("0A000", "COPY QUOTE requires CSV mode".to_string()));
+            }
+            if escape_set {
+                return Err(na("0A000", "COPY ESCAPE requires CSV mode".to_string()));
+            }
+            if options.force_quote_all || !options.force_quote.is_empty() {
+                return Err(na(
+                    "0A000",
+                    "COPY FORCE_QUOTE requires CSV mode".to_string(),
+                ));
+            }
+            if options.force_not_null_all || !options.force_not_null.is_empty() {
+                return Err(na(
+                    "0A000",
+                    "COPY FORCE_NOT_NULL requires CSV mode".to_string(),
+                ));
+            }
+            if options.force_null_all || !options.force_null.is_empty() {
+                return Err(na("0A000", "COPY FORCE_NULL requires CSV mode".to_string()));
+            }
+        }
+        if !options.force_quote.is_empty() || options.force_quote_all {
+            if !to_stdout {
+                return Err(na(
+                    "0A000",
+                    "COPY FORCE_QUOTE cannot be used with COPY FROM".to_string(),
+                ));
+            }
+        }
+        if !options.force_not_null.is_empty() || options.force_not_null_all {
+            if to_stdout {
+                return Err(na(
+                    "22023",
+                    "COPY FORCE_NOT_NULL cannot be used with COPY TO".to_string(),
+                ));
+            }
+        }
+        if !options.force_null.is_empty() || options.force_null_all {
+            if to_stdout {
+                return Err(na(
+                    "22023",
+                    "COPY FORCE_NULL cannot be used with COPY TO".to_string(),
+                ));
+            }
+        }
+        if options.format == CopyFormat::Json && !to_stdout {
+            return Err(na(
+                "22023",
+                "COPY FORMAT JSON is not supported for COPY FROM".to_string(),
+            ));
+        }
+        if options.force_array && options.format != CopyFormat::Json {
+            return Err(na(
+                "22023",
+                "COPY FORCE_ARRAY can only be used with JSON mode".to_string(),
+            ));
+        }
+        // PG19 defGetCopyHeaderOption: MATCH and multi-line headers
+        // are FROM-only.
+        if to_stdout && options.header_lines == -1 {
+            return Err(na(
+                "0A000",
+                "cannot use \"match\" with HEADER in COPY TO".to_string(),
+            ));
+        }
+        if to_stdout && options.header_lines > 1 {
+            return Err(na(
+                "0A000",
+                "cannot use multi-line header in COPY TO".to_string(),
+            ));
+        }
+        if let Some(v) = &options.on_error {
+            if !matches!(v.as_str(), "stop" | "ignore" | "set_null") {
+                return Err(na(
+                    "22023",
+                    format!("COPY ON_ERROR \"{}\" not recognized", v),
+                ));
+            }
+            if to_stdout {
+                return Err(na(
+                    "0A000",
+                    "COPY ON_ERROR cannot be used with COPY TO".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn parse_copy_options(
+        &mut self,
+    ) -> Result<(CopyOptions, bool, bool, bool, bool), SqlError> {
         let mut options = CopyOptions::default();
         let mut delimiter_set = false;
         let mut null_set = false;
-        if self.eat_keyword("with") {
+        let mut quote_set = false;
+        let mut escape_set = false;
+        if matches!(self.peek(), Token::Ident(w) if w == "with")
+            && !matches!(self.peek2(), Token::LParen)
+        {
+            self.next(); // WITH
+            // v2.37: legacy pre-9.0 COPY option syntax (PG19 gram.y
+            // copy_opt_list): `WITH DELIMITER ','`, `WITH NULL 'x'`,
+            // `WITH CSV HEADER`, or a bare `WITH` with no options at
+            // all (`COPY t FROM stdin WITH ;` in rowsecurity.sql).
+            loop {
+                let Token::Ident(opt) = self.peek().clone() else {
+                    break;
+                };
+                match opt.as_str() {
+                    "delimiter" => {
+                        self.next();
+                        let _ = self.eat_keyword("as");
+                        options.delimiter = self.parse_copy_char("DELIMITER")?;
+                        delimiter_set = true;
+                    }
+                    "null" => {
+                        self.next();
+                        let _ = self.eat_keyword("as");
+                        options.null = self.parse_copy_string("NULL")?;
+                        null_set = true;
+                    }
+                    "header" => {
+                        self.next();
+                        options.header_lines = 1;
+                    }
+                    "quote" => {
+                        self.next();
+                        let _ = self.eat_keyword("as");
+                        options.quote = self.parse_copy_char("QUOTE")?;
+                    }
+                    "escape" => {
+                        self.next();
+                        let _ = self.eat_keyword("as");
+                        options.escape = self.parse_copy_char("ESCAPE")?;
+                    }
+                    "csv" => {
+                        self.next();
+                        options.format = CopyFormat::Csv;
+                    }
+                    "json" => {
+                        // v2.37: `COPY t TO STDOUT json` (PG19 legacy
+                        // format word).
+                        self.next();
+                        options.format = CopyFormat::Json;
+                    }
+                    "oids" | "freeze" => {
+                        // Planner/storage hints with no executor
+                        // meaning here; consumed (an optional boolean
+                        // word may follow OIDS in the old syntax).
+                        self.next();
+                        if opt == "oids" {
+                            let _ = self.eat_keyword("true") || self.eat_keyword("false");
+                        }
+                    }
+                    "encoding" => {
+                        self.next();
+                        let _ = self.parse_copy_string("ENCODING")?;
+                    }
+                    "force" => {
+                        // v2.37: FORCE QUOTE / FORCE NOT NULL / FORCE
+                        // NULL <col list | * | col> — recorded like the
+                        // parenthesized form (validated by the caller).
+                        self.next();
+                        enum FK {
+                            Quote,
+                            NotNull,
+                            Null,
+                        }
+                        let kind = if self.eat_keyword("not") {
+                            self.expect_keyword("null")?;
+                            FK::NotNull
+                        } else if self.eat_keyword("quote") {
+                            FK::Quote
+                        } else {
+                            self.expect_keyword("null")?;
+                            FK::Null
+                        };
+                        let (names, all) = self.parse_force_cols()?;
+                        match kind {
+                            FK::Quote => {
+                                options.force_quote = names;
+                                options.force_quote_all = all;
+                            }
+                            FK::NotNull => {
+                                options.force_not_null = names;
+                                options.force_not_null_all = all;
+                            }
+                            FK::Null => {
+                                options.force_null = names;
+                                options.force_null_all = all;
+                            }
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        } else if self.eat_keyword("with") || *self.peek() == Token::LParen {
+            // PG19 gram.y copy_options: WITH '(' list ')' or a bare
+            // '(' list ')' — both are the modern option list.
             self.expect(Token::LParen, "'('")?;
+            let mut seen_opts: Vec<String> = Vec::new();
             loop {
                 let opt = self.expect_ident()?;
+                // PG19 ProcessCopyOptions: ANY option supplied
+                // twice is "conflicting or redundant options" (42601).
+                if seen_opts.iter().any(|o| o == &opt) {
+                    return Err(SqlError {
+                        message: "conflicting or redundant options".to_string(),
+                        code: "42601",
+                    });
+                }
+                seen_opts.push(opt.clone());
                 match opt.as_str() {
                     "format" => {
                         let fmt = self.expect_ident()?;
                         options.format = match fmt.as_str() {
                             "text" => CopyFormat::Text,
                             "csv" => CopyFormat::Csv,
+                            "json" => CopyFormat::Json,
                             "binary" => {
                                 return Err(SqlError {
                                     message: "COPY FORMAT BINARY is not supported".to_string(),
@@ -9882,24 +11147,118 @@ impl Parser {
                         null_set = true;
                     }
                     "header" => {
-                        // `HEADER` or `HEADER true|false`.
-                        options.header = match self.peek() {
-                            Token::Ident(v) if v == "true" => {
+                        // PG19 defGetCopyHeaderOption: bare (true), a
+                        // boolean, a non-negative integer (lines to
+                        // skip), a numeric string, or "match".
+                        options.header_lines = match self.peek().clone() {
+                            Token::Ident(w) if w == "true" || w == "on" => {
                                 self.next();
-                                true
+                                1
                             }
-                            Token::Ident(v) if v == "false" => {
+                            Token::Ident(w) if w == "false" || w == "off" => {
                                 self.next();
-                                false
+                                0
                             }
-                            _ => true,
+                            Token::Ident(w) if w == "match" => {
+                                self.next();
+                                -1
+                            }
+                            Token::Ident(_) => {
+                                return Err(SqlError {
+                                    message: "header requires a Boolean value, an integer value greater than or equal to zero, or the string \"match\"".to_string(),
+                                    code: "42601",
+                                });
+                            }
+                            Token::Number(n) => {
+                                self.next();
+                                let v: i64 = n
+                                    .parse()
+                                    .map_err(|_| err("invalid HEADER value".to_string()))?;
+                                if v < 0 {
+                                    return Err(SqlError {
+                                        message: "a negative integer value cannot be specified for HEADER".to_string(),
+                                        code: "22023",
+                                    });
+                                }
+                                v as i32
+                            }
+                            Token::Str(v) => {
+                                self.next();
+                                match v.to_ascii_lowercase().as_str() {
+                                    "true" | "on" => 1,
+                                    "false" | "off" => 0,
+                                    "match" => -1,
+                                    num => match num.parse::<i64>() {
+                                        Ok(v) if v >= 0 => v as i32,
+                                        Ok(_) => {
+                                            return Err(SqlError {
+                                                message: "a negative integer value cannot be specified for HEADER".to_string(),
+                                                code: "22023",
+                                            });
+                                        }
+                                        Err(_) => {
+                                            return Err(SqlError {
+                                                message: "header requires a Boolean value, an integer value greater than or equal to zero, or the string \"match\"".to_string(),
+                                                code: "42601",
+                                            });
+                                        }
+                                    },
+                                }
+                            }
+                            _ => 1,
                         };
                     }
                     "quote" => {
                         options.quote = self.parse_copy_char("QUOTE")?;
+                        quote_set = true;
                     }
                     "escape" => {
                         options.escape = self.parse_copy_char("ESCAPE")?;
+                        escape_set = true;
+                    }
+                    // v2.37: PG19 parenthesized options with no
+                    // executor meaning in this engine — consumed and
+                    // ignored (FREEZE/OIDS are storage hints; ENCODING
+                    // is always UTF8 here; FORCE_* shape CSV quoting,
+                    // which the bounded CSV writer does not model).
+                    "freeze" => {}
+                    "oids" => {
+                        let _ = self.eat_keyword("true") || self.eat_keyword("false");
+                    }
+                    "encoding" => {
+                        let _ = self.parse_copy_string("ENCODING")?;
+                    }
+                    "force_quote" | "force_not_null" | "force_null" => {
+                        let (names, all) = self.parse_force_cols()?;
+                        match opt.as_str() {
+                            "force_quote" => {
+                                options.force_quote = names;
+                                options.force_quote_all = all;
+                            }
+                            "force_not_null" => {
+                                options.force_not_null = names;
+                                options.force_not_null_all = all;
+                            }
+                            _ => {
+                                options.force_null = names;
+                                options.force_null_all = all;
+                            }
+                        }
+                    }
+                    "force_array" => {
+                        // `FORCE_ARRAY [true|false]` (PG19 defGetBoolean
+                        // shape; a bare option means true here).
+                        options.force_array =
+                            if self.eat_keyword("false") || self.eat_keyword("off") {
+                                false
+                            } else {
+                                let _ = self.eat_keyword("true") || self.eat_keyword("on");
+                                true
+                            };
+                    }
+                    "on_error" => {
+                        let v = self.expect_ident()?;
+                        options.on_error = Some(v.to_ascii_lowercase());
                     }
                     _ => {
                         return Err(err(format!(
@@ -9916,22 +11275,7 @@ impl Parser {
             }
             self.expect(Token::RParen, "')'")?;
         }
-        // v0.10: CSV defaults (like Postgres): comma delimiter and
-        // empty-string NULL unless explicitly set.
-        if options.format == CopyFormat::Csv {
-            if !delimiter_set {
-                options.delimiter = b',';
-            }
-            if !null_set {
-                options.null = String::new();
-            }
-        }
-        Ok(Stmt::Copy {
-            table,
-            columns,
-            to_stdout,
-            options,
-        })
+        Ok((options, delimiter_set, null_set, quote_set, escape_set))
     }
 
     /// v0.10: one single-character COPY option value: `'c'` or `E'c'`.
@@ -11220,6 +12564,7 @@ impl Parser {
                     Token::Ident(s) if s == "select" => {
                         self.next();
                         let sub = self.parse_select_query()?;
+                        self.reject_captured_into()?;
                         self.expect(Token::RParen, "')'")?;
                         Ok(Expr::ScalarSub(Box::new(sub)))
                     }
@@ -14913,8 +16258,11 @@ impl Parser {
             if items.is_empty() && self.select_core_follows() {
                 break;
             }
-            // `*`
-            if *self.peek() == Token::Star {
+            // v2.35: `(expr).*` composite star.
+            if let Some(cs) = self.try_parse_composite_star() {
+                items.push(cs?);
+            } else if *self.peek() == Token::Star {
+                // `*`
                 self.next();
                 items.push(SelectItem::All);
             } else if let Some(q) = self.peek_ident() {
@@ -14955,6 +16303,24 @@ impl Parser {
         // syntax error in PG19 even though `SELECT FROM t` is legal.
         if (distinct || !distinct_on.is_empty()) && items.is_empty() {
             return Err(err("syntax error at or near \"from\"".to_string()));
+        }
+        // v2.37: `SELECT ... INTO [TEMP|UNLOGGED] [TABLE] name`
+        // (PG19 into_clause sits between the target list and FROM).
+        // Captured on the parser; parse_top_kw converts the finished
+        // statement to CreateTableAs. (PG rejects INTO inside
+        // subqueries; this parser only ever converts the outermost
+        // statement, and a subquery INTO would set the same field —
+        // a bounded deviation on SQL PG rejects outright.)
+        if matches!(self.peek(), Token::Ident(k) if k == "into")
+            && !matches!(self.peek2(), Token::LParen)
+            && !PLPGSQL_DYNAMIC_PARSE.with(|c| c.get())
+        {
+            self.next(); // INTO
+            let temp = self.eat_keyword("temp") || self.eat_keyword("temporary");
+            let _unlogged = self.eat_keyword("unlogged");
+            let _ = self.eat_keyword("table");
+            let name = self.parse_table_name()?;
+            self.select_into = Some((name, temp));
         }
         let from = if self.eat_keyword("from") {
             self.parse_from()?
@@ -15831,6 +17197,7 @@ impl Parser {
                 let left = self.parse_set_operand()?;
                 let carrier = self.parse_set_chain(left, 1)?;
                 let sub = self.finish_select_query(carrier)?;
+                self.reject_captured_into()?;
                 self.expect(Token::RParen, "')'")?;
                 FromItem::Derived {
                     sub: Box::new(sub),
@@ -15864,6 +17231,7 @@ impl Parser {
                     // supported (PG19). Parse via parse_select_query_not_consumed
                     // which handles the leading WITH.
                     let sub = self.parse_select_query_not_consumed()?;
+                    self.reject_captured_into()?;
                     FromItem::Derived {
                         sub: Box::new(sub),
                         alias: String::new(),
@@ -16731,6 +18099,103 @@ impl Parser {
     }
 
     pub(crate) fn parse_drop(&mut self) -> Result<Stmt, SqlError> {
+        // v2.36: DROP FOREIGN DATA WRAPPER / DROP FOREIGN TABLE /
+        // DROP SERVER / DROP USER MAPPING.
+        if matches!(self.peek(), Token::Ident(s) if s == "foreign") {
+            if matches!(self.peek2(), Token::Ident(s) if s == "data") {
+                self.next(); // 'foreign'
+                self.expect_keyword("data")?;
+                self.expect_keyword("wrapper")?;
+                let if_exists = if self.eat_keyword("if") {
+                    self.expect_keyword("exists")?;
+                    true
+                } else {
+                    false
+                };
+                let mut names = Vec::new();
+                loop {
+                    names.push(self.expect_ident()?);
+                    if !matches!(self.peek(), Token::Comma) {
+                        break;
+                    }
+                    self.next();
+                }
+                let cascade = self.parse_cascade_opt()?;
+                return Ok(Stmt::DropFdw {
+                    names,
+                    if_exists,
+                    cascade,
+                });
+            }
+            if matches!(self.peek2(), Token::Ident(s) if s == "table") {
+                self.next(); // 'foreign'
+                self.expect_keyword("table")?;
+                let if_exists = if self.eat_keyword("if") {
+                    self.expect_keyword("exists")?;
+                    true
+                } else {
+                    false
+                };
+                let mut names = Vec::new();
+                loop {
+                    names.push(self.parse_table_name()?);
+                    if !matches!(self.peek(), Token::Comma) {
+                        break;
+                    }
+                    self.next();
+                }
+                let cascade = self.parse_cascade_opt()?;
+                return Ok(Stmt::DropForeignTable {
+                    names,
+                    if_exists,
+                    cascade,
+                });
+            }
+        }
+        if matches!(self.peek(), Token::Ident(s) if s == "server") {
+            self.next(); // 'server'
+            let if_exists = if self.eat_keyword("if") {
+                self.expect_keyword("exists")?;
+                true
+            } else {
+                false
+            };
+            let mut names = Vec::new();
+            loop {
+                names.push(self.expect_ident()?);
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.next();
+            }
+            let cascade = self.parse_cascade_opt()?;
+            return Ok(Stmt::DropServer {
+                names,
+                if_exists,
+                cascade,
+            });
+        }
+        if matches!(self.peek(), Token::Ident(s) if s == "user")
+            && matches!(self.peek2(), Token::Ident(s) if s == "mapping")
+        {
+            self.next(); // 'user'
+            self.expect_keyword("mapping")?;
+            let if_exists = if self.eat_keyword("if") {
+                self.expect_keyword("exists")?;
+                true
+            } else {
+                false
+            };
+            self.expect_keyword("for")?;
+            let user = self.parse_mapping_user()?;
+            self.expect_keyword("server")?;
+            let server = self.expect_ident()?;
+            return Ok(Stmt::DropUserMapping {
+                if_exists,
+                user,
+                server,
+            });
+        }
         // v2.19: DROP RULE [IF EXISTS] name ON relation
         // [CASCADE|RESTRICT] (PG19 DropRuleStmt).
         if matches!(self.peek(), Token::Ident(s) if s == "rule") {
@@ -17854,6 +19319,31 @@ impl Parser {
             let name = self.expect_ident()?;
             return Ok(GrantObject::Language(name));
         }
+        // v2.36: GRANT/REVOKE ON FOREIGN DATA WRAPPER name [, ...] /
+        // ON FOREIGN SERVER name [, ...] (PG19 OBJECT_FDW /
+        // OBJECT_FOREIGN_SERVER).
+        if matches!(self.peek(), Token::Ident(s) if s == "foreign") {
+            let save = self.pos;
+            self.next(); // 'foreign'
+            if self.eat_keyword("data") {
+                self.expect_keyword("wrapper")?;
+                let mut names = vec![self.expect_ident()?];
+                while matches!(self.peek(), Token::Comma) {
+                    self.next();
+                    names.push(self.expect_ident()?);
+                }
+                return Ok(GrantObject::ForeignDataWrapper(names));
+            }
+            if self.eat_keyword("server") {
+                let mut names = vec![self.expect_ident()?];
+                while matches!(self.peek(), Token::Comma) {
+                    self.next();
+                    names.push(self.expect_ident()?);
+                }
+                return Ok(GrantObject::ForeignServer(names));
+            }
+            self.pos = save;
+        }
         if self.eat_keyword("schema") {
             // v2.17: GRANT ... ON SCHEMA s1, s2, ... (PG19 GrantStmt
             // accepts a name list).
@@ -18869,6 +20359,7 @@ pub(crate) fn expr_from_tokens(toks: &[Token]) -> Result<Expr, SqlError> {
         unnamed_seq: 0,
         allow_similar_to: true,
         last_bit_typmod: None,
+        select_into: None,
     };
     let e = p.parse_or()?;
     match p.next() {
@@ -19086,6 +20577,27 @@ pub(crate) fn split_trailing_collate(toks: &[Token]) -> (&[Token], Option<String
     (toks, None)
 }
 
+thread_local! {
+    /// v2.37: set while plpgsql parses a DYNAMIC statement string
+    /// (EXECUTE / RETURN QUERY EXECUTE / OPEN FOR). Inside plpgsql,
+    /// SELECT ... INTO binds plpgsql variables — it must never be
+    /// read as the SQL-level SELECT INTO table form (PG19 plpgsql
+    /// gram.y strips INTO before SPI parsing).
+    pub(crate) static PLPGSQL_DYNAMIC_PARSE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// v2.37: run `f` with the plpgsql-dynamic parse gate set (restored
+/// on exit, nesting-safe).
+pub(crate) fn with_plpgsql_dynamic_parse<T>(f: impl FnOnce() -> T) -> T {
+    PLPGSQL_DYNAMIC_PARSE.with(|c| {
+        let prev = c.replace(true);
+        let r = f();
+        c.set(prev);
+        r
+    })
+}
+
 /// Parse one statement from already-trimmed text (no view interception).
 pub(crate) fn parse_statement_inner(text: &str) -> Result<Stmt, SqlError> {
     let tokens = tokenize(text)?;
@@ -19095,6 +20607,7 @@ pub(crate) fn parse_statement_inner(text: &str) -> Result<Stmt, SqlError> {
         unnamed_seq: 0,
         allow_similar_to: true,
         last_bit_typmod: None,
+        select_into: None,
     };
     let stmt = p.parse_top()?;
     match p.next() {
@@ -19204,6 +20717,7 @@ pub(crate) fn parse_expr_str(text: &str) -> Result<Expr, SqlError> {
         unnamed_seq: 0,
         allow_similar_to: true,
         last_bit_typmod: None,
+        select_into: None,
     };
     p.parse_or()
 }
@@ -20393,6 +21907,7 @@ pub(crate) fn coltype_from_sql_spelling(name: &str) -> Result<ColType, String> {
         unnamed_seq: 0,
         allow_similar_to: true,
         last_bit_typmod: None,
+        select_into: None,
     };
     let (ty, named) = p
         .parse_type_name()

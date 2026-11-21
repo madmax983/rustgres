@@ -1360,6 +1360,7 @@ fn handle_query(
             columns,
             to_stdout,
             options,
+            query,
         } = &stmt
         {
             // v0.17: READ ONLY enforcement — COPY FROM is a write.
@@ -1372,8 +1373,9 @@ fn handle_query(
                 )?;
                 break;
             }
+            install_statement_context(session);
             let copy_ok = if *to_stdout {
-                handle_copy_to(stream, engine, wal, session, table, columns, options)
+                handle_copy_to(stream, engine, wal, session, table, columns, options, query)
             } else {
                 handle_copy_from(
                     reader, stream, engine, wal, session, table, columns, options,
@@ -1530,6 +1532,7 @@ fn copy_to_fetch(
     session: &mut Session,
     table: &str,
     columns: &Option<Vec<String>>,
+    query: &Option<Box<sql::SelectStmt>>,
 ) -> Result<(Vec<(String, ColType)>, Vec<Row>), exec::ExecError> {
     if let Some(t) = &session.txn {
         if t.failed {
@@ -1567,7 +1570,10 @@ fn copy_to_fetch(
             default_toast_compression: session.default_toast_compression,
             notices: Vec::new(),
         };
-        match exec::copy_to_rows(&mut *guard, &mut ctx, table, columns) {
+        match match query {
+            Some(q) => exec::copy_query_rows(&mut *guard, &mut ctx, q),
+            None => exec::copy_to_rows(&mut *guard, &mut ctx, table, columns),
+        } {
             Ok(r) => Ok(r),
             Err(e) => {
                 t.failed = true;
@@ -1593,7 +1599,10 @@ fn copy_to_fetch(
                 notices: Vec::new(),
                 writes: &mut writes,
             };
-            exec::copy_to_rows(&mut *guard, &mut ctx, table, columns)
+            match query {
+                Some(q) => exec::copy_query_rows(&mut *guard, &mut ctx, q),
+                None => exec::copy_to_rows(&mut *guard, &mut ctx, table, columns),
+            }
         };
         // COPY TO is read-only; retire the xid.
         retire_txn(&mut guard, xid);
@@ -1603,6 +1612,84 @@ fn copy_to_fetch(
 
 /// v0.17: send CopyOutResponse + CopyData (header + rows) + CopyDone —
 /// shared by the simple and extended protocol COPY TO paths.
+/// v2.37: JSON-escape a string for COPY FORMAT JSON output (PG19
+/// copyto.c uses the standard JSON string rules).
+fn json_escape_into(s: &str, out: &mut Vec<u8>) {
+    out.push(b'"');
+    for c in s.chars() {
+        match c {
+            '"' => out.extend_from_slice(b"\\\""),
+            '\\' => out.extend_from_slice(b"\\\\"),
+            '\n' => out.extend_from_slice(b"\\n"),
+            '\r' => out.extend_from_slice(b"\\r"),
+            '\t' => out.extend_from_slice(b"\\t"),
+            '\u{08}' => out.extend_from_slice(b"\\b"),
+            '\u{0c}' => out.extend_from_slice(b"\\f"),
+            c if (c as u32) < 0x20 => {
+                out.extend_from_slice(format!("\\u{:04x}", c as u32).as_bytes());
+            }
+            c => {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+    }
+    out.push(b'"');
+}
+
+/// v2.37: one COPY FORMAT JSON row: `{"name":value,...}` with PG19
+/// value typing (numbers and booleans bare, null bare, JSON values
+/// embedded, everything else a quoted string of its text form).
+fn copy_json_row(cols: &[(String, ColType)], row: &Row, out: &mut Vec<u8>) {
+    out.push(b'{');
+    for (i, ((name, ty), v)) in cols.iter().zip(row.iter()).enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        json_escape_into(name, out);
+        out.push(b':');
+        match v {
+            Value::Null => out.extend_from_slice(b"null"),
+            Value::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
+            Value::SmallInt(n) => out.extend_from_slice(n.to_string().as_bytes()),
+            Value::Int(n) => out.extend_from_slice(n.to_string().as_bytes()),
+            Value::BigInt(n) => out.extend_from_slice(n.to_string().as_bytes()),
+            Value::Float4(f) => out.extend_from_slice(f.to_string().as_bytes()),
+            Value::Float(f) => out.extend_from_slice(f.to_string().as_bytes()),
+            Value::Numeric(_) => {
+                let text = v.to_text().unwrap_or_default();
+                out.extend_from_slice(text.as_bytes());
+            }
+            other => {
+                let text = other.to_text().unwrap_or_default();
+                // JSON/JSONB column values embed verbatim; everything
+                // else is a quoted string of its text form.
+                if matches!(ty, ColType::Json | ColType::Jsonb) {
+                    out.extend_from_slice(text.as_bytes());
+                } else {
+                    json_escape_into(&text, out);
+                }
+            }
+        }
+    }
+    out.push(b'}');
+}
+
+/// v2.37: resolve FORCE_QUOTE column names to positions in the
+/// COPY output column list (unknown names were already validated by
+/// the fetch path's column checks; unmatched names simply never
+/// quote).
+fn with_force_quote_pos(options: &CopyOptions, cols: &[(String, ColType)]) -> CopyOptions {
+    let mut o = options.clone();
+    if !o.force_quote.is_empty() {
+        o.force_quote_pos = cols
+            .iter()
+            .map(|(n, _)| o.force_quote.iter().any(|f| f == n))
+            .collect();
+    }
+    o
+}
+
 fn send_copy_out(
     stream: &mut Writer,
     cols: &[(String, ColType)],
@@ -1614,6 +1701,7 @@ fn send_copy_out(
     let fmt: i8 = match options.format {
         CopyFormat::Text => 0,
         CopyFormat::Csv => 1,
+        CopyFormat::Json => 0,
     };
     let mut b = MsgBuilder::new(b'H');
     b.u8(fmt as u8).i16(cols.len() as i16);
@@ -1621,8 +1709,32 @@ fn send_copy_out(
         b.i16(0);
     }
     b.send(stream)?;
+    if options.format == CopyFormat::Json {
+        // v2.37: one JSON object per row, one CopyData per line;
+        // FORCE_ARRAY wraps the stream in [ ... ] with PG19's exact
+        // layout (first row prefixed by a space, later rows by a
+        // comma, brackets on their own lines).
+        let mut data = Vec::new();
+        if options.force_array {
+            MsgBuilder::new(b'd').bytes(b"[\n").send(stream)?;
+        }
+        for (i, row) in rows.iter().enumerate() {
+            data.clear();
+            if options.force_array {
+                data.push(if i == 0 { b' ' } else { b',' });
+            }
+            copy_json_row(cols, row, &mut data);
+            data.push(b'\n');
+            MsgBuilder::new(b'd').bytes(&data).send(stream)?;
+        }
+        if options.force_array {
+            MsgBuilder::new(b'd').bytes(b"]\n").send(stream)?;
+        }
+        MsgBuilder::new(b'c').send(stream)?; // CopyDone
+        return Ok(());
+    }
     // Header row (column names) when requested.
-    if options.header {
+    if options.header_lines > 0 {
         let mut data = Vec::new();
         let names: Vec<String> = cols.iter().map(|(n, _)| n.clone()).collect();
         let nulls = vec![false; names.len()];
@@ -1685,6 +1797,184 @@ fn copy_from_ingest(
     ncols: usize,
     data: &[u8],
 ) -> Result<u64, exec::ExecError> {
+    // v2.37: resolve FORCE_NOT_NULL / FORCE_NULL column names to
+    // positions in the effective COPY column list (PG19 copyfrom.c:
+    // a named column outside the list is 42P10). The effective list
+    // is the explicit column list or the table's columns in order.
+    // v2.37: HEADER MATCH (PG19 copyfromparse.c): the first line's
+    // fields must equal the effective COPY column names, else
+    // 22P04. Verified here (names + raw line available); the line
+    // is stripped and the header skip disabled for the row parse.
+    let data_owned;
+    let data = if options.header_lines == -1 {
+        let names: Vec<String> = match columns {
+            Some(cols) => cols.clone(),
+            None => {
+                let mut guard = lock_engine(engine);
+                let snap = guard.take_snapshot();
+                let xid = guard.begin_txn();
+                let r = exec::copy_column_names(&*guard, &snap, xid, session.sid, table, columns);
+                retire_txn(&mut guard, xid);
+                r?
+            }
+        };
+        let nl = data
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|i| i + 1)
+            .unwrap_or(data.len());
+        let mut line = &data[..nl];
+        if line.ends_with(b"\n") {
+            line = &line[..line.len() - 1];
+        }
+        if line.ends_with(b"\r") {
+            line = &line[..line.len() - 1];
+        }
+        let bad = |message: String| exec::ExecError {
+            detail: None,
+            hint: None,
+            code: "22P04",
+            message,
+        };
+        let fields: Vec<Option<String>> = match options.format {
+            CopyFormat::Csv => {
+                // Minimal CSV split of the single header line.
+                let mut out: Vec<Option<String>> = Vec::new();
+                let mut cur = Vec::new();
+                let mut quoted = false;
+                let mut in_q = false;
+                let mut i = 0;
+                while i < line.len() {
+                    let b = line[i];
+                    if in_q {
+                        if b == options.quote {
+                            if i + 1 < line.len() && line[i + 1] == options.quote {
+                                cur.push(b);
+                                i += 2;
+                            } else {
+                                in_q = false;
+                                i += 1;
+                            }
+                        } else {
+                            cur.push(b);
+                            i += 1;
+                        }
+                    } else if b == options.quote && cur.is_empty() {
+                        quoted = true;
+                        in_q = true;
+                        i += 1;
+                    } else if b == options.delimiter {
+                        let text = String::from_utf8_lossy(&cur).into_owned();
+                        out.push(if !quoted && text == options.null {
+                            None
+                        } else {
+                            Some(text)
+                        });
+                        cur = Vec::new();
+                        quoted = false;
+                        i += 1;
+                    } else {
+                        cur.push(b);
+                        i += 1;
+                    }
+                }
+                let text = String::from_utf8_lossy(&cur).into_owned();
+                out.push(if !quoted && text == options.null {
+                    None
+                } else {
+                    Some(text)
+                });
+                out
+            }
+            _ => line
+                .split(|&b| b == options.delimiter)
+                .map(|f| {
+                    let text = String::from_utf8_lossy(f).into_owned();
+                    if text == options.null {
+                        None
+                    } else {
+                        Some(text)
+                    }
+                })
+                .collect(),
+        };
+        if fields.len() != names.len() {
+            return Err(bad(format!(
+                "wrong number of fields in header line: got {}, expected {}",
+                fields.len(),
+                names.len()
+            )));
+        }
+        for (i, (f, name)) in fields.iter().zip(names.iter()).enumerate() {
+            match f {
+                None => {
+                    return Err(bad(format!(
+                        "column name mismatch in header line field {}: got null value (\"{}\"), expected \"{}\"",
+                        i + 1,
+                        options.null,
+                        name
+                    )));
+                }
+                Some(v) if v != name => {
+                    return Err(bad(format!(
+                        "column name mismatch in header line field {}: got \"{}\", expected \"{}\"",
+                        i + 1,
+                        v,
+                        name
+                    )));
+                }
+                _ => {}
+            }
+        }
+        data_owned = data[nl..].to_vec();
+        &data_owned[..]
+    } else {
+        data
+    };
+    let mut options_owned;
+    let options = if !options.force_not_null.is_empty()
+        || !options.force_null.is_empty()
+        || options.header_lines == -1
+    {
+        let names: Vec<String> = match columns {
+            Some(cols) => cols.clone(),
+            None => {
+                let mut guard = lock_engine(engine);
+                let snap = guard.take_snapshot();
+                let xid = guard.begin_txn();
+                let r = exec::copy_column_names(&*guard, &snap, xid, session.sid, table, columns);
+                retire_txn(&mut guard, xid);
+                r?
+            }
+        };
+        let resolve = |list: &[String], what: &str| -> Result<Vec<bool>, exec::ExecError> {
+            let mut pos = vec![false; names.len()];
+            for n in list {
+                match names.iter().position(|c| c == n) {
+                    Some(i) => pos[i] = true,
+                    None => {
+                        return Err(exec::ExecError {
+                            detail: None,
+                            hint: None,
+                            code: "42P10",
+                            message: format!("{} column \"{}\" not referenced by COPY", what, n),
+                        });
+                    }
+                }
+            }
+            Ok(pos)
+        };
+        options_owned = options.clone();
+        if options_owned.header_lines == -1 {
+            // The MATCH line was verified and stripped above.
+            options_owned.header_lines = 0;
+        }
+        options_owned.force_not_null_pos = resolve(&options.force_not_null, "FORCE_NOT_NULL")?;
+        options_owned.force_null_pos = resolve(&options.force_null, "FORCE_NULL")?;
+        &options_owned
+    } else {
+        options
+    };
     // Parse (line-numbered errors).
     let parsed = match copy::parse_rows(data, options, ncols) {
         Ok(r) => r,
@@ -1840,8 +2130,9 @@ fn handle_copy_to(
     table: &str,
     columns: &Option<Vec<String>>,
     options: &CopyOptions,
+    query: &Option<Box<sql::SelectStmt>>,
 ) -> io::Result<()> {
-    let (cols, rows) = match copy_to_fetch(engine, session, table, columns) {
+    let (cols, rows) = match copy_to_fetch(engine, session, table, columns, query) {
         Ok(r) => r,
         Err(e) => {
             send_exec_error(stream, &e)?;
@@ -1849,7 +2140,8 @@ fn handle_copy_to(
             return Ok(());
         }
     };
-    send_copy_out(stream, &cols, &rows, options)?;
+    let options = with_force_quote_pos(options, &cols);
+    send_copy_out(stream, &cols, &rows, &options)?;
     MsgBuilder::new(b'C')
         .cstr(&format!("COPY {}", rows.len()))
         .send(stream)?;
@@ -1893,6 +2185,7 @@ fn handle_copy_from(
     let fmt: i8 = match options.format {
         CopyFormat::Text => 0,
         CopyFormat::Csv => 1,
+        CopyFormat::Json => 0,
     };
     let mut b = MsgBuilder::new(b'G');
     b.u8(fmt as u8).i16(ncols as i16);
@@ -1947,7 +2240,10 @@ fn handle_copy_extended(
     columns: &Option<Vec<String>>,
     to_stdout: bool,
     options: &CopyOptions,
+    query: &Option<Box<sql::SelectStmt>>,
 ) -> io::Result<()> {
+    // v2.37: same per-statement context as run_statement installs.
+    install_statement_context(session);
     // v0.17: READ ONLY enforcement applies to extended COPY too (COPY
     // FROM is a write; COPY TO is a read).
     if !to_stdout && effective_read_only(session) {
@@ -1959,11 +2255,12 @@ fn handle_copy_extended(
         );
     }
     if to_stdout {
-        let (cols, rows) = match copy_to_fetch(engine, session, table, columns) {
+        let (cols, rows) = match copy_to_fetch(engine, session, table, columns, query) {
             Ok(r) => r,
             Err(e) => return protocol_error(stream, session, e.code, &e.message),
         };
-        send_copy_out(stream, &cols, &rows, options)?;
+        let options = with_force_quote_pos(options, &cols);
+        send_copy_out(stream, &cols, &rows, &options)?;
         let tag = format!("COPY {}", rows.len());
         MsgBuilder::new(b'C').cstr(&tag).send(stream)?;
         let portal = session.portals.get_mut(portal_name).unwrap();
@@ -1981,6 +2278,7 @@ fn handle_copy_extended(
         let fmt: i8 = match options.format {
             CopyFormat::Text => 0,
             CopyFormat::Csv => 1,
+            CopyFormat::Json => 0,
         };
         let mut b = MsgBuilder::new(b'G');
         b.u8(fmt as u8).i16(ncols as i16);
@@ -2946,6 +3244,7 @@ fn is_generic_guc(name: &str) -> bool {
             | "enable_sort"
             | "enable_memoize"
             | "enable_partitionwise_join"
+            | "enable_self_join_elimination"
             | "geqo"
             | "extra_float_digits"
             | "work_mem"
@@ -3364,6 +3663,7 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
         | "enable_sort"
         | "enable_memoize"
         | "enable_partitionwise_join"
+        | "enable_self_join_elimination"
         | "geqo" => parse_bool_guc(value)
             .map(|b| (if b { "on" } else { "off" }).to_string())
             .ok_or_else(invalid),
@@ -3836,6 +4136,7 @@ fn name_to_static(name: &str) -> &'static str {
         "enable_sort" => "enable_sort",
         "enable_memoize" => "enable_memoize",
         "enable_partitionwise_join" => "enable_partitionwise_join",
+        "enable_self_join_elimination" => "enable_self_join_elimination",
         "geqo" => "geqo",
         "extra_float_digits" => "extra_float_digits",
         "work_mem" => "work_mem",
@@ -4387,6 +4688,90 @@ fn resolve_ctas_execute(
     }
 }
 
+/// v2.37: per-statement session context installation (datetime
+/// context, float digits, row_security and replication-role
+/// thread-locals, current_setting() snapshot). Extracted from
+/// run_statement so the COPY protocol paths — which bypass
+/// run_statement — install the same context; before this, COPY ran
+/// with whatever row_security state a previous statement on the
+/// connection thread had left behind.
+fn install_statement_context(session: &mut Session) {
+    if let Some(t) = session.txn.as_mut() {
+        if t.start_micros == 0 {
+            t.start_micros = crate::datetime::now_micros();
+        }
+    }
+    // The DateStyle boot default comes from PGDATESTYLE (like real
+    // PG), not the compiled "ISO, MDY" -- suites RESET datestyle
+    // and expect the environment value back.
+    let ds = match session.gucs.get("datestyle") {
+        Some(v) => v.clone(),
+        None => match std::env::var("PGDATESTYLE") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => "ISO, MDY".to_string(),
+        },
+    };
+    let tz = guc_value(session, "timezone").unwrap_or_else(|| "GMT".to_string());
+    let now = session.txn.as_ref().map(|t| t.start_micros).unwrap_or(0);
+    crate::datetime::set_session_context(&ds, &tz, now);
+    // v1.94: float output honors extra_float_digits (PG19
+    // float.c) — suites like tstypes SET it to 0 and expect
+    // the legacy %.6g float4 rendering.
+    let efd: i32 = guc_value(session, "extra_float_digits")
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(1);
+    crate::storage::set_extra_float_digits(efd);
+    // v1.95: row_security GUC for RLS evaluation (default on).
+    let rs = guc_value(session, "row_security")
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "off" | "false" | "no" | "0"
+            )
+        })
+        .unwrap_or(true);
+    crate::exec::set_row_security(rs);
+    // v2.19: session_replication_role for rule firing (PG19
+    // fireRules ev_enabled filter; default origin).
+    let repl = guc_value(session, "session_replication_role")
+        .map(|v| v.trim().eq_ignore_ascii_case("replica"))
+        .unwrap_or(false);
+    crate::exec::set_session_replica(repl);
+    crate::exec::set_session_user(&session.session_user);
+    // v1.96: current_setting() snapshot: the session's GUC map
+    // plus computed values.
+    {
+        let mut map: std::collections::HashMap<String, String> = session.gucs.clone();
+        for n in [
+            "server_version",
+            "server_version_num",
+            "datestyle",
+            "timezone",
+            "extra_float_digits",
+            "row_security",
+            "transaction_isolation",
+            "default_transaction_isolation",
+        ] {
+            if let Some(v) = guc_value(session, n) {
+                map.insert(n.to_string(), v);
+            }
+        }
+        map.insert(
+            "role".to_string(),
+            if session.role == session.session_user {
+                "none".to_string()
+            } else {
+                session.role.clone()
+            },
+        );
+        map.insert(
+            "session_authorization".to_string(),
+            session.session_user.clone(),
+        );
+        crate::exec::set_current_settings(map);
+    }
+}
+
 fn run_statement(
     engine: &Arc<Mutex<Engine>>,
     wal: &Arc<Mutex<Wal>>,
@@ -4426,82 +4811,7 @@ fn run_statement(
     // statements run under the *previous* context and take effect
     // from the next statement, like PG. The transaction start is
     // pinned on first use inside the transaction.
-    {
-        if let Some(t) = session.txn.as_mut() {
-            if t.start_micros == 0 {
-                t.start_micros = crate::datetime::now_micros();
-            }
-        }
-        // The DateStyle boot default comes from PGDATESTYLE (like real
-        // PG), not the compiled "ISO, MDY" -- suites RESET datestyle
-        // and expect the environment value back.
-        let ds = match session.gucs.get("datestyle") {
-            Some(v) => v.clone(),
-            None => match std::env::var("PGDATESTYLE") {
-                Ok(v) if !v.trim().is_empty() => v,
-                _ => "ISO, MDY".to_string(),
-            },
-        };
-        let tz = guc_value(session, "timezone").unwrap_or_else(|| "GMT".to_string());
-        let now = session.txn.as_ref().map(|t| t.start_micros).unwrap_or(0);
-        crate::datetime::set_session_context(&ds, &tz, now);
-        // v1.94: float output honors extra_float_digits (PG19
-        // float.c) — suites like tstypes SET it to 0 and expect
-        // the legacy %.6g float4 rendering.
-        let efd: i32 = guc_value(session, "extra_float_digits")
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(1);
-        crate::storage::set_extra_float_digits(efd);
-        // v1.95: row_security GUC for RLS evaluation (default on).
-        let rs = guc_value(session, "row_security")
-            .map(|v| {
-                !matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "off" | "false" | "no" | "0"
-                )
-            })
-            .unwrap_or(true);
-        crate::exec::set_row_security(rs);
-        // v2.19: session_replication_role for rule firing (PG19
-        // fireRules ev_enabled filter; default origin).
-        let repl = guc_value(session, "session_replication_role")
-            .map(|v| v.trim().eq_ignore_ascii_case("replica"))
-            .unwrap_or(false);
-        crate::exec::set_session_replica(repl);
-        crate::exec::set_session_user(&session.session_user);
-        // v1.96: current_setting() snapshot: the session's GUC map
-        // plus computed values.
-        {
-            let mut map: std::collections::HashMap<String, String> = session.gucs.clone();
-            for n in [
-                "server_version",
-                "server_version_num",
-                "datestyle",
-                "timezone",
-                "extra_float_digits",
-                "row_security",
-                "transaction_isolation",
-                "default_transaction_isolation",
-            ] {
-                if let Some(v) = guc_value(session, n) {
-                    map.insert(n.to_string(), v);
-                }
-            }
-            map.insert(
-                "role".to_string(),
-                if session.role == session.session_user {
-                    "none".to_string()
-                } else {
-                    session.role.clone()
-                },
-            );
-            map.insert(
-                "session_authorization".to_string(),
-                session.session_user.clone(),
-            );
-            crate::exec::set_current_settings(map);
-        }
-    }
+    install_statement_context(session);
     let owned;
     let stmt = match stmt {
         Stmt::Execute { name, args } => {
@@ -6495,10 +6805,17 @@ fn handle_execute(
             columns,
             to_stdout,
             options,
-        }) => Some((table.clone(), columns.clone(), *to_stdout, options.clone())),
+            query,
+        }) => Some((
+            table.clone(),
+            columns.clone(),
+            *to_stdout,
+            options.clone(),
+            query.clone(),
+        )),
         _ => None,
     };
-    if let Some((table, columns, to_stdout, options)) = copy_stmt {
+    if let Some((table, columns, to_stdout, options, query)) = copy_stmt {
         return handle_copy_extended(
             reader,
             stream,
@@ -6510,6 +6827,7 @@ fn handle_execute(
             &columns,
             to_stdout,
             &options,
+            &query,
         );
     }
 
@@ -8614,5 +8932,78 @@ mod tests {
         )
         .expect_err("primary key survives");
         assert_eq!(err.code, "23505");
+    }
+
+    #[test]
+    fn v235_multi_action_alter_rewrite_then_metadata_survives_replay_checkpoint() {
+        // A multi-action ALTER whose FIRST action rewrites rows (ADD
+        // COLUMN ... AS IDENTITY) and whose LAST action is metadata-only
+        // (ALTER COLUMN ... SET GENERATED ALWAYS), in one statement.
+        // Replay copied the rows for the metadata action from the
+        // ORIGINAL version — its by-xmin search matched every version
+        // the transaction superseded and returned the oldest — leaving
+        // 2-wide rows in the live 3-column version. The next CHECKPOINT
+        // wrote them verbatim and the data directory refused to open
+        // ("checkpoint.dat is corrupt (row/column count mismatch)").
+        // Reproduced on the v2.34 base from identity.sql's itest3
+        // sequence; hit in the v2.35 ship schedule as "server
+        // unrecoverable during eager_aggregate".
+        let dir = std::env::temp_dir().join("rg235-multi-alter-replay");
+        let _ = std::fs::remove_dir_all(&dir);
+        let open = || {
+            let (eng, wal) = crate::wal::Wal::open(&dir).expect("data dir must open");
+            (
+                Arc::new(Mutex::new(eng)),
+                Arc::new(Mutex::new(wal)),
+                session_no_txn(),
+            )
+        };
+        {
+            let (engine, wal, mut session) = open();
+            v180_exec(
+                &engine,
+                &wal,
+                &mut session,
+                &[
+                    "CREATE TABLE itest3 (a smallint generated by default as identity (start with 7 increment by 5), b text)",
+                    "INSERT INTO itest3 DEFAULT VALUES",
+                    "INSERT INTO itest3 DEFAULT VALUES",
+                    "INSERT INTO itest3 VALUES (DEFAULT, 'a')",
+                    "ALTER TABLE itest3 ADD COLUMN c int GENERATED BY DEFAULT AS IDENTITY, ALTER COLUMN c SET GENERATED ALWAYS",
+                    "INSERT INTO itest3 DEFAULT VALUES",
+                ],
+            );
+        }
+        {
+            // Replay the WAL, then checkpoint the replayed state — the
+            // exact sequence that bricked the schedule data directory.
+            let (engine, wal, mut session) = open();
+            let rows = v158_rows(
+                v158_run(
+                    &engine,
+                    &wal,
+                    &mut session,
+                    "SELECT * FROM itest3 ORDER BY a",
+                )
+                .expect("select after replay"),
+            );
+            assert_eq!(
+                rows,
+                vec!["7|NULL|1", "12|NULL|2", "17|a|3", "22|NULL|4"],
+                "replayed rows must carry the rewritten third column"
+            );
+            v180_exec(&engine, &wal, &mut session, &["CHECKPOINT"]);
+        }
+        let (engine, wal, mut session) = open();
+        let rows = v158_rows(
+            v158_run(
+                &engine,
+                &wal,
+                &mut session,
+                "SELECT * FROM itest3 ORDER BY a",
+            )
+            .expect("select after checkpoint load"),
+        );
+        assert_eq!(rows, vec!["7|NULL|1", "12|NULL|2", "17|a|3", "22|NULL|4"]);
     }
 }

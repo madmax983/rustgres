@@ -50,6 +50,37 @@ pub fn copy_ncols(
     }
 }
 
+/// v2.37: the effective COPY column names (explicit list, or the
+/// table's columns in declaration order) — used to resolve FORCE_*
+/// column names to positions before ingest.
+pub fn copy_column_names(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    table: &str,
+    columns: &Option<Vec<String>>,
+) -> Result<Vec<String>, ExecError> {
+    // Validate exactly like copy_ncols (42P01/42703/generated rules).
+    copy_ncols(eng, snap, own, session, table, columns)?;
+    match columns {
+        Some(cols) => Ok(cols.clone()),
+        None => {
+            let t = eng
+                .db
+                .find_table(table, snap, &[own], session)
+                .ok_or_else(|| {
+                    exec_err("42P01", format!("relation \"{}\" does not exist", table))
+                })?;
+            Ok(TableMeta::of(t)
+                .columns
+                .iter()
+                .map(|(n, _)| n.clone())
+                .collect())
+        }
+    }
+}
+
 /// v0.10: COPY TO STDOUT — run `SELECT <cols> FROM <table>` and return
 /// the (name, type) columns and the visible rows.
 pub fn copy_to_rows(
@@ -90,6 +121,26 @@ pub fn copy_to_rows(
     }
 }
 
+/// v2.37: COPY (query) TO STDOUT — run the query and return its
+/// columns and rows (PG19: the query is executed like a SELECT;
+/// RLS and privileges apply through the normal executor path).
+pub fn copy_query_rows(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    query: &crate::sql::SelectStmt,
+) -> Result<(Vec<(String, ColType)>, Vec<Row>), ExecError> {
+    let stmt = Stmt::Select(query.clone());
+    match execute(eng, ctx, &stmt)? {
+        ExecResult::Select { columns, rows } => Ok((columns, rows)),
+        _ => Err(ExecError {
+            detail: None,
+            hint: None,
+            code: "XX000",
+            message: "internal error: COPY (query) did not return rows".to_string(),
+        }),
+    }
+}
+
 /// v0.10: COPY FROM STDIN — insert pre-parsed rows. Returns the row count.
 pub fn copy_from_rows(
     eng: &mut Engine,
@@ -112,6 +163,40 @@ pub fn copy_from_rows(
         })
         .collect();
     let n = insert_rows.len() as u64;
+    // v2.37: PG19 COPY FROM + RLS (copy.c CopyFrom): the INSERT
+    // privilege is checked first; then, when row-level security is
+    // enabled on the relation and applies to this role, COPY FROM
+    // is rejected outright — 42501 via check_enable_rls when
+    // row_security is off, else 0A000 "COPY FROM not supported with
+    // row-level security". Owners and BYPASSRLS roles are exempt.
+    {
+        // Mirror exec_insert's privilege shape exactly (column list
+        // -> per-column grants satisfy; no list -> table privilege),
+        // so this pre-check never changes an outcome vs the INSERT
+        // path below — it only runs before the RLS gate, as PG does.
+        match columns {
+            Some(cols) => {
+                require_column_privs(eng, ctx, table, cols, crate::storage::PRIV_INSERT, "INSERT")?
+            }
+            None => require_table_priv(eng, ctx, table, crate::storage::PRIV_INSERT, "INSERT")?,
+        }
+        let t = eng
+            .db
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+            .cloned();
+        if let Some(t) = t {
+            if t.rls_enabled
+                && crate::exec::rls_applies(eng, ctx.snap, ctx.own, &t, table, ctx.role)?
+            {
+                return Err(ExecError {
+                    detail: None,
+                    hint: Some("Use INSERT statements instead.".to_string()),
+                    code: "0A000",
+                    message: "COPY FROM not supported with row-level security".to_string(),
+                });
+            }
+        }
+    }
     // v0.84: COPY's column list is plain names (PG has no indirection
     // in COPY) — wrap as whole-column InsertTargets.
     let targets: Option<Vec<InsertTarget>> = columns.as_ref().map(|cs| {

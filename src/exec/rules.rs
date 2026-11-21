@@ -543,6 +543,7 @@ pub(crate) fn exec_create_rule(
                     .map(|i| match i {
                         SelectItem::All => target_width,
                         SelectItem::AllOf(_) => target_width,
+                        SelectItem::CompositeStar(_) => 1,
                         SelectItem::Expr { .. } => 1,
                     })
                     .sum::<usize>(),
@@ -1494,7 +1495,9 @@ fn returning_columns(cols: &[(String, ColType)], items: &[SelectItem]) -> Vec<(S
     let mut out = Vec::new();
     for item in items {
         match item {
-            SelectItem::All | SelectItem::AllOf(_) => out.extend(cols.iter().cloned()),
+            SelectItem::All | SelectItem::AllOf(_) | SelectItem::CompositeStar(_) => {
+                out.extend(cols.iter().cloned())
+            }
             SelectItem::Expr { expr, alias } => {
                 let name = alias.clone().unwrap_or_else(|| expr_col_name(expr));
                 let ty = match expr {
@@ -1562,6 +1565,7 @@ fn project_user_returning(
     for item in items {
         match item {
             SelectItem::All => out.extend(new_row.iter().cloned()),
+            SelectItem::CompositeStar(_) => out.extend(new_row.iter().cloned()),
             SelectItem::AllOf(q) => {
                 if q.eq_ignore_ascii_case("old") {
                     out.extend(old_or_empty.iter().cloned());

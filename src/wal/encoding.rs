@@ -573,6 +573,11 @@ impl Enc {
                 self.u8(39);
                 return;
             }
+            // v2.35: regnamespace; tag appends after regprocedure's.
+            ColType::Regnamespace => {
+                self.u8(40);
+                return;
+            }
             // v0.57: name; tag appends after v0.37's.
             ColType::Name => {
                 self.u8(17);
@@ -1988,6 +1993,7 @@ impl<'a> Dec<'a> {
             38 => Ok(ColType::Inet),
             // v2.34: regprocedure.
             39 => Ok(ColType::Regprocedure),
+            40 => Ok(ColType::Regnamespace),
             // v0.78: array, then the PG array OID identifying the
             // element type.
             22 => {

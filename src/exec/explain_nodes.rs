@@ -190,6 +190,9 @@ pub(crate) fn pg_scan_output(
                     }
                 }
             }
+            SelectItem::CompositeStar(expr) => {
+                collect(expr, &mut needed)?;
+            }
             SelectItem::Expr { expr, .. } => {
                 let before = needed.len();
                 collect(expr, &mut needed)?;
@@ -282,6 +285,7 @@ pub(crate) fn pg_subquery_col_names(
     let mut names = Vec::new();
     for item in &sub.items {
         match item {
+            SelectItem::CompositeStar(_) => return None,
             SelectItem::Expr { expr, alias } => {
                 names.push(alias.clone().unwrap_or_else(|| expr_col_name(expr)));
             }
@@ -492,6 +496,9 @@ pub(crate) fn pg_top_select_output(
     for item in &stmt.items {
         match item {
             // Whole-row refs have no per-column spelling modeled here.
+            SelectItem::CompositeStar(expr) => {
+                out.push(format!("({}).*", pg_expr_text(expr, px, qualify)?))
+            }
             SelectItem::Expr { expr, .. } => out.push(pg_expr_text(expr, px, qualify)?),
             SelectItem::All => {
                 for it in orig_from {
@@ -2606,8 +2613,20 @@ pub(crate) fn plan_select(
     // `remove_useless_joins_from`, mirroring PG19 planmain.c order.
     // v1.77: the nested-inner-join extension runs when the top-level
     // shape does not apply (disjoint shapes; one pair per milestone).
+    // v2.37: gated by the enable_self_join_elimination GUC (PG19
+    // query_planner skips remove_useless_self_joins when it is off).
+    let sje_off = crate::exec::installed_guc("enable_self_join_elimination")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "off" | "false" | "no" | "0"
+            )
+        })
+        .unwrap_or(false);
     let stmt_owned_sje;
-    let stmt: &SelectStmt =
+    let stmt: &SelectStmt = if sje_off {
+        stmt
+    } else {
         match remove_useless_self_joins_from(eng, &stmt.from, stmt, snap, own, session) {
             Some(rewritten) => {
                 stmt_owned_sje = rewritten;
@@ -2622,7 +2641,8 @@ pub(crate) fn plan_select(
                 }
                 None => stmt,
             },
-        };
+        }
+    };
     // v1.08: PG-text name/type context for this query level, plus the
     // WHERE clause distributed over the FROM items (per-item slices and
     // the join-level remainder).
@@ -3531,6 +3551,11 @@ pub(crate) fn exec_explain(
         Stmt::Select(s) => s,
         _ => unreachable!("non-SELECT routed to exec_explain_dml above"),
     };
+    // v2.36: planning a foreign scan consults the FDW handler
+    // (55000 for the handler-less wrappers modeled here).
+    if let Some(e) = explain_foreign_check(&eng.db, sel) {
+        return Err(e);
+    }
     // v1.98: full analysis — planning-only EXPLAIN validates the query
     // like PG19 parse analysis (privileges, operator/function/type
     // resolution) before rendering a plan. See `validate_explain_select`.

@@ -530,10 +530,19 @@ fn vx_update(
     // The target relation may not reappear in FROM (42712, mirrors
     // exec_update).
     if !from.is_empty() {
+        // v2.37: PG19 checkNameSpaceConflicts keys the conflict on
+        // the effective range name (explicit alias, else the bare
+        // relation name) — `UPDATE t2 t2_1 ... FROM t2 t2_2` is
+        // legal; only a repeated effective name is 42712.
         fn collect_table_names(item: &FromItem, out: &mut Vec<String>) {
             match item {
-                FromItem::Table { name, .. } => {
-                    out.push(name.rsplit('.').next().unwrap_or(name).to_string());
+                FromItem::Table { name, alias, .. } => {
+                    out.push(
+                        alias
+                            .clone()
+                            .unwrap_or_else(|| name.rsplit('.').next().unwrap_or(name).to_string())
+                            .to_lowercase(),
+                    );
                 }
                 FromItem::Join { left, right, .. } => {
                     collect_table_names(left, out);
@@ -542,13 +551,16 @@ fn vx_update(
                 _ => {}
             }
         }
-        let target = table.rsplit('.').next().unwrap_or(table);
+        let target = alias
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| table.rsplit('.').next().unwrap_or(table).to_string())
+            .to_lowercase();
         let mut names = Vec::new();
         for item in from {
             collect_table_names(item, &mut names);
         }
         for from_name in names {
-            if from_name.eq_ignore_ascii_case(target) {
+            if from_name.eq_ignore_ascii_case(&target) {
                 return Err(exec_err(
                     "42712",
                     format!("table name \"{}\" specified more than once", from_name),

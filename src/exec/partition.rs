@@ -720,7 +720,10 @@ pub(crate) fn commit_table_version(
     }
     next.created_xmin = ctx.own;
     next.dropped_xmax = 0;
-    let versions = eng.db.tables.get_mut(name).expect("table still visible");
+    // v2.36: resolve the storage key (schema-attributed tables
+    // live under their bare key; the raw spelling panicked).
+    let key = eng.db.table_storage_key(name);
+    let versions = eng.db.tables.get_mut(&key).expect("table still visible");
     let old_live = versions
         .iter_mut()
         .find(|t| crate::storage::table_visible(t, ctx.snap, &ctx.all_xids))
@@ -731,7 +734,7 @@ pub(crate) fn commit_table_version(
     old_live.rebuild_row_index();
     versions.push(next);
     ctx.writes.push(WriteOp::AlterTable {
-        name: name.to_string(),
+        name: key,
         prev,
         renamed_to: None,
         rewrite_rows: false,
@@ -1058,6 +1061,66 @@ pub(crate) fn attach_partition(
                         "constraint \"{}\" conflicts with non-inherited constraint on child table \"{}\"",
                         cc.name, child_name
                     ),
+                ));
+            }
+        }
+    }
+    // v2.36: PG19 ATExecAttachPartition runs the same attribute /
+    // constraint merge validation as INHERIT — the parent's NOT
+    // NULL columns must be NOT NULL in the child and the parent's
+    // CHECK constraints must already exist there (42804). (Only
+    // the row-level bound validation is skipped for foreign
+    // partitions; these schema checks are not.)
+    {
+        let parent_t = eng
+            .db
+            .find_table(parent_name, ctx.snap, &ctx.all_xids, ctx.session)
+            .expect("parent resolved above");
+        let child_t = eng
+            .db
+            .find_table(child_name, ctx.snap, &ctx.all_xids, ctx.session)
+            .expect("child resolved above");
+        for (pi, (pname, _)) in parent_t.columns.iter().enumerate() {
+            if parent_t.not_null.get(pi) != Some(&true) {
+                continue;
+            }
+            let nn_no_inherit = parent_t.checks.iter().any(|c| {
+                c.kind == crate::sql::CheckKind::NotNull && c.no_inherit && {
+                    let mut refs: Vec<(Option<String>, String)> = Vec::new();
+                    crate::sql::collect_col_refs(&c.expr, &mut refs);
+                    refs.iter().any(|(_, r)| r == pname)
+                }
+            });
+            if nn_no_inherit {
+                continue;
+            }
+            let ci = child_t
+                .columns
+                .iter()
+                .position(|(n, _)| n == pname)
+                .expect("column compatibility checked above");
+            if child_t.not_null.get(ci) != Some(&true) {
+                return Err(exec_err(
+                    "42804",
+                    format!(
+                        "column \"{}\" in child table \"{}\" must be marked NOT NULL",
+                        pname, child_name
+                    ),
+                ));
+            }
+        }
+        for pc in &parent_t.checks {
+            if pc.kind != crate::sql::CheckKind::Check || pc.no_inherit {
+                continue;
+            }
+            let pexpr = format!("{:?}", pc.expr);
+            let found = child_t.checks.iter().any(|cc| {
+                cc.kind == crate::sql::CheckKind::Check && format!("{:?}", cc.expr) == pexpr
+            });
+            if !found {
+                return Err(exec_err(
+                    "42804",
+                    format!("child table is missing constraint \"{}\"", pc.name),
                 ));
             }
         }
@@ -1654,8 +1717,11 @@ pub(crate) fn alter_inherit(
         // v1.97: PG19 MergeCheckConstraint — every parent CHECK
         // constraint must already exist in the child (matched by
         // definition), else INHERIT fails (42804).
+        // v2.36: NO INHERIT constraints never merge (PG19 marks
+        // them connoinherit and MergeInheritedConstraint skips
+        // them), so they are exempt from the requirement.
         for pc in &parent.checks {
-            if pc.kind != crate::sql::CheckKind::Check {
+            if pc.kind != crate::sql::CheckKind::Check || pc.no_inherit {
                 continue;
             }
             let pexpr = format!("{:?}", pc.expr);
@@ -5255,7 +5321,17 @@ pub(crate) fn create_table_from_def(
         let ty = like_def.columns[i].1.clone();
         if ty == ColType::Composite {
             let tname: Option<String> = like_def.composite_types.get(i).and_then(|o| o.clone());
-            let st = tname.as_deref().and_then(|n| eng.db.types.get(n)).cloned();
+            // v2.35: canonicalize the recorded name to the registry
+            // key find_type resolves to, so stored column metadata
+            // always matches the type's storage key exactly.
+            let tname: Option<String> = match &tname {
+                Some(n) => eng.db.type_key(n).or_else(|| tname.clone()),
+                None => None,
+            };
+            if tname.is_some() {
+                like_def.composite_types[i] = tname.clone();
+            }
+            let st = tname.as_deref().and_then(|n| eng.db.find_type(n)).cloned();
             match st {
                 Some(st) if st.composite.is_some() => {}
                 // v1.88: a user-defined range type column stores as the
@@ -5278,13 +5354,38 @@ pub(crate) fn create_table_from_def(
                     like_def.domain_elem[i] = false;
                 }
                 _ => {
-                    return Err(exec_err(
-                        "42704",
-                        format!(
-                            "type \"{}\" does not exist",
-                            tname.as_deref().unwrap_or("<unknown>")
-                        ),
-                    ));
+                    // v2.36: PG19 — every relation has a row type, and
+                    // it is usable as a column type (foreign_data's
+                    // `CREATE TABLE use_ft1_column_type (x ft1)`; the
+                    // same holds for ordinary tables). The type
+                    // registry holds only standalone types, so fall
+                    // back to a visible relation or view of that
+                    // name, mirroring the cast path
+                    // (eval_cast_composite_inner). The recorded name
+                    // stays as written; value paths resolve it the
+                    // same way.
+                    let rel_ok = tname.as_deref().is_some_and(|n| {
+                        eng.db
+                            .find_table(n, ctx.snap, &ctx.all_xids, ctx.session)
+                            .is_some()
+                            || crate::exec::viewdml::view_columns_of_db(
+                                eng,
+                                ctx.snap,
+                                ctx.own,
+                                ctx.session,
+                                n,
+                            )
+                            .is_ok()
+                    });
+                    if !rel_ok {
+                        return Err(exec_err(
+                            "42704",
+                            format!(
+                                "type \"{}\" does not exist",
+                                tname.as_deref().unwrap_or("<unknown>")
+                            ),
+                        ));
+                    }
                 }
             }
         } else if ty == ColType::Array(ArrayElem::Record) {
@@ -5293,7 +5394,7 @@ pub(crate) fn create_table_from_def(
             // array of the domain's base; the domain applies per array
             // element.
             let tname: Option<String> = like_def.composite_types.get(i).and_then(|o| o.clone());
-            let st = tname.as_deref().and_then(|n| eng.db.types.get(n)).cloned();
+            let st = tname.as_deref().and_then(|n| eng.db.find_type(n)).cloned();
             if let Some(st) = st {
                 if let Some(dom) = st.domain.clone() {
                     like_def.columns[i].1 = ColType::Array(ArrayElem::of(&dom.base));
@@ -5358,6 +5459,12 @@ pub(crate) fn create_table_from_def(
         // column definition resolves them (PG19's bogus-marker
         // pass in DefineRelation).
         let mut merged_gen: Vec<Option<(crate::sql::Expr, bool)>> = Vec::new();
+        // v2.35: declared collation per merged column, parallel to
+        // merged.columns (TableDef merging does not track it):
+        // PG19 MergeAttributes requires an exact collation match
+        // across parents and against the child's own definition
+        // (42P21).
+        let mut merged_colls: Vec<Option<String>> = Vec::new();
         // v2.28: identity is NOT inherited (PG19 MergeAttributes):
         // inherited slots stay None and their nextval defaults are
         // stripped; only a child's own declaration sets the slot.
@@ -5457,6 +5564,25 @@ pub(crate) fn create_table_from_def(
                             format!("column \"{}\" has a type conflict", col),
                         ));
                     }
+                    // v2.35: collations must also match exactly
+                    // across parents (PG19 MergeAttributes, 42P21).
+                    if crate::sql::col_type_collatable(
+                        ty,
+                        parent
+                            .domain_types
+                            .get(i)
+                            .cloned()
+                            .unwrap_or(None)
+                            .as_deref(),
+                    ) {
+                        let pcoll = parent.col_collation(i).map(|s| s.to_string());
+                        if merged_colls.get(pos).cloned().unwrap_or(None) != pcoll {
+                            return Err(exec_err(
+                                "42P21",
+                                format!("inherited column \"{}\" has a collation conflict", col),
+                            ));
+                        }
+                    }
                     // v2.16: generation conflicts across parents
                     // (PG19 MergeChildAttribute / DefineRelation).
                     let pgen = parent.gen_cols.get(i).cloned().unwrap_or(None);
@@ -5520,6 +5646,7 @@ pub(crate) fn create_table_from_def(
                     continue;
                 }
                 merged.columns.push((col.clone(), ty.clone()));
+                merged_colls.push(parent.col_collation(i).map(|s| s.to_string()));
                 // v0.81: inherit the composite type name too.
                 merged
                     .composite_types
@@ -5600,6 +5727,26 @@ pub(crate) fn create_table_from_def(
                     "42804",
                     format!("column \"{}\" has a type conflict", col),
                 ));
+            }
+            // v2.35: the child's own collation must match the
+            // inherited collation exactly (PG19
+            // MergeChildAttribute, 42P21).
+            if crate::sql::col_type_collatable(
+                ty,
+                like_def
+                    .domain_types
+                    .get(i)
+                    .cloned()
+                    .unwrap_or(None)
+                    .as_deref(),
+            ) {
+                let lcoll = like_def.collations.get(i).cloned().unwrap_or(None);
+                if merged_colls.get(pos).cloned().unwrap_or(None) != lcoll {
+                    return Err(exec_err(
+                        "42P21",
+                        format!("column \"{}\" has a collation conflict", col),
+                    ));
+                }
             }
             // v2.16: the child's own column vs the inherited
             // generation kind (PG19 MergeChildAttribute, 42804).
@@ -6256,7 +6403,7 @@ pub(crate) fn fk_types_compatible(eng: &Engine, child: &Table, fk: &FkDef, paren
     // Domains resolve to their base type (PG getBaseType).
     let eff = |t: &Table, idx: usize| -> (CT, Option<String>) {
         if let Some(Some(d)) = t.domain_types.get(idx) {
-            if let Some(st) = eng.db.types.get(d) {
+            if let Some(st) = eng.db.find_type(d) {
                 if let Some(dom) = &st.domain {
                     return (dom.base.clone(), None);
                 }
@@ -6698,7 +6845,7 @@ fn validate_fk_period(
     // and named type).
     let type_name = |t: &Table, idx: usize| -> String {
         if let Some(Some(d)) = t.domain_types.get(idx) {
-            if let Some(st) = eng.db.types.get(d) {
+            if let Some(st) = eng.db.find_type(d) {
                 if let Some(dom) = &st.domain {
                     if let Some(bn) = &dom.base_named {
                         return bn.clone();

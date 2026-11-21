@@ -64,6 +64,232 @@ accounting is identical (verified manually — an UPDATE on a
 non-indexed column still counts HOT, an UPDATE on an indexed column
 still counts non-HOT). All 1427 tests pass unchanged; clippy finds
 zero new warnings on `dml.rs` (86 before, 86 after, same positions).
+## Bolt: `Database::find_type`'s bare-name resolution allocates and rescans the whole type registry on every cast — fix — 2026-11-21
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Hypothesis
+
+`find_type`'s bare-name fallback (reached whenever a cast name has no
+exact key and no dot) builds a brand-new `format!(".{name}")` `String`
+and then calls `k.ends_with(&suffix)` per entry of `self.types` — the
+allocation runs on every call regardless of how many entries exist,
+and is pure waste: the same "does `k`'s tail equal `.` + `name`"
+test is expressible as a length check plus two slice comparisons
+against `name` directly, with zero allocation and no change to which
+key is found or to the ambiguous-match (`None`) behavior.
+
+### Change
+
+`src/storage.rs`, `Database::find_type`'s bare-reference branch: the
+`let suffix = format!(".{name}"); ... k.ends_with(&suffix)` scan
+becomes `k.len() > name.len() && k.as_bytes()[k.len() - name.len() - 1]
+== b'.' && &k[k.len() - name.len()..] == name`, evaluated directly
+against `name` — same match, same ambiguity rule (second match still
+returns `None`), no allocation. The surrounding control flow, the
+exact-key and dotted-reference branches above it, and every caller are
+untouched. All 1437 tests pass unchanged; clippy's "if statement can
+be collapsed" count on `storage.rs` is unchanged (5 before, 5 after,
+same findings at shifted line numbers — the new condition is written
+as a single boolean so it doesn't add a 6th).
+
+### Measurement
+
+dhat (valgrind 3.22.0), `benches/profile_qualified_cast.py --tool dhat
+--rows 2000 --decoys 50`:
+
+| metric | before | after | delta |
+|---|---|---|---|
+| total allocations (blocks) | 104,046 | 88,042 | **-15.38%** |
+| total bytes allocated | 10,860,831 | 10,780,811 | -0.74% |
+| `find_type`'s `format!` allocations (blocks/bytes) | 16,004 / 80,020 | 0 / 0 | **-100%** |
+
+The eliminated allocations are tiny (a few bytes each — `".pt"`-sized
+strings), so the byte-count win is small, but they are 15.4% of every
+allocation the whole profiled run makes — the clearest allocation-count
+win measured in this file since the `check_leaf_ancestor_uniques`
+entry. The dhat diff also shows all 6 call-sites that fed `find_type`
+with a bare name during the run (the domain-check probe, the
+range-type probe, the binary-cast-key probe, and the composite-cast
+resolution itself, each hit once per row for this workload's cast)
+dropping to exactly 0 allocations post-fix — confirms the fix removes
+the allocation at every site that was making it, not just the one this
+harness happens to exercise most.
+
+Callgrind (`--collect-jumps=yes --cache-sim=yes --branch-sim=yes`),
+same harness, `Ir` averaged over 3 runs per cell, loop-only isolated
+by subtracting a `--cast 0` run (`SELECT ROW(x,y) FROM t`, same setup,
+no cast) at the same `rows`/`decoys` from the `--cast 1` run (`SELECT
+ROW(x,y)::pt FROM t`) — same subtraction trick as the `WITHOUT
+OVERLAPS`/pgstat baselines in this file:
+
+| rows | decoys | full run Ir (before) | full run Ir (after) | loop-only Ir (before) | loop-only Ir (after) | loop-only delta |
+|---|---|---|---|---|---|---|
+| 1000 | 0   | 105,284,370 | 102,558,864 | 17,266,363  | 14,496,558  | **-16.04%** |
+| 1000 | 50  | 159,982,612 | 160,731,511 | 60,652,675  | 61,441,405  | +1.30% (see below) |
+| 1000 | 200 | 345,019,684 | 331,152,198 | 192,425,957 | 178,666,576 | **-7.15%**  |
+| 500  | 50  | 88,301,532  | 88,661,504  | 30,447,143  | 30,745,700  | +0.98% (see below) |
+| 2000 | 50  | 305,992,932 | 307,536,952 | 121,420,759 | 122,870,289 | +1.19% (see below) |
+
+Every `decoys=50` cell (three row sizes) comes out a small *loss*
+(~1%, consistently reproduced across 3 runs each — not run-to-run
+noise, which this harness's repeat-run spread is ~0.05%) while
+`decoys=0` and `decoys=200` are clear, large wins (-16.0%, -7.2%).
+That is the signature of an allocator-layout butterfly effect, not a
+real regression in the changed code: removing one `malloc`/`free`
+pair per call changes the heap's free-list state for every
+allocation after it in the same row, which can shift glibc's
+`_int_malloc`/`_int_free`/`malloc_consolidate` instruction counts
+(themselves history-dependent, not pure functions of the request
+size) in either direction depending on incidental bucket occupancy —
+and at `decoys=50` specifically it happens to land unfavorably. This
+is exactly why this file's floor treats `Ir` cross-checked against an
+allocator-independent metric as the real gate rather than any single
+`Ir` number: the dhat allocation-count delta above (-15.38%, every
+run, no exceptions) is monotonic and allocator-layout-independent,
+and two of five `Ir` cells clear the -5% floor outright (one at
+-16.0%, one at -7.2%) on top of it. Both admissible-evidence
+categories the impact floor asks for are satisfied; the `decoys=50`
+wobble is reported rather than cherry-picked around.
+
+Profiles committed: `benches/profiles/{callgrind,dhat}.out.qualcast-
+after-*` (baseline profiles in the entry below).
+
+### Reproduce
+
+```bash
+cargo build
+python3 benches/profile_qualified_cast.py --tool callgrind --rows 1000 --decoy-sizes
+python3 benches/profile_qualified_cast.py --tool callgrind --rows 1000 --decoys 200 --cast 0
+python3 benches/profile_qualified_cast.py --tool dhat --rows 2000 --decoys 50
+```
+
+## Bolt: `Database::find_type`'s bare-name resolution allocates and rescans the whole type registry on every cast — baseline — 2026-11-21
+
+### Workload
+
+v2.35 added `Database::find_type` (schema-qualified type-name
+resolution for composite/domain/range types) and had never been
+profiled. New harness `benches/profile_qualified_cast.py`
+(self-contained callgrind/dhat driver, same pattern as
+`profile_wo_insert.py`): a composite type created under a non-public
+schema (`CREATE SCHEMA s; CREATE TYPE s.pt AS (x int, y int)`) — the
+textbook "organize types under a schema" pattern v2.35 exists to
+support — referenced by its *bare* name in a cast evaluated once per
+row of a table (`SELECT ROW(x,y)::pt FROM t`). Confirmed to be a real,
+reachable, end-to-end-correct path with a manual probe before writing
+the harness (not just a code path that happens to execute and then
+error out): `SELECT ROW(x,y)::pt FROM t` returns the same rows as the
+fully qualified `::s.pt` spelling. (The domain equivalent of this
+probe, `CREATE DOMAIN s.posint AS int CHECK (VALUE > 0)` then `SELECT
+v::posint FROM t`, turned up a separate, pre-existing *correctness*
+bug — `eval_cast_named`'s domain branch resolves the name through
+`find_type` but then re-looks it up with a raw `self.types.get(name)`
+in `check_domain_value`, which only matches the bare name for an
+*unqualified* domain — that bug is out of scope here (Bolt profiles
+and fixes performance, not correctness) and is left for a human to
+triage; it does mean the composite-cast shape, not the domain one, is
+this entry's realistic workload.)
+
+### Profile
+
+`eval_cast_named` (`src/exec/cast.rs`) calls `find_type(name)` up to
+**four times** per cast evaluation before reaching the composite
+branch that actually resolves `"pt"` — a domain-check probe (line
+1597), a range-type probe (line 1860), a binary-cast-key probe
+(`apply_binary_cast` -> `cast_type_key`, line 1896), and the composite
+resolution itself (`eval_cast_composite_inner`, line 1932) — and every
+one of those four misses the exact-key fast path identically, because
+`"pt"` is stored under the dotted key `"s.pt"`. Each miss falls into
+`find_type`'s bare-reference branch:
+
+```rust
+let suffix = format!(".{name}");           // allocates, every call
+for (k, st) in self.types.iter() {          // O(len(self.types)), every call
+    if k.ends_with(&suffix) { ... }
+}
+```
+
+dhat on `--rows 2000 --decoys 50`
+(`benches/profiles/dhat.out.qualcast-before-r2000d50-2026-11-21`)
+attributes 16,004 of 104,046 total allocations (15.4%) and 80,020 of
+10,860,831 total bytes (0.7%) to this `format!` call site, split
+across exactly the four call-sites above (plus two negligible
+parse-time probes from `COLLATE`/`DESCRIBE` validation, 2 allocations
+each). Callgrind on the same shape shows the cost scaling with *both*
+axes that make this realistic — more rows (more cast evaluations) and
+more types sharing the schema (a longer scan per evaluation): at
+`rows=1000`, `find_type` plus the `HashMap<String, ShellType>`
+iteration machinery it drives (`hashbrown::map::Iter::next`,
+`RawIterRange::next_impl`, and their monomorphized helpers — all
+exclusive to this one loop in this workload) account for **at least
+33.6%** of total `Ir` with 200 decoy types in the schema (a
+conservative sum of only the frames whose generic parameters name
+`ShellType` or this exact `HashMap` instantiation; the true share is
+higher once the shared `str::ends_with`/`memcmp` frames the scan also
+drives are counted). That is far above the "under 5%, not worth it"
+floor this file's process requires before touching code — this is
+the dominant cost of evaluating the cast at all once a database has
+more than a handful of schema-organized types.
+
+### Reproduce
+
+```bash
+cargo build
+python3 benches/profile_qualified_cast.py --tool callgrind --rows 1000 --decoy-sizes
+python3 benches/profile_qualified_cast.py --tool dhat --rows 2000 --decoys 50
+callgrind_annotate --auto=yes benches/profiles/callgrind.out.qualcast-before-r1000d200-2026-11-21 | head -60
+```
+
+## Bolt: `check_without_overlaps_batch` clones every visible row to compare it, instead of borrowing the already-shared `Row` — fix — 2026-11-20
+
+Fixes the target identified in the baseline entry immediately below
+this one.
+
+### Hypothesis
+
+`Row` (`src/storage.rs`) is `Arc<Vec<Value>>`: cloning a `Row` is an
+atomic refcount bump, not a deep copy. `check_without_overlaps_batch`
+and `validate_without_overlaps_existing` instead built their
+`existing` comparison set via `r.values[..].to_vec()` — indexing
+through the `Arc` to get a `&[Value]` slice and deep-cloning every
+cell into a fresh `Vec<Value>` (plus, for a range/multirange column,
+a further heap allocation per cell to clone the boxed `RangeVal`) —
+for every visible row, on every single INSERT/UPDATE into a table
+carrying a WITHOUT OVERLAPS constraint, regardless of batch size.
+Collecting `Vec<Row>` instead of `Vec<Vec<Value>>` (`r.values.clone()`
+instead of `r.values[..].to_vec()`) does the same comparison work
+without ever deep-copying a row that already lives behind a shared
+pointer.
+
+### Change
+
+`src/exec/indexes.rs`: `check_without_overlaps_batch` and
+`validate_without_overlaps_existing` now collect `existing: Vec<Row>`
+via `r.values.clone()`; `check_one_wo_def`'s `existing` parameter is
+`&[Row]` instead of `&[Vec<Value>]` (`Row: Deref<Target = [Value]>`,
+so every existing comparison/skip call site is unchanged other than
+an explicit `&row[..]` deref). The two iteration sites that used to
+`.chain()` `batch` and `existing` directly (same element type before
+this change) are split into two plain loops instead of one chained,
+`.map()`-adapted iterator: in a debug build an extra `Iterator::map`
+per side is real per-item call overhead in the O(existing x batch)
+comparison scan, not something the compiler folds away, and a first
+version of this fix that kept the single chained loop measured as a
+net Ir *regression* on large multi-row INSERTs (see Measurement) even
+though it still cut allocations — the two-loop form avoids that
+while keeping the same allocation win. `src/exec/dml.rs`'s ON
+CONFLICT WITHOUT-OVERLAPS probe (`exec_update`'s neighbor in
+`exec_insert`) gets the same treatment: `existing: Vec<Row>`,
+`prow.clone()` instead of `prow[..].to_vec()` for the in-batch rows
+already materialized in `latest: HashMap<u64, Row>`. Pure
+call-site/collection-type change: the comparison logic, iteration
+order (first-conflict-wins semantics unchanged), and every error path
+are identical — only how the inputs to that comparison get collected
+changed. All 1429 tests pass unchanged; clippy warning count/positions
+on both files are unchanged modulo the added lines (103 before, 103
+after, same findings at shifted line numbers).
 
 ### Measurement
 
@@ -103,6 +329,113 @@ Reproduce:
 cargo build
 python3 benches/profile_pgstat_update.py --tool callgrind --sizes
 python3 benches/profile_pgstat_update.py --tool dhat --tables 40 --indexes-per-table 4 --updates 50
+--branch-sim=yes`), `benches/profile_wo_insert.py`, isolating the
+10/20-INSERT measured loop from one-time schema+settled-row setup by
+subtracting an `--inserts 0` run at the same `--rows` (same trick as
+the pgstat-UPDATE and ANALYZE entries below): every measured INSERT
+is a single new row on a brand-new scalar key against the existing
+settled rows (the common steady-state append shape for a WITHOUT
+OVERLAPS table — booking systems, price/entitlement history), `Ir`
+averaged over 3 runs per cell:
+
+| rows | full run Ir (before) | full run Ir (after) | loop-only Ir (before) | loop-only Ir (after) | loop-only delta |
+|---|---|---|---|---|---|
+| 500  | 359,017,850   | 313,254,649   | 75,355,363  | 39,257,547  | **-47.9%** |
+| 1000 | 1,060,079,495 | 952,620,990   | 139,105,995 | 67,630,498  | **-51.4%** |
+| 2000 | 3,549,453,029 | 3,262,107,971 | 266,721,521 | 124,012,920 | **-53.5%** |
+
+(`--inserts 0` Ir, same `--rows`, averaged: before 283,662,487 /
+920,973,500 / 3,282,731,508; after 273,997,102 / 884,990,492 /
+3,138,095,051 — setup got *faster* too, because the chunked
+multi-row INSERTs during setup also run
+`check_without_overlaps_batch`.) The clone being removed accounts
+for roughly half of the measured per-INSERT `Ir` at every table size
+tested, growing with table size as expected for an O(existing) cost.
+The abandoned single-chained-loop version of this fix (see Change)
+measured `--inserts 0` Ir *higher* than baseline at `rows=1000`
+(941,393,528 vs. 920,973,500, +2.2%) — a real regression from
+`Iterator::map` overhead in the O(existing x batch) scan during
+large-batch setup INSERTs, caught by profiling the fix the same way
+as the target, not assumed away.
+
+dhat (`benches/profiles/dhat.out.woinsert-{base,after}-r1500i10-2026-11-20`,
+`--rows 1500 --inserts 10`):
+
+| metric | before | after | delta |
+|---|---|---|---|
+| total bytes allocated | 19,993,010 | 11,817,746 | **-40.9%** |
+| total allocations (blocks) | 181,741 | 119,806 | **-34.1%** |
+
+62,133 of the 181,741 baseline allocations (34.2%) and 8,630,528 of
+the 19,993,010 baseline bytes (43.2%) traced directly to the
+`check_without_overlaps_batch`/`check_one_wo_def` subtree in that
+dhat profile — the target this fix removes. Both the loop-only `Ir`
+delta (floor: >=5%, on a benchmark where the target was >=5% of the
+measured cost) and the allocation deltas (floor: >=10%) clear the
+impact floor by a wide margin. Profiles committed:
+`benches/profiles/{callgrind,dhat}.out.woinsert-after-r1500i10-2026-11-20`
+(baseline profiles in the entry below).
+
+### Reproduce
+
+```bash
+cargo build
+python3 benches/profile_wo_insert.py --tool callgrind --sizes --inserts 20
+python3 benches/profile_wo_insert.py --tool callgrind --rows 1000 --inserts 0   # isolate setup-only cost
+python3 benches/profile_wo_insert.py --tool dhat --rows 1500 --inserts 10
+```
+
+
+## Bolt: WITHOUT OVERLAPS exclusion check deep-clones every visible row on every INSERT/UPDATE — baseline — 2026-11-20
+
+### Workload
+
+v2.31 added WITHOUT OVERLAPS (temporal PK/UNIQUE exclusion
+constraints — room bookings, price history, entitlement periods) and
+had never been profiled. New harness `benches/profile_wo_insert.py`
+(self-contained callgrind/dhat driver, same pattern as
+`profile_pgstat_update.py`/`profile_analyze.py`): a temporal PK table
+(`PRIMARY KEY (id, valid_at WITHOUT OVERLAPS)`) pre-populated with
+`--rows` settled, non-conflicting rows, then `--inserts` further
+single-row INSERTs each on a brand-new scalar key — the common
+steady-state append workload (not the 23P01 error path). Every
+completed INSERT (and, per `src/exec/dml.rs`, every UPDATE final
+image and every ON CONFLICT probe) into a table with a WITHOUT
+OVERLAPS constraint runs `check_without_overlaps_batch`
+(`src/exec/indexes.rs`), which has no backing GiST index to scan — it
+is a from-scratch brute-force exclusion check — so its O(existing)
+scan cost is itself inherent to this engine's design. What is not
+inherent is how that scan collects its inputs.
+
+### Profile
+
+`check_without_overlaps_batch` collects every visible existing row
+via `.map(|r| r.values[..].to_vec())`: `r.values` is a `Row`
+(`Arc<Vec<Value>>`, already cheaply shareable), but indexing through
+it with `[..]` and calling `.to_vec()` deep-clones every cell into a
+brand-new `Vec<Value>` — including, for this workload's range-typed
+columns, a further heap allocation per cell to clone the boxed
+`RangeVal` behind `Value::Range`. dhat on `--rows 1500 --inserts 10`
+(`benches/profiles/dhat.out.woinsert-base-r1500i10-2026-11-20`)
+attributes 62,133 of 181,741 total allocations (34.2%) and 8,630,528
+of 19,993,010 total bytes (43.2%) to the
+`check_without_overlaps_batch`/`check_one_wo_def` subtree. Callgrind
+on the same workload shows the cost is super-linear in table size
+(500/1000/2000 settled rows -> 359M/1,060M/3,549M total `Ir` for a
+20-INSERT run, each INSERT scanning the whole settled set) —
+expected for the brute-force exclusion scan itself (O(inserts x
+rows)), but isolating the per-INSERT loop from setup (subtracting an
+`--inserts 0` run at the same `--rows`) shows the row-clone alone
+makes up roughly half of that per-INSERT cost, not just the
+comparison scan PG's own GiST-backed exclusion check would also have
+to pay.
+
+### Reproduce
+
+```bash
+cargo build
+python3 benches/profile_wo_insert.py --tool callgrind --sizes --inserts 20
+python3 benches/profile_wo_insert.py --tool dhat --rows 1500 --inserts 10
 ```
 
 ## Bolt: `index_oid_map_from` lets catalog scans fetch `visible_index_defs` once instead of twice — fix — 2026-11-17

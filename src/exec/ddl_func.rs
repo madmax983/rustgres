@@ -205,6 +205,19 @@ pub(crate) fn resolve_func_type_name(
     if let Ok(ct) = crate::sql::coltype_by_name(name) {
         return Ok(ct);
     }
+    // v2.35: a schema-qualified builtin (`pg_catalog.int4`) resolves
+    // through its bare name.
+    if let Some((_, bare)) = name.rsplit_once('.') {
+        if let Ok(ct) = crate::sql::coltype_by_name(bare) {
+            return Ok(ct);
+        }
+    }
+    // v2.35: `regnamespace` (schema OID; values ride as Int).
+    if name.eq_ignore_ascii_case("regnamespace")
+        || name.eq_ignore_ascii_case("pg_catalog.regnamespace")
+    {
+        return Ok(ColType::Regnamespace);
+    }
     // v1.38: `cstring` is PG19's C-string pseudo-type (the argument
     // type of internal input functions like `int4in`). rustgres has no
     // Cstring value — internal functions receive the text directly —
@@ -240,7 +253,7 @@ pub(crate) fn resolve_func_type_name(
             return Ok(ColType::Composite);
         }
     }
-    if let Some(st) = eng.db.types.get(name) {
+    if let Some(st) = eng.db.find_type(name) {
         if st.composite.is_some() {
             return Ok(ColType::Composite);
         }
@@ -270,6 +283,12 @@ pub(crate) fn resolve_func_type_name(
     }
     // Table rowtype (PG19: every table has a composite rowtype).
     if eng.db.find_table(name, snap, &[own], session).is_some() {
+        return Ok(ColType::Composite);
+    }
+    // v2.35: view rowtype (PG19: a view's pg_class row has a pg_type
+    // entry, so `RETURNS SETOF <view>` / argument types naming a view
+    // resolve as that view's composite rowtype).
+    if eng.db.find_view(name, snap, own).is_some() {
         return Ok(ColType::Composite);
     }
     Err(exec_err(
@@ -399,6 +418,7 @@ pub(crate) fn dummy_value_of(ty: &ColType) -> Value {
         ColType::Regclass => Value::text("x"),
         ColType::Regproc => Value::text("x"),
         ColType::Regprocedure => Value::text("x"), // v2.34: rides as text
+        ColType::Regnamespace => Value::Int(2200), // v2.35: rides as schema oid
         ColType::Xid => Value::Int(1),
         ColType::Oid => Value::Int(1),
         ColType::Inet => Value::text("0.0.0.0"),
@@ -693,7 +713,7 @@ pub(crate) fn named_rowtype_field_type_names(
         let _ = ct;
         return None; // builtin scalar
     }
-    if let Some(st) = eng.db.types.get(ret_type) {
+    if let Some(st) = eng.db.find_type(ret_type) {
         if st.domain.is_some() {
             return None;
         }
@@ -714,6 +734,18 @@ pub(crate) fn named_rowtype_field_type_names(
                 .map(|(_, ct)| ct.sql_name().to_string())
                 .collect(),
         );
+    }
+    // v2.35: view rowtype fields (for RETURNS SETOF <view> bodies).
+    if eng.db.find_view(ret_type, snap, own).is_some() {
+        if let Ok(cols) =
+            crate::exec::viewdml::view_columns_of_db(eng, snap, own, session, ret_type)
+        {
+            return Some(
+                cols.iter()
+                    .map(|(_, ct)| ct.sql_name().to_string())
+                    .collect(),
+            );
+        }
     }
     None
 }
@@ -2338,6 +2370,18 @@ pub(crate) fn exec_create_trigger(
         .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", table)))?
         .clone();
+    // v2.36 PG19 trigger.c: on a FOREIGN table, INSTEAD OF triggers
+    // and constraint triggers are both 42809 ("\"ft\" is a foreign
+    // table"); ordinary row/statement triggers are allowed.
+    if foreign_meta_key(&eng.db, table).is_some()
+        && (timing == crate::sql::TriggerTiming::InsteadOf || is_constraint)
+    {
+        let base = table.rsplit('.').next().unwrap_or(table);
+        return Err(exec_err(
+            "42809",
+            format!("\"{}\" is a foreign table", base),
+        ));
+    }
     // v2.14 PG19 trigger.c: INSTEAD OF on a table is 42809.
     if timing == crate::sql::TriggerTiming::InsteadOf {
         return Err(exec_err("42809", format!("\"{}\" is a table", table)));
@@ -3611,14 +3655,60 @@ pub(crate) fn rewrite_func_arg_refs(stmt: &mut Stmt, arg_names: &[Option<String>
 
 /// v1.33: the SELECT half of `rewrite_func_arg_refs` (select list +
 /// WHERE), shared with DML bodies' nested SELECT sources.
+/// v2.35: the walk is now fully recursive — CTE bodies, set-op
+/// branches, and derived-table subqueries are separate query levels
+/// whose expressions can equally reference the function's named
+/// args (PG19 resolves them as outer references); the stats_import
+/// helper functions (pg_statistic_get_difference et al.) nest their
+/// arg references exactly there and failed 42703 at call time
+/// before. The pre-existing same-level hazard profile is unchanged:
+/// an unqualified name matching an arg is rewritten, as before.
 pub(crate) fn rewrite_select_refs(sel: &mut crate::sql::SelectStmt, arg_names: &[Option<String>]) {
+    for cte in &mut sel.with {
+        match &mut cte.body {
+            crate::sql::CteBody::Simple(s) => rewrite_select_refs(s, arg_names),
+            crate::sql::CteBody::Union { left, right, .. } => {
+                rewrite_select_refs(left, arg_names);
+                rewrite_select_refs(right, arg_names);
+            }
+            crate::sql::CteBody::Dml(stmt) => rewrite_func_arg_refs(stmt, arg_names),
+        }
+    }
+    if let Some(root) = &mut sel.set_op {
+        rewrite_select_refs(&mut root.left, arg_names);
+        for b in &mut root.chain {
+            rewrite_select_refs(&mut b.right, arg_names);
+        }
+        for t in &mut root.order_by {
+            rewrite_func_arg_expr(&mut t.expr, arg_names);
+        }
+        return;
+    }
     for item in &mut sel.items {
-        if let crate::sql::SelectItem::Expr { expr, .. } = item {
-            rewrite_func_arg_expr(expr, arg_names);
+        match item {
+            crate::sql::SelectItem::Expr { expr, .. } => {
+                rewrite_func_arg_expr(expr, arg_names);
+            }
+            crate::sql::SelectItem::CompositeStar(expr) => {
+                rewrite_func_arg_expr(expr, arg_names);
+            }
+            _ => {}
         }
     }
     if let Some(w) = &mut sel.where_ {
         rewrite_func_arg_expr(w, arg_names);
+    }
+    for g in sel.group_by.iter_mut().flatten() {
+        rewrite_func_arg_expr(g, arg_names);
+    }
+    if let Some(h) = &mut sel.having {
+        rewrite_func_arg_expr(h, arg_names);
+    }
+    for o in &mut sel.order_by {
+        rewrite_func_arg_expr(&mut o.expr, arg_names);
+    }
+    for d in &mut sel.distinct_on {
+        rewrite_func_arg_expr(d, arg_names);
     }
     // v2.04: FROM-clause function arguments can reference named
     // args too (`pg_get_publication_tables(pubnames, ...)`) — the
@@ -3653,12 +3743,30 @@ pub(crate) fn rewrite_from_fn_refs(
                     rewrite_func_arg_expr(a, arg_names);
                 }
             }
+            // v2.35: derived-table subqueries are their own query
+            // level; their expressions reference the args as outer
+            // references.
+            crate::sql::FromItem::Derived { sub, .. } => {
+                rewrite_select_refs(sub, arg_names);
+            }
+            crate::sql::FromItem::Values { rows, .. } => {
+                for row in rows.iter_mut() {
+                    for e in row.iter_mut() {
+                        rewrite_func_arg_expr(e, arg_names);
+                    }
+                }
+            }
             // v2.04: function items nested in a JOIN tree (the
             // publication test_gpt shape: SRF JOIN pg_publication
             // JOIN pg_class) need the same walk.
-            crate::sql::FromItem::Join { left, right, .. } => {
+            crate::sql::FromItem::Join {
+                left, right, on, ..
+            } => {
                 rewrite_from_fn_refs(std::slice::from_mut(left), arg_names);
                 rewrite_from_fn_refs(std::slice::from_mut(right), arg_names);
+                if let Some(on) = on {
+                    rewrite_func_arg_expr(on, arg_names);
+                }
             }
             _ => {}
         }

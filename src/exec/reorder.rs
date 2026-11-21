@@ -860,6 +860,11 @@ pub(crate) fn subquery_output_types(
                     pos += 1;
                 }
             }
+            SelectItem::CompositeStar(_) => {
+                // v2.35: field types are not inferred here; skipping
+                // keeps the removal analysis conservative.
+                continue;
+            }
             SelectItem::Expr { expr, alias } => {
                 let out_name = alias.clone().unwrap_or_else(|| match expr {
                     Expr::Column { name, .. } => name.clone(),
@@ -2234,6 +2239,7 @@ pub(crate) fn join_is_removable(
     if stmt.items.iter().any(|item2| match item2 {
         SelectItem::Expr { .. } => false,
         SelectItem::All => true,
+        SelectItem::CompositeStar(_) => true,
         SelectItem::AllOf(q) => q == &rqual,
     }) {
         return false;

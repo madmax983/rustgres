@@ -111,6 +111,32 @@ pub(crate) fn project_item_values(
             }
             Ok(idx.into_iter().map(|i| row.cells[i].clone()).collect())
         }
+        SelectItem::CompositeStar(expr) => {
+            // v2.35: splice the composite value's fields; a NULL
+            // composite expands to one NULL per field (PG semantics).
+            let refs: Vec<&[QCol]> = vec![schema];
+            let fields = super::describe::composite_star_fields(
+                q.eng, q.snap, q.own, q.session, &refs, expr,
+            )
+            .ok_or_else(|| {
+                exec_err(
+                    "42804",
+                    "column notation .star applied to a non-composite type".to_string(),
+                )
+            })?;
+            let v = eval_expr(q, scopes, expr)?;
+            match v {
+                Value::Record(cells) => Ok(cells.into_iter().map(|(_, v)| v).collect()),
+                Value::Null => Ok(vec![Value::Null; fields.len()]),
+                other => Err(exec_err(
+                    "42804",
+                    format!(
+                        "column notation .star applied to type {}, which is not a composite type",
+                        other.type_name()
+                    ),
+                )),
+            }
+        }
         SelectItem::Expr { expr, .. } => {
             if expand_srf {
                 if let Expr::Func { name, args } = expr {

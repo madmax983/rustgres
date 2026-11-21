@@ -39,20 +39,22 @@
 pub(crate) use crate::index::{Index, IndexDef, IndexKey, index_key_cmp};
 pub(crate) use crate::sql::{
     AggFunc, AlterAction, ArithOp, CheckDef, CmpOp, ConflictAction, ConflictArbiter, CteBody,
-    CteDef, CteMaterialize, DefaultExpr, ExplainFormat, Expr, FkAction, FkDef, FrameBound,
-    FrameExclusion, FromItem, IndexColSpec, InsertIndirection, InsertTarget, InsertValue,
-    IsolationLevel, JoinKind, JsonOp, JsonTableSpec, JtBehavior, JtColumn, Literal, MergeAction,
-    MergeWhen, OnConflict, OrderTerm, OrderedSetAgg, PolicyCmd, QuantKind, QuantOp, RaiseLevel,
-    RowsFromPart, SelectItem, SelectStmt, SequenceOpts, SerialKind, SetOpKind, SetOpRoot, SqlError,
-    Stmt, TableDef, TrigCond, TrigForSource, TrigIntoTarget, TriggerBody, TriggerBodyStmt,
-    TriggerDef, TriggerTiming, UniqueDef, WindowFrame, WindowFunc, collect_col_refs,
-    collect_table_refs, parse_statement, parse_trigger_body, trig_event, validate_constraint_expr,
+    CteDef, CteMaterialize, DefaultExpr, ExplainFormat, Expr, FdwClause, FdwOpt, FkAction, FkDef,
+    FrameBound, FrameExclusion, FromItem, IndexColSpec, InsertIndirection, InsertTarget,
+    InsertValue, IsolationLevel, JoinKind, JsonOp, JsonTableSpec, JtBehavior, JtColumn, Literal,
+    MappingUser, MergeAction, MergeWhen, OnConflict, OptAction, OrderTerm, OrderedSetAgg,
+    PolicyCmd, QuantKind, QuantOp, RaiseLevel, RowsFromPart, SelectItem, SelectStmt, SequenceOpts,
+    SerialKind, SetOpKind, SetOpRoot, SqlError, Stmt, TableDef, TrigCond, TrigForSource,
+    TrigIntoTarget, TriggerBody, TriggerBodyStmt, TriggerDef, TriggerTiming, UniqueDef,
+    WindowFrame, WindowFunc, collect_col_refs, collect_table_refs, parse_statement,
+    parse_trigger_body, trig_event, validate_constraint_expr,
 };
 pub(crate) use crate::storage::index_visible;
 pub(crate) use crate::storage::{
-    ArrayElem, ArrayVal, BigDec, BitString, ColStats, ColType, Database, Engine, MultiVal, Numeric,
-    NumericSpecial, OperDef, RangeElem, RangeVal, RelStats, Row, RowVersion, Sequence, ShellType,
-    Snapshot, Table, TableStats, Value, ViewDef, WriteOp, row_visible, toast_consts, toast_storage,
+    AclEntry, ArrayElem, ArrayVal, BigDec, BitString, ColStats, ColType, Database, Engine, FdwDef,
+    ForeignServerDef, ForeignTableMeta, MultiVal, Numeric, NumericSpecial, OperDef, PRIV_USAGE,
+    RangeElem, RangeVal, RelStats, Row, RowVersion, Sequence, ShellType, Snapshot, Table,
+    TableStats, UserMappingDef, Value, ViewDef, WriteOp, row_visible, toast_consts, toast_storage,
 };
 pub(crate) use std::cell::RefCell;
 pub(crate) use std::cmp::Ordering;
@@ -84,6 +86,7 @@ mod explain;
 mod explain_dml;
 mod explain_nodes;
 mod extstats;
+mod fdw;
 mod from;
 mod funcs;
 mod indexes;
@@ -391,6 +394,12 @@ mod v233_tests;
 #[path = "test_mods/v234_tests.rs"]
 mod v234_tests;
 #[cfg(test)]
+#[path = "test_mods/v236_tests.rs"]
+mod v236_tests;
+#[cfg(test)]
+#[path = "test_mods/v237_tests.rs"]
+mod v237_tests;
+#[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;
 
@@ -417,6 +426,7 @@ pub(crate) use explain::*;
 pub(crate) use explain_dml::*;
 pub(crate) use explain_nodes::*;
 pub(crate) use extstats::*;
+pub(crate) use fdw::*;
 pub(crate) use from::*;
 pub(crate) use funcs::*;
 pub(crate) use indexes::*;

@@ -608,6 +608,18 @@ pub(crate) fn coerce_to_type_name(
     v: &Value,
     type_name: &str,
 ) -> Result<Value, ExecError> {
+    // v2.37: the `record` pseudo-type accepts any composite value
+    // unchanged (PG19: a record parameter takes the caller's rowtype;
+    // there is no catalog type named "record" to look up — the
+    // rowsecurity rls_test_policy_fn(text, record) family).
+    if type_name
+        .rsplit('.')
+        .next()
+        .unwrap_or(type_name)
+        .eq_ignore_ascii_case("record")
+    {
+        return Ok(v.clone());
+    }
     if let Ok(ct) = crate::sql::coltype_by_name(type_name) {
         // v2.04: coercing an array value to an array type is the
         // identity (eval_cast renders it to its text form, which
@@ -3318,7 +3330,23 @@ pub(crate) fn plpgsql_exec_dynamic(
         }
     };
     let text = text.trim().trim_end_matches(';').trim().to_string();
-    let mut dyn_stmt = crate::sql::parse_statement_inner(&text).map_err(sql_err)?;
+    // v2.37: dynamic plpgsql SQL parses with SELECT INTO table
+    // creation gated off (INTO binds plpgsql variables there) —
+    // EXCEPT EXPLAIN forms: PG19 plpgsql only intercepts INTO for
+    // a bare SELECT/DML statement, so `EXECUTE 'EXPLAIN ANALYZE
+    // SELECT ... INTO t'` still creates the table.
+    let first_word = text
+        .trim_start()
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mut dyn_stmt = if first_word == "explain" {
+        crate::sql::parse_statement_inner(&text).map_err(sql_err)?
+    } else {
+        crate::sql::with_plpgsql_dynamic_parse(|| crate::sql::parse_statement_inner(&text))
+            .map_err(sql_err)?
+    };
     if !using.is_empty() {
         let mut vals: Vec<Option<Value>> = Vec::new();
         for u in using {
@@ -4177,7 +4205,7 @@ pub(crate) fn func_rowtype_fields(
         let types = t.columns.iter().map(|(_, c)| c.clone()).collect();
         return Ok((names, types));
     }
-    if let Some(st) = q.eng.db.types.get(type_name) {
+    if let Some(st) = q.eng.db.find_type(type_name) {
         if let Some(fields) = &st.composite {
             let names = fields.iter().map(|(n, _, _)| n.clone()).collect();
             let types = fields.iter().map(|(_, c, _)| c.clone()).collect();
@@ -4487,7 +4515,10 @@ pub(crate) fn resolve_named_args(
     args: &[Expr],
 ) -> Result<Vec<Expr>, ExecError> {
     // v2.33: pg_catalog.-qualified names resolve as the bare builtin.
-    let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    let name = name
+        .strip_prefix("pg_catalog.")
+        .or_else(|| name.strip_prefix("public."))
+        .unwrap_or(name);
     let mut positional: Vec<&Expr> = Vec::new();
     let mut named: Vec<(&str, &Expr)> = Vec::new();
     let mut seen_named = false;
@@ -4769,7 +4800,7 @@ pub(crate) fn ctor_cat_of_expr(
     }
     match e {
         Expr::CastNamed { name, .. } => {
-            if let Some(st) = q.eng.db.types.get(name) {
+            if let Some(st) = q.eng.db.find_type(name) {
                 if let Some(d) = &st.domain {
                     return (super::json::ctor_cat_of_coltype(d.base), Some(name.clone()));
                 }
@@ -5293,7 +5324,10 @@ pub(crate) fn eval_func(
     // v2.33: a pg_catalog. qualifier resolves to the bare builtin
     // (pg_catalog is always first on PG's search path; the stats
     // suites qualify the pg_restore_* calls this way).
-    let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    let name = name
+        .strip_prefix("pg_catalog.")
+        .or_else(|| name.strip_prefix("public."))
+        .unwrap_or(name);
     // v0.95: resolve `name => expr` named arguments to positional order
     // (PG19 `reorder_function_arguments`). Zero-cost when absent.
     let owned: Vec<Expr>;
@@ -5328,6 +5362,74 @@ pub(crate) fn eval_func(
             }
             _ => {}
         }
+    }
+    // v2.37: row_security_active(name|oid) (PG19 utils/misc/rls.c:
+    // check_enable_rls with noerror, true iff the result is
+    // RLS_ENABLED for the current role).
+    if name == "row_security_active" && args.len() == 1 {
+        let v = eval_expr(q, scopes, &args[0])?;
+        let found: Option<(String, Table)> = match &v {
+            Value::Text(s) | Value::BpChar(s) => {
+                let bare = s.rsplit('.').next().unwrap_or(s).to_string();
+                q.eng
+                    .db
+                    .find_table(&bare, q.snap, &q.all_xids, q.session)
+                    .map(|t| (bare, t.clone()))
+            }
+            Value::Int(oid) => {
+                let mut hit = None;
+                for k in q.eng.db.tables.keys() {
+                    if let Some(t) = q.eng.db.find_table(k, q.snap, &q.all_xids, q.session) {
+                        if t.oid as i64 == *oid {
+                            hit = Some((k.clone(), t.clone()));
+                            break;
+                        }
+                    }
+                }
+                hit
+            }
+            _ => None,
+        };
+        let Some((tname, t)) = found else {
+            return Err(exec_err(
+                "42P01",
+                format!(
+                    "relation \"{}\" does not exist",
+                    match &v {
+                        Value::Text(s) | Value::BpChar(s) => s.to_string(),
+                        other => other.to_text().unwrap_or_default(),
+                    }
+                ),
+            ));
+        };
+        let _ = tname;
+        let bypass = crate::storage::role_bypassrls_snap(&q.eng.db, q.role, q.snap, q.own);
+        let active = t.rls_enabled && !bypass && (t.owner != q.role || t.rls_forced);
+        return Ok(Value::Bool(active));
+    }
+    // v2.37: set_config(setting, value, is_local) (PG19 guc.c):
+    // returns the new value. The exec layer can only affect the
+    // statement-scoped GUC snapshot (current_setting() reads it)
+    // and the row_security thread-local; cross-statement session
+    // persistence for is_local=false lives in the server's session
+    // GUC store, which the executor cannot reach — a bounded
+    // deviation (the rowsecurity uses are all is_local=true).
+    if name == "set_config" && args.len() == 3 {
+        let n = eval_expr(q, scopes, &args[0])?;
+        let val = eval_expr(q, scopes, &args[1])?;
+        let _is_local = eval_expr(q, scopes, &args[2])?;
+        let (Value::Text(n), Value::Text(val)) = (&n, &val) else {
+            return Ok(Value::Null);
+        };
+        let (n, val) = (n.to_string(), val.to_string());
+        crate::exec::set_installed_guc(&n, &val);
+        if n == "row_security" {
+            crate::exec::set_row_security(matches!(
+                val.trim().to_ascii_lowercase().as_str(),
+                "on" | "true" | "yes" | "1"
+            ));
+        }
+        return Ok(Value::text(val));
     }
     // v1.96: privilege/ACL function family (needs the live catalog).
     if let Some(r) = eval_priv_func(q, scopes, name, args) {
@@ -5553,6 +5655,49 @@ pub(crate) fn eval_func(
                     _ => Value::Null,
                 });
             }
+            // v2.36: FDW registry comments.
+            if cat.as_ref() == "pg_foreign_data_wrapper" {
+                return Ok(match &v0 {
+                    Value::Int(oid) => q
+                        .eng
+                        .db
+                        .fdws
+                        .iter()
+                        .find(|f| f.oid as i64 == *oid)
+                        .and_then(|f| f.comment.clone())
+                        .map(|c| Value::text(c))
+                        .unwrap_or(Value::Null),
+                    _ => Value::Null,
+                });
+            }
+            if cat.as_ref() == "pg_foreign_server" {
+                return Ok(match &v0 {
+                    Value::Int(oid) => q
+                        .eng
+                        .db
+                        .foreign_servers
+                        .iter()
+                        .find(|s| s.oid as i64 == *oid)
+                        .and_then(|s| s.comment.clone())
+                        .map(|c| Value::text(c))
+                        .unwrap_or(Value::Null),
+                    _ => Value::Null,
+                });
+            }
+            if cat.as_ref() == "pg_class" {
+                if let Value::Int(oid) = &v0 {
+                    for (k, meta) in &q.eng.db.foreign_tables {
+                        if let Some(t) = q.eng.db.find_table(k, q.snap, &q.all_xids, q.session) {
+                            if t.oid as i64 == *oid {
+                                return Ok(match &meta.comment {
+                                    Some(c) => Value::text(c.clone()),
+                                    None => Value::Null,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
         }
         // Other catalogs keep the pre-v2.04 behavior (fall through).
     }
@@ -5648,7 +5793,7 @@ pub(crate) fn eval_func(
     }
     // v1.88: constructors of user-defined range types
     // (CREATE TYPE ... AS RANGE) resolve through the type catalog.
-    if let Some((elem, multi)) = q.eng.db.types.get(name).and_then(|st| st.range) {
+    if let Some((elem, multi)) = q.eng.db.find_type(name).and_then(|st| st.range) {
         let mut vals = Vec::with_capacity(args.len());
         for a in args {
             vals.push(eval_expr(q, scopes, a)?);
@@ -6071,7 +6216,7 @@ pub(crate) fn eval_func(
                             | crate::storage::ColType::Composite
                             | crate::storage::ColType::Record
                     ),
-                    Expr::CastNamed { name: n, .. } => match q.eng.db.types.get(n.as_str()) {
+                    Expr::CastNamed { name: n, .. } => match q.eng.db.find_type(n.as_str()) {
                         // A composite type name, or a domain over a
                         // composite / json / array base. A domain over
                         // a scalar base is a legal key.
@@ -6239,6 +6384,7 @@ pub(crate) fn pg_typlen_align(ty: &ColType) -> (i32, usize) {
         ColType::Regclass => (4, 4),     // regclass: 4/'i'
         ColType::Regproc => (4, 4),      // regproc: 4/'i' (v2.14)
         ColType::Regprocedure => (4, 4), // regprocedure: 4/'i' (v2.34)
+        ColType::Regnamespace => (4, 4), // regnamespace: 4/'i' (v2.35)
         ColType::Xid => (4, 4),          // xid: 4/'i'
         ColType::Oid => (4, 4),          // oid: 4/'i' (v2.15)
         ColType::Inet => (-1, 4),        // inet: varlena (v2.15)
@@ -6731,6 +6877,7 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         // v1.86: date_trunc gained PG's 3-arg (zone) form.
         "date_trunc" => n == 2 || n == 3,
         "replace" | "split_part" => n == 3,
+        "string_to_array" => n == 2 || n == 3,
         "encode" | "decode" => n == 2,
         "crc32" | "crc32c" => n == 1,
         "sha224" | "sha256" | "sha384" | "sha512" => n == 1,
@@ -7105,7 +7252,9 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         | "pg_input_error_info"
         // v0.95: parse_ident returns text[].
         // v1.15: quote_ident/quote_literal/quote_nullable (PG19 quote.c).
-        | "parse_ident" | "quote_ident" | "quote_literal" | "quote_nullable" => {
+        | "parse_ident" | "quote_ident" | "quote_literal" | "quote_nullable"
+        // v2.37: string_to_array returns text[] (see eval_str_func).
+        | "string_to_array" => {
             eval_str_func(name, vals)
         }
         "abs" | "round" | "floor" | "ceil" | "ceiling" | "sqrt" | "power" | "mod" | "sign" => {
@@ -7880,7 +8029,7 @@ pub(crate) fn pop_fields_for_type(q: &mut Q, type_name: &str) -> Result<Vec<PopF
             })
             .collect());
     }
-    if let Some(st) = q.eng.db.types.get(type_name) {
+    if let Some(st) = q.eng.db.find_type(type_name) {
         if let Some(fields) = &st.composite {
             return Ok(fields
                 .iter()
@@ -7916,7 +8065,7 @@ pub(crate) fn pop_fields_static(
                 .collect(),
         );
     }
-    eng.db.types.get(type_name).and_then(|st| {
+    eng.db.find_type(type_name).and_then(|st| {
         st.composite.as_ref().map(|fields| {
             fields
                 .iter()
@@ -8057,7 +8206,7 @@ pub(crate) fn populate_fields(
                 Some(b) => b.clone(),
                 None => {
                     let is_domain = f.named.as_ref().is_some_and(|n| {
-                        q.eng.db.types.get(n).is_some_and(|st| st.domain.is_some())
+                        q.eng.db.find_type(n).is_some_and(|st| st.domain.is_some())
                     });
                     if is_domain {
                         populate_typed(q, f, None, &JsonbVal::Null)?
@@ -8074,7 +8223,7 @@ pub(crate) fn populate_fields(
                 let is_domain = f
                     .named
                     .as_ref()
-                    .is_some_and(|n| q.eng.db.types.get(n).is_some_and(|st| st.domain.is_some()));
+                    .is_some_and(|n| q.eng.db.find_type(n).is_some_and(|st| st.domain.is_some()));
                 if is_domain {
                     populate_typed(q, f, base_val, &JsonbVal::Null)?
                 } else {
@@ -8102,7 +8251,7 @@ pub(crate) fn populate_typed(
     // value (PG19 populate_domain: NOT NULL and CHECKs run; the
     // _valid variant turns the error into false).
     if let Some(n) = &f.named {
-        let is_domain = q.eng.db.types.get(n).is_some_and(|st| st.domain.is_some());
+        let is_domain = q.eng.db.find_type(n).is_some_and(|st| st.domain.is_some());
         if is_domain {
             crate::exec::constraint::check_domain_value(q, n, &v, false)?;
         }
@@ -10274,6 +10423,67 @@ pub(crate) fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecErr
                 ""
             };
             Ok(Value::text(r))
+        }
+        // v2.37: string_to_array(str, delim[, null_str]) -> text[]
+        // (PG19 varlena.c split_text: a NULL delimiter splits the
+        // string into individual characters; an EMPTY delimiter
+        // yields the whole string as the single element; an empty
+        // input string yields an empty array in both cases; elements
+        // equal to null_str become NULL).
+        "string_to_array" => {
+            let s = match str_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(s) => s.to_string(),
+            };
+            let delim: Option<String> = match str_arg(name, &vals[1])? {
+                None => None,
+                Some(d) => Some(d.to_string()),
+            };
+            let null_str: Option<String> = if vals.len() > 2 {
+                match str_arg(name, &vals[2])? {
+                    None => None,
+                    Some(x) => Some(x.to_string()),
+                }
+            } else {
+                None
+            };
+            let raw: Vec<String> = match &delim {
+                // NULL delimiter: one element per character.
+                None => s.chars().map(|c| c.to_string()).collect(),
+                // Empty delimiter: the whole string as one element
+                // (empty input still yields an empty array).
+                Some(d) if d.is_empty() => {
+                    if s.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![s.clone()]
+                    }
+                }
+                Some(d) => {
+                    if s.is_empty() {
+                        Vec::new()
+                    } else {
+                        s.split(d.as_str()).map(|p| p.to_string()).collect()
+                    }
+                }
+            };
+            let elems: Vec<Value> = raw
+                .into_iter()
+                .map(|p| {
+                    if null_str.as_deref() == Some(p.as_str()) {
+                        Value::Null
+                    } else {
+                        Value::text(p)
+                    }
+                })
+                .collect();
+            let n = elems.len();
+            Ok(Value::Array(Box::new(crate::storage::ArrayVal {
+                elem: crate::storage::ArrayElem::Text,
+                dims: if n == 0 { Vec::new() } else { vec![n as i32] },
+                lower: vec![1],
+                elems,
+            })))
         }
         // --- v0.16: missing built-ins (pg_regress 42883 cluster) -----------
         "concat" => {
@@ -14796,7 +15006,7 @@ pub(crate) fn ctor_spec_result_type_named(eng: &Engine, spec: &str) -> ColType {
             if let Some(t) = super::json::ctor_spec_coltype(spec) {
                 return t;
             }
-            if let Some(st) = eng.db.types.get(spec) {
+            if let Some(st) = eng.db.find_type(spec) {
                 if let Some(d) = &st.domain {
                     return d.base;
                 }
@@ -14818,7 +15028,10 @@ pub(crate) fn func_result_type(
     ctes: &[CteDef],
 ) -> Result<ColType, ExecError> {
     // v2.33: pg_catalog.-qualified calls type as the bare builtin.
-    let name = name.strip_prefix("pg_catalog.").unwrap_or(name);
+    let name = name
+        .strip_prefix("pg_catalog.")
+        .or_else(|| name.strip_prefix("public."))
+        .unwrap_or(name);
     // v1.96: user-defined aggregates — result type is the final
     // function's return type, else the state type.
     {
@@ -14995,6 +15208,8 @@ pub(crate) fn func_result_type(
         Err(e) => Err(e),
     };
     match name {
+        // v2.37: string_to_array returns text[].
+        "string_to_array" => Ok(ColType::Array(crate::storage::ArrayElem::Text)),
         "upper" | "lower" | "replace" | "split_part" | "concat" | "concat_ws" | "to_hex"
         | "to_oct" | "to_bin" | "left" | "right" | "reverse" | "encode" | "repeat" | "lpad"
         | "rpad" | "chr" | "initcap"
@@ -15257,7 +15472,8 @@ pub(crate) fn func_result_type(
         "has_table_privilege" | "has_column_privilege" | "has_sequence_privilege"
         | "has_database_privilege" | "has_schema_privilege" | "has_function_privilege"
         | "has_type_privilege" | "has_parameter_privilege" | "has_any_column_privilege"
-        | "has_largeobject_privilege" | "pg_has_role" | "aclcontains" => Ok(ColType::Bool),
+        | "has_largeobject_privilege" | "pg_has_role" | "aclcontains"
+        | "has_foreign_data_wrapper_privilege" | "has_server_privilege" => Ok(ColType::Bool),
         "current_setting" | "makeaclitem" | "pg_get_userbyid" => Ok(ColType::Text),
         // v2.04: catalog description helpers used by the publication
         // suite (pg_get_expr deparses our stored filter text form).
@@ -15266,6 +15482,9 @@ pub(crate) fn func_result_type(
         | "pg_get_ruledef" | "pg_get_indexdef" => Ok(ColType::Text),
         // v2.17: pg_statistics_obj_is_visible(oid) -> boolean.
         "pg_statistics_obj_is_visible" => Ok(ColType::Bool),
+        // v2.37: row_security_active -> boolean; set_config -> text.
+        "row_security_active" => Ok(ColType::Bool),
+        "set_config" => Ok(ColType::Text),
         // v2.23: satisfies_hash_partition(...) -> boolean.
         "satisfies_hash_partition" => Ok(ColType::Bool),
         // v2.09: pg_trigger_depth() is int.
@@ -15450,7 +15669,7 @@ pub(crate) fn func_result_type(
         _ => {
             // v1.88: user-defined range type constructors type as
             // their range / multirange type.
-            if let Some((elem, multi)) = eng.db.types.get(name).and_then(|st| st.range) {
+            if let Some((elem, multi)) = eng.db.find_type(name).and_then(|st| st.range) {
                 return Ok(if multi {
                     ColType::Multirange(elem)
                 } else {

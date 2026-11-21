@@ -667,9 +667,27 @@ pub(crate) fn alter_swap(
         // v0.9: the row ids changed — rebuild the id->position index.
         next.rebuild_row_index();
     }
-    let target = renamed_to.clone().unwrap_or_else(|| name.to_string());
+    // v2.36: resolve the storage key — a table whose schema was
+    // set by attribution (ALTER ... SET SCHEMA on an unqualified
+    // name) lives under its bare key while callers spell it
+    // qualified; indexing `tables` by the raw spelling panicked.
+    let key = eng.db.table_storage_key(name);
+    let target = renamed_to.clone().unwrap_or_else(|| key.clone());
     if renamed_to.is_some() {
-        let mut versions = eng.db.tables.remove(name).unwrap_or_default();
+        // v2.36: the obj_schema attribution is keyed by bare table
+        // name — a rename must move it, or schema-qualified
+        // references to the new name stop resolving (the
+        // SET SCHEMA + RENAME TO sequence in foreign_data).
+        let old_base = key.rsplit('.').next().unwrap_or(&key).to_string();
+        let new_base = target.rsplit('.').next().unwrap_or(&target).to_string();
+        if old_base != new_base && eng.db.obj_schema.contains_key(&old_base) {
+            let prev = eng.db.obj_schema.clone();
+            if let Some(s) = eng.db.obj_schema.remove(&old_base) {
+                eng.db.obj_schema.insert(new_base, s);
+            }
+            ctx.writes.push(WriteOp::ObjSchemaSet { prev });
+        }
+        let mut versions = eng.db.tables.remove(&key).unwrap_or_default();
         {
             let old_live = versions
                 .iter_mut()
@@ -688,7 +706,7 @@ pub(crate) fn alter_swap(
         versions.push(next);
         eng.db.tables.insert(target.clone(), versions);
     } else {
-        let versions = eng.db.tables.get_mut(name).expect("visible above");
+        let versions = eng.db.tables.get_mut(&key).expect("visible above");
         let old_live = versions
             .iter_mut()
             .find(|t| crate::storage::table_visible(t, ctx.snap, &ctx.all_xids))
@@ -913,6 +931,13 @@ pub(crate) fn exec_alter_stmt(
         {
             return exec_alter_view_reloptions(eng, ctx, name, actions);
         }
+        // v2.37: ALTER VIEW ... OWNER TO (PG19 AlterTableStmt on a
+        // view changes pg_class.relowner).
+        if is_view && actions.len() == 1 && matches!(actions[0], AlterAction::OwnerTo { .. }) {
+            if let AlterAction::OwnerTo { new_owner } = &actions[0] {
+                return exec_alter_view_owner_to(eng, ctx, name, new_owner);
+            }
+        }
         if is_view
             && !actions.is_empty()
             && actions
@@ -945,7 +970,126 @@ pub(crate) fn exec_alter_flags(
     only: bool,
 ) -> Result<ExecResult, ExecError> {
     for action in actions {
+        // v2.36: foreign-table restrictions + metadata maintenance.
+        let mkey = foreign_meta_key(&eng.db, name);
+        if let Some(mk) = &mkey {
+            let base = name.rsplit('.').next().unwrap_or(name);
+            match action {
+                AlterAction::AddColumn { pkey: Some(_), .. } => {
+                    return Err(exec_err(
+                        "0A000",
+                        "primary key constraints are not supported on foreign tables",
+                    ));
+                }
+                AlterAction::AddColumn { uniques, .. } if !uniques.is_empty() => {
+                    return Err(exec_err(
+                        "0A000",
+                        "unique constraints are not supported on foreign tables",
+                    ));
+                }
+                AlterAction::AddColumn { fks, .. } if !fks.is_empty() => {
+                    return Err(exec_err(
+                        "0A000",
+                        "foreign key constraints are not supported on foreign tables",
+                    ));
+                }
+                AlterAction::AlterColumnType {
+                    using_expr: Some(_),
+                    ..
+                } => {
+                    return Err(exec_err("42809", format!("\"{}\" is not a table", base)));
+                }
+                AlterAction::AlterConstraint { name: cname, .. } => {
+                    let mut e = exec_err(
+                        "42809",
+                        format!(
+                            "cannot alter constraint \"{}\" on relation \"{}\"",
+                            cname, base
+                        ),
+                    );
+                    e.detail =
+                        Some("This operation is not supported for foreign tables.".to_string());
+                    return Err(e);
+                }
+                // v2.36: PK / UNIQUE / FK constraints cannot be
+                // added to a foreign table (0A000, parse-analysis
+                // texts from parse_utilcmd.c).
+                AlterAction::AddConstraint { pkey: Some(_), .. } => {
+                    return Err(exec_err(
+                        "0A000",
+                        "primary key constraints are not supported on foreign tables",
+                    ));
+                }
+                AlterAction::AddConstraint {
+                    unique: Some(_), ..
+                } => {
+                    return Err(exec_err(
+                        "0A000",
+                        "unique constraints are not supported on foreign tables",
+                    ));
+                }
+                AlterAction::AddConstraint { fk: Some(_), .. } => {
+                    return Err(exec_err(
+                        "0A000",
+                        "foreign key constraints are not supported on foreign tables",
+                    ));
+                }
+                _ => {}
+            }
+            let _ = mk;
+        }
+        // Pre-capture the dropped column's index for meta realign.
+        let drop_idx = match action {
+            AlterAction::DropColumn { name: col, .. } => eng
+                .db
+                .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                .and_then(|t| t.columns.iter().position(|(n, _)| n == col)),
+            _ => None,
+        };
         exec_alter_one(eng, ctx, name, action, only)?;
+        if let Some(mk) = &mkey {
+            match action {
+                AlterAction::AddColumn { fdw_options, .. } => {
+                    let opts = create_options(fdw_options)?;
+                    let meta = eng.db.foreign_tables.get_mut(mk).unwrap();
+                    meta.col_options.push(opts);
+                    if meta.col_comments.len() < meta.col_options.len() {
+                        meta.col_comments.push(None);
+                    }
+                }
+                AlterAction::DropColumn { .. } => {
+                    if let Some(i) = drop_idx {
+                        let meta = eng.db.foreign_tables.get_mut(mk).unwrap();
+                        if i < meta.col_options.len() {
+                            meta.col_options.remove(i);
+                        }
+                        if i < meta.col_comments.len() {
+                            meta.col_comments.remove(i);
+                        }
+                    }
+                }
+                AlterAction::RenameTo { new_name } => {
+                    if let Some(meta) = eng.db.foreign_tables.remove(mk) {
+                        let new_key = if mk.contains('.') {
+                            let schema = mk.rsplit_once('.').map(|(s, _)| s).unwrap_or("");
+                            format!("{}.{}", schema, new_name)
+                        } else {
+                            new_name.clone()
+                        };
+                        eng.db.foreign_tables.insert(new_key, meta);
+                    }
+                }
+                AlterAction::SetSchema { schema } => {
+                    if let Some(meta) = eng.db.foreign_tables.remove(mk) {
+                        let base = mk.rsplit('.').next().unwrap_or(mk).to_string();
+                        eng.db
+                            .foreign_tables
+                            .insert(format!("{}.{}", schema, base), meta);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
     Ok(ExecResult::Command {
         tag: "ALTER TABLE".to_string(),
@@ -997,7 +1141,23 @@ pub(crate) fn exec_alter_one(
             uniques,
             pkey,
             fks,
+            fdw_options,
         } => {
+            // v2.36: PG19 ATExecAddColumn — a column cannot be
+            // added directly to a partition (42809); parent-driven
+            // propagation (recursing) is exempt.
+            if !ADD_COLUMN_PROPAGATING.with(|c| c.get()) {
+                let is_partition = eng
+                    .db
+                    .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                    .is_some_and(|t| t.partition.as_ref().is_some_and(|p| p.parent.is_some()));
+                if is_partition {
+                    return Err(exec_err(
+                        "42809",
+                        "cannot add column to a partition".to_string(),
+                    ));
+                }
+            }
             // v2.16: ADD COLUMN IF NOT EXISTS — an existing column
             // is a NOTICE-level skip of the whole action (PG19
             // ATExecAddColumn, the if_not_exists path).
@@ -1169,6 +1329,7 @@ pub(crate) fn exec_alter_one(
                         } else {
                             Vec::new()
                         },
+                        fdw_options: fdw_options.clone(),
                     };
                     if let Err(e) = exec_alter(eng, ctx, child, std::slice::from_ref(&child_action))
                     {
@@ -1304,6 +1465,29 @@ pub(crate) fn exec_alter_one(
             fk,
             notnull,
         } => {
+            // v2.36: PG19 — ADD PRIMARY KEY / UNIQUE on a partitioned
+            // table whose subtree contains foreign tables fails at
+            // the innermost such partitioned table (the backing
+            // unique index cannot be built on the foreign leaves).
+            if pkey.is_some() || unique.is_some() {
+                let partitioned = eng
+                    .db
+                    .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                    .and_then(|t| t.partition.as_ref())
+                    .is_some_and(|p| p.is_partitioned);
+                if partitioned {
+                    if let Some(deep) = deepest_partitioned_with_foreign(
+                        &eng.db,
+                        ctx.snap,
+                        ctx.own,
+                        ctx.session,
+                        name,
+                    ) {
+                        let base = deep.rsplit('.').next().unwrap_or(&deep).to_string();
+                        return Err(unique_index_foreign_err(&base));
+                    }
+                }
+            }
             // v1.97: PG19 ATExecAddConstraint (FK) — ONLY cannot
             // create a foreign key on a partitioned table, since
             // the constraint must exist on every partition.
@@ -1865,6 +2049,73 @@ pub(crate) fn exec_alter_one(
             }
             res
         }
+        // v2.36: ALTER FOREIGN TABLE ... OPTIONS — merge into the
+        // foreign table's FDW metadata (table context: unvalidated).
+        AlterAction::ForeignOptions { options } => {
+            let base = name.rsplit('.').next().unwrap_or(name).to_string();
+            let Some(mkey) = foreign_meta_key(&eng.db, name) else {
+                return Err(exec_err(
+                    "42809",
+                    format!("\"{}\" is not a foreign table", base),
+                ));
+            };
+            let merged = alter_options(&eng.db.foreign_tables[&mkey].options.clone(), options)?;
+            let f = eng
+                .db
+                .foreign_servers
+                .iter()
+                .find(|s| s.name == eng.db.foreign_tables[&mkey].server)
+                .and_then(|s| eng.db.fdws.iter().find(|f| f.name == s.fdw))
+                .cloned();
+            validate_options(f.as_ref(), OptCtx::ForeignTable, &merged)?;
+            eng.db.foreign_tables.get_mut(&mkey).unwrap().options = merged;
+            Ok(ExecResult::Command {
+                tag: "ALTER FOREIGN TABLE".to_string(),
+            })
+        }
+        // v2.36: ALTER FOREIGN TABLE ... ALTER COLUMN c OPTIONS.
+        AlterAction::AlterColumnOptions { name: col, options } => {
+            let base = name.rsplit('.').next().unwrap_or(name).to_string();
+            let Some(mkey) = foreign_meta_key(&eng.db, name) else {
+                return Err(exec_err(
+                    "42809",
+                    format!("\"{}\" is not a foreign table", base),
+                ));
+            };
+            let t = eng
+                .db
+                .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                .cloned();
+            let Some(t) = t else {
+                return Err(exec_err(
+                    "42P01",
+                    format!("relation \"{}\" does not exist", base),
+                ));
+            };
+            let Some(ci) = t.columns.iter().position(|(n, _)| n == col) else {
+                return Err(exec_err(
+                    "42703",
+                    format!("column \"{}\" of relation \"{}\" does not exist", col, base),
+                ));
+            };
+            let meta = eng.db.foreign_tables.get_mut(&mkey).unwrap();
+            while meta.col_options.len() <= ci {
+                meta.col_options.push(Vec::new());
+            }
+            let merged = alter_options(&meta.col_options[ci].clone(), options)?;
+            let f = eng
+                .db
+                .foreign_servers
+                .iter()
+                .find(|s| s.name == eng.db.foreign_tables[&mkey].server)
+                .and_then(|s| eng.db.fdws.iter().find(|f| f.name == s.fdw))
+                .cloned();
+            validate_options(f.as_ref(), OptCtx::Column, &merged)?;
+            eng.db.foreign_tables.get_mut(&mkey).unwrap().col_options[ci] = merged;
+            Ok(ExecResult::Command {
+                tag: "ALTER FOREIGN TABLE".to_string(),
+            })
+        }
         AlterAction::SetSchema { schema } => alter_set_schema(eng, ctx, name, schema),
         AlterAction::SetTablespace { tablespace } => {
             // v2.34: placement is not modeled; PG validates the
@@ -2228,6 +2479,26 @@ pub(crate) fn exec_alter_one(
                     ),
                 ));
             }
+            // v2.36: PG19 ATExecAttachPartition — a foreign table
+            // cannot attach under a parent carrying unique indexes.
+            if foreign_meta_key(&eng.db, child).is_some()
+                && table_has_unique_index(&eng.db, ctx.snap, ctx.own, ctx.session, name)
+            {
+                let pbase = name.rsplit('.').next().unwrap_or(name);
+                let cbase = child.rsplit('.').next().unwrap_or(child);
+                let mut e = exec_err(
+                    "42809",
+                    format!(
+                        "cannot attach foreign table \"{}\" as partition of partitioned table \"{}\"",
+                        cbase, pbase
+                    ),
+                );
+                e.detail = Some(format!(
+                    "Partitioned table \"{}\" contains unique indexes.",
+                    pbase
+                ));
+                return Err(e);
+            }
             attach_partition(eng, ctx, name, child, bound)
         }
         // v2.06: DETACH PARTITION (PG19 ATExecDetachPartition).
@@ -2330,7 +2601,7 @@ pub(crate) fn alter_of_type(
     type_name: &str,
 ) -> Result<ExecResult, ExecError> {
     check_type_usage(eng, ctx, type_name)?;
-    let st = match eng.db.types.get(type_name) {
+    let st = match eng.db.find_type(type_name) {
         Some(st) => st,
         None => {
             return Err(exec_err(
@@ -2455,6 +2726,44 @@ pub(crate) fn alter_column_type_ext(
                 format!("column \"{}\" of relation \"{}\" does not exist", col, name),
             )
         })?;
+    // v2.36: PG19 — a USING clause forces a table rewrite, which a
+    // foreign table cannot undergo (42809 "\"ft\" is not a table").
+    // This fires both for the direct ALTER FOREIGN TABLE form and
+    // when a parent's ALTER COLUMN TYPE propagates into a foreign
+    // inheritance/partition child.
+    if using_expr.is_some() {
+        if foreign_meta_key(&eng.db, name).is_some() {
+            let base = name.rsplit('.').next().unwrap_or(name);
+            return Err(exec_err("42809", format!("\"{}\" is not a table", base)));
+        }
+        // PG19 recurses into every inheritance/partition
+        // descendant; the rewrite of a foreign descendant fails
+        // the same way (the fd_pt1/ft2 case in foreign_data).
+        let mut stack: Vec<String> = vec![name.to_string()];
+        let mut seen: Vec<String> = Vec::new();
+        while let Some(cur) = stack.pop() {
+            if seen.contains(&cur) {
+                continue;
+            }
+            seen.push(cur.clone());
+            let mut kids: Vec<String> = direct_inheritance_children(eng, ctx, &cur);
+            if let Some(t) = eng
+                .db
+                .find_table(&cur, ctx.snap, &ctx.all_xids, ctx.session)
+            {
+                if let Some(p) = &t.partition {
+                    kids.extend(p.children.iter().cloned());
+                }
+            }
+            for k in kids {
+                if foreign_meta_key(&eng.db, &k).is_some() {
+                    let base = k.rsplit('.').next().unwrap_or(&k).to_string();
+                    return Err(exec_err("42809", format!("\"{}\" is not a table", base)));
+                }
+                stack.push(k);
+            }
+        }
+    }
     // v2.15: PG19 resolves the target type (typenameTypeId) — an
     // unknown named type is 42704, not a Composite placeholder.
     // (The pre-fix code recorded the name and silently retyped the
@@ -2484,6 +2793,59 @@ pub(crate) fn alter_column_type_ext(
             "42P16",
             "cannot alter column type of typed table".to_string(),
         ));
+    }
+    // v2.36: PG19 find_composite_type_dependencies — a column of
+    // any relation typed by THIS relation's row type blocks the
+    // change (0A000; foreign-table wording when the target is a
+    // foreign table; foreign_data's ft1 / use_ft1_column_type).
+    // Only direct column uses are modeled; PG also recurses
+    // through views and composite types.
+    {
+        let target_key = eng.db.table_storage_key(name);
+        let mut keys: Vec<String> = eng.db.tables.keys().cloned().collect();
+        keys.sort();
+        for uname in &keys {
+            let Some(u) = eng
+                .db
+                .find_table(uname, ctx.snap, &ctx.all_xids, ctx.session)
+            else {
+                continue;
+            };
+            for (ci, (cname, _)) in u.columns.iter().enumerate() {
+                let Some(cn) = u.composite_types.get(ci).and_then(|o| o.as_ref()) else {
+                    continue;
+                };
+                // A name that resolves in the type registry is a
+                // standalone type use, not a row-type use (the
+                // cast path's precedence).
+                if eng.db.find_type(cn).is_some() {
+                    continue;
+                }
+                if eng.db.table_storage_key(cn) == target_key
+                    && eng
+                        .db
+                        .find_table(cn, ctx.snap, &ctx.all_xids, ctx.session)
+                        .is_some()
+                {
+                    let tbase = target_key.rsplit('.').next().unwrap_or(&target_key);
+                    let ubase = uname.rsplit('.').next().unwrap_or(uname);
+                    return Err(exec_err(
+                        "0A000",
+                        if foreign_meta_key(&eng.db, name).is_some() {
+                            format!(
+                                "cannot alter foreign table \"{}\" because column \"{}.{}\" uses its row type",
+                                tbase, ubase, cname
+                            )
+                        } else {
+                            format!(
+                                "cannot alter table \"{}\" because column \"{}.{}\" uses its row type",
+                                tbase, ubase, cname
+                            )
+                        },
+                    ));
+                }
+            }
+        }
     }
     // v1.97: PG19 ATExecAlterColumnType — a column inherited from
     // a parent (inheritance or partition tree) cannot be altered
@@ -2645,7 +3007,7 @@ pub(crate) fn alter_column_type_ext(
         next.domain_types[idx] = None;
     }
     let named_is_domain = match named_type {
-        Some(n) => match eng.db.types.get(n) {
+        Some(n) => match eng.db.find_type(n) {
             Some(st) if st.domain.is_some() => {
                 if idx < next.domain_types.len() {
                     next.domain_types[idx] = Some(n.to_string());
@@ -6630,8 +6992,9 @@ pub(crate) fn exec_comment_on(
     target: &str,
     name: &str,
     sub: Option<&str>,
-    // The comment text itself: validated by the parser, not
-    // stored (see the fn doc).
+    // The comment text itself: validated by the parser; stored
+    // only for the families that read it back (database, and
+    // v2.36 the FDW registries via obj_description).
     _comment: Option<&str>,
 ) -> Result<ExecResult, ExecError> {
     let rel_missing = || exec_err("42P01", format!("relation \"{}\" does not exist", name));
@@ -6644,6 +7007,15 @@ pub(crate) fn exec_comment_on(
                 && eng.db.find_view(name, ctx.snap, ctx.own).is_none()
             {
                 return Err(rel_missing());
+            }
+            // v2.36: foreign-table comments are stored on the FDW
+            // metadata (read back via obj_description on pg_class).
+            if target == "foreign_table" {
+                if let Some(mk) = foreign_meta_key(&eng.db, name) {
+                    if let Some(meta) = eng.db.foreign_tables.get_mut(&mk) {
+                        meta.comment = _comment.map(|c| c.to_string());
+                    }
+                }
             }
         }
         "view" => {
@@ -6711,7 +7083,7 @@ pub(crate) fn exec_comment_on(
             }
         }
         "domain" => {
-            let is_domain = eng.db.types.get(name).is_some_and(|st| st.domain.is_some());
+            let is_domain = eng.db.find_type(name).is_some_and(|st| st.domain.is_some());
             if !is_domain {
                 return Err(exec_err(
                     "42704",
@@ -6723,7 +7095,7 @@ pub(crate) fn exec_comment_on(
             // COMMENT ON CONSTRAINT name ON DOMAIN dom: validate
             // the domain and the named check on it.
             let dom_name = sub.unwrap_or_default();
-            let dom = eng.db.types.get(dom_name).and_then(|st| st.domain.as_ref());
+            let dom = eng.db.find_type(dom_name).and_then(|st| st.domain.as_ref());
             let Some(dom) = dom else {
                 return Err(exec_err(
                     "42704",
@@ -6857,10 +7229,48 @@ pub(crate) fn exec_comment_on(
             }
             eng.db.db_comment = _comment.map(|c| c.to_string());
         }
+        // v2.36: COMMENT ON FOREIGN DATA WRAPPER / SERVER validate
+        // against the registries (comments are validated, not
+        // stored, like the rest of this family).
+        "foreign_data_wrapper" => {
+            let Some(pos) = eng.db.fdws.iter().position(|f| f.name == name) else {
+                return Err(exec_err(
+                    "42704",
+                    format!("foreign-data wrapper \"{}\" does not exist", name),
+                ));
+            };
+            if !owns(eng, ctx, ctx.role, &eng.db.fdws[pos].owner.clone()) {
+                return Err(exec_err(
+                    "42501",
+                    format!("must be owner of foreign-data wrapper {}", name),
+                ));
+            }
+            eng.db.fdws[pos].comment = _comment.map(|c| c.to_string());
+        }
+        "server" => {
+            let Some(pos) = eng.db.foreign_servers.iter().position(|s| s.name == name) else {
+                return Err(exec_err(
+                    "42704",
+                    format!("server \"{}\" does not exist", name),
+                ));
+            };
+            if !owns(
+                eng,
+                ctx,
+                ctx.role,
+                &eng.db.foreign_servers[pos].owner.clone(),
+            ) {
+                return Err(exec_err(
+                    "42501",
+                    format!("must be owner of foreign server {}", name),
+                ));
+            }
+            eng.db.foreign_servers[pos].comment = _comment.map(|c| c.to_string());
+        }
         _ => {
-            // collation, conversion, server,
+            // collation, conversion,
             // subscription, extension, language, policy,
-            // event_trigger, fdw, large_object,
+            // event_trigger, large_object,
             // text_search_*: no catalog modeled — accept.
         }
     }
@@ -6947,15 +7357,40 @@ pub(crate) fn alter_set_schema(
         if new_key != name {
             alter_rename_to(eng, ctx, name, &new_key)?;
             set_obj_schema_to(eng, ctx, &new_key, schema);
+            move_owned_seqs_schema(eng, ctx, name, schema);
             return Ok(ExecResult::Command {
                 tag: "ALTER TABLE".to_string(),
             });
         }
     }
     set_obj_schema_to(eng, ctx, name, schema);
+    move_owned_seqs_schema(eng, ctx, name, schema);
     Ok(ExecResult::Command {
         tag: "ALTER TABLE".to_string(),
     })
+}
+
+/// v2.36: PG19 — sequences OWNED BY a table's column live in the
+/// table's schema and follow it across SET SCHEMA (the
+/// foreign_data ft1_c11_seq case: created in public by ADD COLUMN
+/// ... serial, then carried into foreign_schema by the table's
+/// move, so DROP SCHEMA ... CASCADE reaches it).
+fn move_owned_seqs_schema(eng: &mut Engine, ctx: &mut StmtCtx, table: &str, schema: &str) {
+    let key = eng.db.table_storage_key(table);
+    let mut seq_names: Vec<String> = Vec::new();
+    for (sn, vs) in &eng.db.sequences {
+        if vs.iter().any(|s| {
+            s.owned_by
+                .as_ref()
+                .is_some_and(|(t, _, _)| t == table || t == &key)
+        }) && !seq_names.contains(sn)
+        {
+            seq_names.push(sn.clone());
+        }
+    }
+    for sn in seq_names {
+        set_obj_schema_to(eng, ctx, &sn, schema);
+    }
 }
 
 // ---------------------------------------------------------------------------

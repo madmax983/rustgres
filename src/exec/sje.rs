@@ -271,6 +271,7 @@ pub(crate) fn sje_rewrite_items(
     let mut new_items: Vec<SelectItem> = Vec::with_capacity(stmt.items.len());
     for item in &stmt.items {
         match item {
+            SelectItem::CompositeStar(_) => return None,
             SelectItem::All if !nested => {
                 // PG19 keeps both column sets, re-pointed at the kept
                 // instance (oracle: `a | b | c | a | b | c`). Only

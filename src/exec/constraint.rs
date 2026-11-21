@@ -203,7 +203,7 @@ pub(crate) fn check_domain_value(
 /// the base type). Returns None otherwise — the caller falls back
 /// to the value's type name.
 pub(crate) fn pg_typeof_domain_name(q: &Q, scopes: &[Scope], arg: &Expr) -> Option<String> {
-    let is_domain = |n: &str| q.eng.db.types.get(n).is_some_and(|st| st.domain.is_some());
+    let is_domain = |n: &str| q.eng.db.find_type(n).is_some_and(|st| st.domain.is_some());
     match arg {
         Expr::CastNamed { name, .. } => is_domain(name).then(|| name.clone()),
         Expr::Column { table, name: col } => {
@@ -264,13 +264,13 @@ pub(crate) fn coerce_assign_composite(
         // in a column of that type (so pg_typeof / output naming
         // matches PG).
         (Value::Range(mut r), Some(tname)) => {
-            if eng.db.types.get(tname).and_then(|st| st.range) == Some((r.elem, false)) {
+            if eng.db.find_type(tname).and_then(|st| st.range) == Some((r.elem, false)) {
                 r.name = Some(tname.to_string());
             }
             Ok(Value::Range(r))
         }
         (Value::Multirange(mut m), Some(tname)) => {
-            if eng.db.types.get(tname).and_then(|st| st.range) == Some((m.elem, true)) {
+            if eng.db.find_type(tname).and_then(|st| st.range) == Some((m.elem, true)) {
                 m.name = Some(tname.to_string());
             }
             Ok(Value::Multirange(m))
@@ -291,7 +291,7 @@ pub(crate) fn domain_default<'e>(
         return None;
     }
     let dname = meta.domain_types.get(ci)?.as_deref()?;
-    eng.db.types.get(dname)?.domain.as_ref()?.default.as_ref()
+    eng.db.find_type(dname)?.domain.as_ref()?.default.as_ref()
 }
 
 /// NOT NULL + CHECK validation for a fully-built row (INSERT / UPDATE /

@@ -78,6 +78,10 @@ pub enum ColType {
     // that displays as the full signature `name(argtypes)`.
     // Values ride as display text, like regproc.
     Regprocedure, // OID 2202
+    // v2.35: PG's `regnamespace` type (OID 4089) — a schema OID.
+    // Values ride as Value::Int holding the schema OID (the
+    // catalog's schema_oid), like relnamespace itself.
+    Regnamespace, // OID 4089
     // v2.15: PG's `oid` type (OID 26) — an unsigned 32-bit object
     // identifier; values carried as Value::Int like Xid.
     Oid, // OID 26
@@ -441,6 +445,7 @@ impl ArrayElem {
             ColType::Regproc => ArrayElem::Record,
             // v2.34: regprocedure[] degrades the same way.
             ColType::Regprocedure => ArrayElem::Record,
+            ColType::Regnamespace => ArrayElem::Int,
             ColType::Oid => ArrayElem::Int,
             ColType::Inet => ArrayElem::Text,
             ColType::Json => ArrayElem::Json,
@@ -690,6 +695,7 @@ impl ColType {
             ColType::Regclass => 2205,     // REGCLASS (v0.37)
             ColType::Regproc => 24,        // REGPROC (v2.14)
             ColType::Regprocedure => 2202, // REGPROCEDURE (v2.34)
+            ColType::Regnamespace => 4089, // REGNAMESPACE (v2.35)
             ColType::Oid => 26,            // OID (v2.15)
             ColType::Inet => 869,          // INET (v2.15)
             ColType::Name => 19,           // NAME (v0.57)
@@ -764,6 +770,7 @@ impl ColType {
             ColType::Regclass => "regclass",
             ColType::Regproc => "regproc",
             ColType::Regprocedure => "regprocedure", // v2.34
+            ColType::Regnamespace => "regnamespace", // v2.35
             ColType::Oid => "oid",                   // v2.15
             ColType::Inet => "inet",                 // v2.15
             ColType::Name => "name",
@@ -833,6 +840,7 @@ impl ColType {
             ColType::Regclass => "regclass",
             ColType::Regproc => "regproc",
             ColType::Regprocedure => "regprocedure", // v2.34
+            ColType::Regnamespace => "regnamespace", // v2.35
             ColType::Oid => "oid",                   // v2.15
             ColType::Inet => "inet",                 // v2.15
             ColType::Name => "name",
@@ -6412,6 +6420,21 @@ pub struct Database {
     /// (a rolled-back CREATE COLLATION leaves the entry, like the
     /// ext_stats registry).
     pub collations: std::collections::HashMap<String, CollationDef>,
+    /// v2.36: FOREIGN DATA registries (pg_foreign_data_wrapper /
+    /// pg_foreign_server / pg_user_mapping). Runtime-only like
+    /// `collations` — not WAL-logged or checkpointed, and
+    /// transactional visibility is not modeled (a rolled-back CREATE
+    /// leaves the entry, the ext_stats/collations precedent).
+    /// Recorded as an explicit v2.36 hold-back. Foreign TABLES are
+    /// ordinary entries in `tables` (fully transactional); their
+    /// FDW metadata rides in `foreign_tables` below.
+    pub fdws: Vec<FdwDef>,
+    pub foreign_servers: Vec<ForeignServerDef>,
+    pub user_mappings: Vec<UserMappingDef>,
+    /// v2.36: foreign-table metadata by table storage key
+    /// (pg_foreign_table + pg_attribute.attoptions). Runtime-only
+    /// like the registries above; the Table itself is durable.
+    pub foreign_tables: std::collections::HashMap<String, ForeignTableMeta>,
     /// v1.96: large object contents (oid -> bytes) and owners.
     /// v1.96: user-defined aggregates by name.
     pub aggregates: std::collections::HashMap<String, AggDef>,
@@ -6423,6 +6446,62 @@ pub struct Database {
     /// v0.37: next table OID to assign (`pg_class.oid`). Starts at
     /// `FIRST_USER_OID` (16384), like PG's `FirstNormalObjectId`.
     pub next_oid: u32,
+}
+
+/// v2.36: a foreign-data wrapper (PG19 pg_foreign_data_wrapper).
+/// `handler` / `validator` / `connection` are function names as
+/// written (base name, lowercased); None = no function (oid 0).
+#[derive(Clone, Debug)]
+pub struct FdwDef {
+    pub oid: u32,
+    pub name: String,
+    pub owner: String,
+    pub handler: Option<String>,
+    pub validator: Option<String>,
+    pub connection: Option<String>,
+    pub options: Vec<(String, String)>,
+    pub acl: Vec<AclEntry>,
+    pub comment: Option<String>,
+}
+
+/// v2.36: a foreign server (PG19 pg_foreign_server).
+#[derive(Clone, Debug)]
+pub struct ForeignServerDef {
+    pub oid: u32,
+    pub name: String,
+    pub owner: String,
+    /// Name of the owning FDW (FdwDef::name).
+    pub fdw: String,
+    pub srvtype: Option<String>,
+    pub srvversion: Option<String>,
+    pub options: Vec<(String, String)>,
+    pub acl: Vec<AclEntry>,
+    pub comment: Option<String>,
+}
+
+/// v2.36: a user mapping (PG19 pg_user_mapping). `user` is the role
+/// name; the empty string is PUBLIC (umuser = 0).
+#[derive(Clone, Debug)]
+pub struct UserMappingDef {
+    pub oid: u32,
+    pub user: String,
+    /// Name of the server (ForeignServerDef::name).
+    pub server: String,
+    pub options: Vec<(String, String)>,
+}
+
+/// v2.36: foreign-table metadata (PG19 pg_foreign_table row +
+/// per-column pg_attribute.attoptions), keyed by table storage key.
+#[derive(Clone, Debug)]
+pub struct ForeignTableMeta {
+    /// Server name (ForeignServerDef::name).
+    pub server: String,
+    pub options: Vec<(String, String)>,
+    /// Per-column FDW options, parallel to Table::columns.
+    pub col_options: Vec<Vec<(String, String)>>,
+    pub comment: Option<String>,
+    /// Per-column comments (pg_description objsubid), parallel.
+    pub col_comments: Vec<Option<String>>,
 }
 
 /// v2.02: a logical-replication publication (pg_publication row,
@@ -6731,6 +6810,11 @@ impl Database {
             schema_acls: HashMap::default(),
             // v2.21: no user-defined collations at bootstrap.
             collations: std::collections::HashMap::default(),
+            // v2.36: no FDW objects at bootstrap (PG19 has none).
+            fdws: Vec::new(),
+            foreign_servers: Vec::new(),
+            user_mappings: Vec::new(),
+            foreign_tables: std::collections::HashMap::default(),
             aggregates: std::collections::HashMap::default(),
             large_objects: std::collections::HashMap::default(),
             lo_owners: std::collections::HashMap::default(),
@@ -6813,6 +6897,92 @@ impl Database {
             .and_then(|vs| vs.iter_mut().find(|r| role_visible(r, snap, own)))
     }
 
+    /// v2.35: schema-tolerant type lookup — the find_table analogue
+    /// for the type registry. Types are stored under the name as
+    /// written at CREATE (dotted when qualified), while references
+    /// historically arrived bare (the parser discarded the qualifier).
+    /// Resolution order (PG19 namespace.c, single-namespace engine):
+    /// exact key; a `pg_catalog.`/`pg_temp.` prefix strips to the bare
+    /// key; a dotted name falls back to its bare suffix key; a bare
+    /// name falls back to a UNIQUE dotted key with that suffix (two
+    /// schemas holding the same bare type name is ambiguous and
+    /// resolves to None, like a search_path miss in this engine).
+    pub fn find_type(&self, name: &str) -> Option<&ShellType> {
+        if let Some(st) = self.types.get(name) {
+            return Some(st);
+        }
+        if let Some((sch, base)) = name.rsplit_once('.') {
+            if sch == "pg_catalog" || sch == "pg_temp" {
+                if let Some(st) = self.types.get(base) {
+                    return Some(st);
+                }
+            }
+            if let Some(st) = self.types.get(base) {
+                // Dotted reference to a bare-stored type (e.g. a type
+                // created unqualified, later moved by SET SCHEMA, or
+                // recorded in obj_schema under that schema).
+                if self.obj_schema.get(base).map(|s| s.as_str()) == Some(sch) {
+                    return Some(st);
+                }
+                // In the single-namespace model a dotted reference to
+                // the only bare type of that name is unambiguous when
+                // no dotted key competes; accept it (this is the
+                // pre-v2.35 stored form for most user types).
+                return Some(st);
+            }
+            return None;
+        }
+        // Bare reference: unique dotted key with this suffix. Every
+        // call that reaches here (no exact key, no dot in `name`) is
+        // on the hot per-row cast-evaluation path once a schema-
+        // qualified type is referenced by its bare name, so this scan
+        // compares against `name` directly instead of building a
+        // `format!(".{name}")` String per call: `k`'s last
+        // `name.len()` bytes must equal `name`, with a `.` right
+        // before them (same match as `k.ends_with(&format!(".{name}"))`,
+        // zero allocations).
+        let mut found: Option<&ShellType> = None;
+        for (k, st) in self.types.iter() {
+            let dotted_suffix_match = k.len() > name.len()
+                && k.as_bytes()[k.len() - name.len() - 1] == b'.'
+                && &k[k.len() - name.len()..] == name;
+            if dotted_suffix_match {
+                if found.is_some() {
+                    return None; // ambiguous across schemas
+                }
+                found = Some(st);
+            }
+        }
+        found
+    }
+
+    /// v2.35: the storage key `find_type` resolves `name` to, when it
+    /// resolves at all (for callers that must record the canonical
+    /// name, e.g. column domain/composite bookkeeping).
+    pub fn type_key(&self, name: &str) -> Option<String> {
+        if self.types.contains_key(name) {
+            return Some(name.to_string());
+        }
+        if let Some((sch, base)) = name.rsplit_once('.') {
+            if self.types.contains_key(base) {
+                let _ = sch;
+                return Some(base.to_string());
+            }
+            return None;
+        }
+        let suffix = format!(".{name}");
+        let mut found: Option<String> = None;
+        for k in self.types.keys() {
+            if k.ends_with(&suffix) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(k.clone());
+            }
+        }
+        found
+    }
+
     /// First view version with `name` visible to (`snap`, `own`).
     pub fn find_view(&self, name: &str, snap: &Snapshot, own: u64) -> Option<&ViewDef> {
         if let Some(v) = self
@@ -6872,6 +7042,14 @@ impl Database {
         if let Some(t) = self.temp_tables.get(&session).and_then(|m| m.get(name)) {
             return Some(t);
         }
+        // v2.35: `pg_temp.<name>` is PG's alias for the session's own
+        // temp schema — resolve it against the temp map under the
+        // bare name (regclass input and qualified references use it).
+        if let Some(base) = name.strip_prefix("pg_temp.") {
+            if let Some(t) = self.temp_tables.get(&session).and_then(|m| m.get(base)) {
+                return Some(t);
+            }
+        }
         if let Some(t) = self
             .tables
             .get(name)
@@ -6892,6 +7070,25 @@ impl Database {
             }
         }
         None
+    }
+
+    /// v2.36: the storage key for a table reference — the exact key
+    /// when present, else the bare key when the reference is
+    /// schema-qualified and `obj_schema` attributes the bare table
+    /// to that schema (the find_table schema fallback). Callers
+    /// that index `tables` directly must resolve through here: the
+    /// raw written name is not always a key (ALTER ... SET SCHEMA
+    /// on an unqualified name keeps the bare key).
+    pub fn table_storage_key(&self, name: &str) -> String {
+        if self.tables.contains_key(name) {
+            return name.to_string();
+        }
+        if let Some((sch, base)) = name.rsplit_once('.') {
+            if self.obj_schema.get(base).map(|s| s.as_str()) == Some(sch) {
+                return base.to_string();
+            }
+        }
+        name.to_string()
     }
 
     /// Mutable variant of [`Database::find_table`].

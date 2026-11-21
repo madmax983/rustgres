@@ -28,6 +28,7 @@ pub(crate) fn parse_stat_expr(text: &str) -> Result<Expr, ExecError> {
         unnamed_seq: 0,
         allow_similar_to: true,
         last_bit_typmod: None,
+        select_into: None,
     };
     let e = p
         .parse_or()
@@ -69,6 +70,27 @@ fn resolve_obj(db: &Database, schema: &Option<String>, name: &str) -> Option<usi
 }
 
 const SYSTEM_COLS: [&str; 6] = ["ctid", "xmin", "xmax", "cmin", "cmax", "tableoid"];
+
+/// v2.35: remove the space tokens_to_sql leaves between a
+/// function/type name and its argument-list paren, matching
+/// ruleutils deparse (`int4range(50, 150)`, `varchar(10)`).
+fn squeeze_fn_call_space(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev = '\0';
+    for c in s.chars() {
+        if c == '(' && prev == ' ' {
+            // Look back past the space: a name character means
+            // this paren opens a call/typmod, not a group.
+            let before = out[..out.len() - 1].chars().next_back().unwrap_or('\0');
+            if before.is_ascii_alphanumeric() || before == '_' || before == '"' || before == '$' {
+                out.pop();
+            }
+        }
+        out.push(c);
+        prev = c;
+    }
+    out
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_create_statistics(
@@ -184,7 +206,14 @@ pub(crate) fn exec_create_statistics(
     let mut resolved: Vec<ExtStatItem> = Vec::new();
     let mut seen_cols: Vec<u16> = Vec::new();
     for item in items {
-        let trimmed = item.trim();
+        // v2.35: the stored item text is what pg_stats_ext_exprs
+        // shows as `expr` — PG's ruleutils deparse writes function
+        // calls without a space before the argument list
+        // (`int4range(50, 150)`), while tokens_to_sql emits
+        // `int4range (50, 150)`. Squeeze the call paren here so the
+        // stored text matches the deparse.
+        let trimmed_owned = squeeze_fn_call_space(item.trim());
+        let trimmed = trimmed_owned.as_str();
         let lower = trimmed.to_lowercase();
         // Plain column reference?
         let colpos = tbl
@@ -587,14 +616,6 @@ pub(crate) fn attnum_of(obj: &ExtStatObj, item_idx: usize) -> i32 {
             }
             0
         }
-    }
-}
-
-fn fmt_float(x: f64) -> String {
-    if x == x.trunc() && x.abs() < 1e15 {
-        format!("{:.1}", x)
-    } else {
-        format!("{}", x)
     }
 }
 
@@ -1578,46 +1599,6 @@ pub(crate) fn pg_statistic_ext_data_scan(db: &Database) -> (Vec<QCol>, Vec<QRow>
     (schema, rows)
 }
 
-/// v2.33: MCV rendering over an explicit payload (own or inherited).
-fn mcv_render_data(data: &ExtStatData) -> (String, String, String, String) {
-    if data.mcv.is_empty() {
-        return ("NULL".into(), "NULL".into(), "NULL".into(), "NULL".into());
-    }
-    let vals: Vec<String> = data
-        .mcv
-        .iter()
-        .map(|(vals, _, _)| {
-            let inner: Vec<String> = vals
-                .iter()
-                .map(|v| match v {
-                    Some(v) => array_quote(&value_to_text_cast(v)),
-                    None => "NULL".to_string(),
-                })
-                .collect();
-            format!("{{{}}}", inner.join(","))
-        })
-        .collect();
-    let nulls: Vec<String> = data
-        .mcv
-        .iter()
-        .map(|(vals, _, _)| {
-            let inner: Vec<String> = vals
-                .iter()
-                .map(|v| if v.is_none() { "t" } else { "f" }.to_string())
-                .collect();
-            format!("{{{}}}", inner.join(","))
-        })
-        .collect();
-    let freqs: Vec<String> = data.mcv.iter().map(|(_, f, _)| fmt_float(*f)).collect();
-    let base: Vec<String> = data.mcv.iter().map(|(_, _, b)| fmt_float(*b)).collect();
-    (
-        format!("{{{}}}", vals.join(",")),
-        format!("{{{}}}", nulls.join(",")),
-        format!("{{{}}}", freqs.join(",")),
-        format!("{{{}}}", base.join(",")),
-    )
-}
-
 pub(crate) fn pg_stats_ext_schema() -> Vec<QCol> {
     let q = "pg_stats_ext";
     vec![
@@ -1688,13 +1669,54 @@ pub(crate) fn pg_stats_ext_scan(
             variants.push((inh, true));
         }
         for (data, inherited) in variants {
-            let (mcv, nulls, freqs, base) = mcv_render_data(data);
-            let txt = |s: String| {
-                if s == "NULL" {
-                    Value::Null
-                } else {
-                    Value::text(s.as_str())
+            // v2.35: PG's pg_stats_ext MCV columns are anyarray —
+            // the values ARE arrays (the stats_import copy-back
+            // calls feed them straight into
+            // pg_restore_extended_stats, whose arginfo demands
+            // array-typed values). Emit real ArrayVals built from
+            // the stored MCV items; their array_out rendering is
+            // the same text mcv_render_data produces manually.
+            let (mcv_v, nulls_v, freqs_v, base_v) = if data.mcv.is_empty() {
+                (Value::Null, Value::Null, Value::Null, Value::Null)
+            } else {
+                let nrows = data.mcv.len() as i32;
+                let ncols = data.mcv[0].0.len() as i32;
+                let mut elems: Vec<Value> = Vec::new();
+                let mut nelems: Vec<Value> = Vec::new();
+                for (vals, _, _) in &data.mcv {
+                    for v in vals {
+                        elems.push(v.clone().unwrap_or(Value::Null));
+                        nelems.push(Value::Bool(v.is_none()));
+                    }
                 }
+                let arr2 = |elem: crate::storage::ArrayElem, elems: Vec<Value>| {
+                    Value::Array(Box::new(crate::storage::ArrayVal {
+                        elem,
+                        dims: vec![nrows, ncols],
+                        lower: vec![1, 1],
+                        elems,
+                    }))
+                };
+                let arr1 = |elem: crate::storage::ArrayElem, elems: Vec<Value>| {
+                    Value::Array(Box::new(crate::storage::ArrayVal {
+                        elem,
+                        dims: vec![nrows],
+                        lower: vec![1],
+                        elems,
+                    }))
+                };
+                (
+                    arr2(crate::storage::ArrayElem::Text, elems),
+                    arr2(crate::storage::ArrayElem::Bool, nelems),
+                    arr1(
+                        crate::storage::ArrayElem::Float,
+                        data.mcv.iter().map(|(_, f, _)| Value::Float(*f)).collect(),
+                    ),
+                    arr1(
+                        crate::storage::ArrayElem::Float,
+                        data.mcv.iter().map(|(_, _, b)| Value::Float(*b)).collect(),
+                    ),
+                )
             };
             rows.push(row(vec![
                 Value::text(table_schema_for(db, o).as_str()),
@@ -1724,10 +1746,10 @@ pub(crate) fn pg_stats_ext_scan(
                     Some(s) => Value::text(s.as_str()),
                     None => Value::Null,
                 },
-                txt(mcv),
-                txt(nulls),
-                txt(freqs),
-                txt(base),
+                mcv_v,
+                nulls_v,
+                freqs_v,
+                base_v,
             ]));
         }
     }

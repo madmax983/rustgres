@@ -1893,6 +1893,11 @@ pub enum SelectItem {
     All,
     /// `qualifier.*`
     AllOf(String),
+    /// v2.35: `(expr).*` — composite-value star expansion (PG19
+    /// gram.y target_el: `a_expr '.' '*'` where the a_expr is a
+    /// parenthesized composite/row value). Expanded at describe and
+    /// projection time from the value's rowtype fields.
+    CompositeStar(Expr),
     Expr {
         expr: Expr,
         alias: Option<String>,
@@ -2766,6 +2771,17 @@ pub enum RangeBoundDef {
 /// v0.9: ALTER TABLE actions.
 #[derive(Clone, Debug, PartialEq)]
 pub enum AlterAction {
+    /// v2.36: `OPTIONS (alter_generic_option_list)` on a foreign
+    /// table (PG19 AT_AlterFdwOptions on OBJECT_FOREIGN_TABLE).
+    ForeignOptions {
+        options: Vec<FdwOpt>,
+    },
+    /// v2.36: `ALTER COLUMN c OPTIONS (alter_generic_option_list)`
+    /// on a foreign table (per-column pg_attribute.attoptions).
+    AlterColumnOptions {
+        name: String,
+        options: Vec<FdwOpt>,
+    },
     AddColumn {
         name: String,
         /// v2.16: `ADD COLUMN IF NOT EXISTS` (PG19) — an existing
@@ -2796,6 +2812,9 @@ pub enum AlterAction {
         uniques: Vec<UniqueDef>,
         pkey: Option<UniqueDef>,
         fks: Vec<FkDef>,
+        /// v2.36: foreign-table column OPTIONS on ADD COLUMN
+        /// (empty for ordinary tables).
+        fdw_options: Vec<FdwOpt>,
     },
     DropColumn {
         name: String,
@@ -3261,6 +3280,13 @@ pub(crate) enum ColCon {
         expr: Expr,
         stored: bool,
     },
+    /// v2.36: column `OPTIONS (...)` (PG19 foreign-table column
+    /// options). Only legal on foreign tables; build_table_def
+    /// strips it from the constraint stream and the foreign-table
+    /// parser harvests it by column name. On plain CREATE TABLE it
+    /// is rejected in build_table_def (42601-adjacent: PG's grammar
+    /// does not admit it there).
+    FdwOptions(Vec<FdwOpt>),
     /// v2.28: `GENERATED {ALWAYS|BY DEFAULT} AS IDENTITY [(seq opts)]`.
     /// `always` distinguishes GENERATED ALWAYS (pg_attribute
     /// attidentity 'a') from BY DEFAULT ('d'); `opts` are the
@@ -3987,6 +4013,18 @@ pub(crate) fn build_table_def(
                         ColCon::Generated { expr, stored } => {
                             def.gen_cols[i] = Some((expr.clone(), *stored))
                         }
+                        // v2.36: foreign-table column OPTIONS ride
+                        // the constraint stream only as a carrier;
+                        // the foreign-table parser harvests them by
+                        // column name before build_table_def runs on
+                        // its stripped item list, so reaching this arm
+                        // means a plain CREATE TABLE used them.
+                        ColCon::FdwOptions(_) => {
+                            return Err(SqlError {
+                                message: "syntax error at or near \"OPTIONS\"".to_string(),
+                                code: "42601",
+                            });
+                        }
                         // v2.28: identity columns (PG19
                         // parse_utilcmd.c transformColumnDefinition):
                         // integer-family type only, implicitly NOT
@@ -4673,6 +4711,10 @@ pub enum GrantObject {
     LargeObject(Vec<i64>),
     /// v1.96: GRANT/REVOKE ON PROCEDURE name(args), ... — base names.
     Procedure(Vec<String>),
+    /// v2.36: GRANT/REVOKE USAGE ON FOREIGN DATA WRAPPER name [, ...].
+    ForeignDataWrapper(Vec<String>),
+    /// v2.36: GRANT/REVOKE USAGE ON FOREIGN SERVER name [, ...].
+    ForeignServer(Vec<String>),
 }
 
 /// v0.16: FETCH / MOVE direction. Counts are row counts; `None` means ALL.
@@ -9176,6 +9218,7 @@ pub fn parse_trigger_body(body: &str) -> Result<TriggerBody, SqlError> {
         unnamed_seq: 0,
         allow_similar_to: true,
         last_bit_typmod: None,
+        select_into: None,
     };
     p.parse_trigger_body_stmts()
 }
@@ -9617,8 +9660,174 @@ pub enum ExplainFormat {
     Yaml,
 }
 
+/// v2.36: one entry of a generic OPTIONS list (PG19 DefElem).
+/// In CREATE lists every entry is `Bare` with a value. In ALTER
+/// lists (alter_generic_options) an entry may carry ADD / SET /
+/// DROP; a bare entry behaves as ADD-if-absent (42710 if present).
+#[derive(Clone, Debug, PartialEq)]
+pub enum OptAction {
+    Bare,
+    Add,
+    Set,
+    Drop,
+}
+
+/// v2.36: one generic option (name + optional string value;
+/// value is None only for DROP entries).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FdwOpt {
+    pub action: OptAction,
+    pub name: String,
+    pub value: Option<String>,
+}
+
+/// v2.36: a HANDLER / VALIDATOR / CONNECTION clause change in
+/// CREATE / ALTER FOREIGN DATA WRAPPER (PG19 fdw_option).
+#[derive(Clone, Debug, PartialEq)]
+pub enum FdwClause {
+    /// Set the function (name as written, base name lowercased).
+    Set(String),
+    /// NO HANDLER / NO VALIDATOR / NO CONNECTION.
+    Clear,
+}
+
+/// v2.36: the user side of a USER MAPPING statement (PG19
+/// auth_ident / RoleSpec).
+#[derive(Clone, Debug, PartialEq)]
+pub enum MappingUser {
+    /// FOR <role name>.
+    Role(String),
+    /// FOR PUBLIC (umuser = 0).
+    Public,
+    /// FOR USER / CURRENT_USER / CURRENT_ROLE: resolved to the
+    /// session's current user at execution.
+    CurrentUser,
+    /// FOR SESSION_USER: resolved to the session user.
+    SessionUser,
+}
+
 #[derive(Clone, Debug)]
 pub enum Stmt {
+    /// v2.36: CREATE FOREIGN DATA WRAPPER name [HANDLER f |
+    /// NO HANDLER] [VALIDATOR f | NO VALIDATOR] [CONNECTION f |
+    /// NO CONNECTION] [OPTIONS (...)] (PG19 CreateFdwStmt). The
+    /// parser rejects repeated clauses with 42601 like gram.y's
+    /// semantic check ("conflicting or redundant options").
+    CreateFdw {
+        name: String,
+        handler: Option<FdwClause>,
+        validator: Option<FdwClause>,
+        connection: Option<FdwClause>,
+        options: Vec<FdwOpt>,
+    },
+    /// v2.36: ALTER FOREIGN DATA WRAPPER name <clauses/options>
+    /// (PG19 AlterFdwStmt; OWNER TO / RENAME TO ride the generic
+    /// arms below as separate variants).
+    AlterFdw {
+        name: String,
+        handler: Option<FdwClause>,
+        validator: Option<FdwClause>,
+        connection: Option<FdwClause>,
+        /// None = no OPTIONS clause present.
+        options: Option<Vec<FdwOpt>>,
+    },
+    AlterFdwOwner {
+        name: String,
+        new_owner: String,
+    },
+    AlterFdwRename {
+        name: String,
+        new_name: String,
+    },
+    /// v2.36: DROP FOREIGN DATA WRAPPER [IF EXISTS] name [, ...]
+    /// [CASCADE|RESTRICT].
+    DropFdw {
+        names: Vec<String>,
+        if_exists: bool,
+        cascade: bool,
+    },
+    /// v2.36: CREATE SERVER [IF NOT EXISTS] name [TYPE 't']
+    /// [VERSION 'v'|NULL] FOREIGN DATA WRAPPER fdw [OPTIONS (...)].
+    CreateServer {
+        name: String,
+        if_not_exists: bool,
+        srvtype: Option<String>,
+        srvversion: Option<String>,
+        fdw: String,
+        options: Vec<FdwOpt>,
+    },
+    /// v2.36: ALTER SERVER name [VERSION 'v'|NULL] [OPTIONS (...)]
+    /// (at least one part; parser-enforced).
+    AlterServer {
+        name: String,
+        /// Some(None) = VERSION NULL; None = clause absent.
+        srvversion: Option<Option<String>>,
+        options: Option<Vec<FdwOpt>>,
+    },
+    AlterServerOwner {
+        name: String,
+        new_owner: String,
+    },
+    AlterServerRename {
+        name: String,
+        new_name: String,
+    },
+    DropServer {
+        names: Vec<String>,
+        if_exists: bool,
+        cascade: bool,
+    },
+    /// v2.36: CREATE USER MAPPING [IF NOT EXISTS] FOR user
+    /// SERVER name [OPTIONS (...)].
+    CreateUserMapping {
+        if_not_exists: bool,
+        user: MappingUser,
+        server: String,
+        options: Vec<FdwOpt>,
+    },
+    AlterUserMapping {
+        user: MappingUser,
+        server: String,
+        options: Vec<FdwOpt>,
+    },
+    DropUserMapping {
+        if_exists: bool,
+        user: MappingUser,
+        server: String,
+    },
+    /// v2.36: CREATE FOREIGN TABLE (PG19): an ordinary CREATE TABLE
+    /// definition plus the SERVER clause and FDW options. The
+    /// definition rides TableDef (columns / LIKE / INHERITS /
+    /// PARTITION OF all reuse the table machinery); per-column
+    /// OPTIONS ride `col_options`, parallel to def.columns as
+    /// parsed (exec re-aligns after LIKE/INHERITS expansion).
+    CreateForeignTable {
+        name: String,
+        def: TableDef,
+        server: String,
+        options: Vec<FdwOpt>,
+        /// Per-column OPTIONS keyed by column name (exec aligns
+        /// them onto the final column list by name after any
+        /// LIKE / INHERITS expansion).
+        col_options: Vec<(String, Vec<FdwOpt>)>,
+        if_not_exists: bool,
+    },
+    /// v2.36: DROP FOREIGN TABLE [IF EXISTS] name [, ...]
+    /// [CASCADE|RESTRICT].
+    DropForeignTable {
+        names: Vec<String>,
+        if_exists: bool,
+        cascade: bool,
+    },
+    /// v2.36: IMPORT FOREIGN SCHEMA remote [LIMIT TO (...)|EXCEPT
+    /// (...)] FROM SERVER name INTO schema [OPTIONS (...)].
+    /// Execution always reaches the FDW handler check (55000 for
+    /// handler-less wrappers, which is every wrapper here).
+    ImportForeignSchema {
+        remote_schema: String,
+        server: String,
+        into_schema: String,
+    },
     /// v2.34: CREATE TABLESPACE name LOCATION 'path' (PG19).
     /// Only the name is modeled (the registry in Database);
     /// location + option names ride along for the PG19
@@ -9880,6 +10089,8 @@ pub enum Stmt {
         strict: bool,
         /// v1.96: SECURITY DEFINER (body runs as the function owner).
         security_definer: bool,
+        /// v2.37: LEAKPROOF (PG19: only a superuser may define one).
+        leakproof: bool,
         /// v1.96: CREATE PROCEDURE (stored as a void function flagged
         /// as a procedure; PG keeps a separate namespace).
         procedure: bool,
@@ -10522,6 +10733,9 @@ pub enum Stmt {
         /// true = `TO STDOUT`, false = `FROM STDIN`.
         to_stdout: bool,
         options: CopyOptions,
+        /// v2.37: `COPY (query) TO STDOUT` — the parenthesized query
+        /// form (table/columns unused when present).
+        query: Option<Box<SelectStmt>>,
     },
     // --- v0.3: transaction control (handled by the session, not the executor)
     Begin {
@@ -10832,9 +11046,31 @@ pub struct CopyOptions {
     pub format: CopyFormat,
     pub delimiter: u8,
     pub null: String,
-    pub header: bool,
+    /// v2.37: PG19 COPY HEADER: -1 = MATCH, 0 = off, 1 = on/true,
+    /// n > 1 = skip n lines (FROM only).
+    pub header_lines: i32,
     pub quote: u8,
     pub escape: u8,
+    /// v2.37: FORCE_NOT_NULL column names / star (CSV FROM semantics).
+    pub force_not_null: Vec<String>,
+    pub force_not_null_all: bool,
+    /// v2.37: FORCE_NULL column names / star (CSV FROM semantics).
+    pub force_null: Vec<String>,
+    pub force_null_all: bool,
+    /// v2.37: FORCE_QUOTE column names / star (CSV TO semantics).
+    pub force_quote: Vec<String>,
+    pub force_quote_all: bool,
+    /// v2.37: FORCE_ARRAY (JSON TO output wraps rows in an array).
+    pub force_array: bool,
+    /// v2.37: ON_ERROR value as written (stop/ignore/set_null),
+    /// validated at parse; ingest soft-error semantics are not
+    /// modeled (bad rows still abort the COPY).
+    pub on_error: Option<String>,
+    /// v2.37: force flags resolved to COPY column positions by the
+    /// server (the parser knows names, not positions). Empty = unset.
+    pub force_not_null_pos: Vec<bool>,
+    pub force_null_pos: Vec<bool>,
+    pub force_quote_pos: Vec<bool>,
 }
 
 /// v0.10: `COPY` data format (BINARY is not supported).
@@ -10842,6 +11078,8 @@ pub struct CopyOptions {
 pub enum CopyFormat {
     Text,
     Csv,
+    /// v2.37: PG19 COPY FORMAT JSON (output only).
+    Json,
 }
 
 impl Default for CopyOptions {
@@ -10850,9 +11088,20 @@ impl Default for CopyOptions {
             format: CopyFormat::Text,
             delimiter: b'\t',
             null: "\\N".to_string(),
-            header: false,
+            header_lines: 0,
             quote: b'"',
             escape: b'"',
+            force_not_null: Vec::new(),
+            force_not_null_all: false,
+            force_null: Vec::new(),
+            force_null_all: false,
+            force_quote: Vec::new(),
+            force_quote_all: false,
+            force_array: false,
+            on_error: None,
+            force_not_null_pos: Vec::new(),
+            force_null_pos: Vec::new(),
+            force_quote_pos: Vec::new(),
         }
     }
 }
@@ -11344,7 +11593,7 @@ pub(crate) fn cte_width(s: &SelectStmt) -> Option<usize> {
     for item in &s.items {
         match item {
             SelectItem::Expr { .. } => n += 1,
-            SelectItem::All | SelectItem::AllOf(_) => return None,
+            SelectItem::All | SelectItem::AllOf(_) | SelectItem::CompositeStar(_) => return None,
         }
     }
     Some(n)

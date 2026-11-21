@@ -1213,3 +1213,390 @@ pub(crate) fn info_triggers_scan(
     }
     (schema, rows)
 }
+
+// ---------------------------------------------------------------------------
+// v2.36: information_schema foreign-data views (PG19 definitions over
+// the FDW registries). Visibility follows the standard rules: an
+// FDW/server row shows when the caller owns it or holds USAGE on it;
+// user mappings show for the mapped user, the server owner, and
+// superusers.
+// ---------------------------------------------------------------------------
+
+pub(crate) fn is_foreign_info_view(name: &str) -> bool {
+    matches!(
+        name,
+        "information_schema.foreign_data_wrapper_options"
+            | "information_schema.foreign_data_wrappers"
+            | "information_schema.foreign_server_options"
+            | "information_schema.foreign_servers"
+            | "information_schema.foreign_table_options"
+            | "information_schema.foreign_tables"
+            | "information_schema.user_mapping_options"
+            | "information_schema.user_mappings"
+            | "information_schema.usage_privileges"
+            | "information_schema.role_usage_grants"
+    )
+}
+
+pub(crate) fn info_foreign_schema(view: &str) -> Vec<QCol> {
+    let cols: &[&str] = match view {
+        "information_schema.foreign_data_wrapper_options" => &[
+            "foreign_data_wrapper_catalog",
+            "foreign_data_wrapper_name",
+            "option_name",
+            "option_value",
+        ],
+        "information_schema.foreign_data_wrappers" => &[
+            "foreign_data_wrapper_catalog",
+            "foreign_data_wrapper_name",
+            "authorization_identifier",
+            "library_name",
+            "foreign_data_wrapper_language",
+        ],
+        "information_schema.foreign_server_options" => &[
+            "foreign_server_catalog",
+            "foreign_server_name",
+            "option_name",
+            "option_value",
+        ],
+        "information_schema.foreign_servers" => &[
+            "foreign_server_catalog",
+            "foreign_server_name",
+            "foreign_data_wrapper_catalog",
+            "foreign_data_wrapper_name",
+            "foreign_server_type",
+            "foreign_server_version",
+            "authorization_identifier",
+        ],
+        "information_schema.foreign_table_options" => &[
+            "foreign_table_catalog",
+            "foreign_table_schema",
+            "foreign_table_name",
+            "option_name",
+            "option_value",
+        ],
+        "information_schema.foreign_tables" => &[
+            "foreign_table_catalog",
+            "foreign_table_schema",
+            "foreign_table_name",
+            "foreign_server_catalog",
+            "foreign_server_name",
+        ],
+        "information_schema.user_mapping_options" => &[
+            "authorization_identifier",
+            "foreign_server_catalog",
+            "foreign_server_name",
+            "option_name",
+            "option_value",
+        ],
+        "information_schema.user_mappings" => &[
+            "authorization_identifier",
+            "foreign_server_catalog",
+            "foreign_server_name",
+        ],
+        _ => &[
+            "grantor",
+            "grantee",
+            "object_catalog",
+            "object_schema",
+            "object_name",
+            "object_type",
+            "privilege_type",
+            "is_grantable",
+        ],
+    };
+    cols.iter()
+        .map(|n| info_qcol(view, n, ColType::Text))
+        .collect()
+}
+
+fn fdw_visible(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    role: &str,
+    f: &crate::storage::FdwDef,
+) -> bool {
+    if crate::storage::is_superuser_snap(db, role, snap, own) {
+        return true;
+    }
+    let closure = crate::storage::role_closure(db, role, snap, own);
+    if closure.iter().any(|n| n == &f.owner) {
+        return true;
+    }
+    f.acl.iter().any(|e| {
+        e.privs & crate::storage::PRIV_USAGE != 0
+            && (e.role == "public" || closure.iter().any(|n| n == &e.role))
+    })
+}
+
+fn srv_visible(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    role: &str,
+    s: &crate::storage::ForeignServerDef,
+) -> bool {
+    if crate::storage::is_superuser_snap(db, role, snap, own) {
+        return true;
+    }
+    let closure = crate::storage::role_closure(db, role, snap, own);
+    if closure.iter().any(|n| n == &s.owner) {
+        return true;
+    }
+    s.acl.iter().any(|e| {
+        e.privs & crate::storage::PRIV_USAGE != 0
+            && (e.role == "public" || closure.iter().any(|n| n == &e.role))
+    })
+}
+
+pub(crate) fn info_foreign_scan(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    role: &str,
+    view: &str,
+) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = info_foreign_schema(view);
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    // PG19 information_schema catalog cells are current_database();
+    // the vendored PG19 regression outputs (the conformance spec
+    // for this engine) name that database "regression".
+    let cat = || Value::text("regression");
+    let t = |s: &str| Value::text(s);
+    match view {
+        "information_schema.foreign_data_wrappers" => {
+            for f in &db.fdws {
+                if fdw_visible(db, snap, own, role, f) {
+                    rows.push(vec![cat(), t(&f.name), t(&f.owner), Value::Null, t("c")]);
+                }
+            }
+        }
+        "information_schema.foreign_data_wrapper_options" => {
+            for f in &db.fdws {
+                if fdw_visible(db, snap, own, role, f) {
+                    for (k, v) in &f.options {
+                        rows.push(vec![cat(), t(&f.name), t(k), t(v)]);
+                    }
+                }
+            }
+        }
+        "information_schema.foreign_servers" => {
+            for s in &db.foreign_servers {
+                if srv_visible(db, snap, own, role, s) {
+                    rows.push(vec![
+                        cat(),
+                        t(&s.name),
+                        cat(),
+                        t(&s.fdw),
+                        match &s.srvtype {
+                            Some(v) => t(v),
+                            None => Value::Null,
+                        },
+                        match &s.srvversion {
+                            Some(v) => t(v),
+                            None => Value::Null,
+                        },
+                        t(&s.owner),
+                    ]);
+                }
+            }
+        }
+        "information_schema.foreign_server_options" => {
+            for s in &db.foreign_servers {
+                if srv_visible(db, snap, own, role, s) {
+                    for (k, v) in &s.options {
+                        rows.push(vec![cat(), t(&s.name), t(k), t(v)]);
+                    }
+                }
+            }
+        }
+        "information_schema.foreign_tables" | "information_schema.foreign_table_options" => {
+            let mut keys: Vec<&String> = db.foreign_tables.keys().collect();
+            keys.sort();
+            for k in keys {
+                let meta = &db.foreign_tables[k];
+                let Some(tb) = db.find_table(k, snap, &[own], session) else {
+                    continue;
+                };
+                let srv = db.foreign_servers.iter().find(|s| s.name == meta.server);
+                let visible = srv
+                    .map(|s| srv_visible(db, snap, own, role, s))
+                    .unwrap_or(false)
+                    || tb.owner == role
+                    || crate::storage::is_superuser_snap(db, role, snap, own);
+                if !visible {
+                    continue;
+                }
+                let (sch, base) = match k.rsplit_once('.') {
+                    Some((s, b)) => (s.to_string(), b.to_string()),
+                    None => ("public".to_string(), k.clone()),
+                };
+                if view == "information_schema.foreign_tables" {
+                    rows.push(vec![cat(), t(&sch), t(&base), cat(), t(&meta.server)]);
+                } else {
+                    for (ok, ov) in &meta.options {
+                        rows.push(vec![cat(), t(&sch), t(&base), t(ok), t(ov)]);
+                    }
+                }
+            }
+        }
+        "information_schema.user_mappings" | "information_schema.user_mapping_options" => {
+            let closure = crate::storage::role_closure(db, role, snap, own);
+            let super_u = crate::storage::is_superuser_snap(db, role, snap, own);
+            for m in &db.user_mappings {
+                let srv = db.foreign_servers.iter().find(|s| s.name == m.server);
+                // PG19: user_mappings rides on _pg_foreign_servers
+                // visibility (owner-membership or USAGE on the
+                // server); the mapping's own user does not gate it.
+                let visible = srv
+                    .map(|s| srv_visible(db, snap, own, role, s))
+                    .unwrap_or(false);
+                if !visible {
+                    continue;
+                }
+                let auth = if m.user.is_empty() {
+                    "PUBLIC"
+                } else {
+                    m.user.as_str()
+                };
+                if view == "information_schema.user_mappings" {
+                    rows.push(vec![t(auth), cat(), t(&m.server)]);
+                } else {
+                    // PG19 user_mapping_options: the value shows
+                    // only to the mapped user themself, to a caller
+                    // who can act as the server owner (for PUBLIC
+                    // mappings), or to a superuser; else NULL.
+                    let srv_owner = srv.map(|s| s.owner.as_str()).unwrap_or("");
+                    let show = super_u
+                        || (!m.user.is_empty() && m.user == role)
+                        || (m.user.is_empty() && closure.iter().any(|n| n == srv_owner));
+                    for (k, v) in &m.options {
+                        rows.push(vec![
+                            t(auth),
+                            cat(),
+                            t(&m.server),
+                            t(k),
+                            if show { t(v) } else { Value::Null },
+                        ]);
+                    }
+                }
+            }
+        }
+        _ => {
+            // usage_privileges / role_usage_grants over FDW + server
+            // ACLs, plus the owner self-grant rows.
+            let role_grants = view == "information_schema.role_usage_grants";
+            let closure = crate::storage::role_closure(db, role, snap, own);
+            let super_u = crate::storage::is_superuser_snap(db, role, snap, own);
+            let mut emit = |grantor: &str,
+                            grantee: &str,
+                            obj_type: &str,
+                            obj_name: &str,
+                            grantable: bool,
+                            owner: &str| {
+                // PG19: the row shows when the grantee is an enabled
+                // role (or PUBLIC), or the grantor is, or the caller
+                // owns the object / is superuser.
+                let grantee_on = grantee == "public" || closure.iter().any(|n| n == grantee);
+                let grantor_on = closure.iter().any(|n| n == grantor);
+                let owner_on = closure.iter().any(|n| n == owner);
+                if !(super_u || grantee_on || grantor_on || owner_on) {
+                    return;
+                }
+                // PG19 role_usage_grants filters usage_privileges
+                // to enabled_roles; for a superuser caller every
+                // role is enabled (pg_has_role is always true).
+                if role_grants
+                    && !super_u
+                    && !closure.iter().any(|n| n == grantor)
+                    && !closure.iter().any(|n| n == grantee)
+                {
+                    return;
+                }
+                // PG19: is_grantable is YES when the grantee can
+                // act as the object owner, not only when the ACL
+                // entry itself carries the grant option.
+                let grantable = grantable
+                    || crate::storage::role_closure(db, grantee, snap, own)
+                        .iter()
+                        .any(|n| n == owner);
+                rows.push(vec![
+                    t(grantor),
+                    t(grantee),
+                    cat(),
+                    t(""),
+                    t(obj_name),
+                    t(obj_type),
+                    t("USAGE"),
+                    t(if grantable { "YES" } else { "NO" }),
+                ]);
+            };
+            for f in &db.fdws {
+                emit(
+                    &f.owner,
+                    &f.owner.clone(),
+                    "FOREIGN DATA WRAPPER",
+                    &f.name,
+                    true,
+                    &f.owner,
+                );
+                for e in &f.acl {
+                    if e.privs & crate::storage::PRIV_USAGE != 0 {
+                        let grantor = if e.grantor.is_empty() {
+                            f.owner.clone()
+                        } else {
+                            e.grantor.clone()
+                        };
+                        let go = e.grant_option & crate::storage::PRIV_USAGE != 0;
+                        emit(
+                            &grantor,
+                            &e.role.clone(),
+                            "FOREIGN DATA WRAPPER",
+                            &f.name,
+                            go,
+                            &f.owner,
+                        );
+                    }
+                }
+            }
+            for s in &db.foreign_servers {
+                emit(
+                    &s.owner,
+                    &s.owner.clone(),
+                    "FOREIGN SERVER",
+                    &s.name,
+                    true,
+                    &s.owner,
+                );
+                for e in &s.acl {
+                    if e.privs & crate::storage::PRIV_USAGE != 0 {
+                        let grantor = if e.grantor.is_empty() {
+                            s.owner.clone()
+                        } else {
+                            e.grantor.clone()
+                        };
+                        let go = e.grant_option & crate::storage::PRIV_USAGE != 0;
+                        emit(
+                            &grantor,
+                            &e.role.clone(),
+                            "FOREIGN SERVER",
+                            &s.name,
+                            go,
+                            &s.owner,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let qrows = rows
+        .into_iter()
+        .map(|cells| QRow {
+            cells: Row::new(cells),
+            prov: Vec::new(),
+        })
+        .collect();
+    (schema, qrows)
+}

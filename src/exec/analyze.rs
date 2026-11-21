@@ -1011,67 +1011,66 @@ fn compute_range_stats(
     let bounds_hist = if ranges.len() < 2 {
         None
     } else {
-        let mut lowers: Vec<(Value, bool)> = Vec::new();
-        let mut uppers: Vec<(Value, bool)> = Vec::new();
-        for r in &ranges {
-            if let Some(lo) = &r.lo {
-                lowers.push((lo.clone(), r.lo_inc));
+        // v2.35: PG19 range_typanalyze exactly — sort ALL lower
+        // bounds and ALL upper bounds (one per non-empty range,
+        // duplicates and infinite bounds included), then pair
+        // evenly-spaced positions (delta/posfrac walk) from both
+        // sorted arrays. The previous distinct-value weighted
+        // histograms could disagree in length between the two
+        // sides and silently produced no bounds histogram at all
+        // (stats_import stat_range_expr_null: 51 distinct lowers
+        // vs 60 distinct uppers).
+        let mut lowers: Vec<(Option<Value>, bool)> =
+            ranges.iter().map(|r| (r.lo.clone(), r.lo_inc)).collect();
+        let mut uppers: Vec<(Option<Value>, bool)> =
+            ranges.iter().map(|r| (r.hi.clone(), r.hi_inc)).collect();
+        lowers.sort_by(|a, b| {
+            match (&a.0, &b.0) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Less,
+                (Some(_), None) => Ordering::Greater,
+                (Some(x), Some(y)) => index_key_cmp(x, y),
             }
-            if let Some(hi) = &r.hi {
-                uppers.push((hi.clone(), r.hi_inc));
+            .then_with(|| b.1.cmp(&a.1))
+        });
+        uppers.sort_by(|a, b| {
+            match (&a.0, &b.0) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(x), Some(y)) => index_key_cmp(x, y),
+            }
+            .then_with(|| a.1.cmp(&b.1))
+        });
+        let n = ranges.len();
+        let num_hist = if n > 101 { 101 } else { n };
+        let elem = ranges[0].elem;
+        let name = ranges[0].name.clone();
+        let mut paired: Vec<Value> = Vec::with_capacity(num_hist);
+        let delta = ((n - 1) / (num_hist - 1)) as i64;
+        let deltafrac = ((n - 1) % (num_hist - 1)) as i64;
+        let mut pos: i64 = 0;
+        let mut posfrac: i64 = 0;
+        for _ in 0..num_hist {
+            let (lo, lo_inc) = lowers[pos as usize].clone();
+            let (hi, hi_inc) = uppers[pos as usize].clone();
+            paired.push(Value::Range(Box::new(crate::storage::RangeVal {
+                elem,
+                name: name.clone(),
+                empty: false,
+                lo,
+                lo_inc,
+                hi,
+                hi_inc,
+            })));
+            pos += delta;
+            posfrac += deltafrac;
+            if posfrac >= (num_hist - 1) as i64 {
+                pos += 1;
+                posfrac -= (num_hist - 1) as i64;
             }
         }
-        let hist_of = |side: &[(Value, bool)]| -> Vec<(Value, bool)> {
-            let mut sorted: Vec<(Value, bool)> = side.to_vec();
-            sorted.sort_by(|a, b| index_key_cmp(&a.0, &b.0));
-            let mut sc: Vec<(Value, u64)> = Vec::new();
-            for (v, _) in &sorted {
-                if let Some(last) = sc
-                    .last_mut()
-                    .filter(|(x, _)| index_key_cmp(x, v) == Ordering::Equal)
-                {
-                    last.1 += 1;
-                } else {
-                    sc.push((v.clone(), 1));
-                }
-            }
-            let bounds = weighted_hist_bounds(&sc, 101);
-            bounds
-                .iter()
-                .map(|b| {
-                    let inc = sorted
-                        .iter()
-                        .find(|(v, _)| index_key_cmp(v, b) == Ordering::Equal)
-                        .map(|(_, i)| *i)
-                        .unwrap_or(true);
-                    (b.clone(), inc)
-                })
-                .collect()
-        };
-        let lo_h = hist_of(&lowers);
-        let hi_h = hist_of(&uppers);
-        if lo_h.len() >= 2 && hi_h.len() >= 2 && lo_h.len() == hi_h.len() {
-            let elem = ranges[0].elem;
-            let name = ranges[0].name.clone();
-            let paired: Vec<Value> = lo_h
-                .iter()
-                .zip(hi_h.iter())
-                .map(|((lo, lo_inc), (hi, hi_inc))| {
-                    Value::Range(Box::new(crate::storage::RangeVal {
-                        elem,
-                        name: name.clone(),
-                        empty: false,
-                        lo: Some(lo.clone()),
-                        lo_inc: *lo_inc,
-                        hi: Some(hi.clone()),
-                        hi_inc: *hi_inc,
-                    }))
-                })
-                .collect();
-            Some(paired)
-        } else {
-            None
-        }
+        Some(paired)
     };
     (length_hist, Some(empty_frac), bounds_hist)
 }

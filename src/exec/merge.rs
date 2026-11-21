@@ -612,7 +612,7 @@ pub(crate) fn exec_merge(
         {
             let mut kept = Vec::with_capacity(vis.len());
             for entry in vis {
-                if rls_row_visible(&mut q, &tgt_schema, &entry.4, &groups)? {
+                if rls_row_visible(&mut q, table, &tgt_schema, &entry.4, &groups)? {
                     kept.push(entry);
                 }
             }
@@ -2031,6 +2031,10 @@ pub(crate) fn describe_merge_returning(
     let mut expanded: Vec<SelectItem> = Vec::new();
     for item in returning {
         match item {
+            SelectItem::CompositeStar(_) => {
+                // v2.35: expanded at projection time.
+                expanded.push(item.clone());
+            }
             SelectItem::All => {
                 for (n, _) in &tgt_cols {
                     expanded.push(SelectItem::Expr {
@@ -2265,11 +2269,26 @@ fn describe_merge_returning_with_schemas(
     let mut expanded: Vec<SelectItem> = Vec::new();
     for item in returning {
         match item {
+            SelectItem::CompositeStar(_) => {
+                // v2.35: expanded at projection time.
+                expanded.push(item.clone());
+            }
             SelectItem::All => {
                 for c in tgt_schema {
                     expanded.push(SelectItem::Expr {
                         expr: Expr::Column {
                             table: Some(qual.to_string()),
+                            name: c.name.clone(),
+                        },
+                        alias: None,
+                    });
+                }
+                // v2.37: PG19 MERGE RETURNING * covers the source
+                // relation too (target first, then source).
+                for c in src_schema.iter().filter(|c| !c.hidden) {
+                    expanded.push(SelectItem::Expr {
+                        expr: Expr::Column {
+                            table: Some(c.qual.clone()),
                             name: c.name.clone(),
                         },
                         alias: None,
