@@ -6932,11 +6932,21 @@ impl Database {
             }
             return None;
         }
-        // Bare reference: unique dotted key with this suffix.
-        let suffix = format!(".{name}");
+        // Bare reference: unique dotted key with this suffix. Every
+        // call that reaches here (no exact key, no dot in `name`) is
+        // on the hot per-row cast-evaluation path once a schema-
+        // qualified type is referenced by its bare name, so this scan
+        // compares against `name` directly instead of building a
+        // `format!(".{name}")` String per call: `k`'s last
+        // `name.len()` bytes must equal `name`, with a `.` right
+        // before them (same match as `k.ends_with(&format!(".{name}"))`,
+        // zero allocations).
         let mut found: Option<&ShellType> = None;
         for (k, st) in self.types.iter() {
-            if k.ends_with(&suffix) {
+            let dotted_suffix_match = k.len() > name.len()
+                && k.as_bytes()[k.len() - name.len() - 1] == b'.'
+                && &k[k.len() - name.len()..] == name;
+            if dotted_suffix_match {
                 if found.is_some() {
                     return None; // ambiguous across schemas
                 }
