@@ -7202,6 +7202,7 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         // jsonb_exists_all / jsonb_concat.
         "jsonb_contains" | "jsonb_contained" | "jsonb_concat" => n == 2,
         "__jsonb_subscript_assign" => n == 3,
+        "__array_subscript_assign" => n == 3,
         "jsonb_exists" => n == 2,
         "jsonb_exists_any" | "jsonb_exists_all" => n == 2,
         "jsonb_populate_record_valid" => n == 2,
@@ -7567,7 +7568,7 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         | "jsonb_extract_path_text" | "jsonb_set" | "jsonb_set_lax" | "jsonb_insert"
         | "jsonb_delete" | "jsonb_delete_path" | "jsonb_contains" | "jsonb_contained"
         | "jsonb_exists" | "jsonb_exists_any" | "jsonb_exists_all" | "jsonb_concat"
-        | "__jsonb_subscript_assign" => eval_json_func(name, vals),
+        | "__jsonb_subscript_assign" | "__array_subscript_assign" => eval_json_func(name, vals),
         // v1.85: scalar jsonb_path_* and the SQL/JSON desugars.
         "jsonb_path_exists" | "jsonb_path_match" | "jsonb_path_query_array"
         | "jsonb_path_query_first" | "jsonb_path_exists_tz" | "jsonb_path_match_tz"
@@ -7629,6 +7630,147 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
 /// `Value::Null` to None. `json` values ride in `Value::Text`,
 /// `jsonb` in `Value::Jsonb`; bare text literals coerce by parsing
 /// (the eval-time type blindness documented at `eval_json_op`).
+/// v2.38-fix: PG19 array subscript assignment
+/// (array_subscript_check_subscripts + array_subscript_assign in
+/// src/backend/utils/adt/arraysubs.c), split out of the type-blind
+/// `__jsonb_subscript_assign` desugar. The executor renames the
+/// desugar to `__array_subscript_assign` for plain ARRAY targets
+/// (dml.rs); the jsonb builtin also delegates here when an Array base
+/// reaches it.
+///
+/// PG's step order is the substance of the v2.38 defects: the
+/// NULL-subscript check (22004) runs BEFORE the assignment proper, so
+/// it fires even when the base value is NULL; and a NULL base is
+/// replaced by an empty array before array_set_element runs, so
+/// assigning into a NULL plain-array base yields the singleton array
+/// at the subscript position — it must never fall into the jsonb
+/// document path (which produced a jsonb value and a bogus 42804 at
+/// assignment coercion, and lost the NULL-subscript error entirely
+/// when the row's base was NULL).
+pub(crate) fn eval_array_subscript_assign(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
+    let (_, path) = match json_path_list_arg(name, &vals[1])? {
+        None => return Ok(Value::Null),
+        Some(p) => p,
+    };
+    if path.iter().any(|e| e.is_none()) {
+        return Err(exec_err(
+            "22004",
+            "array subscript in assignment must not be null",
+        ));
+    }
+    let mut arr = match &vals[0] {
+        Value::Array(av) => {
+            if !av.dims.is_empty() && path.len() != av.ndim() {
+                return Err(exec_err("2202E", "wrong number of array subscripts"));
+            }
+            (**av).clone()
+        }
+        // PG19: a NULL base is replaced by an empty (0-dim) array;
+        // the element type is a placeholder the assignment coercion
+        // retypes from the target column (eval_cast's Array arm).
+        Value::Null => ArrayVal {
+            elem: ArrayElem::of(&vals[2].col_type()),
+            dims: Vec::new(),
+            lower: Vec::new(),
+            elems: Vec::new(),
+        },
+        other => {
+            return Err(exec_err(
+                "42804",
+                format!(
+                    "subscript assignment requires an array value, not {}",
+                    other.type_name()
+                ),
+            ));
+        }
+    };
+    // PG19 array_set_element: subscripts coerce to int, out-of-range
+    // dimensions EXPAND with NULL fill.
+    let mut subs: Vec<i64> = Vec::with_capacity(path.len());
+    for e in &path {
+        let t = e.as_deref().unwrap_or("");
+        subs.push(t.trim().parse::<i64>().map_err(|_| {
+            exec_err(
+                "22P02",
+                format!("invalid input syntax for type integer: \"{t}\""),
+            )
+        })?);
+    }
+    // PG19 subscripts are int4: beyond that is 22003, checked before
+    // the expansion below so the singleton fallback cannot wrap i32.
+    for s in &subs {
+        if *s < i32::MIN as i64 || *s > i32::MAX as i64 {
+            return Err(exec_err("22003", "integer out of range"));
+        }
+    }
+    // Stored ArrayVals are not always coherent (a zero dimension or
+    // an elems/dims length mismatch can ride in from slice
+    // constructors); treat those like the empty array rather than
+    // indexing on a 0 product. A NULL base lands here too.
+    let coherent = !arr.dims.is_empty()
+        && arr.dims.iter().all(|d| *d > 0)
+        && arr.lower.len() == arr.dims.len()
+        && arr.elems.len() == arr.dims.iter().map(|d| *d as usize).product::<usize>();
+    if !coherent {
+        arr.dims = vec![1; subs.len()];
+        arr.lower = subs.iter().map(|s| *s as i32).collect();
+        arr.elems = vec![vals[2].clone()];
+        return Ok(Value::Array(Box::new(arr)));
+    }
+    let nd = arr.dims.len();
+    let mut new_dims64: Vec<i64> = arr.dims.iter().map(|d| *d as i64).collect();
+    let mut new_lower = arr.lower.clone();
+    for d in 0..nd {
+        let s = subs[d];
+        let l = new_lower[d] as i64;
+        let n = new_dims64[d];
+        if s < l {
+            new_dims64[d] += l - s;
+            new_lower[d] = s as i32;
+        } else if s >= l + n {
+            new_dims64[d] += s - l - n + 1;
+        }
+    }
+    // The expanded size is capped (54000), computed in i64 so extreme
+    // bounds cannot wrap.
+    let total64: i64 = new_dims64.iter().product();
+    if total64 > 1_073_741_823 {
+        return Err(exec_err(
+            "54000",
+            "array size exceeds the maximum allowed (1073741823)",
+        ));
+    }
+    let new_dims: Vec<i32> = new_dims64.iter().map(|d| *d as i32).collect();
+    let total: usize = total64 as usize;
+    let mut elems = vec![Value::Null; total];
+    let strides = |dims: &[i32]| -> Vec<usize> {
+        let mut st = vec![1usize; dims.len()];
+        for d in (0..dims.len().saturating_sub(1)).rev() {
+            st[d] = st[d + 1] * dims[d + 1] as usize;
+        }
+        st
+    };
+    let old_st = strides(&arr.dims);
+    let new_st = strides(&new_dims);
+    for (flat, v) in arr.elems.iter().enumerate() {
+        let mut nf = 0usize;
+        for d in 0..nd {
+            let coord = (flat / old_st[d]) % arr.dims[d] as usize;
+            let nc = coord + (arr.lower[d] - new_lower[d]) as usize;
+            nf += nc * new_st[d];
+        }
+        elems[nf] = v.clone();
+    }
+    let mut tf = 0usize;
+    for d in 0..nd {
+        tf += (subs[d] - new_lower[d] as i64) as usize * new_st[d];
+    }
+    elems[tf] = vals[2].clone();
+    arr.dims = new_dims;
+    arr.lower = new_lower;
+    arr.elems = elems;
+    Ok(Value::Array(Box::new(arr)))
+}
 pub(crate) fn eval_json_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
     match name {
         "json_typeof" => match json_doc_arg(name, &vals[0])? {
@@ -7911,126 +8053,39 @@ pub(crate) fn eval_json_func(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         // path yields NULL (jsonb_set strictness).
         "__jsonb_subscript_assign" => {
             // The parser desugar is type-blind: a plain ARRAY column
-            // lands here too. PG19's array assignment errors apply
-            // first (array_subscript_check): a NULL subscript is
-            // 2202E, and the subscript count must equal the array's
-            // dimensionality.
-            if let Value::Array(av) = &vals[0] {
-                let (_, path) = match json_path_list_arg(name, &vals[1])? {
-                    None => return Ok(Value::Null),
-                    Some(p) => p,
-                };
-                if path.iter().any(|e| e.is_none()) {
-                    return Err(exec_err(
-                        "2202E",
-                        "array subscript in assignment must not be null",
-                    ));
-                }
-                if !av.dims.is_empty() && path.len() != av.ndim() {
-                    return Err(exec_err("2202E", "wrong number of array subscripts"));
-                }
-                // PG19 array_set_element: subscripts coerce to int,
-                // out-of-range dimensions EXPAND with NULL fill.
-                let mut subs: Vec<i64> = Vec::with_capacity(path.len());
-                for e in &path {
-                    let t = e.as_deref().unwrap_or("");
-                    subs.push(t.trim().parse::<i64>().map_err(|_| {
-                        exec_err(
-                            "22P02",
-                            format!("invalid input syntax for type integer: \"{t}\""),
-                        )
-                    })?);
-                }
-                let mut arr = (**av).clone();
-                // Stored ArrayVals are not always coherent (a zero
-                // dimension or an elems/dims length mismatch can ride
-                // in from slice constructors); treat those like the
-                // empty array rather than indexing on a 0 product.
-                let coherent = !arr.dims.is_empty()
-                    && arr.dims.iter().all(|d| *d > 0)
-                    && arr.lower.len() == arr.dims.len()
-                    && arr.elems.len() == arr.dims.iter().map(|d| *d as usize).product::<usize>();
-                if !coherent {
-                    arr.dims = vec![1; subs.len()];
-                    arr.lower = subs.iter().map(|s| *s as i32).collect();
-                    arr.elems = vec![vals[2].clone()];
-                    return Ok(Value::Array(Box::new(arr)));
-                }
-                // PG19 subscripts are int4: beyond that is 22003,
-                // and the expanded size is capped (54000) — all
-                // computed in i64 so extreme bounds cannot wrap i32.
-                for s in &subs {
-                    if *s < i32::MIN as i64 || *s > i32::MAX as i64 {
-                        return Err(exec_err("22003", "integer out of range"));
-                    }
-                }
-                let nd = arr.dims.len();
-                let mut new_dims64: Vec<i64> = arr.dims.iter().map(|d| *d as i64).collect();
-                let mut new_lower = arr.lower.clone();
-                for d in 0..nd {
-                    let s = subs[d];
-                    let l = new_lower[d] as i64;
-                    let n = new_dims64[d];
-                    if s < l {
-                        new_dims64[d] += l - s;
-                        new_lower[d] = s as i32;
-                    } else if s >= l + n {
-                        new_dims64[d] += s - l - n + 1;
-                    }
-                }
-                let total64: i64 = new_dims64.iter().product();
-                if total64 > 1_073_741_823 {
-                    return Err(exec_err(
-                        "54000",
-                        "array size exceeds the maximum allowed (1073741823)",
-                    ));
-                }
-                let new_dims: Vec<i32> = new_dims64.iter().map(|d| *d as i32).collect();
-                let total: usize = total64 as usize;
-                let mut elems = vec![Value::Null; total];
-                let strides = |dims: &[i32]| -> Vec<usize> {
-                    let mut st = vec![1usize; dims.len()];
-                    for d in (0..dims.len().saturating_sub(1)).rev() {
-                        st[d] = st[d + 1] * dims[d + 1] as usize;
-                    }
-                    st
-                };
-                let old_st = strides(&arr.dims);
-                let new_st = strides(&new_dims);
-                for (flat, v) in arr.elems.iter().enumerate() {
-                    let mut nf = 0usize;
-                    for d in 0..nd {
-                        let coord = (flat / old_st[d]) % arr.dims[d] as usize;
-                        let nc = coord + (arr.lower[d] - new_lower[d]) as usize;
-                        nf += nc * new_st[d];
-                    }
-                    elems[nf] = v.clone();
-                }
-                let mut tf = 0usize;
-                for d in 0..nd {
-                    tf += (subs[d] - new_lower[d] as i64) as usize * new_st[d];
-                }
-                elems[tf] = vals[2].clone();
-                arr.dims = new_dims;
-                arr.lower = new_lower;
-                arr.elems = elems;
-                return Ok(Value::Array(Box::new(arr)));
+            // can land here too (the executor renames the builtin to
+            // __array_subscript_assign for array-typed targets —
+            // dml.rs — but keep the delegation for any unrenamed
+            // path).
+            if let Value::Array(_) = &vals[0] {
+                return eval_array_subscript_assign(name, &vals);
+            }
+            // PG19 jsonb_subscript_check_subscripts: a NULL subscript
+            // is 22004, raised BEFORE the assignment proper, so it
+            // fires on a NULL base too — the old code only checked
+            // inside the document walk (assign_rec's path-element
+            // error), which a NULL base never reached in that form.
+            let (_, path) = match json_path_list_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(p) => p,
+            };
+            if path.iter().any(|e| e.is_none()) {
+                return Err(exec_err(
+                    "22004",
+                    "jsonb subscript in assignment must not be null",
+                ));
             }
             // PG19: subscript assignment on a NULL base builds the
             // document from an empty container (the first path
             // element picks object vs array), it does not yield NULL.
+            let newval = match &vals[2] {
+                Value::Null => JsonbVal::Null,
+                Value::Jsonb(s) => parse_jsonb(s)?,
+                Value::Text(s) | Value::BpChar(s) => parse_jsonb(s)?,
+                other => datum_to_jsonb(other)?,
+            };
             let doc = match jsonb_val_arg(name, &vals[0])? {
                 None => {
-                    let (_, path) = match json_path_list_arg(name, &vals[1])? {
-                        None => return Ok(Value::Null),
-                        Some(p) => p,
-                    };
-                    let newval = match &vals[2] {
-                        Value::Null => JsonbVal::Null,
-                        Value::Jsonb(s) => parse_jsonb(s)?,
-                        Value::Text(s) | Value::BpChar(s) => parse_jsonb(s)?,
-                        other => datum_to_jsonb(other)?,
-                    };
                     let first = path.first().and_then(|e| e.as_deref()).unwrap_or("");
                     let root = if first.trim().parse::<i64>().is_ok() {
                         JsonbVal::Array(Vec::new())
@@ -8042,19 +8097,12 @@ pub(crate) fn eval_json_func(name: &str, vals: &[Value]) -> Result<Value, ExecEr
                 }
                 Some(v) => v,
             };
-            let (_, path) = match json_path_list_arg(name, &vals[1])? {
-                None => return Ok(Value::Null),
-                Some(p) => p,
-            };
-            let newval = match &vals[2] {
-                Value::Null => JsonbVal::Null,
-                Value::Jsonb(s) => parse_jsonb(s)?,
-                Value::Text(s) | Value::BpChar(s) => parse_jsonb(s)?,
-                other => datum_to_jsonb(other)?,
-            };
             let out = jsonb_subscript_assign(doc, &path, &newval)?;
             Ok(Value::jsonb(out.render()))
         }
+        // v2.38-fix: plain-array subscript assignment, split out of
+        // the jsonb builtin (see eval_array_subscript_assign).
+        "__array_subscript_assign" => eval_array_subscript_assign(name, &vals),
         // v2.38: the jsonb operator implementation functions, callable
         // by name (PG19 pg_proc). STRICT: NULL in -> NULL out (the
         // dispatch's strict wrapper handles the NULL case for the
@@ -15878,6 +15926,13 @@ pub(crate) fn func_result_type(
         "jsonb_pretty" => Ok(ColType::Text),
         "to_json" | "array_to_json" | "json_build_array" | "json_build_object"
         | "json_object" | "json_extract_path" => Ok(ColType::Json),
+        // v2.38-fix: the array subscript-assignment builtin returns
+        // its container (first) argument's type, not jsonb.
+        "__array_subscript_assign" => match args.first() {
+            Some(a) => Ok(super::describe::expr_type(eng, snap, own, session, schemas, outer, ctes, a)
+                .unwrap_or(ColType::Jsonb)),
+            None => Ok(ColType::Jsonb),
+        },
         "to_jsonb" | "jsonb_build_array" | "jsonb_build_object" | "jsonb_object"
         | "jsonb_extract_path" | "jsonb_set" | "jsonb_set_lax" | "jsonb_insert"
         | "jsonb_delete" | "jsonb_delete_path" | "jsonb_concat"

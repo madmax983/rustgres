@@ -5099,6 +5099,37 @@ pub(crate) fn exec_update_inner(
             }
         }
         let columns = meta.columns.clone();
+        // v2.38-fix: the parser's subscript-assignment desugar is
+        // type-blind — it emits `__jsonb_subscript_assign` for every
+        // subscripted SET target — but PG dispatches subscript
+        // assignment on the TARGET column's type. Rename the builtin
+        // to `__array_subscript_assign` for plain ARRAY columns here,
+        // where the column types are known, so a NULL array base takes
+        // the array path (empty-array substitution, with the 22004
+        // NULL-subscript check firing first) instead of building a
+        // jsonb document that fails assignment coercion with a bogus
+        // 42804 — and so the NULL-subscript error is not lost when
+        // the row's array value is NULL.
+        let sets_owned: Vec<(String, Expr)> = sets
+            .iter()
+            .zip(set_cols.iter())
+            .map(|((name, expr), &ci)| {
+                let expr = match expr {
+                    Expr::Func { name: fname, args }
+                        if fname == "__jsonb_subscript_assign"
+                            && matches!(columns[ci].1, ColType::Array(_)) =>
+                    {
+                        Expr::Func {
+                            name: "__array_subscript_assign".to_string(),
+                            args: args.clone(),
+                        }
+                    }
+                    e => e.clone(),
+                };
+                (name.clone(), expr)
+            })
+            .collect();
+        let sets: &[(String, Expr)] = &sets_owned;
         // v0.85: composite type names for positional record coercion on
         // UPDATE assignment.
         let composite_types = meta.composite_types.clone();

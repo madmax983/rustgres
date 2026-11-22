@@ -374,3 +374,94 @@ fn v238_tsvector_and_nested_cast() {
         vec![vec![s("(1,\"(x,3)\")")]]
     );
 }
+
+#[test]
+fn v238fix_array_subscript_null_base() {
+    let mut eng = engine();
+    run(&mut eng, "create temp table t (id int, a smallint[])").unwrap();
+    run(
+        &mut eng,
+        "insert into t values (1, null), (2, '{1,null,3}')",
+    )
+    .unwrap();
+    // v2.38 defect 2 (arrays.sql): assigning into a NULL plain-array
+    // base must take the array path — PG substitutes an empty array
+    // and array_set_element yields the singleton at the subscript
+    // (lower bound = the subscript). The ship binary routed the NULL
+    // base through the jsonb path and failed 42804.
+    run(&mut eng, "update t set a[4] = NULL where a[2] is null").unwrap();
+    assert_eq!(
+        rows(&mut eng, "select a from t where id = 1"),
+        vec![vec![s("[4:4]={NULL}")]]
+    );
+    assert_eq!(
+        rows(&mut eng, "select a from t where id = 2"),
+        vec![vec![s("{1,NULL,3,NULL}")]]
+    );
+    // A non-NULL value into a NULL base lands at its subscript too.
+    run(&mut eng, "insert into t values (3, null)").unwrap();
+    run(&mut eng, "update t set a[2] = 7 where id = 3").unwrap();
+    assert_eq!(
+        rows(&mut eng, "select a from t where id = 3"),
+        vec![vec![s("[2:2]={7}")]]
+    );
+}
+
+#[test]
+fn v238fix_array_subscript_null_subscript_stability() {
+    let mut eng = engine();
+    run(&mut eng, "create temp table t (id int, a int[], j jsonb)").unwrap();
+    run(
+        &mut eng,
+        "insert into t values (1, '{1,2}', '[0]'), (2, null, null)",
+    )
+    .unwrap();
+    // Prior subscript assignments in the session (jsonb and array)
+    // must not affect the NULL-subscript check (v2.38 defect 1: the
+    // check was lost in-suite after earlier assignments ran).
+    run(&mut eng, "update t set j[0] = '5' where id = 1").unwrap();
+    run(&mut eng, "update t set a[1] = 9 where id = 1").unwrap();
+    // Non-NULL base: 22004 (PG19 ERRCODE_NULL_VALUE_NOT_ALLOWED).
+    let e = err(&mut eng, "update t set a[NULL] = 1 where id = 1");
+    assert_eq!(e.code, "22004");
+    assert_eq!(e.message, "array subscript in assignment must not be null");
+    // NULL base: PG's check step fires before the assignment proper,
+    // so the error fires here too (the ship binary lost it: the NULL
+    // base took the jsonb path and the statement silently built a
+    // jsonb document instead).
+    let e = err(&mut eng, "update t set a[NULL] = 1 where id = 2");
+    assert_eq!(e.code, "22004");
+    assert_eq!(e.message, "array subscript in assignment must not be null");
+    // No WHERE clause (every row qualifies, one with a NULL base).
+    let e = err(&mut eng, "update t set a[NULL] = 1");
+    assert_eq!(e.code, "22004");
+    // The jsonb target keeps its own 22004 with the jsonb message.
+    let e = err(&mut eng, "update t set j[NULL] = '1' where id = 2");
+    assert_eq!(e.code, "22004");
+    assert_eq!(e.message, "jsonb subscript in assignment must not be null");
+}
+
+#[test]
+fn v238fix_array_subscript_typing() {
+    let mut eng = engine();
+    run(&mut eng, "create temp table t (id int, a text[])").unwrap();
+    run(&mut eng, "insert into t values (1, null), (2, '{x,y}')").unwrap();
+    // A plain-array target never takes the jsonb path: the result is
+    // a text array, not a jsonb document.
+    run(&mut eng, "update t set a[1] = 'z' where id = 1").unwrap();
+    assert_eq!(
+        rows(&mut eng, "select a from t where id = 1"),
+        vec![vec![s("{z}")]]
+    );
+    // Non-NULL base assignment and expansion are unchanged.
+    run(&mut eng, "update t set a[4] = 'w' where id = 2").unwrap();
+    assert_eq!(
+        rows(&mut eng, "select a from t where id = 2"),
+        vec![vec![s("{x,y,NULL,w}")]]
+    );
+    // The stored value reports the array type, not jsonb.
+    assert_eq!(
+        rows(&mut eng, "select pg_typeof(a) from t where id = 1"),
+        vec![vec![s("text[]")]]
+    );
+}
