@@ -2,6 +2,95 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: RLS policy-scope schema augmentation under an aliased UPDATE target — negative result — 2026-11-22
+
+### Workload
+
+`benches/profile_rls_alias_update.py` (new): a multi-tenant RLS table
+(one permissive tenant-isolation policy, `USING (tenant_id = 1) WITH
+CHECK (tenant_id = 1)`, FORCE ROW LEVEL SECURITY so the owning
+connection pays the policy too) — the same shape `profile_rls.py`
+uses for its INSERT workload — updated through a target alias
+(`UPDATE bench_rls_alias AS b SET val = val + 1 WHERE b.id = $i`),
+one row per statement, `--updates` times. An alias on the UPDATE
+target is the idiomatic form of any UPDATE with a WHERE clause (and
+the only form once a JOIN/FROM is involved), so this is realistic
+application-shaped SQL, not a contrived trigger for the code path.
+`profile_rls.py`'s 2026-10-20 negative result profiled only INSERT,
+which never aliases its own target and so never reaches this code.
+
+### Hypothesis
+
+v2.37 added `src/exec/rls.rs::policy_scope_augment`: PG19 binds a
+policy's qual to the table's bare name regardless of the query's
+alias, so whenever the row schema passed to a policy check is
+qualified by anything other than the bare table name,
+`policy_scope_augment` clones the *entire* column schema
+(`Vec<QCol>`, two owned `String`s per column) and doubles the row's
+cells to add a hidden bare-name-qualified copy. This clone reruns on
+every single row of the UPDATE's target-visibility pass
+(`rls_row_visible` in `src/exec/dml.rs::exec_update_inner`), even
+though the augmented schema is identical across every row of one
+statement — only the per-row cell values differ. An aliased target
+(`UPDATE t AS a ...`) always takes this slow path; an unaliased one
+(`UPDATE t ...`) always takes the already-cheap `Cow::Borrowed` fast
+path, since the schema's qualifier already equals the bare name. This
+had never been profiled, and hoisting the schema clone out of the
+per-row loop looked like a plausible, > 5%-of-profile win on paper.
+
+### Measurement
+
+Callgrind (valgrind 3.22.0), aliased vs. unaliased target, same
+statements otherwise, isolating the per-UPDATE cost from one-time
+schema/row setup (`--updates 0` at the same row count):
+
+| schema | rows | updates | aliased Ir | unaliased Ir | update-loop delta |
+|---|---|---|---|---|---|
+| 4 text cols (`profile_rls_alias_update.py` default) | 2,000 | 20 | 1,152,156,215 | 1,120,131,526 | **+3.85%** (41.60M vs. 40.00M Ir/update, setup ~320.2M Ir subtracted both sides) |
+| 30 text cols (widened to amplify the String-clone cost) | 3,000 | 20 | 4,296,913,709 | 4,173,803,497 | **+2.95%** (whole-run Ir, setup not subtracted) |
+
+dhat (`--rows 2000 --updates 20`, 4-text-col schema): total bytes
+allocated 59,515,239 (aliased) vs. 59,510,747 (unaliased), total
+blocks 769,726 vs. 769,625 — **0.008% bytes, 0.013% blocks**, noise.
+
+`callgrind_annotate --auto=no` on the aliased run shows no
+`rls::eval_group` / `rls::policy_scope_augment` / `rls::rls_row_visible`
+/ `rls::check_one_group` frame in the top ~35 self-cost entries at
+all (small enough to be fully inlined into callers); the only named
+`rls.rs` entries anywhere in the annotation are `rls_check_new_row_ctx`
+(0.01%) and `rls_applies` (0.01%). The alias-vs-no-alias delta itself
+(the clone's full cost, upper-bounded) tops out under 4% of this
+benchmark's own total across a 4x widening of the schema — nowhere
+near this agent's 5%-of-profile floor, and the allocation-count floor
+(≥10%) isn't cleared either. Widening the schema 7.5x (4 → 30
+columns) to amplify the per-row `String` clone cost *shrank* the
+relative delta (3.85% → 2.95%), confirming the fixed per-row overhead
+of the rest of the UPDATE pipeline (row storage, WAL, snapshot/lock
+bookkeeping, expression evaluation) dominates and grows faster than
+the clone itself as the schema widens.
+
+### Conclusion
+
+Hypothesis confirmed as a *real* cost (consistently reproducible,
+always in the same direction) but not a *worth-fixing* one by this
+agent's floor. No code change shipped. Filed as a negative-result
+issue with the full profile data, in case a future round wants to
+revisit this with a much larger table (RLS `UPDATE ... FROM`, or a
+batch UPDATE touching thousands of target rows per statement, might
+change the ratio) or decides the correctness-adjacent clarity of
+hoisting the schema augmentation is worth it even below the floor.
+
+### Reproduce
+
+```bash
+cargo build
+python3 benches/profile_rls_alias_update.py --tool callgrind --rows 2000 --updates 20
+python3 benches/profile_rls_alias_update.py --tool callgrind --rows 2000 --updates 20 --no-alias
+python3 benches/profile_rls_alias_update.py --tool callgrind --rows 2000 --updates 0
+python3 benches/profile_rls_alias_update.py --tool dhat --rows 2000 --updates 20
+python3 benches/profile_rls_alias_update.py --tool dhat --rows 2000 --updates 20 --no-alias
+```
+
 ## Bolt: pgstat UPDATE hook filters indexes by table instead of scanning the whole database — fix — 2026-11-19
 
 ### Workload
