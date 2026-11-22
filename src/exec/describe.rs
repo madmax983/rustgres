@@ -1235,7 +1235,16 @@ pub(crate) fn composite_star_fields(
             }
             None
         }
-        Expr::Func { name, .. } => {
+        Expr::Func { name, args, .. } => {
+            // v2.38: (jsonb_populate_record(NULL::t, ...)).* expands
+            // to t's fields (the base argument's named type).
+            if super::funcs::is_json_record_function(name) && name.contains("populate") {
+                if let Some(Expr::CastNamed { name: tn, .. }) = args.first() {
+                    if let Some(f) = composite_fields_of_type_name(eng, snap, own, session, tn) {
+                        return Some(f);
+                    }
+                }
+            }
             for defs in eng.db.functions.values() {
                 for def in defs {
                     if def.name == *name
@@ -1520,6 +1529,10 @@ pub(crate) fn expr_col_name_strength(e: &Expr) -> (String, u8) {
         // named `array`, while `arr[1]` keeps the column name `arr`.
         Expr::Subscript { array, .. } => expr_col_name_strength(array),
         Expr::Slice { array, .. } => expr_col_name_strength(array),
+        // v2.38: PG19 FigureColname for A_Indirection ending in a
+        // field name: the column takes the field's name (covers both
+        // composite field access and function-call notation).
+        Expr::FieldAccess { field, .. } => (field.clone(), 2),
         // v1.23: PG19 names an `ARRAY[...]` constructor `array`
         // (`FigureColnameInternal`, `T_A_ArrayExpr` case).
         Expr::ArrayCtor { .. } => ("array".to_string(), 2),
@@ -1791,7 +1804,28 @@ pub(crate) fn expr_type(
                     format!("column \"{}\" not found in record", field),
                 ));
             }
-            expr_type(eng, snap, own, session, schemas, outer, ctes, expr)?;
+            let base_ty = expr_type(eng, snap, own, session, schemas, outer, ctes, expr)?;
+            // v2.38: function-call notation on a non-composite base
+            // (see eval's FieldAccess arm): type as the function.
+            if !matches!(base_ty, ColType::Record | ColType::Composite) {
+                // v2.38: `(x).typename` cast notation types as the cast.
+                if let Ok(t) = crate::sql::coltype_by_name(field) {
+                    return Ok(t);
+                }
+                if let Ok(t) = func_result_type(
+                    field,
+                    std::slice::from_ref(expr),
+                    eng,
+                    snap,
+                    own,
+                    session,
+                    schemas,
+                    outer,
+                    ctes,
+                ) {
+                    return Ok(t);
+                }
+            }
             Ok(ColType::Record)
         }
         Expr::BitNot(x) => {
@@ -2073,6 +2107,9 @@ pub(crate) fn expr_type(
                     }
                     Ok(elem_scalar_type(e))
                 }
+                // v2.38: jsonb subscripting (PG19 jsonb_subscript):
+                // text key or integer index, result jsonb.
+                ColType::Jsonb => Ok(ColType::Jsonb),
                 other => Err(exec_err(
                     "42804",
                     format!("cannot subscript type {}", other.sql_name()),
@@ -2365,6 +2402,15 @@ pub(crate) fn combine_arith_types(
                     if matches!(op, ArithOp::Add | ArithOp::Mul | ArithOp::Sub) =>
                 {
                     Ok(ColType::Multirange(*e))
+                }
+                // v2.38: jsonb `-` (delete key / element / key set).
+                (ColType::Jsonb, y)
+                    if op == ArithOp::Sub
+                        && (matches!(y, ColType::Text | ColType::Char(_))
+                            || is_int_kind(y)
+                            || matches!(y, ColType::Array(_))) =>
+                {
+                    Ok(ColType::Jsonb)
                 }
                 // v1.91: `<<` / `>>` over rangeish operands are the
                 // position operators (range_before / range_after and

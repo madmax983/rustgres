@@ -236,6 +236,7 @@ pub(crate) enum Token {
     ArrowText,     // `->>`
     HashArrow,     // `#>`
     HashArrowText, // `#>>`
+    HashMinus,     // v2.38: `#-` jsonb delete-at-path (PG19 gram.y Op)
     /// v1.83: jsonb operators (PG19 gram.y `Op`): `@>`, `<@`, `?`,
     /// `?|`, `?&`. The `?` family lexes out of the v0.86 `?`-led branch
     /// below (exact matches only; `?=` etc. stay `Op`).
@@ -567,7 +568,11 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, SqlError> {
         // v1.82: `#>` / `#>>` lex as single tokens (PG19 gram.y `Op`);
         // longest match first, like the `|` family above.
         if c == '#' {
-            if i + 1 < chars.len() && chars[i + 1] == '>' {
+            if i + 1 < chars.len() && chars[i + 1] == '-' {
+                // v2.38: `#-` (jsonb delete at path) is one Op token.
+                toks.push(Token::HashMinus);
+                i += 2;
+            } else if i + 1 < chars.len() && chars[i + 1] == '>' {
                 if i + 2 < chars.len() && chars[i + 2] == '>' {
                     toks.push(Token::HashArrowText);
                     i += 3;
@@ -1436,6 +1441,8 @@ pub enum JsonOp {
     OverRight,
     /// v1.91: `-|-`: adjacent to (range_adjacent).
     Adjacent,
+    /// v2.38: `#-`: jsonb delete at path (jsonb_delete_path operator form).
+    DeletePath,
 }
 
 impl JsonOp {
@@ -1456,6 +1463,7 @@ impl JsonOp {
             JsonOp::OverLeft => "&<",
             JsonOp::OverRight => "&>",
             JsonOp::Adjacent => "-|-",
+            JsonOp::DeletePath => "#-",
         }
     }
 
@@ -1504,6 +1512,7 @@ impl JsonOp {
             JsonOp::OverLeft => "overleft",
             JsonOp::OverRight => "overright",
             JsonOp::Adjacent => "adjacent",
+            JsonOp::DeletePath => "deletepath",
         }
     }
 
@@ -1524,6 +1533,7 @@ impl JsonOp {
             "overleft" => Some(JsonOp::OverLeft),
             "overright" => Some(JsonOp::OverRight),
             "adjacent" => Some(JsonOp::Adjacent),
+            "deletepath" => Some(JsonOp::DeletePath),
             _ => None,
         }
     }
@@ -11646,6 +11656,7 @@ pub(crate) fn tokens_to_sql(toks: &[Token]) -> String {
             Token::ArrowText => "->>".to_string(),
             Token::HashArrow => "#>".to_string(),
             Token::HashArrowText => "#>>".to_string(),
+            Token::HashMinus => "#-".to_string(),
             // v1.83: jsonb operators render back to their source text.
             Token::AtGt => "@>".to_string(),
             Token::AtQuestion => "@?".to_string(),

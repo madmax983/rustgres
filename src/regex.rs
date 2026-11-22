@@ -18,6 +18,9 @@ enum Ast {
     Class(CharClass),
     AnchorStart,
     AnchorEnd,
+    // v2.38: `\y` (true) / `\Y` (false) zero-width word-boundary
+    // assertions (PG ARE escapes; XQuery like_regex inherits them).
+    WordBoundary(bool),
     Seq(Vec<Ast>),
     Alt(Vec<Ast>),
     // v0.31: `lazy` selects non-greedy (lazy) repetition, e.g. `*?`, `+?`,
@@ -59,6 +62,9 @@ pub struct Compiled {
     /// v0.24: newline-sensitive (`n`/`m`) mode — `.` and `[^...]` do not
     /// match `\n`, and `^`/`$` also match at newlines.
     newline_sensitive: bool,
+    /// v2.38: decoupled NLSTOP / NLANCH (see RegexOptions).
+    dot_stops_newline: bool,
+    newline_anchors: bool,
 }
 
 /// v0.24: regex compile options for PostgreSQL's `n`/`s`/`x` flags.
@@ -67,6 +73,12 @@ pub struct RegexOptions {
     pub case_insensitive: bool,
     /// `n` (or historical synonym `m`): newline-sensitive matching.
     pub newline_sensitive: bool,
+    /// v2.38: REG_NLSTOP alone — `.` does not match `\n`, but anchors
+    /// stay string-bound (XQuery like_regex default).
+    pub dot_stops_newline: bool,
+    /// v2.38: REG_NLANCH alone — `^`/`$` also match at newlines,
+    /// without affecting `.` (XQuery like_regex `m` flag).
+    pub newline_anchors: bool,
     /// `x`: expanded syntax — ignore whitespace and `#` comments.
     pub expanded: bool,
 }
@@ -103,8 +115,9 @@ pub fn compile(pattern: &str, case_insensitive: bool) -> Result<std::rc::Rc<Comp
 /// pattern re-reports the same error on every call, exactly as before.
 const REGEX_CACHE_CAP: usize = 64;
 
-/// (pattern text, case_insensitive, newline_sensitive, expanded).
-type RegexCacheKey = (String, bool, bool, bool);
+/// (pattern text, case_insensitive, newline_sensitive, expanded,
+/// dot_stops_newline, newline_anchors).
+type RegexCacheKey = (String, bool, bool, bool, bool, bool);
 
 thread_local! {
     static REGEX_CACHE: std::cell::RefCell<
@@ -119,6 +132,8 @@ pub fn compile_opts(pattern: &str, opts: RegexOptions) -> Result<std::rc::Rc<Com
         opts.case_insensitive,
         opts.newline_sensitive,
         opts.expanded,
+        opts.dot_stops_newline,
+        opts.newline_anchors,
     );
     if let Some(hit) = REGEX_CACHE.with(|c| c.borrow().get(&key).cloned()) {
         return Ok(hit);
@@ -145,6 +160,8 @@ pub fn compile_opts(pattern: &str, opts: RegexOptions) -> Result<std::rc::Rc<Com
         groups: p.groups,
         ci: opts.case_insensitive,
         newline_sensitive: opts.newline_sensitive,
+        dot_stops_newline: opts.dot_stops_newline,
+        newline_anchors: opts.newline_anchors,
     });
     REGEX_CACHE.with(|c| {
         let mut c = c.borrow_mut();
@@ -354,6 +371,12 @@ impl Parser {
                 ranges: vec![('a', 'z'), ('A', 'Z'), ('0', '9')],
                 singles: vec!['_'],
             })),
+            // PG19 regc_lex.c: in AREs \b is a backspace and \B a
+            // backslash; the word-boundary escapes are \y and \Y.
+            Some('b') => Ok(Ast::Lit('\x08')),
+            Some('B') => Ok(Ast::Lit('\\')),
+            Some('y') => Ok(Ast::WordBoundary(true)),
+            Some('Y') => Ok(Ast::WordBoundary(false)),
             Some(c) if c.is_ascii_digit() && c != '0' => {
                 Ok(Ast::BackRef(c.to_digit(10).unwrap() as usize))
             }
@@ -456,6 +479,7 @@ enum Insn {
     Class(CharClass),
     AnchorStart,
     AnchorEnd,
+    WordBoundary(bool),
     Jump(usize),
     Split(usize, usize),
     SaveStart(usize),
@@ -502,6 +526,9 @@ impl Compiler {
             }
             Ast::AnchorEnd => {
                 self.emit(Insn::AnchorEnd);
+            }
+            Ast::WordBoundary(b) => {
+                self.emit(Insn::WordBoundary(*b));
             }
             Ast::Seq(v) => {
                 for a in v {
@@ -674,7 +701,9 @@ impl Compiled {
                 Insn::Dot => {
                     // v0.24: with `n` (newline-sensitive), `.` does not
                     // match `\n`; with `s` (the default) it does.
-                    if si < s.len() && !(self.newline_sensitive && s[si] == '\n') {
+                    if si < s.len()
+                        && !((self.newline_sensitive || self.dot_stops_newline) && s[si] == '\n')
+                    {
                         si += 1;
                         pc += 1;
                     } else if !backtrack(&mut pc, &mut si, caps, stack) {
@@ -696,7 +725,11 @@ impl Compiled {
                 }
                 Insn::AnchorStart => {
                     // v0.24: with `n`, `^` also matches after a newline.
-                    if si == 0 || (self.newline_sensitive && si > 0 && s[si - 1] == '\n') {
+                    if si == 0
+                        || ((self.newline_sensitive || self.newline_anchors)
+                            && si > 0
+                            && s[si - 1] == '\n')
+                    {
                         pc += 1;
                     } else if !backtrack(&mut pc, &mut si, caps, stack) {
                         return false;
@@ -704,7 +737,21 @@ impl Compiled {
                 }
                 Insn::AnchorEnd => {
                     // v0.24: with `n`, `$` also matches before a newline.
-                    if si == s.len() || (self.newline_sensitive && si < s.len() && s[si] == '\n') {
+                    if si == s.len()
+                        || ((self.newline_sensitive || self.newline_anchors)
+                            && si < s.len()
+                            && s[si] == '\n')
+                    {
+                        pc += 1;
+                    } else if !backtrack(&mut pc, &mut si, caps, stack) {
+                        return false;
+                    }
+                }
+                Insn::WordBoundary(want) => {
+                    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+                    let before = si > 0 && is_word(s[si - 1]);
+                    let after = si < s.len() && is_word(s[si]);
+                    if (before != after) == *want {
                         pc += 1;
                     } else if !backtrack(&mut pc, &mut si, caps, stack) {
                         return false;

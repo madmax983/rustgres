@@ -246,6 +246,63 @@ pub(crate) fn eval_subscript_vals(base: &Value, indices: &[Value]) -> Result<Val
     if matches!(base, Value::Null) || indices.iter().any(|v| matches!(v, Value::Null)) {
         return Ok(Value::Null);
     }
+    // v2.38: jsonb subscript (PG19 jsonb_subscript / jsonb.c
+    // jsonb_subscript_fetch): one subscript per node (chained
+    // brackets nest Subscript expressions); text selects an object
+    // key, integer an array element (negative from the end);
+    // missing key / out-of-range yields SQL NULL.
+    if let Value::Jsonb(s) = base {
+        // Adjacent brackets arrive as one Subscript node (the array
+        // convention); for jsonb PG applies them as successive
+        // indirection steps, each on the previous jsonb result.
+        let mut cur = super::json::parse_jsonb(s)?;
+        for idx in indices {
+            // PG19 jsonb_subscript_fetch: the container kind governs
+            // coercion -- a text subscript on an array parses as an
+            // integer index, an integer subscript on an object names
+            // the key by its text form.
+            let node = match idx {
+                Value::Text(k) | Value::BpChar(k) => {
+                    if matches!(cur, super::json::JsonbVal::Array(_)) {
+                        match k.trim().parse::<i64>() {
+                            Ok(i) => cur.index(i).cloned(),
+                            Err(_) => None,
+                        }
+                    } else {
+                        cur.field(k).cloned()
+                    }
+                }
+                Value::SmallInt(i) => {
+                    if matches!(cur, super::json::JsonbVal::Object(_)) {
+                        cur.field(&i.to_string()).cloned()
+                    } else {
+                        cur.index(*i as i64).cloned()
+                    }
+                }
+                Value::Int(i) | Value::BigInt(i) => {
+                    if matches!(cur, super::json::JsonbVal::Object(_)) {
+                        cur.field(&i.to_string()).cloned()
+                    } else {
+                        cur.index(*i).cloned()
+                    }
+                }
+                other => {
+                    return Err(exec_err(
+                        "22023",
+                        format!(
+                            "jsonb subscript type cannot be {}",
+                            other.type_name().to_lowercase()
+                        ),
+                    ));
+                }
+            };
+            match node {
+                Some(n) => cur = n,
+                None => return Ok(Value::Null),
+            }
+        }
+        return Ok(Value::jsonb(cur.render()));
+    }
     let Value::Array(a) = base else {
         return Err(exec_err(
             "42804",
@@ -1746,10 +1803,32 @@ pub(crate) fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, 
                         exec_err("42703", format!("column \"{}\" not found in record", field))
                     }),
                 Value::Null => Ok(Value::Null),
-                _ => Err(exec_err(
-                    "42809",
-                    "cannot access field of non-composite value".to_string(),
-                )),
+                // v2.38: PG19 parse_func.c — `x.f` where f is a
+                // function whose first argument can take x is the
+                // function-call notation f(x) (e.g.
+                // ('{"a":1}'::jsonb).jsonb_typeof). Only attempted
+                // when f is a known one-argument builtin; anything
+                // else keeps the 42809.
+                other => {
+                    if super::funcs::check_builtin_arity(field, &[other.clone()]).is_ok() {
+                        // Evaluate through eval_func_vals with the
+                        // already-computed value.
+                        match super::funcs::eval_func_vals(field, &[other.clone()]) {
+                            Ok(r) => return Ok(r),
+                            Err(_) => {}
+                        }
+                    }
+                    // v2.38: `(x).typename` is a cast in PG19
+                    // (A_Indirection with a type-name field), e.g.
+                    // ('123.45'::jsonb).numeric.
+                    if let Ok(ct) = crate::sql::coltype_by_name(field) {
+                        return eval_cast(&other, ct);
+                    }
+                    Err(exec_err(
+                        "42809",
+                        "cannot access field of non-composite value".to_string(),
+                    ))
+                }
             }
         }
         // v0.81: `expr::named_composite` — resolves the type name against
@@ -4715,6 +4794,21 @@ pub(crate) fn eval_is_distinct_from(l: Value, r: Value, neg: bool) -> Result<Val
 }
 
 pub(crate) fn eval_cmp_vals(op: CmpOp, a: &Value, b: &Value) -> Result<Value, ExecError> {
+    // v2.38: jsonb comparison against a text operand — PG resolves
+    // the unknown literal to jsonb (a typed text value would be
+    // 42883 in PG; eval-time type blindness treats both alike, the
+    // standing json-family convention). Ordering rides jsonb_cmp.
+    match (a, b) {
+        (Value::Jsonb(_), Value::Text(t) | Value::BpChar(t)) => {
+            let y = super::json::parse_jsonb(t)?;
+            return eval_cmp_vals(op, a, &Value::jsonb(y.render()));
+        }
+        (Value::Text(t) | Value::BpChar(t), Value::Jsonb(_)) => {
+            let x = super::json::parse_jsonb(t)?;
+            return eval_cmp_vals(op, &Value::jsonb(x.render()), b);
+        }
+        _ => {}
+    }
     // v0.79: array comparisons — `=`/`<>` are PG19 `array_eq`
     // (three-valued element-wise); anything else has no PG array
     // operator (42883); array-vs-NULL is NULL.

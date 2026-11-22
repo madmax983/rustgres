@@ -597,6 +597,37 @@ pub(crate) fn eval_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, Exe
     if let Some(r) = super::ranges::eval_range_arith(op, a, b) {
         return r;
     }
+    // v2.38: jsonb `-` (PG19 jsonfuncs.c jsonb_delete / _idx /
+    // _multi): delete object key (text), array element (integer,
+    // negative counts from the end), or key set (text[]). A scalar
+    // or mismatched container is returned unchanged by PG.
+    if op == ArithOp::Sub {
+        if let Value::Jsonb(s) = a {
+            let doc = super::json::parse_jsonb(s)?;
+            let out = match b {
+                Value::Text(k) | Value::BpChar(k) => super::json::jsonb_delete_key(&doc, k)?,
+                Value::SmallInt(i) => super::json::jsonb_delete_idx(&doc, *i as i64)?,
+                Value::Int(i) | Value::BigInt(i) => super::json::jsonb_delete_idx(&doc, *i)?,
+                Value::Array(arr) => {
+                    let mut keys: Vec<Option<String>> = Vec::new();
+                    let mut bad = false;
+                    for e in &arr.elems {
+                        match e {
+                            Value::Text(t) | Value::BpChar(t) => keys.push(Some(t.to_string())),
+                            Value::Null => keys.push(None),
+                            _ => bad = true,
+                        }
+                    }
+                    if bad {
+                        return Err(op_err(op, a, b));
+                    }
+                    super::json::jsonb_delete_keys(&doc, &keys)?
+                }
+                _ => return Err(op_err(op, a, b)),
+            };
+            return Ok(Value::jsonb(out.render()));
+        }
+    }
     // v0.21: text-vs-numeric coercion (unknown-literal resolution)
     // before anything else, so '1.5' + 1 works like Postgres.
     let coerced = coerce_text_numeric(a, b)?;

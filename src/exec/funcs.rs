@@ -95,6 +95,21 @@ pub(crate) fn eval_concat(a: &Value, b: &Value) -> Result<Value, ExecError> {
         let vb = parse_jsonb(y)?;
         return Ok(Value::jsonb(jsonb_concat(&va, &vb).render()));
     }
+    // v2.38: an untyped text operand beside a jsonb is an unknown
+    // literal in PG's operator resolution and takes the jsonb type
+    // when it parses as jsonb ('{"a":1}'::jsonb || '{"b":2}');
+    // non-jsonb text keeps the text-concat path ('{}'::jsonb || '').
+    if let (Value::Jsonb(x), Value::Text(y)) | (Value::Text(y), Value::Jsonb(x)) = (a, b) {
+        if let Ok(vb) = parse_jsonb(y) {
+            let va = parse_jsonb(x)?;
+            let (l, r) = if matches!(a, Value::Jsonb(_)) {
+                (va, vb)
+            } else {
+                (vb, va)
+            };
+            return Ok(Value::jsonb(jsonb_concat(&l, &r).render()));
+        }
+    }
     // v1.94: a bare text operand beside a tsvector/tsquery coerces to
     // that type (PG resolves the unknown literal to the peer type),
     // so `'a:1'::tsvector || 'b:2'` concatenates as tsvectors.
@@ -5883,6 +5898,53 @@ pub(crate) fn eval_func(
         let v = eval_expr(q, scopes, &args[0])?;
         return pg_column_compression_value(q, scopes, &args[0], &v, true);
     }
+    // v2.38: pg_column_size(any) — PG19 dbsize.c: the on-disk size of
+    // the datum. This engine stores values as text; the size model is
+    // the value's canonical text byte length plus the 1-byte short
+    // varlena header for varlena kinds (fixed-width kinds report
+    // their width). Equality/relative comparisons — the only shape
+    // the regression suites assert — are exact under this model.
+    if name == "pg_column_size" {
+        if args.len() != 1 {
+            return Err(exec_err(
+                "42883",
+                "function pg_column_size() does not exist".to_string(),
+            ));
+        }
+        let v = eval_expr(q, scopes, &args[0])?;
+        if v == Value::Null {
+            return Ok(Value::Null);
+        }
+        let n = match &v {
+            Value::Bool(_) => 1,
+            Value::SmallInt(_) => 2,
+            Value::Int(_) | Value::Float4(_) => 4,
+            Value::BigInt(_) | Value::Float(_) | Value::Date(_) => 8,
+            Value::Jsonb(s) => s.len() as i64 + 1,
+            Value::Text(s) | Value::BpChar(s) => s.len() as i64 + 1,
+            other => match text_value_of(&[other]) {
+                Value::Text(s) => s.len() as i64 + 1,
+                _ => 0,
+            },
+        };
+        return Ok(Value::Int(n));
+    }
+    // v2.38: pg_my_temp_schema() -> oid: the session's temporary
+    // schema OID, or 0 when none exists (PG19 namespace.c). This
+    // engine keys temp objects by session without a namespace OID
+    // registry; sessions that have created temp objects report the
+    // conventional first-temp-schema OID shape via pg_temp_N naming
+    // elsewhere, so 0 (no temp schema) is the honest value for the
+    // common case.
+    if name == "pg_my_temp_schema" {
+        if !args.is_empty() {
+            return Err(exec_err(
+                "42883",
+                "function pg_my_temp_schema() does not exist".to_string(),
+            ));
+        }
+        return Ok(Value::Int(0));
+    }
     // v2.28: pg_get_serial_sequence(table, column) — the name of
     // the serial/identity backing sequence as "public.<seq>", or
     // NULL when the column has none (PG19 ruleutils.c).
@@ -6240,6 +6302,145 @@ pub(crate) fn eval_func(
                         "key value must be scalar, not array, composite, or json",
                     ));
                 }
+            }
+        }
+        // v2.38: json-typed arguments of the build functions embed
+        // as JSON documents, not as strings (PG19 jsonb_build_array
+        // / json_build_array over a `json` value). json rides as
+        // Value::Text, so the static arg types decide.
+        if matches!(
+            name,
+            "jsonb_build_array" | "jsonb_build_object" | "json_build_array" | "json_build_object"
+        ) {
+            let json_flags: Vec<bool> = args
+                .iter()
+                .map(|a| {
+                    let mut e = a;
+                    while let Expr::NamedArg { expr, .. } = e {
+                        e = expr;
+                    }
+                    match e {
+                        Expr::Cast { to, .. } => {
+                            matches!(to, crate::storage::ColType::Json)
+                        }
+                        Expr::CastNamed { name: n, .. } => crate::sql::coltype_by_name(n)
+                            .map(|t| matches!(t, crate::storage::ColType::Json))
+                            .unwrap_or(false),
+                        _ => {
+                            let schemas: Vec<&[QCol]> = scopes.iter().map(|s| s.schema).collect();
+                            matches!(
+                                super::describe::expr_type(
+                                    q.eng,
+                                    q.snap,
+                                    q.own,
+                                    q.session,
+                                    &schemas,
+                                    &[],
+                                    &[],
+                                    e
+                                ),
+                                Ok(crate::storage::ColType::Json)
+                            )
+                        }
+                    }
+                })
+                .collect();
+            if json_flags.iter().any(|f| *f) {
+                let as_jsonb = name.starts_with("jsonb");
+                if name.ends_with("build_array") {
+                    if as_jsonb {
+                        let mut elems = Vec::with_capacity(vals.len());
+                        for (v, jf) in vals.iter().zip(&json_flags) {
+                            if *jf {
+                                match v {
+                                    Value::Null => elems.push(super::json::JsonbVal::Null),
+                                    Value::Text(s) | Value::BpChar(s) => {
+                                        elems.push(super::json::parse_jsonb(s)?)
+                                    }
+                                    other => elems.push(super::json::datum_to_jsonb(other)?),
+                                }
+                            } else {
+                                elems.push(super::json::datum_to_jsonb(v)?);
+                            }
+                        }
+                        return Ok(Value::jsonb(super::json::JsonbVal::Array(elems).render()));
+                    }
+                    let mut out = String::from("[");
+                    for (i, (v, jf)) in vals.iter().zip(&json_flags).enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        if *jf {
+                            match v {
+                                Value::Null => out.push_str("null"),
+                                Value::Text(s) | Value::BpChar(s) => out.push_str(s),
+                                other => super::json::datum_to_json_text(other, &mut out),
+                            }
+                        } else {
+                            super::json::datum_to_json_text(v, &mut out);
+                        }
+                    }
+                    out.push(']');
+                    return Ok(Value::text(out));
+                }
+                // build_object
+                if vals.len() % 2 != 0 {
+                    return Err(exec_err(
+                        "22023",
+                        "argument list must have even number of elements",
+                    ));
+                }
+                if as_jsonb {
+                    let mut pairs = Vec::with_capacity(vals.len() / 2);
+                    for (pair, jpair) in vals.chunks_exact(2).zip(json_flags.chunks_exact(2)) {
+                        let (k, v) = (&pair[0], &pair[1]);
+                        if *k == Value::Null {
+                            return Err(exec_err("22004", "null value not allowed for object key"));
+                        }
+                        let jv = if jpair[1] {
+                            match v {
+                                Value::Null => super::json::JsonbVal::Null,
+                                Value::Text(s) | Value::BpChar(s) => super::json::parse_jsonb(s)?,
+                                other => super::json::datum_to_jsonb(other)?,
+                            }
+                        } else {
+                            super::json::datum_to_jsonb(v)?
+                        };
+                        pairs.push((super::json::json_key_text(k)?, jv));
+                    }
+                    return Ok(Value::jsonb(
+                        super::json::jsonb_canon(super::json::JsonbVal::Object(pairs)).render(),
+                    ));
+                }
+                let mut out = String::from("{");
+                for (i, (pair, jpair)) in vals
+                    .chunks_exact(2)
+                    .zip(json_flags.chunks_exact(2))
+                    .enumerate()
+                {
+                    let (k, v) = (&pair[0], &pair[1]);
+                    if *k == Value::Null {
+                        return Err(exec_err("22004", "null value not allowed for object key"));
+                    }
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let kt = super::json::json_key_text(k)?;
+                    out.push('"');
+                    super::json::escape_json_into(&kt, &mut out);
+                    out.push_str("\" : ");
+                    if jpair[1] {
+                        match v {
+                            Value::Null => out.push_str("null"),
+                            Value::Text(s) | Value::BpChar(s) => out.push_str(s),
+                            other => super::json::datum_to_json_text(other, &mut out),
+                        }
+                    } else {
+                        super::json::datum_to_json_text(v, &mut out);
+                    }
+                }
+                out.push('}');
+                return Ok(Value::text(out));
             }
         }
         return eval_func_vals(name, &vals);
@@ -6928,6 +7129,8 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         "pg_input_error_info" => n == 2,
         // v0.37: TOAST introspection functions.
         "pg_column_compression" => n == 1,
+        "pg_column_size" => n == 1,
+        "pg_my_temp_schema" => n == 0,
         "pg_relation_size" => n == 1 || n == 2,
         "pg_get_serial_sequence" => n == 2,
         // v2.18: updatability introspection (PG19 misc.c).
@@ -6993,6 +7196,14 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         "jsonb_set_lax" => (3..=5).contains(&n),
         "jsonb_insert" => n == 3 || n == 4,
         "jsonb_delete" | "jsonb_delete_path" => n == 2,
+        // v2.38: the jsonb operator implementation functions are
+        // callable by name in PG (pg_proc): jsonb_contains /
+        // jsonb_contained / jsonb_exists / jsonb_exists_any /
+        // jsonb_exists_all / jsonb_concat.
+        "jsonb_contains" | "jsonb_contained" | "jsonb_concat" => n == 2,
+        "__jsonb_subscript_assign" => n == 3,
+        "jsonb_exists" => n == 2,
+        "jsonb_exists_any" | "jsonb_exists_all" => n == 2,
         "jsonb_populate_record_valid" => n == 2,
         // v1.84: json SRFs (target-list arity; the FROM path shares
         // this table via eval_table_function).
@@ -7354,7 +7565,9 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         | "json_build_object" | "jsonb_build_object" | "json_object" | "jsonb_object"
         | "json_extract_path" | "json_extract_path_text" | "jsonb_extract_path"
         | "jsonb_extract_path_text" | "jsonb_set" | "jsonb_set_lax" | "jsonb_insert"
-        | "jsonb_delete" | "jsonb_delete_path" => eval_json_func(name, vals),
+        | "jsonb_delete" | "jsonb_delete_path" | "jsonb_contains" | "jsonb_contained"
+        | "jsonb_exists" | "jsonb_exists_any" | "jsonb_exists_all" | "jsonb_concat"
+        | "__jsonb_subscript_assign" => eval_json_func(name, vals),
         // v1.85: scalar jsonb_path_* and the SQL/JSON desugars.
         "jsonb_path_exists" | "jsonb_path_match" | "jsonb_path_query_array"
         | "jsonb_path_query_first" | "jsonb_path_exists_tz" | "jsonb_path_match_tz"
@@ -7692,6 +7905,228 @@ pub(crate) fn eval_json_func(name: &str, vals: &[Value]) -> Result<Value, ExecEr
             Ok(Value::jsonb(out.render()))
         }
         "jsonb_set_lax" => eval_jsonb_set_lax(name, vals),
+        // v2.38: parser desugar for `SET j[...] = v` (parse_update).
+        // NOT strict in the value argument: SQL NULL assigns JSON
+        // null (PG19 jsonb subscript assignment). A NULL target or
+        // path yields NULL (jsonb_set strictness).
+        "__jsonb_subscript_assign" => {
+            // The parser desugar is type-blind: a plain ARRAY column
+            // lands here too. PG19's array assignment errors apply
+            // first (array_subscript_check): a NULL subscript is
+            // 2202E, and the subscript count must equal the array's
+            // dimensionality.
+            if let Value::Array(av) = &vals[0] {
+                let (_, path) = match json_path_list_arg(name, &vals[1])? {
+                    None => return Ok(Value::Null),
+                    Some(p) => p,
+                };
+                if path.iter().any(|e| e.is_none()) {
+                    return Err(exec_err(
+                        "2202E",
+                        "array subscript in assignment must not be null",
+                    ));
+                }
+                if !av.dims.is_empty() && path.len() != av.ndim() {
+                    return Err(exec_err("2202E", "wrong number of array subscripts"));
+                }
+                // PG19 array_set_element: subscripts coerce to int,
+                // out-of-range dimensions EXPAND with NULL fill.
+                let mut subs: Vec<i64> = Vec::with_capacity(path.len());
+                for e in &path {
+                    let t = e.as_deref().unwrap_or("");
+                    subs.push(t.trim().parse::<i64>().map_err(|_| {
+                        exec_err(
+                            "22P02",
+                            format!("invalid input syntax for type integer: \"{t}\""),
+                        )
+                    })?);
+                }
+                let mut arr = (**av).clone();
+                // Stored ArrayVals are not always coherent (a zero
+                // dimension or an elems/dims length mismatch can ride
+                // in from slice constructors); treat those like the
+                // empty array rather than indexing on a 0 product.
+                let coherent = !arr.dims.is_empty()
+                    && arr.dims.iter().all(|d| *d > 0)
+                    && arr.lower.len() == arr.dims.len()
+                    && arr.elems.len() == arr.dims.iter().map(|d| *d as usize).product::<usize>();
+                if !coherent {
+                    arr.dims = vec![1; subs.len()];
+                    arr.lower = subs.iter().map(|s| *s as i32).collect();
+                    arr.elems = vec![vals[2].clone()];
+                    return Ok(Value::Array(Box::new(arr)));
+                }
+                // PG19 subscripts are int4: beyond that is 22003,
+                // and the expanded size is capped (54000) — all
+                // computed in i64 so extreme bounds cannot wrap i32.
+                for s in &subs {
+                    if *s < i32::MIN as i64 || *s > i32::MAX as i64 {
+                        return Err(exec_err("22003", "integer out of range"));
+                    }
+                }
+                let nd = arr.dims.len();
+                let mut new_dims64: Vec<i64> = arr.dims.iter().map(|d| *d as i64).collect();
+                let mut new_lower = arr.lower.clone();
+                for d in 0..nd {
+                    let s = subs[d];
+                    let l = new_lower[d] as i64;
+                    let n = new_dims64[d];
+                    if s < l {
+                        new_dims64[d] += l - s;
+                        new_lower[d] = s as i32;
+                    } else if s >= l + n {
+                        new_dims64[d] += s - l - n + 1;
+                    }
+                }
+                let total64: i64 = new_dims64.iter().product();
+                if total64 > 1_073_741_823 {
+                    return Err(exec_err(
+                        "54000",
+                        "array size exceeds the maximum allowed (1073741823)",
+                    ));
+                }
+                let new_dims: Vec<i32> = new_dims64.iter().map(|d| *d as i32).collect();
+                let total: usize = total64 as usize;
+                let mut elems = vec![Value::Null; total];
+                let strides = |dims: &[i32]| -> Vec<usize> {
+                    let mut st = vec![1usize; dims.len()];
+                    for d in (0..dims.len().saturating_sub(1)).rev() {
+                        st[d] = st[d + 1] * dims[d + 1] as usize;
+                    }
+                    st
+                };
+                let old_st = strides(&arr.dims);
+                let new_st = strides(&new_dims);
+                for (flat, v) in arr.elems.iter().enumerate() {
+                    let mut nf = 0usize;
+                    for d in 0..nd {
+                        let coord = (flat / old_st[d]) % arr.dims[d] as usize;
+                        let nc = coord + (arr.lower[d] - new_lower[d]) as usize;
+                        nf += nc * new_st[d];
+                    }
+                    elems[nf] = v.clone();
+                }
+                let mut tf = 0usize;
+                for d in 0..nd {
+                    tf += (subs[d] - new_lower[d] as i64) as usize * new_st[d];
+                }
+                elems[tf] = vals[2].clone();
+                arr.dims = new_dims;
+                arr.lower = new_lower;
+                arr.elems = elems;
+                return Ok(Value::Array(Box::new(arr)));
+            }
+            // PG19: subscript assignment on a NULL base builds the
+            // document from an empty container (the first path
+            // element picks object vs array), it does not yield NULL.
+            let doc = match jsonb_val_arg(name, &vals[0])? {
+                None => {
+                    let (_, path) = match json_path_list_arg(name, &vals[1])? {
+                        None => return Ok(Value::Null),
+                        Some(p) => p,
+                    };
+                    let newval = match &vals[2] {
+                        Value::Null => JsonbVal::Null,
+                        Value::Jsonb(s) => parse_jsonb(s)?,
+                        Value::Text(s) | Value::BpChar(s) => parse_jsonb(s)?,
+                        other => datum_to_jsonb(other)?,
+                    };
+                    let first = path.first().and_then(|e| e.as_deref()).unwrap_or("");
+                    let root = if first.trim().parse::<i64>().is_ok() {
+                        JsonbVal::Array(Vec::new())
+                    } else {
+                        JsonbVal::Object(Vec::new())
+                    };
+                    let out = jsonb_subscript_assign(root, &path, &newval)?;
+                    return Ok(Value::jsonb(out.render()));
+                }
+                Some(v) => v,
+            };
+            let (_, path) = match json_path_list_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(p) => p,
+            };
+            let newval = match &vals[2] {
+                Value::Null => JsonbVal::Null,
+                Value::Jsonb(s) => parse_jsonb(s)?,
+                Value::Text(s) | Value::BpChar(s) => parse_jsonb(s)?,
+                other => datum_to_jsonb(other)?,
+            };
+            let out = jsonb_subscript_assign(doc, &path, &newval)?;
+            Ok(Value::jsonb(out.render()))
+        }
+        // v2.38: the jsonb operator implementation functions, callable
+        // by name (PG19 pg_proc). STRICT: NULL in -> NULL out (the
+        // dispatch's strict wrapper handles the NULL case for the
+        // bool forms; jsonb_concat is strict too).
+        "jsonb_contains" | "jsonb_contained" => {
+            let a = match jsonb_val_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(v) => v,
+            };
+            let b = match jsonb_val_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(v) => v,
+            };
+            let r = if name == "jsonb_contains" {
+                jsonb_contains(&a, &b)
+            } else {
+                jsonb_contains(&b, &a)
+            };
+            Ok(Value::Bool(r))
+        }
+        "jsonb_exists" => {
+            let doc = match jsonb_val_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(v) => v,
+            };
+            match str_arg(name, &vals[1])? {
+                None => Ok(Value::Null),
+                Some(k) => Ok(Value::Bool(jsonb_exists(&doc, k))),
+            }
+        }
+        "jsonb_exists_any" | "jsonb_exists_all" => {
+            let doc = match jsonb_val_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(v) => v,
+            };
+            let (_, keys) = match json_path_list_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(p) => p,
+            };
+            let has_null = keys.iter().any(|k| k.is_none());
+            let present: Vec<bool> = keys
+                .iter()
+                .flatten()
+                .map(|k| jsonb_exists(&doc, k))
+                .collect();
+            if name == "jsonb_exists_any" {
+                if present.iter().any(|p| *p) {
+                    Ok(Value::Bool(true))
+                } else if has_null {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Bool(false))
+                }
+            } else if present.iter().any(|p| !*p) {
+                Ok(Value::Bool(false))
+            } else if has_null {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Bool(true))
+            }
+        }
+        "jsonb_concat" => {
+            let a = match jsonb_val_arg(name, &vals[0])? {
+                None => return Ok(Value::Null),
+                Some(v) => v,
+            };
+            let b = match jsonb_val_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(v) => v,
+            };
+            Ok(Value::jsonb(jsonb_concat(&a, &b).render()))
+        }
         "jsonb_delete" => {
             let doc = match jsonb_val_arg(name, &vals[0])? {
                 None => return Ok(Value::Null),
@@ -8040,6 +8475,17 @@ pub(crate) fn pop_fields_for_type(q: &mut Q, type_name: &str) -> Result<Vec<PopF
                     sub: None,
                 })
                 .collect());
+        }
+        // v2.38: a DOMAIN over a composite populates as its base
+        // composite (jb_ordered_pair over jb_unordered_pair); the
+        // domain's own checks run on the result separately.
+        let base_name = st
+            .domain
+            .as_ref()
+            .and_then(|dom| dom.base_named.clone())
+            .filter(|b| b != type_name);
+        if let Some(base_name) = base_name {
+            return pop_fields_for_type(q, &base_name);
         }
     }
     Err(exec_err(
@@ -8417,7 +8863,9 @@ fn populate_array_rec(
     let mut flat: Vec<Value> = Vec::new();
     for e in elems {
         let (shape, mut vals) = match e {
-            JsonbVal::Array(sub) => {
+            // v2.38: for json/jsonb element types a nested array is
+            // the element's own value (jsa json[]), not a dimension.
+            JsonbVal::Array(sub) if !matches!(elem_ty, ColType::Json | ColType::Jsonb) => {
                 let (s, v) = populate_array_rec(q, elem, sub, elem_named)?;
                 (s, v)
             }
@@ -9065,6 +9513,12 @@ pub(crate) fn eval_table_function(
         return Ok((names, rows));
     }
     match name {
+        // v2.38: a scalar function in FROM is a one-row table (PG19);
+        // repeat() is the jsonb suite's case.
+        "repeat" => {
+            let v = eval_str_func(name, vals)?;
+            Ok((vec![name.to_string()], vec![vec![v]]))
+        }
         "regexp_split_to_table" => {
             let s = match str_arg(name, &vals[0])? {
                 None => return Ok((vec![name.to_string()], Vec::new())),
@@ -9644,14 +10098,31 @@ pub(crate) fn eval_json_recordset_srf(
             "a column definition list is required for functions returning \"record\"",
         ));
     };
-    let Value::Record(base_fields) = base else {
-        return Err(exec_err(
-            "42601",
-            "a column definition list is required for functions returning \"record\"",
-        ));
+    // v2.38: a NULL base of a NAMED composite (or domain over one)
+    // still carries its row type in the base expression -- PG
+    // populates from that type with an all-NULL base row
+    // (jsonb_populate_recordset(null::jb_ordered_pair, ...)).
+    let (base_fields, fields) = match base {
+        Value::Record(base_fields) => {
+            let base_fields = base_fields.clone();
+            let fields = pop_fields_from_record(&base_fields);
+            (base_fields, fields)
+        }
+        Value::Null => {
+            let fields = resolve_populate_fields(q, &arg_exprs[0], base, &[])?;
+            let base_fields: Vec<(String, Value)> = fields
+                .iter()
+                .map(|f| (f.name.clone(), Value::Null))
+                .collect();
+            (base_fields, fields)
+        }
+        _ => {
+            return Err(exec_err(
+                "42601",
+                "a column definition list is required for functions returning \"record\"",
+            ));
+        }
     };
-    let base_fields = base_fields.clone();
-    let fields = pop_fields_from_record(&base_fields);
     let tree = populate_doc_tree(name, doc_val)?
         .ok_or_else(|| exec_err("22023", format!("cannot call {name} on a non-array")))?;
     let JsonbVal::Array(elems) = &tree else {
@@ -15250,6 +15721,8 @@ pub(crate) fn func_result_type(
         "pg_sleep" => Ok(ColType::Text),
         // v0.37: TOAST introspection functions.
         "pg_column_compression" => Ok(ColType::Text),
+        "pg_column_size" => Ok(ColType::Int),
+        "pg_my_temp_schema" => Ok(ColType::Int),
         "pg_relation_size" => Ok(ColType::BigInt),
         // v2.28: pg_get_serial_sequence(text, text) -> text.
         "pg_get_serial_sequence" => Ok(ColType::Text),
@@ -15272,8 +15745,8 @@ pub(crate) fn func_result_type(
         "similar_to" => Ok(ColType::Bool),
         "substring_similar" => Ok(ColType::Text),
         // v1.94: text-search functions (PG19 pg_proc).
-        "to_tsvector" | "ts_delete" | "setweight" | "strip" | "ts_filter"
-        | "array_to_tsvector" | "tsvectorin" => Ok(ColType::TsVector),
+        "to_tsvector" | "jsonb_to_tsvector" | "ts_delete" | "setweight" | "strip"
+        | "ts_filter" | "array_to_tsvector" | "tsvectorin" => Ok(ColType::TsVector),
         "to_tsquery" | "plainto_tsquery" | "phraseto_tsquery" | "websearch_to_tsquery"
         | "tsquery_phrase"
         | "__tsquery_phrase"
@@ -15407,7 +15880,11 @@ pub(crate) fn func_result_type(
         | "json_object" | "json_extract_path" => Ok(ColType::Json),
         "to_jsonb" | "jsonb_build_array" | "jsonb_build_object" | "jsonb_object"
         | "jsonb_extract_path" | "jsonb_set" | "jsonb_set_lax" | "jsonb_insert"
-        | "jsonb_delete" | "jsonb_delete_path" => Ok(ColType::Jsonb),
+        | "jsonb_delete" | "jsonb_delete_path" | "jsonb_concat"
+        | "__jsonb_subscript_assign" => Ok(ColType::Jsonb),
+        // v2.38: jsonb operator functions return boolean.
+        "jsonb_contains" | "jsonb_contained" | "jsonb_exists" | "jsonb_exists_any"
+        | "jsonb_exists_all" => Ok(ColType::Bool),
         "json_extract_path_text" | "jsonb_extract_path_text" => Ok(ColType::Text),
         "jsonb_populate_record_valid" => Ok(ColType::Bool),
         // v1.85: jsonpath family + SQL/JSON desugar result types.

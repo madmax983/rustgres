@@ -1885,10 +1885,13 @@ impl Parser {
             let mut gist = false;
             if self.eat_keyword("using") {
                 let method = self.expect_ident()?;
-                if method == "gist" {
+                if method == "gist" || method == "gin" {
                     // v2.31: GiST indexes are catalog-only here
                     // (they back WITHOUT OVERLAPS rendering and the
                     // USING INDEX rejection paths).
+                    // v2.38: GIN likewise catalog-only (jsonb/tsvector
+                    // containment indexes; scans stay sequential and
+                    // return identical rows).
                     gist = true;
                 } else if method != "btree" {
                     return Err(SqlError {
@@ -12092,6 +12095,7 @@ impl Parser {
                 Token::ArrowText => Some(JsonOp::ArrowText),
                 Token::HashArrow => Some(JsonOp::HashArrow),
                 Token::HashArrowText => Some(JsonOp::HashArrowText),
+                Token::HashMinus => Some(JsonOp::DeletePath),
                 Token::AmpAmp => Some(JsonOp::Overlaps),
                 Token::AmpLt => Some(JsonOp::OverLeft),
                 Token::AmpGt => Some(JsonOp::OverRight),
@@ -15525,6 +15529,48 @@ impl Parser {
         let mut sets = Vec::new();
         loop {
             let col = self.expect_ident()?;
+            // v2.38: subscripted assignment target, `SET j['a'][0] = v`
+            // (PG19 indirection on the SET target). Desugars to the
+            // hidden __jsonb_subscript_assign builtin over the old
+            // column value (jsonb_set Create semantics: missing keys
+            // are created, arrays pad with JSON nulls). The bracket
+            // contents are full expressions, cast to text for the
+            // path array (integer subscripts render as their digits).
+            if *self.peek() == Token::LBracket {
+                let mut idxs = Vec::new();
+                while *self.peek() == Token::LBracket {
+                    self.next();
+                    let e = self.parse_or()?;
+                    self.expect(Token::RBracket, "']'")?;
+                    idxs.push(Expr::Cast {
+                        expr: Box::new(e),
+                        to: ColType::Text,
+                        written: None,
+                    });
+                }
+                self.expect(Token::Eq, "'='")?;
+                let value = self.parse_or()?;
+                let assign = Expr::Func {
+                    name: "__jsonb_subscript_assign".to_string(),
+                    args: vec![
+                        Expr::Column {
+                            table: None,
+                            name: col.clone(),
+                        },
+                        Expr::ArrayCtor {
+                            elems: idxs,
+                            nested: false,
+                        },
+                        value,
+                    ],
+                };
+                sets.push((col, assign));
+                if *self.peek() == Token::Comma {
+                    self.next();
+                    continue;
+                }
+                break;
+            }
             self.expect(Token::Eq, "'='")?;
             let expr = self.parse_or()?;
             sets.push((col, expr));
@@ -20686,6 +20732,7 @@ pub(crate) fn token_sql(t: &Token) -> String {
         Token::ArrowText => "->>".into(),
         Token::HashArrow => "#>".into(),
         Token::HashArrowText => "#>>".into(),
+        Token::HashMinus => "#-".into(),
         Token::AtGt => "@>".into(),
         Token::AtQuestion => "@?".into(),
         Token::AtAt => "@@".into(),

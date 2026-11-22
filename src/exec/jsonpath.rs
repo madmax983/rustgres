@@ -1849,6 +1849,14 @@ pub(crate) struct JpCtx<'a> {
     pub root: &'a JsonbVal,
     pub vars: Option<&'a JsonbVal>,
     pub lax: bool,
+    /// v2.38: the _tz entry points (jsonb_path_*_tz): datetime item
+    /// methods may convert between zoned and naive kinds using the
+    /// session TimeZone (PG19 executeJsonPath with tz=true).
+    pub tz: bool,
+    /// v2.38: existence-only evaluation (the @? operator): PG runs
+    /// executeJsonPath with found=NULL, where a unary +/- skips
+    /// non-numeric items instead of erroring on them.
+    pub existence: bool,
 }
 
 fn jperr(code: &'static str, msg: impl Into<String>) -> ExecError {
@@ -1945,7 +1953,25 @@ fn eval(e: &JpExpr, ctx: &JpCtx, input: &[JsonbVal], last: Option<i64>) -> EResu
             let seq = eval(base, ctx, input, last)?;
             let mut out = Vec::new();
             for item in &seq {
-                any_collect(item, 0, *first, *lastb, &mut out);
+                if *first == -1 {
+                    // v2.38: **{last} — only the deepest level of
+                    // this item's tree (the parser encodes the
+                    // `last` keyword as -1; a bare ** or {N to last}
+                    // is unaffected since first >= 0 there).
+                    fn max_depth(v: &JsonbVal) -> i64 {
+                        match v {
+                            JsonbVal::Array(e) => 1 + e.iter().map(max_depth).max().unwrap_or(-1),
+                            JsonbVal::Object(p) => {
+                                1 + p.iter().map(|(_, x)| max_depth(x)).max().unwrap_or(-1)
+                            }
+                            _ => 0,
+                        }
+                    }
+                    let md = max_depth(item);
+                    any_collect(item, 0, md, md, &mut out);
+                } else {
+                    any_collect(item, 0, *first, *lastb, &mut out);
+                }
             }
             Ok(out)
         }
@@ -1974,6 +2000,61 @@ fn eval(e: &JpExpr, ctx: &JpCtx, input: &[JsonbVal], last: Option<i64>) -> EResu
         JpExpr::Method(base, m) => {
             check_method_precision(m)?;
             let seq = eval(base, ctx, input, last)?;
+            // v2.38: .type() after a datetime method reports the SQL
+            // type name of the datetime item (PG19), not "string" —
+            // datetime results ride as Str, so the kind comes from
+            // the producing method (or, for .datetime() without a
+            // format, from the produced value's own shape).
+            if let JpMethod::Type = m {
+                if let JpExpr::Method(_, dm) = &**base {
+                    let fixed: Option<&'static str> = match dm {
+                        JpMethod::Date => Some("date"),
+                        JpMethod::Time(_) => Some("time without time zone"),
+                        JpMethod::TimeTz(_) => Some("time with time zone"),
+                        JpMethod::Timestamp(_) => Some("timestamp without time zone"),
+                        JpMethod::TimestampTz(_) => Some("timestamp with time zone"),
+                        JpMethod::Datetime(Some(f)) => {
+                            let (hd, ht, hz) = datetime_fmt_parts(f);
+                            Some(match (hd, ht, hz) {
+                                (true, false, _) => "date",
+                                (false, true, true) => "time with time zone",
+                                (false, true, false) => "time without time zone",
+                                (true, true, true) => "timestamp with time zone",
+                                _ => "timestamp without time zone",
+                            })
+                        }
+                        _ => None,
+                    };
+                    if fixed.is_some() || matches!(dm, JpMethod::Datetime(None)) {
+                        let mut out = Vec::new();
+                        let mut all_str = true;
+                        for item in &seq {
+                            match item {
+                                JsonbVal::Str(s) => {
+                                    let name = match fixed {
+                                        Some(f) => f,
+                                        None => match dt_classify(s) {
+                                            Some(k) => dt_type_name(k),
+                                            None => {
+                                                all_str = false;
+                                                break;
+                                            }
+                                        },
+                                    };
+                                    out.push(JsonbVal::Str(name.to_string()));
+                                }
+                                _ => {
+                                    all_str = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if all_str {
+                            return Ok(out);
+                        }
+                    }
+                }
+            }
             let mut out = Vec::new();
             for item in &seq {
                 if let JsonbVal::Array(elems) = item {
@@ -1996,32 +2077,54 @@ fn eval(e: &JpExpr, ctx: &JpCtx, input: &[JsonbVal], last: Option<i64>) -> EResu
             for item in input {
                 let lv = eval(l, ctx, std::slice::from_ref(item), last)?;
                 let rv = eval(r, ctx, std::slice::from_ref(item), last)?;
-                let ln = single_numeric(&lv, "left", *op)?;
-                let rn = single_numeric(&rv, "right", *op)?;
+                // PG19 executeBinaryArithmExpr unwraps the operand
+                // sequences (a [2] operand contributes its element).
+                let ln = single_numeric(&unwrap_items(&lv), "left", *op)?;
+                let rn = single_numeric(&unwrap_items(&rv), "right", *op)?;
                 out.push(JsonbVal::Number(arith_numeric(*op, &ln, &rn)?));
             }
             Ok(out)
         }
         JpExpr::UnaryPlus(inner) | JpExpr::UnaryMinus(inner) => {
+            // PG19 executeUnaryArithmExpr: the operator applies to
+            // EACH item of the operand sequence (auto-unwrapped);
+            // a non-numeric item is an error — except in the
+            // existence-only (@?) evaluation, where non-numeric
+            // items are skipped.
             let neg = matches!(e, JpExpr::UnaryMinus(_));
             let mut out = Vec::new();
             for item in input {
                 let v = eval(inner, ctx, std::slice::from_ref(item), last)?;
-                let n = single_numeric_unary(&v, neg)?;
-                out.push(JsonbVal::Number(if neg { n.neg() } else { n }));
+                for it in &unwrap_items(&v) {
+                    match it {
+                        JsonbVal::Number(n) => {
+                            out.push(JsonbVal::Number(if neg { n.neg() } else { n.clone() }));
+                        }
+                        _ if ctx.existence && ctx.lax => {}
+                        _ => {
+                            return Err(jperr(
+                                "22038",
+                                format!(
+                                    "operand of unary jsonpath operator {} is not a numeric value",
+                                    if neg { "-" } else { "+" }
+                                ),
+                            ));
+                        }
+                    }
+                }
             }
             Ok(out)
         }
-        // Predicate nodes in expression position produce boolean items
-        // (True/False); Unknown produces no item (PG's jperUnknown in
-        // value position yields an empty sequence).
+        // Predicate nodes in expression position produce boolean
+        // items; Unknown produces a JSON null item (PG19
+        // appendBoolResult: jpbUnknown appends jbvNull).
         _ if e.is_predicate() => {
             let mut out = Vec::new();
             for item in input {
                 match eval_pred(e, ctx, std::slice::from_ref(item), last, false)? {
                     Tri::True => out.push(JsonbVal::Bool(true)),
                     Tri::False => out.push(JsonbVal::Bool(false)),
-                    Tri::Unknown => {}
+                    Tri::Unknown => out.push(JsonbVal::Null),
                 }
             }
             Ok(out)
@@ -2126,9 +2229,24 @@ fn any_collect(v: &JsonbVal, depth: i64, first: i64, last: i64, out: &mut Vec<Js
     }
 }
 
+/// PG19's auto-unwrap of an operand sequence: array items are
+/// replaced by their elements (one level).
+fn unwrap_items(seq: &[JsonbVal]) -> Vec<JsonbVal> {
+    let mut out = Vec::new();
+    for it in seq {
+        match it {
+            JsonbVal::Array(elems) => out.extend(elems.iter().cloned()),
+            _ => out.push(it.clone()),
+        }
+    }
+    out
+}
+
 /// One operand of a jsonpath arithmetic operator must be exactly one
 /// numeric item (jsonpath_exec.c executeArithmetic).
 fn single_numeric(seq: &[JsonbVal], side: &str, op: JpArith) -> Result<Numeric, ExecError> {
+    // PG19 getScalar is an exact type test — a string operand of a
+    // binary operator is an error, never a conversion.
     match seq {
         [JsonbVal::Number(n)] => Ok(n.clone()),
         _ => Err(jperr(
@@ -2137,19 +2255,6 @@ fn single_numeric(seq: &[JsonbVal], side: &str, op: JpArith) -> Result<Numeric, 
                 "{} operand of jsonpath operator {} is not a single numeric value",
                 side,
                 op.sql()
-            ),
-        )),
-    }
-}
-
-fn single_numeric_unary(seq: &[JsonbVal], neg: bool) -> Result<Numeric, ExecError> {
-    match seq {
-        [JsonbVal::Number(n)] => Ok(n.clone()),
-        _ => Err(jperr(
-            "22038",
-            format!(
-                "operand of jsonpath operator {} is not a single numeric value",
-                if neg { "-" } else { "+" }
             ),
         )),
     }
@@ -2281,8 +2386,9 @@ fn eval_index_expr(
 /// to int4 via rint). Out-of-integer-range is a hard error in both
 /// modes.
 fn numeric_to_index(ctx: &JpCtx, n: &Numeric) -> Result<Option<i64>, ExecError> {
-    let r = n.round_to(0).unwrap_or_else(|| n.clone());
-    let f = r.to_f64();
+    // PG19 getArrayIndex: numeric_trunc(..., 0) — truncation toward
+    // zero, NOT rounding ($[0.5] selects element 0).
+    let f = n.to_f64().trunc();
     if !f.is_finite() || f.abs() > 2_147_483_647.0 {
         return Err(jperr(
             "22003",
@@ -2347,8 +2453,11 @@ fn eval_pred(
             Err(_) => Ok(Tri::True),
         },
         JpExpr::Exists(inner) => {
-            // exists(): evaluation failures mean "no items" — except
-            // undefined variables, which PG raises with ereport.
+            // exists(): an evaluation error inside yields UNKNOWN
+            // (PG19 executeBoolItem jpiExists: jperIsError ->
+            // jpbUnknown, in strict mode after a full no-throw
+            // evaluation; lax errors land in the same place) —
+            // except undefined variables, which PG raises.
             match eval(inner, ctx, input, last) {
                 Ok(seq) => Ok(if seq.is_empty() {
                     Tri::False
@@ -2356,42 +2465,56 @@ fn eval_pred(
                     Tri::True
                 }),
                 Err(e) if e.code == "42704" => Err(e),
-                Err(_) => Ok(Tri::False),
+                Err(_) => Ok(Tri::Unknown),
             }
         }
         JpExpr::Cmp(op, l, r) => {
-            let lv = operand_seq(l, ctx, input, last, suppress)?;
-            let rv = operand_seq(r, ctx, input, last, suppress)?;
+            let lv = operand_seq(l, ctx, input, last, true)?;
+            let rv = operand_seq(r, ctx, input, last, true)?;
             match (lv, rv) {
-                (Some(lv), Some(rv)) => Ok(compare_seqs(*op, &lv, &rv)),
+                (Some(lv), Some(rv)) => compare_seqs(*op, &lv, &rv, !ctx.lax, ctx.tz),
                 _ => Ok(Tri::Unknown),
             }
         }
         JpExpr::StartsWith(l, r) => {
-            let lv = operand_seq(l, ctx, input, last, suppress)?;
-            let rv = operand_seq(r, ctx, input, last, suppress)?;
+            let lv = operand_seq(l, ctx, input, last, true)?;
+            let rv = operand_seq(r, ctx, input, last, true)?;
             match (lv, rv) {
                 (Some(lv), Some(rv)) => {
                     let mut unknown = false;
+                    let mut found = false;
                     for a in &lv {
                         for b in &rv {
                             match (a, b) {
                                 (JsonbVal::Str(s), JsonbVal::Str(p)) => {
                                     if s.starts_with(p.as_str()) {
-                                        return Ok(Tri::True);
+                                        if ctx.lax {
+                                            return Ok(Tri::True);
+                                        }
+                                        found = true;
                                     }
                                 }
                                 _ => unknown = true,
                             }
                         }
                     }
-                    Ok(if unknown { Tri::Unknown } else { Tri::False })
+                    // PG19 executePredicate: strict mode lets an
+                    // unknown pair poison a true one.
+                    if !ctx.lax && unknown {
+                        Ok(Tri::Unknown)
+                    } else if found {
+                        Ok(Tri::True)
+                    } else if unknown {
+                        Ok(Tri::Unknown)
+                    } else {
+                        Ok(Tri::False)
+                    }
                 }
                 _ => Ok(Tri::Unknown),
             }
         }
         JpExpr::LikeRegex(l, pat, flags) => {
-            let lv = operand_seq(l, ctx, input, last, suppress)?;
+            let lv = operand_seq(l, ctx, input, last, true)?;
             match lv {
                 Some(lv) => {
                     let re = match like_regex_compile(pat, flags.as_deref()) {
@@ -2468,51 +2591,225 @@ fn operand_seq(
 
 /// Pairwise comparison of two item sequences (executeComparison):
 /// any true pair wins; else any incomparable pair makes it unknown.
-fn compare_seqs(op: JpCmp, lv: &[JsonbVal], rv: &[JsonbVal]) -> Tri {
+fn compare_seqs(
+    op: JpCmp,
+    lv: &[JsonbVal],
+    rv: &[JsonbVal],
+    strict: bool,
+    tz: bool,
+) -> Result<Tri, ExecError> {
     if lv.is_empty() || rv.is_empty() {
-        return Tri::Unknown;
+        // PG19: a comparison with an empty operand sequence is
+        // FALSE (the pair loop simply finds no true pair), not
+        // unknown — e.g. lax ($[*].a > 3) yields a boolean item.
+        return Ok(Tri::False);
     }
     let mut unknown = false;
+    let mut found = false;
     for a in lv {
         for b in rv {
-            match compare_pair(op, a, b) {
-                Some(true) => return Tri::True,
+            match compare_pair(op, a, b, tz)? {
+                Some(true) => {
+                    if !strict {
+                        return Ok(Tri::True);
+                    }
+                    found = true;
+                }
                 Some(false) => {}
                 None => unknown = true,
             }
         }
     }
-    if unknown { Tri::Unknown } else { Tri::False }
+    // PG19 executePredicate: in strict mode an unknown pair poisons
+    // the whole comparison ("return unknown, not success"); in lax
+    // mode any true pair wins.
+    if strict && unknown {
+        return Ok(Tri::Unknown);
+    }
+    Ok(if found {
+        Tri::True
+    } else if unknown {
+        Tri::Unknown
+    } else {
+        Tri::False
+    })
 }
 
-/// Compare one pair of items; None = incomparable (different types,
-/// or unordered kinds like arrays/objects — except ==/!= on
-/// containers, which PG supports via jsonb equality).
-fn compare_pair(op: JpCmp, a: &JsonbVal, b: &JsonbVal) -> Option<bool> {
+/// Compare one pair of items; None = unknown (PG19 compareItems:
+/// non-null items of different types are not comparable, and
+/// arrays/objects are never comparable — not even with ==).
+/// A null compared to a non-null is FALSE for every operator
+/// except !=, which is TRUE.
+/// v2.38: PG19 compareDatetime over string-carried datetime items.
+/// Ok(None) = the pair is not comparable (cast_error -> unknown).
+/// Err = PG19 checkTimezoneIsUsedForCast: comparing a naive value
+/// with a zoned one in a non-_tz function is a HARD error (0A000),
+/// raised even inside predicates — it is not an unknown.
+/// `use_tz` is the _tz entry-point flag: naive<->zoned conversions
+/// go through the session TimeZone only there.
+fn dt_compare(
+    kx: DtKind,
+    x: &str,
+    ky: DtKind,
+    y: &str,
+    use_tz: bool,
+) -> Result<Option<Ordering>, ExecError> {
+    fn tz_cast_err(from: &str, to: &str) -> ExecError {
+        exec_err_detail(
+            "0A000",
+            format!(
+                "cannot convert value from {} to {} without time zone usage",
+                from, to
+            ),
+            "Use *_tz() function for time zone support.",
+        )
+    }
+    const DAY: i64 = 86_400_000_000;
+    let days = |s: &str| {
+        dt_catch(|| crate::datetime::parse_date(s))
+            .ok()
+            .map(i64::from)
+    };
+    let tod = |s: &str| dt_parse_tod(s).ok();
+    let ts = |s: &str| dt_catch(|| crate::datetime::parse_timestamp(s)).ok();
+    let tstz = |s: &str| dt_catch(|| crate::datetime::parse_timestamptz(s)).ok();
+    // timetz_cmp_internal: UTC-adjusted tod, then larger offset
+    // sorts first.
+    let timetz_key =
+        |s: &str| tod(s).map(|t| (t - dt_offset_seconds(s) * 1_000_000, -dt_offset_seconds(s)));
+    let rev = |o: Result<Option<Ordering>, ExecError>| o.map(|r| r.map(|q| q.reverse()));
+    Ok(match (kx, ky) {
+        (DtKind::Date, DtKind::Date) => match (days(x), days(y)) {
+            (Some(a), Some(b)) => Some(a.cmp(&b)),
+            _ => None,
+        },
+        (DtKind::Time, DtKind::Time) => match (tod(x), tod(y)) {
+            (Some(a), Some(b)) => Some(a.cmp(&b)),
+            _ => None,
+        },
+        (DtKind::TimeTz, DtKind::TimeTz) => match (timetz_key(x), timetz_key(y)) {
+            (Some(a), Some(b)) => Some(a.cmp(&b)),
+            _ => None,
+        },
+        (DtKind::Timestamp, DtKind::Timestamp) => match (ts(x), ts(y)) {
+            (Some(a), Some(b)) => Some(a.cmp(&b)),
+            _ => None,
+        },
+        (DtKind::TimestampTz, DtKind::TimestampTz) => match (tstz(x), tstz(y)) {
+            (Some(a), Some(b)) => Some(a.cmp(&b)),
+            _ => None,
+        },
+        (DtKind::Date, DtKind::Timestamp) => match (days(x), ts(y)) {
+            // Compare by day parts first: a far-future date's
+            // midnight in micros overflows i64 (PG19 clamps the
+            // same way in date_cmp_timestamp_internal).
+            (Some(a), Some(b)) => {
+                let (bd, br) = (b.div_euclid(DAY), b.rem_euclid(DAY));
+                Some(match a.cmp(&bd) {
+                    Ordering::Equal => 0i64.cmp(&br),
+                    o => o,
+                })
+            }
+            _ => None,
+        },
+        (DtKind::Timestamp, DtKind::Date) => return rev(dt_compare(ky, y, kx, x, use_tz)),
+        (DtKind::Date, DtKind::TimestampTz) => {
+            if !use_tz {
+                return Err(tz_cast_err("date", "timestamptz"));
+            }
+            match (days(x), tstz(y)) {
+                (Some(a), Some(b)) => {
+                    // The instant read in the session zone, compared
+                    // by day parts (overflow-safe like the naive arm).
+                    let local = b.saturating_add(dt_sess_off_at(b) * 1_000_000);
+                    let (bd, br) = (local.div_euclid(DAY), local.rem_euclid(DAY));
+                    Some(match a.cmp(&bd) {
+                        Ordering::Equal => 0i64.cmp(&br),
+                        o => o,
+                    })
+                }
+                _ => None,
+            }
+        }
+        (DtKind::TimestampTz, DtKind::Date) => return rev(dt_compare(ky, y, kx, x, use_tz)),
+        (DtKind::Timestamp, DtKind::TimestampTz) => {
+            if !use_tz {
+                return Err(tz_cast_err("timestamp", "timestamptz"));
+            }
+            match (ts(x), tstz(y)) {
+                (Some(a), Some(b)) => {
+                    let utc = a - dt_sess_off_local(a) * 1_000_000;
+                    Some(utc.cmp(&b))
+                }
+                _ => None,
+            }
+        }
+        (DtKind::TimestampTz, DtKind::Timestamp) => return rev(dt_compare(ky, y, kx, x, use_tz)),
+        (DtKind::Time, DtKind::TimeTz) => {
+            if !use_tz {
+                return Err(tz_cast_err("time", "timetz"));
+            }
+            match (tod(x), timetz_key(y)) {
+                (Some(a), Some(b)) => {
+                    let off = dt_sess_off_local(a);
+                    Some((a - off * 1_000_000, -off).cmp(&b))
+                }
+                _ => None,
+            }
+        }
+        (DtKind::TimeTz, DtKind::Time) => return rev(dt_compare(ky, y, kx, x, use_tz)),
+        _ => None,
+    })
+}
+
+fn compare_pair(
+    op: JpCmp,
+    a: &JsonbVal,
+    b: &JsonbVal,
+    tz: bool,
+) -> Result<Option<bool>, ExecError> {
+    match (a, b) {
+        (JsonbVal::Null, JsonbVal::Null) => {}
+        (JsonbVal::Null, _) | (_, JsonbVal::Null) => {
+            return Ok(Some(op == JpCmp::Ne));
+        }
+        (JsonbVal::Array(_), _)
+        | (JsonbVal::Object(_), _)
+        | (_, JsonbVal::Array(_))
+        | (_, JsonbVal::Object(_)) => {
+            return Ok(None);
+        }
+        _ => {}
+    }
     let ord: Option<Ordering> = match (a, b) {
         (JsonbVal::Null, JsonbVal::Null) => Some(Ordering::Equal),
         (JsonbVal::Bool(x), JsonbVal::Bool(y)) => Some(x.cmp(y)),
         (JsonbVal::Number(x), JsonbVal::Number(y)) => Some(x.cmp(y)),
-        (JsonbVal::Str(x), JsonbVal::Str(y)) => Some(x.as_bytes().cmp(y.as_bytes())),
-        (JsonbVal::Array(_), JsonbVal::Array(_))
-        | (JsonbVal::Object(_), JsonbVal::Object(_))
-        | (JsonbVal::Array(_), JsonbVal::Object(_))
-        | (JsonbVal::Object(_), JsonbVal::Array(_)) => match op {
-            JpCmp::Eq => return Some(jsonb_cmp(a, b) == Ordering::Equal),
-            JpCmp::Ne => return Some(jsonb_cmp(a, b) != Ordering::Equal),
-            _ => return None,
-        },
-        _ => return None,
+        (JsonbVal::Str(x), JsonbVal::Str(y)) => {
+            // v2.38: two strings that both classify as datetimes
+            // compare by PG19's compareDatetime matrix (datetime
+            // items ride as strings in this engine). Incomparable
+            // kind pairs are unknown; naive<->zoned pairs in a
+            // non-_tz function are a hard 0A000 error.
+            match (dt_classify(x), dt_classify(y)) {
+                (Some(kx), Some(ky)) => match dt_compare(kx, x, ky, y, tz)? {
+                    Some(ord) => Some(ord),
+                    None => return Ok(None),
+                },
+                _ => Some(x.as_bytes().cmp(y.as_bytes())),
+            }
+        }
+        _ => return Ok(None),
     };
-    let ord = ord?;
-    Some(match op {
+    let Some(ord) = ord else { return Ok(None) };
+    Ok(Some(match op {
         JpCmp::Eq => ord == Ordering::Equal,
         JpCmp::Ne => ord != Ordering::Equal,
         JpCmp::Lt => ord == Ordering::Less,
         JpCmp::Le => ord != Ordering::Greater,
         JpCmp::Gt => ord == Ordering::Greater,
         JpCmp::Ge => ord != Ordering::Less,
-    })
+    }))
 }
 
 /// Compile a jsonpath like_regex pattern (XQuery regex flavor) onto
@@ -2538,9 +2835,13 @@ fn like_regex_compile(
     };
     let opts = crate::regex::RegexOptions {
         case_insensitive: flags.contains('i'),
-        // XQuery m: ^/$ match at newlines (and '.' stops at \n,
-        // which the engine bundles); s: '.' also matches \n.
-        newline_sensitive: flags.contains('m') && !flags.contains('s'),
+        // PG19 jspConvertRegexFlags: NLSTOP ('.' stops at \n) is the
+        // default and the `s` flag clears it; NLANCH (^/$ match at
+        // newlines) comes only from the `m` flag. The two are
+        // independent — the bundled newline_sensitive is wrong here.
+        newline_sensitive: false,
+        dot_stops_newline: !flags.contains('s'),
+        newline_anchors: flags.contains('m'),
         expanded: flags.contains('x') && !flags.contains('q'),
     };
     crate::regex::compile_opts(&pattern, opts)
@@ -2583,8 +2884,17 @@ fn apply_method(
             JsonbVal::Array(e) => {
                 out.push(JsonbVal::Number(Numeric::from_i64(e.len() as i64)));
             }
-            JsonbVal::Object(p) => {
-                out.push(JsonbVal::Number(Numeric::from_i64(p.len() as i64)));
+            JsonbVal::Object(_) => {
+                // PG19: .size() is array-only; in lax mode a
+                // non-array item (object included) yields 1.
+                if ctx.lax {
+                    out.push(JsonbVal::Number(Numeric::from_i64(1)));
+                } else {
+                    return Err(jperr(
+                        "22039",
+                        "jsonpath item method .size() can only be applied to an array",
+                    ));
+                }
             }
             _ => {
                 if ctx.lax {
@@ -2705,17 +3015,28 @@ fn apply_method(
                 ));
             }
             let n = conversion_numeric(item, m)?;
-            let n = n.round_to(scale as i32).unwrap_or_else(|| n.clone());
+            // PG19: .decimal() with no arguments is an unconstrained
+            // numeric conversion (no rounding); a scale applies only
+            // when given (or implied 0 when precision alone is given).
+            let n = if s.is_some() || p.is_some() {
+                n.round_to(scale as i32).unwrap_or_else(|| n.clone())
+            } else {
+                n
+            };
             if let Some(p) = p {
-                // precision: total significant digits must fit.
+                // PG19: the precision bounds the total significant
+                // digits of the ROUNDED value (leading zeros are
+                // not significant): numeric(1,2) accepts 0.01.
                 let txt = n.to_text();
-                let int_digits = txt
+                let sig_digits = txt
                     .trim_start_matches('-')
-                    .split('.')
-                    .next()
-                    .map(|s| s.trim_start_matches('0').len().max(1))
-                    .unwrap_or(1) as i64;
-                if int_digits + scale.max(0) as i64 > *p as i64 {
+                    .trim_start_matches('0')
+                    .trim_start_matches('.')
+                    .trim_start_matches('0')
+                    .chars()
+                    .filter(|c| c.is_ascii_digit())
+                    .count() as i64;
+                if sig_digits > *p as i64 {
                     return Err(jperr(
                         "22003",
                         format!(
@@ -2732,12 +3053,13 @@ fn apply_method(
         JpMethod::Boolean => match item {
             JsonbVal::Bool(b) => out.push(JsonbVal::Bool(*b)),
             JsonbVal::Number(n) => {
-                if n.is_zero() {
-                    out.push(JsonbVal::Bool(false));
-                } else if *n == Numeric::from_i64(1) {
-                    out.push(JsonbVal::Bool(true));
-                } else {
-                    return Err(bool_arg_err(item));
+                // PG19 converts the numeric through int4in on its
+                // text form (both modes): "100" and "-1" are true,
+                // "1.23" and "1e1000" are errors.
+                let txt = n.to_text();
+                match txt.trim().parse::<i32>() {
+                    Ok(v) => out.push(JsonbVal::Bool(v != 0)),
+                    Err(_) => return Err(bool_arg_err(item)),
                 }
             }
             JsonbVal::Str(s) => match parse_pg_bool(s) {
@@ -2881,7 +3203,7 @@ fn apply_method(
         | JpMethod::TimestampTz(_)
         | JpMethod::Datetime(_) => {
             let txt = datetime_string_arg(item, m)?;
-            out.push(JsonbVal::Str(eval_datetime_method(m, &txt)?));
+            out.push(JsonbVal::Str(eval_datetime_method(m, &txt, ctx.tz)?));
         }
     }
     Ok(())
@@ -3028,10 +3350,12 @@ fn parse_pg_bool(s: &str) -> Option<bool> {
 
 /// Build an execution context, validating the vars argument the way
 /// PG's jsonb_path_* wrappers do.
-pub(crate) fn jp_context<'a>(
+/// v2.38: jp_context with the _tz flag (see JpCtx::tz).
+pub(crate) fn jp_context_tz<'a>(
     root: &'a JsonbVal,
     path: &JpPath,
     vars: Option<&'a JsonbVal>,
+    tz: bool,
 ) -> Result<JpCtx<'a>, ExecError> {
     if let Some(v) = vars {
         if !matches!(v, JsonbVal::Object(_)) {
@@ -3042,6 +3366,8 @@ pub(crate) fn jp_context<'a>(
         root,
         vars,
         lax: path.lax,
+        tz,
+        existence: false,
     })
 }
 
@@ -3051,14 +3377,26 @@ pub(crate) fn jp_query_seq(
     path: &JpPath,
     vars: Option<&JsonbVal>,
 ) -> Result<Vec<JsonbVal>, ExecError> {
-    let ctx = jp_context(root, path, vars)?;
+    jp_query_seq_tz(root, path, vars, false)
+}
+
+/// v2.38: jp_query_seq for the _tz entry points.
+pub(crate) fn jp_query_seq_tz(
+    root: &JsonbVal,
+    path: &JpPath,
+    vars: Option<&JsonbVal>,
+    tz: bool,
+) -> Result<Vec<JsonbVal>, ExecError> {
+    let ctx = jp_context_tz(root, path, vars, tz)?;
     if path.expr.is_predicate() {
         let mut out = Vec::new();
         for item in std::slice::from_ref(root) {
             match eval_pred(&path.expr, &ctx, std::slice::from_ref(item), None, false)? {
                 Tri::True => out.push(JsonbVal::Bool(true)),
                 Tri::False => out.push(JsonbVal::Bool(false)),
-                Tri::Unknown => {}
+                // PG19 appendBoolResult: an unknown predicate
+                // verdict materializes as a JSON null item.
+                Tri::Unknown => out.push(JsonbVal::Null),
             }
         }
         Ok(out)
@@ -3074,7 +3412,18 @@ pub(crate) fn jp_exists(
     path: &JpPath,
     vars: Option<&JsonbVal>,
 ) -> Result<bool, ExecError> {
-    let ctx = jp_context(root, path, vars)?;
+    jp_exists_tz(root, path, vars, false)
+}
+
+/// v2.38: jp_exists for the _tz entry points.
+pub(crate) fn jp_exists_tz(
+    root: &JsonbVal,
+    path: &JpPath,
+    vars: Option<&JsonbVal>,
+    tz: bool,
+) -> Result<bool, ExecError> {
+    let mut ctx = jp_context_tz(root, path, vars, tz)?;
+    ctx.existence = true;
     if path.expr.is_predicate() {
         // PG19 jsonpath_exec.c: a top-level predicate item goes
         // through appendBoolResult, which in exists mode (no result
@@ -3267,12 +3616,27 @@ pub(crate) fn jp_match(
     path: &JpPath,
     vars: Option<&JsonbVal>,
 ) -> Result<Option<bool>, ExecError> {
-    let ctx = jp_context(root, path, vars)?;
+    jp_match_tz(root, path, vars, false)
+}
+
+/// v2.38: jp_match for the _tz entry points.
+pub(crate) fn jp_match_tz(
+    root: &JsonbVal,
+    path: &JpPath,
+    vars: Option<&JsonbVal>,
+    tz: bool,
+) -> Result<Option<bool>, ExecError> {
+    let ctx = jp_context_tz(root, path, vars, tz)?;
     let seq = if path.expr.is_predicate() {
         match eval_pred(&path.expr, &ctx, std::slice::from_ref(root), None, false)? {
             Tri::True => vec![JsonbVal::Bool(true)],
             Tri::False => vec![JsonbVal::Bool(false)],
-            Tri::Unknown => Vec::new(),
+            // v2.38: PG19 jsonb_path_match: a predicate that
+            // evaluates to unknown yields SQL NULL, never the
+            // 22038 singleton error (executeJsonPath appends no
+            // item; the wrapper then returns NULL even with
+            // silent=false — e.g. 'strict exists($[*].a)').
+            Tri::Unknown => return Ok(None),
         }
     } else {
         eval(&path.expr, &ctx, std::slice::from_ref(root), None)?
@@ -3342,6 +3706,26 @@ fn dt_has_offset(s: &str) -> bool {
                 .rfind('-')
                 .map(|i| i > time_part.find(':').unwrap_or(0))
                 .unwrap_or(false)
+        || dt_named_zone_offset(s).is_some()
+}
+
+/// v2.38: a trailing alphabetic zone designator ("EST", "UTC",
+/// "PST") attached to or following the time: its UTC offset in
+/// seconds, derived by parsing the value with and without it.
+fn dt_named_zone_offset(s: &str) -> Option<i64> {
+    let t = s.trim();
+    let start = t.rfind(|c: char| !c.is_ascii_alphabetic())? + 1;
+    let zone = &t[start..];
+    if zone.len() < 2 || start == 0 {
+        return None;
+    }
+    let stripped = t[..start].trim_end();
+    if !stripped.contains(':') {
+        return None;
+    }
+    let naive = dt_catch(|| crate::datetime::parse_timestamp(stripped)).ok()?;
+    let utc = dt_catch(|| crate::datetime::parse_timestamptz(t)).ok()?;
+    Some((naive - utc) / 1_000_000)
 }
 
 /// Classify a datetime string the way PG's datetime parser does.
@@ -3352,6 +3736,19 @@ fn dt_classify(s: &str) -> Option<DtKind> {
     }
     if dt_catch(|| crate::datetime::parse_date(t)).is_ok() && !t.contains(':') {
         return Some(DtKind::Date);
+    }
+    // v2.38: a space-separated zone ("12:34:56 +05:30") belongs to a
+    // TIME, not a timestamp: the timestamp family requires a date
+    // head before the separator.
+    if let Some(sep) = t.find(['T', ' ']) {
+        let head = &t[..sep];
+        if head.contains(':') {
+            return Some(if dt_has_offset(t) {
+                DtKind::TimeTz
+            } else {
+                DtKind::Time
+            });
+        }
     }
     let has_time_sep = t.contains(['T', ' ']) && t.contains(':');
     if has_time_sep {
@@ -3371,9 +3768,19 @@ fn dt_classify(s: &str) -> Option<DtKind> {
     None
 }
 
-/// Parse "HH:MM:SS[.ffffff]" into micros-of-day.
+/// Parse "HH:MM:SS[.ffffff]" into micros-of-day. A trailing zone
+/// offset (`+hh[:mm]`, `-hh[:mm]`, `Z`, optionally space-separated)
+/// is stripped first — timetz inputs carry one (v2.38).
 fn dt_parse_tod(s: &str) -> Result<i64, String> {
     let t = s.trim();
+    let t = match t.find(['+', 'Z', 'z']) {
+        Some(i) => t[..i].trim_end(),
+        None => match t.rfind('-') {
+            // A '-' after the minutes colon starts the offset.
+            Some(i) if t[..i].matches(':').count() >= 2 => t[..i].trim_end(),
+            _ => t,
+        },
+    };
     let mut parts = t.split(':');
     let h: i64 = parts
         .next()
@@ -3412,38 +3819,119 @@ fn dt_offset_seconds(s: &str) -> i64 {
     if t.ends_with(['Z', 'z']) {
         return 0;
     }
-    let time_part = match t.find(['T', ' ']) {
-        Some(i) => &t[i + 1..],
-        None => t,
-    };
-    for (i, c) in time_part.char_indices() {
-        if (c == '+' || c == '-') && i > 0 {
-            let off = &time_part[i..];
-            let sign = if c == '-' { -1 } else { 1 };
-            let body = &off[1..];
-            let (hh, mm) = match body.split_once(':') {
-                Some((a, b)) => (
-                    a.parse::<i64>().unwrap_or(0),
-                    b.trim_end_matches(|ch: char| ch.is_alphabetic())
-                        .parse::<i64>()
-                        .unwrap_or(0),
-                ),
-                None => (body.parse::<i64>().unwrap_or(0), 0),
-            };
-            return sign * (hh * 3600 + mm * 60);
+    // v2.38: the offset sign is the LAST '+'/'-' that follows a
+    // time colon (date separators and a leading sign don't count;
+    // a space before the offset is fine, e.g. "12:34 +05").
+    let mut sign_at = None;
+    for (i, c) in t.char_indices() {
+        if (c == '+' || c == '-') && t[..i].contains(':') {
+            sign_at = Some(i);
         }
     }
-    0
+    let Some(i) = sign_at else { return 0 };
+    let sign = if t.as_bytes()[i] == b'-' { -1 } else { 1 };
+    let body = &t[i + 1..];
+    let (hh, mm) = match body.split_once(':') {
+        Some((a, b)) => (
+            a.parse::<i64>().unwrap_or(0),
+            b.trim_end_matches(|ch: char| ch.is_alphabetic())
+                .parse::<i64>()
+                .unwrap_or(0),
+        ),
+        None => (
+            body.trim_end_matches(|ch: char| ch.is_alphabetic())
+                .parse::<i64>()
+                .unwrap_or(0),
+            0,
+        ),
+    };
+    sign * (hh * 3600 + mm * 60)
 }
 
-fn dt_format_offset(secs: i64) -> String {
+/// v2.38: the offset a zoned input string carries, derived from the
+/// crate parsers (handles named zones like EST, which
+/// dt_offset_seconds cannot see).
+fn dt_input_offset(s: &str) -> i64 {
+    let naive = dt_catch(|| crate::datetime::parse_timestamp(s)).ok();
+    let utc = dt_catch(|| crate::datetime::parse_timestamptz(s)).ok();
+    match (naive, utc) {
+        (Some(n), Some(u)) => (n - u) / 1_000_000,
+        _ => dt_named_zone_offset(s).unwrap_or_else(|| dt_offset_seconds(s)),
+    }
+}
+
+/// v2.38: PG19 jsonpath renders datetime items in ISO form: the
+/// offset always carries HH:MM (never the bare "+05" of timetz_out).
+fn iso_offset(secs: i64) -> String {
     let sign = if secs < 0 { "-" } else { "+" };
     let a = secs.abs();
-    let (h, m) = (a / 3600, (a % 3600) / 60);
-    if m == 0 {
-        format!("{}{:02}", sign, h)
+    let (h, m, s) = (a / 3600, (a % 3600) / 60, a % 60);
+    if s != 0 {
+        format!("{}{:02}:{:02}:{:02}", sign, h, m, s)
     } else {
         format!("{}{:02}:{:02}", sign, h, m)
+    }
+}
+
+/// v2.38: ISO rendering of a date (jsonpath output is always ISO,
+/// independent of the session DateStyle — which the conformance
+/// runner sets to Postgres,MDY).
+fn iso_date(days: i64) -> String {
+    let (y, m, d) = crate::datetime::civil_from_days(days);
+    if y <= 0 {
+        format!("{:04}-{:02}-{:02} BC", 1 - y, m, d)
+    } else {
+        format!("{:04}-{:02}-{:02}", y, m, d)
+    }
+}
+
+/// v2.38: ISO rendering of a naive timestamp ("T" separator).
+fn iso_ts(micros: i64) -> String {
+    let (days, tod) = crate::datetime::split_micros(micros);
+    format!("{}T{}", iso_date(days), format_time_of_day(tod))
+}
+
+/// v2.38: ISO rendering of an instant at a fixed offset.
+fn iso_tstz_at(utc_micros: i64, off_secs: i64) -> String {
+    format!(
+        "{}{}",
+        iso_ts(utc_micros + off_secs * 1_000_000),
+        iso_offset(off_secs)
+    )
+}
+
+/// v2.38: (has_date, has_time, has_tz) of a .datetime() format,
+/// ignoring quoted literals.
+fn datetime_fmt_parts(fmt: &str) -> (bool, bool, bool) {
+    let mut unq = String::new();
+    let mut quoted = false;
+    for c in fmt.chars() {
+        if c == '"' {
+            quoted = !quoted;
+            continue;
+        }
+        if !quoted {
+            unq.push(c.to_ascii_uppercase());
+        }
+    }
+    let has_time = unq.contains("HH") || unq.contains("MI") || unq.contains("SS");
+    let has_date = [
+        "YYYY", "RRRR", "MM", "DD", "MONTH", "MON", "DAY", "DY", "IYYY", "IW", "ID",
+    ]
+    .iter()
+    .any(|t| unq.contains(t))
+        || unq.contains('J');
+    (has_date, has_time, datetime_format_has_tz(fmt))
+}
+
+/// v2.38: the SQL type name .type() reports for a datetime item.
+fn dt_type_name(kind: DtKind) -> &'static str {
+    match kind {
+        DtKind::Date => "date",
+        DtKind::Time => "time without time zone",
+        DtKind::TimeTz => "time with time zone",
+        DtKind::Timestamp => "timestamp without time zone",
+        DtKind::TimestampTz => "timestamp with time zone",
     }
 }
 
@@ -3509,25 +3997,50 @@ fn check_method_precision(m: &JpMethod) -> Result<(), ExecError> {
     Ok(())
 }
 
+/// v2.38: session-zone offset (seconds) in effect at a UTC instant.
+fn dt_sess_off_at(utc_micros: i64) -> i64 {
+    let zone = crate::datetime::session_tz_name();
+    crate::datetime::tz_lookup_utc(&zone, utc_micros)
+        .map(|(o, _)| o as i64)
+        .unwrap_or(0)
+}
+
+/// v2.38: session-zone offset (seconds) in effect at a naive local
+/// instant.
+fn dt_sess_off_local(local_micros: i64) -> i64 {
+    let zone = crate::datetime::session_tz_name();
+    crate::datetime::tz_lookup_local(&zone, local_micros)
+        .map(|(o, _)| o as i64)
+        .unwrap_or(0)
+}
+
 /// Evaluate one datetime item method on a string input; returns PG's
-/// rendered result text.
-fn eval_datetime_method(m: &JpMethod, input: &str) -> Result<String, ExecError> {
+/// rendered result text. `tz` is the _tz entry-point flag: with it,
+/// zoned<->naive conversions go through the session TimeZone instead
+/// of raising 22031 (PG19 executeDateTimeMethod).
+fn eval_datetime_method(m: &JpMethod, input: &str, tz: bool) -> Result<String, ExecError> {
     let kind = dt_classify(input);
     match m {
         JpMethod::Date => match kind {
             Some(DtKind::Date) => {
                 let d = dt_catch(|| crate::datetime::parse_date(input))
                     .map_err(|_| dt_not_recognized("date", input))?;
-                Ok(crate::datetime::format_date(d))
+                Ok(iso_date(d as i64))
             }
             Some(DtKind::Timestamp) => {
                 let t = dt_catch(|| crate::datetime::parse_timestamp(input))
                     .map_err(|_| dt_not_recognized("date", input))?;
-                Ok(crate::datetime::format_date(
-                    (t.div_euclid(86_400_000_000)) as i32,
-                ))
+                Ok(iso_date(t.div_euclid(86_400_000_000)))
             }
-            Some(DtKind::TimestampTz) => Err(dt_cannot_convert(DtKind::TimestampTz, DtKind::Date)),
+            Some(DtKind::TimestampTz) => {
+                if !tz {
+                    return Err(dt_cannot_convert(DtKind::TimestampTz, DtKind::Date));
+                }
+                let t = dt_catch(|| crate::datetime::parse_timestamptz(input))
+                    .map_err(|_| dt_not_recognized("date", input))?;
+                let local = t + dt_sess_off_at(t) * 1_000_000;
+                Ok(iso_date(local.div_euclid(86_400_000_000)))
+            }
             _ => Err(dt_not_recognized("date", input)),
         },
         JpMethod::Time(prec) => match kind {
@@ -3542,7 +4055,22 @@ fn eval_datetime_method(m: &JpMethod, input: &str) -> Result<String, ExecError> 
                 Ok(format_time_of_day(dt_apply_precision(tod, *prec)))
             }
             Some(k @ (DtKind::TimeTz | DtKind::TimestampTz)) => {
-                Err(dt_cannot_convert(k, DtKind::Time))
+                if !tz {
+                    return Err(dt_cannot_convert(k, DtKind::Time));
+                }
+                // v2.38 (_tz): shift the instant into the session
+                // zone and take its time-of-day.
+                let tod = if k == DtKind::TimeTz {
+                    // PG19 timetz_time: the wall time as-is, zone
+                    // dropped (after the *_tz usage check above).
+                    dt_parse_tod(input).map_err(|_| dt_not_recognized("time", input))?
+                } else {
+                    let t = dt_catch(|| crate::datetime::parse_timestamptz(input))
+                        .map_err(|_| dt_not_recognized("time", input))?;
+                    let local = t + dt_sess_off_at(t) * 1_000_000;
+                    ((local % 86_400_000_000) + 86_400_000_000) % 86_400_000_000
+                };
+                Ok(format_time_of_day(dt_apply_precision(tod, *prec)))
             }
             _ => Err(dt_not_recognized("time", input)),
         },
@@ -3552,35 +4080,47 @@ fn eval_datetime_method(m: &JpMethod, input: &str) -> Result<String, ExecError> 
                 Ok(format!(
                     "{}{}",
                     format_time_of_day(dt_apply_precision(tod, *prec)),
-                    dt_format_offset(dt_offset_seconds(input))
+                    iso_offset(dt_offset_seconds(input))
                 ))
             }
             Some(DtKind::TimestampTz) => {
-                let t = dt_catch(|| crate::datetime::parse_timestamp(input))
+                // PG19 timestamptz_timetz: the instant read in the
+                // SESSION zone (its tod and that offset).
+                let t = dt_catch(|| crate::datetime::parse_timestamptz(input))
                     .map_err(|_| dt_not_recognized("time_tz", input))?;
-                let tod = ((t % 86_400_000_000) + 86_400_000_000) % 86_400_000_000;
+                let off = dt_sess_off_at(t);
+                let local = t + off * 1_000_000;
+                let tod = ((local % 86_400_000_000) + 86_400_000_000) % 86_400_000_000;
                 Ok(format!(
                     "{}{}",
                     format_time_of_day(dt_apply_precision(tod, *prec)),
-                    dt_format_offset(dt_offset_seconds(input))
+                    iso_offset(off)
                 ))
             }
-            Some(DtKind::Time) => Err(dt_cannot_convert(DtKind::Time, DtKind::TimeTz)),
-            Some(DtKind::Timestamp) => Err(dt_cannot_convert(DtKind::Timestamp, DtKind::TimeTz)),
+            Some(DtKind::Time) => {
+                if !tz {
+                    return Err(dt_cannot_convert(DtKind::Time, DtKind::TimeTz));
+                }
+                let tod = dt_parse_tod(input).map_err(|_| dt_not_recognized("time_tz", input))?;
+                let off = dt_sess_off_local(tod);
+                Ok(format!(
+                    "{}{}",
+                    format_time_of_day(dt_apply_precision(tod, *prec)),
+                    iso_offset(off)
+                ))
+            }
             _ => Err(dt_not_recognized("time_tz", input)),
         },
         JpMethod::Timestamp(prec) => match kind {
             Some(DtKind::Timestamp) => {
                 let t = dt_catch(|| crate::datetime::parse_timestamp(input))
                     .map_err(|_| dt_not_recognized("timestamp", input))?;
-                Ok(crate::datetime::format_timestamp(dt_apply_precision(
-                    t, *prec,
-                )))
+                Ok(iso_ts(dt_apply_precision(t, *prec)))
             }
             Some(DtKind::Date) => {
                 let d = dt_catch(|| crate::datetime::parse_date(input))
                     .map_err(|_| dt_not_recognized("timestamp", input))?;
-                Ok(crate::datetime::format_timestamp(dt_apply_precision(
+                Ok(iso_ts(dt_apply_precision(
                     // v1.86: checked (extreme dates overflow i64
                     // micros; saturate — format clamps like PG's
                     // range error path in strict mode is unreachable
@@ -3594,20 +4134,41 @@ fn eval_datetime_method(m: &JpMethod, input: &str) -> Result<String, ExecError> 
                 )))
             }
             Some(DtKind::TimestampTz) => {
-                Err(dt_cannot_convert(DtKind::TimestampTz, DtKind::Timestamp))
+                if !tz {
+                    return Err(dt_cannot_convert(DtKind::TimestampTz, DtKind::Timestamp));
+                }
+                let t = dt_catch(|| crate::datetime::parse_timestamptz(input))
+                    .map_err(|_| dt_not_recognized("timestamp", input))?;
+                let local = t + dt_sess_off_at(t) * 1_000_000;
+                Ok(iso_ts(dt_apply_precision(local, *prec)))
             }
             _ => Err(dt_not_recognized("timestamp", input)),
         },
         JpMethod::TimestampTz(prec) => match kind {
             Some(DtKind::TimestampTz) => {
-                let t = dt_catch(|| crate::datetime::parse_timestamp(input))
+                // v2.38: ISO rendering at the value's OWN offset.
+                let t = dt_catch(|| crate::datetime::parse_timestamptz(input))
                     .map_err(|_| dt_not_recognized("timestamp_tz", input))?;
-                Ok(crate::datetime::format_timestamptz(dt_apply_precision(
-                    t, *prec,
-                )))
+                let t = dt_apply_precision(t, *prec);
+                Ok(iso_tstz_at(t, dt_input_offset(input)))
             }
             Some(k @ (DtKind::Date | DtKind::Timestamp)) => {
-                Err(dt_cannot_convert(k, DtKind::TimestampTz))
+                if !tz {
+                    return Err(dt_cannot_convert(k, DtKind::TimestampTz));
+                }
+                // v2.38 (_tz): interpret the naive value in the
+                // session zone; render the instant there (ISO).
+                let local = if k == DtKind::Date {
+                    let d = dt_catch(|| crate::datetime::parse_date(input))
+                        .map_err(|_| dt_not_recognized("timestamp_tz", input))?;
+                    (d as i64) * 86_400_000_000
+                } else {
+                    dt_catch(|| crate::datetime::parse_timestamp(input))
+                        .map_err(|_| dt_not_recognized("timestamp_tz", input))?
+                };
+                let utc = local - dt_sess_off_local(local) * 1_000_000;
+                let utc = dt_apply_precision(utc, *prec);
+                Ok(iso_tstz_at(utc, dt_sess_off_at(utc)))
             }
             _ => Err(dt_not_recognized("timestamp_tz", input)),
         },
@@ -3640,25 +4201,47 @@ fn eval_datetime_method(m: &JpMethod, input: &str) -> Result<String, ExecError> 
                     + parsed.second.unwrap_or(0) as i64)
                     * 1_000_000
                     + parsed.micros.unwrap_or(0) as i64;
-                Ok(crate::datetime::format_timestamp(
-                    days * 86_400_000_000 + tod,
-                ))
+                // v2.38: the result kind follows the format: date
+                // elements only -> date, time only -> time, both ->
+                // timestamp; TZ elements make it zoned (ISO forms).
+                let (has_date, has_time, has_tz) = datetime_fmt_parts(f);
+                let micros = days * 86_400_000_000 + tod;
+                if has_date && !has_time {
+                    Ok(iso_date(days))
+                } else if has_time && !has_date {
+                    if has_tz {
+                        Ok(format!(
+                            "{}{}",
+                            format_time_of_day(tod),
+                            iso_offset(dt_offset_seconds(input))
+                        ))
+                    } else {
+                        Ok(format_time_of_day(tod))
+                    }
+                } else if has_tz {
+                    let off = dt_offset_seconds(input);
+                    Ok(iso_tstz_at(micros - off * 1_000_000, off))
+                } else {
+                    Ok(iso_ts(micros))
+                }
             }
             None => match kind {
                 Some(DtKind::Date) => {
                     let d = dt_catch(|| crate::datetime::parse_date(input))
                         .map_err(|_| dt_not_recognized("datetime", input))?;
-                    Ok(crate::datetime::format_date(d))
+                    Ok(iso_date(d as i64))
                 }
                 Some(DtKind::Timestamp) => {
                     let t = dt_catch(|| crate::datetime::parse_timestamp(input))
                         .map_err(|_| dt_not_recognized("datetime", input))?;
-                    Ok(crate::datetime::format_timestamp(t))
+                    Ok(iso_ts(t))
                 }
                 Some(DtKind::TimestampTz) => {
-                    let t = dt_catch(|| crate::datetime::parse_timestamp(input))
+                    // v2.38: .datetime() is kind-preserving even in
+                    // the non-_tz functions (PG19): ISO at own offset.
+                    let t = dt_catch(|| crate::datetime::parse_timestamptz(input))
                         .map_err(|_| dt_not_recognized("datetime", input))?;
-                    Ok(crate::datetime::format_timestamptz(t))
+                    Ok(iso_tstz_at(t, dt_input_offset(input)))
                 }
                 Some(DtKind::Time) => {
                     let tod =
@@ -3671,7 +4254,7 @@ fn eval_datetime_method(m: &JpMethod, input: &str) -> Result<String, ExecError> 
                     Ok(format!(
                         "{}{}",
                         format_time_of_day(tod),
-                        dt_format_offset(dt_offset_seconds(input))
+                        iso_offset(dt_offset_seconds(input))
                     ))
                 }
                 None => Err(dt_not_recognized("datetime", input)),

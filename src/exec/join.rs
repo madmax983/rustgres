@@ -808,6 +808,8 @@ pub(crate) fn table_function_col_names(name: &str) -> Result<Vec<String>, ExecEr
         // with the text[] value (PG19: a scalar function in FROM is a
         // one-row table).
         "parse_ident" => Ok(vec![name.to_string()]),
+        // v2.38: repeat() is scalar; in FROM it yields one row.
+        "repeat" => Ok(vec![name.to_string()]),
         // v2.18: the updatability introspection functions are
         // scalar; in FROM they yield one row like parse_ident.
         "pg_relation_is_updatable" | "pg_column_is_updatable" => Ok(vec![name.to_string()]),
@@ -897,6 +899,7 @@ pub(crate) fn table_function_col_types(
             Ok(vec![ColType::Text])
         }
         "regexp_split_to_table" => Ok(vec![ColType::Text]),
+        "repeat" => Ok(vec![ColType::Text]),
         "pg_input_error_info" => Ok(vec![ColType::Text; 4]),
         // v2.30: pg_mcv_list_items (int4, text[], bool[], float8, float8).
         "pg_mcv_list_items" => Ok(vec![
@@ -4282,7 +4285,19 @@ pub(crate) fn build_source(
                         .map(|r| &r[i])
                         .filter(|v| !matches!(v, Value::Null))
                         .map(value_coltype)
-                        .max_by_key(|t| type_rank(t))
+                        // v2.38: PG19 VALUES type resolution treats
+                        // string literals as UNKNOWN — a column with
+                        // any concrete typed value (e.g. a jsonb
+                        // literal in one row) takes that type, and
+                        // the bare literals coerce to it. Text only
+                        // wins when nothing concrete is present.
+                        .max_by_key(|t| {
+                            if matches!(t, ColType::Text) {
+                                -1
+                            } else {
+                                type_rank(t) as i32
+                            }
+                        })
                         .unwrap_or(ColType::Text);
                     QCol {
                         qual: alias.clone(),

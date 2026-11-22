@@ -637,7 +637,8 @@ pub(crate) fn eval_json_op(op: JsonOp, left: &Value, right: &Value) -> Result<Va
         | JsonOp::Overlaps
         | JsonOp::OverLeft
         | JsonOp::OverRight
-        | JsonOp::Adjacent => {
+        | JsonOp::Adjacent
+        | JsonOp::DeletePath => {
             return Err(exec_err(
                 "42883",
                 format!(
@@ -1254,6 +1255,27 @@ fn eval_jsonb_op(op: JsonOp, doc_text: &str, right: &Value) -> Result<Value, Exe
             };
             Ok(jsonb_extract_result(op, doc.path(&path)))
         }
+        // v2.38: `#-` — delete at path (jsonb_delete_path operator
+        // form, PG19 jsonfuncs.c): scalar target is 22023, an empty
+        // container or empty path returns the target unchanged.
+        JsonOp::DeletePath => {
+            let path = match json_path_elems(op, "jsonb", right)? {
+                None => return Ok(Value::Null),
+                Some(p) => p,
+            };
+            if !matches!(doc, JsonbVal::Object(_) | JsonbVal::Array(_)) {
+                return Err(exec_err("22023", "cannot delete path in scalar"));
+            }
+            if path.is_empty()
+                || matches!(doc, JsonbVal::Object(ref p) if p.is_empty())
+                || matches!(doc, JsonbVal::Array(ref e) if e.is_empty())
+            {
+                return Ok(Value::jsonb(doc.render()));
+            }
+            let path_opts: Vec<Option<String>> = path.into_iter().map(Some).collect();
+            let out = jsonb_set_path(doc, &path_opts, None, JsonbPathOp::Delete)?;
+            Ok(Value::jsonb(out.render()))
+        }
         JsonOp::Contains | JsonOp::ContainedBy => {
             let other = match right {
                 Value::Jsonb(s) => match parse_jsonb(s) {
@@ -1411,12 +1433,20 @@ fn eval_jsonb_op(op: JsonOp, doc_text: &str, right: &Value) -> Result<Value, Exe
                 }
             };
             let path = super::jsonpath::parse_jsonpath(path_text)?;
+            // v2.38: the @? / @@ operators are the silent forms
+            // (PG19 jsonb_path_exists_internal / _match_internal with
+            // silent=true): execution errors collapse to SQL NULL,
+            // never raise — even in strict mode.
             if op == JsonOp::PathExists {
-                Ok(Value::Bool(super::jsonpath::jp_exists(&doc, &path, None)?))
+                match super::jsonpath::jp_exists(&doc, &path, None) {
+                    Ok(b) => Ok(Value::Bool(b)),
+                    Err(_) => Ok(Value::Null),
+                }
             } else {
-                match super::jsonpath::jp_match(&doc, &path, None)? {
-                    Some(b) => Ok(Value::Bool(b)),
-                    None => Ok(Value::Null),
+                match super::jsonpath::jp_match(&doc, &path, None) {
+                    Ok(Some(b)) => Ok(Value::Bool(b)),
+                    Ok(None) => Ok(Value::Null),
+                    Err(_) => Ok(Value::Null),
                 }
             }
         }
@@ -2197,6 +2227,128 @@ fn set_path_rec(
     }
 }
 
+/// v2.38: jsonb subscript assignment (PG19 jsonfuncs.c setPath with
+/// JB_PATH_CREATE | JB_PATH_FILL_GAPS — the mode the subscripting
+/// machinery uses, distinct from plain jsonb_set): missing path
+/// elements are created (arrays pad with JSON nulls in both
+/// directions within range), but descending into an EXISTING scalar
+/// is 22023 "cannot replace existing key" with PG's DETAIL, and a
+/// negative array index whose magnitude exceeds the length is
+/// 22023 "path element at position N is out of range: X".
+pub(crate) fn jsonb_subscript_assign(
+    root: JsonbVal,
+    path: &[Option<String>],
+    newval: &JsonbVal,
+) -> Result<JsonbVal, ExecError> {
+    assign_rec(root, path, 0, newval)
+}
+
+fn assign_container_for(next_elem: &str) -> JsonbVal {
+    // PG creates an array when the next path element is an integer,
+    // an object otherwise.
+    if next_elem.trim().parse::<i64>().is_ok() {
+        JsonbVal::Array(Vec::new())
+    } else {
+        JsonbVal::Object(Vec::new())
+    }
+}
+
+fn assign_rec(
+    node: JsonbVal,
+    path: &[Option<String>],
+    level: usize,
+    newval: &JsonbVal,
+) -> Result<JsonbVal, ExecError> {
+    let elem = match &path[level] {
+        None => {
+            return Err(exec_err(
+                "22004",
+                format!("path element at position {} is null", level + 1),
+            ));
+        }
+        Some(s) => s.clone(),
+    };
+    let last = level + 1 == path.len();
+    match node {
+        JsonbVal::Object(mut pairs) => {
+            match pairs.iter().position(|(k, _)| *k == elem) {
+                Some(pos) => {
+                    if last {
+                        pairs[pos].1 = newval.clone();
+                    } else {
+                        let child = std::mem::replace(&mut pairs[pos].1, JsonbVal::Null);
+                        pairs[pos].1 = assign_rec(child, path, level + 1, newval)?;
+                    }
+                }
+                None => {
+                    if last {
+                        pairs.push((elem, newval.clone()));
+                    } else {
+                        let child =
+                            assign_container_for(&path[level + 1].clone().unwrap_or_default());
+                        let built = assign_rec(child, path, level + 1, newval)?;
+                        pairs.push((elem, built));
+                    }
+                    pairs.sort_by(|a, b| jsonb_key_cmp(&a.0, &b.0));
+                }
+            }
+            Ok(JsonbVal::Object(pairs))
+        }
+        JsonbVal::Array(mut elems) => {
+            let raw = parse_path_index(&elem, level)?;
+            let len = elems.len() as i64;
+            let idx = if raw < 0 {
+                if raw.checked_abs().unwrap_or(i64::MAX) > len {
+                    return Err(exec_err(
+                        "22023",
+                        format!(
+                            "path element at position {} is out of range: {}",
+                            level + 1,
+                            raw
+                        ),
+                    ));
+                }
+                len + raw
+            } else {
+                raw
+            };
+            if last {
+                if idx == len {
+                    elems.push(newval.clone());
+                } else if idx > len {
+                    while (elems.len() as i64) < idx {
+                        elems.push(JsonbVal::Null);
+                    }
+                    elems.push(newval.clone());
+                } else {
+                    elems[idx as usize] = newval.clone();
+                }
+            } else {
+                if idx == len {
+                    elems.push(assign_container_for(
+                        &path[level + 1].clone().unwrap_or_default(),
+                    ));
+                } else if idx > len {
+                    while (elems.len() as i64) < idx {
+                        elems.push(JsonbVal::Null);
+                    }
+                    elems.push(assign_container_for(
+                        &path[level + 1].clone().unwrap_or_default(),
+                    ));
+                }
+                let child = std::mem::replace(&mut elems[idx as usize], JsonbVal::Null);
+                elems[idx as usize] = assign_rec(child, path, level + 1, newval)?;
+            }
+            Ok(JsonbVal::Array(elems))
+        }
+        _ => Err(super::core::exec_err_detail(
+            "22023",
+            "cannot replace existing key".to_string(),
+            "The path assumes key is a composite object, but it is a scalar value.".to_string(),
+        )),
+    }
+}
+
 /// `jsonb_delete(jsonb, text)`: object key removal; on an array,
 /// removal of every string element equal to the key. A scalar root
 /// is 22023.
@@ -2572,6 +2724,16 @@ fn jsonpath_silent_arg(vals: &[Value], idx: usize) -> bool {
     matches!(vals.get(idx), Some(Value::Bool(true)))
 }
 
+/// v2.38: PG19 jsonpath_exec.c — jsonb_path_exists / jsonb_path_match
+/// default silent=true (errors collapse to NULL); the query family
+/// defaults silent=false. An explicit 4th argument overrides.
+fn jsonpath_silent_for(base: &str, vals: &[Value]) -> bool {
+    if vals.len() > 3 {
+        return jsonpath_silent_arg(vals, 3);
+    }
+    matches!(base, "jsonb_path_exists" | "jsonb_path_match")
+}
+
 /// Scalar jsonb_path_* functions (exists/match/query_array/
 /// query_first + _tz aliases). All are STRICT: any NULL argument
 /// yields NULL (the SRF/empty cases are handled by the caller).
@@ -2593,53 +2755,59 @@ pub(crate) fn eval_jsonpath_scalar(name: &str, vals: &[Value]) -> Result<Value, 
     let doc = jsonb_val_arg(name, &vals[0])?.unwrap();
     let path = jsonpath_arg(name, &vals[1])?.unwrap();
     let vars = jsonpath_vars_arg(name, vals, 2)?;
-    let silent = jsonpath_silent_arg(vals, 3);
+    let silent = jsonpath_silent_for(base, vals);
+    let tz = name.ends_with("_tz");
     let vars_ref = vars.as_ref();
     match base {
-        "jsonb_path_exists" => match super::jsonpath::jp_exists(&doc, &path, vars_ref) {
+        "jsonb_path_exists" => match super::jsonpath::jp_exists_tz(&doc, &path, vars_ref, tz) {
             Ok(b) => Ok(Value::Bool(b)),
             Err(e) => {
-                if silent {
-                    Ok(Value::Bool(false))
+                if silent && !sj_is_hard_path_error(&e) {
+                    // PG19: jperIsError -> PG_RETURN_NULL.
+                    Ok(Value::Null)
                 } else {
                     Err(e)
                 }
             }
         },
-        "jsonb_path_match" => match super::jsonpath::jp_match(&doc, &path, vars_ref) {
+        "jsonb_path_match" => match super::jsonpath::jp_match_tz(&doc, &path, vars_ref, tz) {
             Ok(Some(b)) => Ok(Value::Bool(b)),
             Ok(None) => Ok(Value::Null),
             Err(e) => {
-                if silent {
+                if silent && !sj_is_hard_path_error(&e) {
                     Ok(Value::Null)
                 } else {
                     Err(e)
                 }
             }
         },
-        "jsonb_path_query_array" => match super::jsonpath::jp_query_seq(&doc, &path, vars_ref) {
-            Ok(seq) => Ok(Value::jsonb(JsonbVal::Array(seq).render())),
-            Err(e) => {
-                if silent {
-                    Ok(Value::jsonb("[]"))
-                } else {
-                    Err(e)
+        "jsonb_path_query_array" => {
+            match super::jsonpath::jp_query_seq_tz(&doc, &path, vars_ref, tz) {
+                Ok(seq) => Ok(Value::jsonb(JsonbVal::Array(seq).render())),
+                Err(e) => {
+                    if silent && !sj_is_hard_path_error(&e) {
+                        Ok(Value::jsonb("[]"))
+                    } else {
+                        Err(e)
+                    }
                 }
             }
-        },
-        "jsonb_path_query_first" => match super::jsonpath::jp_query_seq(&doc, &path, vars_ref) {
-            Ok(seq) => match seq.into_iter().next() {
-                Some(v) => Ok(Value::jsonb(v.render())),
-                None => Ok(Value::Null),
-            },
-            Err(e) => {
-                if silent {
-                    Ok(Value::Null)
-                } else {
-                    Err(e)
+        }
+        "jsonb_path_query_first" => {
+            match super::jsonpath::jp_query_seq_tz(&doc, &path, vars_ref, tz) {
+                Ok(seq) => match seq.into_iter().next() {
+                    Some(v) => Ok(Value::jsonb(v.render())),
+                    None => Ok(Value::Null),
+                },
+                Err(e) => {
+                    if silent && !sj_is_hard_path_error(&e) {
+                        Ok(Value::Null)
+                    } else {
+                        Err(e)
+                    }
                 }
             }
-        },
+        }
         _ => unreachable!(),
     }
 }
@@ -2659,10 +2827,11 @@ pub(crate) fn jsonpath_query_rows(name: &str, vals: &[Value]) -> Result<Vec<Valu
     let path = jsonpath_arg(name, &vals[1])?.unwrap();
     let vars = jsonpath_vars_arg(name, vals, 2)?;
     let silent = jsonpath_silent_arg(vals, 3);
-    match super::jsonpath::jp_query_seq(&doc, &path, vars.as_ref()) {
+    let tz = name.ends_with("_tz");
+    match super::jsonpath::jp_query_seq_tz(&doc, &path, vars.as_ref(), tz) {
         Ok(seq) => Ok(seq.iter().map(|v| Value::jsonb(v.render())).collect()),
         Err(e) => {
-            if silent {
+            if silent && !sj_is_hard_path_error(&e) {
                 Ok(Vec::new())
             } else {
                 Err(e)

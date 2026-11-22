@@ -2005,6 +2005,9 @@ pub(crate) fn eval_cast_composite_inner(
             }
         },
     };
+    // Own the field list: the per-field cast below needs &mut Q.
+    let fields: Vec<(String, ColType, Option<String>)> = fields.to_vec();
+    let fields: &[(String, ColType, Option<String>)] = &fields;
     let src = match v {
         Value::Record(fields) => fields,
         // v0.82: composite text input `'(f1,f2,...)'::mytype` — PG19
@@ -2037,9 +2040,15 @@ pub(crate) fn eval_cast_composite_inner(
         ));
     }
     let mut out = Vec::with_capacity(fields.len());
-    for (i, (fname, fty, _)) in fields.iter().enumerate() {
+    for (i, (fname, fty, nested)) in fields.iter().enumerate() {
         let (_, sv) = &src[i];
-        let cv = eval_cast(sv, *fty)?;
+        // v2.38: a nested composite field casts through its named
+        // type (the anonymous ColType::Composite arm of eval_cast
+        // cannot accept a record value).
+        let cv = match (fty, nested) {
+            (ColType::Composite, Some(n)) => eval_cast_named(q, sv, n)?,
+            _ => eval_cast(sv, *fty)?,
+        };
         out.push((fname.clone(), cv));
     }
     Ok(Value::Record(out))
@@ -2082,6 +2091,45 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
     }
     if v.col_type() == to {
         return Ok(v.clone());
+    }
+    // v2.38: jsonb -> scalar casts (PG19 jsonb.c jsonb_int2/4/8,
+    // jsonb_float4/8, jsonb_numeric, jsonb_bool): the value must be
+    // a scalar; JSON null yields SQL NULL; a numeric scalar casts
+    // through numeric; a boolean scalar only to boolean; anything
+    // else is 42846 "cannot cast jsonb <kind> to type <target>".
+    if let Value::Jsonb(s) = v {
+        if matches!(
+            to,
+            ColType::SmallInt
+                | ColType::Int
+                | ColType::BigInt
+                | ColType::Float4
+                | ColType::Float
+                | ColType::Numeric(..)
+                | ColType::Bool
+        ) {
+            let doc = parse_jsonb(s)?;
+            return match doc {
+                JsonbVal::Null => Ok(Value::Null),
+                JsonbVal::Number(n) if to != ColType::Bool => eval_cast(&Value::Numeric(n), to),
+                JsonbVal::Bool(b) if to == ColType::Bool => Ok(Value::Bool(b)),
+                ref other => Err(exec_err(
+                    "42846",
+                    format!(
+                        "cannot cast jsonb {} to type {}",
+                        match other {
+                            JsonbVal::Null => "null",
+                            JsonbVal::Bool(_) => "boolean",
+                            JsonbVal::Number(_) => "numeric",
+                            JsonbVal::Str(_) => "string",
+                            JsonbVal::Array(_) => "array",
+                            JsonbVal::Object(_) => "object",
+                        },
+                        to.sql_name()
+                    ),
+                )),
+            };
+        }
     }
     match to {
         ColType::Text => Ok(text_value_of(&[v])),

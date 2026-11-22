@@ -3474,6 +3474,7 @@ pub(crate) fn eval_ts_op(op: JsonOp, left: &Value, right: &Value) -> Result<Valu
 /// Names claimed by the text-search dispatch. All are STRICT in PG:
 /// any NULL argument yields NULL (handled in the hook).
 const TS_FUNC_NAMES: &[&str] = &[
+    "jsonb_to_tsvector",
     "to_tsvector",
     "to_tsquery",
     "plainto_tsquery",
@@ -3673,6 +3674,7 @@ fn eval_ts_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
     // The hook runs before check_builtin_arity, so guard the arity
     // here (a wrong-arity call must 42883, never panic on indexing).
     let arity_ok = match name {
+        "jsonb_to_tsvector" => (2..=3).contains(&vals.len()),
         "to_tsvector"
         | "to_tsquery"
         | "plainto_tsquery"
@@ -3692,6 +3694,128 @@ fn eval_ts_func(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
         // 1-arg forms resolve to it); there is no SET support for the
         // GUC yet, so the current config is always english.
         "get_current_ts_config" => Ok(Value::text("english")),
+        // v2.38: jsonb_to_tsvector([cfg,] jsonb, filter) — PG19
+        // to_tsany.c: the filter is a jsonb scalar flag or array of
+        // flags ("string" / "numeric" / "boolean" / "key" / "all")
+        // selecting which document elements feed the vector.
+        "jsonb_to_tsvector" => {
+            let (cfg, doc_v, filter_v) = match vals {
+                [d, f] => (TsConfig::English, d, f),
+                [c, d, f] => (ts_config_arg(c)?, d, f),
+                _ => return Err(no_ts_func(name, vals)),
+            };
+            let doc = match doc_v {
+                Value::Jsonb(t) => super::json::parse_jsonb(t)?,
+                Value::Text(t) | Value::BpChar(t) => super::json::parse_jsonb(t)?,
+                _ => return Err(no_ts_func(name, vals)),
+            };
+            let filter = match filter_v {
+                Value::Jsonb(t) => super::json::parse_jsonb(t)?,
+                Value::Text(t) | Value::BpChar(t) => super::json::parse_jsonb(t)?,
+                _ => return Err(no_ts_func(name, vals)),
+            };
+            let hint =
+                "Possible values are: \"string\", \"numeric\", \"boolean\", \"key\", and \"all\".";
+            let flag_err = |msg: String, with_hint: bool| {
+                if with_hint {
+                    exec_err_hint("22023", msg, hint)
+                } else {
+                    exec_err("22023", msg)
+                }
+            };
+            let flag_names: Vec<String> = match &filter {
+                super::json::JsonbVal::Str(s) => vec![s.clone()],
+                super::json::JsonbVal::Array(items) => {
+                    let mut out = Vec::new();
+                    for it in items {
+                        match it {
+                            super::json::JsonbVal::Str(s) => out.push(s.clone()),
+                            _ => {
+                                return Err(flag_err(
+                                    "flag array element is not a string".to_string(),
+                                    true,
+                                ));
+                            }
+                        }
+                    }
+                    out
+                }
+                super::json::JsonbVal::Object(_) => {
+                    return Err(flag_err(
+                        "wrong flag type, only arrays and scalars are allowed".to_string(),
+                        false,
+                    ));
+                }
+                _ => {
+                    return Err(flag_err(
+                        "flag array element is not a string".to_string(),
+                        true,
+                    ));
+                }
+            };
+            let (mut f_key, mut f_str, mut f_num, mut f_bool) = (false, false, false, false);
+            for f in &flag_names {
+                match f.as_str() {
+                    "key" => f_key = true,
+                    "string" => f_str = true,
+                    "numeric" => f_num = true,
+                    "boolean" => f_bool = true,
+                    "all" => {
+                        f_key = true;
+                        f_str = true;
+                        f_num = true;
+                        f_bool = true;
+                    }
+                    other => {
+                        return Err(flag_err(
+                            format!("wrong flag in flag array: {:?}", other),
+                            true,
+                        ));
+                    }
+                }
+            }
+            fn collect_filtered(
+                v: &super::json::JsonbVal,
+                flags: (bool, bool, bool, bool),
+                out: &mut Vec<String>,
+            ) {
+                let (f_key, f_str, f_num, f_bool) = flags;
+                match v {
+                    super::json::JsonbVal::Object(pairs) => {
+                        for (k, val) in pairs {
+                            if f_key {
+                                out.push(k.clone());
+                            }
+                            collect_filtered(val, flags, out);
+                        }
+                    }
+                    super::json::JsonbVal::Array(items) => {
+                        for it in items {
+                            collect_filtered(it, flags, out);
+                        }
+                    }
+                    super::json::JsonbVal::Str(s) => {
+                        if f_str {
+                            out.push(s.clone());
+                        }
+                    }
+                    super::json::JsonbVal::Number(n) => {
+                        if f_num {
+                            out.push(n.to_text());
+                        }
+                    }
+                    super::json::JsonbVal::Bool(b) => {
+                        if f_bool {
+                            out.push(if *b { "true" } else { "false" }.to_string());
+                        }
+                    }
+                    super::json::JsonbVal::Null => {}
+                }
+            }
+            let mut strings = Vec::new();
+            collect_filtered(&doc, (f_key, f_str, f_num, f_bool), &mut strings);
+            Ok(Value::tsvector(json_strings_to_tsvector(&strings, cfg)))
+        }
         "to_tsvector" => {
             let (cfg, doc) = match vals {
                 [d] => (TsConfig::English, d),

@@ -4947,6 +4947,42 @@ pub(crate) fn exec_update_inner(
             }
         }
     }
+    // v2.38: PG19 raises "wrong number of array subscripts" at
+    // ANALYSIS time when a subscripted assignment target descends
+    // through a domain: for a column declared `somedomain[]` the
+    // first subscript consumes the array level and any further
+    // subscript would land on the domain itself, which assignment
+    // indirection rejects — even when no row matches (the runtime
+    // path in __jsonb_subscript_assign never gets to run).
+    {
+        let tbl = eng
+            .db
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session);
+        if let Some(t) = tbl {
+            for (colname, expr) in sets {
+                let Expr::Func { name, args } = expr else {
+                    continue;
+                };
+                if name != "__jsonb_subscript_assign" {
+                    continue;
+                }
+                let Some(Expr::ArrayCtor { elems, .. }) = args.get(1) else {
+                    continue;
+                };
+                if elems.len() <= 1 {
+                    continue;
+                }
+                let Some(ci) = t.columns.iter().position(|(n, _)| n == colname) else {
+                    continue;
+                };
+                if t.domain_elem.get(ci).copied().unwrap_or(false)
+                    && t.domain_types.get(ci).map(|d| d.is_some()).unwrap_or(false)
+                {
+                    return Err(exec_err("2202E", "wrong number of array subscripts"));
+                }
+            }
+        }
+    }
     // v1.20: PostgreSQL rejects UPDATE...FROM when the target's
     // effective range name reappears among the FROM items (42712
     // "table name specified more than once"). v2.37 correction: PG19
