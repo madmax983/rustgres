@@ -1543,12 +1543,19 @@ pub(crate) fn expr_col_name_strength(e: &Expr) -> (String, u8) {
         Expr::JsonArraySubq { .. } => ("json_array".to_string(), 2),
         // PG names an unaliased window-function column after the
         // function (FigureColnameInternal T_WindowFunc / T_Aggref).
-        Expr::Window { func, .. } => (
+        Expr::Window { func, written, .. } => (
             match func {
-                crate::sql::WindowFunc::Agg(f) => f.name().to_string(),
+                // v2.39: the name as written (var_samp / stddev_samp
+                // keep their own names, not the canonical
+                // variance / stddev of the shared AggFunc).
+                crate::sql::WindowFunc::Agg(f) => {
+                    written.clone().unwrap_or_else(|| f.name().to_string())
+                }
                 crate::sql::WindowFunc::RowNumber => "row_number".to_string(),
                 crate::sql::WindowFunc::Rank => "rank".to_string(),
                 crate::sql::WindowFunc::DenseRank => "dense_rank".to_string(),
+                crate::sql::WindowFunc::PercentRank => "percent_rank".to_string(),
+                crate::sql::WindowFunc::CumeDist => "cume_dist".to_string(),
                 crate::sql::WindowFunc::Ntile => "ntile".to_string(),
                 crate::sql::WindowFunc::Lag => "lag".to_string(),
                 crate::sql::WindowFunc::Lead => "lead".to_string(),
@@ -2193,6 +2200,8 @@ pub(crate) fn window_result_type(
         // Postgres returns bigint for the ranking functions, integer
         // for ntile.
         WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => Ok(ColType::BigInt),
+        // v2.39: percent_rank / cume_dist return float8.
+        WindowFunc::PercentRank | WindowFunc::CumeDist => Ok(ColType::Float),
         WindowFunc::Ntile => Ok(ColType::Int),
         // lag/lead/first_value/last_value/nth_value: type of the value
         // argument.

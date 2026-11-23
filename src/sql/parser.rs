@@ -13318,6 +13318,18 @@ impl Parser {
             // v1.29: `FILTER (WHERE ...)` (PG19 gram.y: the filter
             // clause follows the function application, before OVER).
             let filter = self.parse_filter_clause()?;
+            // v2.39: PG19 gram.y func_expr order — null_treatment
+            // follows FILTER and precedes OVER. PG19 parse_func.c
+            // rejects it for aggregates outright (42809), with or
+            // without OVER.
+            let null_treatment = self.parse_null_treatment()?;
+            if null_treatment.is_some() {
+                return Err(SqlError {
+                    message: "aggregate functions do not accept RESPECT/IGNORE NULLS".to_string(),
+                    code: "42809",
+                });
+            }
+            let null_treatment = null_treatment.unwrap_or_default();
             let mut expr = Expr::Agg {
                 func: func.clone(),
                 arg: args.first().cloned(),
@@ -13338,20 +13350,26 @@ impl Parser {
                         code: "0A000",
                     });
                 }
-                let spec = self.parse_window_spec()?;
+                let spec = self.parse_over_spec()?;
                 expr = Expr::Window {
                     func: WindowFunc::Agg(func),
                     args: args.into_iter().map(|a| *a).collect(),
                     distinct,
-                    partition_by: spec.partition_by,
-                    order_by: spec.order_by,
-                    frame: spec.frame,
+                    partition_by: spec.partition_by.clone(),
+                    order_by: spec.order_by.clone(),
+                    frame: spec.frame.clone(),
                     wid: 0,
                     // v1.29: PG19 parse_func.c keeps aggfilter on
                     // windowed aggregates.
                     filter,
                     // v1.31: PG19 opt_window_exclusion_clause.
-                    exclusion: spec.exclusion,
+                    exclusion: spec.exclusion.clone(),
+                    null_treatment,
+                    win_ref: Self::win_ref_of(&spec),
+                    // v2.39: PG names the output column after the
+                    // aggregate name as written (var_samp, not the
+                    // canonical variance).
+                    written: Some(name.clone()),
                 };
             }
             return Ok(expr);
@@ -13472,12 +13490,51 @@ impl Parser {
                     code: "42803",
                 });
             }
+            // v2.39: PG19 gram.y func_expr order — null_treatment
+            // follows the (rejected above) FILTER clause and precedes
+            // OVER. On a call that is not a window function, PG19
+            // parse_func.c raises 42809 "RESPECT/IGNORE NULLS
+            // specified, but %s is not a window function"; unknown
+            // names keep their exec-time 42883 (PG's catalog lookup
+            // fails first there too).
+            let null_treatment = self.parse_null_treatment()?;
+            let is_window_fn_name = matches!(
+                name.as_str(),
+                "row_number"
+                    | "rank"
+                    | "dense_rank"
+                    | "percent_rank"
+                    | "cume_dist"
+                    | "ntile"
+                    | "lag"
+                    | "lead"
+                    | "first_value"
+                    | "last_value"
+                    | "nth_value"
+            );
+            if null_treatment.is_some()
+                && !is_window_fn_name
+                && is_builtin_fn(&name)
+                && !matches!(self.peek(), Token::Ident(s) if s == "over")
+            {
+                return Err(SqlError {
+                    message: format!(
+                        "RESPECT/IGNORE NULLS specified, but {} is not a window function",
+                        name
+                    ),
+                    code: "42809",
+                });
+            }
             // v0.10: `<func>(...) OVER (...)` — window function.
             if self.eat_keyword("over") {
                 let func = match name.as_str() {
                     "row_number" => WindowFunc::RowNumber,
                     "rank" => WindowFunc::Rank,
                     "dense_rank" => WindowFunc::DenseRank,
+                    // v2.39: percent_rank/cume_dist reach here via the
+                    // ordered-set fallback (no WITHIN GROUP follows).
+                    "percent_rank" => WindowFunc::PercentRank,
+                    "cume_dist" => WindowFunc::CumeDist,
                     "ntile" => WindowFunc::Ntile,
                     "lag" => WindowFunc::Lag,
                     "lead" => WindowFunc::Lead,
@@ -13494,20 +13551,23 @@ impl Parser {
                         });
                     }
                 };
-                let spec = self.parse_window_spec()?;
+                let spec = self.parse_over_spec()?;
                 return Ok(Expr::Window {
                     func,
                     args,
                     distinct: false,
-                    partition_by: spec.partition_by,
-                    order_by: spec.order_by,
-                    frame: spec.frame,
+                    partition_by: spec.partition_by.clone(),
+                    order_by: spec.order_by.clone(),
+                    frame: spec.frame.clone(),
                     wid: 0,
                     // v1.29: FILTER on a non-aggregate window function is
                     // rejected above (0A000); no filter reaches this node.
                     filter: None,
                     // v1.31: PG19 opt_window_exclusion_clause.
-                    exclusion: spec.exclusion,
+                    exclusion: spec.exclusion.clone(),
+                    null_treatment: null_treatment.unwrap_or_default(),
+                    win_ref: Self::win_ref_of(&spec),
+                    written: None,
                 });
             }
             return Ok(Expr::Func { name, args });
@@ -13596,7 +13656,17 @@ impl Parser {
         self.expect(Token::RParen, "')'")
             .map_err(ParseOsError::Sql)?;
         if !self.peek_is_within() {
-            if matches!(func, OrderedSetAgg::Rank | OrderedSetAgg::DenseRank) {
+            // v2.39: percent_rank/cume_dist are also true window
+            // functions (PG19 pg_proc prokind 'w' entries beside the
+            // hypothetical-set aggregates), so they fall back like
+            // rank/dense_rank when no WITHIN GROUP follows.
+            if matches!(
+                func,
+                OrderedSetAgg::Rank
+                    | OrderedSetAgg::DenseRank
+                    | OrderedSetAgg::PercentRank
+                    | OrderedSetAgg::CumeDist
+            ) {
                 return Err(ParseOsError::NotWithinGroup);
             }
             return Err(ParseOsError::Sql(SqlError {
@@ -13643,12 +13713,21 @@ impl Parser {
         self.expect(Token::RParen, "')'")
             .map_err(ParseOsError::Sql)?;
         // FILTER follows WITHIN GROUP (PG19 gram.y clause order),
-        // then the OVER rejection (PG19 parse_func.c 0A000).
+        // then null_treatment, then the OVER rejection (PG19
+        // parse_func.c 0A000 — which precedes its 42809 null
+        // treatment rejection for aggregates).
         let filter = self.parse_filter_clause().map_err(ParseOsError::Sql)?;
+        let null_treatment = self.parse_null_treatment().map_err(ParseOsError::Sql)?;
         if self.eat_keyword("over") {
             return Err(ParseOsError::Sql(SqlError {
                 message: format!("OVER is not supported for ordered-set aggregate {name}"),
                 code: "0A000",
+            }));
+        }
+        if null_treatment.is_some() {
+            return Err(ParseOsError::Sql(SqlError {
+                message: "aggregate functions do not accept RESPECT/IGNORE NULLS".to_string(),
+                code: "42809",
             }));
         }
         // Arity: PG19 resolves the ordered-set signatures by direct /
@@ -13675,8 +13754,87 @@ impl Parser {
         })
     }
 
+    /// v2.39: PG19 gram.y `null_treatment`: `IGNORE NULLS` /
+    /// `RESPECT NULLS`, or absent (`None`). RESPECT is PG's default;
+    /// the `Option` distinguishes an explicit clause (which PG
+    /// rejects on functions that don't accept one) from its absence.
+    pub(crate) fn parse_null_treatment(&mut self) -> Result<Option<NullTreatment>, SqlError> {
+        if self.eat_keyword("ignore") {
+            self.expect_keyword("nulls")?;
+            return Ok(Some(NullTreatment::Ignore));
+        }
+        if self.eat_keyword("respect") {
+            self.expect_keyword("nulls")?;
+            return Ok(Some(NullTreatment::Respect));
+        }
+        Ok(None)
+    }
+
+    /// v2.39: the `WinRef` an `Expr::Window` carries for a spec that
+    /// references a named window, or `None` for a self-contained spec.
+    pub(crate) fn win_ref_of(spec: &WindowSpec) -> Option<WinRef> {
+        spec.ref_name.as_ref().map(|name| WinRef {
+            name: name.clone(),
+            bare: spec.bare_ref,
+            frame_specified: spec.frame_specified,
+        })
+    }
+
+    /// v2.39: PG19 gram.y `over_clause`: `OVER window_specification`
+    /// or `OVER ColId` (a bare reference to a named window). The
+    /// `OVER` keyword itself has already been consumed.
+    pub(crate) fn parse_over_spec(&mut self) -> Result<WindowSpec, SqlError> {
+        if *self.peek() == Token::LParen {
+            return self.parse_window_spec();
+        }
+        // Bare `OVER name` — possibly a quoted identifier.
+        let name = match self.peek().clone() {
+            Token::Ident(s) | Token::QIdent(s) => {
+                self.next();
+                s
+            }
+            other => {
+                return Err(err(format!(
+                    "syntax error: expected '(' or a window name after OVER, found {:?}",
+                    other
+                )));
+            }
+        };
+        let mut spec = WindowSpec::empty();
+        spec.ref_name = Some(name);
+        spec.bare_ref = true;
+        Ok(spec)
+    }
+
+    /// The parenthesized window specification: `( [existing_name]
+    /// [PARTITION BY ...] [ORDER BY ...] [frame] )` — used both for
+    /// `OVER (...)` and for `WINDOW name AS (...)` definitions
+    /// (PG19 gram.y `window_specification`).
     pub(crate) fn parse_window_spec(&mut self) -> Result<WindowSpec, SqlError> {
         self.expect(Token::LParen, "'('")?;
+        // v2.39: PG19 `opt_existing_window_name`. Per gram.y's own
+        // comment, PARTITION/ROWS/RANGE/GROUPS as the first token are
+        // assumed NOT to be a window name (they are unreserved, but
+        // the grammar resolves the ambiguity against the name); ORDER
+        // likewise cannot start a spec body other than as a name.
+        let ref_name = match self.peek().clone() {
+            Token::QIdent(s) => {
+                self.next();
+                Some(s)
+            }
+            Token::Ident(s)
+                if !matches!(
+                    s.as_str(),
+                    "partition" | "order" | "rows" | "range" | "groups"
+                ) && (matches!(self.peek2(), Token::RParen)
+                    || matches!(self.peek2(), Token::Ident(k) if matches!(k.as_str(),
+                        "partition" | "order" | "rows" | "range" | "groups"))) =>
+            {
+                self.next();
+                Some(s)
+            }
+            _ => None,
+        };
         let mut partition_by = Vec::new();
         if self.eat_keyword("partition") {
             self.expect_keyword("by")?;
@@ -13701,13 +13859,16 @@ impl Parser {
                 break;
             }
         }
-        let (frame, exclusion) = self.parse_window_frame()?;
+        let (frame, exclusion, frame_specified) = self.parse_window_frame()?;
         self.expect(Token::RParen, "')'")?;
         Ok(WindowSpec {
             partition_by,
             order_by,
             frame,
             exclusion,
+            ref_name,
+            bare_ref: false,
+            frame_specified,
         })
     }
 
@@ -13717,7 +13878,12 @@ impl Parser {
     /// trailing `EXCLUDE ...` clause (PG19 `opt_window_exclusion_clause`,
     /// only valid after a frame extent). Returns the frame plus the
     /// exclusion (`NoOthers` when absent).
-    pub(crate) fn parse_window_frame(&mut self) -> Result<(WindowFrame, FrameExclusion), SqlError> {
+    /// Returns the frame, the exclusion, and whether an explicit
+    /// frame clause was written (v2.39: named-window merging keys
+    /// off that — PG19 `FRAMEOPTION_NONDEFAULT`).
+    pub(crate) fn parse_window_frame(
+        &mut self,
+    ) -> Result<(WindowFrame, FrameExclusion, bool), SqlError> {
         // v0.78-style keyword guard: only treat `groups` as the frame
         // mode when it starts the frame clause; anywhere else it stays
         // an ordinary identifier.
@@ -13732,7 +13898,7 @@ impl Parser {
         };
         let mode = match mode {
             Some(m) => m,
-            None => return Ok((WindowFrame::Default, FrameExclusion::NoOthers)),
+            None => return Ok((WindowFrame::Default, FrameExclusion::NoOthers, false)),
         };
         let (start, end) = if self.eat_keyword("between") {
             let s = self.parse_frame_bound()?;
@@ -13764,7 +13930,7 @@ impl Parser {
             2 => WindowFrame::Groups { start, end },
             _ => WindowFrame::Rows { start, end },
         };
-        Ok((frame, exclusion))
+        Ok((frame, exclusion, true))
     }
 
     /// v1.31: PG19 gram.y `opt_window_exclusion_clause`:
@@ -13795,7 +13961,13 @@ impl Parser {
     }
 
     /// v0.10: one frame bound: `UNBOUNDED PRECEDING|FOLLOWING`,
-    /// `CURRENT ROW`, or `<n> PRECEDING|FOLLOWING`.
+    /// `CURRENT ROW`, or `<expr> PRECEDING|FOLLOWING`.
+    /// v2.39: PG19 gram.y `frame_bound` is `a_expr PRECEDING` /
+    /// `a_expr FOLLOWING` — the offset is a full expression
+    /// (`2::int8`, `interval '1 day'`, `(SELECT ...) + 1`, a bare
+    /// unknown-typed string literal, ...). `parse_or` stops at the
+    /// PRECEDING/FOLLOWING keyword (it is not an operator, alias
+    /// position, or clause keyword the expression grammar consumes).
     pub(crate) fn parse_frame_bound(&mut self) -> Result<FrameBound, SqlError> {
         if self.eat_keyword("unbounded") {
             if self.eat_keyword("preceding") {
@@ -13813,26 +13985,16 @@ impl Parser {
             self.expect_keyword("row")?;
             return Ok(FrameBound::CurrentRow);
         }
-        match self.next() {
-            Token::Number(n) => {
-                let n: u64 = n
-                    .parse()
-                    .map_err(|_| err(format!("syntax error: bad frame offset \"{}\"", n)))?;
-                if self.eat_keyword("preceding") {
-                    Ok(FrameBound::Preceding(n))
-                } else if self.eat_keyword("following") {
-                    Ok(FrameBound::Following(n))
-                } else {
-                    Err(err(format!(
-                        "syntax error: expected PRECEDING or FOLLOWING after frame offset, found {:?}",
-                        self.peek()
-                    )))
-                }
-            }
-            other => Err(err(format!(
-                "syntax error: expected frame bound, found {:?}",
-                other
-            ))),
+        let offset = self.parse_or()?;
+        if self.eat_keyword("preceding") {
+            Ok(FrameBound::Preceding(Box::new(offset)))
+        } else if self.eat_keyword("following") {
+            Ok(FrameBound::Following(Box::new(offset)))
+        } else {
+            Err(err(format!(
+                "syntax error: expected PRECEDING or FOLLOWING after frame offset, found {:?}",
+                self.peek()
+            )))
         }
     }
 
@@ -14761,6 +14923,14 @@ impl Parser {
         order_by: Vec<OrderTerm>,
     ) -> Result<Expr, SqlError> {
         let filter = self.parse_filter_clause()?;
+        // v2.39: PG19 gram.y order — null_treatment after FILTER;
+        // aggregates reject it (42809), like the generic agg path.
+        if self.parse_null_treatment()?.is_some() {
+            return Err(SqlError {
+                message: "aggregate functions do not accept RESPECT/IGNORE NULLS".to_string(),
+                code: "42809",
+            });
+        }
         let mut args: Vec<Expr> = Vec::new();
         if let Some(a) = &arg {
             args.push((**a).clone());
@@ -14784,17 +14954,20 @@ impl Parser {
                     code: "0A000",
                 });
             }
-            let spec = self.parse_window_spec()?;
+            let spec = self.parse_over_spec()?;
             expr = Expr::Window {
                 func: WindowFunc::Agg(func),
                 args,
                 distinct: false,
-                partition_by: spec.partition_by,
-                order_by: spec.order_by,
-                frame: spec.frame,
+                partition_by: spec.partition_by.clone(),
+                order_by: spec.order_by.clone(),
+                frame: spec.frame.clone(),
                 wid: 0,
                 filter,
-                exclusion: spec.exclusion,
+                exclusion: spec.exclusion.clone(),
+                null_treatment: NullTreatment::Unspecified,
+                win_ref: Self::win_ref_of(&spec),
+                written: None,
             };
         }
         Ok(expr)
@@ -15065,6 +15238,18 @@ impl Parser {
         }
         match self.peek() {
             Token::Ident(s) if !is_reserved(s) => {
+                // v2.39: `WINDOW name AS (` opens the WINDOW clause,
+                // never a bare alias (PG19's grammar resolves the
+                // ambiguity the same way — a target or table named
+                // `window` via a bare alias remains available in
+                // every other position).
+                if s == "window"
+                    && matches!(self.peek2(), Token::Ident(_) | Token::QIdent(_))
+                    && matches!(self.peek3(), Token::Ident(k) if k == "as")
+                    && matches!(self.tokens.get(self.pos + 3), Some(Token::LParen))
+                {
+                    return Ok(None);
+                }
                 let s = s.clone();
                 self.next();
                 Ok(Some(s))
@@ -16389,7 +16574,34 @@ impl Parser {
         } else {
             None
         };
-        Ok(SelectStmt {
+        // v2.39: PG19 gram.y `window_clause` — `WINDOW name AS (spec)
+        // [, ...]`, between HAVING and ORDER BY. Definitions are
+        // resolved in order (a definition may reference an earlier
+        // one), then every `OVER` reference already parsed in the
+        // items / HAVING / DISTINCT ON expressions is merged against
+        // them (expressions are parsed before the clause is seen).
+        let mut window_defs: Vec<NamedWindow> = Vec::new();
+        if self.eat_keyword("window") {
+            loop {
+                let name = self.expect_ident()?;
+                self.expect_keyword("as")?;
+                let spec = self.parse_window_spec()?;
+                if window_defs.iter().any(|d| d.name == name) {
+                    return Err(SqlError {
+                        message: format!("window \"{}\" is already defined", name),
+                        code: "42P20",
+                    });
+                }
+                let spec = Self::merge_window_spec(spec, &window_defs)?;
+                window_defs.push(NamedWindow { name, spec });
+                if *self.peek() == Token::Comma {
+                    self.next();
+                    continue;
+                }
+                break;
+            }
+        }
+        let mut stmt = SelectStmt {
             with: Vec::new(),
             distinct,
             distinct_on,
@@ -16399,6 +16611,7 @@ impl Parser {
             group_by,
             group_by_sets,
             having,
+            window_defs,
             order_by: Vec::new(),
             limit: None,
             offset: None,
@@ -16407,10 +16620,263 @@ impl Parser {
             for_update_of: Vec::new(),
             set_op: None,
             dead_rtes: 0,
+        };
+        // Merge `OVER` references in the expressions parsed so far
+        // (ORDER BY terms are resolved in parse_select_tail, which
+        // runs after this core and re-enters the same helper).
+        Self::resolve_stmt_window_refs(&mut stmt)?;
+        Ok(stmt)
+    }
+
+    /// v2.39: PG19 parse_clause.c `transformWindowDefinitions`
+    /// merging: a spec that references a named window inherits the
+    /// pieces it does not write. PARTITION BY may never be restated
+    /// (42P20); ORDER BY may be supplied only when the referenced
+    /// window has none (42P20); a frame may be taken from the
+    /// referenced window only by the bare `OVER name` form — a
+    /// parenthesized reference (or a WINDOW definition) to a framed
+    /// window is 42P20 "cannot copy window ...". An unknown name is
+    /// 42704 (PG19 ERRCODE_UNDEFINED_OBJECT).
+    pub(crate) fn merge_window_spec(
+        spec: WindowSpec,
+        defs: &[NamedWindow],
+    ) -> Result<WindowSpec, SqlError> {
+        let Some(ref_name) = spec.ref_name.clone() else {
+            return Ok(spec);
+        };
+        let Some(def) = defs.iter().find(|d| d.name == ref_name) else {
+            return Err(SqlError {
+                message: format!("window \"{}\" does not exist", ref_name),
+                code: "42704",
+            });
+        };
+        let d = &def.spec;
+        if !spec.partition_by.is_empty() {
+            return Err(SqlError {
+                message: format!(
+                    "cannot override PARTITION BY clause of window \"{}\"",
+                    ref_name
+                ),
+                code: "42P20",
+            });
+        }
+        if !spec.order_by.is_empty() && !d.order_by.is_empty() {
+            return Err(SqlError {
+                message: format!("cannot override ORDER BY clause of window \"{}\"", ref_name),
+                code: "42P20",
+            });
+        }
+        let (frame, exclusion, frame_specified) = if d.frame_specified {
+            if spec.bare_ref {
+                (d.frame.clone(), d.exclusion.clone(), true)
+            } else {
+                // PG19: the hint is attached only when the
+                // parenthesized form added nothing of its own.
+                let hint = if spec.order_by.is_empty() && !spec.frame_specified {
+                    "\nHINT:  Omit the parentheses in this OVER clause."
+                } else {
+                    ""
+                };
+                return Err(SqlError {
+                    message: format!(
+                        "cannot copy window \"{}\" because it has a frame clause{}",
+                        ref_name, hint
+                    ),
+                    code: "42P20",
+                });
+            }
+        } else {
+            (
+                spec.frame.clone(),
+                spec.exclusion.clone(),
+                spec.frame_specified,
+            )
+        };
+        Ok(WindowSpec {
+            partition_by: d.partition_by.clone(),
+            order_by: if spec.order_by.is_empty() {
+                d.order_by.clone()
+            } else {
+                spec.order_by.clone()
+            },
+            frame,
+            exclusion,
+            ref_name: None,
+            bare_ref: false,
+            frame_specified,
         })
     }
 
-    /// v0.44: trailing `ORDER BY` / `LIMIT` / `OFFSET` / `FOR UPDATE` of a
+    /// v2.39: merge every unresolved `OVER` reference in a statement's
+    /// own expressions (items, HAVING, ORDER BY, DISTINCT ON) against
+    /// its WINDOW clause definitions. Subqueries are not descended
+    /// into — each select core resolves its own references — and
+    /// neither are a window's own argument/partition/order/frame
+    /// expressions (a window there would be an illegal nesting, and
+    /// frame offsets belong to the spec, not the reference).
+    pub(crate) fn resolve_stmt_window_refs(stmt: &mut SelectStmt) -> Result<(), SqlError> {
+        fn resolve_expr(e: &mut Expr, defs: &[NamedWindow]) -> Result<(), SqlError> {
+            match e {
+                Expr::Window {
+                    partition_by,
+                    order_by,
+                    frame,
+                    exclusion,
+                    win_ref,
+                    ..
+                } => {
+                    if let Some(wr) = win_ref.take() {
+                        let partial = WindowSpec {
+                            partition_by: std::mem::take(partition_by),
+                            order_by: std::mem::take(order_by),
+                            frame: std::mem::replace(frame, WindowFrame::Default),
+                            exclusion: std::mem::take(exclusion),
+                            ref_name: Some(wr.name),
+                            bare_ref: wr.bare,
+                            frame_specified: wr.frame_specified,
+                        };
+                        let merged = Parser::merge_window_spec(partial, defs)?;
+                        *partition_by = merged.partition_by;
+                        *order_by = merged.order_by;
+                        *frame = merged.frame;
+                        *exclusion = merged.exclusion;
+                    }
+                    Ok(())
+                }
+                Expr::Arith { left, right, .. }
+                | Expr::And(left, right)
+                | Expr::Or(left, right)
+                | Expr::Concat(left, right)
+                | Expr::JsonOp { left, right, .. }
+                | Expr::Cmp { left, right, .. }
+                | Expr::IsDistinctFrom { left, right, .. }
+                | Expr::UserOp { left, right, .. } => {
+                    resolve_expr(left, defs)?;
+                    resolve_expr(right, defs)
+                }
+                Expr::Not(x)
+                | Expr::BitNot(x)
+                | Expr::Neg(x)
+                | Expr::IsNull { expr: x, .. }
+                | Expr::IsBool { expr: x, .. }
+                | Expr::Cast { expr: x, .. }
+                | Expr::CastNamed { expr: x, .. }
+                | Expr::FieldAccess { expr: x, .. }
+                | Expr::NamedArg { expr: x, .. }
+                | Expr::Collate { expr: x, .. }
+                | Expr::CollationFor { expr: x } => resolve_expr(x, defs),
+                Expr::Like { expr, pattern, .. } | Expr::Regex { expr, pattern, .. } => {
+                    resolve_expr(expr, defs)?;
+                    resolve_expr(pattern, defs)
+                }
+                Expr::Between {
+                    expr, low, high, ..
+                } => {
+                    resolve_expr(expr, defs)?;
+                    resolve_expr(low, defs)?;
+                    resolve_expr(high, defs)
+                }
+                Expr::AtTimeZone { expr, zone } => {
+                    resolve_expr(expr, defs)?;
+                    if let Some(z) = zone {
+                        resolve_expr(z, defs)?;
+                    }
+                    Ok(())
+                }
+                Expr::Case {
+                    operand,
+                    whens,
+                    else_,
+                } => {
+                    if let Some(o) = operand {
+                        resolve_expr(o, defs)?;
+                    }
+                    for (k, r) in whens {
+                        resolve_expr(k, defs)?;
+                        resolve_expr(r, defs)?;
+                    }
+                    if let Some(el) = else_ {
+                        resolve_expr(el, defs)?;
+                    }
+                    Ok(())
+                }
+                Expr::Row(elems) | Expr::ArrayCtor { elems, .. } => {
+                    for el in elems {
+                        resolve_expr(el, defs)?;
+                    }
+                    Ok(())
+                }
+                Expr::Func { args, .. } => {
+                    for a in args {
+                        resolve_expr(a, defs)?;
+                    }
+                    Ok(())
+                }
+                Expr::Agg {
+                    arg,
+                    arg2,
+                    agg_order_by,
+                    filter,
+                    ..
+                } => {
+                    if let Some(a) = arg {
+                        resolve_expr(a, defs)?;
+                    }
+                    if let Some(a) = arg2 {
+                        resolve_expr(a, defs)?;
+                    }
+                    for o in agg_order_by {
+                        resolve_expr(&mut o.expr, defs)?;
+                    }
+                    if let Some(f) = filter {
+                        resolve_expr(f, defs)?;
+                    }
+                    Ok(())
+                }
+                Expr::Subscript { array, indices } => {
+                    resolve_expr(array, defs)?;
+                    for i in indices {
+                        resolve_expr(i, defs)?;
+                    }
+                    Ok(())
+                }
+                Expr::Slice { array, bounds } => {
+                    resolve_expr(array, defs)?;
+                    for (l, u) in bounds {
+                        if let Some(l) = l {
+                            resolve_expr(l, defs)?;
+                        }
+                        if let Some(u) = u {
+                            resolve_expr(u, defs)?;
+                        }
+                    }
+                    Ok(())
+                }
+                Expr::Extract { from, .. } => resolve_expr(from, defs),
+                Expr::InSub { expr, .. } => resolve_expr(expr, defs),
+                Expr::Quantified { left, .. } => resolve_expr(left, defs),
+                _ => Ok(()),
+            }
+        }
+        // The walk runs even with no definitions: a reference with
+        // no WINDOW clause at all must still fail (42704).
+        let defs = stmt.window_defs.clone();
+        for item in &mut stmt.items {
+            if let SelectItem::Expr { expr, .. } = item {
+                resolve_expr(expr, &defs)?;
+            }
+        }
+        if let Some(h) = &mut stmt.having {
+            resolve_expr(h, &defs)?;
+        }
+        for o in &mut stmt.order_by {
+            resolve_expr(&mut o.expr, &defs)?;
+        }
+        for e in &mut stmt.distinct_on {
+            resolve_expr(e, &defs)?;
+        }
+        Ok(())
+    }
     /// SELECT. Split out of `parse_select_rest` so set-operation branches
     /// can be parsed without consuming the outer query's tail (Postgres
     /// forbids `ORDER BY` before a set-op outside parentheses).
@@ -16584,6 +17050,10 @@ impl Parser {
         sel.for_update = for_update;
         sel.lock_clause = had_lock;
         sel.for_update_of = for_update_of;
+        // v2.39: ORDER BY terms are parsed here, after the core —
+        // merge any `OVER` references they carry against the WINDOW
+        // clause the core captured.
+        Self::resolve_stmt_window_refs(sel)?;
         Ok(())
     }
 
@@ -16929,26 +17399,30 @@ impl Parser {
         &mut self,
         mut carrier: SelectStmt,
     ) -> Result<SelectStmt, SqlError> {
+        // v2.39: with no set operations the tail belongs to the plain
+        // SELECT itself — parse it straight onto the carrier so
+        // `parse_select_tail`'s window-reference resolution sees the
+        // core's WINDOW clause definitions. Parsing the tail into a
+        // fresh empty statement (the set-op path below) left those
+        // definitions behind, and a named-window reference in ORDER
+        // BY failed with 42704 `window "..." does not exist`.
+        if carrier.set_op.is_none() {
+            self.parse_select_tail(&mut carrier)?;
+            return Ok(carrier);
+        }
         let mut tail = empty_select();
         self.parse_select_tail(&mut tail)?;
-        if let Some(root) = carrier.set_op.as_mut() {
-            if tail.for_update {
-                return Err(err(
-                    "syntax error: FOR UPDATE is not supported with set operations".to_string(),
-                ));
-            }
-            root.order_by = tail.order_by;
-            root.limit = tail.limit;
-            root.offset = tail.offset;
-        } else {
-            // No set-ops: plain SELECT; the tail belongs to it directly.
-            carrier.order_by = tail.order_by;
-            carrier.limit = tail.limit;
-            carrier.offset = tail.offset;
-            carrier.for_update = tail.for_update;
-            carrier.lock_clause = tail.lock_clause;
-            carrier.for_update_of = tail.for_update_of;
+        // Set-op root: the tail attaches to the root set operation.
+        // (The no-set-op case returned above.)
+        let root = carrier.set_op.as_mut().expect("set_op checked above");
+        if tail.for_update {
+            return Err(err(
+                "syntax error: FOR UPDATE is not supported with set operations".to_string(),
+            ));
         }
+        root.order_by = tail.order_by;
+        root.limit = tail.limit;
+        root.offset = tail.offset;
         Ok(carrier)
     }
 

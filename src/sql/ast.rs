@@ -1842,7 +1842,55 @@ pub enum Expr {
         /// after the frame extent). Participates in window identity
         /// like `filter`.
         exclusion: FrameExclusion,
+        /// v2.39: PG19 `null_treatment` (`RESPECT NULLS` / `IGNORE
+        /// NULLS`, gram.y func_expr order: after FILTER, before OVER).
+        /// Participates in window identity like `filter`.
+        null_treatment: NullTreatment,
+        /// v2.39: an unresolved named-window reference (`OVER w` /
+        /// `OVER (w ...)`), merged against the query's WINDOW clause
+        /// by the parser once the clause is seen (expressions are
+        /// parsed before it). `None` once resolved — and for every
+        /// window written with a full inline spec.
+        win_ref: Option<WinRef>,
+        /// v2.39: for `WindowFunc::Agg`, the aggregate name exactly as
+        /// written (`var_samp` vs `variance`): PG names the output
+        /// column after the written name, but both spellings map to
+        /// one `AggFunc`. `None` falls back to `AggFunc::name()`.
+        written: Option<String>,
     },
+}
+
+/// v2.39: PG19 `null_treatment` (gram.y): `IGNORE NULLS` makes
+/// lead/lag/first_value/last_value/nth_value skip NULL inputs.
+/// PG19 distinguishes an explicit `RESPECT NULLS` from no clause at
+/// all (parse_func.c / nodeWindowAgg.c reject *any* treatment clause
+/// on functions that don't accept one), so both written forms are
+/// kept distinct from `Unspecified`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum NullTreatment {
+    #[default]
+    Unspecified,
+    Respect,
+    Ignore,
+}
+
+/// v2.39: an unresolved reference to a named window from the query's
+/// `WINDOW` clause. The `Expr::Window`'s own partition_by / order_by /
+/// frame / exclusion fields hold the partial spec written inline;
+/// the parser merges them with the referenced definition following
+/// PG19 parse_clause.c `transformWindowDefinitions`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WinRef {
+    /// The referenced window's name.
+    pub name: String,
+    /// True for the bare `OVER name` form (no parentheses): the only
+    /// form that may inherit a frame clause from the referenced
+    /// window (PG19: `OVER (name)` on a framed window is 42P20
+    /// "cannot copy window ... because it has a frame clause").
+    pub bare: bool,
+    /// True when the inline spec wrote an explicit frame clause
+    /// (ROWS/RANGE/GROUPS ...), as opposed to leaving the default.
+    pub frame_specified: bool,
 }
 
 /// v0.10: window function kinds. `Agg` reuses the aggregate functions as
@@ -1852,6 +1900,12 @@ pub enum WindowFunc {
     RowNumber,
     Rank,
     DenseRank,
+    /// v2.39: `percent_rank()` / `cume_dist()` as true window
+    /// functions (PG19 pg_proc: they are also hypothetical-set
+    /// aggregates; with OVER and no WITHIN GROUP they are window
+    /// functions taking no direct arguments).
+    PercentRank,
+    CumeDist,
     Ntile,
     Lag,
     Lead,
@@ -1889,12 +1943,17 @@ pub enum FrameExclusion {
 }
 
 /// v0.10: one end of a window frame.
+/// v2.39: PG19 gram.y `frame_bound` is `a_expr PRECEDING|FOLLOWING` —
+/// the offset is a full expression (evaluated once per partition by
+/// the executor; it must not contain variables of the query level,
+/// PG19 parse_clause.c `checkExprIsVarFree`), not just an integer
+/// literal.
 #[derive(Clone, Debug, PartialEq)]
 pub enum FrameBound {
     UnboundedPreceding,
-    Preceding(u64),
+    Preceding(Box<Expr>),
     CurrentRow,
-    Following(u64),
+    Following(Box<Expr>),
     UnboundedFollowing,
 }
 
@@ -2160,6 +2219,13 @@ pub struct SelectStmt {
     // as NULL; a plain GROUP BY instead raises 42803 for them.
     pub group_by_sets: bool,
     pub having: Option<Expr>,
+    /// v2.39: the `WINDOW name AS (spec) [, ...]` clause (PG19
+    /// gram.y `window_clause`, between HAVING and ORDER BY), with
+    /// every definition already resolved against earlier ones.
+    /// `OVER` references in the statement's expressions are merged
+    /// against these by the parser, so the executor never sees them;
+    /// the definitions are kept for fidelity (e.g. view definitions).
+    pub window_defs: Vec<NamedWindow>,
     pub order_by: Vec<OrderTerm>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
@@ -2222,6 +2288,7 @@ pub(crate) fn empty_select() -> SelectStmt {
         group_by: Vec::new(),
         group_by_sets: false,
         having: None,
+        window_defs: Vec::new(),
         order_by: Vec::new(),
         limit: None,
         offset: None,
@@ -11382,6 +11449,20 @@ pub(crate) fn max_param_from(f: &FromItem) -> usize {
     }
 }
 
+/// v2.39: highest `$n` inside a window frame's offset expressions.
+pub(crate) fn max_param_frame(f: &WindowFrame) -> usize {
+    let bound = |b: &FrameBound| match b {
+        FrameBound::Preceding(e) | FrameBound::Following(e) => max_param_expr(e),
+        _ => 0,
+    };
+    match f {
+        WindowFrame::Default => 0,
+        WindowFrame::Rows { start, end }
+        | WindowFrame::Range { start, end }
+        | WindowFrame::Groups { start, end } => bound(start).max(bound(end)),
+    }
+}
+
 pub(crate) fn max_param_expr(e: &Expr) -> usize {
     match e {
         // v0.95: named args are transparent to inspection.
@@ -11480,6 +11561,7 @@ pub(crate) fn max_param_expr(e: &Expr) -> usize {
             args,
             partition_by,
             order_by,
+            frame,
             ..
         } => args
             .iter()
@@ -11493,7 +11575,10 @@ pub(crate) fn max_param_expr(e: &Expr) -> usize {
                     .map(|o| max_param_expr(&o.expr))
                     .max()
                     .unwrap_or(0),
-            ),
+            )
+            // v2.39: frame offset expressions may carry params too
+            // (e.g. `(SELECT $1) PRECEDING` via the offset subquery).
+            .max(max_param_frame(frame)),
     }
 }
 
@@ -11611,12 +11696,47 @@ pub(crate) fn cte_width(s: &SelectStmt) -> Option<usize> {
 
 /// v0.10: the parsed contents of `OVER (...)`, before conversion into
 /// `Expr::Window`.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WindowSpec {
     pub(crate) partition_by: Vec<Expr>,
     pub(crate) order_by: Vec<OrderTerm>,
     pub(crate) frame: WindowFrame,
     /// v1.31: PG19 `opt_window_exclusion_clause`.
     pub(crate) exclusion: FrameExclusion,
+    /// v2.39: the referenced existing window name (`OVER (w ...)` /
+    /// a WINDOW definition `w2 AS (w1 ...)`), if any. Resolved by
+    /// merging before the spec reaches an `Expr::Window`.
+    pub(crate) ref_name: Option<String>,
+    /// v2.39: true for the bare `OVER w` form (no parentheses).
+    pub(crate) bare_ref: bool,
+    /// v2.39: true when an explicit frame clause was written.
+    pub(crate) frame_specified: bool,
+}
+
+impl WindowSpec {
+    /// v2.39: an empty inline spec (the bare `OVER w` partial spec
+    /// before merging).
+    pub(crate) fn empty() -> WindowSpec {
+        WindowSpec {
+            partition_by: Vec::new(),
+            order_by: Vec::new(),
+            frame: WindowFrame::Default,
+            exclusion: FrameExclusion::NoOthers,
+            ref_name: None,
+            bare_ref: false,
+            frame_specified: false,
+        }
+    }
+}
+
+/// v2.39: one resolved entry of a query's `WINDOW name AS (spec)`
+/// clause (PG19 `window_definition`). Definitions are resolved in
+/// order — a definition may reference an earlier one — before any
+/// `OVER` reference in the statement is merged against them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NamedWindow {
+    pub name: String,
+    pub(crate) spec: WindowSpec,
 }
 
 /// v0.88: render a token slice back to SQL-ish source text, for stored

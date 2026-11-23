@@ -3309,6 +3309,7 @@ pub(crate) fn rewrite_func_arg_expr(e: &mut Expr, arg_names: &[Option<String>]) 
             args,
             partition_by,
             order_by,
+            frame,
             ..
         } => {
             for a in args.iter_mut().chain(partition_by.iter_mut()) {
@@ -3317,6 +3318,10 @@ pub(crate) fn rewrite_func_arg_expr(e: &mut Expr, arg_names: &[Option<String>]) 
             for o in order_by {
                 rewrite_func_arg_expr(&mut o.expr, arg_names);
             }
+            // v2.39: frame offset expressions may reference function
+            // arguments (`ROWS BETWEEN CURRENT ROW AND group_size
+            // FOLLOWING` in a SQL function body).
+            rewrite_frame_arg_exprs(frame, &mut |e| rewrite_func_arg_expr(e, arg_names));
         }
         // v1.30: ordered-set aggregate — rewrite named-arg refs in
         // direct args, the WITHIN GROUP sort keys, and the FILTER.
@@ -3347,6 +3352,26 @@ pub(crate) fn rewrite_func_arg_expr(e: &mut Expr, arg_names: &[Option<String>]) 
 /// against the labeled block's own scope, not the current one.
 pub(crate) type LabelScopes =
     std::collections::HashMap<String, std::collections::HashMap<String, u32>>;
+
+/// v2.39: apply a mutable expression rewrite to a window frame's
+/// offset expressions (the only sub-expressions a frame carries).
+pub(crate) fn rewrite_frame_arg_exprs(frame: &mut WindowFrame, f: &mut impl FnMut(&mut Expr)) {
+    fn bound(b: &mut FrameBound, f: &mut impl FnMut(&mut Expr)) {
+        match b {
+            FrameBound::Preceding(e) | FrameBound::Following(e) => f(e),
+            _ => {}
+        }
+    }
+    match frame {
+        WindowFrame::Rows { start, end }
+        | WindowFrame::Range { start, end }
+        | WindowFrame::Groups { start, end } => {
+            bound(start, f);
+            bound(end, f);
+        }
+        WindowFrame::Default => {}
+    }
+}
 
 pub(crate) fn rewrite_expr_map(
     e: &mut Expr,
@@ -3516,6 +3541,7 @@ pub(crate) fn rewrite_expr_map(
             args,
             partition_by,
             order_by,
+            frame,
             ..
         } => {
             for a in args.iter_mut().chain(partition_by.iter_mut()) {
@@ -3524,6 +3550,8 @@ pub(crate) fn rewrite_expr_map(
             for o in order_by {
                 rewrite_expr_map(&mut o.expr, map, labels);
             }
+            // v2.39: frame offsets, as in rewrite_func_arg_expr.
+            rewrite_frame_arg_exprs(frame, &mut |e| rewrite_expr_map(e, map, labels));
         }
         // v1.30: ordered-set aggregate — rewrite named-arg refs in
         // direct args, the WITHIN GROUP sort keys, and the FILTER.

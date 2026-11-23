@@ -247,4 +247,7 @@ pub(crate) struct ExecWindow {
     /// v1.31: PG19 `opt_window_exclusion_clause`; participates in
     /// window identity like `filter`.
     pub(crate) exclusion: FrameExclusion,
+    /// v2.39: PG19 `null_treatment`; participates in window identity
+    /// like `filter`.
+    pub(crate) null_treatment: crate::sql::NullTreatment,
 }

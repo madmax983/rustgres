@@ -805,6 +805,9 @@ fn map_children(
             wid,
             filter,
             exclusion,
+            null_treatment,
+            win_ref,
+            written,
         } => Expr::Window {
             func: func.clone(),
             args: args.iter().map(|x| f(x)).collect::<Result<Vec<_>, _>>()?,
@@ -818,6 +821,9 @@ fn map_children(
             wid: *wid,
             filter: opt(filter, f)?,
             exclusion: exclusion.clone(),
+            null_treatment: *null_treatment,
+            win_ref: win_ref.clone(),
+            written: written.clone(),
         },
     })
 }

@@ -987,6 +987,7 @@ pub(crate) fn pg_anti_scan_stmt(
         group_by: vec![],
         group_by_sets: false,
         having: None,
+        window_defs: vec![],
         order_by: vec![],
         limit: None,
         offset: None,

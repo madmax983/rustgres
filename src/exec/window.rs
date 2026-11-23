@@ -33,6 +33,7 @@ pub(crate) fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecErr
             partition_by,
             order_by,
             frame,
+            null_treatment,
             ..
         } => {
             if in_agg {
@@ -48,6 +49,55 @@ pub(crate) fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecErr
                     "0A000",
                     "DISTINCT is not implemented for window functions",
                 ));
+            }
+            // v2.39: PG19 nodeWindowAgg.c
+            // WinCheckAndInitializeNullTreatment — only lead/lag/
+            // first_value/last_value/nth_value accept a null
+            // treatment clause; any other window function (including
+            // an explicit RESPECT NULLS) is 0A000 at execution.
+            if *null_treatment != NullTreatment::Unspecified
+                && !matches!(
+                    func,
+                    WindowFunc::Lag
+                        | WindowFunc::Lead
+                        | WindowFunc::FirstValue
+                        | WindowFunc::LastValue
+                        | WindowFunc::NthValue
+                )
+            {
+                return Err(exec_err(
+                    "0A000",
+                    format!(
+                        "function {} does not allow RESPECT/IGNORE NULLS",
+                        window_func_name(func)
+                    ),
+                ));
+            }
+            // v2.39: PG19 parse_clause.c transformFrameOffset +
+            // checkExprIsVarFree — frame offset expressions must not
+            // contain variables of this query level (42P10), nor
+            // aggregates or window functions.
+            for (bound, is_start) in frame_bounds(frame) {
+                let mode = frame_mode_name(frame);
+                if expr_has_level_var(bound) {
+                    return Err(exec_err(
+                        "42P10",
+                        format!("argument of {} must not contain variables", mode),
+                    ));
+                }
+                if contains_agg(bound) {
+                    return Err(exec_err(
+                        "42803",
+                        format!("aggregate functions are not allowed in {}", mode),
+                    ));
+                }
+                if contains_window(bound) {
+                    return Err(exec_err(
+                        "42803",
+                        format!("window functions are not allowed in {}", mode),
+                    ));
+                }
+                let _ = is_start;
             }
             for a in args {
                 if contains_window(a) {
@@ -326,7 +376,11 @@ pub(crate) fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecErr
 /// v0.10: argument counts per window function (Postgres arities).
 pub(crate) fn check_window_arity(func: &WindowFunc, n: usize) -> Result<(), ExecError> {
     let ok = match func {
-        WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => n == 0,
+        WindowFunc::RowNumber
+        | WindowFunc::Rank
+        | WindowFunc::DenseRank
+        | WindowFunc::PercentRank
+        | WindowFunc::CumeDist => n == 0,
         WindowFunc::Ntile => n == 1,
         WindowFunc::Lag | WindowFunc::Lead => n >= 1 && n <= 3,
         WindowFunc::FirstValue | WindowFunc::LastValue => n == 1,
@@ -407,6 +461,80 @@ pub(crate) fn has_offset_bound(b: &FrameBound) -> bool {
     matches!(b, FrameBound::Preceding(_) | FrameBound::Following(_))
 }
 
+/// v2.39: PG19's display name for a window function (error messages).
+pub(crate) fn window_func_name(func: &WindowFunc) -> String {
+    match func {
+        WindowFunc::RowNumber => "row_number".to_string(),
+        WindowFunc::Rank => "rank".to_string(),
+        WindowFunc::DenseRank => "dense_rank".to_string(),
+        WindowFunc::PercentRank => "percent_rank".to_string(),
+        WindowFunc::CumeDist => "cume_dist".to_string(),
+        WindowFunc::Ntile => "ntile".to_string(),
+        WindowFunc::Lag => "lag".to_string(),
+        WindowFunc::Lead => "lead".to_string(),
+        WindowFunc::FirstValue => "first_value".to_string(),
+        WindowFunc::LastValue => "last_value".to_string(),
+        WindowFunc::NthValue => "nth_value".to_string(),
+        WindowFunc::Agg(f) => f.name().to_string(),
+    }
+}
+
+/// v2.39: the (bound, is_start) offset expressions of a frame.
+pub(crate) fn frame_bounds(frame: &WindowFrame) -> Vec<(&Expr, bool)> {
+    let mut out = Vec::new();
+    let (start, end) = match frame {
+        WindowFrame::Default => return out,
+        WindowFrame::Rows { start, end }
+        | WindowFrame::Range { start, end }
+        | WindowFrame::Groups { start, end } => (start, end),
+    };
+    if let FrameBound::Preceding(e) | FrameBound::Following(e) = start {
+        out.push((&**e, true));
+    }
+    if let FrameBound::Preceding(e) | FrameBound::Following(e) = end {
+        out.push((&**e, false));
+    }
+    out
+}
+
+/// v2.39: PG19's construct name for a frame mode ("ROWS" / "RANGE" /
+/// "GROUPS"), used by the frame-offset error messages.
+pub(crate) fn frame_mode_name(frame: &WindowFrame) -> &'static str {
+    match frame {
+        WindowFrame::Range { .. } => "RANGE",
+        WindowFrame::Groups { .. } => "GROUPS",
+        _ => "ROWS",
+    }
+}
+
+/// v2.39: does `e` reference a column of the current query level?
+/// Subqueries are their own level and are not descended into (their
+/// columns are legal inside a frame offset, PG19 checkExprIsVarFree
+/// counts only vars of level 0).
+pub(crate) fn expr_has_level_var(e: &Expr) -> bool {
+    match e {
+        Expr::Column { .. } | Expr::ResolvedCol { .. } | Expr::WholeRow { .. } => true,
+        Expr::ScalarSub(_)
+        | Expr::ArraySubquery(_)
+        | Expr::Exists { .. }
+        | Expr::JsonArraySubq { .. } => false,
+        Expr::InSub { expr, .. } => expr_has_level_var(expr),
+        Expr::Quantified { left, .. } => expr_has_level_var(left),
+        _ => {
+            let mut found = false;
+            expr_walk(e, &mut |x| {
+                if matches!(
+                    x,
+                    Expr::Column { .. } | Expr::ResolvedCol { .. } | Expr::WholeRow { .. }
+                ) {
+                    found = true;
+                }
+            });
+            found
+        }
+    }
+}
+
 /// v0.10: collect the deduplicated window specifications used at this
 /// query level (SELECT list and ORDER BY).
 pub(crate) fn collect_windows(stmt: &SelectStmt) -> Vec<ExecWindow> {
@@ -421,7 +549,9 @@ pub(crate) fn collect_windows(stmt: &SelectStmt) -> Vec<ExecWindow> {
             frame,
             filter,
             exclusion,
+            null_treatment,
             wid: _,
+            ..
         } = e
         {
             let w = ExecWindow {
@@ -435,6 +565,8 @@ pub(crate) fn collect_windows(stmt: &SelectStmt) -> Vec<ExecWindow> {
                 filter: filter.as_deref().cloned(),
                 // v1.31: exclusion participates in window identity.
                 exclusion: exclusion.clone(),
+                // v2.39: null treatment participates in window identity.
+                null_treatment: *null_treatment,
             };
             if !out.contains(&w) {
                 out.push(w);
@@ -530,6 +662,8 @@ pub(crate) fn assign_window_ids(stmt: &mut SelectStmt, windows: &[ExecWindow]) {
                 wid,
                 filter,
                 exclusion,
+                null_treatment,
+                ..
             } => {
                 let w = ExecWindow {
                     func: func.clone(),
@@ -542,6 +676,8 @@ pub(crate) fn assign_window_ids(stmt: &mut SelectStmt, windows: &[ExecWindow]) {
                     filter: filter.as_deref().cloned(),
                     // v1.31: exclusion participates in window identity.
                     exclusion: exclusion.clone(),
+                    // v2.39: null treatment participates in window identity.
+                    null_treatment: *null_treatment,
                 };
                 *wid = windows.iter().position(|x| x == &w).unwrap_or(0);
             }
@@ -624,6 +760,209 @@ pub(crate) struct WindowInput {
     /// nodeWindowAgg.c "Skip anything FILTERed out"); `true` for every
     /// row when the spec has no FILTER.
     pub(crate) filter_vals: Vec<bool>,
+    /// v2.39: the frame's start/end offset values, evaluated once per
+    /// spec (PG19 nodeWindowAgg.c `EvalWindowFrameOffset` runs once,
+    /// before the first row) with the first input row's scope.
+    /// `None` when the bound carries no offset. For ROWS/GROUPS the
+    /// value is the coerced count (`Value::BigInt`, non-negative);
+    /// for RANGE it is the raw offset value (numeric or interval).
+    pub(crate) off_start: Option<Value>,
+    pub(crate) off_end: Option<Value>,
+}
+
+/// v2.39: coerce a ROWS/GROUPS frame offset value to a row count
+/// (PG19 parse_clause.c coerces the offset expression to int8;
+/// nodeWindowAgg.c rejects NULL with 22004 and negative counts with
+/// 22013 ERRCODE_INVALID_PRECEDING_OR_FOLLOWING_SIZE).
+pub(crate) fn frame_offset_count(v: &Value, is_start: bool) -> Result<i64, ExecError> {
+    let c: i64 = match v {
+        Value::SmallInt(i) => *i as i64,
+        Value::Int(i) => *i,
+        Value::BigInt(i) => *i,
+        Value::Float(f) => f.round() as i64,
+        Value::Float4(f) => (*f as f64).round() as i64,
+        Value::Numeric(n) => n.to_f64().round() as i64,
+        Value::Text(s) => s
+            .trim()
+            .parse::<i64>()
+            .or_else(|_| s.trim().parse::<f64>().map(|f| f.round() as i64))
+            .map_err(|_| {
+                exec_err(
+                    "42804",
+                    "argument of ROWS must be integer, not a non-numeric value".to_string(),
+                )
+            })?,
+        _ => {
+            return Err(exec_err(
+                "42804",
+                format!(
+                    "argument of ROWS must be integer, not type {}",
+                    v.type_name().to_lowercase()
+                ),
+            ));
+        }
+    };
+    if c < 0 {
+        return Err(exec_err(
+            "22013",
+            if is_start {
+                "frame starting offset must not be negative"
+            } else {
+                "frame ending offset must not be negative"
+            },
+        ));
+    }
+    Ok(c)
+}
+
+/// v2.39: evaluate a window spec's frame offset expressions once
+/// (PG19 `EvalWindowFrameOffset`), with the given (first-row) scope.
+/// Returns (start offset, end offset) as stored on `WindowInput`.
+pub(crate) fn eval_frame_offsets(
+    q: &mut Q,
+    scopes: &[Scope],
+    spec: &ExecWindow,
+) -> Result<(Option<Value>, Option<Value>), ExecError> {
+    let rows_mode = matches!(
+        spec.frame,
+        WindowFrame::Rows { .. } | WindowFrame::Groups { .. }
+    );
+    // v2.39 finisher: static type of a single ORDER BY key, for the
+    // analysis-time RANGE operator check below (PG19 resolves the
+    // bound through the key's own +/- operator at parse analysis,
+    // so the error fires even on an empty input — the per-row path
+    // in range_frame never runs there).
+    let key_ty: Option<ColType> = if spec.order_by.len() == 1 {
+        match &spec.order_by[0].expr {
+            Expr::ResolvedCol { frame, idx } => scopes
+                .get(*frame)
+                .and_then(|s| s.schema.get(*idx))
+                .map(|c| c.ty.clone()),
+            Expr::Column { name, .. } => scopes.iter().rev().find_map(|s| {
+                s.schema
+                    .iter()
+                    .find(|c| &c.name == name)
+                    .map(|c| c.ty.clone())
+            }),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let mut eval_one = |b: &FrameBound, is_start: bool| -> Result<Option<Value>, ExecError> {
+        let e = match b {
+            FrameBound::Preceding(e) | FrameBound::Following(e) => e,
+            _ => return Ok(None),
+        };
+        // v2.39 finisher: PG19 42883 — a float8/float4-cast RANGE
+        // offset on a numeric ORDER BY key has no numeric -/+ float8
+        // operator. (A bare decimal literal is NOT this: PG coerces
+        // the unknown-typed literal to numeric, and this engine's
+        // Literal::Decimal follows that path.)
+        if !rows_mode && matches!(key_ty, Some(ColType::Numeric(_))) {
+            if let Expr::Cast {
+                to: ColType::Float | ColType::Float4,
+                ..
+            } = &**e
+            {
+                let op = if matches!(b, FrameBound::Preceding(_)) {
+                    "-"
+                } else {
+                    "+"
+                };
+                return Err(exec_err(
+                    "42883",
+                    format!("operator does not exist: numeric {op} double precision"),
+                ));
+            }
+        }
+        let v = eval_expr(q, scopes, e)?;
+        if matches!(v, Value::Null) {
+            return Err(exec_err(
+                "22004",
+                if is_start {
+                    "frame starting offset must not be null"
+                } else {
+                    "frame ending offset must not be null"
+                },
+            ));
+        }
+        if rows_mode {
+            Ok(Some(Value::BigInt(frame_offset_count(&v, is_start)?)))
+        } else {
+            // v2.39 finisher: PG19 nodeWindowAgg RANGE-offset
+            // validation, applied once per partition with the offset
+            // value: a negative offset is 42P20 "invalid preceding
+            // or following size in window function" (interval
+            // offsets included — '-70 min', '-1 year',
+            // '-infinity'), and a NaN offset is "argument of RANGE
+            // must not be NaN". The inherited code skipped both
+            // checks, so PG-error statements silently succeeded.
+            let neg_err = || {
+                exec_err(
+                    "42P20",
+                    "invalid preceding or following size in window function",
+                )
+            };
+            let nan_err = || exec_err("22023", "argument of RANGE must not be NaN");
+            let check_num = |f: f64| -> Result<(), ExecError> {
+                if f.is_nan() {
+                    Err(nan_err())
+                } else if f < 0.0 {
+                    Err(neg_err())
+                } else {
+                    Ok(())
+                }
+            };
+            match &v {
+                Value::Interval(iv) => {
+                    if crate::datetime::interval_cmp(iv, &crate::datetime::Interval::zero())
+                        == std::cmp::Ordering::Less
+                    {
+                        return Err(neg_err());
+                    }
+                }
+                Value::Float(f) => check_num(*f)?,
+                Value::Float4(f) => check_num(*f as f64)?,
+                Value::Numeric(n) => check_num(n.to_f64())?,
+                Value::SmallInt(i) => {
+                    if *i < 0 {
+                        return Err(neg_err());
+                    }
+                }
+                Value::Int(i) => {
+                    if *i < 0 {
+                        return Err(neg_err());
+                    }
+                }
+                Value::BigInt(i) => {
+                    if *i < 0 {
+                        return Err(neg_err());
+                    }
+                }
+                Value::Text(s) => {
+                    if let Ok(f) = s.trim().parse::<f64>() {
+                        check_num(f)?;
+                    } else if let Ok(iv) = crate::datetime::parse_interval(s) {
+                        if crate::datetime::interval_cmp(&iv, &crate::datetime::Interval::zero())
+                            == std::cmp::Ordering::Less
+                        {
+                            return Err(neg_err());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            Ok(Some(v))
+        }
+    };
+    let (start, end) = match &spec.frame {
+        WindowFrame::Default => (None, None),
+        WindowFrame::Rows { start, end }
+        | WindowFrame::Range { start, end }
+        | WindowFrame::Groups { start, end } => (eval_one(start, true)?, eval_one(end, false)?),
+    };
+    Ok((start, end))
 }
 
 /// v0.10: compare two order-key vectors using the window's ORDER BY
@@ -670,15 +1009,27 @@ pub(crate) fn window_keys_equal(a: &[Value], b: &[Value]) -> bool {
 }
 
 /// v0.10: resolve a ROWS frame bound to an inclusive row position.
-pub(crate) fn rows_bound(b: &FrameBound, pos: usize, n: usize) -> usize {
+/// v2.39: `off` is the bound's evaluated offset count (from
+/// `WindowInput::off_start` / `off_end`); i128 math keeps a huge
+/// offset (e.g. 9223372036854775807 FOLLOWING) from overflowing.
+pub(crate) fn rows_bound(b: &FrameBound, pos: usize, n: usize, off: i64) -> usize {
     match b {
         FrameBound::UnboundedPreceding => 0,
-        FrameBound::Preceding(k) => pos.saturating_sub((*k).min(usize::MAX as u64) as usize),
+        FrameBound::Preceding(_) => (pos as i128 - off as i128).max(0) as usize,
         FrameBound::CurrentRow => pos,
-        FrameBound::Following(k) => pos
-            .saturating_add((*k).min(usize::MAX as u64) as usize)
-            .min(n.saturating_sub(1)),
+        FrameBound::Following(_) => (pos as i128 + off as i128)
+            .min(n.saturating_sub(1) as i128)
+            .max(0) as usize,
         FrameBound::UnboundedFollowing => n.saturating_sub(1),
+    }
+}
+
+/// v2.39: the evaluated offset count stored for a bound (ROWS/GROUPS
+/// offsets are coerced to `Value::BigInt` at gather time).
+pub(crate) fn stored_count(v: &Option<Value>) -> i64 {
+    match v {
+        Some(Value::BigInt(i)) => *i,
+        _ => 0,
     }
 }
 
@@ -704,6 +1055,8 @@ pub(crate) fn groups_frame(
     pos: usize,
     start: &FrameBound,
     end: &FrameBound,
+    off_start: i64,
+    off_end: i64,
 ) -> (usize, usize) {
     let n = peer_id.len();
     debug_assert!(n > 0 && pos < n);
@@ -721,12 +1074,12 @@ pub(crate) fn groups_frame(
     let s = match start {
         FrameBound::UnboundedPreceding => 0,
         FrameBound::CurrentRow => first[curg],
-        FrameBound::Preceding(k) => {
-            let target = curg as i128 - *k as i128;
+        FrameBound::Preceding(_) => {
+            let target = curg as i128 - off_start as i128;
             first[target.max(0) as usize]
         }
-        FrameBound::Following(k) => {
-            let target = curg as i128 + *k as i128;
+        FrameBound::Following(_) => {
+            let target = curg as i128 + off_start as i128;
             if target > maxg as i128 {
                 return (1, 0);
             }
@@ -737,15 +1090,15 @@ pub(crate) fn groups_frame(
     let e = match end {
         FrameBound::UnboundedFollowing => n - 1,
         FrameBound::CurrentRow => last[curg],
-        FrameBound::Preceding(k) => {
-            let target = curg as i128 - *k as i128;
+        FrameBound::Preceding(_) => {
+            let target = curg as i128 - off_end as i128;
             if target < 0 {
                 return (1, 0);
             }
             last[target as usize]
         }
-        FrameBound::Following(k) => {
-            let target = curg as i128 + *k as i128;
+        FrameBound::Following(_) => {
+            let target = curg as i128 + off_end as i128;
             last[target.min(maxg as i128) as usize]
         }
         FrameBound::UnboundedPreceding => return (1, 0),
@@ -806,7 +1159,14 @@ pub(crate) fn resolve_frame(
     // verbatim: "computed without regard for any window exclusion
     // clause"); exclusion is applied per-row by the callers.
     if let WindowFrame::Groups { start, end } = &spec.frame {
-        return Ok(groups_frame(peer_id, pos, start, end));
+        return Ok(groups_frame(
+            peer_id,
+            pos,
+            start,
+            end,
+            stored_count(&input.off_start),
+            stored_count(&input.off_end),
+        ));
     }
     // Effective frame (Postgres default rule).
     let (is_range, start, end): (bool, FrameBound, FrameBound) = match &spec.frame {
@@ -828,8 +1188,8 @@ pub(crate) fn resolve_frame(
         WindowFrame::Groups { .. } => unreachable!("GROUPS handled before frame dispatch"),
     };
     if !is_range {
-        let s = rows_bound(&start, pos, n);
-        let e = rows_bound(&end, pos, n);
+        let s = rows_bound(&start, pos, n, stored_count(&input.off_start));
+        let e = rows_bound(&end, pos, n, stored_count(&input.off_end));
         // v0.10: an inverted span is empty (not silently reversed).
         if s > e {
             return Ok((1, 0));
@@ -840,8 +1200,8 @@ pub(crate) fn resolve_frame(
     // row is a peer of every other; resolve positionally like ROWS.
     let key_at = |p: usize| -> &[Value] { &input.order_keys[idxs[p]] };
     if order_len == 0 {
-        let s = rows_bound(&start, pos, n);
-        let e = rows_bound(&end, pos, n);
+        let s = rows_bound(&start, pos, n, stored_count(&input.off_start));
+        let e = rows_bound(&end, pos, n, stored_count(&input.off_end));
         if s > e {
             return Ok((1, 0));
         }
@@ -924,44 +1284,106 @@ pub(crate) fn resolve_frame(
         }
         return Ok((s, e));
     }
-    // RANGE with offsets: numeric interval semantics.
+    // RANGE with offsets. v2.39: the offset is an evaluated value —
+    // a numeric difference for numeric order keys, or an interval
+    // for date/time/timestamp order keys (PG19 nodeWindowAgg.c uses
+    // the order-by type's own +/- operators for the bound values).
+    // An unknown-typed string literal offset ('1 day') is read as an
+    // interval for temporal keys, as PG's parse-time coercion does.
+    let off_start = input.off_start.clone();
+    let off_end = input.off_end.clone();
+    let as_interval = |v: &Option<Value>| -> Option<crate::datetime::Interval> {
+        match v {
+            Some(Value::Interval(iv)) => Some(iv.clone()),
+            Some(Value::Text(s)) => crate::datetime::parse_interval(s).ok(),
+            _ => None,
+        }
+    };
+    let temporal = matches!(
+        cur,
+        Value::Date(_) | Value::Timestamp(_) | Value::Timestamptz(_) | Value::Time(_)
+    );
+    if temporal && (as_interval(&off_start).is_some() || as_interval(&off_end).is_some()) {
+        return range_interval_frame(&cur, &start, &end, &off_start, &off_end, key_at, n);
+    }
     if matches!(cur, Value::Null) {
-        return Err(exec_err(
-            "0A000",
-            "RANGE offset requires a numeric ORDER BY expression",
-        ));
+        // v2.39: PG19 nodeWindowAgg.c — NULL order keys are peers of
+        // each other, and an offset RANGE frame for a NULL-keyed row
+        // is exactly its NULL peer group (the +/- bound values are
+        // NULL, and only NULL keys satisfy the frame test).
+        let mut s = pos;
+        while s > 0 && matches!(key_at(s - 1).first(), Some(Value::Null)) {
+            s -= 1;
+        }
+        let mut e = pos;
+        while e + 1 < n && matches!(key_at(e + 1).first(), Some(Value::Null)) {
+            e += 1;
+        }
+        return Ok((s, e));
     }
     let to_f = |v: &Value| -> Result<f64, ExecError> {
         match v {
+            Value::SmallInt(i) => Ok(*i as f64),
             Value::Int(i) => Ok(*i as f64),
             Value::BigInt(i) => Ok(*i as f64),
             Value::Float(f) => Ok(*f),
+            Value::Float4(f) => Ok(*f as f64),
             Value::Numeric(n) => Ok(n.to_f64()),
+            Value::Text(s) => s.trim().parse::<f64>().map_err(|_| {
+                exec_err(
+                    "0A000",
+                    "RANGE offset requires a numeric ORDER BY expression",
+                )
+            }),
             _ => Err(exec_err(
                 "0A000",
                 "RANGE offset requires a numeric ORDER BY expression",
             )),
         }
     };
-    let cur_f = if matches!(cur, Value::Null) {
-        f64::NAN
-    } else {
-        to_f(&cur)?
-    };
-    let bound_val = |b: &FrameBound| -> Result<f64, ExecError> {
+    let cur_f = to_f(&cur)?;
+    // v2.39 finisher: PG19 parse analysis resolves the RANGE bound
+    // through the order key's own +/- operator; a float8 offset on a
+    // numeric key has none (42883 "operator does not exist:
+    // numeric - double precision"). The inherited f64 flattening
+    // silently accepted it.
+    for (b, off) in [(&start, &off_start), (&end, &off_end)] {
+        // A bare decimal-literal offset coerces to numeric in PG —
+        // its evaluated Value::Float is not the 42883 case (the
+        // cast-typed form is rejected earlier, in eval_frame_offsets).
+        let decimal_literal = matches!(
+            b,
+            FrameBound::Preceding(e) | FrameBound::Following(e)
+                if matches!(e.as_ref(), Expr::Literal(Literal::Decimal(_)))
+        );
+        if !decimal_literal && matches!(cur, Value::Numeric(_)) {
+            if let Some(Value::Float(_)) | Some(Value::Float4(_)) = off {
+                let op = if matches!(b, FrameBound::Preceding(_)) {
+                    "-"
+                } else {
+                    "+"
+                };
+                return Err(exec_err(
+                    "42883",
+                    format!("operator does not exist: numeric {op} double precision"),
+                ));
+            }
+        }
+    }
+    let bound_val = |b: &FrameBound, off: &Option<Value>| -> Result<f64, ExecError> {
         match b {
             FrameBound::UnboundedPreceding => Ok(f64::NEG_INFINITY),
             FrameBound::UnboundedFollowing => Ok(f64::INFINITY),
             FrameBound::CurrentRow => Ok(cur_f),
-            FrameBound::Preceding(k) => Ok(cur_f - (*k as f64)),
-            FrameBound::Following(k) => Ok(cur_f + (*k as f64)),
+            FrameBound::Preceding(_) => Ok(cur_f - to_f(off.as_ref().unwrap_or(&Value::Null))?),
+            FrameBound::Following(_) => Ok(cur_f + to_f(off.as_ref().unwrap_or(&Value::Null))?),
         }
     };
     // Note: for the start bound, PRECEDING gives lo; for the end bound,
     // FOLLOWING gives hi. (A start FOLLOWING / end PRECEDING was
     // rejected by the parser's frame sanity check.)
-    let lo = bound_val(&start)?;
-    let hi = bound_val(&end)?;
+    let lo = bound_val(&start, &off_start)?;
+    let hi = bound_val(&end, &off_end)?;
     let mut s = n;
     let mut e = n;
     for p in 0..n {
@@ -971,6 +1393,110 @@ pub(crate) fn resolve_frame(
         }
         let f = to_f(v)?;
         if f >= lo && f <= hi {
+            if s == n {
+                s = p;
+            }
+            e = p;
+        }
+    }
+    if s == n {
+        return Ok((1, 0)); // empty frame
+    }
+    Ok((s, e))
+}
+
+/// v2.39: RANGE frame with interval offsets over a temporal order
+/// key. All keys and bounds are projected to epoch microseconds
+/// (dates at midnight, times within the day) and the frame is the
+/// contiguous run of rows whose key lies in [lo, hi].
+pub(crate) fn range_interval_frame<'a>(
+    cur: &Value,
+    start: &FrameBound,
+    end: &FrameBound,
+    off_start: &Option<Value>,
+    off_end: &Option<Value>,
+    key_at: impl Fn(usize) -> &'a [Value],
+    n: usize,
+) -> Result<(usize, usize), ExecError> {
+    use crate::datetime as dt;
+    fn key_micros(v: &Value) -> Option<i64> {
+        match v {
+            Value::Date(d) => (*d as i64).checked_mul(86_400_000_000),
+            Value::Timestamp(m) | Value::Timestamptz(m) | Value::Time(m) => Some(*m),
+            _ => None,
+        }
+    }
+    fn off_interval(v: &Option<Value>) -> Option<dt::Interval> {
+        match v {
+            Some(Value::Interval(iv)) => Some(iv.clone()),
+            Some(Value::Text(s)) => dt::parse_interval(s).ok(),
+            _ => None,
+        }
+    }
+    fn shift(cur: &Value, cur_m: i64, iv: &dt::Interval, sign: i32) -> Result<i64, ExecError> {
+        let err = |e: String| exec_err("22008", e);
+        match cur {
+            Value::Timestamp(_) => dt::timestamp_add_interval(cur_m, iv, sign).map_err(err),
+            Value::Timestamptz(_) => dt::timestamptz_add_interval(cur_m, iv, sign).map_err(err),
+            // PG date +/- interval is midnight-based timestamp math.
+            Value::Date(_) => dt::timestamp_add_interval(cur_m, iv, sign).map_err(err),
+            Value::Time(_) => {
+                // v2.39 finisher: saturating math — an 'infinity'
+                // interval offset must saturate the bound (PG: the
+                // frame then covers every row), never overflow-panic
+                // (the inherited code multiplied days * 86.4e9 in
+                // checked-arithmetic style and panicked the server
+                // thread on interval 'infinity').
+                let delta = iv
+                    .micros
+                    .saturating_add((iv.days as i64).saturating_mul(86_400_000_000))
+                    .saturating_mul(sign as i64);
+                Ok(cur_m.saturating_add(delta))
+            }
+            _ => Err(exec_err(
+                "0A000",
+                "RANGE offset requires a numeric ORDER BY expression",
+            )),
+        }
+    }
+    // A NULL current key matches nothing (PG: comparisons with the
+    // NULL bound value are never true).
+    let Some(cur_m) = key_micros(cur) else {
+        return Ok((1, 0));
+    };
+    let bound_micros = |b: &FrameBound,
+                        off: &Option<Value>,
+                        is_start: bool|
+     -> Result<Option<i64>, ExecError> {
+        match b {
+            FrameBound::UnboundedPreceding if is_start => Ok(None),
+            FrameBound::UnboundedFollowing if !is_start => Ok(None),
+            FrameBound::UnboundedPreceding | FrameBound::UnboundedFollowing => {
+                Ok(Some(if is_start { i64::MAX } else { i64::MIN }))
+            }
+            FrameBound::CurrentRow => Ok(Some(cur_m)),
+            FrameBound::Preceding(_) => {
+                let iv = off_interval(off)
+                    .ok_or_else(|| exec_err("0A000", "RANGE offset requires an interval value"))?;
+                Ok(Some(shift(cur, cur_m, &iv, -1)?))
+            }
+            FrameBound::Following(_) => {
+                let iv = off_interval(off)
+                    .ok_or_else(|| exec_err("0A000", "RANGE offset requires an interval value"))?;
+                Ok(Some(shift(cur, cur_m, &iv, 1)?))
+            }
+        }
+    };
+    let lo = bound_micros(start, off_start, true)?;
+    let hi = bound_micros(end, off_end, false)?;
+    let mut s = n;
+    let mut e = n;
+    for p in 0..n {
+        let v = key_at(p).first().unwrap_or(&Value::Null);
+        let Some(f) = key_micros(v) else {
+            continue;
+        };
+        if lo.is_none_or(|l| f >= l) && hi.is_none_or(|h| f <= h) {
             if s == n {
                 s = p;
             }
@@ -1015,6 +1541,21 @@ pub(crate) fn gather_window_inputs_plain(
     let reps = window_group_reps(specs);
     let mut out: Vec<WindowInput> = Vec::with_capacity(specs.len());
     for (i, spec) in specs.iter().enumerate() {
+        // v2.39: frame offsets are evaluated once per spec (PG19
+        // EvalWindowFrameOffset), with the first row's scope.
+        let (off_start, off_end) = {
+            let empty_cells = Row::new(Vec::new());
+            let first = rows.first().map(|r| &r.cells).unwrap_or(&empty_cells);
+            let frame0 = Scope {
+                schema,
+                row: first,
+                prov: None,
+            };
+            let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+            scopes.extend_from_slice(outer);
+            scopes.push(frame0);
+            eval_frame_offsets(q, &scopes, spec)?
+        };
         if reps[i] != i {
             // v0.64: this spec's (partition_by, order_by) is exactly
             // `specs[reps[i]]`'s — that earlier `WindowInput` already
@@ -1051,6 +1592,8 @@ pub(crate) fn gather_window_inputs_plain(
                 order_keys,
                 arg_vals,
                 filter_vals,
+                off_start,
+                off_end,
             });
             continue;
         }
@@ -1097,6 +1640,8 @@ pub(crate) fn gather_window_inputs_plain(
             order_keys,
             arg_vals,
             filter_vals,
+            off_start,
+            off_end,
         });
     }
     Ok(out)
@@ -1120,6 +1665,27 @@ pub(crate) fn gather_window_inputs_grouped(
     let reps = window_group_reps(specs);
     let mut out: Vec<WindowInput> = Vec::with_capacity(specs.len());
     for (i, spec) in specs.iter().enumerate() {
+        // v2.39: frame offsets evaluated once per spec, with the
+        // first surviving group's first-row scope.
+        let (off_start, off_end) = {
+            let empty_cells = Row::new(Vec::new());
+            let first: &[Value] = match surviving.first() {
+                Some(&gi) => match groups[gi].1.first() {
+                    Some(&ri) => &rows[ri].cells,
+                    None => &empty_cells,
+                },
+                None => &empty_cells,
+            };
+            let frame0 = Scope {
+                schema,
+                row: first,
+                prov: None,
+            };
+            let mut scopes: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+            scopes.extend_from_slice(outer);
+            scopes.push(frame0);
+            eval_frame_offsets(q, &scopes, spec)?
+        };
         if reps[i] != i {
             // v0.64: see the identical dedup in gather_window_inputs_plain.
             let part_keys = out[reps[i]].part_keys.clone();
@@ -1159,6 +1725,8 @@ pub(crate) fn gather_window_inputs_grouped(
                 order_keys,
                 arg_vals,
                 filter_vals,
+                off_start,
+                off_end,
             });
             continue;
         }
@@ -1213,6 +1781,8 @@ pub(crate) fn gather_window_inputs_grouped(
             order_keys,
             arg_vals,
             filter_vals,
+            off_start,
+            off_end,
         });
     }
     Ok(out)
@@ -1427,6 +1997,33 @@ pub(crate) fn compute_partition(
                 out[j] = Value::BigInt(peer_id[j] as i64 + 1);
             }
         }
+        // v2.39: PG19 window_percent_rank / window_cume_dist —
+        // (rank - 1) / (partition rows - 1), and (rows preceding or
+        // peer) / partition rows, both float8.
+        WindowFunc::PercentRank => {
+            for j in 0..n {
+                out[j] = if n <= 1 {
+                    Value::Float(0.0)
+                } else {
+                    // First position of j's peer group = rank - 1.
+                    let mut first = j;
+                    while first > 0 && peer_id[first - 1] == peer_id[j] {
+                        first -= 1;
+                    }
+                    Value::Float(first as f64 / (n - 1) as f64)
+                };
+            }
+        }
+        WindowFunc::CumeDist => {
+            for j in 0..n {
+                // Last position of j's peer group, +1 = NP.
+                let mut last = j;
+                while last + 1 < n && peer_id[last + 1] == peer_id[j] {
+                    last += 1;
+                }
+                out[j] = Value::Float((last + 1) as f64 / n as f64);
+            }
+        }
         WindowFunc::Ntile => {
             let k_val = arg(0, 0);
             let k = match k_val {
@@ -1454,6 +2051,10 @@ pub(crate) fn compute_partition(
         }
         WindowFunc::Lag | WindowFunc::Lead => {
             let is_lag = matches!(spec.func, WindowFunc::Lag);
+            // v2.39: IGNORE NULLS — the offset counts non-NULL values
+            // (PG19 nodeWindowAgg.c WinGetFuncArgInPartition with
+            // relpos counting only non-null rows).
+            let ignore_nulls = spec.null_treatment == NullTreatment::Ignore;
             for j in 0..n {
                 let off_val = if input.arg_vals.get(idxs[j]).map(|v| v.len()).unwrap_or(0) > 1 {
                     arg(j, 1)
@@ -1471,6 +2072,43 @@ pub(crate) fn compute_partition(
                 if off < 0 {
                     return Err(exec_err("22003", "lag/lead offset must not be negative"));
                 }
+                let default = if input.arg_vals.get(idxs[j]).map(|v| v.len()).unwrap_or(0) > 2 {
+                    arg(j, 2)
+                } else {
+                    Value::Null
+                };
+                if ignore_nulls && off == 0 {
+                    // PG19 nodeWindowAgg.c: null treatment is disabled
+                    // for relpos == 0 — the current row's own value is
+                    // returned, NULL or not.
+                    out[j] = arg(j, 0);
+                    continue;
+                }
+                if ignore_nulls {
+                    // Walk strictly away from j in the navigation
+                    // direction, counting only rows whose value is
+                    // non-NULL; the off-th such row supplies the
+                    // value (the current row's own nullness is
+                    // irrelevant — PG counts preceding/following
+                    // non-null rows).
+                    let step: i64 = if is_lag { -1 } else { 1 };
+                    let mut seen: i64 = 0;
+                    let mut found: Option<Value> = None;
+                    let mut p = j as i64 + step;
+                    while p >= 0 && (p as usize) < n {
+                        let v = arg(p as usize, 0);
+                        if !matches!(v, Value::Null) {
+                            seen += 1;
+                            if seen == off {
+                                found = Some(v);
+                                break;
+                            }
+                        }
+                        p += step;
+                    }
+                    out[j] = found.unwrap_or(default);
+                    continue;
+                }
                 let target = if is_lag {
                     (j as i64) - off
                 } else {
@@ -1478,14 +2116,14 @@ pub(crate) fn compute_partition(
                 };
                 out[j] = if target >= 0 && (target as usize) < n {
                     arg(target as usize, 0)
-                } else if input.arg_vals.get(idxs[j]).map(|v| v.len()).unwrap_or(0) > 2 {
-                    arg(j, 2)
                 } else {
-                    Value::Null
+                    default
                 };
             }
         }
         WindowFunc::FirstValue => {
+            // v2.39: IGNORE NULLS additionally skips NULL-valued rows.
+            let ignore_nulls = spec.null_treatment == NullTreatment::Ignore;
             for j in 0..n {
                 let (s, e) = resolve_frame(spec, input, idxs, j, &peer_id)?;
                 // v1.31: PG19 `WindowGetFuncArgInFrame` HEAD adjustment —
@@ -1494,7 +2132,11 @@ pub(crate) fn compute_partition(
                 if s <= e {
                     for p in s..=e {
                         if !frame_excluded(&spec.exclusion, &peer_id, j, p) {
-                            v = arg(p, 0);
+                            let cand = arg(p, 0);
+                            if ignore_nulls && matches!(cand, Value::Null) {
+                                continue;
+                            }
+                            v = cand;
                             break;
                         }
                     }
@@ -1503,6 +2145,7 @@ pub(crate) fn compute_partition(
             }
         }
         WindowFunc::LastValue => {
+            let ignore_nulls = spec.null_treatment == NullTreatment::Ignore;
             for j in 0..n {
                 let (s, e) = resolve_frame(spec, input, idxs, j, &peer_id)?;
                 // v1.31: PG19 TAIL adjustment — the last non-excluded
@@ -1511,7 +2154,11 @@ pub(crate) fn compute_partition(
                 if s <= e {
                     for p in (s..=e).rev() {
                         if !frame_excluded(&spec.exclusion, &peer_id, j, p) {
-                            v = arg(p, 0);
+                            let cand = arg(p, 0);
+                            if ignore_nulls && matches!(cand, Value::Null) {
+                                continue;
+                            }
+                            v = cand;
                             break;
                         }
                     }
@@ -1520,6 +2167,7 @@ pub(crate) fn compute_partition(
             }
         }
         WindowFunc::NthValue => {
+            let ignore_nulls = spec.null_treatment == NullTreatment::Ignore;
             for j in 0..n {
                 let (s, e) = resolve_frame(spec, input, idxs, j, &peer_id)?;
                 let nth = match arg(j, 1) {
@@ -1531,7 +2179,8 @@ pub(crate) fn compute_partition(
                     _ => return Err(exec_err("22003", "nth_value argument must be an integer")),
                 };
                 // v1.31: PG19 HEAD adjustment — the nth non-excluded row
-                // of the frame.
+                // of the frame. v2.39: with IGNORE NULLS, only
+                // non-NULL rows count toward n.
                 let mut v = Value::Null;
                 if nth >= 1 && s <= e {
                     let mut seen = 0i64;
@@ -1539,9 +2188,13 @@ pub(crate) fn compute_partition(
                         if frame_excluded(&spec.exclusion, &peer_id, j, p) {
                             continue;
                         }
+                        let cand = arg(p, 0);
+                        if ignore_nulls && matches!(cand, Value::Null) {
+                            continue;
+                        }
                         seen += 1;
                         if seen == nth {
-                            v = arg(p, 0);
+                            v = cand;
                             break;
                         }
                     }

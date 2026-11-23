@@ -1504,6 +1504,7 @@ pub(crate) fn subst_expr(e: &mut Expr, params: &[Option<Value>]) -> Result<(), E
             args,
             partition_by,
             order_by,
+            frame,
             ..
         } => {
             for a in args.iter_mut().chain(partition_by.iter_mut()) {
@@ -1511,6 +1512,23 @@ pub(crate) fn subst_expr(e: &mut Expr, params: &[Option<Value>]) -> Result<(), E
             }
             for o in order_by {
                 subst_expr(&mut o.expr, params)?;
+            }
+            // v2.39: frame offset expressions carry params too
+            // (a SQL function argument used as a frame offset).
+            fn subst_bound(b: &mut FrameBound, params: &[Option<Value>]) -> Result<(), ExecError> {
+                match b {
+                    FrameBound::Preceding(e) | FrameBound::Following(e) => subst_expr(e, params),
+                    _ => Ok(()),
+                }
+            }
+            match frame {
+                WindowFrame::Rows { start, end }
+                | WindowFrame::Range { start, end }
+                | WindowFrame::Groups { start, end } => {
+                    subst_bound(start, params)?;
+                    subst_bound(end, params)?;
+                }
+                WindowFrame::Default => {}
             }
         }
         Expr::Quantified { left, sub, .. } => {

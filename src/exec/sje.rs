@@ -1234,6 +1234,9 @@ pub(crate) fn sje_rewrite_qual(e: &Expr, from_q: &str, to_q: &str) -> Option<Exp
             wid,
             filter,
             exclusion,
+            null_treatment,
+            win_ref,
+            written,
         } => Expr::Window {
             func: func.clone(),
             args: rv(args)?,
@@ -1244,6 +1247,9 @@ pub(crate) fn sje_rewrite_qual(e: &Expr, from_q: &str, to_q: &str) -> Option<Exp
             wid: *wid,
             filter: ro(filter)?,
             exclusion: exclusion.clone(),
+            null_treatment: *null_treatment,
+            win_ref: win_ref.clone(),
+            written: written.clone(),
         },
     })
 }

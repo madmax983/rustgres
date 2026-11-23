@@ -42,11 +42,11 @@ pub(crate) use crate::sql::{
     CteDef, CteMaterialize, DefaultExpr, ExplainFormat, Expr, FdwClause, FdwOpt, FkAction, FkDef,
     FrameBound, FrameExclusion, FromItem, IndexColSpec, InsertIndirection, InsertTarget,
     InsertValue, IsolationLevel, JoinKind, JsonOp, JsonTableSpec, JtBehavior, JtColumn, Literal,
-    MappingUser, MergeAction, MergeWhen, OnConflict, OptAction, OrderTerm, OrderedSetAgg,
-    PolicyCmd, QuantKind, QuantOp, RaiseLevel, RowsFromPart, SelectItem, SelectStmt, SequenceOpts,
-    SerialKind, SetOpKind, SetOpRoot, SqlError, Stmt, TableDef, TrigCond, TrigForSource,
-    TrigIntoTarget, TriggerBody, TriggerBodyStmt, TriggerDef, TriggerTiming, UniqueDef,
-    WindowFrame, WindowFunc, collect_col_refs, collect_table_refs, parse_statement,
+    MappingUser, MergeAction, MergeWhen, NullTreatment, OnConflict, OptAction, OrderTerm,
+    OrderedSetAgg, PolicyCmd, QuantKind, QuantOp, RaiseLevel, RowsFromPart, SelectItem, SelectStmt,
+    SequenceOpts, SerialKind, SetOpKind, SetOpRoot, SqlError, Stmt, TableDef, TrigCond,
+    TrigForSource, TrigIntoTarget, TriggerBody, TriggerBodyStmt, TriggerDef, TriggerTiming,
+    UniqueDef, WindowFrame, WindowFunc, collect_col_refs, collect_table_refs, parse_statement,
     parse_trigger_body, trig_event, validate_constraint_expr,
 };
 pub(crate) use crate::storage::index_visible;
@@ -402,6 +402,9 @@ mod v237_tests;
 #[cfg(test)]
 #[path = "test_mods/v238_tests.rs"]
 mod v238_tests;
+#[cfg(test)]
+#[path = "test_mods/v239_window_tests.rs"]
+mod v239_window_tests;
 #[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;

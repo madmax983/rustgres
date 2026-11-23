@@ -2407,6 +2407,39 @@ pub(crate) fn resolve_predicate_columns(
     resolve_predicate_columns_in(pred, &scopes)
 }
 
+/// v2.39: resolve columns inside a window frame's offset expressions
+/// with the same resolver as the window's other inputs.
+pub(crate) fn resolve_frame_cols(
+    frame: &WindowFrame,
+    r: &impl Fn(&Expr) -> Result<Expr, ExecError>,
+) -> Result<WindowFrame, ExecError> {
+    fn bound(
+        b: &FrameBound,
+        r: &impl Fn(&Expr) -> Result<Expr, ExecError>,
+    ) -> Result<FrameBound, ExecError> {
+        Ok(match b {
+            FrameBound::Preceding(e) => FrameBound::Preceding(Box::new(r(e)?)),
+            FrameBound::Following(e) => FrameBound::Following(Box::new(r(e)?)),
+            other => other.clone(),
+        })
+    }
+    Ok(match frame {
+        WindowFrame::Default => WindowFrame::Default,
+        WindowFrame::Rows { start, end } => WindowFrame::Rows {
+            start: bound(start, r)?,
+            end: bound(end, r)?,
+        },
+        WindowFrame::Range { start, end } => WindowFrame::Range {
+            start: bound(start, r)?,
+            end: bound(end, r)?,
+        },
+        WindowFrame::Groups { start, end } => WindowFrame::Groups {
+            start: bound(start, r)?,
+            end: bound(end, r)?,
+        },
+    })
+}
+
 pub(crate) fn resolve_predicate_columns_in(
     pred: &Expr,
     scopes: &[Scope],
@@ -2687,6 +2720,9 @@ pub(crate) fn resolve_predicate_columns_in(
             wid,
             filter,
             exclusion,
+            null_treatment,
+            win_ref,
+            written,
         } => Ok(Expr::Window {
             func: func.clone(),
             args: args.iter().map(|a| r(a)).collect::<Result<Vec<_>, _>>()?,
@@ -2705,12 +2741,18 @@ pub(crate) fn resolve_predicate_columns_in(
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?,
-            frame: frame.clone(),
+            // v2.39: resolve columns inside frame offset expressions
+            // (their scalar subqueries carry their own scope, like
+            // argument subqueries).
+            frame: resolve_frame_cols(frame, &r)?,
             wid: *wid,
             // v1.29: resolve columns in FILTER (windowed aggregates only).
             filter: filter.as_ref().map(|f| r(f).map(Box::new)).transpose()?,
             // v1.31: exclusion is a plain enum — nothing to resolve.
             exclusion: exclusion.clone(),
+            null_treatment: *null_treatment,
+            win_ref: win_ref.clone(),
+            written: written.clone(),
         }),
     }
 }
