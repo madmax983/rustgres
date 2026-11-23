@@ -2,6 +2,97 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: jsonb subscript assignment's full parse+render round-trip is inherent, not a fixable bug — finding, no fix — 2026-11-23
+
+Full writeup with profile tables and reproduction commands: #87
+
+**Why this workload**: v2.38 (2026-11-22) added jsonb subscript
+assignment (`UPDATE t SET data['path'] = v`, `src/exec/json.rs`
+`jsonb_subscript_assign` / `parse_jsonb` / `JsonbVal::render`) and it
+had never been profiled. New harness
+`benches/profile_jsonb_subscript.py` (self-contained callgrind/dhat
+driver, same pattern as `profile_qualified_cast.py`): a table of rows
+each holding a distinct, moderately nested jsonb document (so the
+per-row parse cache can never hit — the realistic "patch one field
+across many rows" bulk-UPDATE shape), updated via one statement
+touching every row (`SET data['meta']['score'] = id`), compared
+against a `SET id = id` baseline with the *same* INSERT (same jsonb
+documents, same row count) to isolate the subscript-assign-specific
+cost from generic per-row UPDATE/WAL/pgstat overhead.
+
+**The cost is real and large**: at `--rows 2000 --docsize 10`, the
+subscript UPDATE costs 630,977,658 more `Ir` than the `SET id=id`
+control (1,940,917,166 vs 1,309,939,508) — **32.5% of the whole
+workload's instructions**, ~315,489 `Ir`/row, comfortably clearing the
+5% floor. It scales ~linearly with document size (isolating the same
+way at `--rows 1000`): delta is 165,556,549 / 305,884,230 / 782,271,528
+`Ir` at `--docsize` 0/10/40 — roughly +14-16K `Ir` per extra object
+key, not superlinear.
+
+**But every candidate mechanism for a fix turned out cheap**:
+function-level self-cost diffing between the two callgrind logs
+(`benches/profiles/callgrind.out.jsonbsub-{subscript,plain}-r2000d10-2026-11-23`)
+shows `src/exec/json.rs`'s own functions account for only
+71,915,380 of the 630,977,658 delta (~11%) — the actual tree edit
+(`assign_rec`) is 458,000 Ir self-cost in the subscript run, 0.02% of
+that run's total. The thread-local `JSONB_PARSE_CACHE` (keyed on full
+document text, capacity 64) that `parse_jsonb` unconditionally inserts
+into on every miss — the obvious "wasted clone for a value that will
+never be looked up again" suspect, since every row's document is
+distinct here — costs well under 0.05% of the per-row delta (~150 Ir
+extra per row across lookup + insert; verified by grepping the
+`JSONB_PARSE_CACHE`-specific lines in both annotated logs). `JsonbVal`
+clones are similarly negligible (~1.1M of the 630.98M delta). The
+remaining ~89% of the added cost is generic parse/render machinery
+(`malloc`/`free`, `memcpy`, UTF-8 validation/iteration, `String::push`,
+`str::eq`) — confirmed via self-cost counts roughly doubling end to end
+(e.g. `Parser::parse_string` 19,505,090 → 39,010,180,
+`jsonb_escape_string` 12,469,710 → 24,939,420) — consistent with
+exactly **one** extra full tokenize pass and **one** extra full
+serialize pass per row, not a duplicated/redundant parse (ruled out:
+`parse_json`'s self-cost also exactly doubles, not triples or worse).
+
+**Mechanism, and why it's inherent**: `Value::Jsonb` stores jsonb as
+canonical *text*, so `__jsonb_subscript_assign`
+(`src/exec/funcs.rs`) necessarily does `jsonb_val_arg` (parse the
+whole stored document into a `JsonbVal` tree) → `assign_rec` (walk to
+the target path, rebuild the spine) → `.render()` (serialize the
+*whole* tree back to text), every time, regardless of how small the
+edit is. dhat confirms the shape
+(`benches/profiles/dhat.out.jsonbsub-{subscript,plain}-r2000d10-2026-11-23`):
++17,424,343 bytes (+25.8%) and +265,016 allocation blocks (+66.3%)
+over 2000 rows (~132.5 extra small allocations/row) — the allocation
+pattern of a hand-written recursive-descent tokenizer and a
+string-building renderer walking the full document, not a leak or a
+single oversized buffer.
+
+**No fix shipped**: the only way to remove this cost is to stop
+round-tripping through text for a sub-document edit — e.g. keep (or
+cache) a parsed tree form of `Value::Jsonb` so subscript assignment
+touches only the modified path, or adopt a true binary/flattened
+on-disk format the way real PostgreSQL's `jsonb` does. Either option
+changes the public `Value::Jsonb` storage representation and every
+call site across `src/exec/json.rs` and `src/exec/funcs.rs` that
+currently assumes "jsonb value == canonical text" — an architectural,
+correctness-sensitive change, not a Bolt-sized patch. Recording it
+here so a future round doesn't re-spend a profiling cycle rediscovering
+that the parse cache and the tree-edit logic are both already cheap.
+
+**Reproduce**:
+```bash
+cargo build
+python3 benches/profile_jsonb_subscript.py --tool callgrind --rows 2000 --docsize 10 --op subscript
+python3 benches/profile_jsonb_subscript.py --tool callgrind --rows 2000 --docsize 10 --op plain
+python3 benches/profile_jsonb_subscript.py --tool callgrind --doc-sizes --rows 1000 --op subscript
+python3 benches/profile_jsonb_subscript.py --tool callgrind --doc-sizes --rows 1000 --op plain
+python3 benches/profile_jsonb_subscript.py --tool dhat --rows 2000 --docsize 10 --op subscript
+python3 benches/profile_jsonb_subscript.py --tool dhat --rows 2000 --docsize 10 --op plain
+```
+
+Profiles committed:
+`benches/profiles/callgrind.out.jsonbsub-{subscript,plain}-r2000d10-2026-11-23`,
+`benches/profiles/dhat.out.jsonbsub-{subscript,plain}-r2000d10-2026-11-23`.
+
 ## Bolt: pgstat UPDATE hook filters indexes by table instead of scanning the whole database — fix — 2026-11-19
 
 ### Workload
