@@ -1268,6 +1268,9 @@ pub enum AggFunc {
     JsonbAgg,
     JsonObjectAgg,
     JsonbObjectAgg,
+    // v2.42: xmlagg — concatenates the content of each non-null xml
+    // input (declaration stripped), NULL when no non-null input.
+    XmlAgg,
     // v1.90: SQL/JSON constructor aggregates (json.c). The value
     // argument rides wrapped in a `__jsonagg_opt` marker Func carrying
     // (format_json, null_on_null, unique, returning-spec) literals;
@@ -1325,6 +1328,7 @@ impl AggFunc {
             AggFunc::JsonbAgg => "jsonb_agg",
             AggFunc::JsonObjectAgg => "json_object_agg",
             AggFunc::JsonbObjectAgg => "jsonb_object_agg",
+            AggFunc::XmlAgg => "xmlagg",
             AggFunc::JsonArrayAgg => "json_arrayagg",
             AggFunc::JsonObjectAggSql => "json_objectagg",
             AggFunc::RangeAgg => "range_agg",
@@ -2124,6 +2128,35 @@ pub struct RowsFromPart {
     pub col_defs: Vec<(String, ColType, Option<String>)>,
 }
 
+/// v2.42: one XMLTABLE column (PG19 gram.y XmlTableColumn).
+#[derive(Clone, Debug, PartialEq)]
+pub enum XtColumn {
+    /// `name FOR ORDINALITY` — 1-based row position.
+    Ordinality { name: String },
+    /// `name type [EXISTS] [PATH expr] [DEFAULT expr] [NOT NULL]`.
+    Regular {
+        name: String,
+        ty: ColType,
+        /// Written type name when `ty` is a named type.
+        named: Option<String>,
+        exists: bool,
+        path: Option<Expr>,
+        default: Option<Expr>,
+        not_null: bool,
+    },
+}
+
+/// v2.42: a parsed `XMLTABLE(...)` specification (PG19 gram.y
+/// XmlTable): namespace bindings plus the COLUMNS list. The row path
+/// and PASSING document ride in `FromItem::Function` args
+/// ([rowpath, passing]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct XmlTableSpec {
+    /// (prefix, uri); prefix None = DEFAULT namespace.
+    pub namespaces: Vec<(Option<String>, String)>,
+    pub columns: Vec<XtColumn>,
+}
+
 /// A FROM source (v0.6).
 #[derive(Clone, Debug, PartialEq)]
 pub enum FromItem {
@@ -2185,6 +2218,10 @@ pub enum FromItem {
         /// then holds [doc, path-text, vars]. None for every other
         /// table function.
         json_table: Option<Box<JsonTableSpec>>,
+        /// v2.42: the parsed spec when this item is an XMLTABLE table
+        /// function (name == "xmltable"); `args` then holds
+        /// [rowpath, passing]. None for every other table function.
+        xml_table: Option<Box<XmlTableSpec>>,
         /// v2.13: `WITH ORDINALITY` (PG19 gram.y func_table
         /// opt_ordinality, written before the alias clause): appends
         /// a bigint `ordinality` column (1-based) after the function's

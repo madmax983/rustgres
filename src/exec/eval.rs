@@ -2457,6 +2457,7 @@ pub(crate) fn elem_scalar_type(elem: crate::storage::ArrayElem) -> ColType {
         E::Bytea => ColType::Bytea,
         E::Bit => ColType::Bit, // v1.39
         E::Tid => ColType::Tid, // v1.40
+        E::Xml => ColType::Xml, // v2.42
         E::SingleChar => ColType::SingleChar,
         E::Name => ColType::Name,
         E::SmallInt => ColType::SmallInt,

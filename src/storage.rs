@@ -130,6 +130,11 @@ pub enum ColType {
     // PG's `jsonb_out` renders: keys sorted by (length, bytewise) and
     // deduplicated last-wins, numbers as PG numerics).
     Jsonb, // OID 3802
+    // v2.42: PG's `xml` type (OID 142). Values are carried as
+    // `Value::Xml` holding the stored XML text (PG's xml storage is
+    // the text form; well-formedness is validated at input per the
+    // xmloption GUC).
+    Xml, // OID 142
     // v1.85: PG's `jsonpath` type (OID 4072). Values are carried as
     // `Value::Jsonpath` holding the PG-rendered (jsonpath_out) text;
     // the engine re-parses that text on evaluation (it is valid
@@ -411,6 +416,8 @@ pub enum ArrayElem {
     TsVector,
     // v1.94: `tsquery` arrays (`_tsquery`, OID 3645).
     TsQuery,
+    // v2.42: `xml` arrays (`_xml`, OID 143) — xpath() returns these.
+    Xml,
 }
 
 impl ArrayElem {
@@ -452,6 +459,8 @@ impl ArrayElem {
             // v1.83: jsonb[] (PG _jsonb, OID 3807) is not supported;
             // array-of-jsonb degrades to the json element kind.
             ColType::Jsonb => ArrayElem::Json,
+            // v2.42: xml[] is a real element kind (xpath() result).
+            ColType::Xml => ArrayElem::Xml,
             // v1.85: jsonpath[] (PG _jsonpath, OID 4073) is not
             // supported either; same degradation as jsonb.
             ColType::Jsonpath => ArrayElem::Json,
@@ -503,6 +512,7 @@ impl ArrayElem {
             ArrayElem::Tid => 1010,      // v1.40: PG's `_tid` (pg_type.dat)
             ArrayElem::TsVector => 3616, // v1.94: PG's `_tsvector`
             ArrayElem::TsQuery => 3645,  // v1.94: PG's `_tsquery`
+            ArrayElem::Xml => 143,       // v2.42: PG's `_xml`
             // v1.39: PG's `_bit` array OID (pg_type.dat).
             ArrayElem::Bit => 1561,
         }
@@ -540,6 +550,7 @@ impl ArrayElem {
             ArrayElem::Tid => "tid",           // v1.40
             ArrayElem::TsVector => "tsvector", // v1.94
             ArrayElem::TsQuery => "tsquery",   // v1.94
+            ArrayElem::Xml => "xml",           // v2.42
         }
     }
 
@@ -575,6 +586,7 @@ impl ArrayElem {
             ArrayElem::Tid => "tid",           // v1.40
             ArrayElem::TsVector => "tsvector", // v1.94
             ArrayElem::TsQuery => "tsquery",   // v1.94
+            ArrayElem::Xml => "xml",           // v2.42
         }
     }
 }
@@ -704,6 +716,7 @@ impl ColType {
             ColType::Composite => 2249,
             ColType::Json => 114,      // JSON (v0.73)
             ColType::Jsonb => 3802,    // JSONB (v1.83)
+            ColType::Xml => 142,       // XML (v2.42)
             ColType::Jsonpath => 4072, // JSONPATH (v1.85)
             // v1.88: range / multirange OIDs (pg_type.dat). Non-builtin
             // elems have no builtin type; 2249 (record) is the fallback,
@@ -779,6 +792,7 @@ impl ColType {
             ColType::Composite => "record",
             ColType::Json => "json",         // v0.73
             ColType::Jsonb => "jsonb",       // v1.83
+            ColType::Xml => "xml",           // v2.42
             ColType::Jsonpath => "jsonpath", // v1.85
             // v1.88: range names double as SQL name and typname for the
             // builtin elems; user elems fall back to the elem-derived
@@ -849,6 +863,7 @@ impl ColType {
             ColType::Composite => "record",
             ColType::Json => "json",         // v0.73
             ColType::Jsonb => "jsonb",       // v1.83
+            ColType::Xml => "xml",           // v2.42
             ColType::Jsonpath => "jsonpath", // v1.85
             ColType::Range(e) => {
                 return e
@@ -4723,6 +4738,10 @@ pub enum Value {
     // Operations parse the canonical text on demand, like v1.82's
     // json operators parse their document text.
     Jsonb(Arc<str>),
+    // v2.42: an xml value — the stored XML text (xml_out renders it
+    // verbatim), in its own variant like Jsonb so casts, operators,
+    // and type inference can distinguish xml from plain text.
+    Xml(Arc<str>),
     // v1.85: a jsonpath value — the PG-rendered text (jsonpath_out),
     // in its own variant like Jsonb so casts, operators, and type
     // inference can distinguish it from plain text.
@@ -4899,6 +4918,11 @@ impl Value {
         Value::Jsonb(s.into())
     }
 
+    /// v2.42: make an xml value from its stored text.
+    pub fn xml(s: impl Into<Arc<str>>) -> Value {
+        Value::Xml(s.into())
+    }
+
     /// Make a jsonpath value from rendered jsonpath text (v1.85). The
     /// caller must have rendered it via the jsonpath engine.
     pub fn jsonpath(s: impl Into<Arc<str>>) -> Value {
@@ -4939,6 +4963,7 @@ impl Value {
             Value::Text(s) => Some(s.to_string()),
             // v1.83: jsonb_out — the stored text is already canonical.
             Value::Jsonb(s) => Some(s.to_string()),
+            Value::Xml(s) => Some(s.to_string()), // v2.42
             // v1.85: jsonpath_out — the stored text is already rendered.
             Value::Jsonpath(s) => Some(s.to_string()),
             // v1.88: range_out / multirange_out (canonical text).
@@ -5054,6 +5079,7 @@ impl Value {
             Value::Numeric(_) => Cow::Borrowed("numeric"),
             Value::Text(_) => Cow::Borrowed("text"),
             Value::Jsonb(_) => Cow::Borrowed("jsonb"), // v1.83
+            Value::Xml(_) => Cow::Borrowed("xml"),     // v2.42
             Value::Jsonpath(_) => Cow::Borrowed("jsonpath"), // v1.85
             // v1.88: pg_typeof names (user type name wins).
             Value::Range(r) => Cow::Owned(
@@ -5101,6 +5127,7 @@ impl Value {
             Value::Numeric(_) => ColType::Numeric(None),
             Value::Text(_) => ColType::Text,
             Value::Jsonb(_) => ColType::Jsonb,       // v1.83
+            Value::Xml(_) => ColType::Xml,           // v2.42
             Value::Jsonpath(_) => ColType::Jsonpath, // v1.85
             // v1.88: range / multirange values know their elem.
             Value::Range(r) => ColType::Range(r.elem),

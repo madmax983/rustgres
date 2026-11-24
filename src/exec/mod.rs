@@ -46,8 +46,8 @@ pub(crate) use crate::sql::{
     OrderedSetAgg, PolicyCmd, QuantKind, QuantOp, RaiseLevel, RowsFromPart, SelectItem, SelectStmt,
     SequenceOpts, SerialKind, SetOpKind, SetOpRoot, SqlError, Stmt, TableDef, TrigCond,
     TrigForSource, TrigIntoTarget, TriggerBody, TriggerBodyStmt, TriggerDef, TriggerTiming,
-    UniqueDef, WindowFrame, WindowFunc, collect_col_refs, collect_table_refs, parse_statement,
-    parse_trigger_body, trig_event, validate_constraint_expr,
+    UniqueDef, WindowFrame, WindowFunc, XmlTableSpec, collect_col_refs, collect_table_refs,
+    parse_statement, parse_trigger_body, trig_event, validate_constraint_expr,
 };
 pub(crate) use crate::storage::index_visible;
 pub(crate) use crate::storage::{
@@ -122,6 +122,8 @@ pub(crate) mod tsearch;
 mod viewdml;
 mod views;
 mod window;
+pub(crate) mod xml;
+mod xmltable;
 
 #[cfg(test)]
 #[path = "test_mods/hash_join_tests.rs"]
@@ -411,6 +413,9 @@ mod v240_arrays_tests;
 #[cfg(test)]
 #[path = "test_mods/v241_agg_tests.rs"]
 mod v241_agg_tests;
+#[cfg(test)]
+#[path = "test_mods/v242_xml_tests.rs"]
+mod v242_xml_tests;
 #[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;

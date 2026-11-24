@@ -2992,272 +2992,23 @@ pub(crate) fn pg_input_validate_array(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn pg_input_validate_xml(input: &str) -> Result<(), PgInputFailure> {
-    let generic = || pgi_soft("2200N", "invalid XML content".into());
-    let decl_err = || {
-        pgi_soft(
-            "2200N",
-            "invalid XML content: invalid XML declaration".into(),
-        )
-    };
-    let b = input.as_bytes();
-    let mut i = 0usize;
-    let skip_ws = |i: &mut usize| {
-        while *i < b.len() && (b[*i] as char).is_whitespace() {
-            *i += 1;
-        }
-    };
-    // Optional BOM.
-    if input.starts_with('\u{FEFF}') {
-        i = 3;
-    }
-    skip_ws(&mut i);
-    // XML declaration: `<?xml ... ?>` — validate strictly like libxml2.
-    if input[i..].starts_with("<?xml")
-        && matches!(
-            b.get(i + 5),
-            Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | Some(b'?')
-        )
-    {
-        let end = match input[i..].find("?>") {
-            Some(e) => i + e,
-            None => return Err(decl_err()),
-        };
-        let decl = &input[i + 5..end];
-        // Parse attributes: version (required, first), encoding,
-        // standalone ("yes"/"no" only), in document order.
-        let mut rest = decl.trim();
-        let mut seen: Vec<&str> = Vec::new();
-        let mut ok = true;
-        while !rest.is_empty() {
-            let eq = match rest.find('=') {
-                Some(e) => e,
-                None => {
-                    ok = false;
-                    break;
-                }
-            };
-            let name = rest[..eq].trim();
-            let after = rest[eq + 1..].trim_start();
-            let q = after.chars().next().unwrap_or(' ');
-            if q != '"' && q != '\'' {
-                ok = false;
-                break;
-            }
-            let close = match after[1..].find(q) {
-                Some(c) => c + 1,
-                None => {
-                    ok = false;
-                    break;
-                }
-            };
-            let value = &after[1..close];
-            match name {
-                "version" => {
-                    if !seen.is_empty()
-                        || value.is_empty()
-                        || !value
-                            .bytes()
-                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
-                    {
-                        ok = false;
-                        break;
-                    }
-                }
-                "encoding" => {
-                    if seen != ["version"] || value.is_empty() {
-                        ok = false;
-                        break;
-                    }
-                }
-                "standalone" => {
-                    if !(seen == ["version"] || seen == ["version", "encoding"])
-                        || (value != "yes" && value != "no")
-                    {
-                        ok = false;
-                        break;
-                    }
-                }
-                _ => {
-                    ok = false;
-                    break;
-                }
-            }
-            seen.push(name);
-            rest = after[close + 1..].trim();
-        }
-        if !ok || seen.first() != Some(&"version") {
-            return Err(decl_err());
-        }
-        i = end + 2;
-    }
-    // Element structure: exactly one root element, matched tags.
-    let mut stack: Vec<String> = Vec::new();
-    let mut root_seen = false;
-    let is_name = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b':');
-    while i < b.len() {
-        if b[i] == b'<' {
-            if input[i..].starts_with("<!--") {
-                match input[i + 4..].find("-->") {
-                    Some(e) => i += 4 + e + 3,
-                    None => return Err(generic()),
-                }
-            } else if input[i..].starts_with("<![CDATA[") {
-                if stack.is_empty() {
-                    return Err(generic());
-                }
-                match input[i + 9..].find("]]>") {
-                    Some(e) => i += 9 + e + 3,
-                    None => return Err(generic()),
-                }
-            } else if input[i..].starts_with("<?") {
-                match input[i + 2..].find("?>") {
-                    Some(e) => i += 2 + e + 2,
-                    None => return Err(generic()),
-                }
-            } else if input[i..].starts_with("<!") {
-                // DOCTYPE and friends: skip to '>' (no internal subset
-                // support beyond a bracketed block).
-                let mut j = i + 2;
-                let mut closed = false;
-                while j < b.len() {
-                    if b[j] == b'[' {
-                        match input[j..].find(']') {
-                            Some(e) => j += e + 1,
-                            None => return Err(generic()),
-                        }
-                    } else if b[j] == b'>' {
-                        closed = true;
-                        j += 1;
-                        break;
-                    } else {
-                        j += 1;
-                    }
-                }
-                if !closed {
-                    return Err(generic());
-                }
-                i = j;
-            } else if input[i..].starts_with("</") {
-                let mut j = i + 2;
-                let start = j;
-                while j < b.len() && is_name(b[j]) {
-                    j += 1;
-                }
-                let name = &input[start..j];
-                while j < b.len() && (b[j] as char).is_whitespace() {
-                    j += 1;
-                }
-                if j >= b.len() || b[j] != b'>' || name.is_empty() {
-                    return Err(generic());
-                }
-                match stack.pop() {
-                    Some(open) if open == name => {}
-                    _ => return Err(generic()),
-                }
-                i = j + 1;
+    // v2.42: delegate to the real XML parser (src/exec/xml.rs),
+    // replacing the shallow v1.87 structural approximation. PG's
+    // pg_input message is the primary message alone, except the
+    // declaration case whose primary message is the combined
+    // "invalid XML content: invalid XML declaration" (xml.c).
+    match super::xml::xml_input_error_message(input) {
+        None => Ok(()),
+        Some(msg) => {
+            let code = if super::xml::xmloption_is_document() {
+                "2200M"
             } else {
-                // Open tag.
-                if stack.is_empty() {
-                    if root_seen {
-                        return Err(generic());
-                    }
-                    root_seen = true;
-                }
-                let mut j = i + 1;
-                let start = j;
-                while j < b.len() && is_name(b[j]) {
-                    j += 1;
-                }
-                let name = &input[start..j];
-                if name.is_empty()
-                    || !(name.as_bytes()[0].is_ascii_alphabetic() || name.as_bytes()[0] == b'_')
-                {
-                    return Err(generic());
-                }
-                // Attributes up to '>' or '/>'.
-                let mut self_close = false;
-                let mut closed = false;
-                while j < b.len() {
-                    let c = b[j];
-                    if c == b'>' {
-                        closed = true;
-                        j += 1;
-                        break;
-                    }
-                    if c == b'/' && b.get(j + 1) == Some(&b'>') {
-                        self_close = true;
-                        closed = true;
-                        j += 2;
-                        break;
-                    }
-                    if c == b'"' || c == b'\'' {
-                        let q = c;
-                        j += 1;
-                        while j < b.len() && b[j] != q {
-                            if b[j] == b'<' {
-                                return Err(generic());
-                            }
-                            j += 1;
-                        }
-                        if j >= b.len() {
-                            return Err(generic());
-                        }
-                        j += 1;
-                    } else if c == b'<' {
-                        return Err(generic());
-                    } else {
-                        j += 1;
-                    }
-                }
-                if !closed {
-                    return Err(generic());
-                }
-                if !self_close {
-                    stack.push(name.to_string());
-                }
-                i = j;
-            }
-        } else if b[i] == b'&' {
-            // Character/entity reference in content.
-            if stack.is_empty() {
-                return Err(generic());
-            }
-            let semi = match input[i..].find(';') {
-                Some(e) if e <= 12 => i + e,
-                _ => return Err(generic()),
+                "2200N"
             };
-            let ent = &input[i + 1..semi];
-            let valid = matches!(ent, "lt" | "gt" | "amp" | "apos" | "quot")
-                || (ent.starts_with("#x")
-                    && ent[2..].bytes().all(|c| c.is_ascii_hexdigit())
-                    && ent.len() > 2)
-                || (ent.starts_with('#')
-                    && ent[1..].bytes().all(|c| c.is_ascii_digit())
-                    && ent.len() > 1);
-            if !valid {
-                return Err(generic());
-            }
-            i = semi + 1;
-        } else {
-            // Character data: not allowed outside the root element
-            // (except whitespace).
-            if stack.is_empty() && !(b[i] as char).is_whitespace() {
-                return Err(generic());
-            }
-            i += 1;
+            Err(pgi_soft(code, msg))
         }
     }
-    if !stack.is_empty() || !root_seen {
-        return Err(generic());
-    }
-    Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// tsvector / tsquery (v1.94: delegated to the real parsers in
-// exec::tsearch, which also back the cast path)
-// ---------------------------------------------------------------------------
-
 pub(crate) fn pg_input_validate_tsvector(input: &str) -> Result<(), PgInputFailure> {
     // v1.94: the real tsvectorin parser (exec::tsearch) is the
     // validator now — pg_input_is_valid must agree with the cast
@@ -3608,6 +3359,7 @@ pub(crate) fn coltype_typ_string(ct: &ColType) -> String {
         ColType::Tid => "tid".into(),
         ColType::Json => "json".into(),
         ColType::Jsonb => "jsonb".into(),
+        ColType::Xml => "xml".into(), // v2.42
         ColType::Jsonpath => "jsonpath".into(),
         // v1.88: range / multirange type names.
         ColType::Range(_) | ColType::Multirange(_) => ct.sql_name(),

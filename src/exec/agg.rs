@@ -177,6 +177,12 @@ pub(crate) fn value_key(v: &Value, out: &mut Vec<u8>) {
             out.extend_from_slice(&span.to_be_bytes());
             out.extend_from_slice(&micros.to_be_bytes());
         }
+        // v2.42: xml keys by its stored text (internal grouping key;
+        // PG exposes no xml equality operator).
+        Value::Xml(s) => {
+            out.push(30);
+            out.extend_from_slice(s.as_bytes());
+        }
         Value::Jsonb(s) => {
             out.push(20);
             match parse_jsonb(s) {
@@ -2321,6 +2327,29 @@ pub(crate) fn eval_grouped(
                 )?;
                 return pg_column_compression_value(q, &scopes, &args[0], &v, false);
             }
+            // v2.42: the SQL/XML mapping functions need engine access
+            // (nested SPI queries); grouped context evaluates their
+            // plain arguments here.
+            if matches!(
+                name.as_str(),
+                "table_to_xml" | "query_to_xml" | "schema_to_xml"
+            ) {
+                let mut vals = Vec::with_capacity(args.len());
+                for a in args {
+                    let v =
+                        eval_grouped(q, outer, gscope, schema, rows, idxs, key_vals, group_by, a)?;
+                    vals.push(v);
+                }
+                if vals.len() != 4 {
+                    return Err(exec_err(
+                        "42883",
+                        format!("function {name} with the given argument count does not exist"),
+                    ));
+                }
+                return super::funcs::eval_to_xml_vals(
+                    q, name, &vals[0], &vals[1], &vals[2], &vals[3],
+                );
+            }
             if name == "pg_relation_size" {
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
@@ -4181,6 +4210,28 @@ pub(crate) fn eval_agg_func(
                 elems.push(datum_to_jsonb(v)?);
             }
             Ok(Value::jsonb(JsonbVal::Array(elems).render()))
+        }
+        // v2.42: xmlagg — PG's transition is xmlconcat2 (strict, so
+        // NULL inputs are skipped); the final value is the content
+        // concatenation with declarations stripped. Zero non-null
+        // inputs yield NULL.
+        AggFunc::XmlAgg => {
+            let mut out = String::new();
+            let mut any = false;
+            for v in &vals {
+                let Some(t) = super::xml::arg_xml_text(v)? else {
+                    continue;
+                };
+                any = true;
+                let doc = super::xml::parse_xml(&t, false).map_err(|e| e.to_exec())?;
+                for n in &doc.nodes {
+                    super::xml::serialize_node(n, &mut out);
+                }
+            }
+            if !any {
+                return Ok(Value::Null);
+            }
+            Ok(Value::xml(out))
         }
         // v1.84: json_object_agg — "{ " + `"key" : value` pairs joined
         // ", " + "}"; a NULL key is 22004 (PG raises it in the

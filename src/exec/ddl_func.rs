@@ -407,6 +407,8 @@ pub(crate) fn dummy_value_of(ty: &ColType) -> Value {
         ColType::Text | ColType::Varchar(_) | ColType::Name | ColType::Json => Value::text("x"),
         // v1.83: a valid canonical jsonb dummy.
         ColType::Jsonb => Value::jsonb("{}"),
+        // v2.42: a minimal well-formed xml dummy.
+        ColType::Xml => Value::xml("<x/>"),
         // v1.85: the root path is the honest jsonpath dummy.
         ColType::Jsonpath => Value::jsonpath("$"),
         // v1.88: empty range / multirange dummies.

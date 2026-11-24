@@ -433,6 +433,8 @@ pub(crate) fn check_agg_window_arity(f: &AggFunc, n: usize) -> bool {
         // the object aggregates need a second value stream the
         // window machinery does not carry (StringAgg precedent).
         AggFunc::JsonAgg | AggFunc::JsonbAgg => n == 1,
+        // v2.42: xmlagg is window-capable in PG19.
+        AggFunc::XmlAgg => n == 1,
         AggFunc::JsonObjectAgg | AggFunc::JsonbObjectAgg => false,
         // v1.90: PG19 supports both SQL/JSON constructor aggregates
         // as window functions.
@@ -2531,6 +2533,25 @@ pub(crate) fn eval_window_agg(
                 elems.push(datum_to_jsonb(v)?);
             }
             Ok(Value::jsonb(JsonbVal::Array(elems).render()))
+        }
+        // v2.42: xmlagg as a window aggregate (same final as agg.rs).
+        AggFunc::XmlAgg => {
+            let mut out = String::new();
+            let mut any = false;
+            for v in vals {
+                let Some(t) = super::xml::arg_xml_text(v)? else {
+                    continue;
+                };
+                any = true;
+                let doc = super::xml::parse_xml(&t, false).map_err(|e| e.to_exec())?;
+                for n in &doc.nodes {
+                    super::xml::serialize_node(n, &mut out);
+                }
+            }
+            if !any {
+                return Ok(Value::Null);
+            }
+            Ok(Value::xml(out))
         }
         // v1.90: windowed SQL/JSON constructor aggregates are
         // intercepted in compute_partition (they need their marker

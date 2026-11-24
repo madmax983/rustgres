@@ -638,6 +638,11 @@ impl Enc {
                 self.u8(e.code());
                 return;
             }
+            // v2.42: xml; tag appends after v2.35's.
+            ColType::Xml => {
+                self.u8(41);
+                return;
+            }
             // v1.94: tsvector / tsquery; tags append after v1.88's.
             ColType::TsVector => {
                 self.u8(34);
@@ -847,6 +852,11 @@ impl Enc {
             Value::TsQuery(q) => {
                 self.u8(29);
                 self.str(&crate::exec::tsearch::tsquery_to_text(q));
+            }
+            // v2.42: xml values (tag 30) — the stored text.
+            Value::Xml(t) => {
+                self.u8(30);
+                self.str(t);
             }
         }
     }
@@ -1994,6 +2004,8 @@ impl<'a> Dec<'a> {
             // v2.34: regprocedure.
             39 => Ok(ColType::Regprocedure),
             40 => Ok(ColType::Regnamespace),
+            // v2.42: xml.
+            41 => Ok(ColType::Xml),
             // v0.78: array, then the PG array OID identifying the
             // element type.
             22 => {
@@ -2029,6 +2041,8 @@ impl<'a> Dec<'a> {
                     // v1.94: _tsvector / _tsquery.
                     3616 => ArrayElem::TsVector,
                     3645 => ArrayElem::TsQuery,
+                    // v2.42: _xml.
+                    143 => ArrayElem::Xml,
                     t => return Err(self.err(&format!("unknown array element OID {}", t))),
                 };
                 Ok(ColType::Array(elem))
@@ -2128,6 +2142,8 @@ impl<'a> Dec<'a> {
                     .map_err(|e| self.err(&format!("bad tsquery in WAL: {}", e.message)))?;
                 Ok(Value::TsQuery(std::sync::Arc::new(q)))
             }
+            // v2.42: xml values (tag 30; mirrors encoder).
+            30 => Ok(Value::Xml(self.str_arc()?)),
             // v0.79: real array values (tag 17; mirrors the encoder).
             17 => {
                 let elem = self.array_elem()?;
@@ -2213,6 +2229,8 @@ impl<'a> Dec<'a> {
             // v1.94: _tsvector / _tsquery.
             3616 => Ok(ArrayElem::TsVector),
             3645 => Ok(ArrayElem::TsQuery),
+            // v2.42: _xml.
+            143 => Ok(ArrayElem::Xml),
             t => Err(self.err(&format!("unknown array element OID {}", t))),
         }
     }

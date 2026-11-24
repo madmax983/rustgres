@@ -3289,6 +3289,8 @@ fn is_generic_guc(name: &str) -> bool {
             | "datestyle"
             | "client_encoding"
             | "row_security"
+            | "xmloption"
+            | "xmlbinary"
             | "check_function_bodies"
             | "enable_material"
             // v2.41: PG19 planner GUCs the aggregates suite flips.
@@ -3453,6 +3455,8 @@ fn guc_default(name: &str) -> &'static str {
         "datestyle" => "ISO, MDY",
         "client_encoding" => "UTF8",
         "row_security" => "on",
+        "xmloption" => "content",
+        "xmlbinary" => "base64",
         "check_function_bodies" => "on",
         "enable_material" => "on",
         "enable_partitionwise_aggregate" => "off",
@@ -4007,6 +4011,13 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
             value,
             &[("md5", "md5"), ("scram-sha-256", "scram-sha-256")],
         ),
+        // v2.42: PG19 xmloption / xmlbinary enum GUCs.
+        "xmloption" => validate_enum_guc(
+            name,
+            value,
+            &[("document", "document"), ("content", "content")],
+        ),
+        "xmlbinary" => validate_enum_guc(name, value, &[("base64", "base64"), ("hex", "hex")]),
         // v1.81: PG19 check_datestyle (src/backend/commands/variable.c).
         "datestyle" => validate_datestyle(value),
         // v1.81: PG19 client-encoding names (pg_valid_client_encoding).
@@ -4187,6 +4198,8 @@ fn name_to_static(name: &str) -> &'static str {
         "datestyle" => "datestyle",
         "client_encoding" => "client_encoding",
         "row_security" => "row_security",
+        "xmloption" => "xmloption",
+        "xmlbinary" => "xmlbinary",
         "check_function_bodies" => "check_function_bodies",
         "enable_material" => "enable_material",
         "enable_partitionwise_aggregate" => "enable_partitionwise_aggregate",

@@ -654,6 +654,7 @@ pub(crate) fn from_schema_item(
             col_aliases,
             col_defs,
             json_table,
+            xml_table,
             ordinality,
             rows_from,
             ..
@@ -670,6 +671,7 @@ pub(crate) fn from_schema_item(
                 col_aliases,
                 col_defs,
                 json_table.as_deref(),
+                xml_table.as_deref(),
                 &left,
                 *ordinality,
                 rows_from,
@@ -763,6 +765,7 @@ pub(crate) fn from_schema_item(
                     col_defs,
                     lateral,
                     json_table,
+                    xml_table,
                     ordinality,
                     rows_from,
                 } if *lateral
@@ -779,6 +782,7 @@ pub(crate) fn from_schema_item(
                         col_aliases: fca.as_slice(),
                         col_defs: col_defs.as_slice(),
                         json_table: json_table.as_deref(),
+                        xml_table: xml_table.as_deref(),
                         ordinality: *ordinality,
                         rows_from: rows_from.as_slice(),
                     })
@@ -1499,6 +1503,23 @@ pub(crate) fn expr_col_name_strength(e: &Expr) -> (String, u8) {
             2,
         ),
         Expr::Func { name, .. } if name == "__is_json" => ("?column?".to_string(), 0),
+        // v2.42: SQL/XML desugars present under their public names;
+        // IS [NOT] DOCUMENT is a predicate (?column? in PG).
+        Expr::Func { name, .. } if name == "__xml_is_document" => ("?column?".to_string(), 0),
+        Expr::Func { name, .. } if name.starts_with("__xml") => (
+            match name.as_str() {
+                "__xmlelement" => "xmlelement",
+                "__xmlforest" => "xmlforest",
+                "__xmlparse" => "xmlparse",
+                "__xmlserialize" => "xmlserialize",
+                "__xmlpi" => "xmlpi",
+                "__xmlroot" => "xmlroot",
+                "__xmlexists" => "xmlexists",
+                _ => "?column?",
+            }
+            .to_string(),
+            2,
+        ),
         // v2.40: the quantified-comparison desugar is an operator
         // expression in PG — its column is ?column?, not the hidden
         // builtin's name.
@@ -2815,6 +2836,8 @@ pub(crate) fn agg_result_type(
         // v1.84: JSON aggregates return json/jsonb (pg_proc).
         AggFunc::JsonAgg | AggFunc::JsonObjectAgg => Ok(ColType::Json),
         AggFunc::JsonbAgg | AggFunc::JsonbObjectAgg => Ok(ColType::Jsonb),
+        // v2.42: xmlagg returns xml.
+        AggFunc::XmlAgg => Ok(ColType::Xml),
         // v1.90: SQL/JSON constructor aggregates — the RETURNING spec
         // rides on the value argument's __jsonagg_opt marker.
         AggFunc::JsonArrayAgg | AggFunc::JsonObjectAggSql => {

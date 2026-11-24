@@ -2133,6 +2133,22 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
     }
     match to {
         ColType::Text => Ok(text_value_of(&[v])),
+        // v2.42: cast to xml — PG xmlin over the source's text form
+        // (validates per the xmloption GUC at execution time in
+        // exec_cast; this pure path uses DOCUMENT-or-CONTENT default
+        // CONTENT semantics via xml::validate_xml_input_default).
+        ColType::Xml => match v {
+            Value::Xml(_) => Ok(v.clone()),
+            _ => {
+                let t = text_value_of(&[v]);
+                match t {
+                    Value::Text(s) | Value::BpChar(s) => {
+                        super::xml::xml_cast_in(&s).map(Value::xml)
+                    }
+                    _ => Err(cast_err(v, "xml")),
+                }
+            }
+        },
         // v1.94: cast to tsvector (PG tsvectorin on text; a tsquery
         // has no cast to tsvector — 42804 like PG).
         ColType::TsVector => match v {

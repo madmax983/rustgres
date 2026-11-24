@@ -753,6 +753,14 @@ pub(crate) fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<V
     match t {
         // v0.78: array parameters arrive as the `{...}` literal text —
         // the same representation values are carried in.
+        // v2.42: xml parameters carry the text form, validated by
+        // the xml input rules (PG validates at bind-time assignment).
+        ColType::Xml => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
+            super::xml::xml_cast_in(s)?;
+            Ok(Value::xml(s))
+        }
         ColType::Text | ColType::Array(_) => {
             let s = std::str::from_utf8(bytes)
                 .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
@@ -1288,6 +1296,7 @@ pub(crate) fn value_to_literal(v: &Option<Value>) -> Literal {
         // v1.83: a jsonb parameter substitutes as its canonical text;
         // downstream coercion re-canonicalizes for a jsonb target.
         Some(Value::Jsonb(s)) => Literal::Text(s.clone()),
+        Some(Value::Xml(s)) => Literal::Text(s.clone()), // v2.42
         Some(Value::Jsonpath(s)) => Literal::Text(s.clone()), // v1.85
         // v1.88: range parameters substitute as their canonical text;
         // downstream coercion re-parses for a range target.
@@ -1549,6 +1558,7 @@ pub(crate) fn dummy_value(t: &ColType) -> Value {
         ColType::Float => Value::Float(0.0),
         ColType::Numeric(..) => Value::Numeric(Numeric::zero()),
         ColType::Text => Value::text(""),
+        ColType::Xml => Value::xml("<x/>"),          // v2.42
         ColType::Char(_) => Value::bpchar(""),       // v0.35
         ColType::Varchar(_) => Value::text(""),      // v0.35
         ColType::SingleChar => Value::SingleChar(0), // v0.36

@@ -2065,6 +2065,7 @@ pub(crate) fn array_elem_coltype(e: ArrayElem) -> ColType {
         ArrayElem::Xid => ColType::Xid,
         ArrayElem::TsVector => ColType::TsVector, // v1.94
         ArrayElem::TsQuery => ColType::TsQuery,   // v1.94
+        ArrayElem::Xml => ColType::Xml,           // v2.42
     }
 }
 

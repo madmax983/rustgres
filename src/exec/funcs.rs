@@ -5767,6 +5767,20 @@ pub(crate) fn eval_func(
     if (name == "collation_for" || name == "pg_collation_for") && args.len() == 1 {
         return crate::exec::collate::eval_collation_for(q, scopes, &args[0]);
     }
+    // v2.42: SQL/XML constructor forms whose arguments need AST-level
+    // handling (attribute lists, NO VALUE wrappers, element names).
+    // (__xmlparse/__xmlserialize/__xmlpi/__xml_is_document take plain
+    // values and flow through eval_func_vals instead.)
+    if matches!(
+        name,
+        "__xmlelement" | "__xmlforest" | "__xmlroot" | "__xmlexists"
+    ) {
+        return eval_xml_special(q, scopes, name, args);
+    }
+    // v2.42: the SQL/XML mapping functions run nested queries (SPI).
+    if matches!(name, "table_to_xml" | "query_to_xml" | "schema_to_xml") {
+        return eval_to_xml_func(q, scopes, name, args);
+    }
     // v2.41: PG19 aggregate transition/combine functions, also
     // callable as plain functions (float.c / numeric.c / bool
     // statefuncs in pg_proc.dat). Strict: a NULL argument yields NULL
@@ -7235,21 +7249,22 @@ pub(crate) fn pg_column_compression_value(
 /// Returns `(typlen, align_bytes)`; `typlen == -1` marks a varlena.
 pub(crate) fn pg_typlen_align(ty: &ColType) -> (i32, usize) {
     match ty {
-        ColType::Bool => (1, 1),         // 'c'
-        ColType::SingleChar => (1, 1),   // "char": 1/'c'
-        ColType::SmallInt => (2, 2),     // int2: 2/'s'
-        ColType::Int => (4, 4),          // int4: 4/'i'
-        ColType::BigInt => (8, 8),       // int8: 8/'d'
-        ColType::Float4 => (4, 4),       // float4: 4/'i'
-        ColType::Float => (8, 8),        // float8: 8/'d'
-        ColType::Numeric(_) => (-1, 4),  // numeric: -1/'i'
-        ColType::Text => (-1, 4),        // text: -1/'i'
-        ColType::Char(_) => (-1, 4),     // bpchar: -1/'i'
-        ColType::Varchar(_) => (-1, 4),  // varchar: -1/'i'
-        ColType::Bytea => (-1, 4),       // bytea: -1/'i'
-        ColType::Bit => (-1, 4),         // varbit: -1/'i'
-        ColType::Json => (-1, 4),        // json: -1/'i'
-        ColType::Jsonb => (-1, 4),       // jsonb: -1/'i' (v1.83)
+        ColType::Bool => (1, 1),        // 'c'
+        ColType::SingleChar => (1, 1),  // "char": 1/'c'
+        ColType::SmallInt => (2, 2),    // int2: 2/'s'
+        ColType::Int => (4, 4),         // int4: 4/'i'
+        ColType::BigInt => (8, 8),      // int8: 8/'d'
+        ColType::Float4 => (4, 4),      // float4: 4/'i'
+        ColType::Float => (8, 8),       // float8: 8/'d'
+        ColType::Numeric(_) => (-1, 4), // numeric: -1/'i'
+        ColType::Text => (-1, 4),       // text: -1/'i'
+        ColType::Char(_) => (-1, 4),    // bpchar: -1/'i'
+        ColType::Varchar(_) => (-1, 4), // varchar: -1/'i'
+        ColType::Bytea => (-1, 4),      // bytea: -1/'i'
+        ColType::Bit => (-1, 4),        // varbit: -1/'i'
+        ColType::Json => (-1, 4),       // json: -1/'i'
+        ColType::Jsonb => (-1, 4),
+        ColType::Xml => (-1, 4),         // v2.42: xml varlena, align 'i'
         ColType::Jsonpath => (-1, 4),    // jsonpath: -1/'i' (v1.85)
         ColType::Array(_) => (-1, 4),    // array types: 'i'
         ColType::Date => (4, 4),         // date: 4/'i'
@@ -7723,6 +7738,19 @@ pub(crate) fn eval_pg_size_pretty(vals: &[Value]) -> Result<Value, ExecError> {
 pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), ExecError> {
     let n = vals.len();
     let ok = match name {
+        // v2.42: SQL/XML functions.
+        "xmlcomment"
+        | "xmltext"
+        | "xml_is_well_formed"
+        | "xml_is_well_formed_document"
+        | "xml_is_well_formed_content"
+        | "__xml_is_document" => n == 1,
+        "xmlconcat" => n >= 1,
+        "xpath" | "xpath_exists" => n == 2 || n == 3,
+        "table_to_xml" | "query_to_xml" | "schema_to_xml" => n == 4,
+        "__xmlparse" => n == 3,
+        "__xmlserialize" => n == 4,
+        "__xmlpi" => n == 1 || n == 2,
         "upper" | "lower" | "length" | "char_length" | "character_length" | "octet_length"
         | "bit_length" | "abs" | "floor" | "ceil" | "ceiling" | "sqrt" => n == 1,
         "exp" | "ln" => n == 1,
@@ -8045,7 +8073,350 @@ pub(crate) fn parse_ident_parts(qualname: &str, strict: bool) -> Result<Vec<Stri
     Ok(out)
 }
 
+/// v2.42: SQL/XML special forms (parser-emitted `__xml*` names) that
+/// need expression-level argument handling.
+fn eval_xml_special(
+    q: &mut Q,
+    scopes: &[Scope],
+    name: &str,
+    args: &[Expr],
+) -> Result<Value, ExecError> {
+    use crate::exec::xml as x;
+    fn named_parts(e: &Expr) -> Option<(&Expr, String)> {
+        if let Expr::Func { name, args, .. } = e {
+            if name == "__xmlnamed" && args.len() == 2 {
+                if let Expr::Literal(Literal::Text(t)) = &args[1] {
+                    return Some((&args[0], t.to_string()));
+                }
+            }
+        }
+        None
+    }
+    match name {
+        "__xmlelement" => {
+            if args.is_empty() {
+                return Err(exec_err("42601", "xmlelement requires a name".to_string()));
+            }
+            let name_v = eval_expr(q, scopes, &args[0])?;
+            let raw_name = name_v.to_text().ok_or_else(|| {
+                exec_err("22004", "xml element name must not be null".to_string())
+            })?;
+            let elem_name = x::map_sql_identifier_to_xml_name(&raw_name);
+            let mut attrs: Vec<(String, String, Option<String>)> = Vec::new();
+            let mut children: Vec<x::Node> = Vec::new();
+            for a in &args[1..] {
+                if let Expr::Func {
+                    name: an,
+                    args: aargs,
+                    ..
+                } = a
+                {
+                    if an == "__xmlattributes" {
+                        for na in aargs {
+                            let (ve, aname) = named_parts(na).ok_or_else(|| {
+                                exec_err("42601", "malformed XMLATTRIBUTES argument".to_string())
+                            })?;
+                            let v = eval_expr(q, scopes, ve)?;
+                            if let Some(text) = x::attr_text(&v)? {
+                                let mapped = x::map_sql_identifier_to_xml_name(&aname);
+                                if attrs.iter().any(|(n, _, _)| *n == mapped) {
+                                    return Err(exec_err(
+                                        "42601",
+                                        format!(
+                                            "XML attribute name \"{}\" appears more than once",
+                                            mapped
+                                        ),
+                                    ));
+                                }
+                                attrs.push((mapped, text, None));
+                            }
+                        }
+                        continue;
+                    }
+                }
+                let v = eval_expr(q, scopes, a)?;
+                children.extend(x::content_nodes(&v)?);
+            }
+            let elem = x::Node::Element(x::Elem {
+                name: elem_name,
+                ns: None,
+                attrs,
+                ns_decls: Vec::new(),
+                children,
+            });
+            let mut out = String::new();
+            x::serialize_node(&elem, &mut out);
+            Ok(Value::xml(out))
+        }
+        "__xmlforest" => {
+            let mut out = String::new();
+            for a in args {
+                let (ve, fname) = named_parts(a)
+                    .ok_or_else(|| exec_err("42601", "malformed XMLFOREST argument".to_string()))?;
+                let v = eval_expr(q, scopes, ve)?;
+                if v == Value::Null {
+                    continue;
+                }
+                let elem = x::Node::Element(x::Elem {
+                    name: x::map_sql_identifier_to_xml_name(&fname),
+                    ns: None,
+                    attrs: Vec::new(),
+                    ns_decls: Vec::new(),
+                    children: x::content_nodes(&v)?,
+                });
+                x::serialize_node(&elem, &mut out);
+            }
+            Ok(Value::xml(out))
+        }
+        "__xmlroot" => {
+            if args.len() != 3 {
+                return Err(exec_err("42601", "malformed XMLROOT".to_string()));
+            }
+            let v = eval_expr(q, scopes, &args[0])?;
+            let Some(text) = x::arg_xml_text(&v)? else {
+                return Ok(Value::Null);
+            };
+            // version wrapper: 0 args = NO VALUE; 1 arg = the value
+            // (NULL also means NO VALUE in PG). The wrapper is a
+            // parser marker, never a real function: inspect its
+            // argument AST instead of evaluating the wrapper itself.
+            let version = match &args[1] {
+                Expr::Func { args: wa, .. } if wa.is_empty() => Some(None),
+                Expr::Func { args: wa, .. } => match &wa[0] {
+                    Expr::Literal(Literal::Text(t)) => Some(Some(t.to_string())),
+                    e => {
+                        let vv = eval_expr(q, scopes, e)?;
+                        Some(vv.to_text())
+                    }
+                },
+                _ => None,
+            };
+            let standalone = match &args[2] {
+                Expr::Literal(Literal::Null) => None,
+                Expr::Func { args: wa, .. } if wa.is_empty() => Some(None),
+                Expr::Func { args: wa, .. } => match &wa[0] {
+                    // The parser emits a Bool literal for YES/NO.
+                    Expr::Literal(Literal::Bool(b)) => Some(Some(*b)),
+                    Expr::Literal(Literal::Text(t)) => Some(Some(t.as_ref() == "yes")),
+                    e => {
+                        let vv = eval_expr(q, scopes, e)?;
+                        Some(vv.to_text().map(|s| s == "yes"))
+                    }
+                },
+                _ => None,
+            };
+            x::xml_root(&text, version, standalone).map(Value::xml)
+        }
+        "__xmlexists" => {
+            if args.len() != 2 {
+                return Err(exec_err("42601", "malformed XMLEXISTS".to_string()));
+            }
+            let xp = eval_expr(q, scopes, &args[0])?;
+            let doc = eval_expr(q, scopes, &args[1])?;
+            let (Some(xpt), Some(doct)) = (xp.to_text(), x::arg_xml_text(&doc)?) else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Bool(x::eval_xpath_exists(&xpt, &doct, &[])?))
+        }
+        _ => Err(exec_err(
+            "42883",
+            format!("function {} does not exist", name),
+        )),
+    }
+}
+
+/// v2.42: value-level SQL/XML functions. Ok(None) = not an XML
+/// function name; the caller continues with the generic machinery.
+fn eval_xml_func_vals(name: &str, vals: &[Value]) -> Result<Option<Value>, ExecError> {
+    use crate::exec::xml as x;
+    let strict_null = vals.iter().any(|v| *v == Value::Null);
+    match name {
+        "xmlcomment" => {
+            if strict_null {
+                return Ok(Some(Value::Null));
+            }
+            let t = vals[0].to_text().unwrap_or_default();
+            Ok(Some(x::xml_comment(&t)?))
+        }
+        "xmltext" => {
+            if strict_null {
+                return Ok(Some(Value::Null));
+            }
+            let t = vals[0].to_text().unwrap_or_default();
+            Ok(Some(x::xml_text(&t)))
+        }
+        "xmlconcat" => {
+            let mut texts = Vec::new();
+            for v in vals {
+                if let Some(t) = x::arg_xml_text(v)? {
+                    // PG casts text arguments to xml on entry (the
+                    // xml input function validates per xmloption).
+                    if matches!(v, Value::Text(_) | Value::BpChar(_)) {
+                        x::xml_cast_in(&t)?;
+                    }
+                    texts.push(t);
+                }
+            }
+            if texts.is_empty() {
+                return Ok(Some(Value::Null));
+            }
+            Ok(Some(x::xml_concat(&texts)))
+        }
+        "xml_is_well_formed" | "xml_is_well_formed_document" | "xml_is_well_formed_content" => {
+            if strict_null {
+                return Ok(Some(Value::Null));
+            }
+            let t = vals[0].to_text().unwrap_or_default();
+            let document = match name {
+                "xml_is_well_formed_document" => true,
+                "xml_is_well_formed_content" => false,
+                _ => x::xmloption_is_document(),
+            };
+            Ok(Some(Value::Bool(x::parse_xml(&t, document).is_ok())))
+        }
+        "xpath" | "xpath_exists" => {
+            if strict_null {
+                return Ok(Some(Value::Null));
+            }
+            let xpt = vals[0].to_text().unwrap_or_default();
+            let Some(doct) = x::arg_xml_text(&vals[1])? else {
+                return Ok(Some(Value::Null));
+            };
+            let nsmap = if vals.len() > 2 {
+                x::nsmap_of(&vals[2])?
+            } else {
+                Vec::new()
+            };
+            if name == "xpath" {
+                Ok(Some(x::eval_xpath_value(&xpt, &doct, &nsmap)?))
+            } else {
+                Ok(Some(Value::Bool(x::eval_xpath_exists(
+                    &xpt, &doct, &nsmap,
+                )?)))
+            }
+        }
+        "__xmlparse" => {
+            if strict_null {
+                return Ok(Some(Value::Null));
+            }
+            let kind = vals[0].to_text().unwrap_or_default();
+            let text = vals[1].to_text().unwrap_or_default();
+            let strip = matches!(vals.get(2), Some(Value::Bool(true)))
+                || matches!(vals.get(2), Some(Value::Int(n)) if *n != 0);
+            let document = kind == "document";
+            let mut doc = x::parse_xml(&text, document).map_err(|e| e.to_exec())?;
+            if strip {
+                x::strip_ws_nodes(&mut doc.nodes);
+                Ok(Some(Value::xml(x::serialize_doc(&doc))))
+            } else {
+                Ok(Some(Value::xml(text)))
+            }
+        }
+        "__xmlserialize" => {
+            let kind = vals[0].to_text().unwrap_or_default();
+            if vals[1] == Value::Null {
+                return Ok(Some(Value::Null));
+            }
+            let text = vals[1].to_text().unwrap_or_default();
+            let type_name = vals[2].to_text().unwrap_or_default();
+            let indent = matches!(vals.get(3), Some(Value::Bool(true)))
+                || matches!(vals.get(3), Some(Value::Int(n)) if *n != 0);
+            let document = kind == "document";
+            let result_text = if !indent && !document {
+                // CONTENT without INDENT: verbatim, no validation.
+                text.clone()
+            } else {
+                let doc = x::parse_xml(&text, document).map_err(|_| ExecError {
+                    code: "2200L",
+                    message: "not an XML document".to_string(),
+                    detail: None,
+                    hint: None,
+                })?;
+                if indent {
+                    x::indent_format(&doc, document)
+                } else {
+                    text.clone()
+                }
+            };
+            let parts = crate::exec::pg_input::parse_type_name(&type_name);
+            let tm = parts.typmod.as_ref().and_then(|s| s.parse::<i32>().ok());
+            let ty = match parts.base.as_str() {
+                "text" => ColType::Text,
+                "character varying" | "varchar" => ColType::Varchar(tm),
+                "character" | "char" | "bpchar" => ColType::Char(tm),
+                "xml" => ColType::Xml,
+                other => {
+                    return Err(exec_err(
+                        "42704",
+                        format!("type \"{}\" does not exist", other),
+                    ));
+                }
+            };
+            let out = crate::exec::cast::eval_cast(&Value::text(result_text), ty)?;
+            Ok(Some(out))
+        }
+        "__xmlpi" => {
+            let raw = vals[0].to_text().unwrap_or_default();
+            let target = x::map_sql_identifier_to_xml_name(&raw);
+            if target.eq_ignore_ascii_case("xml") {
+                return Err(ExecError {
+                    code: "2200T",
+                    message: "invalid XML processing instruction".to_string(),
+                    detail: Some(format!(
+                        "XML processing instruction target name cannot be \"{}\".",
+                        target
+                    )),
+                    hint: None,
+                });
+            }
+            match vals.get(1) {
+                // No data argument: <?target?>. An explicitly NULL
+                // data argument makes the whole result NULL (PG).
+                None => Ok(Some(Value::xml(format!("<?{}?>", target)))),
+                Some(Value::Null) => Ok(Some(Value::Null)),
+                Some(v) => {
+                    let data = v.to_text().unwrap_or_default();
+                    if data.contains("?>") {
+                        return Err(ExecError {
+                            code: "2200T",
+                            message: "invalid XML processing instruction".to_string(),
+                            detail: Some(
+                                "XML processing instruction cannot contain \"?>\".".to_string(),
+                            ),
+                            hint: None,
+                        });
+                    }
+                    let trimmed = data.trim_start_matches([' ', '\t', '\n', '\r']);
+                    if trimmed.is_empty() {
+                        Ok(Some(Value::xml(format!("<?{}?>", target))))
+                    } else {
+                        Ok(Some(Value::xml(format!("<?{} {}?>", target, trimmed))))
+                    }
+                }
+            }
+        }
+        "__xml_is_document" => {
+            if strict_null {
+                return Ok(Some(Value::Null));
+            }
+            match &vals[0] {
+                Value::Xml(t) => Ok(Some(Value::Bool(x::is_document(t)))),
+                other => {
+                    let t = other.to_text().unwrap_or_default();
+                    let v = x::xml_cast_in(&t)?;
+                    Ok(Some(Value::Bool(x::is_document(&v))))
+                }
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
+    // v2.42: plain SQL/XML functions on evaluated values.
+    if let Some(r) = eval_xml_func_vals(name, vals)? {
+        return Ok(r);
+    }
     // v1.88: range / multirange constructors and functions dispatch
     // before the generic machinery (lower/upper are also text
     // functions; the rangeish-operand check inside decides).
@@ -16397,6 +16768,7 @@ pub(crate) fn ctor_spec_result_type_named(eng: &Engine, spec: &str) -> ColType {
     match spec {
         "" | "json" => ColType::Json,
         "jsonb" => ColType::Jsonb,
+        "xml" => ColType::Xml, // v2.42
         "bytea" => ColType::Bytea,
         _ => {
             if let Some(t) = super::json::ctor_spec_coltype(spec) {
@@ -16704,6 +17076,30 @@ pub(crate) fn func_result_type(
     match name {
         // v2.37: string_to_array returns text[].
         "string_to_array" => Ok(ColType::Array(crate::storage::ArrayElem::Text)),
+        // v2.42: SQL/XML function result types.
+        "xmlcomment" | "xmlconcat" | "xmltext" | "__xmlelement" | "__xmlforest"
+        | "__xmlparse" | "__xmlroot" | "__xmlpi" | "xmlagg" | "table_to_xml"
+        | "query_to_xml" | "schema_to_xml" => Ok(ColType::Xml),
+        "xpath" => Ok(ColType::Array(crate::storage::ArrayElem::Xml)),
+        "xpath_exists" | "__xmlexists" | "__xml_is_document" | "xml_is_well_formed"
+        | "xml_is_well_formed_document" | "xml_is_well_formed_content" => {
+            Ok(ColType::Bool)
+        }
+        "__xmlserialize" => {
+            // The result type is the AS <type> argument (a literal
+            // type name captured by the parser).
+            if let Some(Expr::Literal(Literal::Text(t))) = args.get(2) {
+                let parts = crate::exec::pg_input::parse_type_name(t.as_ref());
+                let tm = parts.typmod.as_ref().and_then(|s| s.parse::<i32>().ok());
+                return Ok(match parts.base.as_str() {
+                    "character varying" | "varchar" => ColType::Varchar(tm),
+                    "character" | "char" | "bpchar" => ColType::Char(tm),
+                    "xml" => ColType::Xml,
+                    _ => ColType::Text,
+                });
+            }
+            Ok(ColType::Text)
+        }
         "upper" | "lower" | "replace" | "split_part" | "concat" | "concat_ws" | "to_hex"
         | "to_oct" | "to_bin" | "left" | "right" | "reverse" | "encode" | "repeat" | "lpad"
         | "rpad" | "chr" | "initcap"
@@ -17457,6 +17853,7 @@ pub(crate) fn value_type_name(v: &Value) -> Cow<'static, str> {
         Value::Numeric(_) => Cow::Borrowed("numeric"),
         Value::Text(_) => Cow::Borrowed("text"),
         Value::Jsonb(_) => Cow::Borrowed("jsonb"), // v1.83
+        Value::Xml(_) => Cow::Borrowed("xml"),     // v2.42
         Value::Jsonpath(_) => Cow::Borrowed("jsonpath"), // v1.85
         // v1.88: range type names for operator error messages.
         Value::Range(r) => Cow::Owned(
@@ -17489,4 +17886,124 @@ pub(crate) fn value_type_name(v: &Value) -> Cow<'static, str> {
         Value::Array(a) => Cow::Owned(format!("{}[]", a.elem.sql_name())),
         Value::Null => Cow::Borrowed("null"),
     }
+}
+
+// v2.42: table_to_xml / query_to_xml / schema_to_xml (PG's SPI-based
+// SQL/XML mapping functions; xmlschema variants remain unimplemented).
+
+fn xml_internal_select(q: &mut Q, sql: &str) -> Result<(Vec<String>, Vec<Vec<Value>>), ExecError> {
+    let stmt = crate::sql::parse_statement(sql).map_err(|e| exec_err(e.code, e.message.clone()))?;
+    if !matches!(stmt, Stmt::Select { .. }) {
+        return Err(exec_err("22000", "invalid query"));
+    }
+    let mut writes: Vec<WriteOp> = Vec::new();
+    let mut ctx = StmtCtx {
+        privs_suppressed: false,
+        snap: q.snap,
+        own: q.own,
+        write_xid: q.own,
+        all_xids: q.all_xids.clone(),
+        level: IsolationLevel::ReadCommitted,
+        writes: &mut writes,
+        session: q.session,
+        role: q.role,
+        read_only: true,
+        default_toast_compression: crate::storage::ToastCompression::Pglz,
+        notices: Vec::new(),
+    };
+    match crate::exec::dispatch::execute_inner(q.eng, &mut ctx, &stmt)? {
+        ExecResult::Select { columns, rows } => Ok((
+            columns.into_iter().map(|(n, _)| n).collect(),
+            rows.into_iter().map(|r| r.into_cells()).collect(),
+        )),
+        _ => Err(exec_err("22000", "invalid query")),
+    }
+}
+
+fn xml_quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn eval_to_xml_func(
+    q: &mut Q,
+    scopes: &[Scope],
+    name: &str,
+    args: &[Expr],
+) -> Result<Value, ExecError> {
+    if args.len() != 4 {
+        return Err(exec_err(
+            "42883",
+            format!("function {name} with the given argument count does not exist"),
+        ));
+    }
+    let target = eval_expr(q, scopes, &args[0])?;
+    let nulls_v = eval_expr(q, scopes, &args[1])?;
+    let forest_v = eval_expr(q, scopes, &args[2])?;
+    let targetns_v = eval_expr(q, scopes, &args[3])?;
+    eval_to_xml_vals(q, name, &target, &nulls_v, &forest_v, &targetns_v)
+}
+
+pub(crate) fn eval_to_xml_vals(
+    q: &mut Q,
+    name: &str,
+    target: &Value,
+    nulls_v: &Value,
+    forest_v: &Value,
+    targetns_v: &Value,
+) -> Result<Value, ExecError> {
+    use crate::exec::xml as x;
+    if *target == Value::Null {
+        return Ok(Value::Null);
+    }
+    let nulls = matches!(nulls_v, Value::Bool(true));
+    let forest = matches!(forest_v, Value::Bool(true));
+    let targetns = match targetns_v {
+        Value::Null => String::new(),
+        v => v.to_text().unwrap_or_default(),
+    };
+    let target_text = target.to_text().unwrap_or_default();
+    let out = match name {
+        "table_to_xml" => {
+            let base = target_text
+                .rsplit('.')
+                .next()
+                .unwrap_or(&target_text)
+                .trim_matches('"')
+                .to_string();
+            let (cols, rows) = xml_internal_select(q, &format!("SELECT * FROM {target_text}"))?;
+            x::map_result_to_xml(Some(&base), true, nulls, forest, &targetns, &cols, &rows)?
+        }
+        "query_to_xml" => {
+            let (cols, rows) = xml_internal_select(q, &target_text)?;
+            x::map_result_to_xml(None, true, nulls, forest, &targetns, &cols, &rows)?
+        }
+        _ => {
+            // schema_to_xml
+            let esc = target_text.replace('\'', "''");
+            let (_, tnames) = xml_internal_select(
+                q,
+                &format!(
+                    "SELECT c.relname FROM pg_class c \
+                     JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE n.nspname = '{esc}' AND c.relkind IN ('r', 'm', 'v') \
+                     ORDER BY 1"
+                ),
+            )?;
+            let mut tables = Vec::new();
+            for trow in &tnames {
+                let tname = trow[0].to_text().unwrap_or_default();
+                let (cols, rows) = xml_internal_select(
+                    q,
+                    &format!(
+                        "SELECT * FROM {}.{}",
+                        xml_quote_ident(&target_text),
+                        xml_quote_ident(&tname)
+                    ),
+                )?;
+                tables.push((tname, cols, rows));
+            }
+            x::map_schema_to_xml(&target_text, nulls, forest, &targetns, &tables)?
+        }
+    };
+    Ok(Value::Xml(std::sync::Arc::from(out.as_str())))
 }

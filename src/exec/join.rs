@@ -1611,6 +1611,7 @@ pub(crate) fn eval_function_item(
     col_aliases: &[String],
     col_defs: &[(String, ColType, Option<String>)],
     json_table: Option<&JsonTableSpec>,
+    xml_table: Option<&XmlTableSpec>,
     ordinality: bool,
     rows_from: &[RowsFromPart],
 ) -> Result<(Vec<QCol>, Vec<QRow>), ExecError> {
@@ -1653,6 +1654,20 @@ pub(crate) fn eval_function_item(
             alias,
             col_aliases,
         );
+    }
+    // v2.42: XMLTABLE — its own evaluator over the XML/XPath engine.
+    if name == "xmltable" {
+        let mut arg_vals = Vec::with_capacity(args.len());
+        for a in args {
+            arg_vals.push(eval_expr(q, scopes, a)?);
+        }
+        let spec = xml_table.ok_or_else(|| {
+            exec_err(
+                "XX000",
+                "xmltable FROM item without a COLUMNS spec".to_string(),
+            )
+        })?;
+        return super::xmltable::eval_xml_table(q, scopes, spec, &arg_vals, alias, col_aliases);
     }
     if ordinality && !col_defs.is_empty() {
         return Err(exec_err(
@@ -2003,6 +2018,8 @@ pub(crate) enum LateralRight<'a> {
         col_defs: &'a [(String, ColType, Option<String>)],
         /// v1.89: the JSON_TABLE COLUMNS tree (name == "json_table").
         json_table: Option<&'a JsonTableSpec>,
+        /// v2.42: the XMLTABLE spec (name == "xmltable").
+        xml_table: Option<&'a XmlTableSpec>,
         /// v2.13: WITH ORDINALITY on the function item.
         ordinality: bool,
         /// v2.13: ROWS FROM parts (empty for a plain function).
@@ -2045,6 +2062,7 @@ pub(crate) fn lateral_right_schema(
             col_aliases,
             col_defs,
             json_table,
+            xml_table,
             ordinality,
             rows_from,
         } => lateral_function_schema(
@@ -2058,6 +2076,7 @@ pub(crate) fn lateral_right_schema(
             col_aliases,
             col_defs,
             *json_table,
+            *xml_table,
             // v1.10: arg type inference sees the innermost scope (the
             // immediate left input), as before.
             scope_schemas.last().copied().unwrap_or(&[]),
@@ -2494,6 +2513,7 @@ pub(crate) fn eval_lateral_right(
             col_aliases,
             col_defs,
             json_table,
+            xml_table,
             ordinality,
             rows_from,
         } => {
@@ -2506,6 +2526,7 @@ pub(crate) fn eval_lateral_right(
                 col_aliases,
                 col_defs,
                 *json_table,
+                *xml_table,
                 *ordinality,
                 rows_from,
             )?;
@@ -3002,6 +3023,7 @@ pub(crate) fn lateral_function_schema(
     col_aliases: &[String],
     col_defs: &[(String, ColType, Option<String>)],
     json_table: Option<&JsonTableSpec>,
+    xml_table: Option<&XmlTableSpec>,
     left: &[QCol],
     ordinality: bool,
     rows_from: &[RowsFromPart],
@@ -3015,6 +3037,16 @@ pub(crate) fn lateral_function_schema(
             )
         })?;
         return super::jsontable::jt_schema(eng, snap, own, session, spec, alias, col_aliases);
+    }
+    // v2.42: XMLTABLE's schema comes from its COLUMNS list.
+    if name == "xmltable" {
+        let spec = xml_table.ok_or_else(|| {
+            exec_err(
+                "XX000",
+                "xmltable FROM item without a COLUMNS spec".to_string(),
+            )
+        })?;
+        return super::xmltable::xt_schema(spec, alias, col_aliases);
     }
     // v2.13: ROWS FROM(...) — per-part static schemas concatenated.
     if !rows_from.is_empty() {
@@ -4207,6 +4239,7 @@ pub(crate) fn build_source(
             col_aliases,
             col_defs,
             json_table,
+            xml_table,
             ordinality,
             rows_from,
             ..
@@ -4219,6 +4252,7 @@ pub(crate) fn build_source(
             col_aliases,
             col_defs,
             json_table.as_deref(),
+            xml_table.as_deref(),
             *ordinality,
             rows_from,
         ),
@@ -4421,6 +4455,7 @@ pub(crate) fn build_source(
                     col_defs,
                     lateral,
                     json_table,
+                    xml_table,
                     ordinality,
                     rows_from,
                 } if *lateral
@@ -4437,6 +4472,7 @@ pub(crate) fn build_source(
                         col_aliases: col_aliases.as_slice(),
                         col_defs: col_defs.as_slice(),
                         json_table: json_table.as_deref(),
+                        xml_table: xml_table.as_deref(),
                         ordinality: *ordinality,
                         rows_from: rows_from.as_slice(),
                     })

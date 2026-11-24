@@ -584,7 +584,9 @@ pub(crate) const IMMUTABLE_FUNCS: &[&str] = &[
     "name",
     "oid",
     "xmlexists",
+    "__xmlexists",
     "xml_is_document",
+    "__xml_is_document",
     "get_bit",
     "get_byte",
     "unicode",
@@ -908,7 +910,9 @@ fn filter_is_boolean(t: &Table, e: &Expr) -> bool {
             name.to_lowercase().as_str(),
             "pg_input_is_valid"
                 | "xmlexists"
+                | "__xmlexists"
                 | "xml_is_document"
+                | "__xml_is_document"
                 | "isempty"
                 | "upper_inf"
                 | "lower_inf"

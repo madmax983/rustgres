@@ -1420,6 +1420,8 @@ impl Parser {
             "json" => Ok(ColType::Json),
             // v1.83: PG's `jsonb` type (pg_type.dat, oid 3802).
             "jsonb" => Ok(ColType::Jsonb),
+            // v2.42: PG's `xml` type (pg_type.dat, oid 142).
+            "xml" => Ok(ColType::Xml),
             // v1.85: PG's `jsonpath` type (pg_type.dat, oid 4072).
             "jsonpath" => Ok(ColType::Jsonpath),
             // v1.94: PG's text-search types (pg_type.dat, oids
@@ -1759,6 +1761,7 @@ impl Parser {
                 | "tstzmultirange"
                 | "tsvector" // v1.94
                 | "tsquery" // v1.94
+                | "xml" // v2.42: xml typed literals
         )
     }
 
@@ -12234,6 +12237,15 @@ impl Parser {
                     ],
                 };
                 expr = if neg { Expr::Not(Box::new(pred)) } else { pred };
+            } else if matches!(self.peek(), Token::Ident(s) if s == "document") {
+                // v2.42: `expr IS [NOT] DOCUMENT` (PG19 gram.y
+                // XmlIsPredicate) -> __xml_is_document(expr).
+                self.next();
+                let pred = Expr::Func {
+                    name: "__xml_is_document".to_string(),
+                    args: vec![expr],
+                };
+                expr = if neg { Expr::Not(Box::new(pred)) } else { pred };
             } else if self.eat_keyword("distinct") {
                 self.expect_keyword("from")?;
                 let right = self.parse_bitor()?;
@@ -13702,6 +13714,15 @@ impl Parser {
             // Quoted variants (e.g. `"Grouping"(...)`) keep the generic
             // path — only the folded keyword form is special.
             "grouping" => return self.parse_grouping(),
+            // v2.42: SQL/XML grammar productions (PG19 gram.y
+            // XmlExpr family) — desugared onto __xml* calls.
+            "xmlelement" => return self.parse_xmlelement(),
+            "xmlforest" => return self.parse_xmlforest(),
+            "xmlparse" => return self.parse_xmlparse(),
+            "xmlserialize" => return self.parse_xmlserialize(),
+            "xmlpi" => return self.parse_xmlpi(),
+            "xmlroot" => return self.parse_xmlroot(),
+            "xmlexists" => return self.parse_xmlexists(),
             _ => {}
         }
         // v1.30: PG19 ordered-set aggregates (`WITHIN GROUP`).
@@ -13757,6 +13778,7 @@ impl Parser {
             "jsonb_agg" => Some(AggFunc::JsonbAgg),
             "json_object_agg" => Some(AggFunc::JsonObjectAgg),
             "jsonb_object_agg" => Some(AggFunc::JsonbObjectAgg),
+            "xmlagg" => Some(AggFunc::XmlAgg),
             "range_agg" => Some(AggFunc::RangeAgg),
             "range_intersect_agg" => Some(AggFunc::RangeIntersectAgg),
             _ => None,
@@ -16262,6 +16284,29 @@ impl Parser {
                 local,
             });
         }
+        // v2.42: `SET XML OPTION DOCUMENT|CONTENT` — the SQL-standard
+        // spelling of SET xmloption (PG19 gram.y VariableSetStmt).
+        if matches!(self.peek(), Token::Ident(s) if s == "xml")
+            && matches!(self.peek2(), Token::Ident(s) if s == "option")
+        {
+            self.next();
+            self.next();
+            let val = if self.eat_keyword("document") {
+                "document"
+            } else if self.eat_keyword("content") {
+                "content"
+            } else {
+                return Err(err(format!(
+                    "syntax error: expected DOCUMENT or CONTENT after SET XML OPTION, found {:?}",
+                    self.peek()
+                )));
+            };
+            return Ok(Stmt::Set {
+                name: "xmloption".to_string(),
+                value: SetValue::Str(val.to_string()),
+                local,
+            });
+        }
         // v2.11: GUC names may be qualified (custom variable classes
         // like `plpgsql.extra_errors`, PG19 VarName = ColId ['.' ColId
         // ...]); parse the dotted form into one name.
@@ -18717,6 +18762,11 @@ impl Parser {
                     self.next();
                     return self.parse_json_table_from();
                 }
+                // v2.42: XMLTABLE likewise (implicitly LATERAL).
+                if name == "xmltable" {
+                    self.next();
+                    return self.parse_xml_table_from();
+                }
                 self.next();
                 let mut args = Vec::new();
                 if *self.peek() != Token::RParen {
@@ -18770,6 +18820,7 @@ impl Parser {
                     col_defs,
                     lateral,
                     json_table: None,
+                    xml_table: None,
                     ordinality,
                     rows_from: Vec::new(),
                 });
@@ -18898,6 +18949,7 @@ impl Parser {
             col_defs,
             lateral,
             json_table: None,
+            xml_table: None,
             ordinality,
             rows_from: parts,
         })
@@ -19001,6 +19053,406 @@ impl Parser {
                 columns,
                 on_error,
             })),
+            xml_table: None,
+        })
+    }
+
+    // ------------------------------------------------ v2.42: XML
+
+    pub(crate) fn expect_string_literal(&mut self) -> Result<String, SqlError> {
+        match self.next() {
+            Token::Str(s) => Ok(s),
+            other => Err(err(format!(
+                "syntax error: expected a string literal, found {:?}",
+                other
+            ))),
+        }
+    }
+
+    /// `XMLELEMENT(NAME name [, XMLATTRIBUTES(...)] [, content...])`
+    /// -> __xmlelement(name-text, [__xmlattributes(...)], content...)
+    pub(crate) fn parse_xmlelement(&mut self) -> Result<Expr, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        self.expect_keyword("name")?;
+        let elname = self.expect_ident()?;
+        let mut args = vec![Expr::Literal(Literal::Text(elname.into()))];
+        if *self.peek() == Token::Comma {
+            self.next();
+            loop {
+                if matches!(self.peek(), Token::Ident(s) if s == "xmlattributes")
+                    && matches!(self.peek2(), Token::LParen)
+                {
+                    args.push(self.parse_xmlattributes()?);
+                } else {
+                    args.push(self.parse_or()?);
+                }
+                if *self.peek() == Token::Comma {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.expect(Token::RParen, "')'")?;
+        Ok(Expr::Func {
+            name: "__xmlelement".to_string(),
+            args,
+        })
+    }
+
+    /// `XMLATTRIBUTES(expr [AS name], ...)` -> __xmlattributes with
+    /// __xmlnamed(expr, name-text) argument wrappers.
+    pub(crate) fn parse_xmlattributes(&mut self) -> Result<Expr, SqlError> {
+        self.next(); // xmlattributes
+        self.expect(Token::LParen, "'('")?;
+        let mut args = Vec::new();
+        loop {
+            let e = self.parse_or()?;
+            let aname = if self.eat_keyword("as") {
+                self.expect_ident()?
+            } else if let Expr::Column { name, .. } = &e {
+                name.clone()
+            } else {
+                return Err(err(
+                    "syntax error: XMLATTRIBUTES requires attribute names (use a column reference or AS)",
+                ));
+            };
+            args.push(Expr::Func {
+                name: "__xmlnamed".to_string(),
+                args: vec![e, Expr::Literal(Literal::Text(aname.into()))],
+            });
+            if *self.peek() == Token::Comma {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        self.expect(Token::RParen, "')'")?;
+        Ok(Expr::Func {
+            name: "__xmlattributes".to_string(),
+            args,
+        })
+    }
+
+    /// `XMLFOREST(expr [AS name], ...)` -> __xmlforest(__xmlnamed...)
+    pub(crate) fn parse_xmlforest(&mut self) -> Result<Expr, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let mut args = Vec::new();
+        loop {
+            let e = self.parse_or()?;
+            let aname = if self.eat_keyword("as") {
+                self.expect_ident()?
+            } else if let Expr::Column { name, .. } = &e {
+                name.clone()
+            } else {
+                return Err(err(
+                    "syntax error: XMLFOREST requires element names (use a column reference or AS)",
+                ));
+            };
+            args.push(Expr::Func {
+                name: "__xmlnamed".to_string(),
+                args: vec![e, Expr::Literal(Literal::Text(aname.into()))],
+            });
+            if *self.peek() == Token::Comma {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        self.expect(Token::RParen, "')'")?;
+        Ok(Expr::Func {
+            name: "__xmlforest".to_string(),
+            args,
+        })
+    }
+
+    /// `XMLPARSE(DOCUMENT|CONTENT expr [, PRESERVING|STRIP WHITESPACE])`
+    pub(crate) fn parse_xmlparse(&mut self) -> Result<Expr, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let kind = if self.eat_keyword("document") {
+            "document"
+        } else if self.eat_keyword("content") {
+            "content"
+        } else {
+            return Err(err(format!(
+                "syntax error: expected DOCUMENT or CONTENT in XMLPARSE, found {:?}",
+                self.peek()
+            )));
+        };
+        let e = self.parse_or()?;
+        let mut strip = 0i64;
+        if *self.peek() == Token::Comma {
+            self.next();
+            if self.eat_keyword("strip") {
+                strip = 1;
+            } else {
+                self.expect_keyword("preserving")?;
+            }
+            self.expect_keyword("whitespace")?;
+        }
+        self.expect(Token::RParen, "')'")?;
+        Ok(Expr::Func {
+            name: "__xmlparse".to_string(),
+            args: vec![
+                Expr::Literal(Literal::Text(kind.into())),
+                e,
+                Expr::Literal(Literal::Int(strip)),
+            ],
+        })
+    }
+
+    /// `XMLSERIALIZE(DOCUMENT|CONTENT expr AS type [INDENT|NO INDENT])`
+    pub(crate) fn parse_xmlserialize(&mut self) -> Result<Expr, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let kind = if self.eat_keyword("document") {
+            "document"
+        } else if self.eat_keyword("content") {
+            "content"
+        } else {
+            return Err(err(format!(
+                "syntax error: expected DOCUMENT or CONTENT in XMLSERIALIZE, found {:?}",
+                self.peek()
+            )));
+        };
+        let e = self.parse_or()?;
+        self.expect_keyword("as")?;
+        let (ty, _named) = self.parse_type_name()?;
+        let mut indent = 0i64;
+        if self.eat_keyword("indent") {
+            indent = 1;
+        } else if self.eat_keyword("no") {
+            self.expect_keyword("indent")?;
+        }
+        self.expect(Token::RParen, "')'")?;
+        // Keep the typmod for char/varchar targets (sql_name drops
+        // it); the evaluator re-parses this string.
+        let type_sql = match ty {
+            ColType::Char(Some(n)) => format!("character({})", n),
+            ColType::Varchar(Some(n)) => format!("character varying({})", n),
+            _ => ty.sql_name(),
+        };
+        Ok(Expr::Func {
+            name: "__xmlserialize".to_string(),
+            args: vec![
+                Expr::Literal(Literal::Text(kind.into())),
+                e,
+                Expr::Literal(Literal::Text(type_sql.into())),
+                Expr::Literal(Literal::Int(indent)),
+            ],
+        })
+    }
+
+    /// `XMLPI(NAME name [, expr])`
+    pub(crate) fn parse_xmlpi(&mut self) -> Result<Expr, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        self.expect_keyword("name")?;
+        let target = self.expect_ident()?;
+        let mut args = vec![Expr::Literal(Literal::Text(target.into()))];
+        if *self.peek() == Token::Comma {
+            self.next();
+            args.push(self.parse_or()?);
+        }
+        self.expect(Token::RParen, "')'")?;
+        Ok(Expr::Func {
+            name: "__xmlpi".to_string(),
+            args,
+        })
+    }
+
+    /// `XMLROOT(expr, VERSION v|NO VALUE [, STANDALONE YES|NO|NO VALUE])`
+    /// Option clauses ride as __xmlroot_opt wrappers (0 args = NO
+    /// VALUE, 1 arg = the value); an absent STANDALONE is Null.
+    pub(crate) fn parse_xmlroot(&mut self) -> Result<Expr, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let e = self.parse_or()?;
+        self.expect(Token::Comma, "','")?;
+        self.expect_keyword("version")?;
+        let version = if self.eat_keyword("no") {
+            self.expect_keyword("value")?;
+            Expr::Func {
+                name: "__xmlroot_opt".to_string(),
+                args: vec![],
+            }
+        } else {
+            let v = self.parse_or()?;
+            Expr::Func {
+                name: "__xmlroot_opt".to_string(),
+                args: vec![v],
+            }
+        };
+        let mut standalone = Expr::Literal(Literal::Null);
+        if *self.peek() == Token::Comma {
+            self.next();
+            self.expect_keyword("standalone")?;
+            standalone = if self.eat_keyword("no") {
+                if self.eat_keyword("value") {
+                    Expr::Func {
+                        name: "__xmlroot_opt".to_string(),
+                        args: vec![],
+                    }
+                } else {
+                    Expr::Func {
+                        name: "__xmlroot_opt".to_string(),
+                        args: vec![Expr::Literal(Literal::Bool(false))],
+                    }
+                }
+            } else if self.eat_keyword("yes") {
+                Expr::Func {
+                    name: "__xmlroot_opt".to_string(),
+                    args: vec![Expr::Literal(Literal::Bool(true))],
+                }
+            } else {
+                return Err(err(format!(
+                    "syntax error: expected YES, NO or NO VALUE in XMLROOT, found {:?}",
+                    self.peek()
+                )));
+            };
+        }
+        self.expect(Token::RParen, "')'")?;
+        Ok(Expr::Func {
+            name: "__xmlroot".to_string(),
+            args: vec![e, version, standalone],
+        })
+    }
+
+    /// `XMLEXISTS(xpath PASSING [BY REF] doc [AS name] [, ...])`
+    /// -> __xmlexists(xpath, doc). Only the first PASSING item is the
+    /// document; named extra items would need $var support in the
+    /// XPath engine (not in the suites in scope).
+    pub(crate) fn parse_xmlexists(&mut self) -> Result<Expr, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let xpath = self.parse_or()?;
+        self.expect_keyword("passing")?;
+        let mut doc: Option<Expr> = None;
+        loop {
+            let _by_ref = self.eat_keyword("by") && self.eat_keyword("ref");
+            let item = self.parse_or()?;
+            let _named = if self.eat_keyword("as") {
+                Some(self.expect_ident()?)
+            } else {
+                None
+            };
+            if doc.is_none() {
+                doc = Some(item);
+            }
+            if *self.peek() == Token::Comma {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        let _trailing_by_ref = self.eat_keyword("by") && self.eat_keyword("ref");
+        self.expect(Token::RParen, "')'")?;
+        Ok(Expr::Func {
+            name: "__xmlexists".to_string(),
+            args: vec![xpath, doc.unwrap_or(Expr::Literal(Literal::Null))],
+        })
+    }
+
+    /// v2.42: `XMLTABLE([XMLNAMESPACES(...),] rowpath PASSING doc
+    /// COLUMNS (...))` — PG19 gram.y XmlTable. The opening '(' is
+    /// already consumed. Implicitly LATERAL like JSON_TABLE.
+    pub(crate) fn parse_xml_table_from(&mut self) -> Result<FromItem, SqlError> {
+        let mut namespaces: Vec<(Option<String>, String)> = Vec::new();
+        if matches!(self.peek(), Token::Ident(s) if s == "xmlnamespaces")
+            && matches!(self.peek2(), Token::LParen)
+        {
+            self.next();
+            self.expect(Token::LParen, "'('")?;
+            loop {
+                if self.eat_keyword("default") {
+                    let uri = self.expect_string_literal()?;
+                    namespaces.push((None, uri));
+                } else if self.eat_keyword("no") {
+                    self.expect_keyword("default")?;
+                } else {
+                    let uri = self.expect_string_literal()?;
+                    self.expect_keyword("as")?;
+                    let prefix = self.expect_ident()?;
+                    namespaces.push((Some(prefix), uri));
+                }
+                if *self.peek() == Token::Comma {
+                    self.next();
+                } else {
+                    break;
+                }
+            }
+            self.expect(Token::RParen, "')'")?;
+            self.expect(Token::Comma, "','")?;
+        }
+        let rowpath = self.parse_or()?;
+        self.expect_keyword("passing")?;
+        // PASSING items: [BY REF] expr [AS name]; the document is the
+        // (single, in-scope) first item.
+        let _by_ref = self.eat_keyword("by") && self.eat_keyword("ref");
+        let passing = self.parse_or()?;
+        if self.eat_keyword("as") {
+            let _ = self.expect_ident()?;
+        }
+        self.expect_keyword("columns")?;
+        // PG gram.y XmlTable: COLUMNS is followed directly by the
+        // column list (no parens); the list ends at XMLTABLE's own ')'.
+        let mut columns: Vec<XtColumn> = Vec::new();
+        loop {
+            let cname = self.expect_ident()?;
+            if self.eat_keyword("for") {
+                self.expect_keyword("ordinality")?;
+                columns.push(XtColumn::Ordinality { name: cname });
+            } else {
+                let (ty, named) = self.parse_type_name()?;
+                let mut exists = false;
+                let mut path: Option<Expr> = None;
+                let mut default: Option<Expr> = None;
+                let mut not_null = false;
+                loop {
+                    if matches!(self.peek(), Token::Ident(s) if s == "exists") {
+                        self.next();
+                        exists = true;
+                    } else if matches!(self.peek(), Token::Ident(s) if s == "path") {
+                        self.next();
+                        path = Some(self.parse_or()?);
+                    } else if self.eat_keyword("default") {
+                        default = Some(self.parse_or()?);
+                    } else if self.eat_keyword("not") {
+                        self.expect_keyword("null")?;
+                        not_null = true;
+                    } else {
+                        break;
+                    }
+                }
+                columns.push(XtColumn::Regular {
+                    name: cname,
+                    ty,
+                    named,
+                    exists,
+                    path,
+                    default,
+                    not_null,
+                });
+            }
+            if *self.peek() == Token::Comma {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        self.expect(Token::RParen, "')'")?;
+        let alias = self.parse_alias_opt()?;
+        let col_aliases = self.parse_col_alias_list()?;
+        Ok(FromItem::Function {
+            name: "xmltable".to_string(),
+            args: vec![rowpath, passing],
+            alias,
+            col_aliases,
+            col_defs: Vec::new(),
+            lateral: true,
+            json_table: None,
+            xml_table: Some(Box::new(XmlTableSpec {
+                namespaces,
+                columns,
+            })),
+            ordinality: false,
+            rows_from: Vec::new(),
         })
     }
 
