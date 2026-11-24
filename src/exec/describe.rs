@@ -1494,6 +1494,10 @@ pub(crate) fn expr_col_name_strength(e: &Expr) -> (String, u8) {
             2,
         ),
         Expr::Func { name, .. } if name == "__is_json" => ("?column?".to_string(), 0),
+        // v2.40: the quantified-comparison desugar is an operator
+        // expression in PG — its column is ?column?, not the hidden
+        // builtin's name.
+        Expr::Func { name, .. } if name == "__any_all_array" => ("?column?".to_string(), 0),
         // v1.94: operator desugars (`<->` / `!!`) are not function
         // calls in PG's FigureColname — the column is ?column?.
         Expr::Func { name, .. } if name == "__tsquery_phrase" || name == "__tsquery_not" => {
@@ -1961,6 +1965,54 @@ pub(crate) fn expr_type(
                 for slot in [4usize, 6usize] {
                     if let Some(e) = args.get(slot) {
                         check_sqljson_default(eng, e)?;
+                    }
+                }
+            }
+            // v2.40: pg_statistic.stavaluesN is declared `anyarray`
+            // in PG19's catalog, so an anyarray parameter cannot
+            // determine an element type from it — an analysis-time
+            // error in PG19 (enforce_generic_type_consistency),
+            // raised here too so it fires even when pg_statistic
+            // has no rows to evaluate (see the eval_func twin).
+            if let Some(fdef) = super::eval::overload_for_argc(eng, name, args.len()) {
+                let has_anyarray_param = (0..fdef.arg_types.len()).any(|i| {
+                    fdef.arg_mode(i).is_input()
+                        && fdef.arg_types[i]
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or(&fdef.arg_types[i])
+                            .trim()
+                            .eq_ignore_ascii_case("anyarray")
+                });
+                if has_anyarray_param {
+                    for a in args {
+                        if let Expr::Column { name: col, .. } = a {
+                            let is_stavalues = matches!(
+                                col.as_str(),
+                                "stavalues1"
+                                    | "stavalues2"
+                                    | "stavalues3"
+                                    | "stavalues4"
+                                    | "stavalues5"
+                            );
+                            let in_statistic = schemas.iter().any(|s| {
+                                s.iter().any(|c| {
+                                    c.name == *col
+                                        && c.qual
+                                            .rsplit('.')
+                                            .next()
+                                            .unwrap_or(&c.qual)
+                                            .eq_ignore_ascii_case("pg_statistic")
+                                })
+                            });
+                            if is_stavalues && in_statistic {
+                                return Err(exec_err(
+                                    "42P13",
+                                    "cannot determine element type of \"anyarray\" argument"
+                                        .to_string(),
+                                ));
+                            }
+                        }
                     }
                 }
             }

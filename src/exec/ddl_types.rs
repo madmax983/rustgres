@@ -1990,6 +1990,9 @@ pub(crate) fn exec_create_domain(
                 // v2.21: runtime-only (not carried by the WAL
                 // record), like the other post-hoc fields.
                 collation: collate.map(|s| s.to_string()),
+                // v2.40: the DECLARED base shape, before the
+                // domain-over-domain flattening rewrites `base`.
+                array_base: matches!(base, ColType::Array(_)),
             }),
         },
     );

@@ -48,6 +48,10 @@ pub(crate) fn eval_array_ctor(
     for e in elems {
         vals.push(eval_expr(q, scopes, e)?);
     }
+    // v2.40: PG19 decides multidimensionality by the elements'
+    // types, not by bracket spelling — ARRAY[ARRAY[..], ARRAY[..]]
+    // stacks dimensions like ARRAY[[..],[..]] does.
+    let nested = nested || (!vals.is_empty() && vals.iter().all(|v| matches!(v, Value::Array(_))));
     array_ctor_from_vals(vals, nested, false)
 }
 
@@ -91,6 +95,86 @@ pub(crate) fn expr_is_statically_array(e: &Expr, schema: Option<&[QCol]>) -> boo
             })
         }),
         _ => false,
+    }
+}
+
+/// v2.40: build an `ARRAY[...]` constructor under a known target
+/// element type (the `ARRAY[...]::elem[]` cast shape): scalar
+/// elements coerce hard to the element type; nested constructors
+/// recurse; already-array values have their elements coerced.
+pub(crate) fn eval_typed_array_ctor(
+    q: &mut Q,
+    scopes: &[Scope],
+    elems: &[Expr],
+    elem: crate::storage::ArrayElem,
+) -> Result<Value, ExecError> {
+    let sty = elem_scalar_type(elem);
+    let mut vals: Vec<Value> = Vec::with_capacity(elems.len());
+    let mut multi = false;
+    for e in elems {
+        if let Expr::ArrayCtor { elems: inner, .. } = e {
+            multi = true;
+            vals.push(eval_typed_array_ctor(q, scopes, inner, elem)?);
+        } else {
+            let v = eval_expr(q, scopes, e)?;
+            if matches!(v, Value::Array(_)) {
+                multi = true;
+            }
+            vals.push(v);
+        }
+    }
+    if multi {
+        let mut fixed: Vec<Value> = Vec::with_capacity(vals.len());
+        for v in vals {
+            fixed.push(coerce_array_elems(&v, elem)?);
+        }
+        return array_ctor_from_vals(fixed, true, false);
+    }
+    let mut out: Vec<Value> = Vec::with_capacity(vals.len());
+    for v in vals {
+        out.push(match v {
+            Value::Null => Value::Null,
+            other => eval_cast(&other, sty)?,
+        });
+    }
+    Ok(Value::Array(Box::new(ArrayVal {
+        elem,
+        dims: if out.is_empty() {
+            Vec::new()
+        } else {
+            vec![out.len() as i32]
+        },
+        lower: if out.is_empty() { Vec::new() } else { vec![1] },
+        elems: out,
+    })))
+}
+
+/// v2.40: retype an array value's elements to `elem` (dims and
+/// lower bounds preserved), used by the typed-constructor path.
+pub(crate) fn coerce_array_elems(
+    v: &Value,
+    elem: crate::storage::ArrayElem,
+) -> Result<Value, ExecError> {
+    match v {
+        Value::Array(a) => {
+            let sty = elem_scalar_type(elem);
+            let mut out = (**a).clone();
+            out.elem = elem;
+            for e in out.elems.iter_mut() {
+                if !matches!(e, Value::Null) {
+                    *e = eval_cast(e, sty)?;
+                }
+            }
+            Ok(Value::Array(Box::new(out)))
+        }
+        Value::Null => Ok(Value::Null),
+        other => Err(exec_err(
+            "42804",
+            format!(
+                "cannot coerce {} to an array element type",
+                other.type_name()
+            ),
+        )),
     }
 }
 
@@ -329,7 +413,7 @@ pub(crate) fn eval_subscript_vals(base: &Value, indices: &[Value]) -> Result<Val
 /// v0.79: `a[l:u, ...]` — PG19 `array_get_slice` semantics. A NULL
 /// array yields NULL; slicing a non-array is 42804. More slice dims
 /// than array dims, or any empty dim range, yields PG's empty
-/// (0-dimensional) array. Absent (or NULL-valued) bounds default to
+/// (0-dimensional) array. Absent bounds default to
 /// the array's own bounds for that dimension; bounds clamp to the
 /// array's range; dims beyond the slice list keep their full range.
 /// The result's lower bounds are reset to 1 (PG19 array_get_slice:
@@ -339,6 +423,15 @@ pub(crate) fn eval_slice_vals(
     bounds: &[(Option<Value>, Option<Value>)],
 ) -> Result<Value, ExecError> {
     if matches!(base, Value::Null) {
+        return Ok(Value::Null);
+    }
+    // v2.40: PG19 array_subscript_fetch_slice — a NULL provided bound
+    // makes the whole slice NULL (the executor's SBSREF check), it does
+    // NOT default to the array bound. Only absent bounds default.
+    if bounds
+        .iter()
+        .any(|(l, u)| matches!(l, Some(Value::Null)) || matches!(u, Some(Value::Null)))
+    {
         return Ok(Value::Null);
     }
     let Value::Array(a) = base else {
@@ -429,19 +522,49 @@ pub(crate) fn eval_slice_vals(
 /// NULL element makes it NULL. Element types are unified through the
 /// common supertype first (so `int[] = bigint[]` works, like PG's
 /// operator resolution). Ordering operators have no PG array support.
+/// v2.40: PG19 array_cmp as a total order: elementwise over the
+/// flattened elements (NULL sorts greater than any non-NULL), then
+/// fewer total elements sorts first. Dimension shapes and lower
+/// bounds do not participate.
+pub(crate) fn array_ordering(a: &ArrayVal, b: &ArrayVal) -> Result<Ordering, ExecError> {
+    let cty = common_supertype(
+        "array comparison",
+        &elem_scalar_type(a.elem),
+        &elem_scalar_type(b.elem),
+    )?;
+    let n = a.elems.len().min(b.elems.len());
+    for i in 0..n {
+        let x = eval_cast(&a.elems[i], cty)?;
+        let y = eval_cast(&b.elems[i], cty)?;
+        let ord = match (&x, &y) {
+            (Value::Null, Value::Null) => Ordering::Equal,
+            (Value::Null, _) => Ordering::Greater,
+            (_, Value::Null) => Ordering::Less,
+            _ => crate::exec::funcs::compare_values(&x, &y, false, Some(false))?,
+        };
+        if ord != Ordering::Equal {
+            return Ok(ord);
+        }
+    }
+    Ok(a.elems.len().cmp(&b.elems.len()))
+}
+
 pub(crate) fn eval_array_cmp(op: CmpOp, a: &ArrayVal, b: &ArrayVal) -> Result<Value, ExecError> {
     if !matches!(op, CmpOp::Eq | CmpOp::Ne) {
-        return Err(exec_err(
-            "42883",
-            format!(
-                "operator does not exist: {} {} {}",
-                a.type_name(),
-                op.sql(),
-                b.type_name()
-            ),
-        ));
+        // v2.40: ordering comparisons via array_cmp (PG19).
+        let ord = array_ordering(a, b)?;
+        return Ok(Value::Bool(match op {
+            CmpOp::Lt => ord == Ordering::Less,
+            CmpOp::Le => ord != Ordering::Greater,
+            CmpOp::Gt => ord == Ordering::Greater,
+            CmpOp::Ge => ord != Ordering::Less,
+            _ => unreachable!(),
+        }));
     }
-    if a.ndim() != b.ndim() || a.dims != b.dims {
+    // PG19 array_eq: dimension sizes AND lower bounds must match,
+    // and elements compare with NULL = NULL (two-valued; the
+    // result is never NULL for non-NULL array operands).
+    if a.ndim() != b.ndim() || a.dims != b.dims || a.lower != b.lower {
         return Ok(Value::Bool(matches!(op, CmpOp::Ne)));
     }
     let cty = common_supertype(
@@ -449,27 +572,23 @@ pub(crate) fn eval_array_cmp(op: CmpOp, a: &ArrayVal, b: &ArrayVal) -> Result<Va
         &elem_scalar_type(a.elem),
         &elem_scalar_type(b.elem),
     )?;
-    let mut null_seen = false;
     for (x, y) in a.elems.iter().zip(b.elems.iter()) {
         let x = eval_cast(x, cty)?;
         let y = eval_cast(y, cty)?;
-        match eval_cmp_vals(CmpOp::Eq, &x, &y)? {
-            Value::Bool(false) => return Ok(Value::Bool(matches!(op, CmpOp::Ne))),
-            Value::Null => null_seen = true,
-            Value::Bool(true) => {}
-            other => {
-                return Err(exec_err(
-                    "XX000",
-                    format!(
-                        "internal error: array element comparison returned {}",
-                        other.type_name()
-                    ),
-                ));
-            }
+        let eq = match (&x, &y) {
+            (Value::Null, Value::Null) => true,
+            (Value::Null, _) | (_, Value::Null) => false,
+            _ => match eval_cmp_vals(CmpOp::Eq, &x, &y)? {
+                Value::Bool(b) => b,
+                // A NULL element comparison (e.g. NaN-free types do
+                // not produce this; treat as unequal like PG's
+                // "treat NULL as false").
+                _ => false,
+            },
+        };
+        if !eq {
+            return Ok(Value::Bool(matches!(op, CmpOp::Ne)));
         }
-    }
-    if null_seen {
-        return Ok(Value::Null);
     }
     Ok(Value::Bool(matches!(op, CmpOp::Eq)))
 }
@@ -533,19 +652,57 @@ pub(crate) fn array_cat_vals(x: &ArrayVal, y: &ArrayVal) -> Result<Value, ExecEr
             elems: cast_all(x)?,
         })));
     }
-    if x.ndim() != y.ndim() || x.dims[1..] != y.dims[1..] {
-        return Err(exec_err("2202E", "cannot concatenate incompatible arrays"));
+    // v2.40: PG19 array_cat combinations — equal ndims (inner dims
+    // AND inner lower bounds must match), or ndims differing by one,
+    // where the smaller array is a single sub-array element whose
+    // dims/lower must match the larger array's trailing dims/lower.
+    let incompatible = || exec_err("2202E", "cannot concatenate incompatible arrays");
+    if x.ndim() == y.ndim() {
+        if x.dims[1..] != y.dims[1..] || x.lower[1..] != y.lower[1..] {
+            return Err(incompatible());
+        }
+        let mut elems = cast_all(x)?;
+        elems.extend(cast_all(y)?);
+        let mut dims = x.dims.clone();
+        dims[0] += y.dims[0];
+        return Ok(Value::Array(Box::new(ArrayVal {
+            elem,
+            dims,
+            lower: x.lower.clone(),
+            elems,
+        })));
     }
-    let mut elems = cast_all(x)?;
-    elems.extend(cast_all(y)?);
-    let mut dims = x.dims.clone();
-    dims[0] += y.dims[0];
-    Ok(Value::Array(Box::new(ArrayVal {
-        elem,
-        dims,
-        lower: x.lower.clone(),
-        elems,
-    })))
+    if x.ndim() + 1 == y.ndim() {
+        if x.dims[..] != y.dims[1..] || x.lower[..] != y.lower[1..] {
+            return Err(incompatible());
+        }
+        let mut elems = cast_all(x)?;
+        elems.extend(cast_all(y)?);
+        let mut dims = y.dims.clone();
+        dims[0] += 1;
+        return Ok(Value::Array(Box::new(ArrayVal {
+            elem,
+            dims,
+            lower: y.lower.clone(),
+            elems,
+        })));
+    }
+    if y.ndim() + 1 == x.ndim() {
+        if y.dims[..] != x.dims[1..] || y.lower[..] != x.lower[1..] {
+            return Err(incompatible());
+        }
+        let mut elems = cast_all(x)?;
+        elems.extend(cast_all(y)?);
+        let mut dims = x.dims.clone();
+        dims[0] += 1;
+        return Ok(Value::Array(Box::new(ArrayVal {
+            elem,
+            dims,
+            lower: x.lower.clone(),
+            elems,
+        })));
+    }
+    Err(incompatible())
 }
 
 pub(crate) fn array_append_elem(x: &ArrayVal, scalar: &Value) -> Result<Value, ExecError> {
@@ -675,11 +832,994 @@ pub(crate) fn eval_array_func(name: &str, vals: &[Value]) -> Result<Value, ExecE
                 Value::text(s.as_str())
             }
         }),
+        // ---- v2.40: the PG19 array function remainder ----------------
+        "array_cat" => {
+            let x = match arr(0)? {
+                None => match arr(1)? {
+                    None => return Ok(Value::Null),
+                    Some(y) => return Ok(Value::Array(Box::new(y.clone()))),
+                },
+                Some(x) => x.clone(),
+            };
+            let y = match arr(1)? {
+                None => return Ok(Value::Array(Box::new(x))),
+                Some(y) => y.clone(),
+            };
+            array_cat_vals(&x, &y)
+        }
+        "array_append" => {
+            let a = match arr(0)? {
+                None => return Ok(Value::Null),
+                Some(a) => a.clone(),
+            };
+            array_append_elem(&a, &vals[1])
+        }
+        "array_prepend" => {
+            let a = match arr(1)? {
+                None => return Ok(Value::Null),
+                Some(a) => a.clone(),
+            };
+            array_prepend_elem(&a, &vals[0])
+        }
+        "array_fill" => eval_array_fill(vals),
+        "array_position" | "array_positions" => {
+            let single = name == "array_position";
+            let a = match arr(0)? {
+                None => return Ok(Value::Null),
+                Some(a) => a.clone(),
+            };
+            // PG19 array_userfuncs.c: searching a multidimensional
+            // array is refused outright (0A000).
+            if a.dims.len() > 1 {
+                return Err(exec_err(
+                    "0A000",
+                    "searching for elements in multidimensional arrays is not supported"
+                        .to_string(),
+                ));
+            }
+            let start = if vals.len() > 2 {
+                match int_arg(name, &vals[2])? {
+                    None => return Ok(Value::Null),
+                    Some(n) => Some(n),
+                }
+            } else {
+                None
+            };
+            let hits = array_positions_of(&a, &vals[1], start)?;
+            if single {
+                Ok(match hits.first() {
+                    None => Value::Null,
+                    Some(p) => Value::Int(*p),
+                })
+            } else {
+                Ok(Value::Array(Box::new(ArrayVal {
+                    elem: crate::storage::ArrayElem::Int,
+                    dims: if hits.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![hits.len() as i32]
+                    },
+                    lower: vec![1],
+                    elems: hits.into_iter().map(Value::Int).collect(),
+                })))
+            }
+        }
+        "array_remove" | "array_replace" => {
+            let a = match arr(0)? {
+                None => return Ok(Value::Null),
+                Some(a) => a.clone(),
+            };
+            // PG19 array_replace_internal: removal from a
+            // multi-dimensional array is 0A000 (the result might
+            // not be rectangular); replacement is elementwise over
+            // the flattened elements with dims preserved.
+            if name == "array_remove" && a.ndim() > 1 {
+                return Err(exec_err(
+                    "0A000",
+                    "removing elements from multidimensional arrays is not supported".to_string(),
+                ));
+            }
+            let mut elems = Vec::with_capacity(a.elems.len());
+            for e in &a.elems {
+                if elem_matches(e, &vals[1])? {
+                    if name == "array_replace" {
+                        elems.push(vals[2].clone());
+                    }
+                } else {
+                    elems.push(e.clone());
+                }
+            }
+            if name == "array_replace" {
+                return Ok(Value::Array(Box::new(ArrayVal { elems, ..a })));
+            }
+            // Removal shrinks the single dimension; removing every
+            // element yields the empty (0-dim) array.
+            if elems.is_empty() {
+                return Ok(Value::Array(Box::new(ArrayVal {
+                    elem: a.elem,
+                    dims: Vec::new(),
+                    lower: Vec::new(),
+                    elems,
+                })));
+            }
+            let mut out = a;
+            out.dims[0] = elems.len() as i32;
+            out.elems = elems;
+            Ok(Value::Array(Box::new(out)))
+        }
+        "array_reverse" => {
+            let a = match arr(0)? {
+                None => return Ok(Value::Null),
+                Some(a) => a.clone(),
+            };
+            Ok(Value::Array(Box::new(reverse_first_dim(&a))))
+        }
+        "array_shuffle" => {
+            let a = match arr(0)? {
+                None => return Ok(Value::Null),
+                Some(a) => a.clone(),
+            };
+            let mut chunks = first_dim_chunks(&a);
+            let mut rng = SimpleRng::new();
+            for i in (1..chunks.len()).rev() {
+                let j = (rng.next() % (i as u64 + 1)) as usize;
+                chunks.swap(i, j);
+            }
+            Ok(Value::Array(Box::new(join_first_dim(&a, chunks))))
+        }
+        "array_sample" => {
+            let a = match arr(0)? {
+                None => return Ok(Value::Null),
+                Some(a) => a.clone(),
+            };
+            let n = match int_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            if n < 0 {
+                return Err(exec_err(
+                    "22023",
+                    "sample size must not be negative".to_string(),
+                ));
+            }
+            let mut chunks = first_dim_chunks(&a);
+            if n as usize > chunks.len() {
+                return Err(exec_err(
+                    "22023",
+                    "sample size must not exceed the number of elements in the array's first dimension".to_string(),
+                ));
+            }
+            let mut rng = SimpleRng::new();
+            for i in (1..chunks.len()).rev() {
+                let j = (rng.next() % (i as u64 + 1)) as usize;
+                chunks.swap(i, j);
+            }
+            chunks.truncate(n as usize);
+            let mut out = join_first_dim(&a, chunks);
+            if n == 0 {
+                out.dims = Vec::new();
+                out.lower = Vec::new();
+                out.elems = Vec::new();
+            } else if !out.dims.is_empty() {
+                out.dims[0] = n as i32;
+                // PG19 array_sample passes keep_lb=false to
+                // array_shuffle_n: the sampled dimension's lower
+                // bound resets to 1 (array_shuffle keeps it).
+                out.lower[0] = 1;
+            }
+            Ok(Value::Array(Box::new(out)))
+        }
+        "trim_array" => {
+            let a = match arr(0)? {
+                None => return Ok(Value::Null),
+                Some(a) => a.clone(),
+            };
+            let n = match int_arg(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(n) => n,
+            };
+            // PG19 trim_array: n outside [0, first-dim length] is
+            // 2202E with a single message (arrayfuncs.c trim_array).
+            let len0 = if a.ndim() == 0 { 0 } else { a.dims[0] };
+            if n < 0 || n > len0 as i64 {
+                return Err(exec_err(
+                    "2202E",
+                    format!("number of elements to trim must be between 0 and {}", len0),
+                ));
+            }
+            if a.ndim() == 0 || n as usize >= a.dims[0] as usize {
+                return Ok(Value::Array(Box::new(ArrayVal {
+                    elem: a.elem,
+                    dims: Vec::new(),
+                    lower: Vec::new(),
+                    elems: Vec::new(),
+                })));
+            }
+            let keep = a.dims[0] as usize - n as usize;
+            let stride = a.elems.len() / a.dims[0] as usize;
+            let mut out = a.clone();
+            out.dims[0] = keep as i32;
+            // PG19 builds the result through array_get_slice, whose
+            // result lower bounds are all 1.
+            for l in out.lower.iter_mut() {
+                *l = 1;
+            }
+            out.elems.truncate(keep * stride);
+            Ok(Value::Array(Box::new(out)))
+        }
+        "array_sort" => {
+            let a = match arr(0)? {
+                None => return Ok(Value::Null),
+                Some(a) => a.clone(),
+            };
+            // PG19: element types with no comparison function (xid)
+            // are 42883, from lookup_type_cache in array_sort — but
+            // only when the first dimension has 2+ elements
+            // (array_sort_internal returns the array untouched
+            // before the lookup otherwise).
+            if a.elem == crate::storage::ArrayElem::Xid && a.dims.first().copied().unwrap_or(0) >= 2
+            {
+                return Err(exec_err(
+                    "42883",
+                    "could not identify a comparison function for type xid".to_string(),
+                ));
+            }
+            let descending = if vals.len() > 1 {
+                match &vals[1] {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Bool(b) => *b,
+                    other => return Err(func_arg_err(name, other)),
+                }
+            } else {
+                false
+            };
+            let nulls_first = if vals.len() > 2 {
+                match &vals[2] {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Bool(b) => *b,
+                    other => return Err(func_arg_err(name, other)),
+                }
+            } else {
+                descending
+            };
+            sort_first_dim(&a, descending, nulls_first)
+        }
+        "array_to_string" => {
+            let a = match arr(0)? {
+                None => return Ok(Value::Null),
+                Some(a) => a.clone(),
+            };
+            let delim = match str_arg_pub(name, &vals[1])? {
+                None => return Ok(Value::Null),
+                Some(d) => d,
+            };
+            let null_str: Option<String> = if vals.len() > 2 {
+                str_arg_pub(name, &vals[2])?
+            } else {
+                None
+            };
+            let mut parts: Vec<String> = Vec::new();
+            for e in &a.elems {
+                match e {
+                    Value::Null => {
+                        if let Some(ns) = &null_str {
+                            parts.push(ns.clone());
+                        }
+                    }
+                    v => parts.push(v.to_text().unwrap_or_default()),
+                }
+            }
+            Ok(Value::text(parts.join(&delim)))
+        }
         _ => Err(exec_err(
             "42883",
             format!("function {name}() does not exist"),
         )),
     }
+}
+
+/// v2.40: PG19's nulls-equal element match used by array_position /
+/// array_remove / array_replace: NULL matches NULL; otherwise the
+/// element type's `=` with three-valued logic collapsed to false.
+/// v2.40: PG19 array containment (@>, <@, &&) — arrayfuncs.c
+/// array_contain_compare: set-membership over the flattened
+/// elements (duplicates ignored); NULL elements never match
+/// (the element equality operator is strict there, unlike
+/// array_eq). An unknown-type text operand coerces to the other
+/// side's element type.
+pub(crate) fn eval_array_containment(
+    op: JsonOp,
+    left: &Value,
+    right: &Value,
+) -> Result<Value, ExecError> {
+    let as_arr = |v: &Value, other: &Value| -> Result<ArrayVal, ExecError> {
+        match v {
+            Value::Array(a) => Ok((**a).clone()),
+            Value::Text(t) => match other {
+                Value::Array(oa) => parse_array_literal(t, oa.elem)
+                    .map_err(|e| exec_err(&e.code, e.message.clone())),
+                _ => Err(exec_err(
+                    "42883",
+                    format!(
+                        "operator does not exist: {} {} {}",
+                        left.type_name(),
+                        op.sql(),
+                        right.type_name()
+                    ),
+                )),
+            },
+            _ => Err(exec_err(
+                "42883",
+                format!(
+                    "operator does not exist: {} {} {}",
+                    left.type_name(),
+                    op.sql(),
+                    right.type_name()
+                ),
+            )),
+        }
+    };
+    let a = as_arr(left, right)?;
+    let b = as_arr(right, left)?;
+    // PG19 array_contain_compare: the element equality operator is
+    // strict — a NULL element matches NOTHING (unlike array_eq).
+    let strict_match = |x: &Value, y: &Value| -> Result<bool, ExecError> {
+        if matches!(x, Value::Null) || matches!(y, Value::Null) {
+            return Ok(false);
+        }
+        elem_matches(x, y)
+    };
+    let contains = |x: &ArrayVal, y: &ArrayVal| -> Result<bool, ExecError> {
+        for e in &y.elems {
+            if matches!(e, Value::Null) {
+                return Ok(false);
+            }
+            let mut found = false;
+            for f in &x.elems {
+                if strict_match(e, f)? {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    Ok(Value::Bool(match op {
+        JsonOp::Contains => contains(&a, &b)?,
+        JsonOp::ContainedBy => contains(&b, &a)?,
+        JsonOp::Overlaps => {
+            let mut any = false;
+            'outer: for e in &a.elems {
+                for f in &b.elems {
+                    if strict_match(e, f)? {
+                        any = true;
+                        break 'outer;
+                    }
+                }
+            }
+            any
+        }
+        _ => unreachable!(),
+    }))
+}
+
+pub(crate) fn elem_matches(a: &Value, b: &Value) -> Result<bool, ExecError> {
+    match (a, b) {
+        (Value::Null, Value::Null) => Ok(true),
+        (Value::Null, _) | (_, Value::Null) => Ok(false),
+        _ => match eval_cmp_vals(CmpOp::Eq, a, b)? {
+            Value::Bool(x) => Ok(x),
+            _ => Ok(false),
+        },
+    }
+}
+
+/// v2.40: split an array into its first-dimension sub-arrays (each a
+/// flat chunk of `elems.len()/dims[0]` values).
+pub(crate) fn first_dim_chunks(a: &ArrayVal) -> Vec<Vec<Value>> {
+    if a.ndim() == 0 || a.dims[0] == 0 {
+        return Vec::new();
+    }
+    let stride = a.elems.len() / a.dims[0] as usize;
+    a.elems.chunks(stride.max(1)).map(|c| c.to_vec()).collect()
+}
+
+/// v2.40: rebuild an array from first-dimension chunks, keeping the
+/// source's inner dims and lower bounds (dims[0] = chunk count).
+pub(crate) fn join_first_dim(a: &ArrayVal, chunks: Vec<Vec<Value>>) -> ArrayVal {
+    let mut dims = a.dims.clone();
+    if !dims.is_empty() {
+        dims[0] = chunks.len() as i32;
+    }
+    ArrayVal {
+        elem: a.elem,
+        dims,
+        lower: a.lower.clone(),
+        elems: chunks.into_iter().flatten().collect(),
+    }
+}
+
+/// v2.40: reverse the first dimension (PG19 array_reverse).
+pub(crate) fn reverse_first_dim(a: &ArrayVal) -> ArrayVal {
+    let mut chunks = first_dim_chunks(a);
+    chunks.reverse();
+    join_first_dim(a, chunks)
+}
+
+/// v2.40: compare two first-dimension chunks for array_sort — scalars
+/// compare directly; sub-arrays compare lexicographically with
+/// PG's array_cmp rule (NULL elements sort after non-NULL, and a
+/// strict prefix is smaller). Returns None on an incomparable pair.
+pub(crate) fn cmp_chunks(a: &[Value], b: &[Value]) -> Result<std::cmp::Ordering, ExecError> {
+    use std::cmp::Ordering;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let ord = match (x, y) {
+            (Value::Null, Value::Null) => Ordering::Equal,
+            (Value::Null, _) => Ordering::Greater,
+            (_, Value::Null) => Ordering::Less,
+            _ => match eval_cmp_vals(CmpOp::Lt, x, y)? {
+                Value::Bool(true) => Ordering::Less,
+                Value::Bool(false) => match eval_cmp_vals(CmpOp::Gt, x, y)? {
+                    Value::Bool(true) => Ordering::Greater,
+                    Value::Bool(false) => Ordering::Equal,
+                    _ => Ordering::Equal,
+                },
+                _ => Ordering::Equal,
+            },
+        };
+        if ord != Ordering::Equal {
+            return Ok(ord);
+        }
+    }
+    Ok(a.len().cmp(&b.len()))
+}
+
+/// v2.40: PG19 array_sort — sort the first dimension (sub-arrays for
+/// ndim > 1), stable; NULL chunks are whole-NULL sub-arrays only in
+/// the 1-D case (a NULL element), placed per nulls_first.
+pub(crate) fn sort_first_dim(
+    a: &ArrayVal,
+    descending: bool,
+    nulls_first: bool,
+) -> Result<Value, ExecError> {
+    if a.ndim() == 0 || a.dims[0] < 2 {
+        return Ok(Value::Array(Box::new(a.clone())));
+    }
+    let mut chunks = first_dim_chunks(a);
+    // Sort with a comparator that can fail: capture the first error.
+    let mut err: Option<ExecError> = None;
+    chunks.sort_by(|x, y| {
+        if err.is_some() {
+            return std::cmp::Ordering::Equal;
+        }
+        // NULL placement is decided before value comparison (PG
+        // tuplesort datum semantics with explicit nulls_first).
+        let x_null = x.iter().all(|v| matches!(v, Value::Null)) && a.ndim() == 1;
+        let y_null = y.iter().all(|v| matches!(v, Value::Null)) && a.ndim() == 1;
+        let ord = match (x_null, y_null) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => {
+                return if nulls_first {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                };
+            }
+            (false, true) => {
+                return if nulls_first {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                };
+            }
+            (false, false) => match cmp_chunks(x, y) {
+                Ok(o) => o,
+                Err(e) => {
+                    err = Some(e);
+                    std::cmp::Ordering::Equal
+                }
+            },
+        };
+        if descending { ord.reverse() } else { ord }
+    });
+    if let Some(e) = err {
+        return Err(e);
+    }
+    Ok(Value::Array(Box::new(join_first_dim(a, chunks))))
+}
+
+/// v2.40: positions (first-dimension subscripts, lower-bound based)
+/// of `needle` in `a`, PG19 array_position/array_positions. The
+/// optional start subscript begins the search in the first
+/// dimension. Element comparison is nulls-equal.
+pub(crate) fn array_positions_of(
+    a: &ArrayVal,
+    needle: &Value,
+    start: Option<i64>,
+) -> Result<Vec<i64>, ExecError> {
+    if a.ndim() == 0 {
+        return Ok(Vec::new());
+    }
+    let chunks = first_dim_chunks(a);
+    let lb = a.lower[0] as i64;
+    let mut out = Vec::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let subscript = lb + i as i64;
+        if let Some(s) = start {
+            if subscript < s {
+                continue;
+            }
+        }
+        // 1-D: compare the element; n-D: compare the sub-array
+        // element-wise (nulls-equal).
+        let hit = if chunk.len() == 1 {
+            elem_matches(&chunk[0], needle)?
+        } else {
+            match needle {
+                Value::Array(n) => {
+                    n.elems.len() == chunk.len()
+                        && chunk
+                            .iter()
+                            .zip(n.elems.iter())
+                            .map(|(x, y)| elem_matches(x, y))
+                            .collect::<Result<Vec<_>, _>>()?
+                            .into_iter()
+                            .all(|m| m)
+                }
+                _ => false,
+            }
+        };
+        if hit {
+            out.push(subscript);
+        }
+    }
+    Ok(out)
+}
+
+/// v2.40: PG19 array_fill(value, dims [, lower_bounds]) — build an
+/// array filled with `value`. dims/lbs are int arrays; a NULL dims
+/// array yields NULL; negative dims are 2202E; more than 6 dims is
+/// 54000; a zero dim yields the empty array.
+pub(crate) fn eval_array_fill(vals: &[Value]) -> Result<Value, ExecError> {
+    // PG19 array_fill: a NULL dims or lbs argument is an error
+    // (22004), as is a NULL element inside either; the dims array
+    // must be one-dimensional (2202E otherwise). Unknown-type text
+    // literals coerce to int[] first.
+    let dims_arr = match &vals[1] {
+        Value::Null => {
+            return Err(exec_err(
+                "22004",
+                "dimension array or low bound array cannot be null".to_string(),
+            ));
+        }
+        Value::Array(a) => a.clone(),
+        Value::Text(t) => Box::new(
+            parse_array_literal(t, crate::storage::ArrayElem::Int)
+                .map_err(|e| exec_err(&e.code, e.message.clone()))?,
+        ),
+        other => return Err(func_arg_err("array_fill", other)),
+    };
+    if dims_arr.dims.len() > 1 {
+        return Err(exec_err(
+            "2202E",
+            "wrong number of array subscripts".to_string(),
+        ));
+    }
+    let mut dims: Vec<i32> = Vec::new();
+    for e in &dims_arr.elems {
+        match e {
+            Value::Null => {
+                return Err(exec_err(
+                    "22004",
+                    "dimension values cannot be null".to_string(),
+                ));
+            }
+            Value::SmallInt(i) => {
+                if *i < 0 {
+                    return Err(exec_err(
+                        "2202E",
+                        "dimension values cannot be negative".to_string(),
+                    ));
+                }
+                dims.push(*i as i32)
+            }
+            Value::Int(i) | Value::BigInt(i) => {
+                if *i < 0 {
+                    return Err(exec_err(
+                        "2202E",
+                        "dimension values cannot be negative".to_string(),
+                    ));
+                }
+                if *i > i32::MAX as i64 {
+                    return Err(exec_err(
+                        "54000",
+                        "array size exceeds the maximum allowed (1073741824)".to_string(),
+                    ));
+                }
+                dims.push(*i as i32);
+            }
+            other => return Err(func_arg_err("array_fill", other)),
+        }
+    }
+    if dims.len() > 6 {
+        return Err(exec_err(
+            "54000",
+            "number of array dimensions exceeds the maximum allowed (6)".to_string(),
+        ));
+    }
+    let mut lower = vec![1i32; dims.len()];
+    if vals.len() > 2 {
+        match &vals[2] {
+            Value::Null => {
+                return Err(exec_err(
+                    "22004",
+                    "dimension array or low bound array cannot be null".to_string(),
+                ));
+            }
+            Value::Text(t) => {
+                let lbs = parse_array_literal(t, crate::storage::ArrayElem::Int)
+                    .map_err(|e| exec_err(&e.code, e.message.clone()))?;
+                let lbs = &lbs;
+                if lbs.elems.len() != dims.len() {
+                    return Err(exec_err(
+                        "2202E",
+                        "lower bound array must have the same number of elements as the dimensions array".to_string(),
+                    ));
+                }
+                for (i, e) in lbs.elems.iter().enumerate() {
+                    match e {
+                        Value::Null => {
+                            return Err(exec_err(
+                                "22004",
+                                "dimension values cannot be null".to_string(),
+                            ));
+                        }
+                        Value::SmallInt(x) => lower[i] = *x as i32,
+                        Value::Int(x) | Value::BigInt(x) => lower[i] = *x as i32,
+                        other => return Err(func_arg_err("array_fill", other)),
+                    }
+                }
+            }
+            Value::Array(lbs) => {
+                if lbs.elems.len() != dims.len() {
+                    return Err(exec_err(
+                        "2202E",
+                        "lower bound array must have the same number of elements as the dimensions array".to_string(),
+                    ));
+                }
+                for (i, e) in lbs.elems.iter().enumerate() {
+                    match e {
+                        Value::Null => {
+                            return Err(exec_err(
+                                "22004",
+                                "dimension values cannot be null".to_string(),
+                            ));
+                        }
+                        Value::SmallInt(x) => lower[i] = *x as i32,
+                        Value::Int(x) | Value::BigInt(x) => lower[i] = *x as i32,
+                        other => return Err(func_arg_err("array_fill", other)),
+                    }
+                }
+            }
+            other => return Err(func_arg_err("array_fill", other)),
+        }
+    }
+    // Total size guard (PG MaxArraySize is on bytes; use the element
+    // count ceiling PG applies via ArrayGetNItems overflow checks).
+    let total: i64 = dims.iter().map(|d| *d as i64).product();
+    if total > 1_073_741_823 {
+        return Err(exec_err(
+            "54000",
+            "array size exceeds the maximum allowed (1073741824)".to_string(),
+        ));
+    }
+    // PG19: an empty dims array (or any zero dimension) yields the
+    // empty array — no elements at all.
+    if dims.is_empty() || dims.iter().any(|d| *d == 0) {
+        return Ok(Value::Array(Box::new(ArrayVal {
+            elem: value_array_elem(&vals[0]),
+            dims: Vec::new(),
+            lower: Vec::new(),
+            elems: Vec::new(),
+        })));
+    }
+    let elem = value_array_elem(&vals[0]);
+    Ok(Value::Array(Box::new(ArrayVal {
+        elem,
+        dims,
+        lower,
+        elems: vec![vals[0].clone(); total as usize],
+    })))
+}
+
+/// v2.40: the ArrayElem for a scalar fill/sample value (PG resolves
+/// array_fill's anyelement statically; a runtime NULL defaults to
+/// int, matching `array_fill(null::integer, ...)`).
+pub(crate) fn value_array_elem(v: &Value) -> crate::storage::ArrayElem {
+    match v {
+        Value::Bool(_) => crate::storage::ArrayElem::Bool,
+        Value::SmallInt(_) => crate::storage::ArrayElem::SmallInt,
+        Value::BigInt(_) => crate::storage::ArrayElem::BigInt,
+        Value::Float4(_) => crate::storage::ArrayElem::Float4,
+        Value::Float(_) => crate::storage::ArrayElem::Float,
+        Value::Numeric(_) => crate::storage::ArrayElem::Numeric,
+        Value::Text(_) | Value::BpChar(_) => crate::storage::ArrayElem::Text,
+        Value::Date(_) => crate::storage::ArrayElem::Date,
+        Value::Timestamp(_) => crate::storage::ArrayElem::Timestamp,
+        Value::Timestamptz(_) => crate::storage::ArrayElem::Timestamptz,
+        Value::Time(_) => crate::storage::ArrayElem::Time,
+        Value::TimeTz(..) => crate::storage::ArrayElem::TimeTz,
+        Value::Interval(_) => crate::storage::ArrayElem::Interval,
+        Value::Bytea(_) => crate::storage::ArrayElem::Bytea,
+        Value::Uuid(_) => crate::storage::ArrayElem::Uuid,
+        _ => crate::storage::ArrayElem::Int,
+    }
+}
+
+/// v2.40: guess an array literal's element type from its first
+/// non-NULL element text (for ANY/ALL coercion when the left
+/// operand is an untyped NULL): integer-looking -> int, float-
+/// looking -> float8, anything else -> text.
+pub(crate) fn sniff_array_elem(s: &str) -> crate::storage::ArrayElem {
+    let inner = s.trim().trim_start_matches('{').trim();
+    let first = inner
+        .split([',', '}'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches('"');
+    if first.eq_ignore_ascii_case("null") || first.is_empty() {
+        return crate::storage::ArrayElem::Text;
+    }
+    if first.parse::<i64>().is_ok() {
+        return crate::storage::ArrayElem::Int;
+    }
+    if first.parse::<f64>().is_ok() {
+        return crate::storage::ArrayElem::Float;
+    }
+    crate::storage::ArrayElem::Text
+}
+
+/// v2.40: tiny xorshift PRNG for array_shuffle/array_sample (PG uses
+/// the global random() sequence; exact values are not observable in
+/// conformance, only the multiset/length properties are).
+pub(crate) struct SimpleRng(u64);
+
+impl SimpleRng {
+    pub(crate) fn new() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E3779B97F4A7C15);
+        SimpleRng(nanos ^ (std::process::id() as u64).wrapping_mul(0x2545F4914F6CDD1D) | 1)
+    }
+    pub(crate) fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+}
+
+/// v2.40: text argument helper shared with funcs.rs callers.
+pub(crate) fn str_arg_pub(name: &str, v: &Value) -> Result<Option<String>, ExecError> {
+    match v {
+        Value::Null => Ok(None),
+        Value::Text(s) | Value::BpChar(s) => Ok(Some(s.to_string())),
+        other => Err(func_arg_err(name, other)),
+    }
+}
+
+/// v2.40: PG19 `array_set_slice` (arrayfuncs.c) — assign the array
+/// `src` into the slice of `base` selected by `bounds` (one
+/// (lower, upper) pair per subscript; either side may be absent).
+/// `elem` is the target column's element type, used when `base` is
+/// NULL (PG substitutes an empty array of the column type) and to
+/// coerce a text-literal source. NULL-bound detection (22004) is
+/// the caller's job: bounds arriving here are value-or-absent.
+///
+/// Semantics (from the PG19 source): a NULL source is a no-op. An
+/// empty/NULL base requires fully-specified bounds (2202E "array
+/// slice subscript must provide both boundaries"), takes its dims
+/// from the slice spans, and reads the source serially ("source
+/// array too small", 2202E, when short; extras ignored). A non-empty
+/// base fills missing bounds from its own range, rejects extra
+/// subscripts (2202E "wrong number of array subscripts") and
+/// lower > upper (2202E); one-dimensional arrays extend with NULL
+/// padding, multi-dimensional arrays reject out-of-range slices
+/// (2202E "array subscript out of range").
+pub(crate) fn eval_array_slice_assign(
+    base: &Value,
+    bounds: &[(Option<i64>, Option<i64>)],
+    src: &Value,
+    elem: crate::storage::ArrayElem,
+) -> Result<Value, ExecError> {
+    if matches!(src, Value::Null) {
+        return Ok(base.clone());
+    }
+    let src_arr: ArrayVal = match src {
+        Value::Array(a) => (**a).clone(),
+        Value::Text(s) | Value::BpChar(s) => parse_array_literal(s, elem)?,
+        other => {
+            return Err(exec_err(
+                "42804",
+                format!(
+                    "slice assignment requires an array value, not {}",
+                    other.type_name()
+                ),
+            ));
+        }
+    };
+    // Coerce source elements to the target element type (PG's
+    // assignment coercion of the source array).
+    let cty = elem_scalar_type(elem);
+    let src_elems: Vec<Value> = src_arr
+        .elems
+        .iter()
+        .map(|v| eval_cast(v, cty))
+        .collect::<Result<_, _>>()?;
+    let base_arr: ArrayVal = match base {
+        Value::Null => ArrayVal {
+            elem,
+            dims: Vec::new(),
+            lower: Vec::new(),
+            elems: Vec::new(),
+        },
+        Value::Array(a) => (**a).clone(),
+        other => {
+            return Err(exec_err(
+                "42804",
+                format!("cannot subscript type {}", other.type_name()),
+            ));
+        }
+    };
+    let too_small = || exec_err("2202E", "source array too small".to_string());
+    if base_arr.ndim() == 0 {
+        // Empty base: bounds fully specified, dims from spans.
+        let mut dims: Vec<i32> = Vec::with_capacity(bounds.len());
+        let mut lower: Vec<i32> = Vec::with_capacity(bounds.len());
+        let mut total: i64 = 1;
+        for (lo, hi) in bounds {
+            let (Some(lo), Some(hi)) = (lo, hi) else {
+                return Err(exec_err(
+                    "2202E",
+                    "array slice subscript must provide both boundaries".to_string(),
+                ));
+            };
+            if hi < lo {
+                return Err(exec_err(
+                    "2202E",
+                    "upper bound cannot be less than lower bound".to_string(),
+                ));
+            }
+            let span = hi - lo + 1;
+            if span > i32::MAX as i64 {
+                return Err(exec_err(
+                    "54000",
+                    "array size exceeds the maximum allowed (1073741824)".to_string(),
+                ));
+            }
+            total = total.saturating_mul(span);
+            dims.push(span as i32);
+            lower.push(*lo as i32);
+        }
+        if total > src_elems.len() as i64 {
+            return Err(too_small());
+        }
+        if total > 1_073_741_823 {
+            return Err(exec_err(
+                "54000",
+                "array size exceeds the maximum allowed (1073741824)".to_string(),
+            ));
+        }
+        return Ok(Value::Array(Box::new(ArrayVal {
+            elem,
+            dims,
+            lower,
+            elems: src_elems.into_iter().take(total as usize).collect(),
+        })));
+    }
+    let ndim = base_arr.ndim();
+    if bounds.len() > ndim {
+        return Err(exec_err(
+            "2202E",
+            "wrong number of array subscripts".to_string(),
+        ));
+    }
+    // Effective (lo, hi) per dimension.
+    let mut eff: Vec<(i64, i64)> = Vec::with_capacity(ndim);
+    for d in 0..ndim {
+        let arr_lo = base_arr.lower[d] as i64;
+        let arr_hi = arr_lo + base_arr.dims[d] as i64 - 1;
+        let (lo, hi) = if d < bounds.len() {
+            let (l, u) = bounds[d];
+            (l.unwrap_or(arr_lo), u.unwrap_or(arr_hi))
+        } else {
+            (arr_lo, arr_hi)
+        };
+        if lo > hi {
+            return Err(exec_err(
+                "2202E",
+                "upper bound cannot be less than lower bound".to_string(),
+            ));
+        }
+        if ndim > 1 && (lo < arr_lo || hi > arr_hi) {
+            return Err(exec_err(
+                "2202E",
+                "array subscript out of range".to_string(),
+            ));
+        }
+        eff.push((lo, hi));
+    }
+    let span_total: i64 = eff.iter().map(|(lo, hi)| hi - lo + 1).product();
+    if span_total > src_elems.len() as i64 {
+        return Err(too_small());
+    }
+    if ndim == 1 {
+        // One-dimensional: extension with NULL padding.
+        let (lo, hi) = eff[0];
+        let arr_lo = base_arr.lower[0] as i64;
+        let arr_hi = arr_lo + base_arr.dims[0] as i64 - 1;
+        let new_lo = arr_lo.min(lo);
+        let new_hi = arr_hi.max(hi);
+        let new_len = new_hi - new_lo + 1;
+        if new_len > 1_073_741_823 {
+            return Err(exec_err(
+                "54000",
+                "array size exceeds the maximum allowed (1073741824)".to_string(),
+            ));
+        }
+        let mut elems = vec![Value::Null; new_len as usize];
+        for (i, v) in base_arr.elems.iter().enumerate() {
+            elems[(arr_lo + i as i64 - new_lo) as usize] = v.clone();
+        }
+        for (i, v) in src_elems.iter().take((hi - lo + 1) as usize).enumerate() {
+            elems[(lo + i as i64 - new_lo) as usize] = v.clone();
+        }
+        return Ok(Value::Array(Box::new(ArrayVal {
+            elem,
+            dims: vec![new_len as i32],
+            lower: vec![new_lo as i32],
+            elems,
+        })));
+    }
+    // Multi-dimensional: replace the region's cells row-major.
+    let mut strides = vec![0usize; ndim];
+    let mut s = 1usize;
+    for d in (0..ndim).rev() {
+        strides[d] = s;
+        s *= base_arr.dims[d] as usize;
+    }
+    let mut elems = base_arr.elems.clone();
+    let mut src_iter = src_elems.iter();
+    // Odometer over the region, innermost dim fastest.
+    let mut pos = vec![0i64; ndim];
+    let total_cells: i64 = span_total;
+    for _ in 0..total_cells {
+        let mut off = 0usize;
+        for d in 0..ndim {
+            off += (eff[d].0 + pos[d] - base_arr.lower[d] as i64) as usize * strides[d];
+        }
+        elems[off] = src_iter.next().cloned().unwrap_or(Value::Null);
+        for d in (0..ndim).rev() {
+            pos[d] += 1;
+            if pos[d] < eff[d].1 - eff[d].0 + 1 {
+                break;
+            }
+            pos[d] = 0;
+        }
+    }
+    Ok(Value::Array(Box::new(ArrayVal {
+        elem,
+        dims: base_arr.dims.clone(),
+        lower: base_arr.lower.clone(),
+        elems,
+    })))
 }
 
 /// v0.79: `unnest(anyarray)` element rows — one output row per element
@@ -765,7 +1905,7 @@ pub(crate) fn parse_array_literal(
         }
         // Parse one element (quoted or unquoted) at the current depth;
         // returns None for a nested `{...}` (handled by the caller).
-        fn element(&mut self) -> Result<(String, bool), ExecError> {
+        fn element(&mut self) -> Result<(String, bool, bool), ExecError> {
             self.ws();
             if self.pos < self.chars.len() && self.chars[self.pos] == b'"' {
                 self.pos += 1;
@@ -790,16 +1930,44 @@ pub(crate) fn parse_array_literal(
                         self.pos += 1;
                     }
                 }
-                Ok((out, true))
+                Ok((out, true, false))
             } else {
-                let start = self.pos;
-                while self.pos < self.chars.len()
-                    && !matches!(self.chars[self.pos], b',' | b'}' | b'{')
-                {
-                    self.pos += 1;
+                // v2.40: PG19 ReadArrayToken's unquoted-element rules:
+                // a `"` inside an unquoted element is malformed
+                // ("Incorrectly quoted array element"), and `\`
+                // escapes the next character literally.
+                let mut out = String::new();
+                let mut dstlen = 0usize; // bytes known non-trailing-ws
+                let mut escaped = false;
+                while self.pos < self.chars.len() {
+                    let c = self.chars[self.pos];
+                    match c {
+                        b',' | b'}' => break,
+                        b'{' | b'"' => return Err(self.malformed()),
+                        b'\\' => {
+                            escaped = true;
+                            self.pos += 1;
+                            if self.pos >= self.chars.len() {
+                                return Err(self.malformed());
+                            }
+                            out.push(self.chars[self.pos] as char);
+                            self.pos += 1;
+                            dstlen = out.len();
+                        }
+                        _ => {
+                            out.push(c as char);
+                            self.pos += 1;
+                            if !c.is_ascii_whitespace() {
+                                dstlen = out.len();
+                            }
+                        }
+                    }
                 }
-                let raw = &self.src[start..self.pos];
-                Ok((raw.trim().to_string(), false))
+                out.truncate(dstlen);
+                // Leading whitespace was consumed by self.ws(); PG
+                // also strips it (tokens are trimmed both sides).
+                let trimmed = out.trim_start().to_string();
+                Ok((trimmed, false, escaped))
             }
         }
     }
@@ -826,29 +1994,45 @@ pub(crate) fn parse_array_literal(
     fn parse_level(p: &mut P) -> Result<Vec<Node>, ExecError> {
         // Caller consumed '{'.
         let mut items: Vec<Node> = Vec::new();
+        // v2.40: PG19 ReadArrayStr token-sequence discipline — an
+        // element (or nested level) is required after '{' (unless the
+        // level is empty) and after every ','. `{1,}`, `{,1}` and
+        // `{1,,2}` are malformed, not empty-string elements.
+        let mut after_comma = false;
         loop {
             p.ws();
             if p.pos >= p.chars.len() {
                 return Err(p.malformed());
             }
             if p.chars[p.pos] == b'}' {
+                if after_comma {
+                    return Err(p.malformed());
+                }
                 p.pos += 1;
                 return Ok(items);
+            }
+            if p.chars[p.pos] == b',' {
+                return Err(p.malformed());
             }
             if p.chars[p.pos] == b'{' {
                 p.pos += 1;
                 let inner = parse_level(p)?;
                 items.push(Node::Arr(inner));
             } else {
-                let (t, quoted) = p.element()?;
+                let (t, quoted, escaped) = p.element()?;
                 // Quoted "NULL" stays a string; unquoted NULL (any
-                // case) is SQL NULL.
-                let is_null = !quoted && t.eq_ignore_ascii_case("null");
+                // case) is SQL NULL — but only when the raw token
+                // was exactly NULL: an escaped spelling like
+                // `n\ull` is the string "null" (PG19 compares the
+                // raw token in ReadArrayStr).
+                let is_null = !quoted && !escaped && t.eq_ignore_ascii_case("null");
                 items.push(Node::Elem(t, is_null));
             }
+            after_comma = false;
             p.ws();
             if p.pos < p.chars.len() && p.chars[p.pos] == b',' {
                 p.pos += 1;
+                after_comma = true;
                 continue;
             }
             p.ws();
@@ -872,6 +2056,13 @@ pub(crate) fn parse_array_literal(
     let psrc: &str = p.src;
     p.ws();
     while p.pos < p.chars.len() && p.chars[p.pos] == b'[' {
+        // v2.40: PG19 ReadArrayDimensions — MAXDIM is 6.
+        if dim_decls.len() >= 6 {
+            return Err(exec_err(
+                "54000",
+                "number of array dimensions exceeds the maximum allowed (6)".to_string(),
+            ));
+        }
         p.pos += 1; // consume '['
         p.ws();
         let lb_start = p.pos;
@@ -881,28 +2072,43 @@ pub(crate) fn parse_array_literal(
         while p.pos < p.chars.len() && p.chars[p.pos].is_ascii_digit() {
             p.pos += 1;
         }
-        let lb: i32 = psrc[lb_start..p.pos].parse().map_err(|_| p.malformed())?;
+        let first: i32 = psrc[lb_start..p.pos].parse().map_err(|_| p.malformed())?;
         p.ws();
-        if p.pos >= p.chars.len() || p.chars[p.pos] != b':' {
-            return Err(p.malformed());
-        }
-        p.pos += 1;
-        p.ws();
-        let ub_start = p.pos;
-        if p.pos < p.chars.len() && p.chars[p.pos] == b'-' {
+        // v2.40: PG accepts both `[m:n]` and the bare `[n]` form
+        // (lBound = 1, ub = n).
+        let (lb, ub) = if p.pos < p.chars.len() && p.chars[p.pos] == b':' {
             p.pos += 1;
-        }
-        while p.pos < p.chars.len() && p.chars[p.pos].is_ascii_digit() {
-            p.pos += 1;
-        }
-        let ub: i32 = psrc[ub_start..p.pos].parse().map_err(|_| p.malformed())?;
+            p.ws();
+            let ub_start = p.pos;
+            if p.pos < p.chars.len() && p.chars[p.pos] == b'-' {
+                p.pos += 1;
+            }
+            while p.pos < p.chars.len() && p.chars[p.pos].is_ascii_digit() {
+                p.pos += 1;
+            }
+            let ub: i32 = psrc[ub_start..p.pos].parse().map_err(|_| p.malformed())?;
+            (first, ub)
+        } else {
+            (1, first)
+        };
         p.ws();
         if p.pos >= p.chars.len() || p.chars[p.pos] != b']' {
             return Err(p.malformed());
         }
         p.pos += 1;
         if ub < lb {
-            return Err(p.malformed());
+            return Err(exec_err(
+                "2202E",
+                "upper bound cannot be less than lower bound".to_string(),
+            ));
+        }
+        // PG19: an upper bound of INT_MAX is disallowed outright
+        // (ArrayCheckBounds would overflow on lb + dim).
+        if ub == i32::MAX {
+            return Err(exec_err(
+                "54000",
+                format!("array upper bound is too large: {ub}"),
+            ));
         }
         dim_decls.push((lb, ub));
     }
@@ -1008,8 +2214,8 @@ pub(crate) fn parse_array_literal(
             ));
         }
         for (i, (_lb, ub)) in dim_decls.iter().enumerate() {
-            let declared = ub - dim_decls[i].0 + 1;
-            if declared != dims[i] {
+            let declared = *ub as i64 - dim_decls[i].0 as i64 + 1;
+            if declared != dims[i] as i64 {
                 return Err(exec_err(
                     "22P02",
                     format!("malformed array literal: {:?}", s),
@@ -1709,6 +2915,14 @@ pub(crate) fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, 
         Expr::Cast { expr, to, .. } => {
             if let Some(v) = cast_empty_array_ctor(expr, to) {
                 return Ok(v);
+            }
+            // v2.40: `ARRAY[...]::elem[]` — PG19 transformArrayExpr
+            // with a target type coerces each element HARD to the
+            // element type (ARRAY[1, 'NaN']::float8[] works even
+            // though the untyped constructor cannot pick a common
+            // element type).
+            if let (Expr::ArrayCtor { elems, .. }, ColType::Array(elem)) = (&**expr, to) {
+                return eval_typed_array_ctor(q, scopes, elems, *elem);
             }
             let v = eval_expr(q, scopes, expr)?;
             // v0.37: regclass cast needs catalog lookup (OID -> name).
@@ -4040,9 +5254,60 @@ pub(crate) fn eval_any_all_array(
     if op_txt == "@@" {
         return eval_any_all_ts(left, &vals[3], is_all);
     }
+    // v2.40: LIKE/ILIKE quantified forms share this builtin with
+    // op texts "~~" / "!~~" / "~~*" / "!~~*" (per-element pattern
+    // match, negated per element for the NOT forms, PG19
+    // ScalarArrayOp over the ~~ family).
+    if matches!(op_txt, "~~" | "!~~" | "~~*" | "!~~*") {
+        let arr = match &vals[3] {
+            Value::Null => return Ok(Value::Null),
+            Value::Array(a) => (**a).clone(),
+            Value::Text(s) => parse_array_literal(s, crate::storage::ArrayElem::Text)?,
+            other => {
+                return Err(exec_err(
+                    "42821",
+                    format!(
+                        "op ANY/ALL (array) requires array on right side, not {}",
+                        other.type_name()
+                    ),
+                ));
+            }
+        };
+        let ilike = op_txt.ends_with('*');
+        let neg = op_txt.starts_with('!');
+        let mut saw_null = false;
+        for elem in &arr.elems {
+            let m = eval_like(left, elem, None, neg, ilike)?;
+            match m {
+                Value::Bool(true) if !is_all => return Ok(Value::Bool(true)),
+                Value::Bool(false) if is_all => return Ok(Value::Bool(false)),
+                Value::Null => saw_null = true,
+                _ => {}
+            }
+        }
+        if saw_null {
+            return Ok(Value::Null);
+        }
+        return Ok(Value::Bool(is_all));
+    }
+    // v2.40: an unknown (text) literal on the right side coerces to
+    // an array of the left operand's element type (PG19
+    // ScalarArrayOp type resolution) — `33 = ANY('{1,2,3}')` is
+    // int = ANY(int[]), not 42821. A NULL left operand carries no
+    // type; sniff the literal's first element (int, else float,
+    // else text).
+    let coerced;
     let arr = match &vals[3] {
         Value::Null => return Ok(Value::Null),
         Value::Array(a) => a,
+        Value::Text(s) => {
+            let elem = match left {
+                Value::Null => sniff_array_elem(s),
+                v => value_array_elem(v),
+            };
+            coerced = parse_array_literal(s, elem)?;
+            &coerced
+        }
         other => {
             return Err(exec_err(
                 "42821",
@@ -4557,6 +5822,8 @@ pub(crate) fn cmp_ordering(a: &Value, b: &Value, op: CmpOp) -> Result<Option<Ord
         // NULL and all others equal; ordering treats NULL as larger
         // (PG's default NULLS LAST for ASC). Field counts must match.
         (Value::Record(fa), Value::Record(fb)) => cmp_records(fa, fb, op),
+        // v2.40: array ordering for min/max and friends (array_cmp).
+        (Value::Array(x), Value::Array(y)) => Ok(Some(array_ordering(x, y)?)),
         _ => Err(exec_err(
             "42883",
             format!(
@@ -4810,10 +6077,22 @@ pub(crate) fn eval_cmp_vals(op: CmpOp, a: &Value, b: &Value) -> Result<Value, Ex
         _ => {}
     }
     // v0.79: array comparisons — `=`/`<>` are PG19 `array_eq`
-    // (three-valued element-wise); anything else has no PG array
-    // operator (42883); array-vs-NULL is NULL.
+    // (three-valued element-wise); v2.40 adds the array_cmp
+    // ordering operators; array-vs-NULL is NULL. An unknown-type
+    // text literal on the other side coerces to the array's
+    // element type (PG19 parse-time resolution).
     match (a, b) {
         (Value::Array(x), Value::Array(y)) => return eval_array_cmp(op, x, y),
+        (Value::Array(x), Value::Text(t)) => {
+            let y =
+                parse_array_literal(t, x.elem).map_err(|e| exec_err(&e.code, e.message.clone()))?;
+            return eval_array_cmp(op, x, &y);
+        }
+        (Value::Text(t), Value::Array(y)) => {
+            let x =
+                parse_array_literal(t, y.elem).map_err(|e| exec_err(&e.code, e.message.clone()))?;
+            return eval_array_cmp(op, &x, y);
+        }
         (Value::Array(_), Value::Null) | (Value::Null, Value::Array(_)) => return Ok(Value::Null),
         (Value::Array(_), _other) | (_other, Value::Array(_)) => {
             return Err(exec_err(

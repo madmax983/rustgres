@@ -149,7 +149,12 @@ def main():
         ec, em = errinfo(c.q("insert into inserttest (nope[1]) values (1)"))
         check("unknown col 42703", ec == "42703", f"{ec} {em}")
         ec, em = errinfo(c.q("insert into inserttest (f2[1:2]) values (1)"))
-        check("slice 0A000", ec == "0A000", f"{ec} {em}")
+        # v2.40: slice-form INSERT targets are supported (PG19
+        # array_set_slice), so this no longer stops at 0A000; the
+        # scalar value fails the column-type check with 42804, as in
+        # PG ("column is of type integer[] but expression is of type
+        # integer").
+        check("slice target type mismatch 42804", ec == "42804", f"{ec} {em}")
         ec, em = errinfo(c.q("insert into inserttest (f1[1]) values (1)"))
         check("subscript non-array 42804", ec == "42804", f"{ec} {em}")
         ec, em = errinfo(c.q("insert into inserttest (f3.nope) values (1)"))

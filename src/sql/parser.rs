@@ -43,6 +43,99 @@ fn parse_buffer_usage_str(s: &str) -> Option<i64> {
     num.parse::<i64>().ok().map(|n| n * mult)
 }
 
+/// v2.40: one bracket of a subscripted assignment target
+/// (`SET col[...] = ...` / upsert SET): a plain index or a slice
+/// with optional bounds.
+pub(crate) enum TargetBound {
+    Index(Expr),
+    Slice(Option<Expr>, Option<Expr>),
+}
+
+/// v2.40: build the assignment expression for a subscripted SET
+/// target from its bracket chain and RHS value. Any slice in the
+/// chain makes the whole target a slice assignment (a plain index
+/// acts as [i:i]); otherwise the v2.38 element-assignment desugar.
+pub(crate) fn subscript_assign_expr(col: &str, chain: Vec<TargetBound>, value: Expr) -> Expr {
+    let base = Expr::Column {
+        table: None,
+        name: col.to_string(),
+    };
+    let is_slice = chain.iter().any(|b| matches!(b, TargetBound::Slice(..)));
+    if is_slice {
+        let mut lowers = Vec::new();
+        let mut uppers = Vec::new();
+        let mut flags = Vec::new();
+        for b in chain {
+            let (lo, hi) = match b {
+                TargetBound::Index(e) => (Some(e.clone()), Some(e)),
+                TargetBound::Slice(l, u) => (l, u),
+            };
+            for (bound, out) in [(lo, &mut lowers), (hi, &mut uppers)] {
+                match bound {
+                    Some(e) => {
+                        flags.push(Expr::Literal(Literal::Int(1)));
+                        out.push(Expr::Cast {
+                            expr: Box::new(e),
+                            to: ColType::Int,
+                            written: None,
+                        });
+                    }
+                    None => {
+                        flags.push(Expr::Literal(Literal::Int(0)));
+                        out.push(Expr::Cast {
+                            expr: Box::new(Expr::Literal(Literal::Null)),
+                            to: ColType::Int,
+                            written: None,
+                        });
+                    }
+                }
+            }
+        }
+        Expr::Func {
+            name: "__array_slice_assign".to_string(),
+            args: vec![
+                base,
+                Expr::ArrayCtor {
+                    elems: lowers,
+                    nested: false,
+                },
+                Expr::ArrayCtor {
+                    elems: uppers,
+                    nested: false,
+                },
+                Expr::ArrayCtor {
+                    elems: flags,
+                    nested: false,
+                },
+                value,
+            ],
+        }
+    } else {
+        let mut idxs = Vec::new();
+        for b in chain {
+            match b {
+                TargetBound::Index(e) => idxs.push(Expr::Cast {
+                    expr: Box::new(e),
+                    to: ColType::Text,
+                    written: None,
+                }),
+                TargetBound::Slice(..) => unreachable!(),
+            }
+        }
+        Expr::Func {
+            name: "__jsonb_subscript_assign".to_string(),
+            args: vec![
+                base,
+                Expr::ArrayCtor {
+                    elems: idxs,
+                    nested: false,
+                },
+                value,
+            ],
+        }
+    }
+}
+
 impl Parser {
     pub(crate) fn peek(&self) -> &Token {
         self.tokens.get(self.pos).unwrap_or(&Token::EOF)
@@ -1548,9 +1641,20 @@ impl Parser {
         // (PG19 `opt_array_bounds`; declared bounds are accepted and
         // ignored, exactly like PG). Each `[]` level flattens to the
         // scalar element type (ArrayElem::of).
+        // v2.40: the keyword form `integer ARRAY[4]` (PG19 Typename
+        // `type ARRAY '[' bounds ']'`) is the same suffix.
         let mut ty = base;
-        while *self.peek() == Token::LBracket {
-            self.next(); // consume '['
+        loop {
+            if *self.peek() == Token::LBracket {
+                self.next(); // consume '['
+            } else if matches!(self.peek(), Token::Ident(s) if s == "array")
+                && matches!(self.peek2(), Token::LBracket)
+            {
+                self.next(); // consume ARRAY
+                self.next(); // consume '['
+            } else {
+                break;
+            }
             // An optional bound `[n]` (a plain number; anything else is
             // a syntax error, like PG).
             if let Token::Number(_) = self.peek() {
@@ -5397,6 +5501,42 @@ impl Parser {
                         message: "duplicate function body specified".to_string(),
                         code: "42601",
                     });
+                }
+                // v2.40: PG19 gram.y — an unquoted (SQL-standard)
+                // function body cannot have polymorphic arguments
+                // or a polymorphic result (functest_S_xx in
+                // create_function_sql).
+                {
+                    let is_poly = |t: &str| {
+                        matches!(
+                            t.rsplit('.')
+                                .next()
+                                .unwrap_or(t)
+                                .trim()
+                                .to_ascii_lowercase()
+                                .as_str(),
+                            "anyelement"
+                                | "anyarray"
+                                | "anynonarray"
+                                | "anyenum"
+                                | "anyrange"
+                                | "anymultirange"
+                                | "anycompatible"
+                                | "anycompatiblearray"
+                                | "anycompatiblenonarray"
+                                | "anycompatiblerange"
+                                | "anycompatiblemultirange"
+                        )
+                    };
+                    if is_poly(&ret_type)
+                        || args.iter().any(|a| is_poly(&a.type_name))
+                        || table_cols.iter().any(|(_, t)| is_poly(t))
+                    {
+                        return Err(SqlError {
+                            message: "SQL function with unquoted function body cannot have polymorphic arguments".to_string(),
+                            code: "42P13",
+                        });
+                    }
                 }
                 // v2.37: SQL-standard function body (PG19 gram.y
                 // func_body: RETURN func_return). The tail of the
@@ -10101,38 +10241,61 @@ impl Parser {
                 }
                 Token::LBracket => {
                     self.next(); // consume '['
-                    // Slice form `[l:u]` / `[:u]` / `[l:]` — PG19
-                    // `indirection_el` allows it; not assignable here.
-                    let is_slice = if *self.peek() == Token::Colon {
+                    // v2.40: slice forms `[l:u]` / `[:u]` / `[l:]` /
+                    // `[:]` keep their bounds; a chain containing
+                    // any slice becomes one Slice step (a plain index
+                    // in the chain is (e, e), PG19 assignment form),
+                    // merging with adjacent Index/Slice steps.
+                    let bound: (bool, Option<Expr>, Option<Expr>) = if *self.peek() == Token::Colon
+                    {
                         self.next();
-                        if *self.peek() != Token::RBracket {
-                            let _ = self.parse_or()?;
-                        }
+                        let hi = if *self.peek() == Token::RBracket {
+                            None
+                        } else {
+                            Some(self.parse_or()?)
+                        };
                         self.expect(Token::RBracket, "']'")?;
-                        true
+                        (true, None, hi)
                     } else {
                         let first = self.parse_or()?;
                         if *self.peek() == Token::Colon {
                             self.next(); // consume ':'
-                            if *self.peek() != Token::RBracket {
-                                let _ = self.parse_or()?;
-                            }
+                            let hi = if *self.peek() == Token::RBracket {
+                                None
+                            } else {
+                                Some(self.parse_or()?)
+                            };
                             self.expect(Token::RBracket, "']'")?;
-                            true
+                            (true, Some(first), hi)
                         } else {
                             self.expect(Token::RBracket, "']'")?;
-                            // Merge with a preceding adjacent Index step.
-                            match indirection.last_mut() {
-                                Some(InsertIndirection::Index(idxs)) => {
-                                    idxs.push(first);
-                                }
-                                _ => indirection.push(InsertIndirection::Index(vec![first])),
-                            }
-                            false
+                            (false, Some(first.clone()), Some(first))
                         }
                     };
+                    let (is_slice, lo, hi) = bound;
                     if is_slice {
-                        indirection.push(InsertIndirection::Slice);
+                        match indirection.last_mut() {
+                            Some(InsertIndirection::Slice(bounds)) => bounds.push((lo, hi)),
+                            Some(InsertIndirection::Index(idxs)) => {
+                                // Convert the preceding plain chain.
+                                let mut bounds: Vec<(Option<Expr>, Option<Expr>)> =
+                                    idxs.drain(..).map(|e| (Some(e.clone()), Some(e))).collect();
+                                bounds.push((lo, hi));
+                                *indirection.last_mut().unwrap() = InsertIndirection::Slice(bounds);
+                            }
+                            _ => indirection.push(InsertIndirection::Slice(vec![(lo, hi)])),
+                        }
+                    } else {
+                        let first = lo.unwrap();
+                        match indirection.last_mut() {
+                            Some(InsertIndirection::Index(idxs)) => {
+                                idxs.push(first);
+                            }
+                            Some(InsertIndirection::Slice(bounds)) => {
+                                bounds.push((Some(first.clone()), Some(first)));
+                            }
+                            _ => indirection.push(InsertIndirection::Index(vec![first])),
+                        }
                     }
                 }
                 _ => break,
@@ -10425,8 +10588,18 @@ impl Parser {
                 let mut sets = Vec::new();
                 loop {
                     let col = self.expect_ident()?;
-                    self.expect(Token::Eq, "'='")?;
-                    let expr = self.parse_or()?;
+                    // v2.40: subscripted upsert targets (`SET f1[1] =
+                    // ...`, `SET f1[1:2] = ...`) share parse_update's
+                    // desugar.
+                    let expr = if *self.peek() == Token::LBracket {
+                        let chain = self.parse_target_brackets()?;
+                        self.expect(Token::Eq, "'='")?;
+                        let value = self.parse_or()?;
+                        subscript_assign_expr(&col, chain, value)
+                    } else {
+                        self.expect(Token::Eq, "'='")?;
+                        self.parse_or()?
+                    };
                     sets.push((col, expr));
                     if *self.peek() == Token::Comma {
                         self.next();
@@ -11513,6 +11686,12 @@ impl Parser {
             });
         }
         if self.eat_keyword("like") {
+            // v2.40: `expr [NOT] LIKE ANY|ALL|SOME (array)` (PG19
+            // ScalarArrayOp over ~~ / !~~) desugars to the hidden
+            // __any_all_array builtin with a like op text.
+            if let Some(e) = self.try_parse_like_quantified(&left, neg, false)? {
+                return Ok(e);
+            }
             let pattern = self.parse_bitor()?;
             let escape = if self.eat_keyword("escape") {
                 Some(Box::new(self.parse_bitor()?))
@@ -11549,6 +11728,10 @@ impl Parser {
             }
         }
         if self.eat_keyword("ilike") {
+            // v2.40: quantified ILIKE, like the LIKE branch above.
+            if let Some(e) = self.try_parse_like_quantified(&left, neg, true)? {
+                return Ok(e);
+            }
             let pattern = self.parse_bitor()?;
             let escape = if self.eat_keyword("escape") {
                 Some(Box::new(self.parse_bitor()?))
@@ -11830,6 +12013,49 @@ impl Parser {
     /// over a subquery produce `Expr::Quantified`, evaluated by the
     /// executor with PG's three-valued logic. `left` may be an
     /// `Expr::Row` for row-wise quantification.
+    /// v2.40: after LIKE/ILIKE, if the next tokens are
+    /// `ANY|ALL|SOME (`, parse the quantified array form and desugar
+    /// to `__any_all_array` with a `~~`-family op text (the NOT LIKE
+    /// forms negate per element, PG19 ScalarArrayOp semantics).
+    /// Returns Ok(None) (consuming nothing) when the shape doesn't
+    /// match.
+    pub(crate) fn try_parse_like_quantified(
+        &mut self,
+        left: &Expr,
+        neg: bool,
+        ilike: bool,
+    ) -> Result<Option<Expr>, SqlError> {
+        let is_quant = matches!(self.peek(), Token::Ident(s) if s == "any" || s == "all" || s == "some")
+            && matches!(self.peek2(), Token::LParen);
+        if !is_quant {
+            return Ok(None);
+        }
+        let quant = if let Token::Ident(s) = self.next() {
+            s
+        } else {
+            unreachable!()
+        };
+        self.expect(Token::LParen, "'('")?;
+        let arr = self.parse_or()?;
+        self.expect(Token::RParen, "')'")?;
+        let op_txt = match (neg, ilike) {
+            (false, false) => "~~",
+            (true, false) => "!~~",
+            (false, true) => "~~*",
+            (true, true) => "!~~*",
+        };
+        let quant_txt = if quant == "all" { "all" } else { "any" };
+        Ok(Some(Expr::Func {
+            name: "__any_all_array".to_string(),
+            args: vec![
+                left.clone(),
+                Expr::Literal(Literal::Text(op_txt.into())),
+                Expr::Literal(Literal::Text(quant_txt.into())),
+                arr,
+            ],
+        }))
+    }
+
     pub(crate) fn parse_quantified(
         &mut self,
         left: Expr,
@@ -15703,6 +15929,47 @@ impl Parser {
         }
     }
 
+    /// v2.40: parse a subscripted assignment target's bracket chain
+    /// (`[expr]` / `[lo:hi]` / `[:hi]` / `[lo:]` / `[:]`), starting at
+    /// the first '['.
+    pub(crate) fn parse_target_brackets(&mut self) -> Result<Vec<TargetBound>, SqlError> {
+        let mut chain: Vec<TargetBound> = Vec::new();
+        while *self.peek() == Token::LBracket {
+            self.next();
+            if *self.peek() == Token::Colon {
+                self.next();
+                let hi = if *self.peek() == Token::RBracket {
+                    None
+                } else {
+                    Some(self.parse_or()?)
+                };
+                self.expect(Token::RBracket, "']'")?;
+                chain.push(TargetBound::Slice(None, hi));
+                continue;
+            }
+            if *self.peek() == Token::RBracket {
+                return Err(err(
+                    "syntax error: empty subscript in assignment target".to_string()
+                ));
+            }
+            let first = self.parse_or()?;
+            if *self.peek() == Token::Colon {
+                self.next();
+                let hi = if *self.peek() == Token::RBracket {
+                    None
+                } else {
+                    Some(self.parse_or()?)
+                };
+                self.expect(Token::RBracket, "']'")?;
+                chain.push(TargetBound::Slice(Some(first), hi));
+            } else {
+                self.expect(Token::RBracket, "']'")?;
+                chain.push(TargetBound::Index(first));
+            }
+        }
+        Ok(chain)
+    }
+
     pub(crate) fn parse_update(&mut self) -> Result<Stmt, SqlError> {
         // v2.16: UPDATE ONLY t — consumed like DELETE's ONLY.
         let _only = self.eat_keyword("only");
@@ -15722,33 +15989,13 @@ impl Parser {
             // contents are full expressions, cast to text for the
             // path array (integer subscripts render as their digits).
             if *self.peek() == Token::LBracket {
-                let mut idxs = Vec::new();
-                while *self.peek() == Token::LBracket {
-                    self.next();
-                    let e = self.parse_or()?;
-                    self.expect(Token::RBracket, "']'")?;
-                    idxs.push(Expr::Cast {
-                        expr: Box::new(e),
-                        to: ColType::Text,
-                        written: None,
-                    });
-                }
+                // v2.38/v2.40: subscripted assignment target
+                // (`SET j['a'][0] = v`, `SET a[1:2] = v`) — desugared
+                // by subscript_assign_expr.
+                let chain = self.parse_target_brackets()?;
                 self.expect(Token::Eq, "'='")?;
                 let value = self.parse_or()?;
-                let assign = Expr::Func {
-                    name: "__jsonb_subscript_assign".to_string(),
-                    args: vec![
-                        Expr::Column {
-                            table: None,
-                            name: col.clone(),
-                        },
-                        Expr::ArrayCtor {
-                            elems: idxs,
-                            nested: false,
-                        },
-                        value,
-                    ],
-                };
+                let assign = subscript_assign_expr(&col, chain, value);
                 sets.push((col, assign));
                 if *self.peek() == Token::Comma {
                     self.next();

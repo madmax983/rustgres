@@ -635,6 +635,30 @@ pub(crate) fn coerce_to_type_name(
     {
         return Ok(v.clone());
     }
+    // v2.40: the polymorphic pseudo-types bind per call site in
+    // PG19; the supplied value already has the concrete type, so
+    // coercion is the identity.
+    if matches!(
+        type_name
+            .rsplit('.')
+            .next()
+            .unwrap_or(type_name)
+            .to_ascii_lowercase()
+            .as_str(),
+        "anyelement"
+            | "anyarray"
+            | "anynonarray"
+            | "anyenum"
+            | "anyrange"
+            | "anymultirange"
+            | "anycompatible"
+            | "anycompatiblearray"
+            | "anycompatiblenonarray"
+            | "anycompatiblerange"
+            | "anycompatiblemultirange"
+    ) {
+        return Ok(v.clone());
+    }
     if let Ok(ct) = crate::sql::coltype_by_name(type_name) {
         // v2.04: coercing an array value to an array type is the
         // identity (eval_cast renders it to its text form, which
@@ -3880,6 +3904,328 @@ pub(crate) fn plpgsql_falloff_result(
     plpgsql_setof_result(call_q, fdef, run)
 }
 
+/// v2.40: PG19 polymorphic argument binding (parse_coerce.c
+/// `enforce_generic_type_consistency`), enforced at call time on the
+/// raw argument values. The strict family (anyelement / anyarray /
+/// anynonarray / anyenum / anyrange / anymultirange) shares ONE
+/// element type and ONE range subtype: every determining argument
+/// must agree exactly, a non-array cannot bind anyarray, and an
+/// argument whose type cannot be determined (NULL, or an unknown
+/// text literal in an anyarray position) leaves the type
+/// undetermined — an error when nothing else determines it. The
+/// anycompatible family instead unifies its arguments to a common
+/// supertype (the numeric lattice, or equality). Before v2.40 the
+/// declared-type coercion rejected these calls incidentally; the
+/// identity coercion for pseudo-types removed that backstop, so the
+/// binding rules are checked explicitly here. Polarity mirrors PG:
+/// conflicts are 42883 (no such function), undetermined types are
+/// 42P13 "could not determine polymorphic type because input has
+/// type unknown".
+pub(crate) fn check_polymorphic_args(
+    fdef: &crate::storage::FuncDef,
+    args: &[Value],
+) -> Result<(), ExecError> {
+    fn bare(t: &str) -> String {
+        t.rsplit('.')
+            .next()
+            .unwrap_or(t)
+            .trim()
+            .to_ascii_lowercase()
+    }
+    fn norm(ct: ColType) -> ColType {
+        match ct {
+            ColType::Numeric(_) => ColType::Numeric(None),
+            ColType::Char(_) => ColType::Char(None),
+            ColType::Varchar(_) => ColType::Varchar(None),
+            other => other,
+        }
+    }
+    fn numeric_rank(ct: &ColType) -> Option<u8> {
+        match ct {
+            ColType::SmallInt => Some(0),
+            ColType::Int => Some(1),
+            ColType::BigInt => Some(2),
+            ColType::Float4 => Some(3),
+            ColType::Float => Some(4),
+            ColType::Numeric(_) => Some(5),
+            _ => None,
+        }
+    }
+    // Common supertype for the anycompatible family: equality, or
+    // the wider of two numeric-family types.
+    fn unify(a: ColType, b: ColType) -> Option<ColType> {
+        if a == b {
+            return Some(a);
+        }
+        match (numeric_rank(&a), numeric_rank(&b)) {
+            (Some(x), Some(y)) => Some(if x >= y { a } else { b }),
+            _ => None,
+        }
+    }
+
+    let inputs: Vec<usize> = (0..fdef.arg_types.len())
+        .filter(|i| fdef.arg_mode(*i).is_input())
+        .collect();
+    let is_poly = |t: &str| {
+        matches!(
+            bare(t).as_str(),
+            "anyelement"
+                | "anyarray"
+                | "anynonarray"
+                | "anyenum"
+                | "anyrange"
+                | "anymultirange"
+                | "anycompatible"
+                | "anycompatiblearray"
+                | "anycompatiblenonarray"
+                | "anycompatiblerange"
+                | "anycompatiblemultirange"
+        )
+    };
+    if !inputs.iter().any(|i| is_poly(&fdef.arg_types[*i])) {
+        return Ok(());
+    }
+    let no_match = |args: &[Value]| {
+        let tys = args
+            .iter()
+            .map(|v| {
+                if matches!(v, Value::Null) {
+                    "unknown".to_string()
+                } else {
+                    v.col_type().sql_name().to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        exec_err(
+            "42883",
+            format!("function {}({}) does not exist", fdef.name, tys),
+        )
+    };
+    let undetermined = || {
+        exec_err(
+            "42P13",
+            "could not determine polymorphic type because input has type unknown".to_string(),
+        )
+    };
+
+    // Strict-family bindings: `se` = shared element type, `sr` =
+    // range subtype. Compatible-family mirrors: `ce`, `cr`.
+    let mut se: Option<ColType> = None;
+    let mut sr: Option<ColType> = None;
+    let mut se_undet = false;
+    let mut sr_undet = false;
+    let mut ce: Option<ColType> = None;
+    let mut cr: Option<ColType> = None;
+    let mut ce_undet = false;
+    let mut cr_undet = false;
+
+    fn bind_exact(
+        slot: &mut Option<ColType>,
+        ct: ColType,
+        args: &[Value],
+        fdef: &crate::storage::FuncDef,
+    ) -> Result<(), ExecError> {
+        match slot {
+            None => {
+                *slot = Some(ct);
+                Ok(())
+            }
+            Some(prev) if *prev == ct => Ok(()),
+            Some(_) => Err(exec_err(
+                "42883",
+                format!(
+                    "function {}({}) does not exist",
+                    fdef.name,
+                    args.iter()
+                        .map(|v| if matches!(v, Value::Null) {
+                            "unknown".to_string()
+                        } else {
+                            v.col_type().sql_name().to_string()
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )),
+        }
+    }
+
+    let mut ai = 0usize;
+    for (pos, di) in inputs.iter().enumerate() {
+        let decl = bare(&fdef.arg_types[*di]);
+        let variadic = fdef.arg_mode(*di) == crate::sql::ArgMode::Variadic;
+        // The values feeding this parameter: a VARIADIC parameter
+        // takes every remaining value as an element; any other
+        // parameter takes exactly one (or none, for a defaulted
+        // parameter the caller omitted).
+        let vals: &[Value] = if variadic {
+            let rest = &args[ai.min(args.len())..];
+            ai = args.len();
+            rest
+        } else if ai < args.len() {
+            let v = &args[ai..ai + 1];
+            ai += 1;
+            v
+        } else {
+            &[]
+        };
+        let _ = pos;
+        match decl.as_str() {
+            "anyelement" | "anynonarray" | "anyenum" => {
+                if vals.is_empty() {
+                    se_undet = true;
+                    continue;
+                }
+                match &vals[0] {
+                    Value::Null => se_undet = true,
+                    Value::Array(_) if decl == "anynonarray" => return Err(no_match(args)),
+                    v => bind_exact(&mut se, norm(v.col_type()), args, fdef)?,
+                }
+            }
+            "anyarray" => {
+                if variadic {
+                    // Elements bind the shared element type directly.
+                    if vals.is_empty() {
+                        se_undet = true;
+                    }
+                    for v in vals {
+                        match v {
+                            Value::Null => se_undet = true,
+                            v => bind_exact(&mut se, norm(v.col_type()), args, fdef)?,
+                        }
+                    }
+                } else if vals.is_empty() {
+                    se_undet = true;
+                } else {
+                    match &vals[0] {
+                        Value::Null => se_undet = true,
+                        // An unknown literal: PG parses it against
+                        // the determined array type; it determines
+                        // nothing by itself.
+                        Value::Text(_) | Value::BpChar(_) => se_undet = true,
+                        Value::Array(a) => bind_exact(
+                            &mut se,
+                            norm(super::eval::elem_scalar_type(a.elem)),
+                            args,
+                            fdef,
+                        )?,
+                        _ => return Err(no_match(args)),
+                    }
+                }
+            }
+            "anyrange" | "anymultirange" => {
+                if vals.is_empty() {
+                    sr_undet = true;
+                    continue;
+                }
+                match &vals[0] {
+                    Value::Null => sr_undet = true,
+                    Value::Range(r) if decl == "anyrange" => {
+                        let sub = super::ranges::elem_coltype(r.elem);
+                        bind_exact(&mut sr, sub, args, fdef)?;
+                        bind_exact(&mut se, sub, args, fdef)?;
+                    }
+                    Value::Multirange(m) if decl == "anymultirange" => {
+                        let sub = super::ranges::elem_coltype(m.elem);
+                        bind_exact(&mut sr, sub, args, fdef)?;
+                        bind_exact(&mut se, sub, args, fdef)?;
+                    }
+                    _ => return Err(no_match(args)),
+                }
+            }
+            "anycompatible" | "anycompatiblenonarray" => {
+                if vals.is_empty() {
+                    ce_undet = true;
+                    continue;
+                }
+                match &vals[0] {
+                    Value::Null => ce_undet = true,
+                    Value::Array(_) if decl == "anycompatiblenonarray" => {
+                        return Err(no_match(args));
+                    }
+                    v => {
+                        let ct = norm(v.col_type());
+                        ce = Some(match ce {
+                            None => ct,
+                            Some(prev) => unify(prev, ct).ok_or_else(|| no_match(args))?,
+                        });
+                    }
+                }
+            }
+            "anycompatiblearray" => {
+                if variadic {
+                    if vals.is_empty() {
+                        ce_undet = true;
+                    }
+                    for v in vals {
+                        match v {
+                            Value::Null => ce_undet = true,
+                            v => {
+                                let ct = norm(v.col_type());
+                                ce = Some(match ce {
+                                    None => ct,
+                                    Some(prev) => unify(prev, ct).ok_or_else(|| no_match(args))?,
+                                });
+                            }
+                        }
+                    }
+                } else if vals.is_empty() {
+                    ce_undet = true;
+                } else {
+                    match &vals[0] {
+                        Value::Null => ce_undet = true,
+                        Value::Text(_) | Value::BpChar(_) => ce_undet = true,
+                        Value::Array(a) => {
+                            let ct = norm(super::eval::elem_scalar_type(a.elem));
+                            ce = Some(match ce {
+                                None => ct,
+                                Some(prev) => unify(prev, ct).ok_or_else(|| no_match(args))?,
+                            });
+                        }
+                        _ => return Err(no_match(args)),
+                    }
+                }
+            }
+            "anycompatiblerange" | "anycompatiblemultirange" => {
+                if vals.is_empty() {
+                    cr_undet = true;
+                    continue;
+                }
+                match &vals[0] {
+                    Value::Null => cr_undet = true,
+                    Value::Range(r) if decl == "anycompatiblerange" => {
+                        let sub = super::ranges::elem_coltype(r.elem);
+                        cr = Some(sub);
+                        ce = Some(match ce {
+                            None => sub,
+                            Some(prev) => unify(prev, sub).ok_or_else(|| no_match(args))?,
+                        });
+                    }
+                    Value::Multirange(m) if decl == "anycompatiblemultirange" => {
+                        let sub = super::ranges::elem_coltype(m.elem);
+                        cr = Some(sub);
+                        ce = Some(match ce {
+                            None => sub,
+                            Some(prev) => unify(prev, sub).ok_or_else(|| no_match(args))?,
+                        });
+                    }
+                    _ => return Err(no_match(args)),
+                }
+            }
+            _ => {
+                // A concrete-typed parameter: just consume its value.
+            }
+        }
+    }
+    if (se_undet && se.is_none() && sr.is_none()) || (sr_undet && sr.is_none()) {
+        return Err(undetermined());
+    }
+    if (ce_undet && ce.is_none() && cr.is_none()) || (cr_undet && cr.is_none()) {
+        return Err(undetermined());
+    }
+    Ok(())
+}
+
 /// v0.86: scalar call of a user function. SQL bodies run via
 /// `run_func_body` (exactly one row, one column expected);
 /// internal bodies dispatch to `eval_internal_function`.
@@ -3908,6 +4254,8 @@ pub(crate) fn call_user_function(
     if fdef.lang == crate::sql::FuncLang::Internal {
         return eval_internal_function(&fdef.body, args);
     }
+    // v2.40: PG19 polymorphic binding rules (see check_polymorphic_args).
+    check_polymorphic_args(fdef, args)?;
     if fdef.returns_set {
         return Err(exec_err(
             "0A000",
@@ -6161,6 +6509,68 @@ pub(crate) fn eval_func(
             }
         }
         if let Some(fdef) = resolve_function_overload(q.eng, name, &raw_vals) {
+            // v2.40: pg_statistic.stavaluesN is declared `anyarray`
+            // in PG19's catalog, so passing it to an anyarray
+            // parameter cannot determine an element type (PG19:
+            // "cannot determine element type of \"anyarray\"
+            // argument"). Our statistic rows carry concrete array
+            // values, so the check keys on the column reference.
+            {
+                let has_anyarray_param = (0..fdef.arg_types.len()).any(|i| {
+                    fdef.arg_mode(i).is_input()
+                        && fdef.arg_types[i]
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or(&fdef.arg_types[i])
+                            .trim()
+                            .eq_ignore_ascii_case("anyarray")
+                });
+                if has_anyarray_param {
+                    for a in args {
+                        if let Expr::Column { table, name: col } = a {
+                            let is_stavalues = matches!(
+                                col.as_str(),
+                                "stavalues1"
+                                    | "stavalues2"
+                                    | "stavalues3"
+                                    | "stavalues4"
+                                    | "stavalues5"
+                            );
+                            let is_statistic = table
+                                .as_deref()
+                                .map(|t| {
+                                    t.rsplit('.')
+                                        .next()
+                                        .unwrap_or(t)
+                                        .eq_ignore_ascii_case("pg_statistic")
+                                })
+                                .unwrap_or_else(|| {
+                                    // Unqualified reference: the
+                                    // column is pg_statistic's when a
+                                    // scope schema carries it under
+                                    // that qual.
+                                    scopes.iter().any(|f| {
+                                        f.schema.iter().any(|c| {
+                                            c.name == *col
+                                                && c.qual
+                                                    .rsplit('.')
+                                                    .next()
+                                                    .unwrap_or(&c.qual)
+                                                    .eq_ignore_ascii_case("pg_statistic")
+                                        })
+                                    })
+                                });
+                            if is_stavalues && is_statistic {
+                                return Err(exec_err(
+                                    "42P13",
+                                    "cannot determine element type of \"anyarray\" argument"
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
             // v1.96 finishing pass: a PROCEDURE reached through a
             // function-call expression is PG19's 42809 — procedures
             // are invoked with CALL, never from SELECT.
@@ -7071,7 +7481,7 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         "setseed" => n == 1,
         "gcd" | "lcm" => n == 2,
         "div" => n == 2,
-        "width_bucket" => n == 3 || n == 4,
+        "width_bucket" => (2..=4).contains(&n),
         "round" => n == 1 || n == 2,
         "substring" | "substr" => n == 2 || n == 3,
         "power" | "mod" | "position" | "nullif" => n == 2,
@@ -7122,6 +7532,19 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         "array_length" | "array_lower" | "array_upper" => n == 2,
         "cardinality" | "array_dims" | "array_ndims" => n == 1,
         "unnest" => n == 1,
+        // v2.40: array function remainder (PG19 array_userfuncs.c).
+        "array_sort" => (1..=3).contains(&n),
+        "array_fill" => (2..=3).contains(&n),
+        "array_position" => (2..=3).contains(&n),
+        "array_positions" | "array_remove" | "array_cat" | "array_append" | "array_prepend" => {
+            n == 2
+        }
+        "array_replace" => n == 3,
+        "array_reverse" | "array_shuffle" => n == 1,
+        "array_sample" | "trim_array" => n == 2,
+        "array_to_string" => (2..=3).contains(&n),
+        "string_to_table" => (2..=3).contains(&n),
+        "generate_subscripts" => (2..=3).contains(&n),
         // v0.29: pg_input_is_valid(input, type).
         "pg_input_is_valid" => n == 2,
         // v0.43: pg_input_error_info(input, type) -> record (table
@@ -7203,6 +7626,7 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         "jsonb_contains" | "jsonb_contained" | "jsonb_concat" => n == 2,
         "__jsonb_subscript_assign" => n == 3,
         "__array_subscript_assign" => n == 3,
+        "__array_slice_assign" => n == 5,
         "jsonb_exists" => n == 2,
         "jsonb_exists_any" | "jsonb_exists_all" => n == 2,
         "jsonb_populate_record_valid" => n == 2,
@@ -7390,6 +7814,12 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         // untyped NULL is NULL.
         "array_length" | "array_lower" | "array_upper" | "cardinality" | "array_dims"
         | "array_ndims" => return eval_array_func(name, vals),
+        // v2.40: array function remainder — same evaluator.
+        "array_sort" | "array_fill" | "array_position" | "array_positions" | "array_remove"
+        | "array_replace" | "array_reverse" | "array_shuffle" | "array_sample" | "trim_array"
+        | "array_cat" | "array_append" | "array_prepend" | "array_to_string" => {
+            return eval_array_func(name, vals)
+        }
         // v0.79: nested scalar unnest — the SRF path (eval_srf_vals)
         // only applies at the top level of the SELECT list. Nested
         // (e.g. inside pg_typeof(...)), unnest yields the array's
@@ -7568,7 +7998,9 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         | "jsonb_extract_path_text" | "jsonb_set" | "jsonb_set_lax" | "jsonb_insert"
         | "jsonb_delete" | "jsonb_delete_path" | "jsonb_contains" | "jsonb_contained"
         | "jsonb_exists" | "jsonb_exists_any" | "jsonb_exists_all" | "jsonb_concat"
-        | "__jsonb_subscript_assign" | "__array_subscript_assign" => eval_json_func(name, vals),
+        | "__jsonb_subscript_assign" | "__array_subscript_assign" | "__array_slice_assign" => {
+            eval_json_func(name, vals)
+        }
         // v1.85: scalar jsonb_path_* and the SQL/JSON desugars.
         "jsonb_path_exists" | "jsonb_path_match" | "jsonb_path_query_array"
         | "jsonb_path_query_first" | "jsonb_path_exists_tz" | "jsonb_path_match_tz"
@@ -7647,6 +8079,66 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
 /// document path (which produced a jsonb value and a bogus 42804 at
 /// assignment coercion, and lost the NULL-subscript error entirely
 /// when the row's base was NULL).
+/// v2.40: decode the `__array_slice_assign` desugar arguments and
+/// run PG19 array_set_slice (eval.rs). Bounds arrays carry one
+/// entry per subscript; the parallel flags array marks which
+/// bounds were syntactically provided (absent bounds default from
+/// the base array; provided-but-NULL bounds are 22004).
+pub(crate) fn eval_array_slice_assign_builtin(vals: &[Value]) -> Result<Value, ExecError> {
+    fn bound_elems(v: &Value) -> Vec<Value> {
+        match v {
+            Value::Array(a) => a.elems.clone(),
+            _ => Vec::new(),
+        }
+    }
+    let lowers = bound_elems(&vals[1]);
+    let uppers = bound_elems(&vals[2]);
+    let flags = bound_elems(&vals[3]);
+    let n = lowers.len().max(uppers.len());
+    let mut bounds: Vec<(Option<i64>, Option<i64>)> = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut pair = (None, None);
+        for (side, arr, slot) in [
+            (0usize, &lowers, &mut pair.0),
+            (1usize, &uppers, &mut pair.1),
+        ] {
+            let provided = flags
+                .get(2 * i + side)
+                .map(|f| !matches!(f, Value::Int(0) | Value::SmallInt(0) | Value::Bool(false)))
+                .unwrap_or(false);
+            if provided {
+                match arr.get(i) {
+                    Some(Value::Null) | None => {
+                        return Err(exec_err(
+                            "22004",
+                            "array subscript in assignment must not be null".to_string(),
+                        ));
+                    }
+                    Some(v) => {
+                        let x = array_index_to_i64(v)?;
+                        if x < i32::MIN as i64 || x > i32::MAX as i64 {
+                            return Err(exec_err("22003", "integer out of range".to_string()));
+                        }
+                        *slot = Some(x);
+                    }
+                }
+            }
+        }
+        bounds.push(pair);
+    }
+    // Element type hint: the base array's when present, else the
+    // source's (PG resolves it from the target column statically;
+    // the assignment coercion after this builtin retypes anyway).
+    let elem = match &vals[0] {
+        Value::Array(a) => a.elem,
+        _ => match &vals[4] {
+            Value::Array(a) => a.elem,
+            other => value_array_elem(other),
+        },
+    };
+    eval_array_slice_assign(&vals[0], &bounds, &vals[4], elem)
+}
+
 pub(crate) fn eval_array_subscript_assign(name: &str, vals: &[Value]) -> Result<Value, ExecError> {
     let (_, path) = match json_path_list_arg(name, &vals[1])? {
         None => return Ok(Value::Null),
@@ -8103,6 +8595,12 @@ pub(crate) fn eval_json_func(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         // v2.38-fix: plain-array subscript assignment, split out of
         // the jsonb builtin (see eval_array_subscript_assign).
         "__array_subscript_assign" => eval_array_subscript_assign(name, &vals),
+        // v2.40: slice-form subscript assignment (parse_update /
+        // upsert desugar): vals = [base, lowers, uppers, flags, src]
+        // where flags is an int array of 2*nbounds 0/1 "provided"
+        // markers (a provided bound that evaluated to NULL is
+        // 22004, PG19 array_subscript_assign_slice).
+        "__array_slice_assign" => eval_array_slice_assign_builtin(&vals),
         // v2.38: the jsonb operator implementation functions, callable
         // by name (PG19 pg_proc). STRICT: NULL in -> NULL out (the
         // dispatch's strict wrapper handles the NULL case for the
@@ -9669,6 +10167,23 @@ pub(crate) fn eval_table_function(
             };
             Ok((vec![name.to_string()], rows))
         }
+        // v2.40: string_to_table / generate_subscripts as FROM-clause
+        // table functions (single output column named after the
+        // function, PG19).
+        "string_to_table" => {
+            let rows = string_to_table_rows(vals)?
+                .into_iter()
+                .map(|v| vec![v])
+                .collect();
+            Ok((vec![name.to_string()], rows))
+        }
+        "generate_subscripts" => {
+            let rows = generate_subscripts_rows(vals)?
+                .into_iter()
+                .map(|v| vec![v])
+                .collect();
+            Ok((vec![name.to_string()], rows))
+        }
         // v0.79: unnest(anyarray) — one row per element (PG19
         // arrayfuncs.c `unnest`). NULL yields zero rows; a text value
         // parses as a text[] literal (unknown-literal coercion).
@@ -9765,7 +10280,93 @@ pub(crate) fn is_builtin_srf(name: &str) -> bool {
             | "pg_stat_get_backend_io"
             | "pg_stat_get_backend_idset"
             | "pg_stat_get_backend_wal"
+            // v2.40: text split + array subscript SRFs.
+            | "string_to_table"
+            | "generate_subscripts"
     )
+}
+
+/// v2.40: string_to_table rows — PG19 varlena.c split_text in table
+/// mode: NULL input yields no rows; a NULL delimiter yields one row
+/// per character; an empty delimiter yields the whole string as one
+/// row; an empty input yields no rows; pieces equal to the optional
+/// null-string become NULL.
+pub(crate) fn string_to_table_rows(vals: &[Value]) -> Result<Vec<Value>, ExecError> {
+    let s = match str_arg("string_to_table", &vals[0])? {
+        None => return Ok(Vec::new()),
+        Some(s) => s.to_string(),
+    };
+    let delim: Option<String> = match str_arg("string_to_table", &vals[1])? {
+        None => None,
+        Some(d) => Some(d.to_string()),
+    };
+    let null_str: Option<String> = if vals.len() > 2 {
+        match str_arg("string_to_table", &vals[2])? {
+            None => None,
+            Some(x) => Some(x.to_string()),
+        }
+    } else {
+        None
+    };
+    if s.is_empty() {
+        return Ok(Vec::new());
+    }
+    let raw: Vec<String> = match &delim {
+        None => s.chars().map(|c| c.to_string()).collect(),
+        Some(d) if d.is_empty() => vec![s.clone()],
+        Some(d) => s.split(d.as_str()).map(|p| p.to_string()).collect(),
+    };
+    Ok(raw
+        .into_iter()
+        .map(|p| {
+            if null_str.as_deref() == Some(p.as_str()) {
+                Value::Null
+            } else {
+                Value::text(p)
+            }
+        })
+        .collect())
+}
+
+/// v2.40: generate_subscripts(anyarray, dim [, reverse]) rows —
+/// PG19 arrayfuncs.c: the subscripts of the given dimension; a NULL
+/// array or an out-of-range dimension yields no rows.
+pub(crate) fn generate_subscripts_rows(vals: &[Value]) -> Result<Vec<Value>, ExecError> {
+    let a = match &vals[0] {
+        Value::Null => return Ok(Vec::new()),
+        Value::Array(a) => a,
+        Value::Text(s) => {
+            // Unknown-literal coercion: subscripts need only the
+            // shape; parse as text[] to recover dims/lower.
+            let parsed = parse_array_literal(s, crate::storage::ArrayElem::Text)?;
+            return generate_subscripts_rows(&[Value::Array(Box::new(parsed)), vals[1].clone()]);
+        }
+        other => return Err(func_arg_err("generate_subscripts", other)),
+    };
+    let dim = match int_arg("generate_subscripts", &vals[1])? {
+        None => return Ok(Vec::new()),
+        Some(d) => d,
+    };
+    let reverse = if vals.len() > 2 {
+        match &vals[2] {
+            Value::Null => return Ok(Vec::new()),
+            Value::Bool(b) => *b,
+            other => return Err(func_arg_err("generate_subscripts", other)),
+        }
+    } else {
+        false
+    };
+    if dim < 1 || dim as usize > a.ndim() {
+        return Ok(Vec::new());
+    }
+    let d = (dim - 1) as usize;
+    let lo = a.lower[d] as i64;
+    let hi = lo + a.dims[d] as i64 - 1;
+    let mut out: Vec<Value> = (lo..=hi).map(Value::Int).collect();
+    if reverse {
+        out.reverse();
+    }
+    Ok(out)
 }
 
 /// v0.32: evaluate a set-returning function to its output rows (one Value
@@ -9821,6 +10422,12 @@ pub(crate) fn eval_srf_vals(
                 })
                 .collect())
         }
+        // v2.40: string_to_table(text, text [, text]) — split_text
+        // semantics identical to string_to_array, one row per piece.
+        "string_to_table" => string_to_table_rows(vals),
+        // v2.40: generate_subscripts(anyarray, int [, bool]) — the
+        // dimension's subscripts, ascending unless reverse is true.
+        "generate_subscripts" => generate_subscripts_rows(vals),
         "regexp_matches" => regexp_matches_rows(vals),
         // v0.79: unnest reuses the FROM-clause table-function core,
         // flattened to one value per row — PG19's unnest returns a
@@ -10216,6 +10823,8 @@ pub(crate) fn eval_user_srf_vals(
 ) -> Result<Vec<Value>, ExecError> {
     let fdef = resolve_function_overload(q.eng, name, vals)
         .ok_or_else(|| exec_err("42883", format!("function {}() does not exist", name)))?;
+    // v2.40: PG19 polymorphic binding rules (see check_polymorphic_args).
+    check_polymorphic_args(&fdef, vals)?;
     if !fdef.returns_set {
         return Err(exec_err(
             "0A000",
@@ -15819,6 +16428,25 @@ pub(crate) fn func_result_type(
             Ok(ColType::Int)
         }
         "array_dims" => Ok(ColType::Text),
+        // v2.40: array function remainder result types.
+        "array_sort" | "array_remove" | "array_replace" | "array_reverse" | "array_shuffle"
+        | "array_sample" | "trim_array" | "array_cat" => arg0(),
+        "array_fill" => match arg0() {
+            Ok(t) => Ok(ColType::Array(crate::storage::ArrayElem::of(&t))),
+            Err(e) => Err(e),
+        },
+        "array_append" => arg0(),
+        "array_prepend" => {
+            if args.len() == 2 {
+                expr_type(eng, snap, own, session, schemas, outer, ctes, &args[1])
+            } else {
+                arg0()
+            }
+        }
+        "array_position" => Ok(ColType::Int),
+        "array_positions" => Ok(ColType::Array(crate::storage::ArrayElem::Int)),
+        "array_to_string" | "string_to_table" => Ok(ColType::Text),
+        "generate_subscripts" => Ok(ColType::Int),
         "unnest" => match arg0() {
             Ok(ColType::Array(e)) => Ok(elem_scalar_type(e)),
             // v1.91: unnest(anymultirange) yields the component ranges.
@@ -15932,6 +16560,12 @@ pub(crate) fn func_result_type(
             Some(a) => Ok(super::describe::expr_type(eng, snap, own, session, schemas, outer, ctes, a)
                 .unwrap_or(ColType::Jsonb)),
             None => Ok(ColType::Jsonb),
+        },
+        // v2.40: slice assignment returns the base array's type.
+        "__array_slice_assign" => match args.first() {
+            Some(a) => Ok(super::describe::expr_type(eng, snap, own, session, schemas, outer, ctes, a)
+                .unwrap_or(ColType::Text)),
+            None => Ok(ColType::Text),
         },
         "to_jsonb" | "jsonb_build_array" | "jsonb_build_object" | "jsonb_object"
         | "jsonb_extract_path" | "jsonb_set" | "jsonb_set_lax" | "jsonb_insert"
@@ -16344,6 +16978,8 @@ pub(crate) fn compare_values(
         // fields with NULL sorting larger (PG's default ASC NULLS LAST),
         // mirroring `cmp_records`' comparison semantics as a total order.
         (Value::Record(fa), Value::Record(fb)) => cmp_record_values(fa, fb)?,
+        // v2.40: array ordering for ORDER BY / DISTINCT (array_cmp).
+        (Value::Array(x), Value::Array(y)) => crate::exec::eval::array_ordering(x, y)?,
         _ => {
             return Err(exec_err(
                 "42804",

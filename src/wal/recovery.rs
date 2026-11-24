@@ -241,6 +241,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     bit_typmod: None,
                     // v2.21: not carried by the WAL domain record.
                     collation: None,
+                    // v2.40: not carried by the WAL domain record.
+                    array_base: false,
                 }),
                 None => None,
             };

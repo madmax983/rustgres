@@ -6092,6 +6092,14 @@ pub struct DomainDef {
     /// they carry an explicit COLLATE. Runtime-only in v2.21 (same
     /// durability class as `bit_typmod`).
     pub collation: Option<String>,
+    /// v2.40: the domain was declared over an array type
+    /// (`CREATE DOMAIN d AS int[]`, including over another domain:
+    /// `dposinta AS posint[]`). The domain-over-domain flattening
+    /// above loses the array wrapper from `base`, so the declared
+    /// shape is recorded separately for the array-of-domain
+    /// element check in `check_domain_value`. Runtime-only (same
+    /// durability class as `bit_typmod`).
+    pub array_base: bool,
 }
 
 #[derive(Clone, Debug)]

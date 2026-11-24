@@ -406,6 +406,9 @@ mod v238_tests;
 #[path = "test_mods/v239_window_tests.rs"]
 mod v239_window_tests;
 #[cfg(test)]
+#[path = "test_mods/v240_arrays_tests.rs"]
+mod v240_arrays_tests;
+#[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;
 

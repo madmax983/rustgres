@@ -131,6 +131,26 @@ pub(crate) fn check_domain_value(
         match value {
             Value::Null => return Ok(Value::Null),
             Value::Array(a) => {
+                // v2.40: when the domain's base is itself an array
+                // type (dposinta AS posint[]), each element must be
+                // an array value — PG19 rejects a scalar element
+                // with 42804 ("column is of type dposinta[] but
+                // expression is of type integer[]"). The flattened
+                // element list of a nested constructor reaches here
+                // as scalars; before the constructor learned to
+                // build well-formed nested arrays the malformed
+                // value failed the assignment type check upstream,
+                // so this shape rule restores that rejection.
+                if dom.array_base {
+                    for e in &a.elems {
+                        if !matches!(e, Value::Array(_) | Value::Null) {
+                            return Err(exec_err(
+                                "42804",
+                                format!("value for domain {} must be an array value", dname),
+                            ));
+                        }
+                    }
+                }
                 for e in &a.elems {
                     check_domain_value(q, dname, e, false)?;
                 }

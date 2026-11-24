@@ -576,6 +576,16 @@ pub(crate) fn eval_json_op(op: JsonOp, left: &Value, right: &Value) -> Result<Va
     {
         return super::tsearch::eval_ts_op(op, left, right);
     }
+    // v2.40: array operands take the array containment family
+    // (@>, <@, &&) before any jsonb interpretation (PG19 resolves
+    // these operators per operand type at parse time).
+    if matches!(
+        op,
+        JsonOp::Contains | JsonOp::ContainedBy | JsonOp::Overlaps
+    ) && (matches!(left, Value::Array(_)) || matches!(right, Value::Array(_)))
+    {
+        return super::eval::eval_array_containment(op, left, right);
+    }
     if let Value::Jsonb(s) = left {
         return eval_jsonb_op(op, s, right);
     }

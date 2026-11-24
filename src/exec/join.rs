@@ -797,6 +797,9 @@ pub(crate) fn table_function_col_names(name: &str) -> Result<Vec<String>, ExecEr
     }
     match name {
         "regexp_split_to_table" | "generate_series" => Ok(vec![name.to_string()]),
+        // v2.40: string_to_table / generate_subscripts — one column
+        // named for the function.
+        "string_to_table" | "generate_subscripts" => Ok(vec![name.to_string()]),
         // v2.30: pg_mcv_list_items OUT columns (selfuncs SRF).
         "pg_mcv_list_items" => Ok(["index", "values", "nulls", "frequency", "base_frequency"]
             .iter()
@@ -937,6 +940,9 @@ pub(crate) fn table_function_col_types(
         // v2.18: updatability introspection result types.
         "pg_relation_is_updatable" => Ok(vec![ColType::Int]),
         "pg_column_is_updatable" => Ok(vec![ColType::Bool]),
+        // v2.40: string_to_table yields text; generate_subscripts int.
+        "string_to_table" => Ok(vec![ColType::Text]),
+        "generate_subscripts" => Ok(vec![ColType::Int]),
         "generate_series" => {
             // PG resolves mixed int/numeric to the numeric signature and
             // int4/int8 mixes to int8 (implicit casts); all-NULL (strict,
@@ -1276,6 +1282,9 @@ pub(crate) fn eval_srf_call(
     // functions expand to their fields; SETOF returns rows).
     // v0.87: resolve the best overload by (name, arg count, arg types).
     if let Some(fdef) = resolve_function_overload(q.eng, name, &arg_vals) {
+        // v2.40: PG19 polymorphic binding rules (see
+        // check_polymorphic_args in funcs.rs).
+        super::funcs::check_polymorphic_args(&fdef, &arg_vals)?;
         validate_coldef_for_fdef(q.eng, q.snap, q.own, q.session, &fdef, col_defs)?;
         let (mut col_names, mut col_types, rows) =
             call_table_function(q, scopes, &fdef, &arg_vals, col_defs)?;
@@ -2879,6 +2888,31 @@ pub(crate) fn srf_static_schema(
         if let Ok(ct) = crate::sql::coltype_by_name(&fdef.ret_type) {
             return Ok((vec![name.to_string()], vec![ct], false));
         }
+        // v2.40: a polymorphic return (anyelement / anycompatible)
+        // binds to the element type of the anyarray argument at
+        // this call site (PG19 resolve_polymorphic_argtypes).
+        if matches!(
+            fdef.ret_type.to_ascii_lowercase().as_str(),
+            "anyelement" | "anycompatible"
+        ) {
+            let pos = fdef.arg_types.iter().position(|t| {
+                matches!(
+                    t.to_ascii_lowercase().as_str(),
+                    "anyarray" | "anycompatiblearray"
+                )
+            });
+            if let Some(pos) = pos {
+                if let Some(arg) = args.get(pos) {
+                    let schemas = [left];
+                    if let Ok(ColType::Array(elem)) =
+                        expr_type(eng, snap, own, session, &schemas, &[], &[], arg)
+                    {
+                        let ct = crate::exec::eval::elem_scalar_type(elem);
+                        return Ok((vec![name.to_string()], vec![ct], false));
+                    }
+                }
+            }
+        }
         // Unresolvable return type (e.g. a shell type): fall through
         // to the builtin tables, which will 42883 honestly.
     }
@@ -2916,6 +2950,9 @@ pub(crate) fn srf_static_schema(
             ColType::Int
         };
         vec![ty]
+    } else if name == "generate_subscripts" {
+        // v2.40: generate_subscripts yields integer subscripts.
+        vec![ColType::Int]
     } else if is_json_expansion_srf(name) {
         json_srf_col_types(name)
     } else if crate::exec::is_pgstat_srf(name) {

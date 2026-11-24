@@ -238,7 +238,11 @@ def main():
         m = c.query("SELECT ARRAY[1,2] = ARRAY[1,2], ARRAY[1,2] = ARRAY[1,3], ARRAY[1,2] = ARRAY[1,2,3]")
         check("I1 array equality", err_code(m) is None and rows_of(m) == [["t", "f", "f"]], (err_code(m), rows_of(m)))
         m = c.query("SELECT ARRAY[1,NULL] = ARRAY[1,NULL], ARRAY[1,2] <> ARRAY[1,3]")
-        check("I2 array eq with NULLs -> NULL; <>", err_code(m) is None and rows_of(m) == [[None, "t"]], (err_code(m), rows_of(m)))
+        # PG19 array_eq: two NULL elements are considered equal, so the
+        # result is a plain boolean, never NULL (arrayfuncs.c array_eq).
+        # The pre-v2.40 expectation of NULL encoded the old three-valued
+        # element comparison; corrected in v2.40.
+        check("I2 array eq with NULLs equal; <>", err_code(m) is None and rows_of(m) == [["t", "t"]], (err_code(m), rows_of(m)))
 
         # ---- J. || ----
         m = c.query("SELECT ARRAY[1,2] || ARRAY[3,4], ARRAY[1,2] || 3, 0 || ARRAY[1,2]")

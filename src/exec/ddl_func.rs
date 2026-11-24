@@ -243,6 +243,33 @@ pub(crate) fn resolve_func_type_name(
     if name.eq_ignore_ascii_case("record") {
         return Ok(ColType::Composite);
     }
+    // v2.40: the polymorphic pseudo-types (anyelement family,
+    // anycompatible family) and the remaining handler pseudo-types
+    // are legal in function signatures in PG19; resolution to a
+    // concrete type happens per call. Same defer placeholder.
+    if matches!(
+        name.to_ascii_lowercase().as_str(),
+        "anyelement"
+            | "anyarray"
+            | "anynonarray"
+            | "anyenum"
+            | "anyrange"
+            | "anymultirange"
+            | "anycompatible"
+            | "anycompatiblearray"
+            | "anycompatiblenonarray"
+            | "anycompatiblerange"
+            | "anycompatiblemultirange"
+            | "internal"
+            | "trigger"
+            | "language_handler"
+            | "fdw_handler"
+            | "index_am_handler"
+            | "tsm_handler"
+            | "opaque"
+    ) {
+        return Ok(ColType::Composite);
+    }
     // v2.04: array types (`text[]`, `int[][]`) exist for every
     // element type in PG; resolve the element and defer to the
     // placeholder (call-time coercion is name-based).
@@ -546,6 +573,34 @@ pub(crate) fn parse_sql_func_body(
     // v1.96: void functions and procedures have no return value to
     // check — PG19 skips check_sql_fn_retval for them entirely.
     if ret_type.eq_ignore_ascii_case("void") {
+        return Ok(stmts);
+    }
+    // v2.40: a polymorphic return type cannot be checked against
+    // the body at CREATE time — PG19 resolves it per call and
+    // reports mismatches there (e.g. test1(anyelement) RETURNS
+    // anyarray AS '' creates fine; the mismatch error fires on
+    // SELECT test1(0)). Skip check_sql_fn_retval for the any* /
+    // anycompatible* family.
+    if matches!(
+        ret_type
+            .rsplit('.')
+            .next()
+            .unwrap_or(ret_type)
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "anyelement"
+            | "anyarray"
+            | "anynonarray"
+            | "anyenum"
+            | "anyrange"
+            | "anymultirange"
+            | "anycompatible"
+            | "anycompatiblearray"
+            | "anycompatiblenonarray"
+            | "anycompatiblerange"
+            | "anycompatiblemultirange"
+    ) {
         return Ok(stmts);
     }
     // PG19 check_sql_fn_retval: an empty body behaves like "the last
@@ -1324,6 +1379,93 @@ pub(crate) fn exec_create_function(
                 return Err(exec_err(
                     "42P13",
                     "VARIADIC parameter must be an array".to_string(),
+                ));
+            }
+        }
+    }
+    // v2.40: PG19 `check_generic_type_consistency` on the declared
+    // signature (functioncmds.c CreateFunction): a polymorphic
+    // result or OUT type must be determinable from the input types,
+    // else CREATE fails with 42P13 "cannot determine result data
+    // type" (the rangetypes/multirangetypes bogus_func family,
+    // whose definitions PG rejects outright). The strict family's
+    // outputs are determined by any strict-family input; a range
+    // output needs a range-family input; the anycompatible family
+    // is self-contained in the same shape.
+    {
+        let bare = |t: &str| {
+            t.rsplit('.')
+                .next()
+                .unwrap_or(t)
+                .trim()
+                .to_ascii_lowercase()
+        };
+        let inputs: Vec<String> = args
+            .iter()
+            .filter(|a| a.mode.is_input())
+            .map(|a| bare(&a.type_name))
+            .collect();
+        let mut outputs: Vec<String> = vec![bare(ret_type)];
+        outputs.extend(
+            args.iter()
+                .filter(|a| a.mode == crate::sql::ArgMode::Out)
+                .map(|a| bare(&a.type_name)),
+        );
+        outputs.extend(table_cols.iter().map(|(_, t)| bare(t)));
+        let strict_in = [
+            "anyelement",
+            "anyarray",
+            "anynonarray",
+            "anyenum",
+            "anyrange",
+            "anymultirange",
+        ];
+        let range_in = ["anyrange", "anymultirange"];
+        let compat_in = [
+            "anycompatible",
+            "anycompatiblearray",
+            "anycompatiblenonarray",
+            "anycompatiblerange",
+            "anycompatiblemultirange",
+        ];
+        let compat_range_in = ["anycompatiblerange", "anycompatiblemultirange"];
+        for out in &outputs {
+            let (needed, detail): (&[&str], String) = match out.as_str() {
+                "anyelement" | "anyarray" | "anynonarray" | "anyenum" => (
+                    &strict_in[..],
+                    format!(
+                        "A result of type {} requires at least one input of type anyelement, anyarray, anynonarray, anyenum, anyrange, or anymultirange.",
+                        out
+                    ),
+                ),
+                "anyrange" | "anymultirange" => (
+                    &range_in[..],
+                    format!(
+                        "A result of type {} requires at least one input of type anyrange or anymultirange.",
+                        out
+                    ),
+                ),
+                "anycompatible" | "anycompatiblearray" | "anycompatiblenonarray" => (
+                    &compat_in[..],
+                    format!(
+                        "A result of type {} requires at least one input of type anycompatible, anycompatiblearray, anycompatiblenonarray, anycompatiblerange, or anycompatiblemultirange.",
+                        out
+                    ),
+                ),
+                "anycompatiblerange" | "anycompatiblemultirange" => (
+                    &compat_range_in[..],
+                    format!(
+                        "A result of type {} requires at least one input of type anycompatiblerange or anycompatiblemultirange.",
+                        out
+                    ),
+                ),
+                _ => continue,
+            };
+            if !inputs.iter().any(|i| needed.contains(&i.as_str())) {
+                return Err(exec_err_detail(
+                    "42P13",
+                    "cannot determine result data type".to_string(),
+                    detail,
                 ));
             }
         }

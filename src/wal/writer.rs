@@ -1837,6 +1837,8 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 bit_typmod: None,
                 // v2.21: nor the domain collation (same gap class).
                 collation: None,
+                // v2.40: nor the declared array-base shape.
+                array_base: false,
             })
         } else {
             None

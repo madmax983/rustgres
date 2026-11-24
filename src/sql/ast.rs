@@ -2418,9 +2418,11 @@ pub enum InsertIndirection {
     Index(Vec<Expr>),
     /// `.field`
     Field(String),
-    /// `[l:u]` slice — parsed so the error can be PG-shaped; rejected
-    /// at execution (0A000, unsupported).
-    Slice,
+    /// A slice chain `[l:u][...]` — v2.40: carries the bounds of the
+    /// whole adjacent bracket chain (a plain index in the chain is
+    /// stored as (e, e), PG19 assignment form). Executed via
+    /// array_set_slice on the NULL base.
+    Slice(Vec<(Option<Expr>, Option<Expr>)>),
 }
 
 /// One `ORDER BY` sort key: expression + direction + explicit NULL

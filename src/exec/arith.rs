@@ -427,7 +427,62 @@ pub(crate) fn eval_width_bucket(
     name: &str,
 ) -> Result<Value, ExecError> {
     use std::cmp::Ordering;
-    // The 3-argument array-bounds form needs arrays, which rustgres lacks.
+    // v2.40: width_bucket(op, thresholds) — the array form (PG19
+    // width_bucket_array_*): the result is the number of thresholds
+    // <= op (thresholds are expected in ascending order; float
+    // comparisons use pg_float_ord so NaN thresholds sort last and
+    // a NaN operand lands in the top bucket). NULL op or NULL
+    // thresholds yield NULL; an empty threshold array yields 0.
+    if vals.len() == 2 {
+        if matches!(op, Value::Null) || matches!(&vals[1], Value::Null) {
+            return Ok(Value::Null);
+        }
+        // PG19 has no width_bucket(text, ...) signature (42883).
+        if let Value::Text(_) = op {
+            let arr_ty = match &vals[1] {
+                Value::Array(a) => a.type_name().into_owned(),
+                other => other.type_name().to_string(),
+            };
+            return Err(exec_err(
+                "42883",
+                format!("function width_bucket(text, {}) does not exist", arr_ty),
+            ));
+        }
+        let thresholds: Vec<Value> = match &vals[1] {
+            Value::Array(a) => {
+                // PG19 width_bucket: the thresholds array must be
+                // one-dimensional (2202E).
+                if a.dims.len() > 1 {
+                    return Err(exec_err(
+                        "2202E",
+                        "thresholds must be one-dimensional array".to_string(),
+                    ));
+                }
+                a.elems.clone()
+            }
+            Value::Text(s) => {
+                // Unknown-literal coercion to the operand's array type.
+                let elem = super::eval::value_array_elem(op);
+                super::eval::parse_array_literal(s, elem)?.elems
+            }
+            other => return Err(func_arg_err(name, other)),
+        };
+        let mut bucket: i64 = 0;
+        for t in &thresholds {
+            if matches!(t, Value::Null) {
+                return Err(exec_err(
+                    "22023",
+                    "threshold values must not be null".to_string(),
+                ));
+            }
+            match super::eval::eval_cmp_vals(super::CmpOp::Le, t, op)? {
+                Value::Bool(true) => bucket += 1,
+                Value::Bool(false) => {}
+                _ => {}
+            }
+        }
+        return Ok(Value::Int(bucket));
+    }
     if vals.len() == 3 {
         return Err(exec_err(
             "42883",

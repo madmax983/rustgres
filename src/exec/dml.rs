@@ -965,14 +965,9 @@ pub(crate) fn plan_upsert(
     let mut set_cols = Vec::new();
     if let ConflictAction::DoUpdate { sets, .. } = &oc.action {
         // v0.12: duplicate SET targets are 42701 in PostgreSQL.
-        let mut seen = std::collections::HashSet::new();
+        // v2.40: subscripted assignments to the same column compose.
+        check_dup_set_cols(sets)?;
         for (name, _) in sets {
-            if !seen.insert(name) {
-                return Err(exec_err(
-                    "42701",
-                    format!("multiple assignments to same column \"{}\"", name),
-                ));
-            }
             set_cols.push(meta.column_index(name).ok_or_else(|| {
                 exec_err(
                     "42703",
@@ -984,16 +979,82 @@ pub(crate) fn plan_upsert(
             })?);
         }
     }
+    // v2.40: compose repeated subscripted DO UPDATE assignments.
+    let action = match &oc.action {
+        ConflictAction::DoUpdate { sets, where_ } => ConflictAction::DoUpdate {
+            sets: compose_subscript_sets(sets),
+            where_: where_.clone(),
+        },
+        other => other.clone(),
+    };
     Ok(UpsertPlan {
         indexes,
         set_cols,
-        action: oc.action.clone(),
+        action,
         con_names,
         key_names,
         explicit_arbiter,
         arbiter_nnd,
         wo_arbiter,
     })
+}
+
+/// v2.40: is this SET expression a subscripted assignment (the
+/// parser's desugar for `col[...] = ...` targets)?
+pub(crate) fn is_subscript_assign_expr(e: &Expr) -> bool {
+    matches!(e, Expr::Func { name, .. } if name == "__jsonb_subscript_assign"
+        || name == "__array_subscript_assign"
+        || name == "__array_slice_assign")
+}
+
+/// v2.40: PG19 composes multiple subscripted assignments to the
+/// same column in one SET list: each applies to the result of the
+/// previous one (transformUpdateTargetList folds the indirection
+/// assignments). Chain them by folding each later assignment's
+/// base argument into the previous assignment expression.
+pub(crate) fn compose_subscript_sets(sets: &[(String, Expr)]) -> Vec<(String, Expr)> {
+    let mut out: Vec<(String, Expr)> = Vec::with_capacity(sets.len());
+    for (name, expr) in sets {
+        let mut expr = expr.clone();
+        if is_subscript_assign_expr(&expr) {
+            let prev = out
+                .iter()
+                .rev()
+                .find(|(n, e)| n == name && is_subscript_assign_expr(e))
+                .map(|(_, e)| e.clone());
+            if let Some(prev) = prev {
+                if let Expr::Func { args, .. } = &mut expr {
+                    if !args.is_empty() {
+                        args[0] = prev;
+                    }
+                }
+            }
+        }
+        out.push((name.clone(), expr));
+    }
+    out
+}
+
+/// v2.40: duplicate SET targets are 42701 in PostgreSQL — except
+/// when every assignment to the column is a subscripted one, which
+/// PG19 composes instead of rejecting.
+pub(crate) fn check_dup_set_cols(sets: &[(String, Expr)]) -> Result<(), ExecError> {
+    let mut seen = std::collections::HashSet::new();
+    for (name, _) in sets {
+        if !seen.insert(name) {
+            let all_sub = sets
+                .iter()
+                .filter(|(n, _)| n == name)
+                .all(|(_, e)| is_subscript_assign_expr(e));
+            if !all_sub {
+                return Err(exec_err(
+                    "42701",
+                    format!("multiple assignments to same column \"{}\"", name),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// v0.10: current values of one row version, by id.
@@ -1910,6 +1971,8 @@ pub(crate) fn exec_create_table_as(
 pub(crate) enum ResolvedIndirection {
     Index(Vec<i64>),
     Field(String),
+    /// v2.40: slice chain with evaluated bounds (None = absent).
+    Slice(Vec<(Option<i64>, Option<i64>)>),
 }
 
 /// v0.84: evaluate the index expressions of an INSERT indirection path.
@@ -1937,11 +2000,32 @@ pub(crate) fn resolve_insert_indirection(
                 out.push(ResolvedIndirection::Index(idxs));
             }
             InsertIndirection::Field(f) => out.push(ResolvedIndirection::Field(f.clone())),
-            InsertIndirection::Slice => {
-                return Err(exec_err(
-                    "0A000",
-                    "slice assignment in INSERT target list is not supported yet",
-                ));
+            // v2.40: slice bounds evaluate like index expressions;
+            // a NULL provided bound is 22004 (PG19 assignment).
+            InsertIndirection::Slice(bounds) => {
+                let mut resolved = Vec::with_capacity(bounds.len());
+                for (lo, hi) in bounds {
+                    let mut pair = (None, None);
+                    for (side, e) in [(0usize, lo), (1usize, hi)] {
+                        if let Some(e) = e {
+                            let v = eval_expr(q, &[], e)?;
+                            if matches!(v, Value::Null) {
+                                return Err(exec_err(
+                                    "22004",
+                                    "array subscript in assignment must not be null",
+                                ));
+                            }
+                            let x = array_index_to_i64(&v)?;
+                            if side == 0 {
+                                pair.0 = Some(x);
+                            } else {
+                                pair.1 = Some(x);
+                            }
+                        }
+                    }
+                    resolved.push(pair);
+                }
+                out.push(ResolvedIndirection::Slice(resolved));
             }
         }
     }
@@ -2053,12 +2137,10 @@ pub(crate) fn insert_leaf_type(
                 ct = ftype.clone();
                 comp = nested.clone();
             }
-            InsertIndirection::Slice => {
-                return Err(exec_err(
-                    "0A000",
-                    "slice assignment in INSERT target list is not supported yet",
-                ));
-            }
+            // v2.40: a slice step's leaf is the array type itself —
+            // the assigned value coerces to the (sub)array type and
+            // array_set_slice consumes it whole.
+            InsertIndirection::Slice(_) => {}
         }
     }
     Ok((ct, comp))
@@ -2084,6 +2166,27 @@ pub(crate) fn assign_insert_indirection(
         return Ok(val);
     };
     match first {
+        // v2.40: slice assignment on the (NULL) base — PG19
+        // array_set_slice via the shared evaluator. Further
+        // indirection after a slice is not supported.
+        ResolvedIndirection::Slice(bounds) => {
+            if !rest.is_empty() {
+                return Err(exec_err(
+                    "0A000",
+                    "indirection after a slice in INSERT target is not supported yet",
+                ));
+            }
+            let elem = match ctype {
+                ColType::Array(e) => *e,
+                _ => {
+                    return Err(exec_err(
+                        "42804",
+                        format!("cannot subscript type {}", ctype.sql_name()),
+                    ));
+                }
+            };
+            eval_array_slice_assign(&base, bounds, &val, elem)
+        }
         ResolvedIndirection::Index(idxs) => {
             let elem = match ctype {
                 ColType::Array(e) => *e,
@@ -4936,17 +5039,9 @@ pub(crate) fn exec_update_inner(
     }
     // v0.12: duplicate SET targets are 42701 in PostgreSQL
     // ("multiple assignments to same column"), not silently accepted.
-    {
-        let mut seen = std::collections::HashSet::new();
-        for (name, _) in sets {
-            if !seen.insert(name) {
-                return Err(exec_err(
-                    "42701",
-                    format!("multiple assignments to same column \"{}\"", name),
-                ));
-            }
-        }
-    }
+    // v2.40: subscripted assignments to the same column compose
+    // instead (check_dup_set_cols carries the exception).
+    check_dup_set_cols(sets)?;
     // v2.38: PG19 raises "wrong number of array subscripts" at
     // ANALYSIS time when a subscripted assignment target descends
     // through a domain: for a column declared `somedomain[]` the
@@ -5129,6 +5224,9 @@ pub(crate) fn exec_update_inner(
                 (name.clone(), expr)
             })
             .collect();
+        // v2.40: compose repeated subscripted assignments to the
+        // same column (each applies to the previous one's result).
+        let sets_owned = compose_subscript_sets(&sets_owned);
         let sets: &[(String, Expr)] = &sets_owned;
         // v0.85: composite type names for positional record coercion on
         // UPDATE assignment.

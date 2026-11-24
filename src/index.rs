@@ -81,6 +81,13 @@ pub fn index_key_cmp(a: &Value, b: &Value) -> Ordering {
         // type-tag fallback and compared Equal, so an index scan on a
         // range column returned heap order and ORDER BY trusted it.
         (Value::Range(x), Value::Range(y)) => crate::exec::ranges::range_cmp(x, y),
+        // v2.40: the array btree opclass is PG19 array_cmp. Without
+        // this arm every array key compared Equal, so a range index
+        // scan on an array column skipped or stopped at the first
+        // key (the arrays.sql arr_tbl case under enable_seqscan=off).
+        (Value::Array(x), Value::Array(y)) => {
+            crate::exec::array_ordering(x, y).unwrap_or(Ordering::Equal)
+        }
         (Value::Multirange(x), Value::Multirange(y)) => crate::exec::ranges::multirange_cmp(x, y),
         // Total fallback: values of different types can never share one
         // indexed column, but the B-tree still needs a total order.
