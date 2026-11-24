@@ -361,9 +361,7 @@ pub(crate) fn coerce_value(
         (Value::BigInt(i), ColType::Float) => Some(Value::Float(*i as f64)),
         (Value::BigInt(i), ColType::Numeric(_)) => Some(Value::Numeric(Numeric::from_i64(*i))),
         (Value::Float4(f), ColType::Float) => Some(Value::Float(*f as f64)),
-        (Value::Float4(f), ColType::Numeric(_)) => {
-            Numeric::from_f64(*f as f64).ok().map(Value::Numeric)
-        }
+        (Value::Float4(f), ColType::Numeric(_)) => Numeric::from_f32(*f).ok().map(Value::Numeric),
         (Value::Float(f), ColType::Numeric(_)) => Numeric::from_f64(*f).ok().map(Value::Numeric),
         // v0.60: assigning a numeric value to numeric(p,s) applies PG19's typmod.
         (Value::Numeric(n), ColType::Numeric(_)) => Some(Value::Numeric(n.clone())),

@@ -1179,6 +1179,7 @@ pub(crate) fn sje_rewrite_qual(e: &Expr, from_q: &str, to_q: &str) -> Option<Exp
             arg2,
             agg_order_by,
             filter,
+            written,
         } => Expr::Agg {
             func: func.clone(),
             arg: ro(arg)?,
@@ -1186,6 +1187,7 @@ pub(crate) fn sje_rewrite_qual(e: &Expr, from_q: &str, to_q: &str) -> Option<Exp
             arg2: ro(arg2)?,
             agg_order_by: rot(agg_order_by)?,
             filter: ro(filter)?,
+            written: written.clone(),
         },
         Expr::WithinGroup {
             func,

@@ -3128,6 +3128,57 @@ pub(crate) fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, 
             eval_is_bool(&v, *neg, *val)
         }
         Expr::Func { name, args } => {
+            // v2.41: DISTINCT / FILTER markers that reach plain
+            // (non-grouped) evaluation wrap a call that is not a
+            // user-defined aggregate in this context: PG19
+            // parse_func.c's 42803.
+            if name == "__agg_order" {
+                let iname = if let Expr::Func { name: n, .. } = &args[0] {
+                    n.clone()
+                } else {
+                    "?".to_string()
+                };
+                return Err(exec_err(
+                    "42803",
+                    format!(
+                        "ORDER BY specified, but {} is not an aggregate function",
+                        iname
+                    ),
+                ));
+            }
+            if name == "__within_group" {
+                let iname = if let Expr::Func { name: n, .. } = &args[0] {
+                    n.clone()
+                } else {
+                    "?".to_string()
+                };
+                return Err(exec_err(
+                    "42809",
+                    format!(
+                        "WITHIN GROUP specified, but {} is not an ordered-set aggregate",
+                        iname
+                    ),
+                ));
+            }
+            if name == "__agg_distinct" || name == "__agg_filter" {
+                let what = if name == "__agg_distinct" {
+                    "DISTINCT"
+                } else {
+                    "FILTER"
+                };
+                let iname = if let Expr::Func { name: n, .. } = &args[0] {
+                    n.clone()
+                } else {
+                    "?".to_string()
+                };
+                return Err(exec_err(
+                    "42803",
+                    format!(
+                        "{} specified, but {} is not an aggregate function",
+                        what, iname
+                    ),
+                ));
+            }
             // v1.28: PG19 ProjectSet on the plain path — an SRF call
             // collected for fan-out evaluates to its current row's value.
             // `q.srf_vals` is only non-empty while a fan-out is projecting

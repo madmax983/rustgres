@@ -1100,6 +1100,7 @@ impl Parser {
                 Token::Ident(s) if s == "domain" => self.parse_alter_domain(),
                 Token::Ident(s) if s == "type" => self.parse_alter_type(),
                 Token::Ident(s) if s == "function" => self.parse_alter_function(),
+                Token::Ident(s) if s == "aggregate" => self.parse_alter_aggregate(),
                 Token::Ident(s) if s == "trigger" => self.parse_alter_trigger(),
                 Token::Ident(s) if s == "rule" => self.parse_alter_rule(),
                 Token::Ident(s) if s == "policy" => self.parse_alter_policy(),
@@ -1873,7 +1874,7 @@ impl Parser {
         }
         // v1.96: CREATE AGGREGATE name (args) (sfunc = f, stype = t [, ...]).
         if matches!(self.peek(), Token::Ident(s) if s == "aggregate") {
-            return self.parse_create_aggregate();
+            return self.parse_create_aggregate(false);
         }
         // v0.11: CREATE ROLE / USER / GROUP
         if matches!(self.peek(), Token::Ident(s) if s == "role" || s == "user" || s == "group") {
@@ -1890,6 +1891,11 @@ impl Parser {
                 self.next(); // 'replace'
                 if matches!(self.peek(), Token::Ident(s) if s == "function") {
                     return self.parse_create_function(true);
+                }
+                // v2.41: CREATE OR REPLACE AGGREGATE (PG19 gram.y
+                // opt_or_replace on AggregateStmt).
+                if matches!(self.peek(), Token::Ident(s) if s == "aggregate") {
+                    return self.parse_create_aggregate(true);
                 }
                 // v2.14: CREATE OR REPLACE TRIGGER (PG19 gram.y
                 // opt_or_replace on CreateTrigStmt).
@@ -8810,6 +8816,37 @@ impl Parser {
             }
             // v1.96: symbolic operator tokens beyond Op (e.g. `!!`).
             Token::BangBang => Ok("!!".to_string()),
+            // v2.41: tilde-led operators (`~<~`, `~>=~`, ...) lex as
+            // separate single-char tokens; reassemble them.
+            Token::Tilde => {
+                let mut name = "~".to_string();
+                loop {
+                    match self.peek() {
+                        Token::Tilde => {
+                            self.next();
+                            name.push('~');
+                        }
+                        Token::Lt => {
+                            self.next();
+                            name.push('<');
+                        }
+                        Token::Gt => {
+                            self.next();
+                            name.push('>');
+                        }
+                        Token::Eq => {
+                            self.next();
+                            name.push('=');
+                        }
+                        Token::Bang => {
+                            self.next();
+                            name.push('!');
+                        }
+                        _ => break,
+                    }
+                }
+                Ok(name)
+            }
             // v1.96: multi-char operators from paired tokens.
             Token::Shr => {
                 if matches!(self.peek(), Token::Gt) {
@@ -8842,35 +8879,129 @@ impl Parser {
     /// affect execution (IN-subquery equality), the rest are stored.
     /// v1.96: CREATE AGGREGATE name ( [argmode] [argname] argtype [, ...] )
     /// ( sfunc = fn, stype = type [, finalfunc = fn] [, initcond = lit] ... )
-    pub(crate) fn parse_create_aggregate(&mut self) -> Result<Stmt, SqlError> {
+    /// v2.41: one aggregate argument type in CREATE AGGREGATE's
+    /// argument list. PG19's grammar takes types only here (no
+    /// argument names), so a bare type followed by ORDER BY must not
+    /// be misread as a named argument (parse_func_arg does that).
+    pub(crate) fn parse_agg_arg_type(&mut self) -> Result<String, SqlError> {
+        self.eat_keyword("variadic");
+        if matches!(self.peek(), Token::Star) {
+            self.next();
+            return Ok("*".to_string());
+        }
+        if let Token::QIdent(name) = self.peek() {
+            let name = name.clone();
+            self.next();
+            return Ok(name);
+        }
+        let w1 = self.expect_ident()?;
+        // v2.41: an optional argument NAME precedes the type
+        // (`variadic items anyarray` in least_agg): when a second
+        // identifier follows and the first word is not a multi-word
+        // type opener, the first word was the name — re-read the
+        // type from the next word.
+        let w1 = if !matches!(w1.as_str(), "double" | "character" | "bit")
+            && (matches!(self.peek(), Token::QIdent(_))
+                || matches!(self.peek(), Token::Ident(s) if !s.eq_ignore_ascii_case("order")))
+        {
+            self.expect_ident()?
+        } else {
+            w1
+        };
+        let mut name = if w1 == "double"
+            && matches!(self.peek(), Token::Ident(s) if s == "precision")
+        {
+            self.next();
+            "double precision".to_string()
+        } else if w1 == "character" && matches!(self.peek(), Token::Ident(s) if s == "varying") {
+            self.next();
+            "character varying".to_string()
+        } else if w1 == "bit" && matches!(self.peek(), Token::Ident(s) if s == "varying") {
+            self.next();
+            "bit varying".to_string()
+        } else {
+            w1
+        };
+        // Optional typmod, e.g. varchar(10): skip the parenthesized
+        // part (aggregate identity ignores typmods, as in PG).
+        if *self.peek() == Token::LParen {
+            let mut depth = 0i32;
+            loop {
+                match self.next() {
+                    Token::LParen => depth += 1,
+                    Token::RParen => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    Token::EOF => {
+                        return Err(err("syntax error: unterminated type modifier".to_string()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        while *self.peek() == Token::LBracket {
+            self.next();
+            self.expect(Token::RBracket, "']'")?;
+            name.push_str("[]");
+        }
+        Ok(name)
+    }
+
+    pub(crate) fn parse_create_aggregate(&mut self, or_replace: bool) -> Result<Stmt, SqlError> {
         self.expect_keyword("aggregate")?;
         let name = self.parse_table_name()?;
         self.expect(Token::LParen, "'('")?;
+        // v2.41: PG19's pre-9.0 old-style form puts the OPTION list in
+        // the first (only) parenthesized group — detected by an
+        // `ident =` opening (`sfunc = ...`, `basetype = ...`).
+        let old_style = matches!(self.peek(), Token::Ident(_)) && matches!(self.peek2(), Token::Eq);
         let mut arg_types = Vec::new();
-        if *self.peek() != Token::RParen {
-            loop {
-                if matches!(self.peek(), Token::Star) {
-                    self.next();
-                    arg_types.push("*".to_string());
-                } else {
-                    let arg = self.parse_func_arg()?;
-                    arg_types.push(arg.type_name);
-                }
-                match self.next() {
-                    Token::Comma => continue,
-                    Token::RParen => break,
-                    other => {
-                        return Err(err(format!(
-                            "syntax error: expected ',' or ')' in aggregate arguments, found {:?}",
-                            other
-                        )));
+        let mut sort_types: Vec<String> = Vec::new();
+        let mut ordered_set = false;
+        if !old_style {
+            if *self.peek() != Token::RParen {
+                loop {
+                    {
+                        let at = self.parse_agg_arg_type()?;
+                        arg_types.push(at);
+                    }
+                    // v2.41: ordered-set argument list: `type, ...
+                    // ORDER BY type, ...` (PG19 AggregateStmt with
+                    // aggsorttypes). The sort types are recorded; the
+                    // aggregate is flagged ordered-set.
+                    if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("order")) {
+                        self.next(); // ORDER
+                        self.expect_keyword("by")?;
+                        ordered_set = true;
+                        loop {
+                            let sarg = self.parse_agg_arg_type()?;
+                            sort_types.push(sarg);
+                            if matches!(self.peek(), Token::Comma) {
+                                self.next();
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                    match self.next() {
+                        Token::Comma => continue,
+                        Token::RParen => break,
+                        other => {
+                            return Err(err(format!(
+                                "syntax error: expected ',' or ')' in aggregate arguments, found {:?}",
+                                other
+                            )));
+                        }
                     }
                 }
+            } else {
+                self.next();
             }
-        } else {
-            self.next();
+            self.expect(Token::LParen, "'('")?;
         }
-        self.expect(Token::LParen, "'('")?;
         let mut sfunc = None;
         let mut stype = None;
         let mut finalfunc = None;
@@ -8879,11 +9010,63 @@ impl Parser {
         let mut minvfunc = None;
         let mut mstype = None;
         let mut parallel = None;
+        let mut combinefunc = None;
+        let mut serialfunc = None;
+        let mut deserialfunc = None;
+        let mut hypothetical = false;
         loop {
             let key = self.expect_ident()?;
+            // v2.41: HYPOTHETICAL is a bare flag option (no `=`).
+            if key == "hypothetical" && *self.peek() != Token::Eq {
+                hypothetical = true;
+                match self.next() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')' in aggregate definition, found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
             self.expect(Token::Eq, "'='")?;
             let val = match self.next() {
-                Token::Ident(s) => s,
+                Token::Ident(mut s) => {
+                    // v2.41: PG19 allows `SFUNC = name(type, ...)`
+                    // (and likewise for the other *FUNC options): the
+                    // signature rides along but the registry keys the
+                    // transition/final functions by name.
+                    if *self.peek() == Token::LParen {
+                        let mut depth = 0i32;
+                        loop {
+                            match self.next() {
+                                Token::LParen => depth += 1,
+                                Token::RParen => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                Token::EOF => {
+                                    return Err(err(
+                                        "syntax error: unterminated aggregate option signature"
+                                            .to_string(),
+                                    ));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    // v2.41: an array-type option value (`stype =
+                    // aggtype[]`): absorb `[]` suffix pairs.
+                    while *self.peek() == Token::LBracket {
+                        self.next();
+                        self.expect(Token::RBracket, "']'")?;
+                        s.push_str("[]");
+                    }
+                    s
+                }
                 Token::Str(s) => s.to_string(),
                 Token::Number(s) => s.to_string(),
                 other => {
@@ -8902,6 +9085,30 @@ impl Parser {
                 "minvfunc" => minvfunc = Some(val),
                 "mstype" => mstype = Some(val),
                 "parallel" => parallel = Some(val),
+                "combinefunc" => combinefunc = Some(val),
+                "serialfunc" => serialfunc = Some(val),
+                "deserialfunc" => deserialfunc = Some(val),
+                // v2.41: old-style keys — BASETYPE names the single
+                // input type; the `1`-suffixed spellings are the
+                // moving-aggregate forward transition, which is the
+                // aggregate's sfunc/stype/initcond when the plain
+                // spellings are absent.
+                "basetype" => arg_types = vec![val],
+                "sfunc1" => {
+                    if sfunc.is_none() {
+                        sfunc = Some(val);
+                    }
+                }
+                "stype1" => {
+                    if stype.is_none() {
+                        stype = Some(val);
+                    }
+                }
+                "initcond1" => {
+                    if initcond.is_none() {
+                        initcond = Some(val);
+                    }
+                }
                 _ => {}
             }
             match self.next() {
@@ -8915,6 +9122,11 @@ impl Parser {
                 }
             }
         }
+        // v2.41: old-style `basetype = 'ANY'` declares a zero-input
+        // aggregate, called as `agg(*)` (PG19 functioncmds.c).
+        if old_style && arg_types.len() == 1 && arg_types[0].eq_ignore_ascii_case("any") {
+            arg_types = vec!["*".to_string()];
+        }
         Ok(Stmt::CreateAggregate {
             name,
             arg_types,
@@ -8926,6 +9138,13 @@ impl Parser {
             minvfunc,
             mstype,
             parallel,
+            or_replace,
+            ordered_set,
+            hypothetical,
+            sort_types,
+            combinefunc,
+            serialfunc,
+            deserialfunc,
         })
     }
 
@@ -9732,6 +9951,61 @@ impl Parser {
     /// {VOLATILE|STABLE|IMMUTABLE}` (PG19 AlterFunctionStmt, volatility
     /// action only). Other actions (STRICT, COST, ROWS, SET, OWNER TO,
     /// RENAME) are an honest 0A000.
+    /// v2.41: ALTER AGGREGATE name (args) RENAME TO new_name
+    /// (PG19 AlterAggregateStmt; the argument list may carry the
+    /// ordered-set ORDER BY part).
+    pub(crate) fn parse_alter_aggregate(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("aggregate")?;
+        let name = self.parse_table_name()?;
+        self.expect(Token::LParen, "'('")?;
+        let mut arg_types = Vec::new();
+        let mut sort_types = Vec::new();
+        if *self.peek() != Token::RParen {
+            loop {
+                let at = self.parse_agg_arg_type()?;
+                arg_types.push(at);
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("order")) {
+                    self.next();
+                    self.expect_keyword("by")?;
+                    loop {
+                        let st = self.parse_agg_arg_type()?;
+                        sort_types.push(st);
+                        if matches!(self.peek(), Token::Comma) {
+                            self.next();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                match self.next() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => {
+                        return Err(err(format!(
+                            "syntax error: expected ',' or ')' in ALTER AGGREGATE, found {:?}",
+                            other
+                        )));
+                    }
+                }
+            }
+        } else {
+            self.next();
+        }
+        if self.eat_keyword("rename") {
+            self.expect_keyword("to")?;
+            let new_name = self.parse_table_name()?;
+            return Ok(Stmt::AlterAggregateRename {
+                name,
+                arg_types,
+                sort_types,
+                new_name,
+            });
+        }
+        Err(err(
+            "syntax error: unsupported ALTER AGGREGATE action".to_string()
+        ))
+    }
+
     pub(crate) fn parse_alter_function(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("function")?;
         let name = self.parse_table_name()?;
@@ -11177,10 +11451,19 @@ impl Parser {
         let mut null_set = false;
         let mut quote_set = false;
         let mut escape_set = false;
-        if matches!(self.peek(), Token::Ident(w) if w == "with")
-            && !matches!(self.peek2(), Token::LParen)
+        // v2.41: PG19's legacy option list also appears WITHOUT the
+        // WITH keyword (`COPY t FROM STDIN NULL 'null'` in
+        // aggregates.sql) — gram.y's copy_opt_list makes WITH optional.
+        let bare_legacy = matches!(self.peek(), Token::Ident(w) if matches!(w.as_str(),
+            "delimiter" | "null" | "header" | "quote" | "escape" | "csv" | "json"
+            | "oids" | "freeze" | "encoding" | "force" | "binary"));
+        if (matches!(self.peek(), Token::Ident(w) if w == "with")
+            && !matches!(self.peek2(), Token::LParen))
+            || bare_legacy
         {
-            self.next(); // WITH
+            if !bare_legacy {
+                self.next(); // WITH
+            }
             // v2.37: legacy pre-9.0 COPY option syntax (PG19 gram.y
             // copy_opt_list): `WITH DELIMITER ','`, `WITH NULL 'x'`,
             // `WITH CSV HEADER`, or a bare `WITH` with no options at
@@ -13443,6 +13726,24 @@ impl Parser {
             "max" => Some(AggFunc::Max),
             "string_agg" => Some(AggFunc::StringAgg),
             "bool_and" => Some(AggFunc::BoolAnd),
+            // v2.41: bool_or; `every` is PG's second pg_proc entry for
+            // the bool_and transition (header told apart by `written`).
+            "bool_or" => Some(AggFunc::BoolOr),
+            "every" => Some(AggFunc::BoolAnd),
+            "any_value" => Some(AggFunc::AnyValue),
+            // v2.41: PG19 regression aggregates (two float8 args).
+            "regr_count" => Some(AggFunc::RegrCount),
+            "regr_avgx" => Some(AggFunc::RegrAvgX),
+            "regr_avgy" => Some(AggFunc::RegrAvgY),
+            "regr_sxx" => Some(AggFunc::RegrSxx),
+            "regr_syy" => Some(AggFunc::RegrSyy),
+            "regr_sxy" => Some(AggFunc::RegrSxy),
+            "regr_slope" => Some(AggFunc::RegrSlope),
+            "regr_intercept" => Some(AggFunc::RegrIntercept),
+            "regr_r2" => Some(AggFunc::RegrR2),
+            "corr" => Some(AggFunc::Corr),
+            "covar_pop" => Some(AggFunc::CovarPop),
+            "covar_samp" => Some(AggFunc::CovarSamp),
             // v1.93: bit_and/bit_or/bit_xor aggregates.
             "bit_and" => Some(AggFunc::BitAnd),
             "bit_or" => Some(AggFunc::BitOr),
@@ -13474,7 +13775,21 @@ impl Parser {
             };
             let arg2 = if matches!(
                 func,
-                AggFunc::StringAgg | AggFunc::JsonObjectAgg | AggFunc::JsonbObjectAgg
+                AggFunc::StringAgg
+                    | AggFunc::JsonObjectAgg
+                    | AggFunc::JsonbObjectAgg
+                    | AggFunc::RegrCount
+                    | AggFunc::RegrAvgX
+                    | AggFunc::RegrAvgY
+                    | AggFunc::RegrSxx
+                    | AggFunc::RegrSyy
+                    | AggFunc::RegrSxy
+                    | AggFunc::RegrSlope
+                    | AggFunc::RegrIntercept
+                    | AggFunc::RegrR2
+                    | AggFunc::Corr
+                    | AggFunc::CovarPop
+                    | AggFunc::CovarSamp
             ) {
                 self.expect(Token::Comma, "','")?;
                 Some(Box::new(self.parse_or()?))
@@ -13563,6 +13878,9 @@ impl Parser {
                 arg2: args.get(1).cloned(),
                 agg_order_by: agg_order_by.clone(),
                 filter: filter.clone(),
+                // v2.41: PG names the output column after the written
+                // name (var_samp / stddev_samp / every).
+                written: Some(name.clone()),
             };
             // v0.10: `<agg>(...) OVER (...)` — windowed aggregate.
             if self.eat_keyword("over") {
@@ -13605,8 +13923,25 @@ impl Parser {
         // rest) — like Postgres.
         if *self.peek() == Token::LParen {
             self.next();
+            // v2.41: PG19 gram.y allows DISTINCT inside any function
+            // call syntactically; parse_func.c rejects it (42803) for
+            // non-aggregates. The parser cannot see the catalog, so a
+            // DISTINCT here is carried as a `__agg_distinct` marker
+            // around the call: grouped evaluation unwraps it for
+            // user-defined aggregates, plain evaluation raises 42803.
+            let agg_distinct = self.eat_keyword("distinct");
+            let mut agg_order_keys: Option<Vec<Expr>> = None;
             let mut args = Vec::new();
-            if *self.peek() != Token::RParen {
+            // v2.41: `agg(*)` for zero-input user aggregates (PG19
+            // gram.y func_arg_list with a bare star): carried as a
+            // `__agg_star` marker argument.
+            if *self.peek() == Token::Star {
+                self.next();
+                args.push(Expr::Func {
+                    name: "__agg_star".to_string(),
+                    args: Vec::new(),
+                });
+            } else if *self.peek() != Token::RParen {
                 loop {
                     // v0.95: `name => expr` named-argument syntax (PG19).
                     // Stored as `Expr::NamedArg`; the executor resolves
@@ -13634,6 +13969,76 @@ impl Parser {
                     } else {
                         args.push(self.parse_or()?);
                     }
+                    // v2.41: aggregate ORDER BY inside a generic
+                    // call (`aggfns(distinct a, b, c order by b)`):
+                    // the parser cannot tell whether the name is an
+                    // aggregate, so the sort keys are carried as a
+                    // `__agg_order` marker (same key wrappers as
+                    // __within_group); grouped evaluation applies
+                    // them for user aggregates, anything else is
+                    // PG19's 42601/42803 at exec.
+                    if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("order"))
+                        && matches!(self.peek2(), Token::Ident(s) if s.eq_ignore_ascii_case("by"))
+                    {
+                        self.next(); // ORDER
+                        self.next(); // BY
+                        let mut keys = Vec::new();
+                        loop {
+                            let mut k = self.parse_or()?;
+                            // USING <op> form: keep the operator as
+                            // a `__agg_using` wrapper carrying the
+                            // operator name in a text literal.
+                            if self.eat_keyword("using") {
+                                let op = self.parse_operator_name()?;
+                                k = Expr::Func {
+                                    name: "__agg_using".to_string(),
+                                    args: vec![
+                                        k,
+                                        Expr::Literal(crate::sql::Literal::Text(op.into())),
+                                    ],
+                                };
+                            } else {
+                                let desc = if self.eat_keyword("desc") {
+                                    true
+                                } else {
+                                    self.eat_keyword("asc");
+                                    false
+                                };
+                                let mut nf: Option<bool> = None;
+                                if self.eat_keyword("nulls") {
+                                    if self.eat_keyword("first") {
+                                        nf = Some(true);
+                                    } else {
+                                        self.expect_keyword("last")?;
+                                        nf = Some(false);
+                                    }
+                                }
+                                if let Some(nf) = nf {
+                                    k = Expr::Func {
+                                        name: if nf {
+                                            "__wg_nf".to_string()
+                                        } else {
+                                            "__wg_nl".to_string()
+                                        },
+                                        args: vec![k],
+                                    };
+                                }
+                                if desc {
+                                    k = Expr::Func {
+                                        name: "__wg_desc".to_string(),
+                                        args: vec![k],
+                                    };
+                                }
+                            }
+                            keys.push(k);
+                            if *self.peek() == Token::Comma {
+                                self.next();
+                                continue;
+                            }
+                            break;
+                        }
+                        agg_order_keys = Some(keys);
+                    }
                     if *self.peek() == Token::Comma {
                         self.next();
                         continue;
@@ -13648,6 +14053,7 @@ impl Parser {
             // lookup fails first; rustgres resolves unknown names at
             // execution, so the WITHIN GROUP kind check applies
             // uniformly (deliberate approximation).
+            let mut within_keys: Option<Vec<Expr>> = None;
             if self.peek_is_within() {
                 let is_window_fn = matches!(
                     name.as_str(),
@@ -13667,13 +14073,63 @@ impl Parser {
                         code: "42809",
                     });
                 }
-                return Err(SqlError {
-                    message: format!(
-                        "WITHIN GROUP specified, but {} is not an aggregate function",
-                        name
-                    ),
-                    code: "42809",
-                });
+                // v2.41: an unresolvable name may be a user-defined
+                // ordered-set aggregate (CREATE AGGREGATE with ORDER
+                // BY in its argument list). The parser cannot see the
+                // catalog, so the clause is carried as a
+                // `__within_group` marker: grouped evaluation
+                // resolves the definition (42809 there when the name
+                // is not an ordered-set aggregate). Sort keys ride as
+                // trailing marker arguments; DESC / NULLS FIRST /
+                // NULLS LAST wrap the key expression.
+                self.expect_keyword("within")?;
+                self.expect_keyword("group")?;
+                self.expect(Token::LParen, "'('")?;
+                self.expect_keyword("order")?;
+                self.expect_keyword("by")?;
+                let mut keys = Vec::new();
+                loop {
+                    let mut k = self.parse_or()?;
+                    let desc = if self.eat_keyword("desc") {
+                        true
+                    } else {
+                        self.eat_keyword("asc");
+                        false
+                    };
+                    let mut nf: Option<bool> = None;
+                    if self.eat_keyword("nulls") {
+                        if self.eat_keyword("first") {
+                            nf = Some(true);
+                        } else {
+                            self.expect_keyword("last")?;
+                            nf = Some(false);
+                        }
+                    }
+                    if let Some(nf) = nf {
+                        k = Expr::Func {
+                            name: if nf {
+                                "__wg_nf".to_string()
+                            } else {
+                                "__wg_nl".to_string()
+                            },
+                            args: vec![k],
+                        };
+                    }
+                    if desc {
+                        k = Expr::Func {
+                            name: "__wg_desc".to_string(),
+                            args: vec![k],
+                        };
+                    }
+                    keys.push(k);
+                    if *self.peek() == Token::Comma {
+                        self.next();
+                        continue;
+                    }
+                    break;
+                }
+                self.expect(Token::RParen, "')'")?;
+                within_keys = Some(keys);
             }
             if is_builtin_fn(&name) {
                 check_builtin_arity(&name, args.len())?;
@@ -13683,10 +14139,11 @@ impl Parser {
             // function" — except on a true window function with OVER
             // following, which is 0A000 "FILTER is not implemented for
             // non-aggregate window functions".
+            let mut agg_filter: Option<Expr> = None;
             if self.eat_keyword("filter") {
                 self.expect(Token::LParen, "'('")?;
                 self.expect_keyword("where")?;
-                let _ = self.parse_or()?;
+                let filter_expr = self.parse_or()?;
                 self.expect(Token::RParen, "')'")?;
                 let followed_by_over = matches!(self.peek(), Token::Ident(s) if s == "over");
                 let is_window_fn = matches!(
@@ -13708,13 +14165,19 @@ impl Parser {
                         code: "0A000",
                     });
                 }
-                return Err(SqlError {
-                    message: format!(
-                        "FILTER specified, but {} is not an aggregate function",
-                        name
-                    ),
-                    code: "42803",
-                });
+                // v2.41: a name the parser cannot resolve may be a
+                // user-defined aggregate — carry the filter as a
+                // marker; known builtins keep the parse-time 42803.
+                if is_builtin_fn(&name) || is_window_fn {
+                    return Err(SqlError {
+                        message: format!(
+                            "FILTER specified, but {} is not an aggregate function",
+                            name
+                        ),
+                        code: "42803",
+                    });
+                }
+                agg_filter = Some(filter_expr);
             }
             // v2.39: PG19 gram.y func_expr order — null_treatment
             // follows the (rejected above) FILTER clause and precedes
@@ -13796,7 +14259,38 @@ impl Parser {
                     written: None,
                 });
             }
-            return Ok(Expr::Func { name, args });
+            // v2.41: wrap DISTINCT / FILTER markers for possible
+            // user-defined aggregates (see above).
+            let mut call = Expr::Func { name, args };
+            if let Some(keys) = agg_order_keys {
+                let mut margs = vec![call];
+                margs.extend(keys);
+                call = Expr::Func {
+                    name: "__agg_order".to_string(),
+                    args: margs,
+                };
+            }
+            if agg_distinct {
+                call = Expr::Func {
+                    name: "__agg_distinct".to_string(),
+                    args: vec![call],
+                };
+            }
+            if let Some(f) = agg_filter {
+                call = Expr::Func {
+                    name: "__agg_filter".to_string(),
+                    args: vec![call, f],
+                };
+            }
+            if let Some(keys) = within_keys {
+                let mut margs = vec![call];
+                margs.extend(keys);
+                call = Expr::Func {
+                    name: "__within_group".to_string(),
+                    args: margs,
+                };
+            }
+            return Ok(call);
         }
         Err(err(format!(
             "syntax error: expected '(', found {:?}",
@@ -15171,6 +15665,7 @@ impl Parser {
             arg2,
             agg_order_by: order_by.clone(),
             filter: filter.clone(),
+            written: None,
         };
         if self.eat_keyword("over") {
             if !order_by.is_empty() {

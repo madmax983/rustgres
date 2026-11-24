@@ -1419,7 +1419,12 @@ pub(crate) fn expr_col_name_strength(e: &Expr) -> (String, u8) {
             }
             _ => ("?column?".to_string(), 0),
         },
-        Expr::Agg { func, .. } => (func.name().to_string(), 2),
+        // v2.41: PG names the column after the written aggregate name
+        // (var_samp, stddev_samp, every), not the canonical AggFunc.
+        Expr::Agg { func, written, .. } => (
+            written.clone().unwrap_or_else(|| func.name().to_string()),
+            2,
+        ),
         // v1.30: PG19 names the column after the ordered-set
         // aggregate (`FigureColName`: the FuncCall name).
         Expr::WithinGroup { func, .. } => (func.name().to_string(), 2),
@@ -1502,6 +1507,23 @@ pub(crate) fn expr_col_name_strength(e: &Expr) -> (String, u8) {
         // calls in PG's FigureColname — the column is ?column?.
         Expr::Func { name, .. } if name == "__tsquery_phrase" || name == "__tsquery_not" => {
             ("?column?".to_string(), 0)
+        }
+        // v2.41: DISTINCT / FILTER markers name the column after
+        // the wrapped call (PG names it after the aggregate).
+        Expr::Func { name, args } if name == "__agg_distinct" || name == "__agg_filter" => {
+            expr_col_name_strength(&args[0])
+        }
+        // v2.41: aggregate ORDER BY marker — column named after the
+        // wrapped call.
+        Expr::Func { name, args } if name == "__agg_order" => expr_col_name_strength(&args[0]),
+        // v2.41: WITHIN GROUP marker — the column takes the
+        // aggregate's name (args[0] may itself be FILTER-wrapped).
+        Expr::Func { name, args } if name == "__within_group" => {
+            let inner = match &args[0] {
+                Expr::Func { name: n, args: a } if n == "__agg_filter" => &a[0],
+                other => other,
+            };
+            expr_col_name_strength(inner)
         }
         // v2.33: PG names the column by the bare function name — a
         // schema qualifier in the call is not part of it.
@@ -2694,6 +2716,10 @@ pub(crate) fn agg_result_type(
             // must accept them too.
             let a = arg.expect("string_agg always takes arguments");
             let t = expr_type(eng, snap, own, session, schemas, outer, ctes, a)?;
+            // v2.41: PG19 also has string_agg(bytea, bytea) -> bytea.
+            if matches!(t, ColType::Bytea) {
+                return Ok(ColType::Bytea);
+            }
             if !matches!(t, ColType::Text | ColType::Varchar(_) | ColType::Char(_)) {
                 return Err(exec_err(
                     "42883",
@@ -2714,6 +2740,38 @@ pub(crate) fn agg_result_type(
             }
             Ok(ColType::Bool)
         }
+        // v2.41: bool_or (same bool argument discipline as bool_and).
+        AggFunc::BoolOr => {
+            let a = arg.expect("bool_or always takes an argument");
+            let t = expr_type(eng, snap, own, session, schemas, outer, ctes, a)?;
+            if !matches!(t, ColType::Bool) {
+                return Err(exec_err(
+                    "42883",
+                    format!("function bool_or({}) does not exist", t.sql_name()),
+                ));
+            }
+            Ok(ColType::Bool)
+        }
+        // v2.41: any_value(anyelement) -> the argument type.
+        AggFunc::AnyValue => {
+            let a = arg.expect("any_value always takes an argument");
+            expr_type(eng, snap, own, session, schemas, outer, ctes, a)
+        }
+        // v2.41: PG19 regression aggregates: (float8, float8) ->
+        // float8, except regr_count -> int8. Numeric/int inputs ride
+        // PG's implicit casts to float8.
+        AggFunc::RegrCount => Ok(ColType::BigInt),
+        AggFunc::RegrAvgX
+        | AggFunc::RegrAvgY
+        | AggFunc::RegrSxx
+        | AggFunc::RegrSyy
+        | AggFunc::RegrSxy
+        | AggFunc::RegrSlope
+        | AggFunc::RegrIntercept
+        | AggFunc::RegrR2
+        | AggFunc::Corr
+        | AggFunc::CovarPop
+        | AggFunc::CovarSamp => Ok(ColType::Float),
         // v1.93: bit_and/bit_or/bit_xor — PG19 defines them for
         // int2/int4/int8 and bit/varbit; the result type is the
         // argument type.

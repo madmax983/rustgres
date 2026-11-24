@@ -412,7 +412,22 @@ pub(crate) fn check_agg_window_arity(f: &AggFunc, n: usize) -> bool {
         | AggFunc::VariancePop
         | AggFunc::StddevSamp
         | AggFunc::StddevPop
+        | AggFunc::BoolOr
+        | AggFunc::AnyValue
         | AggFunc::ArrayAgg => n == 1,
+        // v2.41: regression aggregates take (Y, X) as window funcs too.
+        AggFunc::RegrCount
+        | AggFunc::RegrAvgX
+        | AggFunc::RegrAvgY
+        | AggFunc::RegrSxx
+        | AggFunc::RegrSyy
+        | AggFunc::RegrSxy
+        | AggFunc::RegrSlope
+        | AggFunc::RegrIntercept
+        | AggFunc::RegrR2
+        | AggFunc::Corr
+        | AggFunc::CovarPop
+        | AggFunc::CovarSamp => n == 2,
         AggFunc::StringAgg => false,
         // v1.84: json_agg/jsonb_agg are window-capable in PG19;
         // the object aggregates need a second value stream the
@@ -2431,6 +2446,27 @@ pub(crate) fn eval_window_agg(
         AggFunc::Sum => sum_vals(vals),
         AggFunc::Avg => avg_vals(vals),
         AggFunc::BoolAnd => bool_and_vals(vals),
+        AggFunc::BoolOr => bool_or_vals(vals),
+        AggFunc::AnyValue => Ok(vals.first().cloned().unwrap_or(Value::Null)),
+        // v2.41: windowed regression aggregates need the paired (Y, X)
+        // stream, which the window machinery does not carry; PG19
+        // supports them, so this is a documented approximation gap
+        // (the grouped path is exact).
+        AggFunc::RegrCount
+        | AggFunc::RegrAvgX
+        | AggFunc::RegrAvgY
+        | AggFunc::RegrSxx
+        | AggFunc::RegrSyy
+        | AggFunc::RegrSxy
+        | AggFunc::RegrSlope
+        | AggFunc::RegrIntercept
+        | AggFunc::RegrR2
+        | AggFunc::Corr
+        | AggFunc::CovarPop
+        | AggFunc::CovarSamp => Err(exec_err(
+            "0A000",
+            "regression aggregates are not supported as window functions",
+        )),
         AggFunc::BitAnd | AggFunc::BitOr | AggFunc::BitXor => bit_agg_vals(f, vals),
         AggFunc::VarianceSamp => variance_vals(vals, "variance", true, true),
         AggFunc::VariancePop => variance_vals(vals, "var_pop", false, true),

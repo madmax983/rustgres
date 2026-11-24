@@ -12,6 +12,42 @@ use super::*;
 /// propagates, except an untyped NULL scalar next to an array is a NULL
 /// array *element* (PG's unknown-literal resolution).
 ///
+/// v2.41: extract an N-element float8 transition state from an array
+/// value (PG19 `check_float8_array`).
+pub(crate) fn float8_state_of(v: &Value, n: usize, caller: &str) -> Result<Vec<f64>, ExecError> {
+    if let Value::Array(arr) = v {
+        if arr.elems.len() == n && arr.ndim() == 1 {
+            let mut out = Vec::with_capacity(n);
+            for e in &arr.elems {
+                match e {
+                    Value::Float(f) => out.push(*f),
+                    Value::Float4(f) => out.push(*f as f64),
+                    Value::Int(i) | Value::BigInt(i) => out.push(*i as f64),
+                    Value::SmallInt(i) => out.push(*i as f64),
+                    _ => break,
+                }
+            }
+            if out.len() == n {
+                return Ok(out);
+            }
+        }
+    }
+    Err(exec_err(
+        "XX000",
+        format!("{}: expected {}-element float8 array", caller, n),
+    ))
+}
+
+/// v2.41: build a float8[] value from transition-state slots.
+pub(crate) fn float8_array_value(vals: &[f64]) -> Value {
+    Value::Array(Box::new(crate::storage::ArrayVal {
+        elem: crate::storage::ArrayElem::Float,
+        dims: vec![vals.len() as i32],
+        lower: vec![1],
+        elems: vals.iter().map(|f| Value::Float(*f)).collect(),
+    }))
+}
+
 /// v0.90: `__variadic` marker check — returns true if `e` is the
 /// `__variadic(inner)` marker produced by the parser for `VARIADIC inner`.
 pub(crate) fn is_variadic_marker(e: &Expr) -> Option<&Expr> {
@@ -1964,6 +2000,23 @@ pub(crate) fn rewrite_record_refs_expr(
             rr_box(b, pb, run, params);
         }
     }
+    // v2.41: a bare record-valued parameter (a composite argument or
+    // variable referenced whole, e.g. `RETURN state`) — substitute a
+    // ROW literal of its fields, since param substitution cannot
+    // carry Record values (they degrade to NULL; that made every
+    // plpgsql transition over a composite state return NULL).
+    if let Expr::Param(n) = e {
+        if let Some(Some(Value::Record(fields))) = run.params.get((*n - 1) as usize) {
+            let fields = fields.clone();
+            *e = Expr::Row(
+                fields
+                    .iter()
+                    .map(|(_, fv)| super::agg::value_literal_expr(fv))
+                    .collect(),
+            );
+            return;
+        }
+    }
     // Recurse into children first (coverage mirrors subst_expr).
     match e {
         Expr::Arith { left, right, .. }
@@ -1991,7 +2044,13 @@ pub(crate) fn rewrite_record_refs_expr(
             rr_box(pattern, pb, run, params);
         }
         Expr::FieldAccess { expr, .. } => {
-            rr_box(expr, pb, run, params);
+            // A Param operand is a leaf; the FieldAccess self-check
+            // below rewrites it to the field's value. Recursing into
+            // it would first rewrite a record Param to a ROW literal
+            // (the v2.41 bare-record rewrite) and break that check.
+            if !matches!(**expr, Expr::Param(_)) {
+                rr_box(expr, pb, run, params);
+            }
         }
         Expr::Between {
             expr, low, high, ..
@@ -5707,6 +5766,215 @@ pub(crate) fn eval_func(
     // call (the COLLATION FOR syntax produces Expr::CollationFor).
     if (name == "collation_for" || name == "pg_collation_for") && args.len() == 1 {
         return crate::exec::collate::eval_collation_for(q, scopes, &args[0]);
+    }
+    // v2.41: PG19 aggregate transition/combine functions, also
+    // callable as plain functions (float.c / numeric.c / bool
+    // statefuncs in pg_proc.dat). Strict: a NULL argument yields NULL
+    // (checked after evaluation, mirroring PG's strict call path).
+    match name {
+        "float8_accum" | "float4_accum" if args.len() == 2 => {
+            let st = eval_expr(q, scopes, &args[0])?;
+            let x = eval_expr(q, scopes, &args[1])?;
+            if st == Value::Null || x == Value::Null {
+                return Ok(Value::Null);
+            }
+            let s = float8_state_of(&st, 3, name)?;
+            let (n, sx, sxx) =
+                crate::exec::agg::float8_accum_step((s[0], s[1], s[2]), to_f64v(&x))?;
+            return Ok(float8_array_value(&[n, sx, sxx]));
+        }
+        "float8_regr_accum" if args.len() == 3 => {
+            let st = eval_expr(q, scopes, &args[0])?;
+            let y = eval_expr(q, scopes, &args[1])?;
+            let x = eval_expr(q, scopes, &args[2])?;
+            if st == Value::Null || y == Value::Null || x == Value::Null {
+                return Ok(Value::Null);
+            }
+            let s = float8_state_of(&st, 8, name)?;
+            let cur = crate::exec::agg::RegrState {
+                n: s[0],
+                sx: s[1],
+                sxx: s[2],
+                sy: s[3],
+                syy: s[4],
+                sxy: s[5],
+                common_x: s[6],
+                common_y: s[7],
+            };
+            let out = crate::exec::agg::regr_accum_step(cur, to_f64v(&y), to_f64v(&x))?;
+            return Ok(float8_array_value(&[
+                out.n,
+                out.sx,
+                out.sxx,
+                out.sy,
+                out.syy,
+                out.sxy,
+                out.common_x,
+                out.common_y,
+            ]));
+        }
+        "float8_combine" if args.len() == 2 => {
+            let a = eval_expr(q, scopes, &args[0])?;
+            let b = eval_expr(q, scopes, &args[1])?;
+            if a == Value::Null || b == Value::Null {
+                return Ok(Value::Null);
+            }
+            let sa = float8_state_of(&a, 3, name)?;
+            let sb = float8_state_of(&b, 3, name)?;
+            let (n, sx, sxx) = crate::exec::agg::float8_combine_states(
+                (sa[0], sa[1], sa[2]),
+                (sb[0], sb[1], sb[2]),
+            )?;
+            return Ok(float8_array_value(&[n, sx, sxx]));
+        }
+        "float8_regr_combine" if args.len() == 2 => {
+            let a = eval_expr(q, scopes, &args[0])?;
+            let b = eval_expr(q, scopes, &args[1])?;
+            if a == Value::Null || b == Value::Null {
+                return Ok(Value::Null);
+            }
+            let sa = float8_state_of(&a, 8, name)?;
+            let sb = float8_state_of(&b, 8, name)?;
+            let to_state = |s: &[f64]| crate::exec::agg::RegrState {
+                n: s[0],
+                sx: s[1],
+                sxx: s[2],
+                sy: s[3],
+                syy: s[4],
+                sxy: s[5],
+                common_x: s[6],
+                common_y: s[7],
+            };
+            let out = crate::exec::agg::regr_combine_states(to_state(&sa), to_state(&sb))?;
+            return Ok(float8_array_value(&[
+                out.n,
+                out.sx,
+                out.sxx,
+                out.sy,
+                out.syy,
+                out.sxy,
+                out.common_x,
+                out.common_y,
+            ]));
+        }
+        "booland_statefunc" | "boolor_statefunc" if args.len() == 2 => {
+            let a = eval_expr(q, scopes, &args[0])?;
+            let b = eval_expr(q, scopes, &args[1])?;
+            if a == Value::Null || b == Value::Null {
+                return Ok(Value::Null);
+            }
+            return match (a, b) {
+                (Value::Bool(x), Value::Bool(y)) => {
+                    Ok(Value::Bool(if name == "booland_statefunc" {
+                        x && y
+                    } else {
+                        x || y
+                    }))
+                }
+                _ => Err(exec_err(
+                    "42883",
+                    format!("function {}(boolean, boolean) does not exist", name),
+                )),
+            };
+        }
+        // PG19 int*_avg / numeric_avg final functions (numeric.c):
+        // state {count, sum} -> sum / count as numeric, NULL when
+        // count is zero.
+        "int2_avg" | "int4_avg" | "int8_avg" | "numeric_avg" if args.len() == 1 => {
+            let st = eval_expr(q, scopes, &args[0])?;
+            if st == Value::Null {
+                return Ok(Value::Null);
+            }
+            if let Value::Array(arr) = &st {
+                if arr.elems.len() == 2 {
+                    let (count, sum) = (&arr.elems[0], &arr.elems[1]);
+                    let is_zero = match count {
+                        Value::Int(i) | Value::BigInt(i) => *i == 0,
+                        Value::SmallInt(i) => *i == 0,
+                        Value::Numeric(n) => n.to_f64() == 0.0,
+                        _ => false,
+                    };
+                    if is_zero {
+                        return Ok(Value::Null);
+                    }
+                    let to_num = |v: &Value| -> Result<Value, ExecError> {
+                        match v {
+                            Value::Numeric(_) => Ok(v.clone()),
+                            Value::Int(i) | Value::BigInt(i) => {
+                                Ok(Value::Numeric(crate::storage::Numeric::new(*i as i128, 0)))
+                            }
+                            Value::SmallInt(i) => {
+                                Ok(Value::Numeric(crate::storage::Numeric::new(*i as i128, 0)))
+                            }
+                            _ => Err(exec_err("42883", "invalid avg state".to_string())),
+                        }
+                    };
+                    return eval_arith(ArithOp::Div, &to_num(sum)?, &to_num(count)?);
+                }
+            }
+            return Err(exec_err(
+                "42883",
+                format!("function {}(bigint[]) does not exist", name),
+            ));
+        }
+        // PG19 int8inc / int8inc_any (int8.c): increment, ignoring
+        // the second argument of the _any form.
+        "int8inc" if args.len() == 1 => {
+            let v = eval_expr(q, scopes, &args[0])?;
+            if v == Value::Null {
+                return Ok(Value::Null);
+            }
+            let i = crate::exec::agg::value_as_i64(&v).ok_or_else(|| {
+                exec_err(
+                    "42883",
+                    "function int8inc(bigint) does not exist".to_string(),
+                )
+            })?;
+            return Ok(Value::BigInt(i + 1));
+        }
+        "int8inc_any" if args.len() == 2 => {
+            let v = eval_expr(q, scopes, &args[0])?;
+            if v == Value::Null {
+                return Ok(Value::Null);
+            }
+            let i = crate::exec::agg::value_as_i64(&v).ok_or_else(|| {
+                exec_err(
+                    "42883",
+                    "function int8inc_any(bigint) does not exist".to_string(),
+                )
+            })?;
+            return Ok(Value::BigInt(i + 1));
+        }
+        // PG19 numeric_avg_accum (numeric.c): state numeric[]
+        // {count, sum}; the step appends the input to the sum.
+        "numeric_avg_accum" if args.len() == 2 => {
+            let st = eval_expr(q, scopes, &args[0])?;
+            let x = eval_expr(q, scopes, &args[1])?;
+            if st == Value::Null || x == Value::Null {
+                return Ok(Value::Null);
+            }
+            if let (Value::Array(arr), Value::Numeric(_)) = (&st, &x) {
+                if arr.elems.len() == 2 {
+                    let count = eval_arith(
+                        ArithOp::Add,
+                        &arr.elems[0],
+                        &Value::Numeric(crate::storage::Numeric::new(1, 0)),
+                    )?;
+                    let sum = eval_arith(ArithOp::Add, &arr.elems[1], &x)?;
+                    return Ok(Value::Array(Box::new(crate::storage::ArrayVal {
+                        elem: crate::storage::ArrayElem::Numeric,
+                        dims: vec![2],
+                        lower: vec![1],
+                        elems: vec![count, sum],
+                    })));
+                }
+            }
+            return Err(exec_err(
+                "42883",
+                "function numeric_avg_accum(numeric[], numeric) does not exist".to_string(),
+            ));
+        }
+        _ => {}
     }
     if args.is_empty() {
         match name {
@@ -16163,13 +16431,7 @@ pub(crate) fn func_result_type(
     // v1.96: user-defined aggregates — result type is the final
     // function's return type, else the state type.
     {
-        let base = name.rsplit('.').next().unwrap_or(name);
-        if let Some(def) = eng
-            .db
-            .aggregates
-            .get(name)
-            .or_else(|| eng.db.aggregates.get(base))
-        {
+        if let Some(def) = super::agg::find_user_agg(&eng.db, name) {
             if let Some(ff) = &def.finalfunc {
                 if let Some(fdefs) = eng.db.functions.get(ff) {
                     if let Some(fd) = fdefs.first() {
@@ -16179,6 +16441,110 @@ pub(crate) fn func_result_type(
             }
             return resolve_func_type_name(eng, snap, own, session, &def.stype);
         }
+    }
+    // v2.41: WITHIN GROUP marker — type by the user ordered-set
+    // aggregate's final function: rank_final is int8,
+    // percentile_cont_final is float8, percentile_disc_final takes
+    // the sort key's type.
+    if name == "__within_group" && args.len() >= 2 {
+        let inner = match &args[0] {
+            Expr::Func { name: n, args: a } if n == "__agg_filter" => &a[0],
+            other => other,
+        };
+        if let Expr::Func { name: iname, .. } = inner {
+            if let Some(def) = super::agg::find_user_agg(&eng.db, iname) {
+                let ff = def
+                    .finalfunc
+                    .as_deref()
+                    .unwrap_or("")
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                match ff.as_str() {
+                    "rank_final" => return Ok(ColType::BigInt),
+                    "percentile_cont_final" => return Ok(ColType::Float),
+                    "percentile_disc_final" => {
+                        return expr_type(eng, snap, own, session, schemas, outer, ctes, &args[1]);
+                    }
+                    _ => {}
+                }
+            }
+            // v2.41: not a user ordered-set aggregate — PG19 raises
+            // 42809 when the name resolves to a non-aggregate
+            // function, 42883 when it does not resolve at all.
+            if let Expr::Func {
+                name: iname,
+                args: iargs,
+            } = inner
+            {
+                let base = iname.rsplit('.').next().unwrap_or(iname);
+                if super::agg::find_user_agg(&eng.db, iname).is_some() {
+                    return Err(exec_err(
+                        "42809",
+                        format!(
+                            "WITHIN GROUP specified, but {} is not an ordered-set aggregate",
+                            base
+                        ),
+                    ));
+                }
+                return match func_result_type(
+                    iname, iargs, eng, snap, own, session, schemas, outer, ctes,
+                ) {
+                    Ok(_) => Err(exec_err(
+                        "42809",
+                        format!(
+                            "WITHIN GROUP specified, but {} is not an ordered-set aggregate",
+                            base
+                        ),
+                    )),
+                    Err(_) => Err(exec_err(
+                        "42883",
+                        format!("function {}() does not exist", base),
+                    )),
+                };
+            }
+        }
+    }
+    // v2.41: the ORDER BY marker types as its inner call too.
+    if name == "__agg_order" && !args.is_empty() {
+        if let Expr::Func {
+            name: iname,
+            args: iargs,
+        } = &args[0]
+        {
+            return func_result_type(iname, iargs, eng, snap, own, session, schemas, outer, ctes);
+        }
+    }
+    // v2.41: DISTINCT / FILTER markers type as their inner call.
+    if (name == "__agg_distinct" || name == "__agg_filter") && !args.is_empty() {
+        if let Expr::Func {
+            name: iname,
+            args: iargs,
+        } = &args[0]
+        {
+            return func_result_type(iname, iargs, eng, snap, own, session, schemas, outer, ctes);
+        }
+    }
+    // v2.41: PG19 aggregate transition/combine functions as scalar
+    // calls (float.c / numeric.c / bool statefuncs / int8inc).
+    match name {
+        "float8_accum"
+        | "float4_accum"
+        | "float8_combine"
+        | "float8_regr_accum"
+        | "float8_regr_combine" => {
+            return Ok(ColType::Array(crate::storage::ArrayElem::Float));
+        }
+        "numeric_avg_accum" => {
+            return Ok(ColType::Array(crate::storage::ArrayElem::Numeric));
+        }
+        "booland_statefunc" | "boolor_statefunc" => return Ok(ColType::Bool),
+        "int2_avg" | "int4_avg" | "int8_avg" | "numeric_avg" => {
+            return Ok(ColType::Numeric(None));
+        }
+        "int8inc" | "int8inc_any" => return Ok(ColType::BigInt),
+        _ => {}
     }
     let arg0 = || expr_type(eng, snap, own, session, schemas, outer, ctes, &args[0]);
     // v1.88: range constructors and bound functions (static types).

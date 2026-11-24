@@ -313,7 +313,7 @@ pub(crate) fn cast_to_numeric(v: &Value) -> Result<Numeric, ExecError> {
         Value::Int(i) => Ok(Numeric::new(*i as i128, 0)),
         Value::BigInt(i) => Ok(Numeric::new(*i as i128, 0)),
         Value::Numeric(n) => Ok(n.clone()),
-        Value::Float4(f) => Numeric::from_f64(*f as f64)
+        Value::Float4(f) => Numeric::from_f32(*f)
             .map_err(|_| exec_err("22003", "value out of range for type numeric")),
         Value::Float(f) => Numeric::from_f64(*f)
             .map_err(|_| exec_err("22003", "value out of range for type numeric")),

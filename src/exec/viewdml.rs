@@ -734,6 +734,7 @@ fn map_children(
             arg2,
             agg_order_by,
             filter,
+            written,
         } => Expr::Agg {
             func: *func,
             arg: opt(arg, f)?,
@@ -741,6 +742,7 @@ fn map_children(
             arg2: opt(arg2, f)?,
             agg_order_by: map_terms(agg_order_by, f)?,
             filter: opt(filter, f)?,
+            written: written.clone(),
         },
         Expr::WithinGroup {
             func,

@@ -125,7 +125,7 @@ pub(crate) fn to_numeric_opt(v: &Value) -> Option<Numeric> {
         Value::Int(i) => Some(Numeric::new(*i as i128, 0)),
         Value::BigInt(i) => Some(Numeric::new(*i as i128, 0)),
         Value::Numeric(n) => Some(n.clone()),
-        Value::Float4(f) => Numeric::from_f64(*f as f64).ok(),
+        Value::Float4(f) => Numeric::from_f32(*f).ok(),
         Value::Float(f) => Numeric::from_f64(*f).ok(),
         // v0.25: untyped literals in a numeric function position (e.g.
         // `power('inf', '2')`) coerce through numeric's input function.

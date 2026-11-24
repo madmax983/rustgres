@@ -3291,6 +3291,9 @@ fn is_generic_guc(name: &str) -> bool {
             | "row_security"
             | "check_function_bodies"
             | "enable_material"
+            // v2.41: PG19 planner GUCs the aggregates suite flips.
+            | "enable_presorted_aggregate"
+            | "parallel_leader_participation"
             | "enable_partitionwise_aggregate"
             | "enable_partition_pruning"
             | "enable_incremental_sort"
@@ -3663,6 +3666,8 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
         | "enable_sort"
         | "enable_memoize"
         | "enable_partitionwise_join"
+        | "enable_presorted_aggregate"
+        | "parallel_leader_participation"
         | "enable_self_join_elimination"
         | "geqo" => parse_bool_guc(value)
             .map(|b| (if b { "on" } else { "off" }).to_string())
@@ -4136,6 +4141,8 @@ fn name_to_static(name: &str) -> &'static str {
         "enable_sort" => "enable_sort",
         "enable_memoize" => "enable_memoize",
         "enable_partitionwise_join" => "enable_partitionwise_join",
+        "enable_presorted_aggregate" => "enable_presorted_aggregate",
+        "parallel_leader_participation" => "parallel_leader_participation",
         "enable_self_join_elimination" => "enable_self_join_elimination",
         "geqo" => "geqo",
         "extra_float_digits" => "extra_float_digits",

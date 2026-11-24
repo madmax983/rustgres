@@ -2663,6 +2663,7 @@ pub(crate) fn resolve_predicate_columns_in(
             arg2,
             agg_order_by,
             filter,
+            written,
         } => Ok(Expr::Agg {
             func: *func,
             arg: arg.as_ref().map(|a| r(a).map(Box::new)).transpose()?,
@@ -2682,6 +2683,7 @@ pub(crate) fn resolve_predicate_columns_in(
             // v1.29: resolve columns in FILTER (same row scope as the
             // aggregate arguments).
             filter: filter.as_ref().map(|f| r(f).map(Box::new)).transpose()?,
+            written: written.clone(),
         }),
         // v1.30: resolve columns in an ordered-set aggregate — the
         // direct args, the WITHIN GROUP sort keys, and the FILTER

@@ -2019,6 +2019,9 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 initcond,
                 arg_types,
                 owner,
+                ordered_set: false,
+                hypothetical: false,
+                sort_types: Vec::new(),
             },
         );
     }

@@ -1390,6 +1390,277 @@ pub(crate) fn grouped_col_value(
 /// Evaluate a select-list / HAVING expression for one group: aggregates
 /// fold the group's rows, bare columns must be group-bound, and
 /// subqueries evaluate with the group's first row as correlation scope.
+/// v2.41: resolve a user-defined aggregate by (possibly qualified)
+/// name. The registry is name-keyed; a same-name aggregate with
+/// different argument types lives under a `name\u{1}sig` composite
+/// key and is found by the prefix scan.
+pub(crate) fn find_user_agg(
+    db: &crate::storage::Database,
+    name: &str,
+) -> Option<crate::storage::AggDef> {
+    let base = name.rsplit('.').next().unwrap_or(name);
+    if let Some(d) = db.aggregates.get(name).or_else(|| db.aggregates.get(base)) {
+        return Some(d.clone());
+    }
+    let prefix = format!("{}\u{1}", base);
+    db.aggregates
+        .iter()
+        .find(|(k, _)| k.starts_with(&prefix))
+        .map(|(_, d)| d.clone())
+}
+
+/// v2.41: evaluate a user-defined ordered-set aggregate call (the
+/// parser's `__within_group` marker). The definition must be an
+/// ordered-set aggregate built on PG's ordered_set_transition
+/// machinery; the final function selects the ordered-set kind.
+pub(crate) fn eval_user_within_group(
+    q: &mut Q,
+    outer: &[Scope],
+    gscope: Scope,
+    schema: &[QCol],
+    rows: &[QRow],
+    idxs: &[usize],
+    marker_args: &[Expr],
+) -> Result<Value, ExecError> {
+    // args[0] = the call (possibly FILTER-wrapped); args[1..] = the
+    // WITHIN GROUP sort keys with direction wrappers.
+    let (inner, filter) = match &marker_args[0] {
+        Expr::Func { name, args } if name == "__agg_filter" => (&args[0], Some(&args[1])),
+        other => (other, None),
+    };
+    let (iname, iargs) = match inner {
+        Expr::Func { name, args } => (name, args),
+        _ => {
+            return Err(exec_err(
+                "42809",
+                "WITHIN GROUP specified, but the call is not an aggregate function".to_string(),
+            ));
+        }
+    };
+    let def = find_user_agg(&q.eng.db, iname);
+    let def = match def {
+        Some(d) if d.ordered_set => d,
+        _ => {
+            return Err(exec_err(
+                "42809",
+                format!(
+                    "WITHIN GROUP specified, but {} is not an ordered-set aggregate",
+                    iname
+                ),
+            ));
+        }
+    };
+    let sfunc_base = def.sfunc.rsplit('.').next().unwrap_or(&def.sfunc);
+    if sfunc_base != "ordered_set_transition" && sfunc_base != "ordered_set_transition_multi" {
+        return Err(exec_err(
+            "42809",
+            format!(
+                "WITHIN GROUP specified, but {} is not an ordered-set aggregate",
+                iname
+            ),
+        ));
+    }
+    let ff = def
+        .finalfunc
+        .as_deref()
+        .unwrap_or("")
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    // PG19: rank_final is the hypothetical-set final function; the
+    // definition must carry the HYPOTHETICAL flag.
+    if ff == "rank_final" && !def.hypothetical {
+        return Err(exec_err(
+            "42809",
+            format!(
+                "WITHIN GROUP specified, but {} is not a hypothetical-set aggregate",
+                iname
+            ),
+        ));
+    }
+    let kind = match ff.as_str() {
+        "percentile_disc_final" => crate::sql::OrderedSetAgg::PercentileDisc,
+        "percentile_cont_final" => crate::sql::OrderedSetAgg::PercentileCont,
+        "rank_final" => crate::sql::OrderedSetAgg::Rank,
+        _ => {
+            return Err(exec_err(
+                "42883",
+                format!("function {}() does not exist", ff),
+            ));
+        }
+    };
+    let mut terms: Vec<crate::sql::OrderTerm> = Vec::new();
+    for k in &marker_args[1..] {
+        let mut e = k;
+        let mut desc = false;
+        let mut nulls_first: Option<bool> = None;
+        loop {
+            match e {
+                Expr::Func { name, args } if name == "__wg_desc" => {
+                    desc = true;
+                    e = &args[0];
+                }
+                Expr::Func { name, args } if name == "__wg_nf" => {
+                    nulls_first = Some(true);
+                    e = &args[0];
+                }
+                Expr::Func { name, args } if name == "__wg_nl" => {
+                    nulls_first = Some(false);
+                    e = &args[0];
+                }
+                _ => break,
+            }
+        }
+        terms.push(crate::sql::OrderTerm {
+            expr: e.clone(),
+            desc,
+            nulls_first,
+        });
+    }
+    eval_within_group_agg(
+        q, outer, gscope, schema, rows, idxs, kind, iargs, &terms, filter,
+    )
+}
+
+/// v2.41: sort a group's row indices by an aggregate ORDER BY key
+/// list (the parser's `__agg_order` marker keys). Plain keys compare
+/// with the window comparator (direction + NULL placement); USING
+/// keys evaluate the named operator pairwise (it is the opclass's
+/// less-than function: a ~<~ b orders a first).
+pub(crate) fn sort_idxs_by_agg_order(
+    q: &mut Q,
+    outer: &[Scope],
+    schema: &[QCol],
+    rows: &[QRow],
+    idxs: &[usize],
+    key_exprs: &[Expr],
+) -> Result<Vec<usize>, ExecError> {
+    // Unwrap the key wrappers into (expr, desc, nulls_first, using).
+    struct Key {
+        expr: Expr,
+        desc: bool,
+        nulls_first: Option<bool>,
+        using: Option<String>,
+    }
+    let mut keys: Vec<Key> = Vec::new();
+    for k in key_exprs {
+        let mut e = k;
+        let mut desc = false;
+        let mut nulls_first: Option<bool> = None;
+        let mut using: Option<String> = None;
+        loop {
+            match e {
+                Expr::Func { name, args } if name == "__wg_desc" => {
+                    desc = true;
+                    e = &args[0];
+                }
+                Expr::Func { name, args } if name == "__wg_nf" => {
+                    nulls_first = Some(true);
+                    e = &args[0];
+                }
+                Expr::Func { name, args } if name == "__wg_nl" => {
+                    nulls_first = Some(false);
+                    e = &args[0];
+                }
+                Expr::Func { name, args } if name == "__agg_using" => {
+                    if let Expr::Literal(crate::sql::Literal::Text(op)) = &args[1] {
+                        using = Some(op.to_string());
+                    }
+                    e = &args[0];
+                }
+                _ => break,
+            }
+        }
+        keys.push(Key {
+            expr: e.clone(),
+            desc,
+            nulls_first,
+            using,
+        });
+    }
+    // Evaluate the plain keys per row once.
+    let mut plain_vals: Vec<Vec<Value>> = Vec::with_capacity(idxs.len());
+    for &i in idxs {
+        let frame = Scope {
+            schema,
+            row: &rows[i].cells,
+            prov: None,
+        };
+        let mut buf: Vec<Scope> = Vec::with_capacity(outer.len() + 1);
+        buf.extend_from_slice(outer);
+        buf.push(frame);
+        let mut vals = Vec::with_capacity(keys.len());
+        for k in &keys {
+            vals.push(eval_expr(q, &buf, &k.expr)?);
+        }
+        plain_vals.push(vals);
+    }
+    let pos_of: std::collections::HashMap<usize, usize> =
+        idxs.iter().enumerate().map(|(p, &i)| (i, p)).collect();
+    let mut order: Vec<usize> = idxs.to_vec();
+    let mut sort_err: Option<ExecError> = None;
+    order.sort_by(|&a, &b| {
+        if sort_err.is_some() {
+            return Ordering::Equal;
+        }
+        let (pa, pb) = (pos_of[&a], pos_of[&b]);
+        for (ki, k) in keys.iter().enumerate() {
+            let (av, bv) = (&plain_vals[pa][ki], &plain_vals[pb][ki]);
+            let ord = if let Some(op) = &k.using {
+                // NULL keys: the operator is strict, so a NULL on
+                // either side is "not less" both ways — fall back to
+                // the default NULL placement for ASC.
+                if *av == Value::Null || *bv == Value::Null {
+                    match compare_values(av, bv, false, None) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            sort_err = Some(e);
+                            return Ordering::Equal;
+                        }
+                    }
+                } else {
+                    let lt = Expr::UserOp {
+                        op: op.clone(),
+                        left: Box::new(value_literal_expr(av)),
+                        right: Box::new(value_literal_expr(bv)),
+                    };
+                    let gt = Expr::UserOp {
+                        op: op.clone(),
+                        left: Box::new(value_literal_expr(bv)),
+                        right: Box::new(value_literal_expr(av)),
+                    };
+                    match (eval_expr(q, &[], &lt), eval_expr(q, &[], &gt)) {
+                        (Ok(Value::Bool(true)), _) => Ordering::Less,
+                        (_, Ok(Value::Bool(true))) => Ordering::Greater,
+                        (Ok(_), Ok(_)) => Ordering::Equal,
+                        (Err(e), _) | (_, Err(e)) => {
+                            sort_err = Some(e);
+                            return Ordering::Equal;
+                        }
+                    }
+                }
+            } else {
+                match compare_values(av, bv, k.desc, k.nulls_first) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        sort_err = Some(e);
+                        return Ordering::Equal;
+                    }
+                }
+            };
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    });
+    if let Some(e) = sort_err {
+        return Err(e);
+    }
+    Ok(order)
+}
+
 pub(crate) fn eval_grouped(
     q: &mut Q,
     outer: &[Scope],
@@ -1408,10 +1679,151 @@ pub(crate) fn eval_grouped(
     // `exec_agg`, so only the current set matters here.
     // v1.96: user-defined aggregates (CREATE AGGREGATE) parse as
     // plain function calls; fold them here in grouped evaluation.
+    // v2.41: DISTINCT / FILTER markers around a possible user
+    // aggregate (parser cannot see the catalog). Unwrap them here;
+    // a marker around anything that is not a user aggregate is
+    // PG19 parse_func.c's 42803.
+    // v2.41: peel combined marker layers (ORDER BY inside DISTINCT
+    // inside FILTER, as the parser nests them) around a possible
+    // user aggregate and fold it in one place.
+    {
+        let mut core = e;
+        let mut distinct = false;
+        let mut filter: Option<&Expr> = None;
+        let mut order_keys: Option<&[Expr]> = None;
+        let mut peeled = false;
+        loop {
+            match core {
+                Expr::Func { name, args } if name == "__agg_distinct" => {
+                    distinct = true;
+                    core = &args[0];
+                    peeled = true;
+                }
+                Expr::Func { name, args } if name == "__agg_filter" => {
+                    filter = Some(&args[1]);
+                    core = &args[0];
+                    peeled = true;
+                }
+                Expr::Func { name, args } if name == "__agg_order" => {
+                    order_keys = Some(&args[1..]);
+                    core = &args[0];
+                    peeled = true;
+                }
+                _ => break,
+            }
+        }
+        if peeled {
+            let sorted_holder: Option<Vec<usize>> = match order_keys {
+                Some(keys) => Some(sort_idxs_by_agg_order(q, outer, schema, rows, idxs, keys)?),
+                None => None,
+            };
+            let use_idxs: &[usize] = sorted_holder.as_deref().unwrap_or(idxs);
+            if let Expr::Func {
+                name: cname,
+                args: cargs,
+            } = core
+            {
+                if find_user_agg(&q.eng.db, cname).is_some() {
+                    return eval_user_agg(
+                        q, outer, schema, rows, use_idxs, cname, cargs, distinct, filter,
+                    );
+                }
+            }
+        }
+    }
+    if let Expr::Func { name, args } = e {
+        if name == "__agg_order" {
+            // v2.41: aggregate ORDER BY on a possible user aggregate:
+            // sort the group's rows by the keys, then evaluate the
+            // wrapped call (which may itself carry DISTINCT/FILTER
+            // markers) over the sorted indices.
+            let mut probe = &args[0];
+            loop {
+                match probe {
+                    Expr::Func { name: n, args: a }
+                        if n == "__agg_distinct" || n == "__agg_filter" =>
+                    {
+                        probe = &a[0];
+                    }
+                    _ => break,
+                }
+            }
+            let is_user_agg = matches!(probe, Expr::Func { name: n, .. }
+                if find_user_agg(&q.eng.db, n).is_some());
+            if is_user_agg {
+                let sorted = sort_idxs_by_agg_order(q, outer, schema, rows, idxs, &args[1..])?;
+                return eval_grouped(
+                    q, outer, gscope, schema, rows, &sorted, key_vals, group_by, &args[0],
+                );
+            }
+            let iname = if let Expr::Func { name: n, .. } = probe {
+                n.clone()
+            } else {
+                "?".to_string()
+            };
+            return Err(exec_err(
+                "42883",
+                format!("function {}() does not exist", iname),
+            ));
+        }
+        if name == "__agg_distinct" || name == "__agg_filter" {
+            let (inner, filter) = if name == "__agg_filter" {
+                (&args[0], Some(&args[1]))
+            } else {
+                (&args[0], None)
+            };
+            if let Expr::Func {
+                name: iname,
+                args: iargs,
+            } = inner
+            {
+                let base = iname.rsplit('.').next().unwrap_or(iname);
+                if q.eng.db.aggregates.contains_key(iname) || q.eng.db.aggregates.contains_key(base)
+                {
+                    return eval_user_agg(
+                        q,
+                        outer,
+                        schema,
+                        rows,
+                        idxs,
+                        iname,
+                        iargs,
+                        name == "__agg_distinct",
+                        filter,
+                    );
+                }
+            }
+            let what = if name == "__agg_distinct" {
+                "DISTINCT"
+            } else {
+                "FILTER"
+            };
+            let iname = if let Expr::Func { name: n, .. } = inner {
+                n.clone()
+            } else {
+                "?".to_string()
+            };
+            return Err(exec_err(
+                "42803",
+                format!(
+                    "{} specified, but {} is not an aggregate function",
+                    what, iname
+                ),
+            ));
+        }
+    }
+    if let Expr::Func { name, args } = e {
+        if name == "__within_group" {
+            return eval_user_within_group(q, outer, gscope, schema, rows, idxs, args);
+        }
+    }
     if let Expr::Func { name, args } = e {
         let base = name.rsplit('.').next().unwrap_or(name);
-        if q.eng.db.aggregates.contains_key(name) || q.eng.db.aggregates.contains_key(base) {
-            return eval_user_agg(q, outer, schema, rows, idxs, name, args);
+        if q.eng.db.aggregates.contains_key(name)
+            || q.eng.db.aggregates.contains_key(base)
+            || find_user_agg(&q.eng.db, name).is_some()
+        {
+            return eval_user_agg(q, outer, schema, rows, idxs, name, args, false, None);
         }
     }
     if let Expr::Func { name, args } = e {
@@ -1458,6 +1870,7 @@ pub(crate) fn eval_grouped(
             arg2,
             agg_order_by,
             filter,
+            ..
         } => eval_agg_func(
             q,
             outer,
@@ -2307,41 +2720,387 @@ pub(crate) fn variance_vals(
 }
 
 /// v0.64: float8-style variance/stddev (PG's float8 aggregates) for
-/// float4/float8 inputs: same N*sumX2-sumX^2 formula in f64, NaN or
-/// infinite input -> NaN, sample N<=1 -> NULL.
+/// float4/float8 inputs. v2.41: the accumulation is PG19's
+/// Youngs-Cramer algorithm (float.c float8_accum: state {N, Sx, Sxx}),
+/// replacing the naive N*sumX2-sumX^2 formula, which lost all
+/// precision on large-offset inputs (var_pop over ~1e8-offset values
+/// read 0 or garbage where PG returns the exact small variance).
+/// NaN or infinite input -> NaN; sample N<=1 -> NULL.
 pub(crate) fn variance_float_vals(
     vals: &[Value],
     sample: bool,
     want_variance: bool,
 ) -> Result<Value, ExecError> {
-    let mut n = 0i64;
-    let mut sum = 0.0f64;
-    let mut sum2 = 0.0f64;
-    let mut bad = false;
-    for v in vals {
-        let x = to_f64v(v);
-        n += 1;
-        if !x.is_finite() {
-            bad = true;
-            continue;
-        }
-        sum += x;
-        sum2 += x * x;
-    }
-    if n == 0 || (sample && n <= 1) {
+    let (n, _sx, sxx) = float8_accum_state(vals.iter().map(to_f64v))?;
+    if n == 0.0 || (sample && n < 2.0) {
         return Ok(Value::Null);
     }
-    if bad {
-        return Ok(Value::Float(f64::NAN));
-    }
-    let nf = n as f64;
-    let numer = nf * sum2 - sum * sum;
-    if numer <= 0.0 {
-        return Ok(Value::Float(0.0));
-    }
-    let denom = if sample { nf * (nf - 1.0) } else { nf * nf };
-    let var = numer / denom;
+    let var = if sample { sxx / (n - 1.0) } else { sxx / n };
     Ok(Value::Float(if want_variance { var } else { var.sqrt() }))
+}
+
+/// v2.41: PG19 float.c `float8_accum` over a stream of float8 values:
+/// returns the {N, Sx, Sxx} transition state (Youngs-Cramer).
+/// 22003 on finite-input overflow, like `float_overflow_error`.
+pub(crate) fn float8_accum_state(
+    xs: impl Iterator<Item = f64>,
+) -> Result<(f64, f64, f64), ExecError> {
+    let mut st = (0.0f64, 0.0f64, 0.0f64);
+    for x in xs {
+        st = float8_accum_step(st, x)?;
+    }
+    Ok(st)
+}
+
+/// v2.41: one PG19 `float8_accum` transition on state {N, Sx, Sxx}.
+pub(crate) fn float8_accum_step(
+    (n0, sx0, sxx0): (f64, f64, f64),
+    x: f64,
+) -> Result<(f64, f64, f64), ExecError> {
+    let (mut n, mut sx, mut sxx) = (n0, sx0, sxx0);
+    n += 1.0;
+    sx += x;
+    if n0 > 0.0 {
+        let tmp = x * n - sx;
+        sxx += tmp * tmp / (n * n0);
+        if sx.is_infinite() || sxx.is_infinite() {
+            if sx0.is_finite() && x.is_finite() {
+                return Err(exec_err("22003", "value out of range: overflow"));
+            }
+            sxx = f64::NAN;
+        }
+    } else if x.is_nan() || x.is_infinite() {
+        sxx = f64::NAN;
+    }
+    Ok((n, sx, sxx))
+}
+
+/// v2.41: PG19 `float8_combine` over two {N, Sx, Sxx} states.
+pub(crate) fn float8_combine_states(
+    a: (f64, f64, f64),
+    b: (f64, f64, f64),
+) -> Result<(f64, f64, f64), ExecError> {
+    let (n1, sx1, sxx1) = a;
+    let (n2, sx2, sxx2) = b;
+    if n1 == 0.0 {
+        return Ok(b);
+    }
+    if n2 == 0.0 {
+        return Ok(a);
+    }
+    let n = n1 + n2;
+    let sx = sx1 + sx2;
+    let tmp = sx1 / n1 - sx2 / n2;
+    let sxx = sxx1 + sxx2 + n1 * n2 * tmp * tmp / n;
+    if sxx.is_infinite() && sxx1.is_finite() && sxx2.is_finite() {
+        return Err(exec_err("22003", "value out of range: overflow"));
+    }
+    Ok((n, sx, sxx))
+}
+
+/// v2.41: PG19 float.c `float8_regr_accum` state over (Y, X) pairs:
+/// {N, Sx, Sxx, Sy, Syy, Sxy, commonX, commonY} (note the C array's
+/// slot order: Sx/Sxx before Sy/Syy). Strict: callers skip pairs with
+/// a NULL member before folding.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RegrState {
+    pub n: f64,
+    pub sx: f64,
+    pub sxx: f64,
+    pub sy: f64,
+    pub syy: f64,
+    pub sxy: f64,
+    pub common_x: f64,
+    pub common_y: f64,
+}
+
+pub(crate) fn regr_accum_pairs(ys: &[Value], xs: &[Value]) -> Result<RegrState, ExecError> {
+    let mut st = RegrState::default();
+    for (yv, xv) in ys.iter().zip(xs.iter()) {
+        st = regr_accum_step(st, to_f64v(yv), to_f64v(xv))?;
+    }
+    Ok(st)
+}
+
+/// v2.41: one PG19 `float8_regr_accum` transition (Y, X) on the state.
+pub(crate) fn regr_accum_step(mut st: RegrState, y: f64, x: f64) -> Result<RegrState, ExecError> {
+    let old_n = st.n;
+    let old_sx = st.sx;
+    let old_sy = st.sy;
+    st.n += 1.0;
+    st.sx += x;
+    st.sy += y;
+    if old_n > 0.0 {
+        if x != st.common_x || x.is_nan() {
+            st.common_x = f64::NAN;
+        }
+        if y != st.common_y || y.is_nan() {
+            st.common_y = f64::NAN;
+        }
+        let tmp_x = x * st.n - st.sx;
+        let tmp_y = y * st.n - st.sy;
+        let scale = 1.0 / (st.n * old_n);
+        if st.common_x.is_nan() {
+            st.sxx += tmp_x * tmp_x * scale;
+        }
+        if st.common_y.is_nan() {
+            st.syy += tmp_y * tmp_y * scale;
+        }
+        if st.common_x.is_nan() && st.common_y.is_nan() {
+            st.sxy += tmp_x * tmp_y * scale;
+        }
+        // REL_19_STABLE (the vendored regress's branch; the local
+        // 19beta3 float.c predates this): an Inf/NaN input poisons
+        // its dependent sums at ANY position — "verify that we
+        // handle Inf/NaN the same regardless of position"
+        // (aggregates.sql). Without this, a mid-stream Inf in Y
+        // left Sxy at exactly 0 when X never varied.
+        if x.is_nan() || x.is_infinite() {
+            st.sxx = f64::NAN;
+            st.sxy = f64::NAN;
+        }
+        if y.is_nan() || y.is_infinite() {
+            st.syy = f64::NAN;
+            st.sxy = f64::NAN;
+        }
+        if st.sx.is_infinite()
+            || st.sxx.is_infinite()
+            || st.sy.is_infinite()
+            || st.syy.is_infinite()
+            || st.sxy.is_infinite()
+        {
+            let x_side = (st.sx.is_infinite() || st.sxx.is_infinite())
+                && old_sx.is_finite()
+                && x.is_finite();
+            let y_side = (st.sy.is_infinite() || st.syy.is_infinite())
+                && old_sy.is_finite()
+                && y.is_finite();
+            let xy_side = st.sxy.is_infinite()
+                && old_sx.is_finite()
+                && x.is_finite()
+                && old_sy.is_finite()
+                && y.is_finite();
+            if x_side || y_side || xy_side {
+                return Err(exec_err("22003", "value out of range: overflow"));
+            }
+            if st.sxx.is_infinite() {
+                st.sxx = f64::NAN;
+            }
+            if st.syy.is_infinite() {
+                st.syy = f64::NAN;
+            }
+            if st.sxy.is_infinite() {
+                st.sxy = f64::NAN;
+            }
+        }
+    } else {
+        if x.is_nan() || x.is_infinite() {
+            st.sxx = f64::NAN;
+            st.sxy = f64::NAN;
+        }
+        if y.is_nan() || y.is_infinite() {
+            st.syy = f64::NAN;
+            st.sxy = f64::NAN;
+        }
+        st.common_x = x;
+        st.common_y = y;
+    }
+    Ok(st)
+}
+
+/// v2.41: PG19 `float8_regr_combine` over two regr states.
+pub(crate) fn regr_combine_states(a: RegrState, b: RegrState) -> Result<RegrState, ExecError> {
+    if a.n == 0.0 {
+        return Ok(b);
+    }
+    if b.n == 0.0 {
+        return Ok(a);
+    }
+    let n = a.n + b.n;
+    let tmp1 = a.sx / a.n - b.sx / b.n;
+    let tmp2 = a.sy / a.n - b.sy / b.n;
+    let sxx = a.sxx + b.sxx + a.n * b.n * tmp1 * tmp1 / n;
+    if sxx.is_infinite() && a.sxx.is_finite() && b.sxx.is_finite() {
+        return Err(exec_err("22003", "value out of range: overflow"));
+    }
+    let syy = a.syy + b.syy + a.n * b.n * tmp2 * tmp2 / n;
+    if syy.is_infinite() && a.syy.is_finite() && b.syy.is_finite() {
+        return Err(exec_err("22003", "value out of range: overflow"));
+    }
+    let sxy = a.sxy + b.sxy + a.n * b.n * tmp1 * tmp2 / n;
+    if sxy.is_infinite() && a.sxy.is_finite() && b.sxy.is_finite() {
+        return Err(exec_err("22003", "value out of range: overflow"));
+    }
+    Ok(RegrState {
+        n,
+        sx: a.sx + b.sx,
+        sxx,
+        sy: a.sy + b.sy,
+        syy,
+        sxy,
+        common_x: if a.common_x == b.common_x {
+            a.common_x
+        } else {
+            f64::NAN
+        },
+        common_y: if a.common_y == b.common_y {
+            a.common_y
+        } else {
+            f64::NAN
+        },
+    })
+}
+
+/// v2.41: is this one of the PG19 two-argument regression aggregates?
+pub(crate) fn is_regr_agg(func: AggFunc) -> bool {
+    matches!(
+        func,
+        AggFunc::RegrCount
+            | AggFunc::RegrAvgX
+            | AggFunc::RegrAvgY
+            | AggFunc::RegrSxx
+            | AggFunc::RegrSyy
+            | AggFunc::RegrSxy
+            | AggFunc::RegrSlope
+            | AggFunc::RegrIntercept
+            | AggFunc::RegrR2
+            | AggFunc::Corr
+            | AggFunc::CovarPop
+            | AggFunc::CovarSamp
+    )
+}
+
+/// v2.41: PG19 float.c regression final functions over the
+/// float8_regr_accum state. `ys`/`xs` are the paired non-null inputs
+/// (first / second written arguments).
+pub(crate) fn regr_final(func: AggFunc, ys: &[Value], xs: &[Value]) -> Result<Value, ExecError> {
+    let st = regr_accum_pairs(ys, xs)?;
+    let n = st.n;
+    if n < 1.0 {
+        return Ok(Value::Null);
+    }
+    let f = |v: f64| Ok(Value::Float(v));
+    match func {
+        AggFunc::RegrCount => Ok(Value::BigInt(n as i64)),
+        AggFunc::RegrAvgX => {
+            if !st.common_x.is_nan() {
+                f(st.common_x)
+            } else {
+                f(st.sx / n)
+            }
+        }
+        AggFunc::RegrAvgY => {
+            if !st.common_y.is_nan() {
+                f(st.common_y)
+            } else {
+                f(st.sy / n)
+            }
+        }
+        AggFunc::RegrSxx => f(st.sxx),
+        AggFunc::RegrSyy => f(st.syy),
+        AggFunc::RegrSxy => f(st.sxy),
+        AggFunc::CovarPop => f(st.sxy / n),
+        AggFunc::CovarSamp => {
+            if n < 2.0 {
+                Ok(Value::Null)
+            } else {
+                f(st.sxy / (n - 1.0))
+            }
+        }
+        AggFunc::RegrSlope => {
+            if st.sxx == 0.0 {
+                Ok(Value::Null)
+            } else {
+                f(st.sxy / st.sxx)
+            }
+        }
+        AggFunc::RegrIntercept => {
+            if st.sxx == 0.0 {
+                return Ok(Value::Null);
+            }
+            let mut dy = st.sx * st.sxy / st.sxx;
+            if (dy == 0.0 || dy.is_infinite())
+                && !(st.sx.is_infinite()
+                    || st.sxy.is_infinite()
+                    || st.sxx.is_infinite()
+                    || st.sx.is_nan()
+                    || st.sxy.is_nan()
+                    || st.sxx.is_nan())
+            {
+                // PG19's frexp/ldexp rescaling for under/overflowed dy.
+                let (m_sx, n_sx) = frexp(st.sx);
+                let (m_sxy, n_sxy) = frexp(st.sxy);
+                let (m_sxx, n_sxx) = frexp(st.sxx);
+                let m_dy = m_sx * m_sxy / m_sxx;
+                dy = ldexp(m_dy, n_sx + n_sxy - n_sxx);
+            }
+            f((st.sy - dy) / n)
+        }
+        AggFunc::RegrR2 => {
+            if st.sxx == 0.0 {
+                return Ok(Value::Null);
+            }
+            if st.syy == 0.0 {
+                return f(1.0);
+            }
+            let numerator = st.sxy * st.sxy;
+            let denominator = st.sxx * st.syy;
+            let mut result = if numerator == 0.0
+                || numerator.is_infinite()
+                || denominator == 0.0
+                || denominator.is_infinite()
+            {
+                let r = st.sxy / (st.sxx.sqrt() * st.syy.sqrt());
+                r * r
+            } else {
+                numerator / denominator
+            };
+            if result > 1.0 {
+                result = 1.0;
+            }
+            f(result)
+        }
+        AggFunc::Corr => {
+            if st.sxx == 0.0 || st.syy == 0.0 {
+                return Ok(Value::Null);
+            }
+            let product = st.sxx * st.syy;
+            let sqrt_product = if product == 0.0 || product.is_infinite() {
+                st.sxx.sqrt() * st.syy.sqrt()
+            } else {
+                product.sqrt()
+            };
+            let mut result = st.sxy / sqrt_product;
+            if result < -1.0 {
+                result = -1.0;
+            } else if result > 1.0 {
+                result = 1.0;
+            }
+            f(result)
+        }
+        _ => unreachable!("regr_final called for a non-regression aggregate"),
+    }
+}
+
+/// v2.41: C `frexp` for f64: returns (mantissa in [0.5, 1), exponent).
+pub(crate) fn frexp(x: f64) -> (f64, i32) {
+    if x == 0.0 || !x.is_finite() {
+        return (x, 0);
+    }
+    let bits = x.to_bits();
+    let exp = (((bits >> 52) & 0x7ff) as i32) - 1022;
+    if exp == -1022 {
+        // Subnormal: scale up first (not hit by the suite; kept total).
+        let (m, e) = frexp(x * 4503599627370496.0);
+        return (m, e - 52);
+    }
+    let mantissa = f64::from_bits((bits & !(0x7ff_u64 << 52)) | (1022_u64 << 52));
+    (mantissa, exp)
+}
+
+/// v2.41: C `ldexp` for f64.
+pub(crate) fn ldexp(m: f64, e: i32) -> f64 {
+    m * f64::powi(2.0, e)
 }
 
 /// v1.93: `bit_and` / `bit_or` / `bit_xor` aggregates — PG19's
@@ -2415,6 +3174,30 @@ pub(crate) fn bool_and_vals(vals: &[Value]) -> Result<Value, ExecError> {
     Ok(if any { Value::Bool(true) } else { Value::Null })
 }
 
+/// v2.41: `bool_or` — true iff any non-null input is true, false iff
+/// every non-null input is false, NULL when there are no non-null
+/// inputs (PG19 boolor_statefunc semantics).
+pub(crate) fn bool_or_vals(vals: &[Value]) -> Result<Value, ExecError> {
+    let mut any = false;
+    for v in vals {
+        match v {
+            Value::Bool(b) => {
+                any = true;
+                if *b {
+                    return Ok(Value::Bool(true));
+                }
+            }
+            _ => {
+                return Err(exec_err(
+                    "42883",
+                    format!("function bool_or({}) does not exist", v.type_name()),
+                ));
+            }
+        }
+    }
+    Ok(if any { Value::Bool(false) } else { Value::Null })
+}
+
 // ---------------------------------------------------------------------------
 // v1.30: PG19 ordered-set aggregates (WITHIN GROUP)
 // ---------------------------------------------------------------------------
@@ -2460,6 +3243,13 @@ pub(crate) fn within_group_check_arg_types(
         if matches!(a, Expr::Literal(Literal::Null)) {
             continue;
         }
+        // PG19: an untyped string literal adopts the sort column's
+        // type (select_common_type resolves UNKNOWN to the other
+        // type); conversion failure surfaces at evaluation as the
+        // target type's input error (e.g. 22P02 for 'fred' -> int).
+        if matches!(a, Expr::Literal(Literal::Text(_))) {
+            continue;
+        }
         let ta = expr_type(
             &mut *q.eng,
             q.snap,
@@ -2480,7 +3270,16 @@ pub(crate) fn within_group_check_arg_types(
             &[],
             &o.expr,
         )?;
-        if ta == ts || (within_group_numeric(&ta) && within_group_numeric(&ts)) {
+        let stringy = |t: &ColType| {
+            matches!(
+                t,
+                ColType::Text | ColType::Varchar(_) | ColType::Name | ColType::Char(_)
+            )
+        };
+        if ta == ts
+            || (within_group_numeric(&ta) && within_group_numeric(&ts))
+            || (stringy(&ta) && stringy(&ts))
+        {
             continue;
         }
         return Err(exec_err(
@@ -2871,6 +3670,33 @@ pub(crate) fn eval_within_group_agg(
         return Err(e);
     }
 
+    // PG19: hypothetical-set direct args are coerced to the sort
+    // columns' types (an untyped '3' becomes integer 3; 'fred'
+    // fails with the target type's input error).
+    if func.is_hypothetical() {
+        for (j, dv) in direct.iter_mut().enumerate() {
+            if matches!(dv, Value::Null) {
+                continue;
+            }
+            let target = keyed.iter().find_map(|(keys, _)| match &keys[j] {
+                Value::Null => None,
+                v => Some(v),
+            });
+            if let Some(tv) = target {
+                let tt = super::analyze::value_coltype(tv);
+                let dt = super::analyze::value_coltype(dv);
+                if tt != dt && !matches!(dt, ColType::Text if !matches!(dv, Value::Text(_))) {
+                    if let Ok(cv) = super::cast::eval_cast(dv, tt) {
+                        *dv = cv;
+                    } else if matches!(dv, Value::Text(_)) {
+                        // Surface the input error for untyped literals.
+                        *dv = super::cast::eval_cast(dv, tt)?;
+                    }
+                }
+            }
+        }
+    }
+
     if func.is_hypothetical() {
         return hypothetical_final(func, &direct, &keyed, within_order_by);
     }
@@ -3093,7 +3919,21 @@ pub(crate) fn eval_agg_func(
         // Aggregate arguments cannot nest aggregates (the parser allows
         // the syntax; fail like Postgres rather than recursing forever).
         let v = eval_expr(q, scopes, a)?;
-        if func == AggFunc::StringAgg {
+        if is_regr_agg(func) {
+            // v2.41: regression aggregates are strict in both args
+            // (PG19 float8_regr_accum runs only when both are
+            // non-null): Y rides `vals`, X rides the `delims` channel.
+            let x = eval_expr(
+                q,
+                scopes,
+                arg2.expect("regression aggregates take two arguments"),
+            )?;
+            if crate::storage::value_is_null(&v) || crate::storage::value_is_null(&x) {
+                continue;
+            }
+            vals.push(v);
+            delims.push(x);
+        } else if func == AggFunc::StringAgg {
             let d = eval_expr(q, scopes, arg2.expect("string_agg takes a delimiter"))?;
             // v0.73: whole-row null test (see the general filter below).
             if crate::storage::value_is_null(&v) {
@@ -3156,7 +3996,8 @@ pub(crate) fn eval_agg_func(
                     | AggFunc::JsonObjectAgg
                     | AggFunc::JsonbObjectAgg
                     | AggFunc::JsonObjectAggSql
-            ) {
+            ) || is_regr_agg(func)
+            {
                 if let Some(d) = delims.get(i) {
                     value_key(d, &mut k);
                 }
@@ -3180,6 +4021,22 @@ pub(crate) fn eval_agg_func(
         AggFunc::Sum => sum_vals(&vals),
         AggFunc::Avg => avg_vals(&vals),
         AggFunc::BoolAnd => bool_and_vals(&vals),
+        AggFunc::BoolOr => bool_or_vals(&vals),
+        // v2.41: any_value — the collector already skipped NULLs, so
+        // the first surviving value is PG19's first non-null input.
+        AggFunc::AnyValue => Ok(vals.first().cloned().unwrap_or(Value::Null)),
+        AggFunc::RegrCount
+        | AggFunc::RegrAvgX
+        | AggFunc::RegrAvgY
+        | AggFunc::RegrSxx
+        | AggFunc::RegrSyy
+        | AggFunc::RegrSxy
+        | AggFunc::RegrSlope
+        | AggFunc::RegrIntercept
+        | AggFunc::RegrR2
+        | AggFunc::Corr
+        | AggFunc::CovarPop
+        | AggFunc::CovarSamp => regr_final(func, &vals, &delims),
         AggFunc::BitAnd | AggFunc::BitOr | AggFunc::BitXor => bit_agg_vals(func, &vals),
         AggFunc::VarianceSamp => variance_vals(&vals, "variance", true, true),
         AggFunc::VariancePop => variance_vals(&vals, "var_pop", false, true),
@@ -3208,6 +4065,49 @@ pub(crate) fn eval_agg_func(
         AggFunc::StringAgg => {
             if vals.is_empty() {
                 return Ok(Value::Null);
+            }
+            // v2.41: PG19 string_agg(bytea, bytea) — byte concatenation
+            // with the per-row delimiter (NULL delimiter = none).
+            if matches!(vals[0], Value::Bytea(_)) {
+                let mut out: Vec<u8> = Vec::new();
+                for (i, v) in vals.iter().enumerate() {
+                    let b = match v {
+                        Value::Bytea(b) => b,
+                        other => {
+                            return Err(exec_err(
+                                "42883",
+                                format!(
+                                    "function string_agg(bytea, {}) does not exist",
+                                    other.type_name()
+                                ),
+                            ));
+                        }
+                    };
+                    if i > 0 {
+                        match &delims[i] {
+                            Value::Null => {}
+                            Value::Bytea(d) => out.extend_from_slice(d),
+                            // An untyped string literal delimiter is
+                            // cast to bytea by PG's resolution of
+                            // string_agg(bytea, bytea).
+                            Value::Text(d) => out.extend_from_slice(d.as_bytes()),
+                            Value::BpChar(d) => {
+                                out.extend_from_slice(crate::storage::rtrim_spaces(d).as_bytes())
+                            }
+                            other => {
+                                return Err(exec_err(
+                                    "42883",
+                                    format!(
+                                        "function string_agg(bytea, {}) does not exist",
+                                        other.type_name()
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    out.extend_from_slice(b);
+                }
+                return Ok(Value::Bytea(out));
             }
             let mut out = String::new();
             for (i, v) in vals.iter().enumerate() {
@@ -3515,6 +4415,7 @@ pub(crate) fn contains_user_agg(db: &crate::storage::Database, stmt: &SelectStmt
 /// v1.96: fold a user-defined aggregate over the group's rows:
 /// state starts at INITCOND (or NULL), each row feeds SFUNC(state,
 /// arg); FINALFUNC (if any) produces the result.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn eval_user_agg(
     q: &mut Q,
     outer: &[Scope],
@@ -3523,15 +4424,10 @@ pub(crate) fn eval_user_agg(
     idxs: &[usize],
     name: &str,
     args: &[Expr],
+    distinct: bool,
+    filter: Option<&Expr>,
 ) -> Result<Value, ExecError> {
-    let base = name.rsplit('.').next().unwrap_or(name);
-    let def = q
-        .eng
-        .db
-        .aggregates
-        .get(name)
-        .or_else(|| q.eng.db.aggregates.get(base))
-        .cloned()
+    let def = find_user_agg(&q.eng.db, name)
         .ok_or_else(|| exec_err("42883", format!("function {}() does not exist", name)))?;
     // EXECUTE privilege (aggregates share the function ACL namespace).
     {
@@ -3546,13 +4442,21 @@ pub(crate) fn eval_user_agg(
             }
         }
     }
-    if args.len() != 1 {
+    // v2.41: multi-argument aggregates (PG19 CREATE AGGREGATE allows
+    // any arity; the transition function receives state + all args).
+    // A zero-arg aggregate is count-like `oldcnt(*)` — the parser
+    // hands those as a single `*` column-free call with no args only
+    // for builtins; user aggregates defined with `(*)` arrive with
+    // arg_types ["*"] and one wildcard arg expression, handled by the
+    // generic fold (its value is ignored by star sfuncs in practice
+    // because the suite's oldcnt uses a non-strict counter sfunc —
+    // see agg_transition's int4inc-style handling below).
+    if args.is_empty() && !def.arg_types.iter().any(|a| a == "*") {
         return Err(exec_err(
             "42883",
             format!("function {}() does not exist", name),
         ));
     }
-    let arg_expr = &args[0];
     // v1.96: strictness of the transition function drives the
     // NULL-state fold (PG19 execNodeAgg): with a strict sfunc and no
     // INITCOND, the first non-null input becomes the state and null
@@ -3598,13 +4502,34 @@ pub(crate) fn eval_user_agg(
         .unwrap_or(false);
     let mut state: Value = match &def.initcond {
         Some(ic) => {
-            let e = crate::sql::parse_expr_str(ic)
-                .map_err(|se| exec_err("42601", se.message.clone()))?;
-            let v = eval_expr(q, outer, &e)?;
-            coerce_to_type_name(q, &v, &def.stype).unwrap_or(v)
+            // v2.41: an array-typed INITCOND is the array's text
+            // input form ('{}'), not an expression (aggfns'
+            // `initcond = '{}'` died in the expression parser).
+            if def.stype.ends_with("[]") && ic.trim_start().starts_with('{') {
+                let elem = match crate::sql::coltype_by_name(&def.stype) {
+                    Ok(crate::sql::ColType::Array(e)) => e,
+                    _ => crate::storage::ArrayElem::Text,
+                };
+                let av = parse_array_literal(ic, elem)?;
+                let v = Value::Array(Box::new(av));
+                coerce_to_type_name(q, &v, &def.stype).unwrap_or(v)
+            } else {
+                let e = crate::sql::parse_expr_str(ic)
+                    .map_err(|se| exec_err("42601", se.message.clone()))?;
+                let v = eval_expr(q, outer, &e)?;
+                coerce_to_type_name(q, &v, &def.stype).unwrap_or(v)
+            }
         }
         None => Value::Null,
     };
+    // v2.41: FILTER gates input rows; DISTINCT dedupes input rows
+    // (the full argument tuple) before the fold, like nodeAgg.c.
+    // PG19's strict-sfunc first-input adoption applies only while
+    // the state is still the INITIAL null (no INITCOND and no
+    // transition has run): once a transition returns NULL, a strict
+    // sfunc is simply never called again (balk's contract).
+    let mut pristine = def.initcond.is_none();
+    let mut seen: Vec<Vec<u8>> = Vec::new();
     for &i in idxs {
         let frame = Scope {
             schema,
@@ -3621,17 +4546,67 @@ pub(crate) fn eval_user_agg(
             scopes_storage = buf;
             &scopes_storage
         };
-        let v = eval_expr(q, scopes, arg_expr)?;
-        if sfunc_strict {
-            if v == Value::Null {
-                continue;
-            }
-            if state == Value::Null {
-                state = coerce_to_type_name(q, &v, &def.stype).unwrap_or(v);
+        if let Some(f) = filter {
+            if !check_bool(eval_expr(q, scopes, f)?, "FILTER")? {
                 continue;
             }
         }
-        state = agg_transition(q, scopes, &def.sfunc, &def.stype, state, v)?;
+        // Evaluate the argument tuple for this row. A VARIADIC call
+        // (`least_agg(variadic array[...])`) arrives as one marker
+        // arg; its array value is the single sfunc argument. A
+        // `__agg_star` marker (`agg(*)`) contributes no values: the
+        // transition runs on the state alone, once per row.
+        let mut vals: Vec<Value> = Vec::with_capacity(args.len());
+        for a in args {
+            if let Expr::Func {
+                name: mn,
+                args: margs,
+            } = a
+            {
+                if mn == "__agg_star" && margs.is_empty() {
+                    continue;
+                }
+            }
+            if let Expr::Func {
+                name: mn,
+                args: margs,
+            } = a
+            {
+                if mn == "__variadic" && margs.len() == 1 {
+                    vals.push(eval_expr(q, scopes, &margs[0])?);
+                    continue;
+                }
+            }
+            vals.push(eval_expr(q, scopes, a)?);
+        }
+        if distinct {
+            let mut k: Vec<u8> = Vec::new();
+            for v in &vals {
+                value_key(v, &mut k);
+            }
+            if seen.contains(&k) {
+                continue;
+            }
+            seen.push(k);
+        }
+        if sfunc_strict {
+            if vals.iter().any(|v| *v == Value::Null) {
+                continue;
+            }
+            if state == Value::Null {
+                // Strict sfunc + NULL initial state: PG19 adopts the
+                // first non-null input as the state — only while the
+                // state is pristine, and only meaningful for the
+                // single-argument form (stype == arg type).
+                if pristine && vals.len() == 1 {
+                    state = coerce_to_type_name(q, &vals[0], &def.stype).unwrap_or(vals[0].clone());
+                    pristine = false;
+                }
+                continue;
+            }
+        }
+        state = agg_transition_multi(q, scopes, &def, state, &vals)?;
+        pristine = false;
     }
     if let Some(ff) = &def.finalfunc {
         let call = Expr::Func {
@@ -3668,7 +4643,13 @@ pub(crate) fn agg_transition(
     // Strict scalar transitions: any NULL input yields NULL (PG
     // strictness), EXCEPT that numeric sum-style user sfuncs in the
     // suite rely on int4pl over non-null inputs only.
-    if state == Value::Null || v == Value::Null {
+    // v2.41: the shortcut applies only to builtin transitions — a
+    // user-defined sfunc may be non-strict and handle a NULL state
+    // itself (aggregates.sql's avg_transfn does exactly that; the
+    // shortcut made every such aggregate fold to NULL).
+    let is_user_sfunc =
+        q.eng.db.functions.contains_key(sfunc) || q.eng.db.functions.contains_key(base);
+    if !is_user_sfunc && (state == Value::Null || v == Value::Null) {
         return Ok(Value::Null);
     }
     match base {
@@ -3694,10 +4675,123 @@ pub(crate) fn agg_transition(
         }
         _ => {}
     }
+    // v2.41: PG19 int*_avg_accum (numeric.c): state int8[]
+    // {count, sum}; non-strict — a NULL state initializes, a NULL
+    // input is skipped (nodeAgg still calls it for avg aggregates
+    // because the sfunc is not strict).
+    if matches!(base, "int2_avg_accum" | "int4_avg_accum" | "int8_avg_accum") {
+        if v == Value::Null {
+            return Ok(state);
+        }
+        let (count, sum) = match &state {
+            Value::Array(a) if a.elems.len() == 2 => (
+                value_as_i64(&a.elems[0]).unwrap_or(0),
+                value_as_i64(&a.elems[1]).unwrap_or(0),
+            ),
+            _ => (0, 0),
+        };
+        let vi = value_as_i64(&v).ok_or_else(|| {
+            exec_err(
+                "42883",
+                format!(
+                    "function {}(bigint[], {}) does not exist",
+                    base,
+                    v.type_name()
+                ),
+            )
+        })?;
+        return Ok(Value::Array(Box::new(ArrayVal {
+            elem: ArrayElem::BigInt,
+            dims: vec![2],
+            lower: vec![1],
+            elems: vec![Value::BigInt(count + 1), Value::BigInt(sum + vi)],
+        })));
+    }
+    let state_expr = match &state {
+        Value::Array(av) if av.elems.is_empty() => Expr::CastNamed {
+            expr: Box::new(value_literal_expr(&state)),
+            name: stype.to_string(),
+        },
+        _ => value_literal_expr(&state),
+    };
     let call = Expr::Func {
         name: sfunc.to_string(),
-        args: vec![value_literal_expr(&state), value_literal_expr(&v)],
+        args: vec![state_expr, value_literal_expr(&v)],
     };
+    // v2.41: same plan-fold memo address-reuse hazard as in
+    // agg_transition_multi — evict before evaluating.
+    q.plan_fold_memo
+        .borrow_mut()
+        .remove(&(&call as *const Expr));
+    eval_expr(q, scopes, &call)
+}
+
+/// v2.41: one transition step for a possibly multi-argument user
+/// aggregate: SFUNC(state, arg1, ..., argN). The single-argument form
+/// keeps the historical `agg_transition` fast paths.
+pub(crate) fn agg_transition_multi(
+    q: &mut Q,
+    scopes: &[Scope],
+    def: &crate::storage::AggDef,
+    state: Value,
+    vals: &[Value],
+) -> Result<Value, ExecError> {
+    // v2.41: a user-defined transition function is called directly
+    // with the raw values — the literal-reconstruction path below
+    // cannot carry composite/array state faithfully (empty arrays
+    // have no inferable type, records degrade). Builtin sfuncs keep
+    // the synthesized-call path.
+    {
+        let base = def.sfunc.rsplit('.').next().unwrap_or(&def.sfunc);
+        let defs = q
+            .eng
+            .db
+            .functions
+            .get(&def.sfunc)
+            .or_else(|| q.eng.db.functions.get(base));
+        if let Some(defs) = defs {
+            if let Some(fdef) = defs
+                .iter()
+                .find(|f| !f.is_procedure && f.arg_types.len() == vals.len() + 1)
+            {
+                let fdef = fdef.clone();
+                let mut raw: Vec<Value> = Vec::with_capacity(vals.len() + 1);
+                raw.push(state);
+                raw.extend(vals.iter().cloned());
+                let colls: Vec<Option<String>> = vec![None; raw.len()];
+                return call_user_function(q, scopes, &fdef, &raw, &colls);
+            }
+        }
+    }
+    if vals.len() == 1 {
+        return agg_transition(q, scopes, &def.sfunc, &def.stype, state, vals[0].clone());
+    }
+    // v2.41: an empty-array state needs its declared type attached
+    // (a bare ARRAY[] literal has no inferable element type, 42P08).
+    let state_expr = match &state {
+        Value::Array(av) if av.elems.is_empty() => Expr::CastNamed {
+            expr: Box::new(value_literal_expr(&state)),
+            name: def.stype.clone(),
+        },
+        _ => value_literal_expr(&state),
+    };
+    let mut call_args = vec![state_expr];
+    for v in vals {
+        call_args.push(value_literal_expr(v));
+    }
+    let call = Expr::Func {
+        name: def.sfunc.clone(),
+        args: call_args,
+    };
+    // v2.41: the plan-fold memo is keyed by node POINTER and assumes
+    // plan-owned AST nodes; this synthesized call node is a stack
+    // temporary whose address is reused every fold iteration, so a
+    // previous iteration's folded result would be returned for
+    // different arguments (sum2 folded one row, then replayed it).
+    // Evict any entry for this address before evaluating.
+    q.plan_fold_memo
+        .borrow_mut()
+        .remove(&(&call as *const Expr));
     eval_expr(q, scopes, &call)
 }
 
@@ -3713,6 +4807,27 @@ pub(crate) fn value_as_i64(v: &Value) -> Option<i64> {
 /// function calls in aggregate transitions).
 pub(crate) fn value_literal_expr(v: &Value) -> Expr {
     use crate::sql::Literal;
+    // v2.41: composite/array/numeric values get structural literals
+    // (previously they degraded to NULL, silently nulling every
+    // user-aggregate transition whose state or input was not a
+    // scalar — aggfns' aggtype[] state was the visible case).
+    match v {
+        Value::Array(av) if av.dims.len() <= 1 => {
+            return Expr::ArrayCtor {
+                elems: av.elems.iter().map(value_literal_expr).collect(),
+                nested: false,
+            };
+        }
+        Value::Record(fields) => {
+            return Expr::Row(
+                fields
+                    .iter()
+                    .map(|(_, fv)| value_literal_expr(fv))
+                    .collect(),
+            );
+        }
+        _ => {}
+    }
     let lit = match v {
         Value::Null => Literal::Null,
         Value::Int(i) | Value::BigInt(i) => Literal::Int(*i),
@@ -3720,8 +4835,16 @@ pub(crate) fn value_literal_expr(v: &Value) -> Expr {
         Value::Bool(b) => Literal::Bool(*b),
         Value::Text(s) | Value::BpChar(s) => Literal::Text(s.clone()),
         Value::Float(f) => Literal::Float(*f),
+        Value::Float4(f) => Literal::Real(*f),
+        Value::Numeric(n) => Literal::Numeric(n.clone()),
         Value::Bytea(b) => Literal::Bytea(b.clone()),
-        _ => Literal::Null,
+        // Remaining types ride as their text form; the receiving
+        // call's argument coercion parses it back to the declared
+        // type (the pre-v2.41 behavior for these was a NULL).
+        other => match other.to_text() {
+            Some(s) => Literal::Text(s.into()),
+            None => Literal::Null,
+        },
     };
     Expr::Literal(lit)
 }

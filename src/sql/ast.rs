@@ -1280,6 +1280,27 @@ pub enum AggFunc {
     // range_intersect_agg(anyrange) -> anyrange.
     RangeAgg,
     RangeIntersectAgg,
+    // v2.41: bool_or (booland/boolor pair in PG19 pg_aggregate.dat);
+    // `every` is a separate pg_proc entry folding like bool_and, told
+    // apart only by the written name on the Agg node.
+    BoolOr,
+    // v2.41: any_value (PG19 nodeAgg.c): first non-null input value.
+    AnyValue,
+    // v2.41: PG19 float8 regression aggregates (float.c
+    // float8_regr_accum state, 8 float8 slots). Two arguments (Y, X);
+    // the second rides `arg2` like string_agg's delimiter.
+    RegrCount,
+    RegrAvgX,
+    RegrAvgY,
+    RegrSxx,
+    RegrSyy,
+    RegrSxy,
+    RegrSlope,
+    RegrIntercept,
+    RegrR2,
+    Corr,
+    CovarPop,
+    CovarSamp,
 }
 
 impl AggFunc {
@@ -1308,6 +1329,20 @@ impl AggFunc {
             AggFunc::JsonObjectAggSql => "json_objectagg",
             AggFunc::RangeAgg => "range_agg",
             AggFunc::RangeIntersectAgg => "range_intersect_agg",
+            AggFunc::BoolOr => "bool_or",
+            AggFunc::AnyValue => "any_value",
+            AggFunc::RegrCount => "regr_count",
+            AggFunc::RegrAvgX => "regr_avgx",
+            AggFunc::RegrAvgY => "regr_avgy",
+            AggFunc::RegrSxx => "regr_sxx",
+            AggFunc::RegrSyy => "regr_syy",
+            AggFunc::RegrSxy => "regr_sxy",
+            AggFunc::RegrSlope => "regr_slope",
+            AggFunc::RegrIntercept => "regr_intercept",
+            AggFunc::RegrR2 => "regr_r2",
+            AggFunc::Corr => "corr",
+            AggFunc::CovarPop => "covar_pop",
+            AggFunc::CovarSamp => "covar_samp",
         }
     }
 }
@@ -1716,6 +1751,13 @@ pub enum Expr {
         /// aggregate's transition. Groups are still formed from all
         /// rows; evaluated per input row in row scope.
         filter: Option<Box<Expr>>,
+        /// v2.41: the aggregate name exactly as written (`var_samp`
+        /// vs `variance`, `every` vs `bool_and`): PG names the output
+        /// column after the written function name, but several
+        /// spellings map to one `AggFunc`. Mirrors the v2.39
+        /// `Expr::Window` field. `None` falls back to
+        /// `AggFunc::name()`.
+        written: Option<String>,
     },
     /// v1.30: PG19 ordered-set aggregate, e.g.
     /// `percentile_cont(0.5) WITHIN GROUP (ORDER BY x)` or
@@ -10683,6 +10725,25 @@ pub enum Stmt {
         minvfunc: Option<String>,
         mstype: Option<String>,
         parallel: Option<String>,
+        /// v2.41: CREATE OR REPLACE AGGREGATE.
+        or_replace: bool,
+        /// v2.41: ordered-set aggregate (`type ORDER BY type` in
+        /// the argument list) and the HYPOTHETICAL flag option.
+        ordered_set: bool,
+        hypothetical: bool,
+        sort_types: Vec<String>,
+        /// v2.41: combine / serialization function options,
+        /// validated at CREATE (PG19 aggregate.c checks).
+        combinefunc: Option<String>,
+        serialfunc: Option<String>,
+        deserialfunc: Option<String>,
+    },
+    /// v2.41: ALTER AGGREGATE name(args) RENAME TO new_name.
+    AlterAggregateRename {
+        name: String,
+        arg_types: Vec<String>,
+        sort_types: Vec<String>,
+        new_name: String,
     },
     /// v1.96: DROP AGGREGATE [IF EXISTS] name(args).
     DropAggregate {

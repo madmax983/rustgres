@@ -402,12 +402,17 @@ fn v204_aggregate_polymorphic_transition_type() {
     .unwrap_err();
     assert_eq!(e.code, "42P13");
     assert!(e.message.contains("cannot determine transition data type"));
-    // With a polymorphic argument the type is deducible: no 42P13.
-    run(
+    // With a polymorphic argument the transition type is
+    // deducible, so the 42P13 above does not fire; but PG19 looks
+    // the transition function up by exact signature, and
+    // stfnp(int[]) cannot serve (anyarray, anyarray) — 42883
+    // (v2.41 exact-match rule; polymorphism.out's tfp cases).
+    let e = run(
         &mut eng,
         "CREATE AGGREGATE agg_ok(anyarray) (SFUNC = stfnp, STYPE = anyarray, INITCOND = '{}')",
     )
-    .unwrap();
+    .unwrap_err();
+    assert_eq!(e.code, "42883");
     // Concrete STYPE is unaffected.
     run(
         &mut eng,

@@ -1614,6 +1614,30 @@ impl Numeric {
         Numeric::parse(&s)
     }
 
+    /// v2.41: PG19 `float4_numeric` — build from the f32's OWN
+    /// shortest round-trip representation ("7.8"), not the widened
+    /// f64's (7.800000190734863). Widening first (the old
+    /// `from_f64(f as f64)` call sites) fed the exact binary
+    /// expansion into numeric aggregates over float4 columns.
+    pub fn from_f32(f: f32) -> Result<Self, NumericParseError> {
+        if f.is_nan() {
+            return Ok(Numeric::nan());
+        }
+        if f.is_infinite() {
+            return Ok(if f.is_sign_positive() {
+                Numeric::infinity()
+            } else {
+                Numeric::neg_infinity()
+            });
+        }
+        let s = if f.abs() < 1e-6 || f.abs() >= 1e21 {
+            format!("{:e}", f)
+        } else {
+            format!("{}", f)
+        };
+        Numeric::parse(&s)
+    }
+
     pub fn to_f64(&self) -> f64 {
         match self.special {
             NumericSpecial::NaN => f64::NAN,
@@ -6140,6 +6164,14 @@ pub struct AggDef {
     pub arg_types: Vec<String>,
     /// v1.96: creating role (DROP AGGREGATE / privilege checks).
     pub owner: String,
+    /// v2.41: ordered-set aggregate (aggkind 'o'/'h') and its
+    /// sort-argument types.
+    pub ordered_set: bool,
+    pub hypothetical: bool,
+    /// Recorded for catalog fidelity (pg_aggregate.aggsorttypes);
+    /// call sites re-derive the sort keys from the call itself.
+    #[allow(dead_code)]
+    pub sort_types: Vec<String>,
 }
 
 #[derive(Clone, Debug)]

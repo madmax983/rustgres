@@ -552,7 +552,11 @@ fn hypothetical_dense_rank_nulls_are_peers_of_none() {
     );
 }
 
-/// Mismatched direct-arg / sort-column types → 42804.
+/// An untyped literal direct arg adopts the sort column's type;
+/// a value the type's input function rejects → 22P02 (PG19
+/// aggregates.out: rank('fred') over int is "invalid input syntax
+/// for type integer"). v2.41 corrected this from the older 42804
+/// approximation.
 #[test]
 fn hypothetical_type_mismatch() {
     let mut eng = engine();
@@ -560,9 +564,10 @@ fn hypothetical_type_mismatch() {
         &mut eng,
         "select rank('a') within group (order by x) from (values (1)) as t(x)",
     );
-    assert_eq!(err.code, "42804");
+    assert_eq!(err.code, "22P02");
     assert!(
-        err.message.contains("WITHIN GROUP types"),
+        err.message
+            .contains("invalid input syntax for type integer"),
         "{}",
         err.message
     );
@@ -670,7 +675,7 @@ fn nonagg_within_group_rejected() {
     );
     assert_eq!(err.code, "42809");
     assert!(
-        err.message.contains("not an aggregate function"),
+        err.message.contains("not an ordered-set aggregate"),
         "{}",
         err.message
     );
@@ -723,10 +728,9 @@ fn over_rejected() {
     assert_eq!(err.code, "0A000");
 }
 
-/// An unknown function with WITHIN GROUP → 42809. (PG raises
-/// 42883 because its catalog lookup fails first; rustgres
-/// resolves unknown names at execution, so the WITHIN GROUP
-/// kind check applies uniformly — deliberate approximation.)
+/// An unknown function with WITHIN GROUP → 42883, PG19's own
+/// answer (its catalog lookup fails first). v2.41: the type
+/// resolver now reports the inner call's name, not the marker's.
 #[test]
 fn unknown_func_within_group() {
     let mut eng = engine();
@@ -734,7 +738,7 @@ fn unknown_func_within_group() {
         &mut eng,
         "select nosuchfn(1) within group (order by x) from (values (1)) as t(x)",
     );
-    assert_eq!(err.code, "42809");
+    assert_eq!(err.code, "42883");
 }
 
 /// Unaliased select items are named after the aggregate (PG19).

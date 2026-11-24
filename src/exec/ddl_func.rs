@@ -1375,7 +1375,9 @@ pub(crate) fn exec_create_function(
                 ));
             }
             let t = canon_func_type_name(&a.type_name);
-            if !(t.ends_with("[]") || t == "anyarray") {
+            // v2.41: anycompatiblearray is an array pseudotype too
+            // (cleast_accum's `variadic anycompatiblearray`).
+            if !(t.ends_with("[]") || t == "anyarray" || t == "anycompatiblearray") {
                 return Err(exec_err(
                     "42P13",
                     "VARIADIC parameter must be an array".to_string(),
@@ -4657,6 +4659,18 @@ pub(crate) fn check_language_usage(
 /// v1.96: CREATE AGGREGATE — register the definition (the fold runs
 /// in agg evaluation via the sfunc).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+/// v2.41: does any overload of this function use a non-anycompatible
+/// polymorphic parameter (anyelement/anyarray family)?
+fn sfunc_has_plain_pseudo(defs: &[crate::storage::FuncDef]) -> bool {
+    defs.iter().filter(|d| !d.is_procedure).any(|d| {
+        d.arg_types.iter().any(|a| {
+            let l = a.trim_start_matches("variadic ").to_ascii_lowercase();
+            l.starts_with("any") && !l.starts_with("anycompatible")
+        })
+    })
+}
+
 pub(crate) fn exec_create_aggregate(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -4670,8 +4684,125 @@ pub(crate) fn exec_create_aggregate(
     minvfunc: &Option<String>,
     mstype: &Option<String>,
     parallel: &Option<String>,
+    or_replace: bool,
+    ordered_set: bool,
+    hypothetical: bool,
+    sort_types: &[String],
+    combinefunc: &Option<String>,
+    serialfunc: &Option<String>,
+    deserialfunc: &Option<String>,
 ) -> Result<ExecResult, ExecError> {
     let _ = msfunc;
+    // v2.41: PG19 writes array types in pg_proc with the internal
+    // `_typename` spelling too (`stype = _int8` in create_aggregate's
+    // newavg); normalize `_x` to `x[]` for storage and validation.
+    let norm_ty = |s: &str| -> String {
+        let l = s.trim().to_ascii_lowercase();
+        if let Some(rest) = l.strip_prefix('_') {
+            if !rest.is_empty() && !rest.starts_with('_') {
+                return format!("{}[]", rest);
+            }
+        }
+        l
+    };
+    let arg_types_n: Vec<String> = arg_types.iter().map(|s| norm_ty(s)).collect();
+    let arg_types: &[String] = &arg_types_n;
+    let stype_n = norm_ty(stype);
+    let stype: &str = &stype_n;
+    // v2.41: serialization / combine function validation (PG19
+    // aggregate.c): SERIALFUNC and DESERIALFUNC come as a pair; each
+    // must resolve with the exact signature PG requires, else 42883
+    // naming the required signature.
+    if serialfunc.is_some() != deserialfunc.is_some() {
+        return Err(exec_err(
+            "42P13",
+            "must specify both or neither of serialization and deserialization functions"
+                .to_string(),
+        ));
+    }
+    // Known builtin signatures for the support functions PG checks.
+    let known_sig = |n: &str| -> Option<(Vec<String>, String)> {
+        let b = n.rsplit('.').next().unwrap_or(n).to_ascii_lowercase();
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        match b.as_str() {
+            "numeric_avg_serialize" => Some((v(&["internal"]), "bytea".to_string())),
+            "numeric_avg_deserialize" => Some((v(&["bytea", "internal"]), "internal".to_string())),
+            "numeric_avg_combine" => Some((v(&["internal", "internal"]), "internal".to_string())),
+            "int2larger" => Some((v(&["int2", "int2"]), "int2".to_string())),
+            "int4larger" => Some((v(&["int4", "int4"]), "int4".to_string())),
+            "int8larger" => Some((v(&["int8", "int8"]), "int8".to_string())),
+            "float4larger" => Some((v(&["float4", "float4"]), "float4".to_string())),
+            "float8larger" => Some((v(&["float8", "float8"]), "float8".to_string())),
+            _ => None,
+        }
+    };
+    let canon_ty = |s: &str| -> String {
+        let l = norm_ty(s);
+        match l.as_str() {
+            "integer" => "int4".to_string(),
+            "bigint" => "int8".to_string(),
+            "smallint" => "int2".to_string(),
+            "double precision" => "float8".to_string(),
+            "real" => "float4".to_string(),
+            other => other.to_string(),
+        }
+    };
+    let check_support_sig =
+        |fname: &str, want_args: &[String], want_ret: &str| -> Result<(), ExecError> {
+            let bare = fname
+                .rsplit('.')
+                .next()
+                .unwrap_or(fname)
+                .to_ascii_lowercase();
+            let sig_disp = want_args.join(", ");
+            let missing = || {
+                exec_err(
+                    "42883",
+                    format!("function {}({}) does not exist", bare, sig_disp),
+                )
+            };
+            if let Some(defs) = eng
+                .db
+                .functions
+                .get(&fname.to_ascii_lowercase())
+                .or_else(|| eng.db.functions.get(&bare))
+            {
+                let ok = defs.iter().filter(|d| !d.is_procedure).any(|d| {
+                    d.arg_types.len() == want_args.len()
+                        && d.arg_types
+                            .iter()
+                            .zip(want_args.iter())
+                            .all(|(a, w)| canon_ty(a) == canon_ty(w))
+                        && canon_ty(&d.ret_type) == canon_ty(want_ret)
+                });
+                if ok {
+                    return Ok(());
+                }
+                return Err(missing());
+            }
+            if let Some((args, ret)) = known_sig(&bare) {
+                let ok = args.len() == want_args.len()
+                    && args
+                        .iter()
+                        .zip(want_args.iter())
+                        .all(|(a, w)| canon_ty(a) == canon_ty(w))
+                    && canon_ty(&ret) == canon_ty(want_ret);
+                if ok {
+                    return Ok(());
+                }
+                return Err(missing());
+            }
+            Err(missing())
+        };
+    if let Some(sf) = serialfunc {
+        check_support_sig(sf, &[stype.to_string()], "bytea")?;
+    }
+    if let Some(df) = deserialfunc {
+        check_support_sig(df, &["bytea".to_string(), stype.to_string()], stype)?;
+    }
+    if let Some(cf) = combinefunc {
+        check_support_sig(cf, &[stype.to_string(), stype.to_string()], stype)?;
+    }
     // v1.96 finishing pass: PG19 aggregate definition validation
     // (aggregate.c / functioncmds.c): PARALLEL takes a fixed value
     // set; the transition function's signature must be exactly
@@ -4715,10 +4846,16 @@ pub(crate) fn exec_create_aggregate(
             ));
         }
     }
-    // Polymorphic aggregates (anyelement & family) resolve their
-    // state type at call time; PG19's static checks don't apply.
-    let polymorphic = stype.starts_with("any") || arg_types.iter().any(|t| t.starts_with("any"));
-    if !polymorphic {
+    // PG19 resolves the transition function by EXACT signature:
+    // no implicit casts, and polymorphic parameters bind
+    // consistently across the whole signature (aggregate.c /
+    // enforce_generic_type_consistency). A polymorphic sfunc whose
+    // bindings clash, or a concrete parameter facing a polymorphic
+    // aggregate type, means the function does not exist for that
+    // signature (42883); a fully concrete mismatch, or an
+    // anycompatible binding clash, is 42P13 "requires run-time
+    // type coercion".
+    {
         let canon = |s: &str| crate::sql::coltype_by_name(s).unwrap_or(ColType::Composite);
         let defs_of = |n: &str| {
             let k = n.to_ascii_lowercase();
@@ -4728,38 +4865,191 @@ pub(crate) fn exec_create_aggregate(
                 .get(&k)
                 .or_else(|| eng.db.functions.get(&b))
         };
+        let pseudo_of = |raw: &str| -> Option<String> {
+            let l = raw.trim_start_matches("variadic ").to_ascii_lowercase();
+            if l.starts_with("any") { Some(l) } else { None }
+        };
+        let is_compat = |p: &str| p.starts_with("anycompatible");
+        let is_array_pseudo = |p: &str| p == "anyarray" || p == "anycompatiblearray";
         if let Some(defs) = defs_of(sfunc) {
-            let want: Vec<ColType> = std::iter::once(stype.to_string())
+            let want_raw: Vec<String> = std::iter::once(stype.to_string())
                 .chain(arg_types.iter().cloned())
-                .map(|s| canon(&s))
                 .collect();
+            let want: Vec<ColType> = want_raw.iter().map(|s| canon(s)).collect();
             let st = canon(stype);
+            let agg_pseudo = want_raw.iter().any(|w| pseudo_of(w).is_some());
             let mut any_named = false;
-            let mut exact = false;
+            let mut matched = false;
+            let mut sfunc_compat = false;
             for d in defs.iter().filter(|d| !d.is_procedure) {
                 any_named = true;
-                let params: Vec<ColType> = d.arg_types.iter().map(|s| canon(s)).collect();
-                if params == want {
-                    if canon(&d.ret_type) != st {
-                        return Err(exec_err(
-                            "42P13",
-                            format!(
-                                "return type of transition function {} is not {}",
-                                sfunc, stype
-                            ),
-                        ));
-                    }
-                    exact = true;
+                if d.arg_types
+                    .iter()
+                    .any(|a| pseudo_of(a).map(|p| is_compat(&p)).unwrap_or(false))
+                {
+                    sfunc_compat = true;
                 }
+                if d.arg_types.len() != want.len() {
+                    continue;
+                }
+                // Binding slots: element and array bindings for the
+                // anyelement family and the anycompatible family.
+                let mut binds: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                let mut ok = true;
+                for (praw, wraw) in d.arg_types.iter().zip(want_raw.iter()) {
+                    let wcanon = canon_ty(wraw);
+                    match pseudo_of(praw) {
+                        None => {
+                            if pseudo_of(wraw).is_some() || canon(praw) != canon(wraw) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        Some(pseudo) => {
+                            let fam = if is_compat(&pseudo) { "C" } else { "E" };
+                            if is_array_pseudo(&pseudo) {
+                                if let Some(wp) = pseudo_of(wraw) {
+                                    if !is_array_pseudo(&wp) {
+                                        ok = false;
+                                        break;
+                                    }
+                                } else if let Some(elem) = wcanon.strip_suffix("[]") {
+                                    let arr_key = format!("{fam}A");
+                                    let el_key = format!("{fam}E");
+                                    if binds.get(&arr_key).map(|b| b != &wcanon).unwrap_or(false)
+                                        || binds.get(&el_key).map(|b| b != elem).unwrap_or(false)
+                                    {
+                                        ok = false;
+                                        break;
+                                    }
+                                    binds.insert(arr_key, wcanon.clone());
+                                    binds.insert(el_key, elem.to_string());
+                                } else {
+                                    ok = false;
+                                    break;
+                                }
+                            } else {
+                                // Element-family pseudo.
+                                if pseudo_of(wraw).is_some() {
+                                    // Deferred only while the family
+                                    // binding is still open: once an
+                                    // earlier position bound the
+                                    // element type concretely (e.g.
+                                    // anyarray over an int[] state),
+                                    // a polymorphic aggregate
+                                    // argument cannot match it
+                                    // (tfp(integer[], anyelement)
+                                    // does not exist).
+                                    let el_key = format!("{fam}E");
+                                    if binds.contains_key(&el_key) {
+                                        ok = false;
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                let el_key = format!("{fam}E");
+                                if binds.get(&el_key).map(|b| b != &wcanon).unwrap_or(false) {
+                                    ok = false;
+                                    break;
+                                }
+                                binds.insert(el_key, wcanon);
+                            }
+                        }
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                // Return type: a pseudo return must resolve (via the
+                // same bindings) to the state type; a concrete one
+                // must equal it exactly.
+                match pseudo_of(&d.ret_type) {
+                    None => {
+                        if canon(&d.ret_type) != st {
+                            return Err(exec_err(
+                                "42P13",
+                                format!(
+                                    "return type of transition function {} is not {}",
+                                    sfunc, stype
+                                ),
+                            ));
+                        }
+                    }
+                    Some(pseudo) => {
+                        let fam = if is_compat(&pseudo) { "C" } else { "E" };
+                        let key = if is_array_pseudo(&pseudo) {
+                            format!("{fam}A")
+                        } else {
+                            format!("{fam}E")
+                        };
+                        if pseudo_of(stype).is_none() {
+                            if let Some(b) = binds.get(&key) {
+                                if b != &canon_ty(stype) {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+                matched = true;
+                break;
             }
-            if any_named && !exact {
-                let sig = vec![stype; want.len()].join(", ");
+            if any_named && !matched {
+                let disp = |s: &str| -> String {
+                    let (base, arr) = match s.strip_suffix("[]") {
+                        Some(b) => (b, "[]"),
+                        None => (s, ""),
+                    };
+                    let d = match base.to_ascii_lowercase().as_str() {
+                        "int8" => "bigint".to_string(),
+                        "int4" => "integer".to_string(),
+                        "int2" => "smallint".to_string(),
+                        "float8" => "double precision".to_string(),
+                        "float4" => "real".to_string(),
+                        "bool" => "boolean".to_string(),
+                        other => other.to_string(),
+                    };
+                    format!("{d}{arr}")
+                };
+                if agg_pseudo || (sfunc_has_plain_pseudo(defs) && !sfunc_compat) {
+                    let sig = want_raw
+                        .iter()
+                        .map(|w| disp(w))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(exec_err(
+                        "42883",
+                        format!("function {}({}) does not exist", sfunc, sig),
+                    ));
+                }
+                let sig = vec![disp(stype); want.len()].join(", ");
                 return Err(exec_err(
                     "42P13",
                     format!(
                         "function {}({}) requires run-time type coercion",
                         sfunc, sig
                     ),
+                ));
+            }
+        }
+        // PG19: strictness of the forward and inverse transition
+        // functions must match (against the moving-window transition
+        // function when present, else the plain one).
+        if let Some(inv) = minvfunc {
+            let fwd_name: &str = msfunc.as_deref().unwrap_or(sfunc);
+            let strict_of = |n: &str| -> bool {
+                eng.db
+                    .functions
+                    .get(&n.to_ascii_lowercase())
+                    .and_then(|ds| ds.iter().find(|d| !d.is_procedure))
+                    .map(|d| d.strict)
+                    .unwrap_or(true)
+            };
+            if strict_of(fwd_name) != strict_of(inv) {
+                return Err(exec_err(
+                    "42P13",
+                    "strictness of aggregate's forward and inverse transition functions must match",
                 ));
             }
         }
@@ -4781,15 +5071,153 @@ pub(crate) fn exec_create_aggregate(
             }
         }
     }
+    // PG19: the final function must exist with the state type as
+    // its argument (plus the aggregate's own arguments when
+    // finalfunc_extra). Checked for user-defined finalfuncs and
+    // the builtin unary-minus family (errors.sql's newavg2:
+    // finalfunc = int2um over an int4 state is 42883).
+    if let Some(ff) = &finalfunc {
+        let bare = ff.rsplit('.').next().unwrap_or(ff).to_ascii_lowercase();
+        let builtin_sig: Option<&str> = match bare.as_str() {
+            "int2um" => Some("int2"),
+            "int4um" => Some("int4"),
+            "int8um" => Some("int8"),
+            "float4um" => Some("float4"),
+            "float8um" => Some("float8"),
+            _ => None,
+        };
+        if let Some(param) = builtin_sig {
+            if canon_ty(param) != canon_ty(stype) {
+                let stc = canon_ty(stype);
+                let disp = match stc.as_str() {
+                    "int8" => "bigint",
+                    "int4" => "integer",
+                    "int2" => "smallint",
+                    "float8" => "double precision",
+                    "float4" => "real",
+                    other => other,
+                };
+                return Err(exec_err(
+                    "42883",
+                    format!("function {}({}) does not exist", ff, disp),
+                ));
+            }
+        } else if let Some(defs) = eng.db.functions.get(&bare) {
+            let ok = defs.iter().filter(|d| !d.is_procedure).any(|d| {
+                (d.arg_types.len() == 1 || d.arg_types.len() == arg_types.len() + 1)
+                    && d.arg_types
+                        .first()
+                        .map(|p| canon_ty(p) == canon_ty(stype))
+                        .unwrap_or(false)
+            });
+            if !ok {
+                let stc = canon_ty(stype);
+                let disp = match stc.as_str() {
+                    "int8" => "bigint",
+                    "int4" => "integer",
+                    "int2" => "smallint",
+                    "float8" => "double precision",
+                    "float4" => "real",
+                    other => other,
+                };
+                return Err(exec_err(
+                    "42883",
+                    format!("function {}({}) does not exist", ff, disp),
+                ));
+            }
+        }
+    }
+    // PG19 OR REPLACE guards: replacing a plain FUNCTION of the
+    // same signature is a routine-kind change; replacing an
+    // aggregate whose result type would change is rejected.
+    let same_ty = |a: &str, b: &str| -> bool {
+        let norm = |s: &str| {
+            s.to_ascii_lowercase()
+                .replace("character varying", "varchar")
+                .replace("bit varying", "varbit")
+        };
+        norm(a) == norm(b) || crate::sql::coltype_by_name(a) == crate::sql::coltype_by_name(b)
+    };
+    if or_replace && !eng.db.aggregates.contains_key(&name.to_ascii_lowercase()) {
+        let sig_norm: Vec<String> = arg_types.iter().map(|a| norm_ty(a)).collect();
+        let is_plain_fn = eng.db.functions.values().flatten().any(|d| {
+            !d.is_procedure
+                && d.name.eq_ignore_ascii_case(&name)
+                && d.arg_types.len() == sig_norm.len()
+                && d.arg_types
+                    .iter()
+                    .zip(sig_norm.iter())
+                    .all(|(a, b)| same_ty(a, b))
+        });
+        if is_plain_fn {
+            return Err(exec_err("42809", "cannot change routine kind"));
+        }
+    }
+    if or_replace {
+        if let Some(old) = eng.db.aggregates.get(&name.to_ascii_lowercase()) {
+            let final_ret = |ff: &Option<String>, st: &str| -> String {
+                match ff {
+                    Some(f) => eng
+                        .db
+                        .functions
+                        .get(&f.to_ascii_lowercase())
+                        .and_then(|ds| ds.iter().find(|d| !d.is_procedure))
+                        .map(|d| d.ret_type.clone())
+                        .unwrap_or_else(|| match f.to_ascii_lowercase().as_str() {
+                            "numeric_avg" | "int2_avg" | "int4_avg" | "int8_avg" => {
+                                "numeric".to_string()
+                            }
+                            "numeric_out" => "cstring".to_string(),
+                            _ => st.to_string(),
+                        }),
+                    None => st.to_string(),
+                }
+            };
+            let old_ret = final_ret(&old.finalfunc, &old.stype);
+            let new_ret = final_ret(&finalfunc, &stype);
+            if !same_ty(&old_ret, &new_ret) {
+                return Err(exec_err(
+                    "42P13",
+                    "cannot change return type of existing function",
+                ));
+            }
+        }
+    }
     let key = name.to_ascii_lowercase();
-    if eng.db.aggregates.contains_key(&key) {
-        return Err(exec_err(
-            "42723",
-            format!(
-                "function \"{}\" already exists with same argument types",
-                name
-            ),
-        ));
+    // v2.41: the registry is name-keyed for the common case; a second
+    // aggregate with the same name but DIFFERENT argument types
+    // (newcnt(*) vs newcnt("any")) lives under a composite key.
+    let sig_of = |ats: &[String]| -> String {
+        ats.iter()
+            .map(|s| s.to_ascii_lowercase().replace(' ', ""))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let mut key = key;
+    if let Some(existing) = eng.db.aggregates.get(&key) {
+        if sig_of(&existing.arg_types) == sig_of(arg_types) {
+            if !or_replace {
+                return Err(exec_err(
+                    "42723",
+                    format!(
+                        "function \"{}\" already exists with same argument types",
+                        name
+                    ),
+                ));
+            }
+            // OR REPLACE: fall through and overwrite the definition.
+        } else {
+            key = format!("{}\u{1}{}", key, sig_of(arg_types));
+            if eng.db.aggregates.contains_key(&key) && !or_replace {
+                return Err(exec_err(
+                    "42723",
+                    format!(
+                        "function \"{}\" already exists with same argument types",
+                        name
+                    ),
+                ));
+            }
+        }
     }
     // v1.96: aggregate argument/state types need USAGE (PG19
     // parse-time type check, same as function args).
@@ -4832,6 +5260,19 @@ pub(crate) fn exec_create_aggregate(
             | "float8mi"
             | "float8mul"
             | "float8div"
+            // v2.41: transition functions added as scalar builtins.
+            | "int8inc"
+            | "int8inc_any"
+            | "numeric_avg_accum"
+            | "float8_accum"
+            | "float4_accum"
+            | "float8_regr_accum"
+            | "booland_statefunc"
+            | "boolor_statefunc"
+            // v2.41: ordered-set support transitions (internal
+            // state; evaluated by the within-group machinery).
+            | "ordered_set_transition"
+            | "ordered_set_transition_multi"
     );
     if !eng.db.functions.contains_key(&sfunc_key)
         && !eng.db.functions.contains_key(&bare)
@@ -4852,6 +5293,9 @@ pub(crate) fn exec_create_aggregate(
             initcond: initcond.clone(),
             arg_types: arg_types.to_vec(),
             owner: ctx.role.to_string(),
+            ordered_set,
+            hypothetical,
+            sort_types: sort_types.to_vec(),
         },
     );
     // v1.96: record routine ownership like functions (shared map).
@@ -4887,15 +5331,178 @@ pub(crate) fn exec_create_aggregate(
 }
 
 /// v1.96: DROP AGGREGATE.
+/// v2.41: ALTER AGGREGATE ... RENAME TO — rename the registry
+/// entry (name key or composite overflow key), preserving the
+/// definition. PG19 raises 42883 when the aggregate does not exist.
+pub(crate) fn exec_alter_aggregate_rename(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    arg_types: &[String],
+    _sort_types: &[String],
+    new_name: &str,
+) -> Result<ExecResult, ExecError> {
+    let key = name.to_ascii_lowercase();
+    let sig = arg_types
+        .iter()
+        .map(|s| s.to_ascii_lowercase().replace(' ', ""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let found = if eng.db.aggregates.contains_key(&key) {
+        Some(key.clone())
+    } else {
+        let composite = format!("{}\u{1}{}", key, sig);
+        if eng.db.aggregates.contains_key(&composite) {
+            Some(composite)
+        } else {
+            let prefix = format!("{}\u{1}", key);
+            eng.db
+                .aggregates
+                .keys()
+                .find(|k| k.starts_with(&prefix))
+                .cloned()
+        }
+    };
+    let found = match found {
+        Some(k) => k,
+        None => {
+            return Err(exec_err(
+                "42883",
+                format!("aggregate {}({}) does not exist", name, sig),
+            ));
+        }
+    };
+    let new_key = if let Some((_, sfx)) = found.split_once('\u{1}') {
+        format!("{}\u{1}{}", new_name.to_ascii_lowercase(), sfx)
+    } else {
+        new_name.to_ascii_lowercase()
+    };
+    // PG19: renaming onto an existing aggregate of the same
+    // signature is a 42723 name conflict.
+    if new_key != found && eng.db.aggregates.contains_key(&new_key) {
+        return Err(exec_err(
+            "42723",
+            format!(
+                "function {}({}) already exists in schema \"public\"",
+                new_name, sig
+            ),
+        ));
+    }
+    // PG19: only the owner may rename an aggregate (42501).
+    if let Some(def) = eng.db.aggregates.get(&found) {
+        if def.owner != ctx.role
+            && !crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own)
+        {
+            return Err(exec_err(
+                "42501",
+                format!("must be owner of function {}", name),
+            ));
+        }
+    }
+    let def = eng.db.aggregates.remove(&found).unwrap();
+    eng.db.aggregates.insert(new_key, def);
+    Ok(ExecResult::Command {
+        tag: "ALTER AGGREGATE".to_string(),
+    })
+}
+
 pub(crate) fn exec_drop_aggregate(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     name: &str,
-    _arg_types: &[String],
+    arg_types: &[String],
     if_exists: bool,
     _cascade: bool,
 ) -> Result<ExecResult, ExecError> {
+    // PG19 resolves the argument type names before the aggregate
+    // itself: an unknown type is 42704 (errors.sql's
+    // `drop aggregate newcnt (nonesuch)`).
+    for t in arg_types {
+        let base = t
+            .trim()
+            .trim_end_matches("[]")
+            .rsplit('.')
+            .next()
+            .unwrap_or(t)
+            .to_ascii_lowercase();
+        if base == "*"
+            || base.starts_with("any")
+            || crate::sql::coltype_by_name(&base).is_ok()
+            || eng.db.find_type(&base).is_some()
+        {
+            continue;
+        }
+        // With IF EXISTS, PG19 downgrades this to a NOTICE and
+        // skips the drop entirely.
+        if if_exists {
+            return Ok(ExecResult::Command {
+                tag: "DROP AGGREGATE".to_string(),
+            });
+        }
+        return Err(exec_err(
+            "42704",
+            format!("type \"{}\" does not exist", base),
+        ));
+    }
     let key = name.to_ascii_lowercase();
+    // PG19: the drop must name the aggregate's exact signature —
+    // a same-named aggregate with different argument types is
+    // 42883 "aggregate name(types) does not exist".
+    let norm_sig = |ats: &[String]| -> String {
+        ats.iter()
+            .map(|a| {
+                let l = a
+                    .trim()
+                    .trim_start_matches("variadic ")
+                    .to_ascii_lowercase()
+                    .replace(' ', "");
+                match l.as_str() {
+                    "integer" | "int" => "int4".to_string(),
+                    "bigint" => "int8".to_string(),
+                    "smallint" => "int2".to_string(),
+                    "real" => "float4".to_string(),
+                    "doubleprecision" => "float8".to_string(),
+                    "boolean" => "bool".to_string(),
+                    other => other.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let want_sig = norm_sig(arg_types);
+    let mut found_key: Option<String> = None;
+    if let Some(def) = eng.db.aggregates.get(&key) {
+        if norm_sig(&def.arg_types) == want_sig {
+            found_key = Some(key.clone());
+        }
+    }
+    if found_key.is_none() {
+        let prefix = format!("{}\u{1}", key);
+        for (k, def) in eng.db.aggregates.iter() {
+            if k.starts_with(&prefix) && norm_sig(&def.arg_types) == want_sig {
+                found_key = Some(k.clone());
+                break;
+            }
+        }
+    }
+    if found_key.is_none() && eng.db.aggregates.contains_key(&key) && !if_exists {
+        let disp = arg_types
+            .iter()
+            .map(|a| match a.to_ascii_lowercase().as_str() {
+                "float4" => "real".to_string(),
+                "int4" => "integer".to_string(),
+                "int8" => "bigint".to_string(),
+                "int2" => "smallint".to_string(),
+                other => other.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(exec_err(
+            "42883",
+            format!("aggregate {}({}) does not exist", name, disp),
+        ));
+    }
+    let key = found_key.unwrap_or(key);
     if let Some(def) = eng.db.aggregates.get(&key) {
         if def.owner != ctx.role
             && !crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own)
