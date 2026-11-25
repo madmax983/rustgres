@@ -4286,7 +4286,7 @@ pub(crate) fn exec_insert_inner(
                     let hit_planned = latest.iter().any(|(pid, prow)| {
                         (!partitioned_upsert
                             || planned_leaf.get(pid).map(|l| l.as_str()) == Some(ctable.as_str()))
-                            && temp_key(icols, prow) == temp_key(icols, &cvalues)
+                            && temp_key_eq(icols, prow, &cvalues)
                     });
                     if hit_table.is_some() || hit_planned {
                         violated.push(iname.clone());

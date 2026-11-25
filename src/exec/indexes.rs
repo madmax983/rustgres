@@ -703,6 +703,15 @@ pub(crate) fn temp_key(cols: &[usize], values: &[Value]) -> IndexKey {
     IndexKey(cols.iter().map(|&p| values[p].clone()).collect())
 }
 
+/// Same comparison as `temp_key(cols, a) == temp_key(cols, b)` (index-key
+/// semantics via `index_key_cmp`, not raw `==`), but without allocating an
+/// `IndexKey` for either side — for scans that run this per candidate
+/// instead of once.
+pub(crate) fn temp_key_eq(cols: &[usize], a: &[Value], b: &[Value]) -> bool {
+    cols.iter()
+        .all(|&c| index_key_cmp(&a[c], &b[c]) == Ordering::Equal)
+}
+
 /// Pairwise UNIQUE check for UPDATE's planned rows: the index still holds
 /// only the old entries at plan time, so new-vs-new conflicts need an
 /// explicit pass.
