@@ -756,6 +756,9 @@ fn v088_create_index_metadata_roundtrip() {
         // v2.31: WO + gist flags (RGSWAL36/37 trailing bytes).
         without_overlaps: true,
         gist: true,
+        // v2.44: exclusion flag + operators (RGSWAL38 trailing).
+        exclusion: true,
+        excl_ops: vec!["&&".into()],
         xmin: 42,
     };
     let mut e = Enc::new();
@@ -779,10 +782,14 @@ fn v088_create_index_metadata_roundtrip() {
             include_names,
             without_overlaps,
             gist,
+            exclusion,
+            excl_ops,
             xmin,
         } => {
             assert!(without_overlaps);
             assert!(gist);
+            assert!(exclusion);
+            assert_eq!(excl_ops, vec!["&&".to_string()]);
             assert!(nulls_not_distinct);
             assert_eq!(parent_index.as_deref(), Some("parent_ix"));
             assert_eq!(include_names, vec!["c".to_string()]);
@@ -1335,6 +1342,8 @@ fn v200_alter_replay_create_index_entries_resolve() {
             include_names: Vec::new(),
             without_overlaps: false,
             gist: false,
+            exclusion: false,
+            excl_ops: Vec::new(),
             xmin: 6,
         },
     )

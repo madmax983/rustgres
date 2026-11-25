@@ -3197,6 +3197,10 @@ pub(crate) fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, 
             eval_extract(field, &v)
         }
         Expr::Cmp { op, left, right } => {
+            // v2.44: PG19 operator resolution for geometric types
+            // and composites containing them (plan-time in PG, so
+            // checked before either operand is evaluated).
+            check_cmp_static(q, scopes, *op, left, right)?;
             // v1.11: row-valued subquery — `ROW(...) = (SELECT ...)` or
             // `(SELECT ...) = ROW(...)`. PG19 permits a multi-column
             // subquery as an operand of a row comparison; the subquery
@@ -6110,6 +6114,245 @@ pub(crate) fn eval_is_distinct_from(l: Value, r: Value, neg: bool) -> Result<Val
         },
     };
     Ok(Value::Bool(distinct != neg))
+}
+
+/// v2.44: static type knowledge for PG19 operator resolution
+/// involving the geometric types (carried as canonical text at
+/// runtime, so value-level comparison cannot see their types).
+pub(crate) enum StaticTy {
+    Geo(&'static str),
+    Composite(String),
+    Scalar(String),
+    Record,
+}
+
+pub(crate) fn static_ty(q: &Q, scopes: &[Scope], e: &Expr) -> Option<StaticTy> {
+    match e {
+        Expr::Cast { to, .. } => match to {
+            ColType::Point => Some(StaticTy::Geo("point")),
+            ColType::BoxGeo => Some(StaticTy::Geo("box")),
+            ColType::Circle => Some(StaticTy::Geo("circle")),
+            ColType::Composite => None,
+            _ => None,
+        },
+        Expr::CastNamed { name, .. } => match name.as_str() {
+            "point" => Some(StaticTy::Geo("point")),
+            "box" => Some(StaticTy::Geo("box")),
+            "circle" => Some(StaticTy::Geo("circle")),
+            _ => {
+                if q.eng
+                    .db
+                    .find_type(name)
+                    .is_some_and(|t| t.composite.is_some())
+                    || q.eng
+                        .db
+                        .find_table(name, q.snap, &q.all_xids, q.session)
+                        .is_some()
+                {
+                    Some(StaticTy::Composite(name.clone()))
+                } else {
+                    Some(StaticTy::Scalar(name.clone()))
+                }
+            }
+        },
+        Expr::Func { name, .. } => match name.as_str() {
+            "point" => Some(StaticTy::Geo("point")),
+            "box" => Some(StaticTy::Geo("box")),
+            "circle" => Some(StaticTy::Geo("circle")),
+            "circle_center" | "center" => Some(StaticTy::Geo("point")),
+            _ => None,
+        },
+        Expr::Column { table: qual, name } => {
+            // Lightweight schema scan (this runs per comparison —
+            // resolve_col's ambiguity machinery is far too heavy
+            // here, and any miss simply skips the static check).
+            let qc = scopes.iter().rev().find_map(|sc| {
+                sc.schema
+                    .iter()
+                    .find(|c| c.name == *name && qual.as_ref().is_none_or(|qq| c.qual == *qq))
+            })?;
+            match &qc.ty {
+                ColType::Point => Some(StaticTy::Geo("point")),
+                ColType::BoxGeo => Some(StaticTy::Geo("box")),
+                ColType::Circle => Some(StaticTy::Geo("circle")),
+                ColType::Composite => {
+                    let t = q
+                        .eng
+                        .db
+                        .find_table(&qc.qual, q.snap, &q.all_xids, q.session)?;
+                    t.composite_types
+                        .get(qc.src_ord as usize)
+                        .cloned()
+                        .flatten()
+                        .map(StaticTy::Composite)
+                }
+                // Plain scalar columns are the hot path: no
+                // allocation, no static knowledge needed (the
+                // check only fires when a geo/composite side is
+                // present, and then the scalar side's name is
+                // derived lazily by scalar_name_of).
+                _ => None,
+            }
+        }
+        Expr::Row(_) | Expr::WholeRow { .. } => Some(StaticTy::Record),
+        _ => None,
+    }
+}
+
+/// v2.44: the field list of a composite type (CREATE TYPE
+/// definition, or a table's rowtype).
+pub(crate) fn composite_fields_of(q: &Q, name: &str) -> Option<Vec<(ColType, Option<String>)>> {
+    if let Some(st) = q.eng.db.find_type(name) {
+        return st
+            .composite
+            .as_ref()
+            .map(|fs| fs.iter().map(|(_, c, n)| (c.clone(), n.clone())).collect());
+    }
+    let t = q.eng.db.find_table(name, q.snap, &q.all_xids, q.session)?;
+    Some(
+        t.columns
+            .iter()
+            .enumerate()
+            .map(|(i, (_, c))| (c.clone(), t.composite_types.get(i).cloned().flatten()))
+            .collect(),
+    )
+}
+
+/// v2.44: the first field type (leaf name) that blocks a composite
+/// equality (`eq = true`) or ordering (`eq = false`) operation in
+/// PG19: point and circle have neither an equality operator nor a
+/// btree opclass; box has equality but no ordering.
+pub(crate) fn composite_blocker(
+    q: &Q,
+    fields: &[(ColType, Option<String>)],
+    eq: bool,
+) -> Option<&'static str> {
+    for (ct, nested) in fields {
+        match ct {
+            ColType::Point => return Some("point"),
+            ColType::Circle => return Some("circle"),
+            ColType::BoxGeo => {
+                if !eq {
+                    return Some("box");
+                }
+            }
+            ColType::Composite => {
+                if let Some(n) = nested {
+                    if let Some(fs) = composite_fields_of(q, n) {
+                        if let Some(b) = composite_blocker(q, &fs, eq) {
+                            return Some(b);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// v2.44: PG19 operator resolution for comparisons the text
+/// carrier would otherwise silently accept: point/circle have no
+/// comparison operators at all, box has only = / <>, and a
+/// composite containing such a field inherits the lack (42883).
+pub(crate) fn check_cmp_static(
+    q: &Q,
+    scopes: &[Scope],
+    op: CmpOp,
+    l: &Expr,
+    r: &Expr,
+) -> Result<(), ExecError> {
+    if matches!(op, CmpOp::ImageEq) {
+        // Bytewise image equality needs no operator resolution.
+        return Ok(());
+    }
+    let lt = static_ty(q, scopes, l);
+    let rt = static_ty(q, scopes, r);
+    let eq = matches!(op, CmpOp::Eq | CmpOp::Ne);
+    // Composite operand against a composite/record operand.
+    for (side, other) in [(&lt, &rt), (&rt, &lt)] {
+        if let Some(StaticTy::Composite(name)) = side {
+            if matches!(other, Some(StaticTy::Composite(_)) | Some(StaticTy::Record)) {
+                if let Some(fs) = composite_fields_of(q, name) {
+                    if let Some(b) = composite_blocker(q, &fs, eq) {
+                        return Err(exec_err(
+                            "42883",
+                            if eq {
+                                format!("could not identify an equality operator for type {}", b)
+                            } else {
+                                format!("could not identify a comparison function for type {}", b)
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    // Geometric operands.
+    let name_of = |t: &Option<StaticTy>| -> Option<String> {
+        match t {
+            Some(StaticTy::Geo(n)) => Some(n.to_string()),
+            Some(StaticTy::Scalar(s)) => Some(s.clone()),
+            Some(StaticTy::Composite(n)) => Some(n.clone()),
+            _ => None,
+        }
+    };
+    let lgeo = matches!(lt, Some(StaticTy::Geo(_)));
+    let rgeo = matches!(rt, Some(StaticTy::Geo(_)));
+    if lgeo || rgeo {
+        // An unknown string literal coerces to the other side's
+        // type in PG, so it borrows the other side's name; a plain
+        // scalar side's name is derived lazily (error path only).
+        let scalar_name_of = |e: &Expr| -> Option<String> {
+            match e {
+                Expr::Cast { to, .. } => Some(crate::exec::pg_input::coltype_typ_string(to)),
+                Expr::Column { table: qual, name } => scopes
+                    .iter()
+                    .rev()
+                    .find_map(|sc| {
+                        sc.schema.iter().find(|c| {
+                            c.name == *name && qual.as_ref().is_none_or(|qq| c.qual == *qq)
+                        })
+                    })
+                    .map(|qc| crate::exec::pg_input::coltype_typ_string(&qc.ty)),
+                _ => None,
+            }
+        };
+        let ln = name_of(&lt)
+            .or_else(|| scalar_name_of(l))
+            .or_else(|| name_of(&rt));
+        let rn = name_of(&rt)
+            .or_else(|| scalar_name_of(r))
+            .or_else(|| name_of(&lt));
+        if let (Some(ln), Some(rn)) = (ln, rn) {
+            let sym = match op {
+                CmpOp::Eq => "=",
+                CmpOp::Ne => "<>",
+                CmpOp::Lt => "<",
+                CmpOp::Le => "<=",
+                CmpOp::Gt => ">",
+                CmpOp::Ge => ">=",
+                CmpOp::ImageEq => "==",
+            };
+            // PG19 geo_ops: point has = and <> only (no ordering
+            // operators, no opclass); circle has no comparison
+            // operators at all; box has = and <> only; any mixed
+            // pairing is 42883.
+            let blocked = (ln == "point" && rn == "point" && !eq)
+                || ((ln == "point") != (rn == "point"))
+                || ln == "circle"
+                || rn == "circle"
+                || (ln == "box" && rn == "box" && !eq)
+                || ((ln == "box") != (rn == "box"));
+            if blocked {
+                return Err(exec_err(
+                    "42883",
+                    format!("operator does not exist: {} {} {}", ln, sym, rn),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn eval_cmp_vals(op: CmpOp, a: &Value, b: &Value) -> Result<Value, ExecError> {

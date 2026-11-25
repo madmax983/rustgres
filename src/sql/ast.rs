@@ -2643,6 +2643,38 @@ impl UniqueDef {
     }
 }
 
+/// v2.44: one element of an EXCLUDE constraint (PG19 IndexElem +
+/// its exclusion operator): a column reference or a general
+/// expression, with the operator text as written (`=`, `&&`, `-|-`,
+/// ...). `sql` is the canonical source rendering captured at parse
+/// time (tokens_to_sql), used for catalog deparse and as the
+/// constraints-codec fallback when the s-expr expr codec cannot
+/// represent the expression.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExclElem {
+    pub expr: Expr,
+    pub sql: String,
+    pub op: String,
+}
+
+/// v2.44: an EXCLUDE constraint (PG19 contype 'x'). Backed by a
+/// catalog-only index (IndexDef.exclusion) and enforced by the
+/// scan-based pairwise check in exec::indexes, like WITHOUT
+/// OVERLAPS. Exclusion constraints are never inherited.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExclDef {
+    pub name: String,
+    /// Access method as written, lowercased (`gist` default).
+    pub method: String,
+    pub elems: Vec<ExclElem>,
+    /// INCLUDE columns of the backing index (never keys).
+    pub include: Vec<String>,
+    pub predicate: Option<Expr>,
+    pub predicate_sql: Option<String>,
+    pub deferrable: bool,
+    pub initially_deferred: bool,
+}
+
 /// v0.9: referential actions for foreign keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FkAction {
@@ -2752,6 +2784,8 @@ pub struct TableDef {
     pub uniques: Vec<UniqueDef>,
     pub pkey: Option<UniqueDef>,
     pub fks: Vec<FkDef>,
+    /// v2.44: EXCLUDE constraints (PG19 contype 'x').
+    pub excls: Vec<ExclDef>,
     /// v2.03: generated columns, parallel to `columns`
     /// (`Some((expr, stored))`).
     pub gen_cols: Vec<Option<(Expr, bool)>>,
@@ -3012,6 +3046,8 @@ pub enum AlterAction {
         fk: Option<FkDef>,
         // v0.76: NOT NULL column constraint.
         notnull: Option<NotNullDef>,
+        // v2.44: EXCLUDE constraint.
+        excl: Option<ExclDef>,
     },
     DropConstraint {
         name: String,
@@ -3495,6 +3531,10 @@ pub(crate) enum ParsedTableCon {
         /// v1.97: declared NO INHERIT (PG19).
         no_inherit: bool,
     },
+    /// v2.44: `EXCLUDE [USING method] (elem WITH op [, ...]) ...`.
+    /// The ExclDef's name field is empty here; the optional
+    /// CONSTRAINT name rides in the first slot.
+    Exclude(Option<String>, ExclDef),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3590,6 +3630,7 @@ impl TableDef {
             uniques: Vec::new(),
             pkey: None,
             fks: Vec::new(),
+            excls: Vec::new(),
             partition: None,
             likes: Vec::new(),
             reloptions: Vec::new(),
@@ -3695,6 +3736,7 @@ pub(crate) fn def_constraint_name_exists(def: &TableDef, cname: &str) -> bool {
     def.uniques.iter().any(|u| u.name == cname)
         || def.checks.iter().any(|c| c.name == cname)
         || def.fks.iter().any(|f| f.name == cname)
+        || def.excls.iter().any(|x| x.name == cname)
         || def.pkey.as_ref().map(|p| p.name == cname).unwrap_or(false)
 }
 
@@ -3870,6 +3912,52 @@ pub(crate) fn def_add_unique(
         include: include.to_vec(),
         without_overlaps,
     });
+    Ok(())
+}
+
+/// v2.44: the name an EXCLUDE element contributes to an
+/// auto-generated constraint name (PG19 ChooseIndexName /
+/// ChooseConstraintName): the column name for a plain column
+/// element or a cast of one; `expr` for any other expression.
+pub(crate) fn excl_elem_name_part(e: &Expr) -> String {
+    match e {
+        Expr::Column { name, .. } => name.clone(),
+        Expr::Cast { expr, .. } | Expr::CastNamed { expr, .. } => excl_elem_name_part(expr),
+        _ => "expr".to_string(),
+    }
+}
+
+/// v2.44: add an EXCLUDE constraint to a CREATE TABLE def
+/// (PG19 transformIndexConstraints / ChooseConstraintName:
+/// `<table>_<elem parts joined by _>_excl`, collision-suffixed).
+pub(crate) fn def_add_excl(
+    table: &str,
+    def: &mut TableDef,
+    name: Option<String>,
+    mut excl: ExclDef,
+) -> Result<(), SqlError> {
+    let cname = match &name {
+        Some(n) => {
+            if def_constraint_name_exists(def, n) {
+                return Err(err(format!("constraint \"{}\" already exists", n)));
+            }
+            n.clone()
+        }
+        None => choose_auto_name(
+            def,
+            &format!(
+                "{}_{}_excl",
+                table,
+                excl.elems
+                    .iter()
+                    .map(|e| excl_elem_name_part(&e.expr))
+                    .collect::<Vec<_>>()
+                    .join("_")
+            ),
+        ),
+    };
+    excl.name = cname;
+    def.excls.push(excl);
     Ok(())
 }
 
@@ -4395,6 +4483,9 @@ pub(crate) fn build_table_def(
                         def.deferred_not_null
                             .push((col.clone(), con_name.clone(), *no_inherit));
                     }
+                }
+                ParsedTableCon::Exclude(n, excl) => {
+                    def_add_excl(table, &mut def, n.clone(), excl.clone())?
                 }
                 ParsedTableCon::Fk {
                     name: n,
@@ -10988,6 +11079,11 @@ pub enum Stmt {
         buffer_usage_limit_kb: Option<i64>,
         buffer_usage_overflow: bool,
         buffer_usage_full: bool,
+        /// v2.44: PARALLEL option: None = absent, Some(None) =
+        /// bare PARALLEL (no degree), Some(Some(n)) = degree.
+        /// Validated at execution like BUFFER_USAGE_LIMIT (PG19
+        /// gram.y / vacuum.c).
+        parallel: Option<Option<i64>>,
     },
     // --- v0.8: secondary indexes
     CreateIndex {
@@ -11011,6 +11107,10 @@ pub enum Stmt {
         /// v2.31: `USING gist` — a catalog-only GiST index (no
         /// btree machinery rides on it in this engine).
         gist: bool,
+        /// v2.44: the access method name as written ("btree" when
+        /// no USING clause), for DefineIndex-time validation
+        /// (INCLUDE support is method-dependent in PG19).
+        method: String,
     },
     DropIndex {
         names: Vec<String>,

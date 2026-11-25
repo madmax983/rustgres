@@ -761,6 +761,13 @@ pub(crate) fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<V
             super::xml::xml_cast_in(s)?;
             Ok(Value::xml(s))
         }
+        // v2.44: geometric parameters validate + canonicalize at
+        // bind time (PG input function over the text form).
+        ColType::Point | ColType::BoxGeo | ColType::Circle => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
+            super::geometry::geo_input(*t, s).map(Value::text)
+        }
         ColType::Text | ColType::Array(_) => {
             let s = std::str::from_utf8(bytes)
                 .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
@@ -1558,10 +1565,13 @@ pub(crate) fn dummy_value(t: &ColType) -> Value {
         ColType::Float => Value::Float(0.0),
         ColType::Numeric(..) => Value::Numeric(Numeric::zero()),
         ColType::Text => Value::text(""),
-        ColType::Xml => Value::xml("<x/>"),          // v2.42
-        ColType::Char(_) => Value::bpchar(""),       // v0.35
-        ColType::Varchar(_) => Value::text(""),      // v0.35
-        ColType::SingleChar => Value::SingleChar(0), // v0.36
+        ColType::Xml => Value::xml("<x/>"),            // v2.42
+        ColType::Point => Value::text("(0,0)"),        // v2.44
+        ColType::BoxGeo => Value::text("(0,0),(0,0)"), // v2.44
+        ColType::Circle => Value::text("<(0,0),0>"),   // v2.44
+        ColType::Char(_) => Value::bpchar(""),         // v0.35
+        ColType::Varchar(_) => Value::text(""),        // v0.35
+        ColType::SingleChar => Value::SingleChar(0),   // v0.36
         ColType::Bool => Value::Bool(false),
         ColType::Date => Value::Date(0),
         ColType::Timestamp => Value::Timestamp(0),

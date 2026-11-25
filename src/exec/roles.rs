@@ -3530,7 +3530,7 @@ pub(crate) fn exec_reindex(
     ctx: &mut StmtCtx,
     kind: char,
     name: &Option<String>,
-    _concurrently: bool,
+    concurrently: bool,
 ) -> Result<ExecResult, ExecError> {
     let maintain_ok = |t: &crate::storage::Table| {
         t.owner == ctx.role
@@ -3561,6 +3561,16 @@ pub(crate) fn exec_reindex(
             let Some(idx) = idx else {
                 return Err(exec_err("42704", format!("index \"{}\" does not exist", n)));
             };
+            // v2.44: PG19 index.c — REINDEX INDEX CONCURRENTLY on
+            // an exclusion-constraint index (incl. WITHOUT OVERLAPS
+            // backing indexes, which are exclusion indexes in PG)
+            // is 0A000.
+            if concurrently && (idx.def.exclusion || idx.def.without_overlaps) {
+                return Err(exec_err(
+                    "0A000",
+                    "concurrent index creation for exclusion constraints is not supported",
+                ));
+            }
             let tname = idx.def.table.clone();
             if let Some(t) = eng
                 .db

@@ -2141,6 +2141,20 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
         }
     }
     match to {
+        // v2.44: casts to the geometric types validate + canonicalize
+        // the source's text form (PG *_in over the cast input).
+        ColType::Point | ColType::BoxGeo | ColType::Circle => match v {
+            Value::Null => Ok(Value::Null),
+            _ => {
+                let t = text_value_of(&[v]);
+                match t {
+                    Value::Text(s) | Value::BpChar(s) => {
+                        super::geometry::geo_input(to, &s).map(Value::text)
+                    }
+                    _ => Err(cast_err(v, &to.sql_name())),
+                }
+            }
+        },
         ColType::Text => Ok(text_value_of(&[v])),
         // v2.42: cast to xml — PG xmlin over the source's text form
         // (validates per the xmloption GUC at execution time in

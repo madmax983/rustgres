@@ -643,6 +643,19 @@ impl Enc {
                 self.u8(41);
                 return;
             }
+            // v2.44: geometric types; tags append after xml's.
+            ColType::Point => {
+                self.u8(42);
+                return;
+            }
+            ColType::BoxGeo => {
+                self.u8(43);
+                return;
+            }
+            ColType::Circle => {
+                self.u8(44);
+                return;
+            }
             // v1.94: tsvector / tsquery; tags append after v1.88's.
             ColType::TsVector => {
                 self.u8(34);
@@ -1005,6 +1018,8 @@ impl Enc {
                 include_names,
                 without_overlaps,
                 gist,
+                exclusion,
+                excl_ops,
                 xmin,
             } => {
                 self.u8(5);
@@ -1049,6 +1064,10 @@ impl Enc {
                 // v2.31 (RGSWAL36): WITHOUT OVERLAPS flag, trailing.
                 self.u8(*without_overlaps as u8);
                 self.u8(*gist as u8);
+                // v2.44 (RGSWAL38): exclusion flag + operators,
+                // trailing.
+                self.u8(*exclusion as u8);
+                self.str_list(excl_ops);
             }
             WalRecord::DropIndex { name, xmax } => {
                 self.u8(6);
@@ -2006,6 +2025,10 @@ impl<'a> Dec<'a> {
             40 => Ok(ColType::Regnamespace),
             // v2.42: xml.
             41 => Ok(ColType::Xml),
+            // v2.44: geometric types.
+            42 => Ok(ColType::Point),
+            43 => Ok(ColType::BoxGeo),
+            44 => Ok(ColType::Circle),
             // v0.78: array, then the PG array OID identifying the
             // element type.
             22 => {
@@ -2456,6 +2479,12 @@ impl<'a> Dec<'a> {
                 } else {
                     false
                 };
+                // v2.44: exclusion flag + operators ride RGSWAL38+.
+                let (exclusion, excl_ops) = if self.wal_version >= 38 {
+                    (self.u8()? != 0, self.str_list_d()?)
+                } else {
+                    (false, Vec::new())
+                };
                 Ok(WalRecord::CreateIndex {
                     name,
                     table,
@@ -2473,6 +2502,8 @@ impl<'a> Dec<'a> {
                     include_names,
                     without_overlaps,
                     gist,
+                    exclusion,
+                    excl_ops,
                     xmin,
                 })
             }

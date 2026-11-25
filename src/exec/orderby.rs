@@ -44,6 +44,70 @@ pub(crate) fn apply_order(
     out_cols: &[(String, ColType)],
     orows: &mut Vec<OutRow>,
 ) -> Result<(), ExecError> {
+    // v2.44: PG19 resolves the ordering operator at plan time: a
+    // geometric column, or a composite column containing a field
+    // without a btree opclass (point/box/circle), cannot be
+    // ordered (42883). Only bare column terms resolving into the
+    // FROM schema are checked (output aliases keep runtime
+    // behavior).
+    {
+        let aliases: Vec<&str> = stmt
+            .items
+            .iter()
+            .filter_map(|t| match t {
+                crate::sql::SelectItem::Expr { alias, .. } => alias.as_deref(),
+                _ => None,
+            })
+            .collect();
+        for term in &stmt.order_by {
+            let Expr::Column { table: qual, name } = &term.expr else {
+                continue;
+            };
+            if qual.is_none() && aliases.contains(&name.as_str()) {
+                continue;
+            }
+            let Some(qc) = schema
+                .iter()
+                .find(|c| c.name == *name && qual.as_ref().is_none_or(|qq| c.qual == *qq))
+            else {
+                continue;
+            };
+            let geo_name = match &qc.ty {
+                ColType::Point => Some("point"),
+                ColType::BoxGeo => Some("box"),
+                ColType::Circle => Some("circle"),
+                _ => None,
+            };
+            if let Some(g) = geo_name {
+                return Err(exec_err(
+                    "42883",
+                    format!("could not identify an ordering operator for type {}", g),
+                ));
+            }
+            if matches!(qc.ty, ColType::Composite) {
+                if let Some(t) = q
+                    .eng
+                    .db
+                    .find_table(&qc.qual, q.snap, &q.all_xids, q.session)
+                {
+                    if let Some(Some(cname)) = t.composite_types.get(qc.src_ord as usize) {
+                        let cname = cname.clone();
+                        if let Some(fs) = crate::exec::eval::composite_fields_of(q, &cname) {
+                            if crate::exec::eval::composite_blocker(q, &fs, false).is_some() {
+                                return Err(exec_err(
+                                    "42883",
+                                    format!(
+                                        "could not identify an ordering operator for type {}",
+                                        cname
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     let out_qcols: Vec<QCol> = out_cols
         .iter()
         .map(|(n, ty)| QCol {

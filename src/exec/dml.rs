@@ -277,6 +277,25 @@ pub(crate) fn coerce_value(
     {
         return Ok(v);
     }
+    // v2.44: geometric columns carry canonical text; a text input
+    // validates + canonicalizes through the type's input function
+    // (PG assignment cast via the input function).
+    if matches!(col_type, ColType::Point | ColType::BoxGeo | ColType::Circle) {
+        return match &v {
+            Value::Text(s) | Value::BpChar(s) => {
+                super::geometry::geo_input(*col_type, s).map(Value::text)
+            }
+            _ => Err(exec_err(
+                "42804",
+                format!(
+                    "column \"{}\" is of type {} but expression is of type {}",
+                    col_name,
+                    col_type.sql_name(),
+                    v.col_type().sql_name()
+                ),
+            )),
+        };
+    }
     // v0.65: narrowing integer assignments (PG's assignment casts, e.g.
     // nextval()'s bigint into a serial integer column). Overflow is
     // PG19's 22003, not a type mismatch.
@@ -652,6 +671,10 @@ pub(crate) struct UpsertPlan {
     /// constraint (exclusion arbiter; DO UPDATE was rejected at
     /// plan time with 0A000).
     pub(crate) wo_arbiter: bool,
+    /// v2.44: the explicit arbiter names an EXCLUDE constraint
+    /// (DO UPDATE / DO SELECT were rejected at plan time with
+    /// 42809; a deferrable arbiter with 55000).
+    pub(crate) excl_arbiter: Option<String>,
     /// v2.08: nulls_not_distinct of each arbiter index (parallel to
     /// `indexes`); a leaf index is arbiter-compatible only when its
     /// null treatment matches (PG19 execPartition.c
@@ -833,7 +856,121 @@ pub(crate) fn plan_upsert(
                 explicit_arbiter: true,
                 arbiter_nnd: vec![false],
                 wo_arbiter,
+                excl_arbiter: None,
             });
+        }
+    }
+    // v2.44: ON CONFLICT ON CONSTRAINT naming an EXCLUDE
+    // constraint (PG19 plancat.c / execIndexing.c): a deferrable
+    // arbiter is 55000; DO UPDATE and DO SELECT are 42809; DO
+    // NOTHING arbitrates on the exclusion constraint (the insert
+    // loop's exclusion probe absorbs the row).
+    if let ConflictArbiter::Constraint(cname) = &oc.arbiter {
+        if let Some(x) = t.excls.iter().find(|x| &x.name == cname) {
+            if x.deferrable {
+                return Err(exec_err(
+                    "55000",
+                    "ON CONFLICT does not support deferrable unique constraints/exclusion constraints as arbiters",
+                ));
+            }
+            if matches!(
+                oc.action,
+                ConflictAction::DoUpdate { .. } | ConflictAction::DoSelect { .. }
+            ) {
+                return Err(exec_err(
+                    "42809",
+                    "ON CONFLICT DO UPDATE not supported with exclusion constraints",
+                ));
+            }
+            let cols: Vec<usize> = x
+                .elems
+                .iter()
+                .filter_map(|e| match &e.expr {
+                    Expr::Column { name, .. } => t.column_index(name),
+                    _ => None,
+                })
+                .collect();
+            let key_names: Vec<String> = x
+                .elems
+                .iter()
+                .map(|e| crate::exec::indexes::excl_elem_label(t, e))
+                .collect();
+            return Ok(UpsertPlan {
+                indexes: vec![(x.name.clone(), cols)],
+                set_cols: Vec::new(),
+                action: oc.action.clone(),
+                con_names: vec![Some(x.name.clone())],
+                key_names: vec![key_names],
+                explicit_arbiter: true,
+                arbiter_nnd: vec![false],
+                wo_arbiter: false,
+                excl_arbiter: Some(x.name.clone()),
+            });
+        }
+    }
+    // v2.44: inference specification matching an EXCLUDE
+    // constraint whose elements are all plain columns (PG19
+    // infer_arbiter_indexes considers exclusion indexes too; the
+    // element column set must match exactly and the constraint
+    // must not be partial — this engine's arbiter model carries
+    // no inference predicate). Same action rules as the named
+    // form: deferrable 55000, DO UPDATE / DO SELECT 42809.
+    if let ConflictArbiter::Columns(cols) = &oc.arbiter {
+        let want: Vec<Option<&str>> = cols
+            .iter()
+            .map(|c| arbiter_elem_bare_name(&c.key))
+            .collect();
+        if want.iter().all(|w| w.is_some()) {
+            let want: Vec<&str> = want.into_iter().map(|w| w.unwrap()).collect();
+            let hit = t.excls.iter().find(|x| {
+                x.predicate.is_none()
+                    && x.elems.len() == want.len()
+                    && x.elems
+                        .iter()
+                        .zip(want.iter())
+                        .all(|(e, w)| matches!(&e.expr, Expr::Column { name, .. } if name == w))
+            });
+            if let Some(x) = hit {
+                if x.deferrable {
+                    return Err(exec_err(
+                        "55000",
+                        "ON CONFLICT does not support deferrable unique constraints/exclusion constraints as arbiters",
+                    ));
+                }
+                if matches!(
+                    oc.action,
+                    ConflictAction::DoUpdate { .. } | ConflictAction::DoSelect { .. }
+                ) {
+                    return Err(exec_err(
+                        "42809",
+                        "ON CONFLICT DO UPDATE not supported with exclusion constraints",
+                    ));
+                }
+                let pos: Vec<usize> = x
+                    .elems
+                    .iter()
+                    .filter_map(|e| match &e.expr {
+                        Expr::Column { name, .. } => t.column_index(name),
+                        _ => None,
+                    })
+                    .collect();
+                let key_names: Vec<String> = x
+                    .elems
+                    .iter()
+                    .map(|e| crate::exec::indexes::excl_elem_label(t, e))
+                    .collect();
+                return Ok(UpsertPlan {
+                    indexes: vec![(x.name.clone(), pos)],
+                    set_cols: Vec::new(),
+                    action: oc.action.clone(),
+                    con_names: vec![Some(x.name.clone())],
+                    key_names: vec![key_names],
+                    explicit_arbiter: true,
+                    arbiter_nnd: vec![false],
+                    wo_arbiter: false,
+                    excl_arbiter: Some(x.name.clone()),
+                });
+            }
         }
     }
     // v2.08: the trailing bool carries the arbiter's null treatment.
@@ -1000,6 +1137,7 @@ pub(crate) fn plan_upsert(
         explicit_arbiter,
         arbiter_nnd,
         wo_arbiter,
+        excl_arbiter: None,
     })
 }
 
@@ -1007,7 +1145,7 @@ pub(crate) fn plan_upsert(
 /// parser's desugar for `col[...] = ...` targets)?
 pub(crate) fn is_subscript_assign_expr(e: &Expr) -> bool {
     matches!(e, Expr::Func { name, .. } if name == "__jsonb_subscript_assign"
-        || name == "__array_subscript_assign"
+        || name == "__array_subscript_assign" || name == "__point_subscript_assign"
         || name == "__array_slice_assign")
 }
 
@@ -1925,6 +2063,7 @@ pub(crate) fn exec_create_table_as(
         uniques: Vec::new(),
         pkey: None,
         fks: Vec::new(),
+        excls: Vec::new(),
         partition: None,
         likes: Vec::new(),
         reloptions: Vec::new(),
@@ -3816,6 +3955,13 @@ pub(crate) fn exec_insert_inner(
             } else {
                 check_insert_unique(eng, table, &built, ctx.snap, &ctx.all_xids, ctx.session)?;
             }
+            // v2.44: EXCLUDE constraint enforcement for plain
+            // (non-partitioned) targets; the partitioned path checks
+            // per leaf inside check_partitioned_insert_unique.
+            if !is_partitioned_parent {
+                let batch: Vec<Vec<Value>> = built.iter().map(|r| r[..].to_vec()).collect();
+                crate::exec::indexes::check_exclusion_batch(eng, ctx, table, &batch, &[])?;
+            }
         }
         // v0.9: child-side foreign keys. v2.15: PG queues RI checks
         // to end of statement, so ALL rows of this statement are
@@ -4195,6 +4341,83 @@ pub(crate) fn exec_insert_inner(
                                 Err(e) if e.code == "23P01" => {
                                     let absorb = matches!(&plan.action, ConflictAction::DoNothing)
                                         && (!plan.explicit_arbiter || plan.wo_arbiter);
+                                    if absorb {
+                                        conflict = Some(0);
+                                    } else {
+                                        return Err(e);
+                                    }
+                                }
+                                Err(e) => return Err(e),
+                            }
+                            if conflict.is_some() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            // v2.44: EXCLUDE probe — same shape as the WO probe
+            // above (the backing index is catalog-only). Bare DO
+            // NOTHING and an arbiter naming THIS exclusion
+            // constraint absorb the conflict; a deferred constraint
+            // queues instead of erroring; anything else is 23P01.
+            if conflict.is_none() {
+                if let Some(t) = eng
+                    .db
+                    .find_table(&ctable, ctx.snap, &ctx.all_xids, ctx.session)
+                    .cloned()
+                {
+                    let defs: Vec<ExclDef> = if !t.excls.is_empty() {
+                        t.excls.clone()
+                    } else if ctable != table {
+                        eng.db
+                            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+                            .map(|rt| rt.excls.clone())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    if !defs.is_empty() {
+                        let mut existing: Vec<Row> = t
+                            .rows
+                            .iter()
+                            .filter(|r| crate::storage::row_visible(r, ctx.snap, &ctx.all_xids))
+                            .map(|r| r.values.clone())
+                            .collect();
+                        for (pid, prow) in &latest {
+                            if !partitioned_upsert
+                                || planned_leaf.get(pid).map(|l| l.as_str())
+                                    == Some(ctable.as_str())
+                            {
+                                existing.push(prow.clone());
+                            }
+                        }
+                        for def in &defs {
+                            if crate::exec::indexes::excl_deferred_now(eng, ctx, &ctable, def) {
+                                crate::exec::deferred::queue_excl(
+                                    eng,
+                                    ctx.session,
+                                    &ctable,
+                                    &def.name,
+                                );
+                                continue;
+                            }
+                            match crate::exec::indexes::check_one_excl_def(
+                                eng,
+                                ctx,
+                                &t,
+                                &ctable,
+                                def,
+                                &[cvalues.clone()],
+                                &existing,
+                                false,
+                            ) {
+                                Ok(()) => {}
+                                Err(e) if e.code == "23P01" => {
+                                    let absorb = matches!(&plan.action, ConflictAction::DoNothing)
+                                        && (!plan.explicit_arbiter
+                                            || plan.excl_arbiter.as_deref()
+                                                == Some(def.name.as_str()));
                                     if absorb {
                                         conflict = Some(0);
                                     } else {
@@ -5285,6 +5508,17 @@ pub(crate) fn exec_update_inner(
                             args: args.clone(),
                         }
                     }
+                    // v2.44: point targets take the fixed-length
+                    // subscripting path (indices 0/1 = x/y).
+                    Expr::Func { name: fname, args }
+                        if fname == "__jsonb_subscript_assign"
+                            && matches!(columns[ci].1, ColType::Point) =>
+                    {
+                        Expr::Func {
+                            name: "__point_subscript_assign".to_string(),
+                            args: args.clone(),
+                        }
+                    }
                     e => e.clone(),
                 };
                 (name.clone(), expr)
@@ -5880,6 +6114,9 @@ pub(crate) fn exec_update_inner(
                     &ctx.all_xids,
                     ctx.session,
                 )?;
+                // v2.44: EXCLUDE constraints against the same final
+                // image.
+                crate::exec::indexes::check_exclusion_batch(eng, ctx, dst, &batch, excl)?;
             }
         }
         // v0.8: pairwise unique check — two rows updated to the same unique

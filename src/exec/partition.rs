@@ -7227,6 +7227,177 @@ pub(crate) fn create_constraint_index(
     Ok(())
 }
 
+/// v2.44: validate one EXCLUDE definition against a table at
+/// CREATE / ADD CONSTRAINT time (PG19 indexcmds.c
+/// ComputeIndexAttrs + the partitioned-table rules): element
+/// columns must exist (42703); on a partitioned table every
+/// partition-key column must appear as an element (0A000 + DETAIL)
+/// and at least one of its elements must use the equality operator
+/// (0A000).
+pub(crate) fn validate_excl_def(t: &Table, table: &str, def: &ExclDef) -> Result<(), ExecError> {
+    for e in &def.elems {
+        if let Expr::Column { name, .. } = &e.expr {
+            if t.column_index(name).is_none() {
+                return Err(exec_err(
+                    "42703",
+                    format!(
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        name, table
+                    ),
+                ));
+            }
+        }
+    }
+    for c in &def.include {
+        if t.column_index(c).is_none() {
+            return Err(exec_err(
+                "42703",
+                format!("column \"{}\" of relation \"{}\" does not exist", c, table),
+            ));
+        }
+    }
+    if let Some(p) = &t.partition {
+        if p.is_partitioned {
+            for k in &p.key {
+                if k.expr.is_some() {
+                    continue;
+                }
+                let Some((kc, _)) = t.columns.get(k.col) else {
+                    continue;
+                };
+                let kc = kc.clone();
+                let ops: Vec<&str> = def
+                    .elems
+                    .iter()
+                    .filter(|e| matches!(&e.expr, Expr::Column { name, .. } if name == &kc))
+                    .map(|e| e.op.as_str())
+                    .collect();
+                if ops.is_empty() {
+                    return Err(exec_err_detail(
+                        "0A000",
+                        "EXCLUDE constraint on partitioned table must include all partitioning columns"
+                            .to_string(),
+                        format!(
+                            "EXCLUDE constraint on table \"{}\" lacks column \"{}\" which is part of the partition key.",
+                            table, kc
+                        ),
+                    ));
+                }
+                if !ops.contains(&"=") {
+                    return Err(exec_err(
+                        "0A000",
+                        format!(
+                            "cannot match partition key to index on column \"{}\" using non-equal operator \"{}\"",
+                            kc, ops[0]
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// v2.44: create the catalog-only backing index of an EXCLUDE
+/// constraint (PG19: the constraint owns a GiST/btree index whose
+/// name is the constraint name; indisexclusion in pg_index). No
+/// tree is built — enforcement is the scan-based check in
+/// exec::indexes, exactly like WITHOUT OVERLAPS.
+pub(crate) fn create_exclusion_index(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table: &str,
+    def: &ExclDef,
+) -> Result<(), ExecError> {
+    let t = eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+        .expect("table still visible; engine lock held throughout")
+        .clone();
+    // v2.44: PG names an exclusion constraint's backing index
+    // after the constraint verbatim (the constraint is defined
+    // directly on this table in every flow that reaches here;
+    // exclusion constraints are never propagated to children).
+    let ix_name = def.name.clone();
+    let is_temp = eng.db.is_temp_table(ctx.session, table);
+    if is_temp {
+        if eng
+            .db
+            .temp_indexes
+            .get(&ctx.session)
+            .and_then(|m| m.get(&ix_name))
+            .is_some_and(|ix| index_visible(&ix.def, ctx.snap, &ctx.all_xids))
+        {
+            return Err(exec_err(
+                "42P07",
+                format!("relation \"{}\" already exists", ix_name),
+            ));
+        }
+    } else if eng
+        .db
+        .find_index(&ix_name, ctx.snap, &ctx.all_xids)
+        .is_some()
+    {
+        return Err(exec_err(
+            "42P07",
+            format!("relation \"{}\" already exists", ix_name),
+        ));
+    }
+    let mut cols = Vec::with_capacity(def.elems.len());
+    let mut col_names = Vec::with_capacity(def.elems.len());
+    let mut exprs = Vec::with_capacity(def.elems.len());
+    for e in &def.elems {
+        if let Expr::Column { name, .. } = &e.expr {
+            if let Some(pos) = t.column_index(name) {
+                cols.push(pos);
+                col_names.push(name.clone());
+                exprs.push(None);
+                continue;
+            }
+        }
+        cols.push(usize::MAX);
+        col_names.push(crate::exec::indexes::excl_elem_label(&t, e));
+        exprs.push(Some(e.sql.clone()));
+    }
+    let mut idef = IndexDef::plain(
+        ix_name.clone(),
+        table.to_string(),
+        cols,
+        col_names,
+        false,
+        true,
+        ctx.own,
+    );
+    idef.exprs = exprs;
+    idef.planner_usable = false;
+    idef.gist = def.method != "btree";
+    idef.exclusion = true;
+    idef.excl_ops = def.elems.iter().map(|e| e.op.clone()).collect();
+    idef.include_names = def.include.clone();
+    idef.include_cols = def
+        .include
+        .iter()
+        .filter_map(|c| t.column_index(c))
+        .collect();
+    idef.predicate = def.predicate_sql.clone();
+    let ix = Index::new(idef);
+    if is_temp {
+        eng.db
+            .temp_indexes
+            .entry(ctx.session)
+            .or_default()
+            .insert(ix_name.clone(), ix);
+        ctx.writes.push(WriteOp::CreateTempIndex {
+            session: ctx.session,
+            name: ix_name,
+        });
+    } else {
+        eng.db.indexes.insert(ix_name.clone(), ix);
+        ctx.writes.push(WriteOp::CreateIndex { name: ix_name });
+    }
+    Ok(())
+}
+
 /// v2.06: `ALTER TABLE parent DETACH PARTITION child
 /// [CONCURRENTLY|FINALIZE]` (PG19 ATExecDetachPartition +
 /// RemoveInheritance): the child becomes a standalone table keeping

@@ -34,6 +34,10 @@ pub(crate) enum ConRef {
     PKey(Vec<String>),
     /// A FOREIGN KEY, matched by (columns, referenced table).
     Fk(Vec<String>, String),
+    /// v2.44: an EXCLUDE constraint, matched by name. Exclusion
+    /// constraints are never inherited: always local, inhcount 0,
+    /// never carried by a parent.
+    Excl(String),
 }
 
 impl ConRef {
@@ -91,6 +95,7 @@ pub(crate) fn parent_carries(pt: &Table, r: &ConRef, partition_link: bool) -> bo
         }
         ConRef::Unique(cols) => partition_link && pt.uniques.iter().any(|u| &u.cols == cols),
         ConRef::PKey(cols) => partition_link && pt.pkey.as_ref().is_some_and(|p| &p.cols == cols),
+        ConRef::Excl(_) => false,
         ConRef::Fk(cols, ref_table) => {
             partition_link
                 && pt
@@ -194,6 +199,7 @@ pub(crate) fn stored_is_local(t: &Table, r: &ConRef) -> bool {
             .find(|f| &f.cols == cols && &f.ref_table == ref_table)
             .map(|f| f.is_local)
             .unwrap_or(true),
+        ConRef::Excl(_) => true,
     }
 }
 
@@ -251,5 +257,10 @@ pub(crate) fn con_stored_name(t: &Table, r: &ConRef) -> Option<String> {
             .iter()
             .find(|f| &f.cols == cols && &f.ref_table == ref_table)
             .map(|f| f.name.clone()),
+        ConRef::Excl(name) => t
+            .excls
+            .iter()
+            .find(|x| &x.name == name)
+            .map(|x| x.name.clone()),
     }
 }

@@ -140,6 +140,12 @@ pub enum WalRecord {
         /// v2.29 (RGSWAL35): INCLUDE column names; trailing field,
         /// present only in RGSWAL35+ images.
         include_names: Vec<String>,
+        /// v2.44 (RGSWAL38): EXCLUDE-constraint backing index;
+        /// trailing fields, RGSWAL38+ only.
+        exclusion: bool,
+        /// v2.44 (RGSWAL38): per-key-column exclusion operators;
+        /// parallel to `columns`.
+        excl_ops: Vec<String>,
         xmin: u64,
     },
     DropIndex {

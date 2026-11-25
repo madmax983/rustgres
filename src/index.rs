@@ -313,6 +313,18 @@ pub struct IndexDef {
     /// this engine (relam 783, pg_get_indexdef renders gist); no
     /// btree is built or maintained and the planner never uses it.
     pub gist: bool,
+    /// v2.44: backing index of an EXCLUDE constraint (PG19
+    /// pg_index.indisexclusion): catalog-only like the WO index
+    /// (no tree is built; enforcement is the scan-based check in
+    /// exec::indexes). `gist` carries the access method (false =
+    /// btree, whose relam is 403).
+    pub exclusion: bool,
+    /// v2.44: per-key-column exclusion operator text (`=`, `&&`,
+    /// ...), parallel to `cols` / `col_names`; empty for
+    /// non-exclusion indexes. Needed to render
+    /// pg_get_constraintdef's `WITH <op>` clauses and to compare
+    /// definitions for ALTER INDEX ... ATTACH PARTITION.
+    pub excl_ops: Vec<String>,
 }
 
 impl IndexDef {
@@ -350,6 +362,8 @@ impl IndexDef {
             without_overlaps: false,
             gist: false,
             include_cols: Vec::new(),
+            exclusion: false,
+            excl_ops: Vec::new(),
         }
     }
 }

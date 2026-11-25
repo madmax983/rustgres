@@ -154,6 +154,76 @@ pub(crate) fn unique_mode_deferred(
     }
 }
 
+/// v2.44: is this EXCLUDE constraint currently checked deferred
+/// for the session? The unique_mode_deferred logic parameterized
+/// by (name, deferrable, initially_deferred) — exclusion
+/// constraints are never inherited, so the ancestor walk only
+/// matters for partitioned tables (where the constraint lives on
+/// the root and DML lands on leaves).
+pub(crate) fn constraint_deferred_now(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    table: &str,
+    con_name: &str,
+    deferrable: bool,
+    initially_deferred: bool,
+) -> bool {
+    if !deferrable {
+        return false;
+    }
+    let st = eng.deferred_fk.borrow();
+    let Some(st) = st.get(&ctx.session) else {
+        return initially_deferred;
+    };
+    if st
+        .firing
+        .contains(&(table.to_string(), con_name.to_string()))
+    {
+        return false;
+    }
+    let mut cur = table.to_string();
+    loop {
+        if let Some(m) = st.modes.get(&(cur.clone(), con_name.to_string())) {
+            return *m;
+        }
+        let parent = eng
+            .db
+            .find_table(&cur, ctx.snap, &ctx.all_xids, ctx.session)
+            .and_then(|t| t.partition.as_ref().and_then(|p| p.parent.clone()));
+        match parent {
+            Some(p) => cur = p,
+            None => return initially_deferred,
+        }
+    }
+}
+
+/// v2.44: queue a deferred EXCLUDE revalidation (deduplicated like
+/// queue_unique; firing rescans the table pairwise).
+pub(crate) fn queue_excl(eng: &Engine, session: u64, table: &str, con_name: &str) {
+    let mut map = eng.deferred_fk.borrow_mut();
+    let st = map.entry(session).or_default();
+    let exists = st.queue.iter().any(|e| {
+        matches!(e, PendingFk::Excl { table: t2, con_name: c }
+            if t2 == table && c == con_name)
+    });
+    if !exists {
+        st.queue.push(PendingFk::Excl {
+            table: table.to_string(),
+            con_name: con_name.to_string(),
+        });
+    }
+}
+
+/// v2.44: fire one queued deferred EXCLUDE revalidation.
+fn fire_excl(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    table: &str,
+    con_name: &str,
+) -> Result<(), ExecError> {
+    crate::exec::indexes::check_exclusion_table_rescan(eng, ctx, table, con_name)
+}
+
 /// v2.07: queue a deferred UNIQUE/PK revalidation (deduplicated: one
 /// entry per (root, constraint) is enough — firing rescans the tree).
 pub(crate) fn queue_unique(eng: &Engine, session: u64, root: &str, con_name: &str) {
@@ -706,6 +776,9 @@ pub(crate) fn flush_deferred_fk(
                     (PendingFk::Unique { table, con_name }, Some(set)) => {
                         set.contains(&(table.clone(), con_name.clone()))
                     }
+                    (PendingFk::Excl { table, con_name }, Some(set)) => {
+                        set.contains(&(table.clone(), con_name.clone()))
+                    }
                 };
                 if hit {
                     taken.push(e);
@@ -772,6 +845,9 @@ pub(crate) fn flush_deferred_fk(
                 PendingFk::Unique { table, con_name } => {
                     fire_unique(eng, ctx, &table, &con_name)?;
                 }
+                PendingFk::Excl { table, con_name } => {
+                    fire_excl(eng, ctx, &table, &con_name)?;
+                }
             }
         }
     }
@@ -785,6 +861,8 @@ pub(crate) fn flush_deferred_fk(
 enum ConRes {
     Fk(FkDef),
     Unique(UniqueDef),
+    /// v2.44: an EXCLUDE constraint.
+    Excl(ExclDef),
     /// v2.09: a constraint trigger (SET CONSTRAINTS resolves trigger
     /// names in PG — they ARE constraints for this purpose).
     Trig(crate::sql::TriggerDef),
@@ -798,6 +876,7 @@ impl ConRes {
         match self {
             ConRes::Fk(f) => f.deferrable,
             ConRes::Unique(u) => u.deferrable,
+            ConRes::Excl(x) => x.deferrable,
             ConRes::Trig(t) => t.deferrable,
             ConRes::Other => false,
         }
@@ -806,6 +885,7 @@ impl ConRes {
         match self {
             ConRes::Fk(f) => &f.name,
             ConRes::Unique(u) => &u.name,
+            ConRes::Excl(x) => &x.name,
             ConRes::Trig(t) => &t.name,
             ConRes::Other => "",
         }
@@ -830,6 +910,9 @@ fn all_constraints(eng: &Engine, ctx: &StmtCtx) -> Vec<(String, String, ConRes)>
         }
         if let Some(p) = &t.pkey {
             out.push((name.to_string(), p.name.clone(), ConRes::Unique(p.clone())));
+        }
+        for x in &t.excls {
+            out.push((name.to_string(), x.name.clone(), ConRes::Excl(x.clone())));
         }
         for tr in &t.triggers {
             if tr.is_constraint {

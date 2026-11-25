@@ -155,6 +155,16 @@ pub enum ColType {
     // tsquery 3615.
     TsVector, // OID 3614
     TsQuery,  // OID 3615
+    // v2.44: PG's geometric types point (OID 600), box (OID 603),
+    // circle (OID 718) — the minimal family the EXCLUDE-constraint
+    // suites exercise. Values are carried as `Value::Text` holding
+    // the canonical PG output form (`(x,y)`, `(x,y),(x,y)` with the
+    // high corner first, `<(x,y),r>`), parsed and canonicalized at
+    // input (assignment coercion / casts) in exec::geometry, exactly
+    // like Inet's canonical-text discipline.
+    Point,  // OID 600
+    BoxGeo, // OID 603 (named BoxGeo: `Box` is taken by the prelude)
+    Circle, // OID 718
     // v0.78: PG's array type — carries the element type. Arrays only
     // flow through expression evaluation (like Record/Json); table
     // columns cannot be arrays (no DDL support). Values are carried as
@@ -455,6 +465,8 @@ impl ArrayElem {
             ColType::Regnamespace => ArrayElem::Int,
             ColType::Oid => ArrayElem::Int,
             ColType::Inet => ArrayElem::Text,
+            // v2.44: geometric arrays degrade to the text element kind.
+            ColType::Point | ColType::BoxGeo | ColType::Circle => ArrayElem::Text,
             ColType::Json => ArrayElem::Json,
             // v1.83: jsonb[] (PG _jsonb, OID 3807) is not supported;
             // array-of-jsonb degrades to the json element kind.
@@ -717,6 +729,9 @@ impl ColType {
             ColType::Json => 114,      // JSON (v0.73)
             ColType::Jsonb => 3802,    // JSONB (v1.83)
             ColType::Xml => 142,       // XML (v2.42)
+            ColType::Point => 600,     // POINT (v2.44)
+            ColType::BoxGeo => 603,    // BOX (v2.44)
+            ColType::Circle => 718,    // CIRCLE (v2.44)
             ColType::Jsonpath => 4072, // JSONPATH (v1.85)
             // v1.88: range / multirange OIDs (pg_type.dat). Non-builtin
             // elems have no builtin type; 2249 (record) is the fallback,
@@ -793,6 +808,9 @@ impl ColType {
             ColType::Json => "json",         // v0.73
             ColType::Jsonb => "jsonb",       // v1.83
             ColType::Xml => "xml",           // v2.42
+            ColType::Point => "point",       // v2.44
+            ColType::BoxGeo => "box",        // v2.44
+            ColType::Circle => "circle",     // v2.44
             ColType::Jsonpath => "jsonpath", // v1.85
             // v1.88: range names double as SQL name and typname for the
             // builtin elems; user elems fall back to the elem-derived
@@ -864,6 +882,9 @@ impl ColType {
             ColType::Json => "json",         // v0.73
             ColType::Jsonb => "jsonb",       // v1.83
             ColType::Xml => "xml",           // v2.42
+            ColType::Point => "point",       // v2.44
+            ColType::BoxGeo => "box",        // v2.44
+            ColType::Circle => "circle",     // v2.44
             ColType::Jsonpath => "jsonpath", // v1.85
             ColType::Range(e) => {
                 return e
@@ -5743,6 +5764,10 @@ pub struct Table {
     pub uniques: Vec<UniqueDef>,
     pub pkey: Option<UniqueDef>,
     pub fks: Vec<FkDef>,
+    /// v2.44: EXCLUDE constraints (PG19 contype 'x'). Versions,
+    /// WAL-replays, and checkpoints with the table via the s-expr
+    /// constraints codec's (excls ...) section.
+    pub excls: Vec<crate::sql::ExclDef>,
     /// v0.11: role that owns the table (the creating role).
     pub owner: String,
     /// v0.11: explicit GRANT entries (owner and superusers bypass).
@@ -5876,6 +5901,7 @@ impl Table {
             uniques: Vec::new(),
             pkey: None,
             fks: Vec::new(),
+            excls: Vec::new(),
             owner: "postgres".to_string(),
             acl: Vec::new(),
             col_acl: Vec::new(),
@@ -5953,6 +5979,7 @@ impl Table {
         t.uniques = def.uniques.clone();
         t.pkey = def.pkey.clone();
         t.fks = def.fks.clone();
+        t.excls = def.excls.clone();
         // v0.96: table inheritance links (pg_inherits equivalent).
         t.inherits = def.inherits.clone();
         // v0.81: named composite types per column.
@@ -8408,6 +8435,10 @@ pub enum PendingFk {
         table: String,
         con_name: String,
     },
+    /// v2.44: one queued deferred EXCLUDE-constraint revalidation.
+    /// Like Unique, it carries no key: at fire time the whole table
+    /// is rescanned pairwise and any surviving conflict violates.
+    Excl { table: String, con_name: String },
 }
 
 /// v2.09: one queued deferred constraint-trigger firing (PG19

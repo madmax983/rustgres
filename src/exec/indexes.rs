@@ -144,32 +144,40 @@ pub(crate) fn check_partitioned_insert_unique(
     // `route_partition_inserts` already does for the same rows) for
     // zero benefit.
     let leaves = collect_partition_leaves(&eng.db, table, ctx.snap, ctx.own, ctx.session);
-    let any_unique = leaves.iter().any(|leaf| {
-        // v2.31: a leaf carrying only WITHOUT OVERLAPS definitions
-        // (catalog-only GiST indexes) still needs the routing pass.
-        if eng
-            .db
-            .find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session)
-            .is_some_and(|t| !wo_defs(t).is_empty())
-        {
-            return true;
-        }
-        // v2.25: ancestor unique indexes (declared on this parent or
-        // higher) also count — a leaf with no local unique index can
-        // still be constrained by a partitioned unique index above it.
-        if !ancestor_unique_indexes(&eng.db, leaf, ctx.snap, &ctx.all_xids, ctx.session).is_empty()
-        {
-            return true;
-        }
-        if eng.db.is_temp_table(ctx.session, leaf) {
-            !temp_unique_cols(&eng.db, leaf, ctx.snap, &ctx.all_xids, ctx.session).is_empty()
-        } else {
-            eng.db
-                .visible_indexes_for(leaf, ctx.snap, &ctx.all_xids, ctx.session)
-                .into_iter()
-                .any(|ix| ix.def.unique && ix.def.planner_usable)
-        }
-    });
+    // v2.44: EXCLUDE defs on the root also force the routing pass
+    // (they are enforced per leaf below).
+    let root_has_excl = eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+        .is_some_and(|t| !t.excls.is_empty());
+    let any_unique = root_has_excl
+        || leaves.iter().any(|leaf| {
+            // v2.31: a leaf carrying only WITHOUT OVERLAPS definitions
+            // (catalog-only GiST indexes) still needs the routing pass.
+            if eng
+                .db
+                .find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session)
+                .is_some_and(|t| !wo_defs(t).is_empty())
+            {
+                return true;
+            }
+            // v2.25: ancestor unique indexes (declared on this parent or
+            // higher) also count — a leaf with no local unique index can
+            // still be constrained by a partitioned unique index above it.
+            if !ancestor_unique_indexes(&eng.db, leaf, ctx.snap, &ctx.all_xids, ctx.session)
+                .is_empty()
+            {
+                return true;
+            }
+            if eng.db.is_temp_table(ctx.session, leaf) {
+                !temp_unique_cols(&eng.db, leaf, ctx.snap, &ctx.all_xids, ctx.session).is_empty()
+            } else {
+                eng.db
+                    .visible_indexes_for(leaf, ctx.snap, &ctx.all_xids, ctx.session)
+                    .into_iter()
+                    .any(|ix| ix.def.unique && ix.def.planner_usable)
+            }
+        });
     if !any_unique {
         return Ok(());
     }
@@ -281,6 +289,52 @@ pub(crate) fn check_partitioned_insert_unique(
             &ctx.all_xids,
             ctx.session,
         )?;
+        // v2.44: EXCLUDE constraints declared on the partitioned
+        // root are enforced per leaf (the leaf carries no copy of
+        // the definition; element columns resolve by name).
+        check_exclusion_for_leaf(eng, ctx, table, leaf, &leaf_rows)?;
+    }
+    Ok(())
+}
+
+/// v2.44: enforce the partitioned ROOT's exclusion definitions
+/// against one leaf's batch + existing rows.
+fn check_exclusion_for_leaf(
+    eng: &mut Engine,
+    ctx: &StmtCtx,
+    root: &str,
+    leaf: &str,
+    leaf_rows: &[Vec<Value>],
+) -> Result<(), ExecError> {
+    let rt = match eng
+        .db
+        .find_table(root, ctx.snap, &ctx.all_xids, ctx.session)
+    {
+        Some(t) => t.clone(),
+        None => return Ok(()),
+    };
+    if rt.excls.is_empty() || leaf_rows.is_empty() {
+        return Ok(());
+    }
+    let lt = match eng
+        .db
+        .find_table(leaf, ctx.snap, &ctx.all_xids, ctx.session)
+    {
+        Some(t) => t.clone(),
+        None => return Ok(()),
+    };
+    let existing: Vec<Row> = lt
+        .rows
+        .iter()
+        .filter(|r| row_visible(r, ctx.snap, &ctx.all_xids))
+        .map(|r| r.values.clone())
+        .collect();
+    for def in &rt.excls {
+        if excl_deferred_now(eng, ctx, root, def) {
+            crate::exec::deferred::queue_excl(eng, ctx.session, root, &def.name);
+            continue;
+        }
+        check_one_excl_def(eng, ctx, &lt, leaf, def, leaf_rows, &existing, false)?;
     }
     Ok(())
 }
@@ -954,6 +1008,463 @@ pub(crate) fn validate_without_overlaps_existing(
     check_one_wo_def(t, table, def, &[], &existing, true)
 }
 
+// ===== v2.44: EXCLUDE constraint enforcement (PG19 execIndexing.c
+// check_exclusion_constraint / check_exclusion_or_unique_constraint,
+// scan-based like the WO machinery: the backing GiST/btree index is
+// catalog-only in this engine). A conflict needs, for some pair of
+// rows that both satisfy the partial predicate, EVERY element
+// operator to hold; an operator yielding NULL (any NULL operand)
+// means no conflict for that element. =====
+
+/// The display label of one exclusion element: the column name for
+/// a plain column reference, else the element's source text.
+pub(crate) fn excl_elem_label(t: &Table, elem: &ExclElem) -> String {
+    if let Expr::Column { name, .. } = &elem.expr {
+        if t.column_index(name).is_some() {
+            return name.clone();
+        }
+    }
+    elem.sql.clone()
+}
+
+/// `Key (a, b)=(1, 2)` for the 23P01 DETAIL (PG19
+/// index_build_error_details / report exclusion detail shape).
+fn excl_key_text(t: &Table, def: &ExclDef, vals: &[Value]) -> String {
+    let cols: Vec<String> = def.elems.iter().map(|e| excl_elem_label(t, e)).collect();
+    let vs: Vec<String> = vals
+        .iter()
+        .map(|v| match v.to_text() {
+            Some(s) => s,
+            None => "null".to_string(),
+        })
+        .collect();
+    format!("Key ({})=({})", cols.join(", "), vs.join(", "))
+}
+
+/// Evaluate one row against an exclusion definition: the element
+/// values plus whether the row is IN the index at all (partial
+/// predicate satisfied). Element expressions evaluate over the
+/// table's columns via the ordinary expression machinery.
+pub(crate) fn eval_excl_row(
+    eng: &mut Engine,
+    ctx: &StmtCtx,
+    t: &Table,
+    def: &ExclDef,
+    values: &[Value],
+) -> Result<(Vec<Value>, bool), ExecError> {
+    let schema: Vec<QCol> = t
+        .columns
+        .iter()
+        .map(|(n, ty)| QCol {
+            qual: String::new(),
+            name: n.clone(),
+            ty: *ty,
+            hidden: false,
+            src_ord: 0,
+        })
+        .collect();
+    let mut lock_ids = Vec::new();
+    let mut q = Q {
+        eng,
+        snap: ctx.snap,
+        own: ctx.own,
+        all_xids: ctx.all_xids.clone(),
+        session: ctx.session,
+        role: ctx.role,
+        read_only: false,
+        depth: 0,
+        lock_ids: &mut lock_ids,
+        ctes: Vec::new(),
+        wctx: None,
+        srf_vals: Vec::new(),
+        priv_scopes: Vec::new(),
+        priv_role_override: None,
+        hashed_exists: Rc::new(RefCell::new(HashMap::new())),
+        immutable_fn_cache: Rc::new(RefCell::new(HashMap::new())),
+        plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
+        hashed_in: Rc::new(RefCell::new(Vec::new())),
+        pending_updates: None,
+        write: None,
+    };
+    let frame = Scope {
+        schema: &schema,
+        row: values,
+        prov: None,
+    };
+    if let Some(pred) = &def.predicate {
+        let pv = eval_expr(&mut q, &[frame.clone()], pred)?;
+        if !matches!(pv, Value::Bool(true)) {
+            return Ok((Vec::new(), false));
+        }
+    }
+    let mut out = Vec::with_capacity(def.elems.len());
+    for e in &def.elems {
+        out.push(eval_expr(&mut q, &[frame.clone()], &e.expr)?);
+    }
+    Ok((out, true))
+}
+
+/// Does exclusion operator `op` hold between element values `a`
+/// and `b` (PG19: the operator's procedure result; NULL on either
+/// side means the operator yields NULL, i.e. no conflict)?
+/// `elem_ty` is the static type of a plain-column element (None for
+/// expression elements), used to pick the geometric reading of the
+/// text-carried values.
+pub(crate) fn excl_op_holds(
+    eng: &mut Engine,
+    ctx: &StmtCtx,
+    elem_ty: Option<ColType>,
+    op: &str,
+    a: &Value,
+    b: &Value,
+) -> Result<bool, ExecError> {
+    if matches!(a, Value::Null) || matches!(b, Value::Null) {
+        return Ok(false);
+    }
+    // Range / multirange family: the ranges module's operator
+    // evaluator (same code the expression layer dispatches to).
+    if matches!(a, Value::Range(_) | Value::Multirange(_))
+        || matches!(b, Value::Range(_) | Value::Multirange(_))
+    {
+        let jop = match op {
+            "&&" => Some(JsonOp::Overlaps),
+            "@>" => Some(JsonOp::Contains),
+            "<@" => Some(JsonOp::ContainedBy),
+            "-|-" => Some(JsonOp::Adjacent),
+            "&<" => Some(JsonOp::OverLeft),
+            "&>" => Some(JsonOp::OverRight),
+            _ => None,
+        };
+        if let Some(jop) = jop {
+            return match super::ranges::eval_range_op(jop, a, b)? {
+                Value::Bool(x) => Ok(x),
+                _ => Ok(false),
+            };
+        }
+        if op == "=" {
+            return Ok(crate::exec::constraint::fk_key_eq(a, b));
+        }
+        if op == "<>" {
+            return Ok(!crate::exec::constraint::fk_key_eq(a, b));
+        }
+    }
+    // Geometric family (values are canonical text; elem_ty picks
+    // the reading).
+    if let Some(ty) = elem_ty {
+        if matches!(ty, ColType::Circle | ColType::BoxGeo | ColType::Point) {
+            let (Value::Text(ta), Value::Text(tb)) = (a, b) else {
+                return Ok(false);
+            };
+            match (ty, op) {
+                (ColType::Circle, "&&") => {
+                    let ca = super::geometry::parse_circle(ta);
+                    let cb = super::geometry::parse_circle(tb);
+                    return Ok(match (ca, cb) {
+                        (Some(x), Some(y)) => super::geometry::circles_overlap(&x, &y),
+                        _ => false,
+                    });
+                }
+                (ColType::BoxGeo, "&&") => {
+                    let ba = super::geometry::parse_box(ta);
+                    let bb = super::geometry::parse_box(tb);
+                    return Ok(match (ba, bb) {
+                        (Some(x), Some(y)) => super::geometry::boxes_overlap(&x, &y),
+                        _ => false,
+                    });
+                }
+                (ColType::BoxGeo, "<@") => {
+                    let ba = super::geometry::parse_box(ta);
+                    let bb = super::geometry::parse_box(tb);
+                    return Ok(match (ba, bb) {
+                        (Some(x), Some(y)) => super::geometry::box_contained(&x, &y),
+                        _ => false,
+                    });
+                }
+                (ColType::BoxGeo, "@>") => {
+                    let ba = super::geometry::parse_box(ta);
+                    let bb = super::geometry::parse_box(tb);
+                    return Ok(match (ba, bb) {
+                        (Some(x), Some(y)) => super::geometry::box_contained(&y, &x),
+                        _ => false,
+                    });
+                }
+                (_, "=") => return Ok(ta == tb),
+                (_, "<>") => return Ok(ta != tb),
+                _ => {}
+            }
+        }
+    }
+    // Expression elements carry no static type: when both values
+    // are text, try the geometric readings (a `(x::circle)` element
+    // evaluates to canonical circle text, etc.).
+    if let (Value::Text(ta), Value::Text(tb)) = (a, b) {
+        if op == "&&" {
+            if let (Some(x), Some(y)) = (
+                super::geometry::parse_circle(ta),
+                super::geometry::parse_circle(tb),
+            ) {
+                return Ok(super::geometry::circles_overlap(&x, &y));
+            }
+            if let (Some(x), Some(y)) = (
+                super::geometry::parse_box(ta),
+                super::geometry::parse_box(tb),
+            ) {
+                return Ok(super::geometry::boxes_overlap(&x, &y));
+            }
+        }
+        if op == "<@" || op == "@>" {
+            if let (Some(x), Some(y)) = (
+                super::geometry::parse_box(ta),
+                super::geometry::parse_box(tb),
+            ) {
+                return Ok(if op == "<@" {
+                    super::geometry::box_contained(&x, &y)
+                } else {
+                    super::geometry::box_contained(&y, &x)
+                });
+            }
+        }
+    }
+    // Array overlap: any common non-NULL element.
+    if op == "&&" {
+        if let (Value::Array(x), Value::Array(y)) = (a, b) {
+            let common = x.elems.iter().any(|e| {
+                !matches!(e, Value::Null)
+                    && y.elems
+                        .iter()
+                        .any(|f| crate::exec::constraint::fk_key_eq(e, f))
+            });
+            return Ok(common);
+        }
+    }
+    match op {
+        "=" => Ok(crate::exec::constraint::fk_key_eq(a, b)),
+        "<>" | "!=" => Ok(!crate::exec::constraint::fk_key_eq(a, b)),
+        "<" | "<=" | ">" | ">=" => {
+            let cmp = super::funcs::compare_values(a, b, false, None)?;
+            Ok(match (op, cmp) {
+                ("<", Ordering::Less) => true,
+                ("<=", Ordering::Less | Ordering::Equal) => true,
+                (">", Ordering::Greater) => true,
+                (">=", Ordering::Greater | Ordering::Equal) => true,
+                _ => false,
+            })
+        }
+        _ => {
+            // Generic fallback: evaluate `a <op> b` through the
+            // expression machinery (covers jsonb @>/<@, text ~,
+            // etc. for expression elements and exotic pairings).
+            let _ = (eng, ctx);
+            Err(exec_err(
+                "42883",
+                format!(
+                    "operator does not exist: {} {} {}",
+                    a.type_name().to_lowercase(),
+                    op,
+                    b.type_name().to_lowercase()
+                ),
+            ))
+        }
+    }
+}
+
+/// The static type of a plain-column element (for operator
+/// dispatch); None for expression elements.
+fn excl_elem_type(t: &Table, elem: &ExclElem) -> Option<ColType> {
+    if let Expr::Column { name, .. } = &elem.expr {
+        t.column_index(name).map(|i| t.columns[i].1)
+    } else {
+        None
+    }
+}
+
+/// Check one exclusion definition: `batch` rows (already
+/// element-evaluated pairs are computed here) against `existing`
+/// visible rows, plus batch-internal pairs; in create mode the
+/// batch is empty and `existing` is checked pairwise (PG19's
+/// could-not-create wording).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_one_excl_def(
+    eng: &mut Engine,
+    ctx: &StmtCtx,
+    t: &Table,
+    _table: &str,
+    def: &ExclDef,
+    batch: &[Vec<Value>],
+    existing: &[Row],
+    create_mode: bool,
+) -> Result<(), ExecError> {
+    let elem_tys: Vec<Option<ColType>> = def.elems.iter().map(|e| excl_elem_type(t, e)).collect();
+    let mut batch_vals: Vec<Vec<Value>> = Vec::with_capacity(batch.len());
+    for row in batch {
+        let (vals, in_idx) = eval_excl_row(eng, ctx, t, def, row)?;
+        if in_idx {
+            batch_vals.push(vals);
+        }
+    }
+    let mut existing_vals: Vec<Vec<Value>> = Vec::with_capacity(existing.len());
+    for r in existing {
+        let (vals, in_idx) = eval_excl_row(eng, ctx, t, def, r)?;
+        if in_idx {
+            existing_vals.push(vals);
+        }
+    }
+    let pair_conflicts = |eng: &mut Engine, a: &[Value], b: &[Value]| -> Result<bool, ExecError> {
+        for (i, e) in def.elems.iter().enumerate() {
+            if !excl_op_holds(eng, ctx, elem_tys[i], &e.op, &a[i], &b[i])? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    let conflict_err = |new: &[Value], old: &[Value]| -> ExecError {
+        if create_mode {
+            exec_err_detail(
+                "23P01",
+                format!("could not create exclusion constraint \"{}\"", def.name),
+                format!(
+                    "{} conflicts with key {}.",
+                    excl_key_text(t, def, new),
+                    excl_key_text(t, def, old).replacen("Key ", "", 1)
+                ),
+            )
+        } else {
+            exec_err_detail(
+                "23P01",
+                format!(
+                    "conflicting key value violates exclusion constraint \"{}\"",
+                    def.name
+                ),
+                format!(
+                    "{} conflicts with existing key {}.",
+                    excl_key_text(t, def, new),
+                    excl_key_text(t, def, old).replacen("Key ", "", 1)
+                ),
+            )
+        }
+    };
+    if create_mode {
+        for i in 0..existing_vals.len() {
+            for j in (i + 1)..existing_vals.len() {
+                if pair_conflicts(eng, &existing_vals[i], &existing_vals[j])? {
+                    return Err(conflict_err(&existing_vals[j], &existing_vals[i]));
+                }
+            }
+        }
+        return Ok(());
+    }
+    for (bi, bv) in batch_vals.iter().enumerate() {
+        for ev in &existing_vals {
+            if pair_conflicts(eng, bv, ev)? {
+                return Err(conflict_err(bv, ev));
+            }
+        }
+        for ov in batch_vals.iter().skip(bi + 1) {
+            if pair_conflicts(eng, bv, ov)? {
+                return Err(conflict_err(ov, bv));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Is this exclusion constraint deferred for the current
+/// transaction (deferrable + INITIALLY DEFERRED, or SET CONSTRAINTS
+/// DEFERRED named it)? Mirrors unique_mode_deferred's table-level
+/// reading (see deferred.rs).
+pub(crate) fn excl_deferred_now(eng: &Engine, ctx: &StmtCtx, table: &str, def: &ExclDef) -> bool {
+    if !def.deferrable {
+        return false;
+    }
+    crate::exec::deferred::constraint_deferred_now(
+        eng,
+        ctx,
+        table,
+        &def.name,
+        def.deferrable,
+        def.initially_deferred,
+    )
+}
+
+/// Check every non-deferred exclusion constraint of `table`
+/// against a batch of new/updated rows (the DML entry point,
+/// called beside the WO batch check). Deferred constraints are
+/// queued for the end-of-statement/transaction revalidation.
+pub(crate) fn check_exclusion_batch(
+    eng: &mut Engine,
+    ctx: &StmtCtx,
+    table: &str,
+    batch: &[Vec<Value>],
+    exclude_ids: &[u64],
+) -> Result<(), ExecError> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let t = match eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+    {
+        Some(t) => t.clone(),
+        None => return Ok(()),
+    };
+    if t.excls.is_empty() {
+        return Ok(());
+    }
+    let existing: Vec<Row> = t
+        .rows
+        .iter()
+        .filter(|r| row_visible(r, ctx.snap, &ctx.all_xids) && !exclude_ids.contains(&r.id))
+        .map(|r| r.values.clone())
+        .collect();
+    for def in &t.excls {
+        if excl_deferred_now(eng, ctx, table, def) {
+            crate::exec::deferred::queue_excl(eng, ctx.session, table, &def.name);
+            continue;
+        }
+        check_one_excl_def(eng, ctx, &t, table, def, batch, &existing, false)?;
+    }
+    Ok(())
+}
+
+/// CREATE / ADD CONSTRAINT validation over the rows already in the
+/// table (PG19 index_build's could-not-create 23P01).
+pub(crate) fn validate_exclusion_existing(
+    eng: &mut Engine,
+    ctx: &StmtCtx,
+    t: &Table,
+    table: &str,
+    def: &ExclDef,
+) -> Result<(), ExecError> {
+    let existing: Vec<Row> = t
+        .rows
+        .iter()
+        .filter(|r| row_visible(r, ctx.snap, &ctx.all_xids))
+        .map(|r| r.values.clone())
+        .collect();
+    check_one_excl_def(eng, ctx, t, table, def, &[], &existing, true)
+}
+
+/// Deferred-fire rescan: the whole table pairwise (PG19 checks the
+/// queued tuples; a full rescan reaches the same verdict).
+pub(crate) fn check_exclusion_table_rescan(
+    eng: &mut Engine,
+    ctx: &StmtCtx,
+    table: &str,
+    con_name: &str,
+) -> Result<(), ExecError> {
+    let t = match eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+    {
+        Some(t) => t.clone(),
+        None => return Ok(()),
+    };
+    let Some(def) = t.excls.iter().find(|d| d.name == con_name).cloned() else {
+        return Ok(());
+    };
+    validate_exclusion_existing(eng, ctx, &t, table, &def)
+}
+
 /// v1.92: is this candidate index name already taken in the
 /// (temp-aware) relation namespace? Mirrors PG19's
 /// ChooseRelationName check, which considers indexes and tables.
@@ -1087,6 +1598,12 @@ pub(crate) fn index_defs_equivalent(a: &IndexDef, b: &IndexDef) -> bool {
         && a.predicate == b.predicate
         && a.include_names == b.include_names
         && a.nulls_not_distinct == b.nulls_not_distinct
+        // v2.44: exclusion indexes must match method + operators
+        // too (PG19 CompareIndexDefs compares the AM and, for
+        // exclusion, the per-key operators).
+        && a.gist == b.gist
+        && a.exclusion == b.exclusion
+        && a.excl_ops == b.excl_ops
 }
 
 /// v2.29: ChooseIndexName for a child index on `table`:
@@ -1263,6 +1780,8 @@ pub(crate) fn create_child_index(
         include_cols,
         without_overlaps: parent_def.without_overlaps,
         gist: parent_def.gist,
+        exclusion: parent_def.exclusion,
+        excl_ops: parent_def.excl_ops.clone(),
     };
     let mut ix = Index::new(def.clone());
     if def.planner_usable {
@@ -1421,9 +1940,24 @@ pub(crate) fn exec_create_index(
     include: &[String],
     // v2.31: USING gist (catalog-only index).
     gist: bool,
+    // v2.44: the access method name (INCLUDE validation).
+    method: &str,
 ) -> Result<ExecResult, ExecError> {
     // v0.11: indexing a table needs its owner (or a superuser).
     require_table_owner(eng, ctx, table)?;
+    // v2.44: PG19 DefineIndex (indexcmds.c) — INCLUDE columns
+    // require amcaninclude; gin/hash/brin cannot include (0A000).
+    // (hash/brin are rejected earlier by the parser in this
+    // engine; gin reaches here.)
+    if !include.is_empty() && matches!(method, "gin" | "hash" | "brin") {
+        return Err(exec_err(
+            "0A000",
+            format!(
+                "access method \"{}\" does not support included columns",
+                method
+            ),
+        ));
+    }
     // v2.36: PG19 DefineIndex — indexes are not supported on
     // foreign tables (42809 + DETAIL).
     if foreign_meta_key(&eng.db, table).is_some() {
@@ -1915,6 +2449,8 @@ pub(crate) fn exec_create_index(
         include_cols,
         without_overlaps: false,
         gist,
+        exclusion: false,
+        excl_ops: Vec::new(),
     });
     if planner_usable && mv_rows.is_some() {
         // Matview build: keys come from the rows computed above;
@@ -2306,6 +2842,7 @@ pub(crate) fn exec_alter_index(
                         .is_some_and(|t| {
                             t.pkey.as_ref().is_some_and(|p| p.name == idx)
                                 || t.uniques.iter().any(|u| u.name == idx)
+                                || t.excls.iter().any(|x| x.name == idx)
                         })
                 };
                 let child_tbl = eng

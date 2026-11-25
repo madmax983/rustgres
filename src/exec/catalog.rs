@@ -664,6 +664,18 @@ pub(crate) fn pg_index_scan(
                 }
             }
         }
+        // v2.44: an exclusion index's indimmediate follows its
+        // constraint's deferrable flag (PG19 index.c: exclusion
+        // indexes are immediate unless the constraint is
+        // DEFERRABLE).
+        let excl_deferrable = if d.exclusion {
+            t.excls
+                .iter()
+                .find(|x| x.name == d.name)
+                .map(|x| x.deferrable)
+        } else {
+            None
+        };
         // indkey: attnums of keys then INCLUDEs (0 for expressions).
         let attnum_of =
             |pos: usize| -> i64 { t.attnums.get(pos).copied().unwrap_or(pos as i16 + 1) as i64 };
@@ -727,8 +739,11 @@ pub(crate) fn pg_index_scan(
                 Value::Bool(d.unique),
                 Value::Bool(d.nulls_not_distinct),
                 Value::Bool(indisprimary),
-                Value::Bool(d.without_overlaps),
-                Value::Bool(!(d.unique && deferrable)),
+                Value::Bool(d.without_overlaps || d.exclusion),
+                Value::Bool(match excl_deferrable {
+                    Some(df) => !df,
+                    None => !(d.unique && deferrable),
+                }),
                 Value::Bool(indisclustered),
                 Value::Bool(indisvalid),
                 Value::Bool(false),
@@ -6034,6 +6049,38 @@ pub(crate) fn pg_constraint_scan(
             )));
             meta.push((name.to_string(), r));
         }
+        // v2.44: EXCLUDE constraint rows (PG19 contype 'x'). The
+        // conkey is the attnums of the plain-column elements only
+        // (expression elements contribute none, like PG's
+        // index-column-only conkey); exclusion constraints are
+        // never inherited, so conislocal = true / coninhcount = 0
+        // and connoinherit follows the index-constraint rule.
+        for x in &t.excls {
+            let r = super::locality::ConRef::Excl(x.name.clone());
+            let lc = loc(&r, None);
+            let conkey: Vec<i64> = x
+                .elems
+                .iter()
+                .filter_map(|e| match &e.expr {
+                    Expr::Column { name, .. } => t.column_index(name).map(|i| (i + 1) as i64),
+                    _ => None,
+                })
+                .collect();
+            let x_noinherit = lc.0;
+            rows.push(mk(plain(
+                b'x',
+                &x.name,
+                x.deferrable,
+                x.initially_deferred,
+                true,
+                true,
+                conkey,
+                lc,
+                x_noinherit,
+                false,
+            )));
+            meta.push((name.to_string(), r));
+        }
         for c in &t.checks {
             let contype = match c.kind {
                 crate::sql::CheckKind::Check => b'c',
@@ -6305,7 +6352,7 @@ pub(crate) fn pg_constraint_scan(
             ) else {
                 continue;
             };
-            if !matches!(ct, b'p' | b'u') {
+            if !matches!(ct, b'p' | b'u' | b'x') {
                 continue;
             }
             let wo = match ct {
@@ -6313,6 +6360,10 @@ pub(crate) fn pg_constraint_scan(
                     .pkey
                     .as_ref()
                     .is_some_and(|pk| pk.name.as_str() == &**cname && pk.without_overlaps),
+                // v2.44: every EXCLUDE row's conindid is its
+                // backing index (PG19 sets it for all exclusion
+                // constraints).
+                b'x' => t.excls.iter().any(|x| x.name.as_str() == &**cname),
                 _ => t
                     .uniques
                     .iter()
@@ -6322,7 +6373,13 @@ pub(crate) fn pg_constraint_scan(
                 continue;
             }
             let is_child = t.partition.as_ref().is_some_and(|p| p.parent.is_some());
-            let ix_name = super::partition::constraint_index_name(tname, cname, is_child);
+            // v2.44: exclusion backing indexes carry the
+            // constraint name verbatim.
+            let ix_name = if *ct == b'x' {
+                cname.to_string()
+            } else {
+                super::partition::constraint_index_name(tname, cname, is_child)
+            };
             if let Some(oid) = oids.get(&ix_name) {
                 let mut cells: Vec<Value> = rows[i].cells.iter().cloned().collect();
                 cells[11] = Value::Int(*oid);
@@ -6877,6 +6934,36 @@ pub(crate) fn pg_constraintdef_for_oid(
         }
     };
     match contype {
+        b'x' => {
+            // v2.44: EXCLUDE USING <method> (<elem> WITH <op>, ...)
+            // [WHERE (<pred>)] (PG19 ruleutils.c
+            // pg_get_constraintdef_worker CONSTR_EXCLUSION; INCLUDE
+            // columns are not part of the constraint definition
+            // text).
+            let x = t.excls.iter().find(|x| x.name == cname)?;
+            let elems: Vec<String> = x
+                .elems
+                .iter()
+                .map(|e| {
+                    format!(
+                        "{} WITH {}",
+                        crate::exec::indexes::excl_elem_label(t, e),
+                        e.op
+                    )
+                })
+                .collect();
+            let pred = match &x.predicate {
+                // deparse_filter already parenthesizes.
+                Some(p) => format!(" WHERE {}", crate::exec::publication::deparse_filter(p)),
+                None => String::new(),
+            };
+            Some(format!(
+                "EXCLUDE USING {} ({}){}",
+                x.method,
+                elems.join(", "),
+                pred
+            ))
+        }
         b'p' => {
             let pk = t.pkey.as_ref().filter(|p| p.name == cname)?;
             // v2.29: INCLUDE columns render after the key list.

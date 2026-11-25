@@ -3332,6 +3332,9 @@ pub(crate) fn coltype_typ_string(ct: &ColType) -> String {
         ColType::Numeric(Some((p, s))) => format!("numeric({p},{s})"),
         ColType::Numeric(None) => "numeric".into(),
         ColType::Text => "text".into(),
+        ColType::Point => "point".into(),   // v2.44
+        ColType::BoxGeo => "box".into(),    // v2.44
+        ColType::Circle => "circle".into(), // v2.44
         ColType::Char(Some(n)) => format!("character({n})"),
         ColType::Char(None) => "character".into(),
         ColType::Varchar(Some(n)) => format!("character varying({n})"),

@@ -179,6 +179,9 @@ pub(crate) fn localize_constraint(
                 }
             }
         }
+        ConRef::Excl(_) => {
+            // v2.44: exclusion constraints are always local already.
+        }
     }
     alter_swap(eng, ctx, child, None, next, None)?;
     Ok(())
@@ -1523,7 +1526,13 @@ pub(crate) fn exec_alter_one(
             pkey,
             fk,
             notnull,
+            excl,
         } => {
+            // v2.44: EXCLUDE constraints take their own path (never
+            // inherited, never propagated to children).
+            if let Some(x) = excl {
+                return alter_add_exclusion(eng, ctx, name, x);
+            }
             // v2.36: PG19 — ADD PRIMARY KEY / UNIQUE on a partitioned
             // table whose subtree contains foreign tables fails at
             // the innermost such partitioned table (the backing
@@ -1699,6 +1708,7 @@ pub(crate) fn exec_alter_one(
                         pkey: pkey.clone(),
                         fk: fk.clone(),
                         notnull: (*notnull).clone(),
+                        excl: None,
                     };
                     if let Err(e) = exec_alter(eng, ctx, child, std::slice::from_ref(&child_action))
                     {
@@ -1903,6 +1913,52 @@ pub(crate) fn exec_alter_one(
             cascade,
             if_exists,
         } => {
+            // v2.44: EXCLUDE constraints drop directly (definition
+            // + backing index); they are never inherited, so the
+            // locality machinery below does not apply.
+            {
+                let has_excl = eng
+                    .db
+                    .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                    .is_some_and(|t| t.excls.iter().any(|x| x.name == *con));
+                if has_excl {
+                    let t = eng
+                        .db
+                        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                        .expect("checked above")
+                        .clone();
+                    let mut next = t.clone();
+                    next.excls.retain(|x| x.name != *con);
+                    if eng.db.is_temp_table(ctx.session, name) {
+                        alter_swap_temp(eng, ctx, name, None, next, None)?;
+                    } else {
+                        alter_swap(eng, ctx, name, None, next, None)?;
+                    }
+                    // v2.44: the backing index carries the
+                    // constraint name verbatim.
+                    let ix_name = con.clone();
+                    if eng.db.is_temp_table(ctx.session, name) {
+                        if let Some(m) = eng.db.temp_indexes.get_mut(&ctx.session) {
+                            if let Some(ix) = m.remove(&ix_name) {
+                                ctx.writes.push(WriteOp::DropTempIndex {
+                                    session: ctx.session,
+                                    name: ix_name.clone(),
+                                    index: ix,
+                                });
+                            }
+                        }
+                    } else if eng
+                        .db
+                        .find_index(&ix_name, ctx.snap, &ctx.all_xids)
+                        .is_some()
+                    {
+                        drop_index_internal(eng, ctx, &ix_name)?;
+                    }
+                    return Ok(ExecResult::Command {
+                        tag: "ALTER TABLE".to_string(),
+                    });
+                }
+            }
             // v2.16: DROP CONSTRAINT IF EXISTS — a missing
             // constraint is a NOTICE-level skip (PG19).
             if *if_exists {
@@ -3947,13 +4003,27 @@ pub(crate) fn alter_drop_column_ext(
         }
     }
     for u in &t.uniques {
-        if u.cols.iter().any(|c| c == col) {
+        if u.cols.iter().any(|c| c == col) || u.include.iter().any(|c| c == col) {
             dep_constraints.push(format!("constraint \"{}\"", u.name));
         }
     }
     if let Some(pk) = &t.pkey {
-        if pk.cols.iter().any(|c| c == col) {
+        if pk.cols.iter().any(|c| c == col) || pk.include.iter().any(|c| c == col) {
             dep_constraints.push(format!("constraint \"{}\"", pk.name));
+        }
+    }
+    // v2.44: EXCLUDE constraints referencing the column (element
+    // expression refs or INCLUDE) are dependents too.
+    for x in &t.excls {
+        let mut refs = Vec::new();
+        for e in &x.elems {
+            collect_col_refs(&e.expr, &mut refs);
+        }
+        if let Some(pred) = &x.predicate {
+            collect_col_refs(pred, &mut refs);
+        }
+        if refs.iter().any(|(_, r)| r == col) || x.include.iter().any(|c| c == col) {
+            dep_constraints.push(format!("constraint \"{}\"", x.name));
         }
     }
     for fk in &t.fks {
@@ -4008,7 +4078,9 @@ pub(crate) fn alter_drop_column_ext(
             if !crate::storage::index_visible(&ix.def, ctx.snap, &ctx.all_xids) {
                 continue;
             }
-            if ix.def.col_names.iter().any(|c| c == col) {
+            if ix.def.col_names.iter().any(|c| c == col)
+                || ix.def.include_names.iter().any(|c| c == col)
+            {
                 dep_indexes.push(ix_name.clone());
             }
         }
@@ -4216,12 +4288,12 @@ pub(crate) fn alter_drop_column_ext(
     let drop_idx_for: Vec<String> = next
         .uniques
         .iter()
-        .filter(|u| u.cols.iter().any(|c| c == col))
+        .filter(|u| u.cols.iter().any(|c| c == col) || u.include.iter().any(|c| c == col))
         .map(|u| u.name.clone())
         .chain(
             next.pkey
                 .iter()
-                .filter(|p| p.cols.iter().any(|c| c == col))
+                .filter(|p| p.cols.iter().any(|c| c == col) || p.include.iter().any(|c| c == col))
                 .map(|p| p.name.clone()),
         )
         .collect();
@@ -4230,13 +4302,35 @@ pub(crate) fn alter_drop_column_ext(
         collect_col_refs(&c.expr, &mut refs);
         !refs.iter().any(|(_, r)| r == col)
     });
-    next.uniques.retain(|u| !u.cols.iter().any(|c| c == col));
+    next.uniques
+        .retain(|u| !u.cols.iter().any(|c| c == col) && !u.include.iter().any(|c| c == col));
     if next
         .pkey
         .as_ref()
-        .is_some_and(|p| p.cols.iter().any(|c| c == col))
+        .is_some_and(|p| p.cols.iter().any(|c| c == col) || p.include.iter().any(|c| c == col))
     {
         next.pkey = None;
+    }
+    // v2.44: EXCLUDE defs referencing the column die with it
+    // (their backing indexes are in dep_indexes via col/include
+    // names; expression-element indexes are dropped by name here).
+    let dropped_excls: Vec<String> = next
+        .excls
+        .iter()
+        .filter(|x| {
+            let mut refs = Vec::new();
+            for e in &x.elems {
+                collect_col_refs(&e.expr, &mut refs);
+            }
+            if let Some(pred) = &x.predicate {
+                collect_col_refs(pred, &mut refs);
+            }
+            refs.iter().any(|(_, r)| r == col) || x.include.iter().any(|c| c == col)
+        })
+        .map(|x| x.name.clone())
+        .collect();
+    if !dropped_excls.is_empty() {
+        next.excls.retain(|x| !dropped_excls.contains(&x.name));
     }
     next.fks.retain(|fk| !fk.cols.iter().any(|c| c == col));
     // v0.77: temp tables have no backing global indexes — never touch
@@ -4267,6 +4361,15 @@ pub(crate) fn alter_drop_column_ext(
     for ix in &dep_indexes {
         if eng.db.indexes.contains_key(ix) {
             drop_index_internal(eng, ctx, ix)?;
+        }
+    }
+    // v2.44: backing indexes of dropped EXCLUDE defs whose element
+    // was an expression (not visible to the col_names scan above).
+    if !is_temp {
+        for xn in &dropped_excls {
+            if eng.db.indexes.contains_key(xn) {
+                drop_index_internal(eng, ctx, xn)?;
+            }
         }
     }
     // Remaining indexes: shift positions after the dropped column.
@@ -4564,6 +4667,7 @@ pub(crate) fn table_has_constraint(t: &Table, con: &str) -> bool {
         || t.uniques.iter().any(|u| u.name == con)
         || t.pkey.as_ref().is_some_and(|p| p.name == con)
         || t.fks.iter().any(|f| f.name == con)
+        || t.excls.iter().any(|x| x.name == con)
 }
 
 /// v0.77: duplicate check for ADD CONSTRAINT UNIQUE/PRIMARY KEY (or ADD
@@ -4618,6 +4722,64 @@ pub(crate) fn temp_unique_dup_check(
         seen.push(key);
     }
     Ok(())
+}
+
+/// v2.44: ALTER TABLE ... ADD CONSTRAINT ... EXCLUDE (PG19
+/// ATExecAddConstraint / ATAddConstraint with CONSTR_EXCLUSION):
+/// exclusion constraints are never inherited, so there is no
+/// child propagation; existing rows are validated with the
+/// could-not-create 23P01, then the definition lands on the table
+/// and its catalog-only backing index is created.
+pub(crate) fn alter_add_exclusion(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    x: &ExclDef,
+) -> Result<ExecResult, ExecError> {
+    let t = eng
+        .db
+        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+        .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
+        .clone();
+    let mut def = x.clone();
+    if def.name.is_empty() {
+        let parts: Vec<String> = def
+            .elems
+            .iter()
+            .map(|e| crate::sql::excl_elem_name_part(&e.expr))
+            .collect();
+        let base = format!("{}_{}_excl", name, parts.join("_"));
+        let mut cand = base.clone();
+        let mut k = 1;
+        while table_has_constraint(&t, &cand)
+            || eng.db.find_index(&cand, ctx.snap, &ctx.all_xids).is_some()
+        {
+            cand = format!("{}{}", base, k);
+            k += 1;
+        }
+        def.name = cand;
+    } else if table_has_constraint(&t, &def.name) {
+        return Err(exec_err(
+            "42710",
+            format!(
+                "constraint \"{}\" for relation \"{}\" already exists",
+                def.name, name
+            ),
+        ));
+    }
+    crate::exec::partition::validate_excl_def(&t, name, &def)?;
+    crate::exec::indexes::validate_exclusion_existing(eng, ctx, &t, name, &def)?;
+    let mut next = t.clone();
+    next.excls.push(def.clone());
+    if eng.db.is_temp_table(ctx.session, name) {
+        alter_swap_temp(eng, ctx, name, None, next, None)?;
+    } else {
+        alter_swap(eng, ctx, name, None, next, None)?;
+    }
+    crate::exec::partition::create_exclusion_index(eng, ctx, name, &def)?;
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
 }
 
 pub(crate) fn alter_add_constraint(
@@ -6604,6 +6766,20 @@ pub(crate) fn alter_rename_column_ext(
         return Err(exec_err(
             "42703",
             format!("column \"{}\" of relation \"{}\" does not exist", old, name),
+        ));
+    }
+    // v2.44: PG19 RenameColumn — the new name must not collide
+    // with a system column name (42701).
+    if matches!(
+        new,
+        "oid" | "tableoid" | "xmin" | "cmin" | "xmax" | "cmax" | "ctid"
+    ) {
+        return Err(exec_err(
+            "42701",
+            format!(
+                "column name \"{}\" conflicts with a system column name",
+                new
+            ),
         ));
     }
     if t.column_index(new).is_some() {

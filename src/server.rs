@@ -5030,7 +5030,41 @@ fn run_statement(
             buffer_usage_limit_kb,
             buffer_usage_overflow,
             buffer_usage_full,
+            parallel,
         } => {
+            // v2.44: PG19 vacuum PARALLEL validation (gram.y /
+            // vacuum.c): a bare PARALLEL needs a degree; the
+            // degree range is 0..=1024; FULL + workers is 0A000.
+            if let Some(par) = parallel {
+                match par {
+                    None => {
+                        return Err(ExecError {
+                            detail: None,
+                            hint: None,
+                            code: "42601",
+                            message: "parallel requires an integer value".to_string(),
+                        });
+                    }
+                    Some(n) => {
+                        if !(0..=1024).contains(n) {
+                            return Err(ExecError {
+                                detail: None,
+                                hint: None,
+                                code: "22023",
+                                message: "PARALLEL option must be between 0 and 1024".to_string(),
+                            });
+                        }
+                        if *buffer_usage_full && *n > 0 {
+                            return Err(ExecError {
+                                detail: None,
+                                hint: None,
+                                code: "0A000",
+                                message: "VACUUM FULL cannot be performed in parallel".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
             // v2.34: PG19 vacuum.c BUFFER_USAGE_LIMIT validation.
             if *buffer_usage_overflow {
                 return Err(ExecError {

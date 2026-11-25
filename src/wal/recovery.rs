@@ -551,6 +551,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     t.gen_cols = if dc.gen_cols.len() == t.columns.len() { dc.gen_cols.clone() } else { vec![None; t.columns.len()] };
                     t.identity = if dc.identity.len() == t.columns.len() { dc.identity.clone() } else { vec![0; t.columns.len()] };
                     t.triggers = dc.triggers.clone();
+                    t.excls = dc.excls.clone();
                 }
                 Err(e) => {
                     return Err(format!(
@@ -734,6 +735,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             include_names,
             without_overlaps,
             gist,
+            exclusion,
+            excl_ops,
             xmin,
         } => {
             // Rebuild the index from the table's current rows: at recovery
@@ -794,6 +797,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     include_cols,
                     without_overlaps: *without_overlaps,
                     gist: *gist,
+                    exclusion: *exclusion,
+                    excl_ops: excl_ops.clone(),
                 });
                 if planner_usable {
                     for r in &t.rows {
@@ -904,6 +909,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     t.gen_cols = if dc.gen_cols.len() == t.columns.len() { dc.gen_cols.clone() } else { vec![None; t.columns.len()] };
                     t.identity = if dc.identity.len() == t.columns.len() { dc.identity.clone() } else { vec![0; t.columns.len()] };
                     t.triggers = dc.triggers.clone();
+                    t.excls = dc.excls.clone();
                 }
                 Err(e) => {
                     return Err(format!(
@@ -2112,6 +2118,8 @@ pub fn records_for_commit(
                     include_names: ix.def.include_names.clone(),
                     without_overlaps: ix.def.without_overlaps,
                     gist: ix.def.gist,
+                    exclusion: ix.def.exclusion,
+                    excl_ops: ix.def.excl_ops.clone(),
                     xmin: own,
                 });
             }

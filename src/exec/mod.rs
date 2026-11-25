@@ -39,12 +39,12 @@
 pub(crate) use crate::index::{Index, IndexDef, IndexKey, index_key_cmp};
 pub(crate) use crate::sql::{
     AggFunc, AlterAction, ArithOp, CheckDef, CmpOp, ConflictAction, ConflictArbiter, CteBody,
-    CteDef, CteMaterialize, DefaultExpr, ExplainFormat, Expr, FdwClause, FdwOpt, FkAction, FkDef,
-    FrameBound, FrameExclusion, FromItem, IndexColSpec, InsertIndirection, InsertTarget,
-    InsertValue, IsolationLevel, JoinKind, JsonOp, JsonTableSpec, JtBehavior, JtColumn, Literal,
-    MappingUser, MergeAction, MergeWhen, NullTreatment, OnConflict, OptAction, OrderTerm,
-    OrderedSetAgg, PolicyCmd, QuantKind, QuantOp, RaiseLevel, RowsFromPart, SelectItem, SelectStmt,
-    SequenceOpts, SerialKind, SetOpKind, SetOpRoot, SqlError, Stmt, TableDef, TrigCond,
+    CteDef, CteMaterialize, DefaultExpr, ExclDef, ExclElem, ExplainFormat, Expr, FdwClause, FdwOpt,
+    FkAction, FkDef, FrameBound, FrameExclusion, FromItem, IndexColSpec, InsertIndirection,
+    InsertTarget, InsertValue, IsolationLevel, JoinKind, JsonOp, JsonTableSpec, JtBehavior,
+    JtColumn, Literal, MappingUser, MergeAction, MergeWhen, NullTreatment, OnConflict, OptAction,
+    OrderTerm, OrderedSetAgg, PolicyCmd, QuantKind, QuantOp, RaiseLevel, RowsFromPart, SelectItem,
+    SelectStmt, SequenceOpts, SerialKind, SetOpKind, SetOpRoot, SqlError, Stmt, TableDef, TrigCond,
     TrigForSource, TrigIntoTarget, TriggerBody, TriggerBodyStmt, TriggerDef, TriggerTiming,
     UniqueDef, WindowFrame, WindowFunc, XmlTableSpec, collect_col_refs, collect_table_refs,
     parse_statement, parse_trigger_body, trig_event, validate_constraint_expr,
@@ -89,6 +89,7 @@ mod extstats;
 mod fdw;
 mod from;
 mod funcs;
+pub(crate) mod geometry;
 mod indexes;
 mod info_schema;
 mod join;
@@ -419,6 +420,9 @@ mod v242_xml_tests;
 #[cfg(test)]
 #[path = "test_mods/v243_tests.rs"]
 mod v243_tests;
+#[cfg(test)]
+#[path = "test_mods/v244_tests.rs"]
+mod v244_tests;
 #[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;

@@ -7265,6 +7265,9 @@ pub(crate) fn pg_typlen_align(ty: &ColType) -> (i32, usize) {
         ColType::Json => (-1, 4),       // json: -1/'i'
         ColType::Jsonb => (-1, 4),
         ColType::Xml => (-1, 4),         // v2.42: xml varlena, align 'i'
+        ColType::Point => (16, 8),       // point: 16/'d' (v2.44)
+        ColType::BoxGeo => (32, 8),      // box: 32/'d' (v2.44)
+        ColType::Circle => (24, 8),      // circle: 24/'d' (v2.44)
         ColType::Jsonpath => (-1, 4),    // jsonpath: -1/'i' (v1.85)
         ColType::Array(_) => (-1, 4),    // array types: 'i'
         ColType::Date => (4, 4),         // date: 4/'i'
@@ -7922,6 +7925,7 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         "jsonb_contains" | "jsonb_contained" | "jsonb_concat" => n == 2,
         "__jsonb_subscript_assign" => n == 3,
         "__array_subscript_assign" => n == 3,
+        "__point_subscript_assign" => n == 3,
         "__array_slice_assign" => n == 5,
         "jsonb_exists" => n == 2,
         "jsonb_exists_any" | "jsonb_exists_all" => n == 2,
@@ -8572,6 +8576,20 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
                 Err(e) => Err(numfmt_exec_err(e)),
             }
         }
+        // v2.44: geometric functions. Dispatched INSIDE the main
+        // match on purpose: a pre-dispatch hook call in
+        // eval_func_vals measurably slowed every function call
+        // (~+60% on a function-heavy join query — codegen cliff in
+        // this dispatcher), while a match arm is free.
+        "circle_center" | "center" | "point" | "box" | "circle" => {
+            match super::geometry::try_eval_geo_func(name, &vals) {
+                Some(r) => r,
+                None => Err(exec_err(
+                    "42883",
+                    format!("function {} does not exist", name),
+                )),
+            }
+        }
         "random" | "setseed" => eval_math_func(name, vals),
         "now"
         | "current_date"
@@ -8637,7 +8655,8 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         | "jsonb_extract_path_text" | "jsonb_set" | "jsonb_set_lax" | "jsonb_insert"
         | "jsonb_delete" | "jsonb_delete_path" | "jsonb_contains" | "jsonb_contained"
         | "jsonb_exists" | "jsonb_exists_any" | "jsonb_exists_all" | "jsonb_concat"
-        | "__jsonb_subscript_assign" | "__array_subscript_assign" | "__array_slice_assign" => {
+        | "__jsonb_subscript_assign" | "__array_subscript_assign" | "__array_slice_assign"
+        | "__point_subscript_assign" => {
             eval_json_func(name, vals)
         }
         // v1.85: scalar jsonb_path_* and the SQL/JSON desugars.
@@ -9234,6 +9253,9 @@ pub(crate) fn eval_json_func(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         // v2.38-fix: plain-array subscript assignment, split out of
         // the jsonb builtin (see eval_array_subscript_assign).
         "__array_subscript_assign" => eval_array_subscript_assign(name, &vals),
+        // v2.44: point subscript assignment (PG19 treats point as
+        // a fixed-length float8[2] for subscripting: indices 0/1).
+        "__point_subscript_assign" => super::geometry::eval_point_subscript_assign(&vals),
         // v2.40: slice-form subscript assignment (parse_update /
         // upsert desugar): vals = [base, lowers, uppers, flags, src]
         // where flags is an int array of 2*nbounds 0/1 "provided"
@@ -17323,6 +17345,14 @@ pub(crate) fn func_result_type(
                 .unwrap_or(ColType::Jsonb)),
             None => Ok(ColType::Jsonb),
         },
+        // v2.44: point subscript assignment returns point.
+        "__point_subscript_assign" => Ok(ColType::Point),
+        // v2.44: geometric function result types (without these,
+        // plan-time typing rejects the calls with 42883 before
+        // eval_func_vals ever sees them).
+        "point" | "circle_center" | "center" => Ok(ColType::Point),
+        "box" => Ok(ColType::BoxGeo),
+        "circle" => Ok(ColType::Circle),
         // v2.40: slice assignment returns the base array's type.
         "__array_slice_assign" => match args.first() {
             Some(a) => Ok(super::describe::expr_type(eng, snap, own, session, schemas, outer, ctes, a)

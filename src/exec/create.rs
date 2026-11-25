@@ -514,6 +514,26 @@ pub(crate) fn exec_create(
                 u.without_overlaps,
             )?;
         }
+        // v2.44: EXCLUDE constraints — validate the definition
+        // (element columns, partitioned-table rules), then create
+        // the catalog-only backing index. The table is empty at
+        // CREATE TABLE time, so no existing-row validation is
+        // needed here (ALTER ADD validates via
+        // validate_exclusion_existing).
+        if !eff_def.excls.is_empty() {
+            let t = eng
+                .db
+                .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                .cloned();
+            if let Some(t) = &t {
+                for x in &eff_def.excls {
+                    validate_excl_def(t, name, x)?;
+                }
+            }
+            for x in &eff_def.excls {
+                create_exclusion_index(eng, ctx, name, x)?;
+            }
+        }
     }
     // v2.29: a new partition inherits physical child indexes from
     // every standalone index on its parent (PG19 DefineIndex /

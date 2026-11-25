@@ -409,6 +409,10 @@ pub(crate) fn dummy_value_of(ty: &ColType) -> Value {
         ColType::Jsonb => Value::jsonb("{}"),
         // v2.42: a minimal well-formed xml dummy.
         ColType::Xml => Value::xml("<x/>"),
+        // v2.44: geometric dummies (canonical text forms).
+        ColType::Point => Value::text("(0,0)"),
+        ColType::BoxGeo => Value::text("(0,0),(0,0)"),
+        ColType::Circle => Value::text("<(0,0),0>"),
         // v1.85: the root path is the honest jsonpath dummy.
         ColType::Jsonpath => Value::jsonpath("$"),
         // v1.88: empty range / multirange dummies.

@@ -53,7 +53,10 @@ pub(crate) const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK16";
 /// v2.29: version 33 adds the per-index parent link + INCLUDE
 /// column names to index images. v32 checkpoints are refused;
 /// remove the data directory to start fresh.
-pub(crate) const CHKPT_VERSION: u32 = 35;
+/// v2.44: version 36 adds the per-index exclusion flag +
+/// exclusion operators to index images. v35 checkpoints are
+/// refused; remove the data directory to start fresh.
+pub(crate) const CHKPT_VERSION: u32 = 36;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -123,7 +126,7 @@ pub(crate) const CHKPT_VERSION: u32 = 35;
 /// the field decodes as false.
 /// v2.12: `RGSWAL31` — CreateFunction records carry `arg_modes`
 /// (trailing list). Older logs still read; modes decode as all-IN.
-pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL37";
+pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL38";
 /// v1.80: the format version number in [`WAL_MAGIC`].
 /// v2.14: version 33 — CreateView records carry view triggers
 /// (trailing string). Older logs still read; triggers decode empty.
@@ -133,7 +136,10 @@ pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL37";
 /// v2.29: version 35 — CreateIndex records carry the parent
 /// partitioned index link + INCLUDE column names (trailing). Older
 /// logs still read; the link decodes as None and includes as empty.
-pub(crate) const WAL_VERSION: u32 = 37;
+/// v2.44: version 38 — CreateIndex records carry the exclusion
+/// flag + per-key exclusion operators (trailing). Older logs still
+/// read; they decode as a plain index.
+pub(crate) const WAL_VERSION: u32 = 38;
 /// v1.80: oldest WAL format this build can replay.
 pub(crate) const MIN_READABLE_WAL_VERSION: u32 = 20;
 pub(crate) const WAL_HEADER_LEN: u64 = 16;
@@ -609,6 +615,9 @@ impl Wal {
             // v2.31 (checkpoint v34): WITHOUT OVERLAPS flag.
             ix_body.u8(ix.def.without_overlaps as u8);
             ix_body.u8(ix.def.gist as u8);
+            // v2.44 (checkpoint v36): exclusion flag + operators.
+            ix_body.u8(ix.def.exclusion as u8);
+            ix_body.str_list(&ix.def.excl_ops);
             ix_body.u64(ix.def.created_xmin);
             ix_body.u64(0); // live index: no committed drop
             n_indexes += 1;
@@ -1406,6 +1415,7 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                     vec![0; __t.columns.len()]
                 };
                 __t.triggers = dc.triggers.clone();
+                __t.excls = dc.excls.clone();
             }
             Err(e) => {
                 return Err(bad(&format!(
@@ -1468,6 +1478,9 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
         // v2.31 (checkpoint v34): WITHOUT OVERLAPS flag.
         let without_overlaps = d.u8().map_err(|e| bad(&e))? != 0;
         let gist = d.u8().map_err(|e| bad(&e))? != 0;
+        // v2.44 (checkpoint v36): exclusion flag + operators.
+        let exclusion = d.u8().map_err(|e| bad(&e))? != 0;
+        let excl_ops = d.str_list_d().map_err(|e| bad(&e))?;
         let created_xmin = d.u64().map_err(|e| bad(&e))?;
         let dropped_xmax = d.u64().map_err(|e| bad(&e))?;
         let bad_idx = |why: String| {
@@ -1530,6 +1543,8 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 include_cols,
                 without_overlaps,
                 gist,
+                exclusion,
+                excl_ops,
             });
             if planner_usable {
                 for r in &t.rows {

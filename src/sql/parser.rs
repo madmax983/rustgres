@@ -1592,6 +1592,9 @@ impl Parser {
             "xid" => Ok(ColType::Xid),                   // v1.17
             "oid" => Ok(ColType::Oid),                   // v2.15
             "inet" => Ok(ColType::Inet),                 // v2.15
+            "point" => Ok(ColType::Point),               // v2.44
+            "box" => Ok(ColType::BoxGeo),                // v2.44
+            "circle" => Ok(ColType::Circle),             // v2.44
             // v2.13: PG's internal array type names (`_int4` is the
             // int4[] type, pg_type typarray naming) — they appear in
             // column definition lists (`AS x(ia _int4)`) and casts.
@@ -1747,6 +1750,9 @@ impl Parser {
                 | "xid" // v1.17
                 | "oid" // v2.15
                 | "inet" // v2.15
+                | "point" // v2.44
+                | "box" // v2.44
+                | "circle" // v2.44
                 | "int4range" // v1.88
                 | "int8range"
                 | "numrange"
@@ -1996,9 +2002,11 @@ impl Parser {
             // other access method is 0A000 (feature not supported) rather
             // than silently misbehaving as a btree.
             let mut gist = false;
+            let mut method_name = "btree".to_string();
             if self.eat_keyword("using") {
                 let method = self.expect_ident()?;
-                if method == "gist" || method == "gin" {
+                method_name = method.clone();
+                if method == "gist" || method == "gin" || method == "spgist" {
                     // v2.31: GiST indexes are catalog-only here
                     // (they back WITHOUT OVERLAPS rendering and the
                     // USING INDEX rejection paths).
@@ -2150,6 +2158,7 @@ impl Parser {
                 only,
                 include,
                 gist,
+                method: method_name,
             });
         }
         // v0.9: CREATE SEQUENCE (CREATE VIEW is intercepted before
@@ -2581,6 +2590,7 @@ impl Parser {
             uniques: Vec::new(),
             pkey: None,
             fks: Vec::new(),
+            excls: Vec::new(),
             partition: Some(PartitionDef {
                 method,
                 keys,
@@ -2829,7 +2839,7 @@ impl Parser {
     pub(crate) fn is_table_constraint_start(&mut self) -> bool {
         matches!(self.peek(), Token::Ident(s)
             if s == "constraint" || s == "primary" || s == "unique"
-                || s == "check" || s == "foreign" || s == "not")
+                || s == "check" || s == "foreign" || s == "not" || s == "exclude")
     }
 
     /// v0.72: `LIKE source_table [INCLUDING|EXCLUDING kind ...]`
@@ -3275,6 +3285,12 @@ impl Parser {
             validate_constraint_expr(&e, "CHECK")?;
             let (nv, enf, noinh) = self.parse_check_attrs_full()?;
             Ok(ParsedTableCon::Check(cname, e, nv, enf, noinh))
+        } else if self.eat_keyword("exclude") {
+            // v2.44: EXCLUDE [USING method] (elem WITH op [, ...])
+            // [INCLUDE (...)] [WHERE expr] [attrs] (PG19 gram.y
+            // ConstraintElem EXCLUDE production).
+            let excl = self.parse_exclude_body()?;
+            Ok(ParsedTableCon::Exclude(cname, excl))
         } else if self.eat_keyword("foreign") {
             self.expect_keyword("key")?;
             let (cols, period_col) = self.parse_fk_col_list()?;
@@ -3317,6 +3333,131 @@ impl Parser {
                 "syntax error: expected PRIMARY KEY, UNIQUE, CHECK or FOREIGN KEY".to_string(),
             ))
         }
+    }
+
+    /// v2.44: an operator in `WITH <op>` position (PG19 gram.y
+    /// any_operator): a dedicated operator token, a generic Op, or
+    /// the `OPERATOR(op)` decorated form. Returns the operator text.
+    pub(crate) fn parse_operator_text(&mut self) -> Result<String, SqlError> {
+        if matches!(self.peek(), Token::Ident(s) if s == "operator") {
+            self.next();
+            self.expect(Token::LParen, "'('")?;
+            let op = self.parse_operator_text()?;
+            self.expect(Token::RParen, "')'")?;
+            return Ok(op);
+        }
+        let t = self.next();
+        let s = match &t {
+            Token::Eq => "=".to_string(),
+            Token::Neq => "<>".to_string(),
+            Token::Lt => "<".to_string(),
+            Token::Gt => ">".to_string(),
+            Token::LtEq => "<=".to_string(),
+            Token::GtEq => ">=".to_string(),
+            Token::AmpAmp => "&&".to_string(),
+            Token::DashPipeDash => "-|-".to_string(),
+            Token::AmpLt => "&<".to_string(),
+            Token::AmpGt => "&>".to_string(),
+            Token::AtGt => "@>".to_string(),
+            Token::LtAt => "<@".to_string(),
+            Token::AtAt => "@@".to_string(),
+            Token::AtQuestion => "@?".to_string(),
+            Token::Tilde => "~".to_string(),
+            Token::TildeStar => "~*".to_string(),
+            Token::BangTilde => "!~".to_string(),
+            Token::BangTildeStar => "!~*".to_string(),
+            Token::Plus => "+".to_string(),
+            Token::Minus => "-".to_string(),
+            Token::Star => "*".to_string(),
+            Token::Slash => "/".to_string(),
+            Token::Percent => "%".to_string(),
+            Token::PipePipe => "||".to_string(),
+            Token::Op(s) => s.clone(),
+            other => {
+                return Err(err(format!(
+                    "syntax error: expected operator, found {:?}",
+                    other
+                )));
+            }
+        };
+        Ok(s)
+    }
+
+    /// v2.44: the body of an EXCLUDE table constraint after the
+    /// EXCLUDE keyword (PG19 gram.y): `[USING method] ( elem WITH
+    /// op [, ...] ) [INCLUDE (...)] [WHERE expr] [attrs]`. The
+    /// returned def's name is empty; naming is the caller's job.
+    pub(crate) fn parse_exclude_body(&mut self) -> Result<ExclDef, SqlError> {
+        let mut method = "gist".to_string();
+        if self.eat_keyword("using") {
+            method = self.expect_ident()?;
+        }
+        self.expect(Token::LParen, "'('")?;
+        let mut elems = Vec::new();
+        loop {
+            let start = self.pos;
+            let expr = self.parse_or()?;
+            let sql = tokens_to_sql(&self.tokens[start..self.pos]);
+            // index_elem trailers: [COLLATE name] [opclass]
+            // [ASC|DESC] [NULLS FIRST|LAST] — accepted, not modeled
+            // (opclasses/collations are catalog fidelity elsewhere
+            // in this engine too).
+            if self.eat_keyword("collate") {
+                let _ = self.expect_ident()?;
+            }
+            if matches!(self.peek(), Token::Ident(s) if s != "with")
+                && !matches!(self.peek(), Token::Ident(s) if s == "asc" || s == "desc" || s == "nulls")
+            {
+                // operator class name (possibly schema-qualified).
+                self.next();
+                while *self.peek() == Token::Dot {
+                    self.next();
+                    self.next();
+                }
+            }
+            let _ = self.eat_keyword("asc") || self.eat_keyword("desc");
+            if self.eat_keyword("nulls") {
+                let _ = self.eat_keyword("first") || self.eat_keyword("last");
+            }
+            self.expect_keyword("with")?;
+            let op = self.parse_operator_text()?;
+            elems.push(ExclElem { expr, sql, op });
+            match self.next() {
+                Token::Comma => continue,
+                Token::RParen => break,
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected ',' or ')', found {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+        if elems.is_empty() {
+            return Err(err("syntax error: empty exclusion element list".to_string()));
+        }
+        let include = self.parse_include_opt()?;
+        // OptWhereClause: WHERE a_expr (parens, when written, are
+        // part of the expression).
+        let (predicate, predicate_sql) = if self.eat_keyword("where") {
+            let start = self.pos;
+            let e = self.parse_or()?;
+            let sql = tokens_to_sql(&self.tokens[start..self.pos]);
+            (Some(e), Some(sql))
+        } else {
+            (None, None)
+        };
+        let (deferrable, initially_deferred) = self.parse_unique_attrs()?;
+        Ok(ExclDef {
+            name: String::new(),
+            method,
+            elems,
+            include,
+            predicate,
+            predicate_sql,
+            deferrable,
+            initially_deferred,
+        })
     }
 
     /// v2.29: optional `INCLUDE (col [, ...])` after an index or
@@ -4912,6 +5053,7 @@ impl Parser {
                 unique: None,
                 fk: None,
                 notnull: None,
+                excl: None,
             }),
             ParsedTableCon::Unique(name, cols, df, idf, nnd, inc, wo) => {
                 Ok(AlterAction::AddConstraint {
@@ -4929,6 +5071,7 @@ impl Parser {
                     pkey: None,
                     fk: None,
                     notnull: None,
+                    excl: None,
                 })
             }
             ParsedTableCon::Check(name, e, nv, enf, noinh) => Ok(AlterAction::AddConstraint {
@@ -4945,6 +5088,7 @@ impl Parser {
                 pkey: None,
                 fk: None,
                 notnull: None,
+                excl: None,
             }),
             ParsedTableCon::Fk { name, cols, tail } => Ok(AlterAction::AddConstraint {
                 fk: Some(tail.into_fk(name.unwrap_or_default(), cols)),
@@ -4952,6 +5096,7 @@ impl Parser {
                 unique: None,
                 pkey: None,
                 notnull: None,
+                excl: None,
             }),
             ParsedTableCon::NotNull {
                 name,
@@ -4969,6 +5114,18 @@ impl Parser {
                 unique: None,
                 pkey: None,
                 fk: None,
+                excl: None,
+            }),
+            ParsedTableCon::Exclude(name, mut excl) => Ok(AlterAction::AddConstraint {
+                excl: Some({
+                    excl.name = name.unwrap_or_default();
+                    excl
+                }),
+                check: None,
+                unique: None,
+                pkey: None,
+                fk: None,
+                notnull: None,
             }),
         }
     }
@@ -17137,6 +17294,7 @@ impl Parser {
         Ok(Stmt::Close { name: Some(name) })
     }
 
+    #[allow(unused_assignments)] // last_oname is written per option before any read
     pub(crate) fn parse_vacuum(&mut self) -> Result<Stmt, SqlError> {
         // v0.75: `VACUUM (options) table` — parenthesized option list
         // (PG12+). Options are parsed and the relevant ones (analyze,
@@ -17146,16 +17304,21 @@ impl Parser {
         let mut bul_kb: Option<i64> = None;
         let mut bul_overflow = false;
         let mut bul_full = false;
+        let mut vac_parallel: Option<Option<i64>> = None;
+        let mut last_oname = String::new();
         if *self.peek() == Token::LParen {
             self.next();
             loop {
                 if self.eat_keyword("analyze") {
                     analyze = true;
+                    last_oname = "analyze".to_string();
                 } else if self.eat_keyword("verbose") {
                     verbose = true;
+                    last_oname = "verbose".to_string();
                 } else {
                     // Skip unknown option: `name [value]`.
                     let oname = self.expect_ident().unwrap_or_default().to_ascii_lowercase();
+                    last_oname = oname.clone();
                     if oname == "full" {
                         bul_full = true;
                     }
@@ -17165,8 +17328,17 @@ impl Parser {
                     // to the separator match below.
                     // BUFFER_USAGE_LIMIT is captured for the
                     // execution-time PG19 range validation.
+                    if oname == "parallel" {
+                        vac_parallel = Some(None);
+                    }
                     if matches!(self.peek(), Token::Number(_) | Token::Str(_)) {
                         let vtok = self.next();
+                        if oname == "parallel" {
+                            if let Token::Number(ns) = &vtok {
+                                vac_parallel =
+                                    Some(Some(ns.replace('_', "").parse::<i64>().unwrap_or(0)));
+                            }
+                        }
                         if oname == "buffer_usage_limit" {
                             match vtok {
                                 Token::Number(n) => match n.parse::<i64>() {
@@ -17185,8 +17357,16 @@ impl Parser {
                 match self.next() {
                     Token::Comma => continue,
                     Token::RParen => break,
-                    Token::Ident(_) => {
-                        // `option value` — value was an ident; expect comma or ')'.
+                    Token::Ident(iv) => {
+                        // v2.44: a boolean option value can clear
+                        // the flag (VACUUM (FULL FALSE)).
+                        if last_oname == "full" {
+                            bul_full = !matches!(
+                                iv.to_ascii_lowercase().as_str(),
+                                "false" | "off" | "no" | "0"
+                            );
+                        }
+                        // `option value` — value was an ident; expect comma or ')`.
                         match self.next() {
                             Token::Comma => continue,
                             Token::RParen => break,
@@ -17263,6 +17443,7 @@ impl Parser {
             buffer_usage_limit_kb: bul_kb,
             buffer_usage_overflow: bul_overflow,
             buffer_usage_full: bul_full,
+            parallel: vac_parallel,
         })
     }
 
@@ -21313,13 +21494,21 @@ impl Parser {
         let (kind, name) = if self.eat_keyword("table") {
             // v1.96: bare CONCURRENTLY may follow the kind keyword
             // (REINDEX TABLE CONCURRENTLY name).
-            let _ = self.eat_keyword("concurrently");
+            if self.eat_keyword("concurrently") {
+                concurrently = true;
+            }
             ('t', Some(self.expect_ident()?))
         } else if self.eat_keyword("index") {
-            let _ = self.eat_keyword("concurrently");
+            // v2.44: the flag must survive — REINDEX INDEX
+            // CONCURRENTLY on an exclusion index is 0A000.
+            if self.eat_keyword("concurrently") {
+                concurrently = true;
+            }
             ('i', Some(self.expect_ident()?))
         } else if self.eat_keyword("schema") {
-            let _ = self.eat_keyword("concurrently");
+            if self.eat_keyword("concurrently") {
+                concurrently = true;
+            }
             ('s', Some(self.expect_ident()?))
         } else if self.eat_keyword("database") {
             let n = if matches!(self.peek(), Token::Ident(_)) {
@@ -23717,6 +23906,9 @@ pub(crate) fn coltype_by_name(name: &str) -> Result<ColType, String> {
         "uuid" => ColType::Uuid,
         "oid" => ColType::Oid,
         "inet" => ColType::Inet,
+        "point" => ColType::Point,   // v2.44
+        "box" => ColType::BoxGeo,    // v2.44
+        "circle" => ColType::Circle, // v2.44
         o => return Err(format!("bad column type {}", o)),
     })
 }
@@ -24069,6 +24261,42 @@ pub fn encode_constraints(t: &crate::storage::Table) -> String {
         }
         out.push(')');
     }
+    // v2.44: optional trailing (excls ...) section — EXCLUDE
+    // constraint definitions, emitted only when non-empty.
+    // Element expressions and the predicate ride as their source
+    // SQL (re-parsed on decode), the same fallback the policy
+    // codec uses for expressions its s-expr form cannot carry.
+    if !t.excls.is_empty() {
+        out.push_str(" (excls");
+        for x in &t.excls {
+            out.push_str(" (");
+            sexpr_escape(&x.name, &mut out);
+            out.push(' ');
+            sexpr_escape(&x.method, &mut out);
+            out.push_str(if x.deferrable { " 1" } else { " 0" });
+            out.push_str(if x.initially_deferred { " 1" } else { " 0" });
+            out.push_str(" (elems");
+            for e in &x.elems {
+                out.push_str(" (");
+                sexpr_escape(&e.sql, &mut out);
+                out.push(' ');
+                sexpr_escape(&e.op, &mut out);
+                out.push(')');
+            }
+            out.push_str(") (include");
+            for c in &x.include {
+                out.push(' ');
+                sexpr_escape(c, &mut out);
+            }
+            out.push_str(") (pred ");
+            match &x.predicate_sql {
+                Some(s) => sexpr_escape(s, &mut out),
+                None => out.push('-'),
+            }
+            out.push_str("))");
+        }
+        out.push(')');
+    }
     out.push(')');
     out
 }
@@ -24397,6 +24625,9 @@ pub struct DecodedConstraints {
     /// v2.28: per-column identity kinds (absent in pre-v2.28
     /// encodings: empty = no identity columns).
     pub identity: Vec<u8>,
+    /// v2.44: EXCLUDE constraint definitions (absent in pre-v2.44
+    /// encodings: none).
+    pub excls: Vec<ExclDef>,
 }
 
 pub(crate) fn sexpr_is_close(p: &mut SexprParser) -> bool {
@@ -24944,6 +25175,8 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
     let mut att_local: Vec<bool> = Vec::new();
     // v2.28: optional trailing (identity ...) section.
     let mut identity: Vec<u8> = Vec::new();
+    // v2.44: optional trailing (excls ...) section.
+    let mut excls: Vec<ExclDef> = Vec::new();
     while !sexpr_is_close(&mut p) {
         p.open()?;
         match p.atom()?.as_str() {
@@ -25024,6 +25257,70 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
                 }
                 p.close()?;
             }
+            "excls" => {
+                while !sexpr_is_close(&mut p) {
+                    p.open()?;
+                    let name = p.atom()?;
+                    let method = p.atom()?;
+                    let deferrable = p.atom()? == "1";
+                    let initially_deferred = p.atom()? == "1";
+                    p.open()?;
+                    if p.atom()? != "elems" {
+                        return Err("bad excls elems head".into());
+                    }
+                    let mut elems = Vec::new();
+                    while !sexpr_is_close(&mut p) {
+                        p.open()?;
+                        let sql = p.atom()?;
+                        let op = p.atom()?;
+                        p.close()?;
+                        let expr = parse_expr_str(&sql)
+                            .map_err(|e| format!("bad excl elem expr: {}", e.message))?;
+                        elems.push(ExclElem { expr, sql, op });
+                    }
+                    p.close()?;
+                    p.open()?;
+                    if p.atom()? != "include" {
+                        return Err("bad excls include head".into());
+                    }
+                    let mut include = Vec::new();
+                    while !sexpr_is_close(&mut p) {
+                        include.push(p.atom()?);
+                    }
+                    p.close()?;
+                    p.open()?;
+                    if p.atom()? != "pred" {
+                        return Err("bad excls pred head".into());
+                    }
+                    p.ws();
+                    let predicate_sql = if p.chars.peek() == Some(&'-') {
+                        p.chars.next();
+                        None
+                    } else {
+                        Some(p.atom()?)
+                    };
+                    p.close()?;
+                    let predicate = match &predicate_sql {
+                        Some(sql) => Some(
+                            parse_expr_str(sql)
+                                .map_err(|e| format!("bad excl pred expr: {}", e.message))?,
+                        ),
+                        None => None,
+                    };
+                    p.close()?;
+                    excls.push(ExclDef {
+                        name,
+                        method,
+                        elems,
+                        include,
+                        predicate,
+                        predicate_sql,
+                        deferrable,
+                        initially_deferred,
+                    });
+                }
+                p.close()?;
+            }
             o => return Err(format!("bad trailing constraints section {}", o)),
         }
     }
@@ -25054,6 +25351,7 @@ pub fn decode_constraints(s: &str) -> Result<DecodedConstraints, String> {
         nn_local,
         att_local,
         identity,
+        excls,
     })
 }
 
