@@ -5860,6 +5860,47 @@ fn fk_action_char(a: FkAction) -> u8 {
     }
 }
 
+/// v2.43: display name for a flag-only not-null constraint on
+/// table `tname`: the stored record's name when one exists;
+/// otherwise, for an inherited copy, the name it carries on the
+/// ancestor where it is local (recursively); otherwise the local
+/// <table>_<column>_not_null synthesis.
+fn nn_display_name(
+    db: &Database,
+    snap: &crate::storage::Snapshot,
+    own: u64,
+    session: u64,
+    tname: &str,
+    t: &Table,
+    col: &str,
+    depth: u32,
+) -> String {
+    if let Some(rec) = t.checks.iter().find(|c| {
+        c.kind == crate::sql::CheckKind::NotNull
+            && crate::sql::check_expr_column(&c.expr).as_deref() == Some(col)
+    }) {
+        return rec.name.clone();
+    }
+    if depth < 32 {
+        let r = super::locality::ConRef::NotNull(col.to_string());
+        if !super::locality::con_is_local(db, snap, &[own], session, t, &r) {
+            let mut parents: Vec<String> = t.inherits.clone();
+            if let Some(pp) = t.partition.as_ref().and_then(|p| p.parent.clone()) {
+                parents.push(pp);
+            }
+            for pname in &parents {
+                if let Some(pt) = db.find_table(pname, snap, &[own], session) {
+                    if super::locality::parent_carries(pt, &r, true) {
+                        return nn_display_name(db, snap, own, session, pname, pt, col, depth + 1);
+                    }
+                }
+            }
+        }
+    }
+    let bare = tname.rsplit('.').next().unwrap_or(tname);
+    format!("{}_{}_not_null", bare, col)
+}
+
 pub(crate) fn pg_constraint_scan(
     db: &Database,
     snap: &Snapshot,
@@ -5955,6 +5996,11 @@ pub(crate) fn pg_constraint_scan(
         if let Some(pk) = &t.pkey {
             let r = super::locality::ConRef::PKey(pk.cols.clone());
             let lc = loc(&r, None);
+            // v2.43: PG19 index.c — an index constraint with no
+            // parent constraint is connoinherit=true (PK/UNIQUE do
+            // not descend via INHERITS, only via the partition
+            // tree, where the copy has a parent constraint).
+            let pk_noinherit = lc.0;
             rows.push(mk(plain(
                 b'p',
                 &pk.name,
@@ -5964,7 +6010,7 @@ pub(crate) fn pg_constraint_scan(
                 true,
                 attnums(t, &pk.cols),
                 lc,
-                false,
+                pk_noinherit,
                 pk.without_overlaps,
             )));
             meta.push((name.to_string(), r));
@@ -5972,6 +6018,8 @@ pub(crate) fn pg_constraint_scan(
         for u in &t.uniques {
             let r = super::locality::ConRef::Unique(u.cols.clone());
             let lc = loc(&r, None);
+            // v2.43: same PG19 index-constraint rule as the pkey.
+            let uq_noinherit = lc.0;
             rows.push(mk(plain(
                 b'u',
                 &u.name,
@@ -5981,7 +6029,7 @@ pub(crate) fn pg_constraint_scan(
                 true,
                 attnums(t, &u.cols),
                 lc,
-                false,
+                uq_noinherit,
                 u.without_overlaps,
             )));
             meta.push((name.to_string(), r));
@@ -5996,10 +6044,17 @@ pub(crate) fn pg_constraint_scan(
             // conbin (pg_get_expr is the identity in this engine);
             // NOT NULL rows carry theirs too (PG19). Their conkey is
             // the column attnum; plain CHECK conkey stays empty.
-            let bin = Some(format!(
-                "({})",
-                crate::exec::publication::deparse_filter(&c.expr)
-            ));
+            // v2.43: PG19's conbin deparse parenthesizes the
+            // whole expression exactly once; our deparser already
+            // parenthesizes binary/IS NULL expressions, so only
+            // wrap when it did not (was: unconditional wrap, which
+            // produced ((aa IS NOT NULL)) for pg_get_expr).
+            let deparsed = crate::exec::publication::deparse_filter(&c.expr);
+            let bin = Some(if deparsed.starts_with('(') {
+                deparsed
+            } else {
+                format!("({})", deparsed)
+            });
             let lc = loc(&r, bin);
             let conkey = match c.kind {
                 crate::sql::CheckKind::NotNull => crate::sql::check_expr_column(&c.expr)
@@ -6043,15 +6098,21 @@ pub(crate) fn pg_constraint_scan(
                 }),
                 neg: true,
             };
-            let bin = Some(format!(
-                "({})",
-                crate::exec::publication::deparse_filter(&expr)
-            ));
+            let deparsed = crate::exec::publication::deparse_filter(&expr);
+            let bin = Some(if deparsed.starts_with('(') {
+                deparsed
+            } else {
+                format!("({})", deparsed)
+            });
             let lc = loc(&r, bin);
-            let bare = name.rsplit('.').next().unwrap_or(name);
+            // v2.43: an inherited not-null copy keeps the name the
+            // constraint carries where it is defined (PG clones the
+            // parent's pg_constraint row); only a local definition
+            // is named <table>_<column>_not_null.
+            let nn_name = nn_display_name(db, snap, own, session, name, t, col_name, 0);
             rows.push(mk(plain(
                 b'n',
-                &format!("{}_{}_not_null", bare, col_name),
+                &nn_name,
                 false,
                 false,
                 true,

@@ -1646,13 +1646,26 @@ pub fn describe_columns(
         // v0.10: DML with RETURNING describes the RETURNING list; without
         // it there are no result columns (like a plain command tag).
         Stmt::Insert {
-            table, returning, ..
+            table,
+            alias,
+            returning,
+            ..
         } => {
             if returning.is_empty() {
                 Ok(None)
             } else {
                 Ok(Some(
-                    describe_returning(eng, snap, own, session, table, table, &[], returning)?.0,
+                    describe_returning(
+                        eng,
+                        snap,
+                        own,
+                        session,
+                        table,
+                        alias.as_deref().unwrap_or(table),
+                        &[],
+                        returning,
+                    )?
+                    .0,
                 ))
             }
         }

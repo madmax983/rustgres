@@ -380,10 +380,15 @@ pub(crate) fn filter_rows(
     }
     let mut out = Vec::new();
     for row in rows {
+        // v2.43: keep row provenance in the filter frame — system
+        // columns (tableoid/xmin/xmax/ctid) referenced from WHERE /
+        // join quals resolve through it, exactly as in projection
+        // (project.rs). Dropping it made `WHERE a.tableoid = ...`
+        // fail 42703 while the same reference in the target list worked.
         let frame = Scope {
             schema,
             row: &row.cells,
-            prov: None,
+            prov: Some(&row.prov),
         };
         let scopes_storage: Vec<Scope>;
         let scopes: &[Scope] = if outer.is_empty() {

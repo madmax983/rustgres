@@ -2460,6 +2460,7 @@ pub(crate) fn exec_insert_auto_view(
         eng,
         ctx,
         &av.base,
+        &None,
         overriding,
         &t_columns,
         rows,
@@ -2703,6 +2704,7 @@ pub(crate) fn exec_update_auto_view(
         &where_t,
         with,
         &t_returning,
+        false,
     );
     ctx.privs_suppressed = saved;
     let res = res?;
@@ -2830,6 +2832,7 @@ pub(crate) fn exec_delete_auto_view(
         &where_t,
         with,
         &t_returning,
+        false,
     );
     ctx.privs_suppressed = saved;
     let res = res?;

@@ -180,6 +180,7 @@ pub(crate) fn execute_inner(
         }
         Stmt::Insert {
             table,
+            alias,
             overriding,
             columns,
             rows,
@@ -191,6 +192,7 @@ pub(crate) fn execute_inner(
             eng,
             ctx,
             table,
+            alias,
             *overriding,
             columns,
             rows,
@@ -1349,21 +1351,23 @@ pub(crate) fn execute_inner(
         Stmt::Analyze { tables } => exec_analyze(eng, ctx, tables),
         Stmt::Update {
             table,
+            only,
             alias,
             sets,
             from,
             where_,
             with,
             returning,
-        } => exec_update(eng, ctx, table, alias, sets, from, where_, with, returning),
+        } => exec_update(eng, ctx, table, alias, sets, from, where_, with, returning, *only),
         Stmt::Delete {
             table,
+            only,
             alias,
             using,
             where_,
             with,
             returning,
-        } => exec_delete(eng, ctx, table, alias, using, where_, with, returning),
+        } => exec_delete(eng, ctx, table, alias, using, where_, with, returning, *only),
         Stmt::Merge {
             table,
             alias,

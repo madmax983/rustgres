@@ -3298,6 +3298,7 @@ fn is_generic_guc(name: &str) -> bool {
             | "parallel_leader_participation"
             | "enable_partitionwise_aggregate"
             | "enable_partition_pruning"
+            | "enable_parallel_append"
             | "enable_incremental_sort"
             | "vacuum_cost_delay"
             | "hash_mem_multiplier"
@@ -3461,6 +3462,7 @@ fn guc_default(name: &str) -> &'static str {
         "enable_material" => "on",
         "enable_partitionwise_aggregate" => "off",
         "enable_partition_pruning" => "on",
+        "enable_parallel_append" => "on",
         "enable_incremental_sort" => "on",
         "vacuum_cost_delay" => "0",
         "hash_mem_multiplier" => "2.0",
@@ -3670,6 +3672,7 @@ fn validate_generic_guc(name: &str, value: &str) -> Result<String, ExecError> {
         | "enable_sort"
         | "enable_memoize"
         | "enable_partitionwise_join"
+        | "enable_parallel_append"
         | "enable_presorted_aggregate"
         | "parallel_leader_participation"
         | "enable_self_join_elimination"

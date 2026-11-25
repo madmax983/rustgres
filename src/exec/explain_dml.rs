@@ -70,6 +70,7 @@ pub(crate) fn validate_explain_stmt(
         Stmt::Select(sel) => validate_explain_select(q, sel),
         Stmt::Insert {
             table,
+            alias: _,
             overriding: _,
             columns,
             rows,
@@ -90,6 +91,7 @@ pub(crate) fn validate_explain_stmt(
         ),
         Stmt::Update {
             table,
+            only: _,
             alias,
             sets,
             from,
@@ -109,6 +111,7 @@ pub(crate) fn validate_explain_stmt(
         ),
         Stmt::Delete {
             table,
+            only: _,
             alias,
             using,
             where_,
@@ -1379,6 +1382,7 @@ pub(crate) fn exec_explain_dml_analyze(
     match stmt {
         Stmt::Insert {
             table,
+            alias,
             overriding: _,
             columns,
             rows,
@@ -1422,6 +1426,7 @@ pub(crate) fn exec_explain_dml_analyze(
                 eng,
                 ctx,
                 table,
+                alias,
                 None,
                 columns,
                 rows,
@@ -1476,6 +1481,7 @@ pub(crate) fn exec_explain_dml_analyze(
         }
         Stmt::Update {
             table,
+            only,
             alias,
             sets,
             from,
@@ -1495,7 +1501,9 @@ pub(crate) fn exec_explain_dml_analyze(
                 !costs,
                 false,
             )?;
-            let res = exec_update(eng, ctx, table, alias, sets, from, where_, with, returning)?;
+            let res = exec_update(
+                eng, ctx, table, alias, sets, from, where_, with, returning, *only,
+            )?;
             let affected = affected_of(&res);
             out.push(format!(
                 "Update on {table} (actual rows={:.2} loops=1)",
@@ -1506,6 +1514,7 @@ pub(crate) fn exec_explain_dml_analyze(
         }
         Stmt::Delete {
             table,
+            only,
             alias,
             using,
             where_,
@@ -1524,7 +1533,9 @@ pub(crate) fn exec_explain_dml_analyze(
                 !costs,
                 false,
             )?;
-            let res = exec_delete(eng, ctx, table, alias, using, where_, with, returning)?;
+            let res = exec_delete(
+                eng, ctx, table, alias, using, where_, with, returning, *only,
+            )?;
             let affected = affected_of(&res);
             out.push(format!(
                 "Delete on {table} (actual rows={:.2} loops=1)",

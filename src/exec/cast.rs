@@ -1258,6 +1258,15 @@ pub(crate) fn regclass_display(q: &Q, oid: u32) -> String {
             return name.clone();
         }
     }
+    // v2.43: session temp tables render by name too (inherit.sql
+    // bar / inh_temp_parent tableoid::regclass casts).
+    if let Some(tm) = q.eng.db.temp_tables.get(&q.session) {
+        for (name, t) in tm {
+            if t.oid == oid {
+                return name.clone();
+            }
+        }
+    }
     // v2.29: synthetic index OIDs render as the index name.
     {
         let imap = crate::exec::catalog::index_oid_map(&q.eng.db, q.snap, q.own, q.session);

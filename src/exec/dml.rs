@@ -359,6 +359,12 @@ pub(crate) fn coerce_value(
         (Value::Int(i), ColType::Float) => Some(Value::Float(*i as f64)),
         (Value::Int(i), ColType::Numeric(_)) => Some(Value::Numeric(Numeric::from_i64(*i))),
         (Value::BigInt(i), ColType::Float) => Some(Value::Float(*i as f64)),
+        // v2.43: int8 -> float4 is a PG assignment cast (pg_cast.dat
+        // castcontext 'a'); the missing arm made INSERT of an integer
+        // literal/expr into a real column fail 42804 (v2.42 follow-on).
+        (Value::BigInt(i), ColType::Float4) => Some(Value::Float4(*i as f32)),
+        // v2.43: float8 -> float4 is likewise an assignment cast.
+        (Value::Float(f), ColType::Float4) => Some(Value::Float4(*f as f32)),
         (Value::BigInt(i), ColType::Numeric(_)) => Some(Value::Numeric(Numeric::from_i64(*i))),
         (Value::Float4(f), ColType::Float) => Some(Value::Float(*f as f64)),
         (Value::Float4(f), ColType::Numeric(_)) => Numeric::from_f32(*f).ok().map(Value::Numeric),
@@ -2993,6 +2999,8 @@ pub(crate) fn exec_insert(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     table: &str,
+    // v2.43: INSERT target alias (qualifier for DO UPDATE scopes).
+    alias: &Option<String>,
     // v2.28: OVERRIDING {SYSTEM|USER} VALUE (None / b's' / b'u').
     overriding: Option<u8>,
     columns: &Option<Vec<InsertTarget>>,
@@ -3006,6 +3014,7 @@ pub(crate) fn exec_insert(
         eng,
         ctx,
         table,
+        alias,
         overriding,
         columns,
         rows,
@@ -3019,6 +3028,7 @@ pub(crate) fn exec_insert(
             eng,
             ctx,
             table,
+            alias,
             overriding,
             columns,
             rows,
@@ -3043,6 +3053,8 @@ pub(crate) fn exec_insert_inner(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     table: &str,
+    // v2.43: INSERT target alias.
+    alias: &Option<String>,
     // v2.28: OVERRIDING {SYSTEM|USER} VALUE (None / b's' / b'u').
     overriding: Option<u8>,
     columns: &Option<Vec<InsertTarget>>,
@@ -3958,12 +3970,13 @@ pub(crate) fn exec_insert_inner(
         let mut planned_leaf: HashMap<u64, String> = HashMap::new();
         // Schemas for DO UPDATE evaluation: excluded first, target last
         // (unqualified columns resolve to the target, like Postgres).
+        let tgt_qual: String = alias.clone().unwrap_or_else(|| table.to_string());
         let mk_schemas = || {
             let tgt: Vec<QCol> = meta_for_upsert
                 .columns
                 .iter()
                 .map(|(n, ty)| QCol {
-                    qual: table.to_string(),
+                    qual: tgt_qual.clone(),
                     name: n.clone(),
                     ty: *ty,
 
@@ -4760,7 +4773,7 @@ pub(crate) fn exec_insert_inner(
             ctx.own,
             ctx.session,
             table,
-            table,
+            alias.as_deref().unwrap_or(table),
             &[],
             eff_returning,
         )?;
@@ -4768,7 +4781,7 @@ pub(crate) fn exec_insert_inner(
             .columns
             .iter()
             .map(|(n, ty)| QCol {
-                qual: table.to_string(),
+                qual: alias.clone().unwrap_or_else(|| table.to_string()),
                 name: n.clone(),
                 ty: *ty,
 
@@ -4916,6 +4929,55 @@ pub(crate) fn reorder_row(
         .collect()
 }
 
+/// v2.43: DML target expansion for plain inheritance (PG19): the
+/// named table plus every inheritance descendant (BFS over the live
+/// `inherits` links), each with its own column list. Used by UPDATE
+/// and DELETE when the statement has no ONLY. (SELECT scans have
+/// always expanded this way; DML historically did not, so rows in
+/// child tables survived a parent UPDATE/DELETE.)
+pub(crate) fn inheritance_targets(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    table: &str,
+) -> Vec<(String, Vec<(String, ColType)>)> {
+    let mut out: Vec<(String, Vec<(String, ColType)>)> = Vec::new();
+    let mut frontier: Vec<String> = vec![table.to_string()];
+    while let Some(cur) = frontier.pop() {
+        if out.iter().any(|(n, _)| n == &cur) {
+            continue;
+        }
+        if let Some(t) = eng
+            .db
+            .find_table(&cur, ctx.snap, &ctx.all_xids, ctx.session)
+        {
+            out.push((cur.clone(), t.columns.clone()));
+        }
+        for (k, vs) in eng.db.tables.iter() {
+            if vs
+                .last()
+                .is_some_and(|t| t.inherits.iter().any(|p| p == &cur))
+                && !frontier.contains(k)
+                && !out.iter().any(|(n, _)| n == k)
+            {
+                frontier.push(k.clone());
+            }
+        }
+        // v2.43: session TEMP tables can be inheritance children
+        // too (inherit.sql bar/bar2 UPDATE/DELETE propagation).
+        if let Some(tm) = eng.db.temp_tables.get(&ctx.session) {
+            for (k, t) in tm.iter() {
+                if t.inherits.iter().any(|p| p == &cur)
+                    && !frontier.contains(k)
+                    && !out.iter().any(|(n, _)| n == k)
+                {
+                    frontier.push(k.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// v2.19: UPDATE entry point — rules first (exec/rules.rs).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exec_update(
@@ -4928,12 +4990,16 @@ pub(crate) fn exec_update(
     where_: &Option<Expr>,
     with: &[CteDef],
     returning: &[SelectItem],
+    // v2.43: UPDATE ONLY — false expands over inheritance children.
+    only: bool,
 ) -> Result<ExecResult, ExecError> {
     let out = match crate::exec::rules::try_fire_update(
-        eng, ctx, table, alias, sets, from, where_, with, returning,
+        eng, ctx, table, alias, sets, from, where_, with, returning, only,
     ) {
         Some(r) => r,
-        None => exec_update_inner(eng, ctx, table, alias, sets, from, where_, with, returning),
+        None => exec_update_inner(
+            eng, ctx, table, alias, sets, from, where_, with, returning, only,
+        ),
     };
     if let Ok(res) = &out {
         let n = pgstat_dml_count(res);
@@ -4988,6 +5054,7 @@ pub(crate) fn exec_update_inner(
     where_: &Option<Expr>,
     with: &[CteDef],
     returning: &[SelectItem],
+    only: bool,
 ) -> Result<ExecResult, ExecError> {
     // v2.36: DML on a foreign table reaches the wrapper (55000
     // for the handler-less wrappers modeled here).
@@ -5250,7 +5317,7 @@ pub(crate) fn exec_update_inner(
         // partitioned target scans every leaf; rows are remapped to the
         // parent's column order so the parent-qualified schema evaluates
         // correctly (leaves may reorder columns).
-        let mut vis: Vec<(String, Vec<(String, ColType)>, u64, u64, Row)> = Vec::new();
+        let mut vis: Vec<(String, Vec<(String, ColType)>, u64, u64, Row, Row)> = Vec::new();
         // v0.70: the tables to scan — every leaf for a partitioned
         // target, else the named table itself.
         let leaves: Vec<(String, Vec<(String, ColType)>)> = if partitioned {
@@ -5259,8 +5326,11 @@ pub(crate) fn exec_update_inner(
                 ls.push((table.to_string(), columns.clone()));
             }
             ls
-        } else {
+        } else if only {
             vec![(table.to_string(), columns.clone())]
+        } else {
+            // v2.43: plain inheritance expansion (PG19).
+            inheritance_targets(eng, ctx, table)
         };
         // Leaf column orders, for routing and remapping below.
         let leaf_cols_of = leaves.clone();
@@ -5279,7 +5349,14 @@ pub(crate) fn exec_update_inner(
                 } else {
                     Row::new(reorder_row(leaf_cols, &columns, &r.values))
                 };
-                vis.push((leaf.clone(), leaf_cols.clone(), r.id, r.xmax, pv));
+                vis.push((
+                    leaf.clone(),
+                    leaf_cols.clone(),
+                    r.id,
+                    r.xmax,
+                    pv,
+                    r.values.clone(),
+                ));
             }
         }
         // v1.95: row-level security — the target's UPDATE USING group
@@ -5396,7 +5473,7 @@ pub(crate) fn exec_update_inner(
             std::collections::HashMap::new();
         // SET expressions are evaluated with a scratch query context;
         // subqueries in SET correlate to the row being updated.
-        for (leaf, leaf_cols, id, xmax, values) in &vis {
+        for (leaf, leaf_cols, id, xmax, values, leaf_row) in &vis {
             check_write_conflict(eng, *xmax, ctx.level)?;
             // v0.76: UPDATE ... FROM — test each target row against the
             // FROM cross product. The SET expressions evaluate against the
@@ -5592,7 +5669,24 @@ pub(crate) fn exec_update_inner(
             } else {
                 (leaf.clone(), leaf_cols.clone())
             };
-            let new_dst = reorder_row(&columns, &dst_cols, &new_values);
+            let new_dst = if !partitioned && dst == *leaf {
+                // v2.43: an inheritance child's row carries columns
+                // the parent does not have; overlay the updated
+                // parent columns onto the child's original row
+                // instead of reorder_row's NULL fill. (For the plain
+                // single-table case this is the identity.)
+                let mut base = leaf_row.to_vec();
+                for (ci, (cname, _)) in columns.iter().enumerate() {
+                    if let Some(pos) = dst_cols.iter().position(|(n, _)| n == cname) {
+                        if pos < base.len() {
+                            base[pos] = new_values[ci].clone();
+                        }
+                    }
+                }
+                base
+            } else {
+                reorder_row(&columns, &dst_cols, &new_values)
+            };
             let dst_meta = {
                 let dt = eng
                     .db
@@ -5635,7 +5729,11 @@ pub(crate) fn exec_update_inner(
             ret_prov_ids.push((*id, dst.clone()));
             // v0.76: remember the FROM row for RETURNING (None without FROM).
             ret_from.push(from_row.clone());
-            let old_src = Row::new(reorder_row(&columns, leaf_cols, &values.to_vec()));
+            let old_src = if partitioned {
+                Row::new(reorder_row(&columns, leaf_cols, &values.to_vec()))
+            } else {
+                leaf_row.clone()
+            };
             if dst == *leaf {
                 old_leaf_vals.push((leaf.clone(), old_src));
                 // v0.89: record the planned row in the statement-local
@@ -6413,12 +6511,14 @@ pub(crate) fn exec_delete(
     where_: &Option<Expr>,
     with: &[CteDef],
     returning: &[SelectItem],
+    // v2.43: DELETE FROM ONLY — false expands over inheritance children.
+    only: bool,
 ) -> Result<ExecResult, ExecError> {
     let out = match crate::exec::rules::try_fire_delete(
-        eng, ctx, table, alias, using, where_, with, returning,
+        eng, ctx, table, alias, using, where_, with, returning, only,
     ) {
         Some(r) => r,
-        None => exec_delete_inner(eng, ctx, table, alias, using, where_, with, returning),
+        None => exec_delete_inner(eng, ctx, table, alias, using, where_, with, returning, only),
     };
     if let Ok(res) = &out {
         let n = pgstat_dml_count(res);
@@ -6440,6 +6540,7 @@ pub(crate) fn exec_delete_inner(
     where_: &Option<Expr>,
     with: &[CteDef],
     returning: &[SelectItem],
+    only: bool,
 ) -> Result<ExecResult, ExecError> {
     // v2.36: DML on a foreign table reaches the wrapper (55000
     // for the handler-less wrappers modeled here).
@@ -6524,8 +6625,11 @@ pub(crate) fn exec_delete_inner(
                     ls.push((table.to_string(), columns.clone()));
                 }
                 ls
-            } else {
+            } else if only {
                 vec![(table.to_string(), columns.clone())]
+            } else {
+                // v2.43: plain inheritance expansion (PG19).
+                inheritance_targets(eng, ctx, table)
             };
             for (leaf, leaf_cols) in &targets {
                 let lt = eng

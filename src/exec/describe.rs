@@ -915,12 +915,27 @@ pub(crate) fn describe_cte_dml(
 ) -> Result<Vec<(String, ColType)>, ExecError> {
     match stmt {
         Stmt::Insert {
-            table, returning, ..
+            table,
+            alias,
+            returning,
+            ..
         } => {
             if returning.is_empty() {
                 Ok(Vec::new())
             } else {
-                Ok(describe_returning(eng, snap, own, session, table, table, &[], returning)?.0)
+                // v2.43: an INSERT target alias hides the table
+                // name in RETURNING (PG19), like UPDATE/DELETE.
+                Ok(describe_returning(
+                    eng,
+                    snap,
+                    own,
+                    session,
+                    table,
+                    alias.as_deref().unwrap_or(table),
+                    &[],
+                    returning,
+                )?
+                .0)
             }
         }
         Stmt::Update {

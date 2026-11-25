@@ -4551,6 +4551,7 @@ impl Parser {
                 let mut deferrable: Option<bool> = None;
                 let mut initially: Option<bool> = None;
                 let mut enforced: Option<bool> = None;
+                let mut inherit: Option<bool> = None;
                 loop {
                     if self.eat_keyword("not") {
                         if self.eat_keyword("deferrable") {
@@ -4567,6 +4568,13 @@ impl Parser {
                         deferrable = Some(true);
                     } else if self.eat_keyword("enforced") {
                         enforced = Some(true);
+                    } else if self.eat_keyword("inherit") {
+                        // v2.43: PG19 AT_AlterConstraint INHERIT.
+                        inherit = Some(true);
+                    } else if self.eat_keyword("no") {
+                        // v2.43: NO INHERIT.
+                        self.expect_keyword("inherit")?;
+                        inherit = Some(false);
                     } else if self.eat_keyword("initially") {
                         if self.eat_keyword("deferred") {
                             initially = Some(true);
@@ -4595,6 +4603,7 @@ impl Parser {
                     deferrable,
                     initially_deferred: initially,
                     enforced,
+                    inherit,
                 });
             }
             self.eat_keyword("column");
@@ -10394,6 +10403,20 @@ impl Parser {
     pub(crate) fn parse_insert(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("into")?;
         let table = self.parse_table_name()?;
+        // v2.43: `INSERT INTO t [AS] x` target alias (PG19). A
+        // bare alias must not swallow the row-source keywords —
+        // above all DEFAULT, whose DEFAULT VALUES production is
+        // the standard idiom (PG's grammar resolves the same
+        // ambiguity by lookahead).
+        let alias = if matches!(self.peek(), Token::Ident(k) if k == "as") {
+            self.parse_alias_opt()?
+        } else if matches!(self.peek(), Token::Ident(k)
+            if matches!(k.as_str(), "values" | "select" | "with" | "table" | "default" | "overriding" | "execute"))
+        {
+            None
+        } else {
+            self.parse_alias_opt()?
+        };
         // v0.72: `INSERT INTO t (SELECT ...)` — a parenthesized query
         // is a row source, not a column list (PG19). Peek past the
         // paren: a query starter means "no column list".
@@ -10491,6 +10514,7 @@ impl Parser {
         let returning = self.parse_returning()?;
         Ok(Stmt::Insert {
             table,
+            alias,
             overriding,
             columns,
             rows,
@@ -10862,28 +10886,8 @@ impl Parser {
                 }
             } else if self.eat_keyword("update") {
                 self.expect_keyword("set")?;
-                let mut sets = Vec::new();
-                loop {
-                    let col = self.expect_ident()?;
-                    // v2.40: subscripted upsert targets (`SET f1[1] =
-                    // ...`, `SET f1[1:2] = ...`) share parse_update's
-                    // desugar.
-                    let expr = if *self.peek() == Token::LBracket {
-                        let chain = self.parse_target_brackets()?;
-                        self.expect(Token::Eq, "'='")?;
-                        let value = self.parse_or()?;
-                        subscript_assign_expr(&col, chain, value)
-                    } else {
-                        self.expect(Token::Eq, "'='")?;
-                        self.parse_or()?
-                    };
-                    sets.push((col, expr));
-                    if *self.peek() == Token::Comma {
-                        self.next();
-                        continue;
-                    }
-                    break;
-                }
+                // v2.43: shared SET-list parser (multi-column form too).
+                let sets = self.parse_set_list()?;
                 if sets.is_empty() {
                     return Err(err(
                         "syntax error: ON CONFLICT DO UPDATE requires at least one assignment"
@@ -16510,48 +16514,105 @@ impl Parser {
         Ok(chain)
     }
 
-    pub(crate) fn parse_update(&mut self) -> Result<Stmt, SqlError> {
-        // v2.16: UPDATE ONLY t — consumed like DELETE's ONLY.
-        let _only = self.eat_keyword("only");
-        // v2.15: schema-qualified target (UPDATE fkpart10.tbl1 ...).
-        let table = self.parse_table_name()?;
-        // v0.76: `UPDATE t AS x` / `UPDATE t x` (PG's alias clause).
-        let alias = self.parse_alias_opt()?;
-        self.expect_keyword("set")?;
-        let mut sets = Vec::new();
+    /// v2.43: one SET assignment list, shared by UPDATE and ON CONFLICT
+    /// DO UPDATE: `col = expr`, subscripted targets (v2.38 desugar), and
+    /// the PG19 multi-column form `(a, b) = (SELECT ...)` /
+    /// `(a, b) = (e1, e2)` (gram.y MultiAssignRef). The multi-column
+    /// forms desugar to one assignment per column: a Row source splits
+    /// pairwise; a sub-SELECT source is cloned per column with its
+    /// target list narrowed to that column ( PG evaluates a MULTIEXPR
+    /// sublink once; the clone re-evaluates a pure SELECT per column,
+    /// which is observably identical for the deterministic sources the
+    /// form is used with). Arity mismatch is PG19's 42601
+    /// "number of columns does not match number of values"
+    /// (parse_expr.c transformMultiAssignRef).
+    pub(crate) fn parse_set_list(&mut self) -> Result<Vec<(String, Expr)>, SqlError> {
+        let mut sets: Vec<(String, Expr)> = Vec::new();
         loop {
-            let col = self.expect_ident()?;
-            // v2.38: subscripted assignment target, `SET j['a'][0] = v`
-            // (PG19 indirection on the SET target). Desugars to the
-            // hidden __jsonb_subscript_assign builtin over the old
-            // column value (jsonb_set Create semantics: missing keys
-            // are created, arrays pad with JSON nulls). The bracket
-            // contents are full expressions, cast to text for the
-            // path array (integer subscripts render as their digits).
-            if *self.peek() == Token::LBracket {
-                // v2.38/v2.40: subscripted assignment target
-                // (`SET j['a'][0] = v`, `SET a[1:2] = v`) — desugared
-                // by subscript_assign_expr.
-                let chain = self.parse_target_brackets()?;
+            if *self.peek() == Token::LParen {
+                self.next();
+                let mut cols = Vec::new();
+                loop {
+                    cols.push(self.expect_ident()?);
+                    if *self.peek() == Token::Comma {
+                        self.next();
+                        continue;
+                    }
+                    break;
+                }
+                self.expect(Token::RParen, "')'")?;
                 self.expect(Token::Eq, "'='")?;
                 let value = self.parse_or()?;
-                let assign = subscript_assign_expr(&col, chain, value);
-                sets.push((col, assign));
-                if *self.peek() == Token::Comma {
-                    self.next();
-                    continue;
+                let arity_err = || SqlError {
+                    message: "number of columns does not match number of values".to_string(),
+                    code: "42601",
+                };
+                match value {
+                    Expr::Row(elems) => {
+                        if elems.len() != cols.len() {
+                            return Err(arity_err());
+                        }
+                        for (c, e) in cols.into_iter().zip(elems) {
+                            sets.push((c, e));
+                        }
+                    }
+                    Expr::ScalarSub(sub) => {
+                        if sub.items.len() != cols.len() {
+                            return Err(arity_err());
+                        }
+                        let items = sub.items.clone();
+                        for (c, it) in cols.into_iter().zip(items) {
+                            let mut s2 = sub.clone();
+                            s2.items = vec![it];
+                            sets.push((c, Expr::ScalarSub(s2)));
+                        }
+                    }
+                    other => {
+                        if cols.len() == 1 {
+                            sets.push((cols.into_iter().next().unwrap(), other));
+                        } else {
+                            return Err(SqlError {
+                                message: "source for a multiple-column UPDATE item must be a sub-SELECT or ROW() expression".to_string(),
+                                code: "0A000",
+                            });
+                        }
+                    }
                 }
-                break;
+            } else {
+                let col = self.expect_ident()?;
+                if *self.peek() == Token::LBracket {
+                    let chain = self.parse_target_brackets()?;
+                    self.expect(Token::Eq, "'='")?;
+                    let value = self.parse_or()?;
+                    let assign = subscript_assign_expr(&col, chain, value);
+                    sets.push((col, assign));
+                } else {
+                    self.expect(Token::Eq, "'='")?;
+                    let expr = self.parse_or()?;
+                    sets.push((col, expr));
+                }
             }
-            self.expect(Token::Eq, "'='")?;
-            let expr = self.parse_or()?;
-            sets.push((col, expr));
             if *self.peek() == Token::Comma {
                 self.next();
                 continue;
             }
             break;
         }
+        Ok(sets)
+    }
+
+    pub(crate) fn parse_update(&mut self) -> Result<Stmt, SqlError> {
+        // v2.16: UPDATE ONLY t. v2.43: the flag is now carried into
+        // exec — without ONLY the update expands over inheritance
+        // descendants, like PG19.
+        let only = self.eat_keyword("only");
+        // v2.15: schema-qualified target (UPDATE fkpart10.tbl1 ...).
+        let table = self.parse_table_name()?;
+        // v0.76: `UPDATE t AS x` / `UPDATE t x` (PG's alias clause).
+        let alias = self.parse_alias_opt()?;
+        self.expect_keyword("set")?;
+        // v2.43: shared SET-list parser (adds the multi-column form).
+        let sets = self.parse_set_list()?;
         if sets.is_empty() {
             return Err(err("syntax error: UPDATE requires at least one assignment"));
         }
@@ -16566,6 +16627,7 @@ impl Parser {
         let returning = self.parse_returning()?;
         Ok(Stmt::Update {
             table,
+            only,
             alias,
             sets,
             from,
@@ -16770,10 +16832,10 @@ impl Parser {
 
     pub(crate) fn parse_delete(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("from")?;
-        // v2.16: DELETE FROM ONLY t / FROM (t) — ONLY restricts to
-        // the named table; this engine's DELETE already scans only
-        // the target table's own rows, so it is consumed.
-        let _only = self.eat_keyword("only");
+        // v2.16: DELETE FROM ONLY t / FROM (t). v2.43: the flag is
+        // carried into exec — without ONLY the delete expands over
+        // inheritance descendants, like PG19.
+        let only = self.eat_keyword("only");
         let paren = *self.peek() == Token::LParen;
         if paren {
             self.next();
@@ -16796,6 +16858,7 @@ impl Parser {
         let returning = self.parse_returning()?;
         Ok(Stmt::Delete {
             table,
+            only,
             alias,
             using,
             where_,

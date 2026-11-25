@@ -2788,7 +2788,7 @@ pub struct TableDef {
     /// v0.96: table-constraint `NOT NULL` columns that named no local
     /// column (legal only with `INHERITS`); applied to the merged
     /// column list at exec, 42703 when still missing.
-    pub deferred_not_null: Vec<String>,
+    pub deferred_not_null: Vec<(String, Option<String>, bool)>,
     /// v1.96: `CREATE TABLE name OF type_name` — a typed table whose
     /// columns come from the named composite type (expanded at exec).
     pub of_type: Option<String>,
@@ -3191,6 +3191,9 @@ pub enum AlterAction {
         deferrable: Option<bool>,
         initially_deferred: Option<bool>,
         enforced: Option<bool>,
+        /// v2.43: PG19 AT_AlterConstraint inheritability — Some(true) =
+        /// INHERIT, Some(false) = NO INHERIT (not-null constraints only).
+        inherit: Option<bool>,
     },
     /// v2.06: `ALTER TABLE t ADD PRIMARY KEY USING INDEX idx` (PG19
     /// transformIndexConstraints): the unique index becomes the PK.
@@ -3912,7 +3915,11 @@ pub(crate) fn def_add_check(
     def.checks.push(CheckDef {
         name: cname,
         expr: e,
-        not_valid,
+        // v2.43: PG19 transformCheckConstraints — initially_valid
+        // is is_enforced: a NOT ENFORCED constraint starts life
+        // NOT VALID (convalidated=false) until an ENFORCED flip
+        // validates it.
+        not_valid: not_valid || !enforced,
         kind: CheckKind::Check,
         no_inherit,
         enforced,
@@ -4385,7 +4392,8 @@ pub(crate) fn build_table_def(
                         // v0.96: with INHERITS the column may come from a
                         // parent; the NOT NULL is applied to the merged
                         // columns at exec.
-                        def.deferred_not_null.push(col.clone());
+                        def.deferred_not_null
+                            .push((col.clone(), con_name.clone(), *no_inherit));
                     }
                 }
                 ParsedTableCon::Fk {
@@ -10802,6 +10810,10 @@ pub enum Stmt {
     },
     Insert {
         table: String,
+        /// v2.43: `INSERT INTO t [AS] alias` (PG19 InsertStmt.relation
+        /// carries a range alias; it replaces the table name as the
+        /// qualifier for ON CONFLICT / RETURNING references).
+        alias: Option<String>,
         /// v2.28: `OVERRIDING {SYSTEM|USER} VALUE` (PG19): Some(b's')
         /// = SYSTEM, Some(b'u') = USER, None = clause absent.
         overriding: Option<u8>,
@@ -10827,6 +10839,9 @@ pub enum Stmt {
     // --- v0.5: UPDATE / DELETE with MVCC semantics
     Update {
         table: String,
+        /// v2.43: `UPDATE ONLY t` — without ONLY, DML expands over
+        /// the inheritance descendants (PG19).
+        only: bool,
         /// v0.76: optional table alias (`UPDATE t AS x ...`).
         alias: Option<String>,
         /// (column, expression) assignments.
@@ -10844,6 +10859,9 @@ pub enum Stmt {
     },
     Delete {
         table: String,
+        /// v2.43: `DELETE FROM ONLY t` — without ONLY, DML expands
+        /// over the inheritance descendants (PG19).
+        only: bool,
         /// v0.65: optional table alias (`DELETE FROM t AS dt`); the
         /// alias is the qualifier visible in WHERE/RETURNING, like PG.
         alias: Option<String>,

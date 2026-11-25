@@ -235,9 +235,14 @@ fn set_drop_not_null_recursion() {
     let mut eng = engine();
     ok(&mut eng, "create table p (a int not null)");
     ok(&mut eng, "create table c () inherits (p)");
+    // v2.43: the inherited copy keeps the parent's constraint
+    // name (PG19 clones the pg_constraint row; inherit.out shows
+    // inh_parent_f1_not_null on every descendant). The pre-v2.43
+    // expectation (c_a_not_null) encoded the old per-table
+    // synthesis.
     assert_eq!(
         locality(&mut eng, "c"),
-        vec!["c_a_not_null|f|1".to_string()]
+        vec!["p_a_not_null|f|1".to_string()]
     );
     // Direct DROP NOT NULL on the child is refused (inherited).
     let e = err(&mut eng, "alter table c alter column a drop not null");
@@ -247,9 +252,14 @@ fn set_drop_not_null_recursion() {
     assert!(locality(&mut eng, "c").is_empty());
     // SET NOT NULL on the parent propagates as inherited.
     ok(&mut eng, "alter table p alter column a set not null");
+    // v2.43: the inherited copy keeps the parent's constraint
+    // name (PG19 clones the pg_constraint row; inherit.out shows
+    // inh_parent_f1_not_null on every descendant). The pre-v2.43
+    // expectation (c_a_not_null) encoded the old per-table
+    // synthesis.
     assert_eq!(
         locality(&mut eng, "c"),
-        vec!["c_a_not_null|f|1".to_string()]
+        vec!["p_a_not_null|f|1".to_string()]
     );
     // Enforcement reaches the child.
     let e = err(&mut eng, "insert into c values (null)");

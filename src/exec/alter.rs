@@ -1412,6 +1412,65 @@ pub(crate) fn exec_alter_one(
                         using_expr.as_ref(),
                     )?;
                 }
+                // v2.43: plain-inheritance descendants get the type
+                // change (and the USING row rewrite) too — PG19
+                // ATExecAlterColumnType recurses find_all_inheritors,
+                // not just the partition tree. Previously the
+                // descendants' catalog type silently stayed behind
+                // and their rows were never rewritten (inherit.sql
+                // `select * from d` after ALTER a ... TYPE integer).
+                let mut visited: Vec<String> = children.clone();
+                let descs = inheritance_descendants(&eng.db, name);
+                for d in &descs {
+                    if d == name || visited.contains(d) {
+                        continue;
+                    }
+                    // Tombstoned (dropped) tables still appear in
+                    // the raw inheritance scan; skip the invisible.
+                    if eng
+                        .db
+                        .find_table(d, ctx.snap, &ctx.all_xids, ctx.session)
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    visited.push(d.clone());
+                    alter_column_type_ext(
+                        eng,
+                        ctx,
+                        d,
+                        col,
+                        col_type,
+                        named_type.as_deref(),
+                        using_expr.as_ref(),
+                        false,
+                        true,
+                    )?;
+                    for pc in partition_descendants(eng, ctx, d) {
+                        if visited.contains(&pc) {
+                            continue;
+                        }
+                        if eng
+                            .db
+                            .find_table(&pc, ctx.snap, &ctx.all_xids, ctx.session)
+                            .is_none()
+                        {
+                            continue;
+                        }
+                        visited.push(pc.clone());
+                        alter_column_type_ext(
+                            eng,
+                            ctx,
+                            &pc,
+                            col,
+                            col_type,
+                            named_type.as_deref(),
+                            using_expr.as_ref(),
+                            false,
+                            true,
+                        )?;
+                    }
+                }
             }
             res
         }
@@ -1568,6 +1627,43 @@ pub(crate) fn exec_alter_one(
                         }
                     }
                 }
+                // v2.43: children inherit the constraint under the
+                // name it landed with on the parent (PG clones the
+                // parent's pg_constraint row). An unnamed ADD was
+                // auto-named from the PARENT's table inside
+                // alter_add_constraint; without this read-back each
+                // child would auto-name from itself (bc_aa_check
+                // instead of ac_aa_check) and locality would break.
+                let mut check = (*check).clone();
+                let mut notnull = (*notnull).clone();
+                if let Some(pt) = eng
+                    .db
+                    .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                {
+                    if let Some(c) = check.as_mut() {
+                        if c.name.is_empty() {
+                            if let Some(stored) = pt.checks.iter().find(|x| {
+                                x.kind == crate::sql::CheckKind::Check
+                                    && format!("{:?}", x.expr) == format!("{:?}", c.expr)
+                            }) {
+                                c.name = stored.name.clone();
+                            }
+                        }
+                    }
+                    if let Some(n) = notnull.as_mut() {
+                        if n.name.is_empty() {
+                            if let Some(stored) = pt.checks.iter().find(|x| {
+                                x.kind == crate::sql::CheckKind::NotNull
+                                    && crate::sql::check_expr_column(&x.expr).as_deref()
+                                        == Some(n.col.as_str())
+                            }) {
+                                n.name = stored.name.clone();
+                            }
+                        }
+                    }
+                }
+                let check = &check;
+                let notnull = &notnull;
                 let prev = ADD_CONSTRAINT_PROPAGATING.with(|c| c.replace(true));
                 let mut prop: Result<(), ExecError> = Ok(());
                 for child in &children {
@@ -1598,11 +1694,11 @@ pub(crate) fn exec_alter_one(
                         }
                     }
                     let child_action = AlterAction::AddConstraint {
-                        check: check.clone(),
+                        check: (*check).clone(),
                         unique: unique.clone(),
                         pkey: pkey.clone(),
                         fk: fk.clone(),
-                        notnull: notnull.clone(),
+                        notnull: (*notnull).clone(),
                     };
                     if let Err(e) = exec_alter(eng, ctx, child, std::slice::from_ref(&child_action))
                     {
@@ -2514,6 +2610,7 @@ pub(crate) fn exec_alter_one(
             deferrable,
             initially_deferred,
             enforced,
+            inherit,
         } => {
             let res = alter_alter_constraint(
                 eng,
@@ -2523,6 +2620,8 @@ pub(crate) fn exec_alter_one(
                 *deferrable,
                 *initially_deferred,
                 *enforced,
+                *inherit,
+                only,
             );
             if res.is_ok() {
                 let children: Vec<String> = eng
@@ -2570,6 +2669,11 @@ pub(crate) fn exec_alter_one(
                             deferrable: *deferrable,
                             initially_deferred: *initially_deferred,
                             enforced: *enforced,
+                            // v2.43: inheritability is handled at the
+                            // top level (it walks the subtree itself);
+                            // partition-child clones only mirror the
+                            // deferrable/enforced attributes.
+                            inherit: None,
                         };
                         exec_alter(eng, ctx, child, std::slice::from_ref(&child_action))?;
                     }
@@ -2957,44 +3061,24 @@ pub(crate) fn alter_column_type_ext(
         }
     }
     {
-        // Inheritance: a child inheriting this column from another
-        // parent whose definition would diverge must fail
-        // (PG19: "cannot alter inherited column").
-        let mut tnames: Vec<String> = eng.db.tables.keys().cloned().collect();
-        if let Some(tm) = eng.db.temp_tables.get(&ctx.session) {
-            tnames.extend(tm.keys().cloned());
-        }
-        for cname in &tnames {
-            if let Some(c) = eng
-                .db
-                .find_table(cname, ctx.snap, &ctx.all_xids, ctx.session)
-            {
-                if c.inherits.iter().any(|p| p == name) && c.inherits.len() > 1 {
-                    if let Some((_, cty)) = c.columns.iter().find(|(cn, _)| cn == col) {
-                        let _ = cty;
-                        for p2 in &c.inherits {
-                            if p2 == name {
-                                continue;
-                            }
-                            if let Some(pt) =
-                                eng.db.find_table(p2, ctx.snap, &ctx.all_xids, ctx.session)
-                            {
-                                if let Some((_, pty)) = pt.columns.iter().find(|(cn, _)| cn == col)
-                                {
-                                    if pty != col_type {
-                                        return Err(exec_err(
-                                            "42P16",
-                                            format!(
-                                                "cannot alter inherited column \"{}\" of relation \"{}\"",
-                                                col, cname
-                                            ),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+        // v2.43: PG19's attinhcount > numparents guard (see
+        // inherited_column_blocker). The pre-v2.43 version compared
+        // the other parents' CURRENT types against the NEW type,
+        // which false-fired on diamond hierarchies whose other
+        // parents are themselves descendants of the altered table
+        // (inherit.sql a/b/c/d). The guard is a top-level check:
+        // parent-driven propagation (bypass_inherited) must not
+        // re-run it per child, where the child's other parents are
+        // outside the child's own subtree by construction.
+        if !bypass_inherited {
+            if let Some(blocked) = inherited_column_blocker(eng, ctx, name, col) {
+                return Err(exec_err(
+                    "42P16",
+                    format!(
+                        "cannot alter inherited column \"{}\" of relation \"{}\"",
+                        col, blocked
+                    ),
+                ));
             }
         }
     }
@@ -4601,6 +4685,7 @@ pub(crate) fn alter_add_constraint(
     let mut unique = unique.clone();
     let mut pkey = pkey.clone();
     let mut fk = fk.clone();
+    let mut notnull = notnull.clone();
     {
         let taken = |n: &str| table_has_constraint(t, n);
         if let Some(u) = unique.as_mut() {
@@ -4636,6 +4721,23 @@ pub(crate) fn alter_add_constraint(
                 f.name = crate::sql::pg_fk_auto_name(name, &f.cols, taken);
             }
         }
+        if let Some(n) = notnull.as_mut() {
+            if n.name.is_empty() {
+                // v2.43: PG19 names an unnamed NOT NULL constraint
+                // <table>_<col>_not_null (StoreRelNotNull via
+                // ChooseConstraintName); it previously stayed empty,
+                // so pg_constraint showed a nameless 'n' row and a
+                // later ALTER CONSTRAINT could not address it.
+                let base = format!("{}_{}_not_null", name, n.col);
+                let mut cand = base.clone();
+                let mut k = 1;
+                while taken(&cand) {
+                    cand = format!("{}{}", base, k);
+                    k += 1;
+                }
+                n.name = cand;
+            }
+        }
         if let Some(c) = check.as_mut() {
             if c.name.is_empty() {
                 // PG19 names an unnamed CHECK <table>_<firstcol>_check
@@ -4667,6 +4769,13 @@ pub(crate) fn alter_add_constraint(
             ),
         ));
     }
+    // v2.43: PG19 — a NOT ENFORCED check starts life NOT VALID
+    // (convalidated=false) until an ENFORCED flip validates it.
+    if let Some(c) = check.as_mut() {
+        if !c.enforced {
+            c.not_valid = true;
+        }
+    }
     // v2.27: a propagated ADD (parent -> child) lands non-local.
     let propagating = ADD_CONSTRAINT_PROPAGATING.with(|c| c.get());
     if propagating {
@@ -4687,6 +4796,7 @@ pub(crate) fn alter_add_constraint(
     let unique = &unique;
     let pkey = &pkey;
     let fk = &fk;
+    let notnull = &notnull;
     // v1.96 finishing pass: PG19 constraint names are unique per
     // relation across all kinds (tablecmds.c ConstraintNameExists):
     // adding a CHECK/UNIQUE/PK/FK whose name the table already
@@ -5041,6 +5151,16 @@ pub(crate) fn alter_add_constraint(
                 // forces it non-local (conislocal is always false for
                 // merged constraints on partitions).
                 ex.is_local = !part_child;
+                // v2.43: an ENFORCED local definition merging into a
+                // NOT ENFORCED inherited copy upgrades the copy to
+                // ENFORCED and marks it validated — the incoming
+                // NOT VALID flag is ignored on merge (PG19 heap.c;
+                // inherit.sql inh_check_constraint10). The reverse
+                // asymmetry was rejected above.
+                if c.enforced && !ex.enforced {
+                    ex.enforced = true;
+                    ex.not_valid = false;
+                }
                 check_merged = true;
             }
         }
@@ -5163,6 +5283,33 @@ pub(crate) fn alter_add_constraint(
                     "42703",
                     format!("column \"{}\" of relation \"{}\" does not exist", c, name),
                 ));
+            }
+        }
+        // v2.43: PG19 ATExecAddIndexConstraint funnels SET NOT NULL
+        // into every inheritance descendant for the key columns
+        // (inherit.sql inh_nn_lvl1..3: a descendant's NO INHERIT
+        // not-null blocks the whole ADD with 55000). Done before
+        // the parent's own swap so a failure leaves no partial PK.
+        {
+            let descs = inheritance_descendants(&eng.db, name);
+            for d in &descs {
+                if d == name {
+                    continue;
+                }
+                // inheritance_descendants scans raw version lists,
+                // tombstoned (dropped) tables included; skip any
+                // descendant not visible to this statement, like
+                // the other tolerant walkers do.
+                if eng
+                    .db
+                    .find_table(d, ctx.snap, &ctx.all_xids, ctx.session)
+                    .is_none()
+                {
+                    continue;
+                }
+                for c in &pk.cols {
+                    set_not_null_impl(eng, ctx, d, c, true, false, false)?;
+                }
             }
         }
         // v2.05: PG19 — ADD PRIMARY KEY implies NOT NULL on the key
@@ -5476,6 +5623,14 @@ fn set_not_null_impl(
             format!("column \"{}\" of relation \"{}\" does not exist", col, name),
         )
     })?;
+    // v2.43: PG19 checks ownership on every table the recursion
+    // touches (ATSimplePermissions in ATExecSetNotNull /
+    // ATExecDropNotNull): alice's DROP NOT NULL on inh_parent
+    // fails on bob's inh_child (42501), while bob — a member of
+    // alice's role — succeeds on both.
+    if !top {
+        super::privilege::require_table_owner(eng, ctx, name)?;
+    }
     let refnn = super::locality::ConRef::NotNull(col.to_string());
     // v2.28: PG19 ATExecDropNotNull — an identity column must stay
     // NOT NULL while it is an identity column (55000). Only the
@@ -5492,6 +5647,24 @@ fn set_not_null_impl(
         ));
     }
     if set {
+        // v2.43: PG19 ATExecSetNotNull — an existing NO INHERIT
+        // not-null constraint on the column cannot be made
+        // inheritable by SET NOT NULL (or by the ADD PRIMARY KEY /
+        // UNIQUE recursion that funnels through here); 55000 naming
+        // the constraint, at whichever level of the tree it sits.
+        if let Some(rec) = t.checks.iter().find(|c| {
+            c.kind == crate::sql::CheckKind::NotNull
+                && c.no_inherit
+                && crate::sql::check_expr_column(&c.expr).as_deref() == Some(col)
+        }) {
+            return Err(exec_err(
+                "55000",
+                format!(
+                    "cannot change NO INHERIT status of NOT NULL constraint \"{}\" on relation \"{}\"",
+                    rec.name, name
+                ),
+            ));
+        }
         if !t.not_null.get(ci).copied().unwrap_or(false) {
             for r in t
                 .rows
@@ -6460,34 +6633,17 @@ pub(crate) fn alter_rename_column_ext(
                 format!("cannot rename inherited column \"{}\"", old),
             ));
         }
-        // v1.97 (PG19 renameatt_internal): a descendant that
-        // inherits the column from MORE THAN ONE parent cannot
-        // have it renamed through just this parent (inherit.sql
-        // inht1/inhts: b arrives via both inht1 and inhs1).
-        if !only {
-            for child in &descendants {
-                let Some(ct) = eng
-                    .db
-                    .find_table(child, ctx.snap, &ctx.all_xids, ctx.session)
-                else {
-                    continue;
-                };
-                let parents_with_col = ct
-                    .inherits
-                    .iter()
-                    .filter(|p| {
-                        eng.db
-                            .find_table(p, ctx.snap, &ctx.all_xids, ctx.session)
-                            .is_some_and(|pt| pt.column_index(old).is_some())
-                    })
-                    .count();
-                if parents_with_col > 1 {
-                    return Err(exec_err(
-                        "42P16",
-                        format!("cannot rename inherited column \"{}\"", old),
-                    ));
-                }
-            }
+        // v2.43 (PG19 renameatt_internal): the attinhcount >
+        // numparents guard — a descendant whose column also
+        // arrives from OUTSIDE this hierarchy blocks the rename
+        // (inherit.sql inht1/inhs1/inhts: b arrives via both
+        // parents), while a pure diamond inside the hierarchy
+        // (inht2/inht3/inht4) renames cleanly.
+        if !only && inherited_column_blocker(eng, ctx, name, old).is_some() {
+            return Err(exec_err(
+                "42P16",
+                format!("cannot rename inherited column \"{}\"", old),
+            ));
         }
         rename_column_one_table(eng, ctx, name, old, new)?;
         if !only {
@@ -7503,6 +7659,614 @@ fn validate_check_rows(
     Ok(())
 }
 
+/// v2.43: PG19 ATExecAlterConstrInheritability — flip a NOT NULL
+/// constraint's connoinherit. Only contype 'n' constraints can change
+/// inheritability (42809 otherwise). NO INHERIT is refused on a
+/// partitioned table (0A000) and on a constraint this relation itself
+/// inherited (55000, derived coninhcount > 0). Propagation touches the
+/// immediate children only in PG, with ATExecSetNotNull recursing from
+/// there; here the whole subtree is walked directly:
+/// - to NO INHERIT: each child carrying the column's not-null keeps it
+///   but it becomes local (nn_local = true); the derived coninhcount
+///   drops on its own because the parent no longer carries it for
+///   inheritance (locality::parent_carries).
+/// - to INHERIT: each descendant lacking the not-null gains it as an
+///   inherited copy under the parent's constraint name, after the
+///   SET NOT NULL validation (23502 on NULL rows).
+
+/// v2.43: synthesize the not-null CheckDef for a flag-only column
+/// whose catalog name (<table>_<col>_not_null) is `con`, if any.
+/// An unnamed inline NOT NULL stores no record; PG still lets
+/// ALTER CONSTRAINT address it by that name.
+fn synth_nn_def(t: &Table, tname: &str, con: &str) -> Option<crate::sql::CheckDef> {
+    let bare = tname.rsplit('.').next().unwrap_or(tname);
+    for (i, (col, _)) in t.columns.iter().enumerate() {
+        if t.not_null.get(i).copied().unwrap_or(false)
+            && format!("{}_{}_not_null", bare, col) == con
+        {
+            return Some(crate::sql::CheckDef {
+                name: con.to_string(),
+                expr: crate::sql::Expr::IsNull {
+                    expr: Box::new(crate::sql::Expr::Column {
+                        table: None,
+                        name: col.clone(),
+                    }),
+                    neg: true,
+                },
+                not_valid: false,
+                kind: crate::sql::CheckKind::NotNull,
+                no_inherit: false,
+                enforced: true,
+                is_local: t.nn_local.get(i).copied().unwrap_or(true),
+            });
+        }
+    }
+    None
+}
+
+fn alter_constraint_inherit(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    name: &str,
+    t: &Table,
+    con: &str,
+    inherit: bool,
+) -> Result<ExecResult, ExecError> {
+    let not_null_err = || {
+        exec_err(
+            "42809",
+            format!(
+                "constraint \"{}\" of relation \"{}\" is not a not-null constraint",
+                con, name
+            ),
+        )
+    };
+    // The named constraint must exist on this relation (any kind).
+    let cd = t.checks.iter().find(|c| c.name == con);
+    let exists_other = t.fks.iter().any(|f| f.name == con)
+        || t.uniques.iter().any(|u| u.name == con)
+        || t.pkey.as_ref().is_some_and(|p| p.name == con);
+    let cd = match cd {
+        Some(c) if c.kind == crate::sql::CheckKind::NotNull => c.clone(),
+        Some(_) => return Err(not_null_err()),
+        None if exists_other => return Err(not_null_err()),
+        None => match synth_nn_def(t, name, con) {
+            // v2.43: an unnamed inline NOT NULL has no stored
+            // record, but PG addresses it by its catalog name
+            // (<table>_<col>_not_null) in ALTER CONSTRAINT.
+            Some(s) => s,
+            None => {
+                return Err(exec_err(
+                    "42704",
+                    format!(
+                        "constraint \"{}\" of relation \"{}\" does not exist",
+                        con, name
+                    ),
+                ));
+            }
+        },
+    };
+    let col = crate::sql::check_expr_column(&cd.expr).ok_or_else(|| {
+        exec_err(
+            "42809",
+            format!(
+                "constraint \"{}\" of relation \"{}\" is not a not-null constraint",
+                con, name
+            ),
+        )
+    })?;
+    let target_no_inherit = !inherit;
+    if target_no_inherit {
+        if t.partition.is_some() {
+            return Err(exec_err(
+                "0A000",
+                format!(
+                    "not-null constraint \"{}\" on partitioned table \"{}\" cannot be NO INHERIT",
+                    con, name
+                ),
+            ));
+        }
+        let cnt = super::locality::con_inhcount(
+            &eng.db,
+            &ctx.snap,
+            &ctx.all_xids,
+            ctx.session,
+            t,
+            &super::locality::ConRef::NotNull(col.clone()),
+        );
+        if cnt > 0 {
+            return Err(exec_err(
+                "55000",
+                format!(
+                    "cannot alter inherited constraint \"{}\" on relation \"{}\"",
+                    con, name
+                ),
+            ));
+        }
+    }
+    if cd.no_inherit == target_no_inherit {
+        return Ok(ExecResult::Command {
+            tag: "ALTER TABLE".to_string(),
+        });
+    }
+    let mut next = t.clone();
+    if let Some(c) = next
+        .checks
+        .iter_mut()
+        .find(|c| c.name == con && c.kind == crate::sql::CheckKind::NotNull)
+    {
+        c.no_inherit = target_no_inherit;
+    } else {
+        // Flag-only not-null: materialize the record so the flip
+        // has somewhere to live (PG has a real pg_constraint row).
+        let mut rec = cd.clone();
+        rec.no_inherit = target_no_inherit;
+        next.checks.push(rec);
+    }
+    alter_swap(eng, ctx, name, None, next, None)?;
+    // Immediate children (INHERITS links + partition children).
+    let mut children: Vec<String> = Vec::new();
+    for (k, vs) in eng.db.tables.iter() {
+        if vs
+            .last()
+            .is_some_and(|ct| ct.inherits.iter().any(|p| p == name))
+            && !children.contains(k)
+        {
+            children.push(k.clone());
+        }
+    }
+    if let Some(p) = t.partition.as_ref() {
+        for ch in &p.children {
+            if !children.contains(ch) {
+                children.push(ch.clone());
+            }
+        }
+    }
+    if target_no_inherit {
+        for ch in &children {
+            let Some(ct) = eng
+                .db
+                .find_table(ch, ctx.snap, &ctx.all_xids, ctx.session)
+                .cloned()
+            else {
+                continue;
+            };
+            let Some(ci) = ct.column_index(&col) else {
+                continue;
+            };
+            if !ct.not_null.get(ci).copied().unwrap_or(false) {
+                continue;
+            }
+            let mut cnext = ct.clone();
+            if cnext.nn_local.len() < cnext.columns.len() {
+                cnext.nn_local.resize(cnext.columns.len(), true);
+            }
+            cnext.nn_local[ci] = true;
+            // The stored NotNull record's own locality bit drives
+            // pg_constraint.conislocal when a named record exists.
+            for c in cnext.checks.iter_mut() {
+                if c.kind == crate::sql::CheckKind::NotNull
+                    && crate::sql::check_expr_column(&c.expr).as_deref() == Some(col.as_str())
+                {
+                    c.is_local = true;
+                }
+            }
+            alter_swap(eng, ctx, ch, None, cnext, None)?;
+        }
+    } else {
+        // Whole subtree (BFS over the same child relation).
+        let mut order: Vec<String> = children.clone();
+        let mut i = 0;
+        while i < order.len() {
+            let cur = order[i].clone();
+            i += 1;
+            for (k, vs) in eng.db.tables.iter() {
+                if vs
+                    .last()
+                    .is_some_and(|ct| ct.inherits.iter().any(|p| p == &cur))
+                    && !order.contains(k)
+                {
+                    order.push(k.clone());
+                }
+            }
+        }
+        for ch in &order {
+            let Some(ct) = eng
+                .db
+                .find_table(ch, ctx.snap, &ctx.all_xids, ctx.session)
+                .cloned()
+            else {
+                continue;
+            };
+            let Some(ci) = ct.column_index(&col) else {
+                continue;
+            };
+            if ct.not_null.get(ci).copied().unwrap_or(false) {
+                // v2.43: a descendant's own NO INHERIT not-null on
+                // this column blocks the parent's INHERIT flip
+                // (PG19 ATExecAlterConstrInheritability; inherit.sql
+                // scenario 3, inh_nn3's nn3_f1).
+                if let Some(rec) = ct.checks.iter().find(|c| {
+                    c.kind == crate::sql::CheckKind::NotNull
+                        && c.no_inherit
+                        && crate::sql::check_expr_column(&c.expr).as_deref() == Some(col.as_str())
+                }) {
+                    return Err(exec_err(
+                        "55000",
+                        format!(
+                            "cannot change NO INHERIT status of NOT NULL constraint \"{}\" on relation \"{}\"",
+                            rec.name, ch
+                        ),
+                    ));
+                }
+                // v2.43: re-inherit — a copy localized by the
+                // earlier NO INHERIT flip (the same-named record,
+                // or a flag-only nn_local copy with no record of
+                // its own) merges back into the inherited
+                // constraint: it stops being local. An independent
+                // differently-named local definition stays local.
+                let mut cnext = ct.clone();
+                let mut changed = false;
+                let rec_named = cnext
+                    .checks
+                    .iter()
+                    .any(|c| c.kind == crate::sql::CheckKind::NotNull && c.name == con);
+                let rec_other = cnext.checks.iter().any(|c| {
+                    c.kind == crate::sql::CheckKind::NotNull
+                        && c.name != con
+                        && crate::sql::check_expr_column(&c.expr).as_deref() == Some(col.as_str())
+                });
+                if cnext.nn_local.get(ci).copied().unwrap_or(false) && (rec_named || !rec_other) {
+                    if cnext.nn_local.len() < cnext.columns.len() {
+                        cnext.nn_local.resize(cnext.columns.len(), true);
+                    }
+                    cnext.nn_local[ci] = false;
+                    changed = true;
+                }
+                for c in cnext.checks.iter_mut() {
+                    if c.kind == crate::sql::CheckKind::NotNull && c.name == con && c.is_local {
+                        c.is_local = false;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    alter_swap(eng, ctx, ch, None, cnext, None)?;
+                }
+                continue;
+            }
+            // SET NOT NULL validation (PG19 ATExecSetNotNull scan).
+            let has_null = ct
+                .rows
+                .iter()
+                .filter(|rv| row_visible(rv, ctx.snap, &ctx.all_xids))
+                .any(|rv| matches!(rv.values.get(ci), Some(Value::Null) | None));
+            if has_null {
+                return Err(exec_err(
+                    "23502",
+                    format!(
+                        "column \"{}\" of relation \"{}\" contains null values",
+                        col, ch
+                    ),
+                ));
+            }
+            let mut cnext = ct.clone();
+            if cnext.not_null.len() < cnext.columns.len() {
+                cnext.not_null.resize(cnext.columns.len(), false);
+            }
+            if cnext.nn_local.len() < cnext.columns.len() {
+                cnext.nn_local.resize(cnext.columns.len(), true);
+            }
+            cnext.not_null[ci] = true;
+            cnext.nn_local[ci] = false;
+            let mut ncd = cd.clone();
+            ncd.is_local = false;
+            ncd.no_inherit = false;
+            cnext.checks.push(ncd);
+            alter_swap(eng, ctx, ch, None, cnext, None)?;
+        }
+    }
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
+/// v2.43: PG19's true attinhcount for a column: the sum over
+/// direct parents carrying the column of (their attinhcount plus
+/// one when their copy is local).
+fn recursive_att_inhcount(eng: &Engine, ctx: &StmtCtx, tname: &str, col: &str, depth: u32) -> i64 {
+    if depth > 64 {
+        return 0;
+    }
+    if eng
+        .db
+        .find_table(tname, ctx.snap, &ctx.all_xids, ctx.session)
+        .is_none()
+    {
+        return 0;
+    }
+    let mut n: i64 = 0;
+    for pname in constraint_parents(eng, ctx, tname) {
+        if let Some(pt) = eng
+            .db
+            .find_table(&pname, ctx.snap, &ctx.all_xids, ctx.session)
+        {
+            if let Some(pi) = pt.column_index(col) {
+                n += recursive_att_inhcount(eng, ctx, &pname, col, depth + 1)
+                    + i64::from(pt.att_local.get(pi).copied().unwrap_or(false));
+            }
+        }
+    }
+    n
+}
+
+/// v2.43: PG19's inherited-column guard shared by ALTER COLUMN TYPE
+/// and RENAME COLUMN (ATExecAlterColumnType / renameatt_internal):
+/// a descendant blocks the operation when its column attinhcount
+/// exceeds the number of its direct parents inside the altered
+/// table's hierarchy (find_all_inheritors' numparents) — i.e. the
+/// column also arrives from outside this hierarchy. Returns the
+/// blocking descendant's name.
+fn inherited_column_blocker(eng: &Engine, ctx: &StmtCtx, root: &str, col: &str) -> Option<String> {
+    let descendants = constraint_descendants(eng, ctx, root);
+    for child in &descendants {
+        let Some(ct) = eng
+            .db
+            .find_table(child, ctx.snap, &ctx.all_xids, ctx.session)
+        else {
+            continue;
+        };
+        if ct.column_index(col).is_none() {
+            continue;
+        }
+        let inh = recursive_att_inhcount(eng, ctx, child, col, 0);
+        let numparents = constraint_parents(eng, ctx, child)
+            .iter()
+            .filter(|p| p.as_str() == root || descendants.contains(p))
+            .count() as i64;
+        if inh > numparents {
+            return Some(child.clone());
+        }
+    }
+    None
+}
+
+/// v2.43: direct parents of `table` for constraint purposes: plain
+/// inheritance parents plus the partition parent, if any.
+fn constraint_parents(eng: &Engine, ctx: &StmtCtx, table: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(t) = eng
+        .db
+        .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+    {
+        for p in &t.inherits {
+            if !out.contains(p) {
+                out.push(p.clone());
+            }
+        }
+        if let Some(p) = t.partition.as_ref().and_then(|pi| pi.parent.clone()) {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// v2.43: every descendant relation of `table` (plain inheritance
+/// plus the partition tree), excluding `table` itself.
+fn constraint_descendants(eng: &Engine, ctx: &StmtCtx, table: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for d in inheritance_descendants(&eng.db, table) {
+        if d != table && !out.contains(&d) {
+            out.push(d);
+        }
+    }
+    for d in partition_descendants(eng, ctx, table) {
+        if !out.contains(&d) {
+            out.push(d);
+        }
+    }
+    // v2.43: session TEMP tables can sit in an inheritance tree
+    // too (inherit.sql parent1/parent2/childtab); the catalog scan
+    // above does not see them.
+    let mut frontier: Vec<String> = vec![table.to_string()];
+    frontier.extend(out.iter().cloned());
+    while let Some(cur) = frontier.pop() {
+        if let Some(tm) = eng.db.temp_tables.get(&ctx.session) {
+            for (k, t) in tm.iter() {
+                if t.inherits.iter().any(|p| p == &cur) && !out.contains(k) && !frontier.contains(k)
+                {
+                    out.push(k.clone());
+                    frontier.push(k.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn set_check_enforced(eng: &mut Engine, ctx: &StmtCtx, tname: &str, con: &str, e: bool) {
+    if let Some(tt) = eng
+        .db
+        .find_table_mut(tname, ctx.snap, &ctx.all_xids, ctx.session)
+    {
+        if let Some(cd) = tt
+            .checks
+            .iter_mut()
+            .find(|c| c.name == con && c.kind == crate::sql::CheckKind::Check)
+        {
+            cd.enforced = e;
+            // v2.43: convalidated tracks enforceability flips — a
+            // NOT ENFORCED constraint is always marked NOT VALID in
+            // PG19, and becoming ENFORCED here means the caller
+            // validated the rows.
+            cd.not_valid = !e;
+        }
+    }
+}
+
+/// v2.43: PG19 ATExecAlterCheckConstrEnforceability. `root` is the
+/// named table's current catalog row; `con` names a CHECK constraint
+/// on it. See the caller for the model summary.
+fn alter_check_enforceability(
+    eng: &mut Engine,
+    ctx: &mut StmtCtx,
+    root: &Table,
+    name: &str,
+    con: &str,
+    enforced: bool,
+    only: bool,
+) -> Result<ExecResult, ExecError> {
+    let root_cd = root
+        .checks
+        .iter()
+        .find(|c| c.name == con && c.kind == crate::sql::CheckKind::Check)
+        .cloned()
+        .expect("caller checked the constraint exists");
+    let descendants = constraint_descendants(eng, ctx, name);
+    // Descendants carrying a same-named CHECK, with their defs.
+    let mut carriers: Vec<(String, crate::sql::CheckDef)> = Vec::new();
+    if !root_cd.no_inherit {
+        for dname in &descendants {
+            if let Some(dt) = eng
+                .db
+                .find_table(dname, ctx.snap, &ctx.all_xids, ctx.session)
+            {
+                if let Some(dcd) = dt
+                    .checks
+                    .iter()
+                    .find(|c| c.name == con && c.kind == crate::sql::CheckKind::Check)
+                    .cloned()
+                {
+                    carriers.push((dname.clone(), dcd));
+                }
+            }
+        }
+    }
+    if only && !root_cd.no_inherit && !descendants.is_empty() {
+        // PG19: the flip must reach every child; ONLY refuses.
+        let mut e = exec_err(
+            "42P16",
+            "constraint must be altered on child tables too".to_string(),
+        );
+        e.hint = Some("Do not specify the ONLY keyword.".to_string());
+        return Err(e);
+    }
+    if enforced {
+        // Validate every relation whose copy is becoming enforced
+        // (root first, then descendants; a violation names the
+        // offending relation, 23514).
+        if !root_cd.enforced || root_cd.not_valid {
+            validate_check_rows(eng, ctx, root, name, &root_cd)?;
+        }
+        for (dname, dcd) in &carriers {
+            if !dcd.enforced || dcd.not_valid {
+                let dt = eng
+                    .db
+                    .find_table(dname, ctx.snap, &ctx.all_xids, ctx.session)
+                    .cloned()
+                    .expect("carrier table exists");
+                validate_check_rows(eng, ctx, &dt, dname, dcd)?;
+            }
+        }
+        set_check_enforced(eng, ctx, name, con, true);
+        for (dname, _) in &carriers {
+            set_check_enforced(eng, ctx, dname, con, true);
+        }
+    } else {
+        // A child cannot be weakened while a parent outside this
+        // ALTER remains ENFORCED (42P17).
+        for pname in constraint_parents(eng, ctx, name) {
+            let penforced = eng
+                .db
+                .find_table(&pname, ctx.snap, &ctx.all_xids, ctx.session)
+                .and_then(|pt| {
+                    pt.checks
+                        .iter()
+                        .find(|c| c.name == con && c.kind == crate::sql::CheckKind::Check)
+                        .map(|c| c.enforced)
+                })
+                .unwrap_or(false);
+            if penforced {
+                let mut e = exec_err(
+                    "42P17",
+                    format!(
+                        "cannot mark inherited constraint \"{}\" as NOT ENFORCED",
+                        con
+                    ),
+                );
+                e.detail = Some(format!(
+                    "The matching constraint on parent table \"{}\" is ENFORCED.",
+                    pname
+                ));
+                return Err(e);
+            }
+        }
+        // Flip the subtree; a descendant with another ENFORCED
+        // parent outside this ALTER keeps its enforced state
+        // (merged enforceability, PG19), and a descendant that
+        // stays enforced shields its own subtree the same way.
+        // will_flip is the memoized fixpoint over the parent DAG:
+        // a carrier flips iff no parent holds an ENFORCED copy
+        // that does not itself flip.
+        fn parent_enforced(eng: &Engine, ctx: &StmtCtx, pname: &str, con: &str) -> bool {
+            eng.db
+                .find_table(pname, ctx.snap, &ctx.all_xids, ctx.session)
+                .and_then(|pt| {
+                    pt.checks
+                        .iter()
+                        .find(|c| c.name == con && c.kind == crate::sql::CheckKind::Check)
+                        .map(|c| c.enforced)
+                })
+                .unwrap_or(false)
+        }
+        fn will_flip(
+            eng: &Engine,
+            ctx: &StmtCtx,
+            root: &str,
+            carriers: &[(String, crate::sql::CheckDef)],
+            con: &str,
+            tname: &str,
+            memo: &mut Vec<(String, bool)>,
+        ) -> bool {
+            if tname == root {
+                return true;
+            }
+            if let Some((_, v)) = memo.iter().find(|(n, _)| n == tname) {
+                return *v;
+            }
+            if !carriers.iter().any(|(n, _)| n == tname) {
+                return false;
+            }
+            // Provisional false guards against (impossible) cycles.
+            memo.push((tname.to_string(), false));
+            let blocked = constraint_parents(eng, ctx, tname).iter().any(|p| {
+                parent_enforced(eng, ctx, p, con)
+                    && !will_flip(eng, ctx, root, carriers, con, p, memo)
+            });
+            let v = !blocked;
+            if let Some(e) = memo.iter_mut().find(|(n, _)| n == tname) {
+                e.1 = v;
+            }
+            v
+        }
+        let mut memo: Vec<(String, bool)> = Vec::new();
+        let mut flipset: Vec<String> = vec![name.to_string()];
+        for (dname, _) in &carriers {
+            if will_flip(eng, ctx, name, &carriers, con, dname, &mut memo) {
+                flipset.push(dname.clone());
+            }
+        }
+        for dname in &flipset {
+            set_check_enforced(eng, ctx, dname, con, false);
+        }
+    }
+    Ok(ExecResult::Command {
+        tag: "ALTER TABLE".to_string(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn alter_alter_constraint(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -7511,12 +8275,18 @@ pub(crate) fn alter_alter_constraint(
     deferrable: Option<bool>,
     initially: Option<bool>,
     enforced: Option<bool>,
+    inherit: Option<bool>,
+    only: bool,
 ) -> Result<ExecResult, ExecError> {
     let t = eng
         .db
         .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
         .clone();
+    // v2.43: inheritability flips are a self-contained path.
+    if let Some(inh) = inherit {
+        return alter_constraint_inherit(eng, ctx, name, &t, con, inh);
+    }
     let mut next = t.clone();
     if let Some(fk) = next.fks.iter_mut().find(|f| f.name == con) {
         if let Some(d) = deferrable {
@@ -7541,7 +8311,11 @@ pub(crate) fn alter_alter_constraint(
             }
             fk.enforced = e;
         }
-    } else if let Some(cd) = next.checks.iter_mut().find(|c| c.name == con) {
+    } else if next
+        .checks
+        .iter()
+        .any(|c| c.name == con && c.kind == crate::sql::CheckKind::Check)
+    {
         if deferrable.is_some() || initially.is_some() {
             return Err(exec_err(
                 "42809",
@@ -7552,37 +8326,13 @@ pub(crate) fn alter_alter_constraint(
             ));
         }
         if let Some(e) = enforced {
-            if e && (!cd.enforced || cd.not_valid) {
-                let cd_now = cd.clone();
-                if cd_now.kind == crate::sql::CheckKind::Check {
-                    validate_check_rows(eng, ctx, &t, name, &cd_now)?;
-                    // v2.16: PG19 ATExecAlterConstraintEnforcedness
-                    // validates the whole inheritance subtree; a
-                    // violation in a descendant blocks the flip and
-                    // names that relation (23514).
-                    let descendants = inheritance_descendants(&eng.db, name);
-                    for dname in &descendants {
-                        let Some(dt) = eng
-                            .db
-                            .find_table(dname, ctx.snap, &ctx.all_xids, ctx.session)
-                            .cloned()
-                        else {
-                            continue;
-                        };
-                        if let Some(dcd) = dt
-                            .checks
-                            .iter()
-                            .find(|c| c.name == con && c.kind == crate::sql::CheckKind::Check)
-                            .cloned()
-                        {
-                            // Names the descendant relation itself.
-                            validate_check_rows(eng, ctx, &dt, dname, &dcd)?;
-                        }
-                    }
-                }
-                cd.not_valid = false;
-            }
-            cd.enforced = e;
+            // v2.43: full PG19 enforceability model
+            // (ATExecAlterCheckConstrEnforceability): the flip
+            // recurses the whole inheritance + partition subtree,
+            // validates it when becoming ENFORCED, respects
+            // NO INHERIT, and refuses ONLY / child-side weakening.
+            // It mutates the catalog directly and returns here.
+            return alter_check_enforceability(eng, ctx, &t, name, con, e, only);
         }
     } else if t.uniques.iter().any(|u| u.name == con)
         || t.pkey.as_ref().is_some_and(|p| p.name == con)

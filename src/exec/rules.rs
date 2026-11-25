@@ -2278,6 +2278,8 @@ pub(crate) fn try_fire_insert(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     table: &str,
+    // v2.43: INSERT target alias.
+    alias: &Option<String>,
     // v2.28: OVERRIDING clause of the original statement.
     overriding: Option<u8>,
     columns: &Option<Vec<InsertTarget>>,
@@ -2352,6 +2354,7 @@ pub(crate) fn try_fire_insert(
             eng,
             ctx,
             table,
+            alias,
             overriding,
             columns,
             rows,
@@ -2369,6 +2372,8 @@ fn fire_insert_impl(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
     table: &str,
+    // v2.43: INSERT target alias.
+    alias: &Option<String>,
     // v2.28: OVERRIDING of the original statement (fallback path).
     overriding: Option<u8>,
     columns: &Option<Vec<InsertTarget>>,
@@ -2396,6 +2401,7 @@ fn fire_insert_impl(
                     eng,
                     ctx,
                     table,
+                    alias,
                     overriding,
                     columns,
                     rows,
@@ -2481,6 +2487,7 @@ fn fire_insert_impl(
             eng,
             ctx,
             table,
+            &None,
             None,
             &Some(recon_columns),
             &recon_rows,
@@ -2566,6 +2573,7 @@ pub(crate) fn try_fire_update(
     where_: &Option<Expr>,
     with: &[CteDef],
     returning: &[SelectItem],
+    only: bool,
 ) -> Option<Result<ExecResult, ExecError>> {
     let rules = firing_rules(eng, &rule_key_for(eng, ctx, table), rule_event::UPDATE);
     if rules.is_empty() {
@@ -2595,7 +2603,7 @@ pub(crate) fn try_fire_update(
     }
     Some(with_rule_frame(eng, table, rule_event::UPDATE, |eng| {
         fire_update_impl(
-            eng, ctx, table, alias, sets, from, where_, with, returning, &rules,
+            eng, ctx, table, alias, sets, from, where_, with, returning, only, &rules,
         )
     }))
 }
@@ -2611,6 +2619,7 @@ fn fire_update_impl(
     where_: &Option<Expr>,
     with: &[CteDef],
     returning: &[SelectItem],
+    only: bool,
     rules: &[RuleDef],
 ) -> Result<ExecResult, ExecError> {
     let cols = rel_columns(eng, ctx, table)?;
@@ -2667,7 +2676,7 @@ fn fire_update_impl(
         None
     } else if kept.len() == n {
         Some(exec_update_inner(
-            eng, ctx, table, alias, sets, from, where_, with, returning,
+            eng, ctx, table, alias, sets, from, where_, with, returning, only,
         )?)
     } else {
         let mut cnt: u64 = 0;
@@ -2675,7 +2684,18 @@ fn fire_update_impl(
         let mut orows: Vec<Row> = Vec::new();
         for &i in &kept {
             let w = row_equality_where(eng, ctx, table, alias, &cols, &pairs[i].0);
-            let r = exec_update_inner(eng, ctx, table, alias, sets, &[], &Some(w), &[], returning)?;
+            let r = exec_update_inner(
+                eng,
+                ctx,
+                table,
+                alias,
+                sets,
+                &[],
+                &Some(w),
+                &[],
+                returning,
+                true,
+            )?;
             let (c, cc, rr) = split_dml(&r);
             cnt += c;
             if ocols.is_empty() {
@@ -2709,6 +2729,7 @@ pub(crate) fn try_fire_delete(
     where_: &Option<Expr>,
     with: &[CteDef],
     returning: &[SelectItem],
+    only: bool,
 ) -> Option<Result<ExecResult, ExecError>> {
     let rules = firing_rules(eng, &rule_key_for(eng, ctx, table), rule_event::DELETE);
     if rules.is_empty() {
@@ -2738,7 +2759,7 @@ pub(crate) fn try_fire_delete(
     }
     Some(with_rule_frame(eng, table, rule_event::DELETE, |eng| {
         fire_delete_impl(
-            eng, ctx, table, alias, using, where_, with, returning, &rules,
+            eng, ctx, table, alias, using, where_, with, returning, only, &rules,
         )
     }))
 }
@@ -2753,6 +2774,7 @@ fn fire_delete_impl(
     where_: &Option<Expr>,
     with: &[CteDef],
     returning: &[SelectItem],
+    only: bool,
     rules: &[RuleDef],
 ) -> Result<ExecResult, ExecError> {
     let base = rule_rel_key(table);
@@ -2888,7 +2910,7 @@ fn fire_delete_impl(
         None
     } else if kept.len() == n {
         Some(exec_delete_inner(
-            eng, ctx, table, alias, using, where_, with, returning,
+            eng, ctx, table, alias, using, where_, with, returning, only,
         )?)
     } else {
         let mut cnt: u64 = 0;
@@ -2896,7 +2918,7 @@ fn fire_delete_impl(
         let mut orows: Vec<Row> = Vec::new();
         for &i in &kept {
             let w = row_equality_where(eng, ctx, table, alias, &cols, &olds[i]);
-            let r = exec_delete_inner(eng, ctx, table, alias, &[], &Some(w), &[], returning)?;
+            let r = exec_delete_inner(eng, ctx, table, alias, &[], &Some(w), &[], returning, true)?;
             let (c, cc, rr) = split_dml(&r);
             cnt += c;
             if ocols.is_empty() {

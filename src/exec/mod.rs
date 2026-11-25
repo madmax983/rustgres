@@ -417,6 +417,9 @@ mod v241_agg_tests;
 #[path = "test_mods/v242_xml_tests.rs"]
 mod v242_xml_tests;
 #[cfg(test)]
+#[path = "test_mods/v243_tests.rs"]
+mod v243_tests;
+#[cfg(test)]
 #[path = "test_mods/variance_stress_tests.rs"]
 mod variance_stress_tests;
 

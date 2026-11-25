@@ -1806,6 +1806,86 @@ pub(crate) fn alter_inherit(
                 ));
             }
         }
+        // v2.43: same conflict for a flag-only parent not-null
+        // (an UNNAMED inline NOT NULL has no CheckDef record on
+        // the parent; only the not_null flag) merging into a
+        // child's NO INHERIT record.
+        for (pi, (pname, _)) in parent.columns.iter().enumerate() {
+            if parent.not_null.get(pi) != Some(&true) {
+                continue;
+            }
+            let parent_noinh = parent.checks.iter().any(|pc| {
+                pc.kind == crate::sql::CheckKind::NotNull
+                    && pc.no_inherit
+                    && crate::sql::check_expr_column(&pc.expr).as_deref() == Some(pname.as_str())
+            });
+            if parent_noinh {
+                continue;
+            }
+            if let Some(cc) = child.checks.iter().find(|cc| {
+                cc.kind == crate::sql::CheckKind::NotNull
+                    && cc.no_inherit
+                    && crate::sql::check_expr_column(&cc.expr).as_deref() == Some(pname.as_str())
+            }) {
+                return Err(exec_err(
+                    "42P17",
+                    format!(
+                        "constraint \"{}\" conflicts with non-inherited constraint on child table \"{}\"",
+                        cc.name, child_name
+                    ),
+                ));
+            }
+        }
+        // v2.43: PG19 MergeWithExistingConstraint at INHERIT time —
+        // an ENFORCED parent CHECK cannot merge into a NOT ENFORCED
+        // child copy, and a plain parent not-null cannot merge into
+        // a child's NO INHERIT not-null record (inherit.sql
+        // p1_a_check / inh_child sections).
+        for pc in &parent.checks {
+            if pc.no_inherit {
+                continue;
+            }
+            match pc.kind {
+                crate::sql::CheckKind::Check => {
+                    if !pc.enforced {
+                        continue;
+                    }
+                    let pexpr = format!("{:?}", pc.expr);
+                    if let Some(cc) = child.checks.iter().find(|cc| {
+                        cc.kind == crate::sql::CheckKind::Check
+                            && !cc.enforced
+                            && format!("{:?}", cc.expr) == pexpr
+                    }) {
+                        return Err(exec_err(
+                            "42P17",
+                            format!(
+                                "constraint \"{}\" conflicts with NOT ENFORCED constraint on child table \"{}\"",
+                                cc.name, child_name
+                            ),
+                        ));
+                    }
+                }
+                crate::sql::CheckKind::NotNull => {
+                    let Some(pcol) = crate::sql::check_expr_column(&pc.expr) else {
+                        continue;
+                    };
+                    if let Some(cc) = child.checks.iter().find(|cc| {
+                        cc.kind == crate::sql::CheckKind::NotNull
+                            && cc.no_inherit
+                            && crate::sql::check_expr_column(&cc.expr).as_deref()
+                                == Some(pcol.as_str())
+                    }) {
+                        return Err(exec_err(
+                            "42P17",
+                            format!(
+                                "constraint \"{}\" conflicts with non-inherited constraint on child table \"{}\"",
+                                cc.name, child_name
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
         let prev = child.clone();
         let mut next = child;
         next.inherits.push(parent_name.to_string());
@@ -2619,7 +2699,7 @@ pub(crate) fn apply_partition_overrides(
     }
     // Table-constraint NOT NULL elements naming columns with no
     // column element of their own (deferred by the builder).
-    for col in &ov.deferred_not_null {
+    for (col, _name, _noinh) in &ov.deferred_not_null {
         let pos = col_pos(col)?;
         not_null[pos] = true;
     }
@@ -5624,8 +5704,15 @@ pub(crate) fn create_table_from_def(
                             ));
                         }
                     }
-                    // NOT NULL accumulates across parents.
-                    if parent.not_null.get(i).copied().unwrap_or(false) {
+                    // NOT NULL accumulates across parents — except a
+                    // NO INHERIT not-null constraint on the parent,
+                    // which does not propagate (v2.43, PG19
+                    // MergeAttributes via connoinherit).
+                    if super::locality::parent_carries(
+                        parent,
+                        &super::locality::ConRef::NotNull(col.clone()),
+                        false,
+                    ) {
                         merged.not_null[pos] = true;
                     }
                     // v0.96: conflicting inherited defaults are rejected
@@ -5661,11 +5748,16 @@ pub(crate) fn create_table_from_def(
                 merged
                     .domain_elem
                     .push(parent.domain_elem.get(i).copied().unwrap_or(false));
-                merged
-                    .not_null
-                    .push(parent.not_null.get(i).copied().unwrap_or(false));
+                // v2.43: a NO INHERIT not-null on the parent does
+                // not propagate to the child (PG19 connoinherit).
+                let nn_inh = super::locality::parent_carries(
+                    parent,
+                    &super::locality::ConRef::NotNull(col.clone()),
+                    false,
+                );
+                merged.not_null.push(nn_inh);
                 // v2.27: an inherited not-null is non-local.
-                merged_nn.push(!parent.not_null.get(i).copied().unwrap_or(false));
+                merged_nn.push(!nn_inh);
                 merged_att.push(false);
                 merged.defaults.push(if parent.identity_at(i) != 0 {
                     None
@@ -5693,14 +5785,31 @@ pub(crate) fn create_table_from_def(
             // constraint arriving from two parents merges into ONE
             // entry (its derived coninhcount counts both parents).
             for pc in parent.checks.iter().filter(|c| !c.no_inherit) {
-                let dup = merged.checks.iter().any(|c| {
+                let dup_pos = merged.checks.iter().position(|c| {
                     c.name == pc.name
                         && c.kind == pc.kind
                         && format!("{:?}", c.expr) == format!("{:?}", pc.expr)
                 });
-                if !dup {
+                if let Some(pos) = dup_pos {
+                    // v2.43: the same constraint arriving from a
+                    // second parent merges (PG19
+                    // MergeWithExistingConstraint): enforceability
+                    // merges upward, never an error between parents.
+                    let ex = &mut merged.checks[pos];
+                    if pc.enforced && !ex.enforced {
+                        ex.enforced = true;
+                        ex.not_valid = false;
+                    }
+                } else {
                     let mut copy = pc.clone();
                     copy.is_local = false;
+                    // v2.43: at CREATE TABLE a constraint copy's
+                    // convalidated is its enforceability, not the
+                    // parent's validation state (PG19
+                    // transformCheckConstraints: initially_valid =
+                    // is_enforced for every constraint of the new
+                    // table).
+                    copy.not_valid = !copy.enforced;
                     merged.checks.push(copy);
                 }
             }
@@ -5879,6 +5988,37 @@ pub(crate) fn create_table_from_def(
                     && c.name == lc.name
                     && format!("{:?}", c.expr) == format!("{:?}", lc.expr)
             }) {
+                // v2.43: PG19 MergeWithExistingConstraint against an
+                // INHERITED copy (a purely local duplicate keeps the
+                // historical plain merge): a local NO INHERIT def
+                // cannot merge with an inherited copy, and a local
+                // NOT ENFORCED def cannot merge with an ENFORCED
+                // inherited copy (the p1_fail cases); the reverse
+                // upgrades the copy to ENFORCED + validated.
+                if !ex.is_local && lc.kind == crate::sql::CheckKind::Check {
+                    if lc.no_inherit {
+                        return Err(exec_err(
+                            "42P17",
+                            format!(
+                                "constraint \"{}\" conflicts with inherited constraint on relation \"{}\"",
+                                lc.name, name
+                            ),
+                        ));
+                    }
+                    if !lc.enforced && ex.enforced {
+                        return Err(exec_err(
+                            "42P17",
+                            format!(
+                                "constraint \"{}\" conflicts with NOT ENFORCED constraint on relation \"{}\"",
+                                lc.name, name
+                            ),
+                        ));
+                    }
+                    if lc.enforced && !ex.enforced {
+                        ex.enforced = true;
+                        ex.not_valid = false;
+                    }
+                }
                 ex.is_local = true;
                 continue;
             }
@@ -5923,9 +6063,53 @@ pub(crate) fn create_table_from_def(
                 .position(|(n, _)| n == c)
                 .ok_or_else(|| exec_err("42703", format!("column \"{}\" does not exist", c)))
         };
-        for c in &like_def.deferred_not_null {
+        for (c, cname, cnoinh) in &like_def.deferred_not_null {
             let i = col_pos(c)?;
             merged.not_null[i] = true;
+            // v2.43: a table-level NOT NULL naming an inherited
+            // column materializes its constraint record here (the
+            // builder deferred it); the name and NO INHERIT flag
+            // survive (PG19 StoreRelNotNull). A NO INHERIT def over
+            // an inherited not-null is an error (PG19
+            // transformCreateStmt).
+            let existing_nn = merged
+                .checks
+                .iter()
+                .find(|x| {
+                    x.kind == crate::sql::CheckKind::NotNull
+                        && crate::sql::check_expr_column(&x.expr).as_deref() == Some(c.as_str())
+                })
+                .map(|x| x.is_local);
+            if *cnoinh && existing_nn == Some(false) {
+                let mut e = exec_err(
+                    "42P17",
+                    format!(
+                        "cannot define not-null constraint with NO INHERIT on column \"{}\"",
+                        c
+                    ),
+                );
+                e.detail = Some("The column has an inherited not-null constraint.".to_string());
+                return Err(e);
+            }
+            if existing_nn.is_none() {
+                merged.checks.push(crate::sql::CheckDef {
+                    name: cname
+                        .clone()
+                        .unwrap_or_else(|| format!("{}_{}_not_null", name, c)),
+                    expr: crate::sql::Expr::IsNull {
+                        expr: Box::new(crate::sql::Expr::Column {
+                            table: None,
+                            name: c.clone(),
+                        }),
+                        neg: true,
+                    },
+                    not_valid: false,
+                    kind: crate::sql::CheckKind::NotNull,
+                    no_inherit: *cnoinh,
+                    enforced: true,
+                    is_local: true,
+                });
+            }
         }
         if let Some(pk) = &merged.pkey {
             for c in &pk.cols {

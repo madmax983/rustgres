@@ -100,9 +100,14 @@ pub(crate) fn require_table_owner(
         .db
         .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
     {
-        if t.owner != ctx.role
-            && !crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own)
-        {
+        // v2.43: PG19 ownership is membership-aware
+        // (has_privs_of_role): a role that inherits the owning
+        // role counts as owner (inherit.sql alice/bob DROP NOT
+        // NULL recursion).
+        let is_owner = crate::storage::role_closure(&eng.db, ctx.role, ctx.snap, ctx.own)
+            .iter()
+            .any(|r| r == &t.owner);
+        if !is_owner && !crate::storage::is_superuser_snap(&eng.db, ctx.role, ctx.snap, ctx.own) {
             return Err(exec_err(
                 "42501",
                 format!("permission denied: must be owner of table \"{}\"", table),
