@@ -698,6 +698,7 @@ pub(crate) fn execute_inner(
             not_null,
             default,
             base_bit_typmod,
+            base_numeric_typmod,
             collate,
         } => exec_create_domain(
             eng,
@@ -709,6 +710,7 @@ pub(crate) fn execute_inner(
             *not_null,
             default.as_ref(),
             *base_bit_typmod,
+            *base_numeric_typmod,
             collate.as_deref(),
         ),
         Stmt::DropDomain { names, if_exists } => exec_drop_domain(eng, ctx, names, *if_exists),

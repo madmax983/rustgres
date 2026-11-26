@@ -77,13 +77,16 @@ end$$;",
     assert_eq!(notices, vec!["x = 1, y = 8".to_string()]);
 }
 
-/// v1.02: %-format edge cases — `%%` escape, missing args (kept
-/// literally), extra args (ignored), no-arg format, NULL arg.
-/// PG19 would raise on arity mismatch (pl_gram.y
-/// `check_raise_parameters`); the shared evaluator stays total by
-/// design (documented deviation, same as the v1.00 trigger
-/// bodies). PG renders NULL params as `<NULL>`; the shared
-/// text-cast renders them empty (same deviation).
+/// v1.02: %-format edge cases — `%%` escape, no-arg format,
+/// NULL arg.
+/// PG renders NULL params as `<NULL>`; the shared text-cast
+/// renders them empty (documented deviation).
+/// v2.45: the v1.02 arity deviation is RETIRED — PG19's
+/// pl_gram.y `check_raise_parameters` rejects a literal-format
+/// RAISE whose placeholder count differs from its argument
+/// count at CREATE time (42601, both directions), and the
+/// vendored plpgsql suite pins that; the parser now does the
+/// same, so the mismatch cases assert the CREATE failure.
 #[test]
 fn raise_notice_format_edges() {
     let mut eng = engine();
@@ -92,8 +95,6 @@ fn raise_notice_format_edges() {
         "create function fmt102(x int, y int) returns int volatile language plpgsql as $$
 begin
   raise notice '100%% sure: %', x;
-  raise notice 'missing: % and %', x;
-  raise notice 'extra: %', x, y;
   raise notice 'plain';
   raise notice 'null: %', null;
   return x;
@@ -107,11 +108,36 @@ end$$;",
         notices,
         vec![
             "100% sure: 5".to_string(),
-            "missing: 5 and %".to_string(),
-            "extra: 5".to_string(),
             "plain".to_string(),
             "null: ".to_string(),
         ]
+    );
+    // PG19 check_raise_parameters: too few / too many are both
+    // 42601 at CREATE.
+    let (r, _) = run_n(
+        &mut eng,
+        "create function fmt_few(x int) returns int volatile language plpgsql as $$
+begin
+  raise notice 'missing: % and %', x;
+  return x;
+end$$;",
+    );
+    let e = r.unwrap_err();
+    assert_eq!(e.code, "42601");
+    assert!(e.message.contains("too few parameters specified for RAISE"));
+    let (r, _) = run_n(
+        &mut eng,
+        "create function fmt_many(x int, y int) returns int volatile language plpgsql as $$
+begin
+  raise notice 'extra: %', x, y;
+  return x;
+end$$;",
+    );
+    let e = r.unwrap_err();
+    assert_eq!(e.code, "42601");
+    assert!(
+        e.message
+            .contains("too many parameters specified for RAISE")
     );
     // Direct evaluator checks (same shared fn the trigger path uses).
     assert_eq!(

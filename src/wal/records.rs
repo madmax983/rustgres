@@ -158,8 +158,10 @@ pub enum WalRecord {
         name: String,
         columns: Vec<(String, ColType)>,
         constraints: String,
-        /// True for pure-metadata alters: replay copies the old version's
-        /// rows. False for ADD/DROP COLUMN: rows are rewritten and flow
+        /// True for pure-metadata alters: replay moves the old version's
+        /// rows into the new version (the superseded version is left
+        /// empty, exactly as the live alter_swap leaves it — v2.45).
+        /// False for ADD/DROP COLUMN: rows are rewritten and flow
         /// through InsertRows records instead.
         copy_rows: bool,
         /// v0.11: owner and ACL travel with every alter (grants and

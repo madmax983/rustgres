@@ -6165,6 +6165,12 @@ pub struct DomainDef {
     /// it and check_domain_value enforces it. (Not yet carried by
     /// the WAL type record.)
     pub bit_typmod: Option<(i32, bool)>,
+    /// v2.45: numeric(p,s) typmod of the base type — or of its
+    /// element type when the domain is over `numeric(p,s)[]` (the
+    /// array ColType is typmod-free, so the domain carries it and
+    /// check_domain_value enforces it, like bit_typmod).
+    /// Runtime-only (same durability class as `bit_typmod`).
+    pub numeric_typmod: Option<(u32, i32)>,
     /// v2.21: the domain's own collation (`CREATE DOMAIN ... AS text
     /// COLLATE name`); columns of this domain type inherit it unless
     /// they carry an explicit COLLATE. Runtime-only in v2.21 (same
@@ -6259,6 +6265,11 @@ pub struct FuncDef {
     /// 3 VARIADIC). May be shorter than `arg_types` for definitions
     /// built by older code paths; missing entries mean IN.
     pub arg_modes: Vec<u8>,
+    /// v2.45: COMMENT ON FUNCTION text (pg_description), read back
+    /// via obj_description(oid, 'pg_proc'). In-memory like
+    /// db_comment: COMMENT statements are not WAL-logged in this
+    /// engine, so a comment does not survive a checkpoint.
+    pub comment: Option<String>,
 }
 
 impl FuncDef {

@@ -1342,6 +1342,16 @@ pub(crate) fn eval_srf_call(
             unnest_record_elem_fields(q.eng, q.snap, q.own, q.session, &args[0])
         {
             fields.into_iter().map(|(_, t)| t).collect::<Vec<ColType>>()
+        } else if let Some(types) = unnest_value_record_types(&arg_vals[0]) {
+            // v2.45: the static field lookup missed (the argument
+            // expression was rewritten past CastNamed recognition —
+            // the UPDATE ... FROM path does this), but the evaluated
+            // array's record elements carry the same fields
+            // eval_table_function named the columns from. Derive
+            // the types from the value so names and types agree
+            // (previously this shape hit the names/types arity
+            // debug_assert and killed the connection thread).
+            types
         } else {
             let elem_ty = match &arg_vals[0] {
                 Value::Array(a) => elem_scalar_type(a.elem),
@@ -2683,6 +2693,22 @@ fn expr_named_type(
 /// its composite element type when the argument is an array of a
 /// named composite (PG expands unnest of a record array to the
 /// composite's columns).
+/// v2.45: the field types of an evaluated array-of-records value
+/// (first non-null record element), mirroring how
+/// eval_table_function derives the column NAMES for unnest of a
+/// record array. Fallback for when the argument expression's static
+/// named-type lookup misses.
+fn unnest_value_record_types(v: &Value) -> Option<Vec<ColType>> {
+    let Value::Array(a) = v else {
+        return None;
+    };
+    let rec = a.elems.iter().find_map(|e| match e {
+        Value::Record(fs) => Some(fs),
+        _ => None,
+    })?;
+    Some(rec.iter().map(|(_, fv)| fv.col_type()).collect())
+}
+
 fn unnest_record_elem_fields(
     eng: &Engine,
     snap: &Snapshot,

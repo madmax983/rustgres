@@ -4141,7 +4141,7 @@ fn condition_name_for_sqlstate(code: &str) -> Option<&'static str> {
 /// NEW first, the v1.00 behavior) plus the TG_* variables.
 pub(crate) fn eval_trigger_expr(
     eng: &mut Engine,
-    ctx: &StmtCtx,
+    ctx: &mut StmtCtx,
     tctx: &TrigCtx,
     cols: &[(String, ColType)],
     new_row: &[Value],
@@ -4330,7 +4330,18 @@ pub(crate) fn eval_trigger_expr(
         plan_fold_memo: Rc::new(RefCell::new(HashMap::new())),
         hashed_in: Rc::new(RefCell::new(Vec::new())),
         pending_updates: None,
-        write: None,
+        // v2.45: trigger expressions run in the firing statement's
+        // transaction with full SPI (PG19 trigger.c/pl_exec.c): a
+        // function called from a trigger body may itself execute
+        // DML through exec_plpgsql_stmt, which requires the write
+        // context (previously write: None -> 0A000 for every
+        // tg_backlink_set-style helper call).
+        write: Some(qwrite_from_ctx(
+            &mut ctx.writes,
+            ctx.write_xid,
+            ctx.level,
+            ctx.default_toast_compression,
+        )),
     };
     let scope_new = Scope {
         schema: &schema_new,
@@ -4350,7 +4361,7 @@ pub(crate) fn eval_trigger_expr(
 /// NULL counts as false). No WHEN = always fire.
 pub(crate) fn trigger_when_matches(
     eng: &mut Engine,
-    ctx: &StmtCtx,
+    ctx: &mut StmtCtx,
     tctx: &TrigCtx,
     cols: &[(String, ColType)],
     new_row: Option<&[Value]>,

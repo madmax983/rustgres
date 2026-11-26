@@ -1885,6 +1885,125 @@ pub(crate) fn unnest_rows(v: &Value) -> Result<Vec<Value>, ExecError> {
 /// of its text form, so `int4in`-style 22P02 errors surface intact).
 /// Multidimensional input must have matching dims (22P02); malformed
 /// input is 22P02 `malformed array literal: "<string>"`.
+/// v2.45: parse an anonymous record literal in PG19 `record_in`
+/// format — `(f1,f2,...)` with double-quoted fields when they carry
+/// specials — into a `Value::Record` with fields named f1..fn.
+/// Field types are inferred from the literal spelling (integer ->
+/// int, decimal -> float8, true/false -> bool, otherwise text);
+/// an empty field is NULL. This is the element path for record[]
+/// values that round-trip through their text form (array parameter
+/// substitution, array literals of records).
+pub(crate) fn parse_anonymous_record(s: &str) -> Result<Value, ExecError> {
+    let bad = || {
+        exec_err(
+            "22P02",
+            format!("invalid input syntax for type record: {:?}", s),
+        )
+    };
+    let t = s.trim();
+    let inner = t
+        .strip_prefix('(')
+        .and_then(|x| x.strip_suffix(')'))
+        .ok_or_else(bad)?;
+    let bytes = inner.as_bytes();
+    let mut fields: Vec<(String, Value)> = Vec::new();
+    let mut i = 0usize;
+    let mut idx = 0usize;
+    // Split at top-level commas; a field may be double-quoted.
+    loop {
+        idx += 1;
+        // Skip field-leading whitespace (record_in ignores it around
+        // unquoted fields).
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        let (text, quoted) = if i < bytes.len() && bytes[i] == b'"' {
+            i += 1;
+            let mut out = String::new();
+            let mut closed = false;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'"' => {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                            out.push('"');
+                            i += 2;
+                        } else {
+                            i += 1;
+                            closed = true;
+                            break;
+                        }
+                    }
+                    b'\\'
+                        if i + 1 < bytes.len()
+                            && (bytes[i + 1] == b'"' || bytes[i + 1] == b'\\') =>
+                    {
+                        out.push(bytes[i + 1] as char);
+                        i += 2;
+                    }
+                    c => {
+                        out.push(c as char);
+                        i += 1;
+                    }
+                }
+            }
+            if !closed {
+                return Err(bad());
+            }
+            (out, true)
+        } else {
+            let start = i;
+            while i < bytes.len() && bytes[i] != b',' {
+                i += 1;
+            }
+            (inner[start..i].trim().to_string(), false)
+        };
+        // After a quoted field, only whitespace then ',' or end.
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        let val = if !quoted && text.is_empty() {
+            Value::Null
+        } else if quoted {
+            Value::Text(text.into())
+        } else if let Ok(n) = text.parse::<i32>() {
+            Value::Int(n as i64)
+        } else if let Ok(n) = text.parse::<i64>() {
+            Value::BigInt(n)
+        } else if text.eq_ignore_ascii_case("true") {
+            Value::Bool(true)
+        } else if text.eq_ignore_ascii_case("false") {
+            Value::Bool(false)
+        } else if text.parse::<f64>().is_ok()
+            && text.chars().any(|c| c.is_ascii_digit())
+            && text
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '+' | '-'))
+        {
+            Value::Float(text.parse::<f64>().unwrap())
+        } else {
+            Value::Text(text.into())
+        };
+        fields.push((format!("f{}", idx), val));
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] != b',' {
+            return Err(bad());
+        }
+        i += 1;
+        if i >= bytes.len() {
+            // Trailing comma: one more empty (NULL) field.
+            idx += 1;
+            fields.push((format!("f{}", idx), Value::Null));
+            break;
+        }
+    }
+    if inner.is_empty() {
+        fields.clear();
+    }
+    Ok(Value::Record(fields))
+}
+
 pub(crate) fn parse_array_literal(
     s: &str,
     elem: crate::storage::ArrayElem,

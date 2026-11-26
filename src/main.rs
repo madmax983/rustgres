@@ -125,9 +125,32 @@ fn main() {
                 }
                 let engine = Arc::clone(&engine);
                 let wal = Arc::clone(&wal);
-                handlers.push(std::thread::spawn(move || {
-                    server::handle_connection(stream, engine, wal)
-                }));
+                // v2.45: connection threads get a large (virtual)
+                // stack: expression/function evaluation is deeply
+                // recursive, and the default 2 MiB thread stack let
+                // a depth-10 mutually recursive function pair
+                // (plpgsql recurse <-> SQL sql_recurse in the PG19
+                // plpgsql suite) overflow the stack and abort the
+                // whole server. PG19 survives via small frames plus
+                // a stack-depth check; here the headroom is paired
+                // with the 54001 depth guard in call_user_function.
+                // 128 MiB, not more: the stack is VIRTUAL, but a
+                // capped address space (the conformance runner's
+                // 8 GiB RLIMIT_AS) fits only ~16 threads at
+                // 512 MiB — a spawn failure there killed the whole
+                // server mid-schedule. 128 MiB still leaves ~250 KB
+                // per frame at the depth-500 guard, and a failed
+                // spawn now refuses just this connection (PG-like)
+                // instead of panicking the listener.
+                match std::thread::Builder::new()
+                    .stack_size(128 * 1024 * 1024)
+                    .spawn(move || server::handle_connection(stream, engine, wal))
+                {
+                    Ok(h) => handlers.push(h),
+                    Err(e) => {
+                        eprintln!("spawn connection thread failed: {e}; refusing connection");
+                    }
+                }
                 served += 1;
                 if max_conn.is_some_and(|m| served >= m) {
                     break;

@@ -85,19 +85,35 @@ pub(crate) fn coerce_text_numeric(
 
 /// v0.21: Postgres float range checks on an arithmetic result `r`
 /// computed from `x`, `y`: an infinite result from finite inputs is
-/// 22003 (overflow); an exact-zero result from nonzero inputs is 22003
-/// (underflow). Infinities propagate per IEEE when an input was
+/// 22003 (overflow). Infinities propagate per IEEE when an input was
 /// infinite.
-pub(crate) fn check_float_arith(r: f64, x: f64, y: f64, ty: &'static str) -> Result<(), ExecError> {
+/// v2.45: the underflow-to-zero check applies ONLY to multiplication
+/// and division (PG19 float.h: float4/8_mul and float4/8_div check
+/// `result == 0 && inputs nonzero`; float4/8_pl and float4/8_mi check
+/// overflow only). Applying it to subtraction made exact cancellation
+/// (1.0 - 1.0 = 0) raise a bogus 22003.
+pub(crate) fn check_float_arith(
+    op: ArithOp,
+    r: f64,
+    x: f64,
+    y: f64,
+    ty: &'static str,
+) -> Result<(), ExecError> {
     if r.is_infinite() && x.is_finite() && y.is_finite() {
         return Err(exec_err(
             "22003",
             format!("value out of range for type {}", ty),
         ));
     }
-    // v0.21: underflow to zero from finite nonzero inputs (e.g. 1e-30^2 in
+    // Underflow to zero from finite nonzero inputs (e.g. 1e-30^2 in
     // float4). Infinite inputs legitimately produce zero (42/inf = 0).
-    if r == 0.0 && x != 0.0 && y != 0.0 && x.is_finite() && y.is_finite() {
+    if matches!(op, ArithOp::Mul | ArithOp::Div)
+        && r == 0.0
+        && x != 0.0
+        && y != 0.0
+        && x.is_finite()
+        && y.is_finite()
+    {
         return Err(exec_err(
             "22003",
             format!("value out of range for type {}", ty),
@@ -806,7 +822,7 @@ pub(crate) fn eval_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, Exe
                         unreachable!("bitwise ops return early via eval_bitwise")
                     }
                 };
-                check_float_arith(f64::from(r), f64::from(xf), f64::from(yf), "real")?;
+                check_float_arith(op, f64::from(r), f64::from(xf), f64::from(yf), "real")?;
                 Ok(Value::Float4(r))
             } else {
                 let r = match op {
@@ -824,7 +840,7 @@ pub(crate) fn eval_arith(op: ArithOp, a: &Value, b: &Value) -> Result<Value, Exe
                         unreachable!("bitwise ops return early via eval_bitwise")
                     }
                 };
-                check_float_arith(r, x, y, "double precision")?;
+                check_float_arith(op, r, x, y, "double precision")?;
                 Ok(Value::Float(r))
             }
         }

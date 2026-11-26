@@ -1850,6 +1850,8 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 // v1.92: the WAL domain record does not carry the
                 // bit typmod yet (bounded durability gap).
                 bit_typmod: None,
+                // v2.45: nor the numeric typmod (same gap class).
+                numeric_typmod: None,
                 // v2.21: nor the domain collation (same gap class).
                 collation: None,
                 // v2.40: nor the declared array-base shape.
@@ -1932,6 +1934,7 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
             }
             let (parsed, plpgsql) = crate::exec::rebuild_function_bodies(
                 lang,
+                &name,
                 &arg_names,
                 &arg_modes,
                 &body,
@@ -1956,6 +1959,7 @@ pub(crate) fn load_checkpoint(dir: &Path) -> std::io::Result<(Engine, u64)> {
                 is_procedure,
                 table_cols,
                 arg_modes,
+                comment: None,
             });
         }
         eng.db.functions.insert(name, overloads);

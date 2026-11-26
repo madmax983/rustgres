@@ -94,16 +94,32 @@ fn v212_cursor_open_fetch_move_close() {
          END $$ LANGUAGE plpgsql",
     );
     assert_eq!(rows(&mut eng, "SELECT fc212()"), vec![vec!["1213"]]);
-    // NO SCROLL cursor rejects a backward fetch with 55000.
+    // Explicit NO SCROLL cursor rejects a backward fetch with 55000.
     ok(
         &mut eng,
         "CREATE FUNCTION fc212b() RETURNS int AS $$
-         DECLARE c cursor for select a from rc212 order by a; r record;
+         DECLARE c no scroll cursor for select a from rc212 order by a; r record;
          BEGIN
            open c; fetch c into r; fetch prior from c into r; return r.a;
          END $$ LANGUAGE plpgsql",
     );
     assert_eq!(err_code(&mut eng, "SELECT fc212b()"), "55000");
+    // v2.45: an UNSPECIFIED scroll option follows PG19's
+    // planner-decided rule — this engine materializes every
+    // portal, so the portal can scan backward (the plpgsql
+    // suite's sc_test pins exactly this: bound cursor, no SCROLL
+    // spec, MOVE FORWARD ALL + FETCH BACKWARD). Before v2.45 the
+    // unspecified case defaulted to NO SCROLL (the old fc212b
+    // expectation above).
+    ok(
+        &mut eng,
+        "CREATE FUNCTION fc212b2() RETURNS int AS $$
+         DECLARE c cursor for select a from rc212 order by a; r record;
+         BEGIN
+           open c; fetch c into r; fetch c into r; fetch prior from c into r; return r.a;
+         END $$ LANGUAGE plpgsql",
+    );
+    assert_eq!(rows(&mut eng, "SELECT fc212b2()"), vec![vec!["1"]]);
     // Fetching past the end sets FOUND false and NULLs the target.
     ok(
         &mut eng,

@@ -1877,6 +1877,7 @@ pub(crate) fn exec_create_domain(
     not_null: bool,
     default: Option<&DefaultExpr>,
     base_bit_typmod: Option<(i32, bool)>,
+    base_numeric_typmod: Option<(u32, i32)>,
     collate: Option<&str>,
 ) -> Result<ExecResult, ExecError> {
     if eng.db.types.contains_key(name) {
@@ -1946,16 +1947,32 @@ pub(crate) fn exec_create_domain(
             }
         },
     };
-    // Array-of-domain bases (`CREATE DOMAIN d AS e[]` with `e` a domain)
-    // are not supported yet — honest 0A000 instead of mis-checking.
-    if matches!(base_ty, ColType::Array(_)) && base_named.is_some() {
-        return Err(exec_err(
-            "0A000",
-            format!(
-                "domain over array of domain \"{}\" is not supported yet",
-                name
-            ),
-        ));
+    // Array-of-domain bases are supported through the base_domain
+    // check chain (v2.40's array_base machinery covers `d AS e[]`
+    // for a scalar-based domain e, and v2.45's chained coercion
+    // covers a domain over a domain-over-array like `mynums2 AS
+    // mynums`). The one shape that still mis-checks is an array OF
+    // a domain whose own base is an array (`d AS mynums[]`) — the
+    // flattening loses the outer array wrapper — so that one keeps
+    // the honest 0A000.
+    if matches!(base, ColType::Array(_)) {
+        if let Some(bn) = base_named {
+            let inner_is_array_domain = eng
+                .db
+                .find_type(bn)
+                .and_then(|st| st.domain.as_ref())
+                .map(|inner| matches!(inner.base, ColType::Array(_)))
+                .unwrap_or(false);
+            if inner_is_array_domain {
+                return Err(exec_err(
+                    "0A000",
+                    format!(
+                        "domain over array of domain \"{}\" is not supported yet",
+                        name
+                    ),
+                ));
+            }
+        }
     }
     // PG19: domain CHECK expressions may only reference VALUE.
     for c in checks {
@@ -1973,6 +1990,14 @@ pub(crate) fn exec_create_domain(
             }
         }
     }
+    // v2.45: numeric base typmod for the DomainDef, suppressed for
+    // domain-over-domain (the inner domain's own typmod governs
+    // through the chained check in check_domain_value).
+    let domain_numeric_typmod = if base_domain.is_some() {
+        None
+    } else {
+        base_numeric_typmod
+    };
     eng.db.types.insert(
         name.to_string(),
         ShellType {
@@ -1987,6 +2012,7 @@ pub(crate) fn exec_create_domain(
                 not_null,
                 default: default.cloned(),
                 bit_typmod: base_bit_typmod,
+                numeric_typmod: domain_numeric_typmod,
                 // v2.21: runtime-only (not carried by the WAL
                 // record), like the other post-hoc fields.
                 collation: collate.map(|s| s.to_string()),

@@ -1370,6 +1370,18 @@ pub(crate) fn subst_expr(e: &mut Expr, params: &[Option<Value>]) -> Result<(), E
                         written: None,
                     };
                 }
+                // v2.45: a bpchar parameter substitutes as a bpchar
+                // cast of its padded text, so comparisons against it
+                // keep bpchar's trailing-space-insensitive semantics
+                // (a bare text literal would compare bytewise and
+                // `charvar = ''` would never fire inside plpgsql).
+                Some(Some(Value::BpChar(s))) => {
+                    *e = Expr::Cast {
+                        expr: Box::new(Expr::Literal(Literal::Text(s.clone()))),
+                        to: ColType::Char(None),
+                        written: None,
+                    };
+                }
                 _ => {
                     *e = Expr::Literal(param_literal(*p, params)?);
                 }

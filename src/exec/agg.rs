@@ -4877,6 +4877,16 @@ pub(crate) fn value_literal_expr(v: &Value) -> Expr {
                     .collect(),
             );
         }
+        // v2.45: a bpchar value literalizes as a bpchar cast of its
+        // padded text (see subst_params): plain text would lose
+        // bpchar comparison semantics for record fields / params.
+        Value::BpChar(s) => {
+            return Expr::Cast {
+                expr: Box::new(Expr::Literal(Literal::Text(s.clone()))),
+                to: ColType::Char(None),
+                written: None,
+            };
+        }
         _ => {}
     }
     let lit = match v {

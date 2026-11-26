@@ -18,6 +18,11 @@ pub(crate) struct Parser {
     /// carries no typmod, so RETURNING specs and JSON_TABLE columns
     /// read it from here.
     pub(crate) last_bit_typmod: Option<(i32, bool)>,
+    /// v2.45: the (precision, scale) typmod of the most recent
+    /// numeric/decimal type name parsed by parse_type_name_rest —
+    /// read by CREATE DOMAIN, whose array base (`numeric(4,2)[1]`)
+    /// drops the typmod from the ColType entirely.
+    pub(crate) last_numeric_typmod: Option<(u32, i32)>,
     /// v2.37: `SELECT ... INTO name` captured by parse_select_core
     /// (the INTO clause sits between the target list and FROM, deep
     /// inside query parsing); parse_top_kw converts the statement
@@ -1352,6 +1357,8 @@ impl Parser {
         // v1.92: reset the bit-typmod side channel; the bit/varbit
         // arms below set it when they consume a `(n)`.
         self.last_bit_typmod = None;
+        // v2.45: same reset for the numeric-typmod side channel.
+        self.last_numeric_typmod = None;
         let base: ColType = match name.as_str() {
             "int" | "integer" => Ok(ColType::Int),
             // v0.14: PostgreSQL internal alias names (pg_regress conformance).
@@ -1505,6 +1512,9 @@ impl Parser {
                     self.expect(Token::RParen, "')'")?;
                     typmod = Some((precision as u32, scale as i32));
                 }
+                // v2.45: side-channel for CREATE DOMAIN (an array
+                // base loses the typmod from the ColType).
+                self.last_numeric_typmod = typmod;
                 Ok(ColType::Numeric(typmod))
             }
             "bool" | "boolean" => Ok(ColType::Bool),
@@ -2497,6 +2507,12 @@ impl Parser {
         // recognized parameters (fillfactor range) and records them.
         if self.eat_keyword("with") {
             def.reloptions = self.parse_reloptions()?;
+        }
+        // v2.45: `WITHOUT OIDS` — PG19 still accepts it as a no-op
+        // (gram.y OptWith; OIDs were removed in PG12, so there is
+        // nothing to store).
+        if self.eat_keyword("without") {
+            self.expect_keyword("oids")?;
         }
         // v0.69: `PARTITION BY ...` after the column list.
         if matches!(self.peek(), Token::Ident(s) if s == "partition") {
@@ -5956,17 +5972,24 @@ impl Parser {
         // v2.04: a bare array type (`text[]` with no arg name, as in
         // DROP FUNCTION f(text[], text)) — the `[` suffix belongs to
         // the type word, so this is a bare type, not a named arg.
+        // v2.45: a dotted or %-suffixed first token is likewise a
+        // bare type (`partitioned_table.a%type` has no arg name).
         let bare_array = *self.peek() == Token::LBracket;
         let bare_type = matches!(self.peek(), Token::Comma | Token::RParen)
             || (w1 == "double" && matches!(self.peek(), Token::Ident(s) if s == "precision"))
-            || bare_array;
+            || bare_array
+            || *self.peek() == Token::Dot
+            || *self.peek() == Token::Percent;
         let mut arg = if bare_type {
-            let mut type_name = if w1 == "double" {
-                self.next(); // 'precision'
-                "double precision".to_string()
-            } else {
-                w1
-            };
+            let mut type_name =
+                if w1 == "double" && matches!(self.peek(), Token::Ident(s) if s == "precision") {
+                    self.next(); // 'precision'
+                    "double precision".to_string()
+                } else if *self.peek() == Token::Dot || *self.peek() == Token::Percent {
+                    self.parse_func_type_rest(w1)?
+                } else {
+                    w1
+                };
             while *self.peek() == Token::LBracket {
                 self.next(); // '['
                 if *self.peek() != Token::RBracket {
@@ -6011,13 +6034,40 @@ impl Parser {
     /// takes a `text[]` argument, and PG19 accepts array-typed
     /// function arguments generally.
     pub(crate) fn parse_func_type_name(&mut self) -> Result<String, SqlError> {
-        let mut name = self.expect_ident()?;
+        let first = self.expect_ident()?;
+        self.parse_func_type_rest(first)
+    }
+
+    /// v2.45: continue a function-signature type name whose first
+    /// identifier was already read: dotted components (schema.table,
+    /// schema.table.column), a `%TYPE` / `%ROWTYPE` suffix (PG19
+    /// `Typename` with a pct_type), and `[]` array suffixes.
+    pub(crate) fn parse_func_type_rest(&mut self, first: String) -> Result<String, SqlError> {
+        let mut name = first;
         // v2.35: keep the schema qualifier (types/functions store
         // dotted names; resolvers strip pg_catalog. themselves).
-        if *self.peek() == Token::Dot && matches!(self.peek2(), Token::Ident(_)) {
-            self.next(); // '.'
-            let bare = self.expect_ident()?;
-            name = format!("{}.{}", name, bare);
+        for _ in 0..2 {
+            if *self.peek() == Token::Dot && matches!(self.peek2(), Token::Ident(_)) {
+                self.next(); // '.'
+                let bare = self.expect_ident()?;
+                name = format!("{}.{}", name, bare);
+            } else {
+                break;
+            }
+        }
+        if *self.peek() == Token::Percent {
+            self.next(); // '%'
+            let kw = self.expect_ident()?;
+            match kw.to_ascii_lowercase().as_str() {
+                "type" => name.push_str("%type"),
+                "rowtype" => name.push_str("%rowtype"),
+                _ => {
+                    return Err(err(format!(
+                        "syntax error: expected TYPE or ROWTYPE after %, found {}",
+                        kw
+                    )));
+                }
+            }
         }
         while *self.peek() == Token::LBracket {
             self.next(); // '['
@@ -8393,6 +8443,7 @@ impl Parser {
             unnamed_seq: 0,
             allow_similar_to: true,
             last_bit_typmod: None,
+            last_numeric_typmod: None,
             select_into: None,
         };
         if let Ok(mut e) = ep.parse_or() {
@@ -8526,6 +8577,11 @@ impl Parser {
                 Token::Ident(s) if s == "notice" => RaiseLevel::Notice,
                 Token::Ident(s) if s == "exception" => RaiseLevel::Exception,
                 Token::Ident(s) if s == "warning" => RaiseLevel::Warning,
+                // v2.45: PG19 trigger bodies are full plpgsql; the
+                // remaining RAISE levels are legal there. INFO/LOG/
+                // DEBUG ride the notice channel (the wire protocol
+                // has one NoticeResponse path here).
+                Token::Ident(s) if s == "info" || s == "log" || s == "debug" => RaiseLevel::Notice,
                 other => {
                     return Err(SqlError {
                         message: format!(
@@ -9632,6 +9688,13 @@ impl Parser {
         } else {
             None
         };
+        // v2.45: same capture for a numeric base — scalar bases
+        // carry it in the ColType, array bases lose it entirely.
+        let base_numeric_typmod = match &base {
+            ColType::Numeric(tm) => *tm,
+            ColType::Array(crate::storage::ArrayElem::Numeric) => self.last_numeric_typmod,
+            _ => None,
+        };
         let mut checks = Vec::new();
         let mut not_null = false;
         let mut default = None;
@@ -9715,6 +9778,7 @@ impl Parser {
             not_null,
             default,
             base_bit_typmod,
+            base_numeric_typmod,
             collate,
         })
     }
@@ -22325,6 +22389,7 @@ pub(crate) fn expr_from_tokens(toks: &[Token]) -> Result<Expr, SqlError> {
         unnamed_seq: 0,
         allow_similar_to: true,
         last_bit_typmod: None,
+        last_numeric_typmod: None,
         select_into: None,
     };
     let e = p.parse_or()?;
@@ -22573,6 +22638,7 @@ pub(crate) fn parse_statement_inner(text: &str) -> Result<Stmt, SqlError> {
         unnamed_seq: 0,
         allow_similar_to: true,
         last_bit_typmod: None,
+        last_numeric_typmod: None,
         select_into: None,
     };
     let stmt = p.parse_top()?;
@@ -22684,6 +22750,7 @@ pub(crate) fn parse_expr_str(text: &str) -> Result<Expr, SqlError> {
         unnamed_seq: 0,
         allow_similar_to: true,
         last_bit_typmod: None,
+        last_numeric_typmod: None,
         select_into: None,
     };
     p.parse_or()
@@ -23874,6 +23941,7 @@ pub(crate) fn coltype_from_sql_spelling(name: &str) -> Result<ColType, String> {
         unnamed_seq: 0,
         allow_similar_to: true,
         last_bit_typmod: None,
+        last_numeric_typmod: None,
         select_into: None,
     };
     let (ty, named) = p
@@ -23886,6 +23954,11 @@ pub(crate) fn coltype_from_sql_spelling(name: &str) -> Result<ColType, String> {
 }
 
 pub(crate) fn coltype_by_name(name: &str) -> Result<ColType, String> {
+    // v2.45: PG folds unquoted type names to lowercase; callers hand
+    // us the name as written (e.g. a plpgsql `INTEGER` declaration),
+    // so normalize before matching the builtin spellings.
+    let lowered = name.trim().to_ascii_lowercase();
+    let name = lowered.as_str();
     Ok(match name {
         "integer" | "int" | "int4" => ColType::Int,
         "bigint" | "int8" => ColType::BigInt,

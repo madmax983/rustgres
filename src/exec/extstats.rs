@@ -28,6 +28,7 @@ pub(crate) fn parse_stat_expr(text: &str) -> Result<Expr, ExecError> {
         unnamed_seq: 0,
         allow_similar_to: true,
         last_bit_typmod: None,
+        last_numeric_typmod: None,
         select_into: None,
     };
     let e = p

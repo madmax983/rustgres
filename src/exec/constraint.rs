@@ -151,10 +151,15 @@ pub(crate) fn check_domain_value(
                         }
                     }
                 }
-                for e in &a.elems {
-                    check_domain_value(q, dname, e, false)?;
+                // v2.45: keep each element's coerced value (a
+                // typmod-carrying domain transforms its elements;
+                // the checked-but-uncoerced array is not PG's
+                // result).
+                let mut a2 = (**a).clone();
+                for (slot, e) in a2.elems.iter_mut().zip(a.elems.iter()) {
+                    *slot = check_domain_value(q, dname, e, false)?;
                 }
-                return Ok(value.clone());
+                return Ok(Value::Array(Box::new(a2)));
             }
             _ => {}
         }
@@ -173,10 +178,16 @@ pub(crate) fn check_domain_value(
         return Ok(Value::Null);
     }
     // Domain over domain: the inner domain's constraints run first
-    // (PG19 checks innermost first).
-    if let Some(inner) = &dom.base_domain {
-        check_domain_value(q, inner, value, false)?;
-    }
+    // (PG19 checks innermost first). v2.45: the inner call's coerced
+    // value becomes the value — a typmod on the inner domain
+    // transforms it, and PG's result is the coerced one.
+    let inner_coerced: Value;
+    let value = if let Some(inner) = &dom.base_domain {
+        inner_coerced = check_domain_value(q, inner, value, false)?;
+        &inner_coerced
+    } else {
+        value
+    };
     // v1.92: a bit(n) / bit varying(n) domain typmod — ColType::Bit
     // is typmod-free in this engine, so the domain carries the
     // typmod and it is enforced here, before the CHECKs (PG coerces
@@ -184,6 +195,34 @@ pub(crate) fn check_domain_value(
     if let (Some((n, varying)), Value::BitString(bs)) = (dom.bit_typmod, value) {
         super::json::sj_check_bit_len(bs.bitlen, n, varying)?;
     }
+    // v2.45: a numeric(p,s) domain typmod — for a domain over an
+    // array of numeric the ColType drops it, so the domain carries
+    // it and the coercion happens here, before the CHECKs (PG's
+    // coerce_to_domain applies the base typmod the same way). The
+    // coerced value is what the CHECKs see and what is returned.
+    let coerced_holder: Value;
+    let value = if let Some(tm) = dom.numeric_typmod {
+        match value {
+            Value::Numeric(n) => {
+                coerced_holder =
+                    Value::Numeric(super::dml::apply_numeric_typmod(n.clone(), Some(tm))?);
+                &coerced_holder
+            }
+            Value::Array(a) if a.elem == crate::storage::ArrayElem::Numeric => {
+                let mut a2 = (**a).clone();
+                for e in &mut a2.elems {
+                    if let Value::Numeric(n) = e {
+                        *e = Value::Numeric(super::dml::apply_numeric_typmod(n.clone(), Some(tm))?);
+                    }
+                }
+                coerced_holder = Value::Array(Box::new(a2));
+                &coerced_holder
+            }
+            _ => value,
+        }
+    } else {
+        value
+    };
     // This domain's CHECKs see a one-column scope named `value` (PG19's
     // VALUE pseudo-column).
     for c in &dom.checks {

@@ -702,13 +702,25 @@ pub(crate) fn coerce_to_type_name(
         if matches!(ct, ColType::Array(_)) && matches!(v, Value::Array(_)) {
             return Ok(v.clone());
         }
-        return eval_cast(v, ct);
+        return eval_cast_io_fallback(v, ct);
     }
     // v2.04: an array value coerced to an array type name passes
     // through (element-wise coercion is not modeled for declared
     // function argument types; literals arrive already typed).
     if type_name.ends_with("[]") && matches!(v, Value::Array(_)) {
         return Ok(v.clone());
+    }
+    // v2.45: a text literal coerced to an array type name parses as
+    // an array literal of the element type (plpgsql declaration
+    // initializers like `a integer[] = '{10,20,30}'` arrive as text;
+    // PG applies the array input function).
+    if let Some(elem) = type_name.trim().strip_suffix("[]") {
+        let elem = elem.trim();
+        if matches!(v, Value::Text(_) | Value::BpChar(_)) && !elem.is_empty() {
+            if let Ok(ect) = crate::sql::coltype_by_name(elem) {
+                return eval_cast(v, ColType::Array(crate::storage::ArrayElem::of(&ect)));
+            }
+        }
     }
     // v2.12: refcursor values are portal names (text); pass through.
     if type_name.eq_ignore_ascii_case("refcursor") {
@@ -719,7 +731,33 @@ pub(crate) fn coerce_to_type_name(
             other => other.clone(),
         });
     }
-    eval_cast_named(q, v, type_name)
+    // v2.45: CoerceViaIO fallback, as in eval_cast_io_fallback.
+    match eval_cast_named(q, v, type_name) {
+        Ok(r) => Ok(r),
+        Err(e) if e.code == "42846" && !matches!(v, Value::Null) => {
+            let text = value_to_text_cast(v);
+            eval_cast_named(q, &Value::Text(text.into()), type_name)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// v2.45: PG19 assignment coercion falls back to CoerceViaIO when
+/// no cast pathway exists (find_coercion_pathway): render the value
+/// with its type's output function and re-parse it with the
+/// target's input function. plpgsql datum assignment / RETURN and
+/// function-result coercion all ride this pathway (cast_invoker:
+/// int 20150717 -> date via "20150717"; compos: a composite value
+/// coerced to int fails inside int's input function, 22P02).
+fn eval_cast_io_fallback(v: &Value, ct: ColType) -> Result<Value, ExecError> {
+    match eval_cast(v, ct.clone()) {
+        Ok(r) => Ok(r),
+        Err(e) if e.code == "42846" && !matches!(v, Value::Null) => {
+            let text = value_to_text_cast(v);
+            eval_cast(&Value::Text(text.into()), ct)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// v0.86: run a SQL-language function body with bound arguments.
@@ -1221,6 +1259,11 @@ pub(crate) struct PlpgsqlRun {
     /// v2.11: (SQLSTATE, message) of the last error caught by an
     /// EXCEPTION handler.
     pub(crate) last_error: Option<(String, String)>,
+    /// v2.45: number of EXCEPTION handler statement lists currently
+    /// executing (PG19 `estate->cur_error != NULL`): gates bare
+    /// RAISE (reraise) and GET STACKED DIAGNOSTICS, which are only
+    /// legal inside a handler (0Z002 otherwise).
+    pub(crate) handler_depth: usize,
     /// v2.11: decl-index lists of the nested blocks currently
     /// executing (innermost last), for shadowed name resolution.
     pub(crate) scopes: Vec<Vec<usize>>,
@@ -1251,6 +1294,7 @@ impl PlpgsqlRun {
             found: false,
             row_count: 0,
             last_error: None,
+            handler_depth: 0,
             scopes: Vec::new(),
             setof_cols: None,
             colls: Vec::new(),
@@ -1747,7 +1791,12 @@ pub(crate) fn plpgsql_open_bound(
         .ok_or_else(|| exec_err("XX000", format!("cursor \"{}\" has no query", disp)))?;
     let ext_run = PlpgsqlRun::new(ext_params, run.nargs);
     let out = eval_plpgsql_query(q, scopes, &query, pb, &ext_run)?;
-    plpgsql_open_portal(pb, run, var, decl.cursor_scroll.unwrap_or(false), out)?;
+    // v2.45: an unspecified bound cursor's scrollability is the
+    // planner's call in PG19 (CURSOR_OPT_SCROLL unset either way);
+    // materialized plans here support backward scan, so the
+    // default is scrollable. Only an explicit NO SCROLL forbids it
+    // (the sc_test generate_series variant pins this).
+    plpgsql_open_portal(pb, run, var, decl.cursor_scroll.unwrap_or(true), out)?;
     Ok(())
 }
 
@@ -1934,6 +1983,17 @@ pub(crate) fn plpgsql_coerce_for_decl(
     let Some(d) = d else {
         return Ok(v.clone());
     };
+    // v2.45: PG19 exec_assign_value: a NOT NULL variable rejects a
+    // null assignment (22004).
+    if d.not_null && matches!(v, Value::Null) {
+        return Err(exec_err(
+            "22004",
+            format!(
+                "null value cannot be assigned to variable \"{}\" declared NOT NULL",
+                d.name
+            ),
+        ));
+    }
     if d.is_cursor
         || d.type_name.is_empty()
         || plpgsql_is_record_decl(d)
@@ -1941,6 +2001,33 @@ pub(crate) fn plpgsql_coerce_for_decl(
         || matches!(v, Value::Record(_))
     {
         return Ok(v.clone());
+    }
+    // v2.45: the declaration's retained typmod applies to a numeric
+    // value (PG19 exec_assign_value coerces through the var's type,
+    // typmod included) — scalar, or per element for an array of
+    // numeric (a `numeric(4,2)[1]` variable).
+    if let Some(tm) = d.typmod {
+        match v {
+            Value::Numeric(n) => {
+                return Ok(Value::Numeric(crate::exec::dml::apply_numeric_typmod(
+                    n.clone(),
+                    Some(tm),
+                )?));
+            }
+            Value::Array(a) if a.elem == crate::storage::ArrayElem::Numeric => {
+                let mut a2 = (**a).clone();
+                for e in &mut a2.elems {
+                    if let Value::Numeric(n) = e {
+                        *e = Value::Numeric(crate::exec::dml::apply_numeric_typmod(
+                            n.clone(),
+                            Some(tm),
+                        )?);
+                    }
+                }
+                return Ok(Value::Array(Box::new(a2)));
+            }
+            _ => {}
+        }
     }
     coerce_to_type_name(q, v, &d.type_name)
 }
@@ -2505,6 +2592,136 @@ pub(crate) fn plpgsql_assign_field(
     Ok(())
 }
 
+/// v2.45: PG19 array_set_element for plpgsql subscript assignment:
+/// a NULL base becomes an empty array; dimensions expand with NULL
+/// fill so the subscript lands in range; the element is replaced at
+/// the row-major offset. Subscripts are int4 (22003 beyond).
+pub(crate) fn plpgsql_array_set_element(
+    base: Value,
+    subs: &[i64],
+    v: Value,
+) -> Result<Value, ExecError> {
+    for s in subs {
+        if *s < i32::MIN as i64 || *s > i32::MAX as i64 {
+            return Err(exec_err("22003", "integer out of range".to_string()));
+        }
+    }
+    let mut arr = match base {
+        Value::Array(av) => (*av).clone(),
+        Value::Null => crate::storage::ArrayVal {
+            elem: crate::storage::ArrayElem::of(&v.col_type()),
+            dims: Vec::new(),
+            lower: Vec::new(),
+            elems: Vec::new(),
+        },
+        other => {
+            return Err(exec_err(
+                "42804",
+                format!(
+                    "subscript assignment requires an array value, not {}",
+                    other.type_name()
+                ),
+            ));
+        }
+    };
+    if arr.dims.is_empty() {
+        // Empty/NULL base: singleton at the subscript position.
+        arr.dims = vec![1; subs.len()];
+        arr.lower = subs.iter().map(|s| *s as i32).collect();
+        arr.elems = vec![v];
+        return Ok(Value::Array(Box::new(arr)));
+    }
+    if subs.len() != arr.dims.len() {
+        return Err(exec_err(
+            "2202E",
+            "wrong number of array subscripts".to_string(),
+        ));
+    }
+    // v2.45: PG19 array_set_element refuses expansions past
+    // MaxArraySize items (arrayfuncs.c: dim overflow or a total
+    // over the limit is 54000). Without the guard, a subscript near
+    // i32::MAX tried to materialize billions of NULLs and aborted
+    // the connection thread.
+    {
+        let mut total: i64 = 1;
+        for d in 0..arr.dims.len() {
+            let s = subs[d] as i64;
+            let lo = arr.lower[d] as i64;
+            let hi = lo + arr.dims[d] as i64 - 1;
+            let new_dim = hi.max(s) - lo.min(s) + 1;
+            if new_dim > i32::MAX as i64 {
+                return Err(exec_err(
+                    "54000",
+                    "array size exceeds the maximum allowed (134217728)".to_string(),
+                ));
+            }
+            total = total.saturating_mul(new_dim);
+            if total > 134_217_728 {
+                return Err(exec_err(
+                    "54000",
+                    "array size exceeds the maximum allowed (134217728)".to_string(),
+                ));
+            }
+        }
+    }
+    // Expand each dimension to cover its subscript (PG19
+    // array_set_element: lower-side expansion inserts NULLs at the
+    // front of that dimension's slabs; for row-major storage we
+    // rebuild the element vector dimension by dimension).
+    for d in 0..arr.dims.len() {
+        let s = subs[d] as i32;
+        let lo = arr.lower[d];
+        let dim = arr.dims[d];
+        if s < lo {
+            let add = (lo - s) as usize;
+            let slab: usize = arr.dims[d + 1..].iter().map(|x| *x as usize).product();
+            let mut elems = Vec::with_capacity(arr.elems.len() + add * slab);
+            let nslabs = if slab == 0 {
+                0
+            } else {
+                arr.elems.len() / slab.max(1)
+            };
+            let total_slabs = nslabs;
+            let per_outer = total_slabs / (dim as usize).max(1);
+            for outer in 0..per_outer {
+                for _ in 0..add {
+                    elems.extend(std::iter::repeat_n(Value::Null, slab));
+                }
+                let start = outer * dim as usize * slab;
+                elems.extend_from_slice(&arr.elems[start..start + dim as usize * slab]);
+            }
+            arr.elems = elems;
+            arr.lower[d] = s;
+            arr.dims[d] = dim + add as i32;
+        } else if s >= lo + dim {
+            let add = (s - (lo + dim) + 1) as usize;
+            let slab: usize = arr.dims[d + 1..].iter().map(|x| *x as usize).product();
+            let mut elems = Vec::with_capacity(arr.elems.len() + add * slab);
+            let nslabs = arr.elems.len() / slab.max(1);
+            let per_outer = nslabs / (dim as usize).max(1);
+            for outer in 0..per_outer {
+                let start = outer * dim as usize * slab;
+                elems.extend_from_slice(&arr.elems[start..start + dim as usize * slab]);
+                for _ in 0..add {
+                    elems.extend(std::iter::repeat_n(Value::Null, slab));
+                }
+            }
+            arr.elems = elems;
+            arr.dims[d] = dim + add as i32;
+        }
+    }
+    // Row-major offset.
+    let mut off: usize = 0;
+    for d in 0..arr.dims.len() {
+        let stride: usize = arr.dims[d + 1..].iter().map(|x| *x as usize).product();
+        off += (subs[d] as i32 - arr.lower[d]) as usize * stride;
+    }
+    if off < arr.elems.len() {
+        arr.elems[off] = v;
+    }
+    Ok(Value::Array(Box::new(arr)))
+}
+
 /// v2.11: assign a SELECT INTO / RETURNING INTO result row (or the
 /// all-NULL no-row case) to the target list. A lone record target
 /// with a multi-column row binds as a record.
@@ -2644,6 +2861,313 @@ pub(crate) fn init_plpgsql_decls(
         if slot < run.params.len() {
             run.params[slot] = Some(Value::Bool(false));
         }
+    }
+    Ok(())
+}
+
+/// v2.45: seed the SQLSTATE / SQLERRM special variables from the
+/// run's last caught error (PG19: they are copies of the current
+/// error's fields, made when an EXCEPTION handler is entered).
+pub(crate) fn plpgsql_seed_errvars(pb: &crate::sql::PlpgsqlBody, run: &mut PlpgsqlRun) {
+    let Some((code, msg)) = run.last_error.clone() else {
+        return;
+    };
+    for (name, val) in [("sqlstate", code), ("sqlerrm", msg)] {
+        if let Some(slot) = plpgsql_slot(pb, run, name) {
+            if slot < run.params.len() {
+                run.params[slot] = Some(Value::Text(val.into()));
+            }
+        }
+    }
+}
+
+/// v2.45: effective plpgsql.print_strict_params for a body: the
+/// `#print_strict_params` directive wins, then the GUC (PG19
+/// pl_comp.c reads the directive into the compiled function; the
+/// GUC supplies the default).
+pub(crate) fn plpgsql_print_strict_params(pb: &crate::sql::PlpgsqlBody) -> bool {
+    match pb.print_strict_params {
+        Some(b) => b,
+        None => matches!(
+            installed_guc("plpgsql.print_strict_params").as_deref(),
+            Some("on") | Some("true") | Some("yes") | Some("1")
+        ),
+    }
+}
+
+/// v2.45: collect the $n parameter slots an expression references,
+/// in first-use order (for STRICT diagnostics).
+fn collect_expr_params(e: &Expr, out: &mut Vec<u32>) {
+    fn push(out: &mut Vec<u32>, n: u32) {
+        if !out.contains(&n) {
+            out.push(n);
+        }
+    }
+    match e {
+        Expr::Param(n) => push(out, *n),
+        Expr::FieldAccess { expr, .. } => collect_expr_params(expr, out),
+        Expr::Arith { left, right, .. }
+        | Expr::Cmp { left, right, .. }
+        | Expr::IsDistinctFrom { left, right, .. }
+        | Expr::UserOp { left, right, .. } => {
+            collect_expr_params(left, out);
+            collect_expr_params(right, out);
+        }
+        Expr::And(l, r) | Expr::Or(l, r) | Expr::Concat(l, r) => {
+            collect_expr_params(l, out);
+            collect_expr_params(r, out);
+        }
+        Expr::JsonOp { left, right, .. } => {
+            collect_expr_params(left, out);
+            collect_expr_params(right, out);
+        }
+        Expr::Not(i) | Expr::Neg(i) | Expr::BitNot(i) => collect_expr_params(i, out),
+        Expr::IsNull { expr, .. } | Expr::IsBool { expr, .. } => collect_expr_params(expr, out),
+        Expr::Cast { expr, .. } | Expr::CastNamed { expr, .. } => collect_expr_params(expr, out),
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_expr_params(expr, out);
+            collect_expr_params(pattern, out);
+            if let Some(esc) = escape {
+                collect_expr_params(esc, out);
+            }
+        }
+        Expr::Regex { expr, pattern, .. } => {
+            collect_expr_params(expr, out);
+            collect_expr_params(pattern, out);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_expr_params(expr, out);
+            collect_expr_params(low, out);
+            collect_expr_params(high, out);
+        }
+        Expr::Func { args, .. } => {
+            for a in args {
+                collect_expr_params(a, out);
+            }
+        }
+        Expr::NamedArg { expr, .. } => collect_expr_params(expr, out),
+        Expr::Extract { from, .. } => collect_expr_params(from, out),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                collect_expr_params(o, out);
+            }
+            for (w, t) in whens {
+                collect_expr_params(w, out);
+                collect_expr_params(t, out);
+            }
+            if let Some(el) = else_ {
+                collect_expr_params(el, out);
+            }
+        }
+        Expr::Row(exprs) | Expr::ArrayCtor { elems: exprs, .. } => {
+            for x in exprs {
+                collect_expr_params(x, out);
+            }
+        }
+        Expr::Subscript { array, indices } => {
+            collect_expr_params(array, out);
+            for i in indices {
+                collect_expr_params(i, out);
+            }
+        }
+        Expr::InSub { expr, sub, .. } => {
+            collect_expr_params(expr, out);
+            collect_select_params(sub, out);
+        }
+        Expr::Quantified { left, sub, .. } => {
+            collect_expr_params(left, out);
+            collect_select_params(sub, out);
+        }
+        Expr::ScalarSub(sel) => collect_select_params(sel, out),
+        Expr::Exists { sub, .. } => collect_select_params(sub, out),
+        Expr::Agg { arg, arg2, .. } => {
+            if let Some(a) = arg {
+                collect_expr_params(a, out);
+            }
+            if let Some(a) = arg2 {
+                collect_expr_params(a, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_select_params(sel: &crate::sql::SelectStmt, out: &mut Vec<u32>) {
+    for item in &sel.items {
+        if let crate::sql::SelectItem::Expr { expr, .. } = item {
+            collect_expr_params(expr, out);
+        }
+    }
+    if let Some(w) = &sel.where_ {
+        collect_expr_params(w, out);
+    }
+    for f in &sel.from {
+        collect_from_params(f, out);
+    }
+}
+
+fn collect_from_params(f: &crate::sql::FromItem, out: &mut Vec<u32>) {
+    use crate::sql::FromItem as F;
+    match f {
+        F::Derived { sub, .. } => collect_select_params(sub, out),
+        F::Values { rows, .. } => {
+            for row in rows {
+                for e in row {
+                    collect_expr_params(e, out);
+                }
+            }
+        }
+        F::Function { args, .. } => {
+            for a in args {
+                collect_expr_params(a, out);
+            }
+        }
+        F::Join {
+            left, right, on, ..
+        } => {
+            collect_from_params(left, out);
+            collect_from_params(right, out);
+            if let Some(on) = on {
+                collect_expr_params(on, out);
+            }
+        }
+        F::Table { .. } => {}
+    }
+}
+
+fn collect_stmt_params(stmt: &crate::sql::Stmt, out: &mut Vec<u32>) {
+    use crate::sql::Stmt as S;
+    match stmt {
+        S::Select(sel) => collect_select_params(sel, out),
+        S::Insert {
+            rows,
+            select,
+            returning,
+            ..
+        } => {
+            for row in rows {
+                for v in row {
+                    if let crate::sql::InsertValue::Expr(e) = v {
+                        collect_expr_params(e, out);
+                    }
+                }
+            }
+            if let Some(sel) = select {
+                collect_select_params(sel, out);
+            }
+            for item in returning {
+                if let crate::sql::SelectItem::Expr { expr, .. } = item {
+                    collect_expr_params(expr, out);
+                }
+            }
+        }
+        S::Update {
+            sets,
+            from,
+            where_,
+            returning,
+            ..
+        } => {
+            for (_, e) in sets {
+                collect_expr_params(e, out);
+            }
+            for f in from {
+                collect_from_params(f, out);
+            }
+            if let Some(w) = where_ {
+                collect_expr_params(w, out);
+            }
+            for item in returning {
+                if let crate::sql::SelectItem::Expr { expr, .. } = item {
+                    collect_expr_params(expr, out);
+                }
+            }
+        }
+        S::Delete {
+            using,
+            where_,
+            returning,
+            ..
+        } => {
+            for f in using {
+                collect_from_params(f, out);
+            }
+            if let Some(w) = where_ {
+                collect_expr_params(w, out);
+            }
+            for item in returning {
+                if let crate::sql::SelectItem::Expr { expr, .. } = item {
+                    collect_expr_params(expr, out);
+                }
+            }
+        }
+        S::Explain { stmt: inner, .. } => collect_stmt_params(inner, out),
+        _ => {}
+    }
+}
+
+/// v2.45: a STRICT row-count error (PG19 pl_exec.c
+/// exec_stmt_select / exec_stmt_dml): when print_strict_params is
+/// in effect and the query has parameters, DETAIL lists them as
+/// `parameters: $1 = '2', $2 = 'foo'`.
+fn strict_row_error(
+    pb: &crate::sql::PlpgsqlBody,
+    run: &PlpgsqlRun,
+    query: &crate::sql::Stmt,
+    code: &'static str,
+    message: &str,
+) -> ExecError {
+    let mut e = exec_err(code, message.to_string());
+    if plpgsql_print_strict_params(pb) {
+        let mut ns = Vec::new();
+        collect_stmt_params(query, &mut ns);
+        if !ns.is_empty() {
+            let parts: Vec<String> = ns
+                .iter()
+                .map(|n| {
+                    let v = run
+                        .params
+                        .get((*n as usize).saturating_sub(1))
+                        .cloned()
+                        .flatten();
+                    match v {
+                        Some(val) => format!(
+                            "${} = '{}'",
+                            n,
+                            value_to_text_cast(&val).replace('\'', "''")
+                        ),
+                        None => format!("${} = NULL", n),
+                    }
+                })
+                .collect();
+            e.detail = Some(format!("parameters: {}", parts.join(", ")));
+        }
+    }
+    e
+}
+
+/// v2.45: the variable_conflict = error raise (42702), recorded on
+/// the body by the CREATE-time rewriter.
+pub(crate) fn plpgsql_conflict_check(pb: &crate::sql::PlpgsqlBody) -> Result<(), ExecError> {
+    if let Some(name) = &pb.conflict_error {
+        let mut e = exec_err(
+            "42702",
+            format!("column reference \"{}\" is ambiguous", name),
+        );
+        e.detail =
+            Some("It could refer to either a PL/pgSQL variable or a table column.".to_string());
+        return Err(e);
     }
     Ok(())
 }
@@ -2863,6 +3387,17 @@ pub(crate) fn run_plpgsql_stmts(
                 plpgsql_set_diag(pb, run, !out.rows.is_empty(), out.rows.len() as i64);
             }
             S::Assert { cond, message } => {
+                // v2.45: plpgsql.check_asserts (default on) gates
+                // ASSERT entirely (PG19 pl_exec.c exec_stmt_assert
+                // returns immediately when assertions are off).
+                if let Some(v) = crate::exec::installed_guc("plpgsql.check_asserts") {
+                    if matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "off" | "false" | "no" | "0"
+                    ) {
+                        continue;
+                    }
+                }
                 // v1.96: ASSERT — P0004 when the condition is not
                 // true (false OR NULL), message from the optional
                 // second expression (PG pl_exec.c exec_stmt_assert).
@@ -2892,10 +3427,18 @@ pub(crate) fn run_plpgsql_stmts(
                 args,
                 sqlstate,
                 using_message,
+                conflict,
             } => {
                 // v1.02: `RAISE NOTICE|EXCEPTION '<format>', <args>...`
                 // (PG19 `exec_stmt_raise`, pl_exec.c), extended in
                 // v2.11 with condition names, SQLSTATE, and USING.
+                // v2.45: a duplicated option is a run-time 42601.
+                if let Some(name) = conflict {
+                    return Err(exec_err(
+                        "42601",
+                        format!("RAISE option already specified: {}", name),
+                    ));
+                }
                 let msg = if !format.is_empty() {
                     let mut vals = Vec::with_capacity(args.len());
                     for a in args {
@@ -2971,6 +3514,17 @@ pub(crate) fn run_plpgsql_stmts(
                 }
             }
             S::Reraise => {
+                // v2.45: PG19 exec_stmt_raise: bare RAISE is legal
+                // only while an exception handler is executing
+                // (0Z002, stacked diagnostics accessed without an
+                // active handler).
+                if run.handler_depth == 0 {
+                    return Err(exec_err(
+                        "0Z002",
+                        "RAISE without parameters cannot be used outside an exception handler"
+                            .to_string(),
+                    ));
+                }
                 return Err(match &run.last_error {
                     Some((code, msg)) => ExecError {
                         code: intern_sqlstate(code),
@@ -2979,8 +3533,8 @@ pub(crate) fn run_plpgsql_stmts(
                         hint: None,
                     },
                     None => exec_err(
-                        "0A000",
-                        "RAISE without parameters can only be used within an exception handler"
+                        "0Z002",
+                        "RAISE without parameters cannot be used outside an exception handler"
                             .to_string(),
                     ),
                 });
@@ -3018,6 +3572,118 @@ pub(crate) fn run_plpgsql_stmts(
                     .map(|r| r[0].clone())
                     .unwrap_or(Value::Null);
                 plpgsql_assign_target(q, pb, run, &crate::sql::PlTarget::Param(*index), v)?;
+            }
+            S::AssignSubscript {
+                var,
+                field,
+                indices,
+                select,
+            } => {
+                // v2.45: `var[sub] := expr` / `rec.field[sub] := expr`
+                // (PG19 exec_assign_expr with indirection +
+                // array_set_element). Indices evaluate first, then
+                // the value (PG's assign evaluation order).
+                let mut subs: Vec<i64> = Vec::with_capacity(indices.len());
+                for ix in indices {
+                    let out = run_plpgsql_select(q, scopes, ix, pb, run, "assignment")?;
+                    let iv = out
+                        .rows
+                        .first()
+                        .and_then(|r| r.first().cloned())
+                        .unwrap_or(Value::Null);
+                    match iv {
+                        Value::Null => {
+                            return Err(exec_err(
+                                "22004",
+                                "array subscript in assignment must not be null".to_string(),
+                            ));
+                        }
+                        Value::Int(i) | Value::BigInt(i) => subs.push(i),
+                        Value::SmallInt(i) => subs.push(i as i64),
+                        other => {
+                            return Err(exec_err(
+                                "42804",
+                                format!(
+                                    "array subscript must be an integer, not {}",
+                                    other.type_name()
+                                ),
+                            ));
+                        }
+                    }
+                }
+                let out = run_plpgsql_select(q, scopes, select, pb, run, "assignment")?;
+                let v = out
+                    .rows
+                    .first()
+                    .map(|r| r[0].clone())
+                    .unwrap_or(Value::Null);
+                let base = match field {
+                    Some(f) => plpgsql_record_field(
+                        pb,
+                        run,
+                        {
+                            // slot of the record var as a 1-based param id
+                            plpgsql_slot(pb, run, var)
+                                .map(|s| (s + 1) as u32)
+                                .unwrap_or(0)
+                        },
+                        f,
+                    )
+                    .unwrap_or(Value::Null),
+                    None => plpgsql_slot(pb, run, var)
+                        .and_then(|s| run.params.get(s).cloned())
+                        .flatten()
+                        .unwrap_or(Value::Null),
+                };
+                // v2.45: PG19's exec_assign_expr with indirection
+                // coerces the assigned value to the array's element
+                // type — typmod included (bug #5717: a numeric(4,2)
+                // element rounds / overflows 22003) — and the
+                // reconstructed container then goes through any
+                // domain constraint on the variable's declared type
+                // (23514). The bare store-back previously did
+                // neither.
+                let slot = plpgsql_slot(pb, run, var);
+                let decl = slot
+                    .and_then(|s| plpgsql_decl_for_slot(pb, run, s))
+                    .cloned();
+                let v = match (&decl, &v) {
+                    (Some(d), Value::Numeric(n)) if d.typmod.is_some() => {
+                        Value::Numeric(crate::exec::dml::apply_numeric_typmod(n.clone(), d.typmod)?)
+                    }
+                    _ => v,
+                };
+                let new_arr = plpgsql_array_set_element(base, &subs, v)?;
+                let new_arr = match &decl {
+                    Some(d)
+                        if !d.type_name.is_empty()
+                            && q.eng
+                                .db
+                                .find_type(&d.type_name)
+                                .map(|st| st.domain.is_some())
+                                .unwrap_or(false) =>
+                    {
+                        crate::exec::constraint::check_domain_value(
+                            q,
+                            &d.type_name,
+                            &new_arr,
+                            false,
+                        )?
+                    }
+                    _ => new_arr,
+                };
+                match field {
+                    Some(f) => {
+                        plpgsql_assign_field(run, pb, var, f, new_arr)?;
+                    }
+                    None => {
+                        if let Some(s) = slot {
+                            if s < run.params.len() {
+                                run.params[s] = Some(new_arr);
+                            }
+                        }
+                    }
+                }
             }
             S::If {
                 branches,
@@ -3082,15 +3748,24 @@ pub(crate) fn run_plpgsql_stmts(
                 }
                 if out.rows.is_empty() {
                     if *strict {
-                        return Err(exec_err("P0002", "query returned no rows".to_string()));
+                        return Err(strict_row_error(
+                            pb,
+                            run,
+                            query,
+                            "P0002",
+                            "query returned no rows",
+                        ));
                     }
                     plpgsql_assign_into(q, pb, run, targets, &out)?;
                     plpgsql_set_diag(pb, run, false, 0);
                 } else {
                     if (*strict || plpgsql_extra_error("too_many_rows")) && out.rows.len() > 1 {
-                        return Err(exec_err(
+                        return Err(strict_row_error(
+                            pb,
+                            run,
+                            query,
                             "P0003",
-                            "query returned more than one row".to_string(),
+                            "query returned more than one row",
                         ));
                     }
                     plpgsql_assign_into(q, pb, run, targets, &out)?;
@@ -3107,9 +3782,12 @@ pub(crate) fn run_plpgsql_stmts(
                     Some(targets) if !targets.is_empty() => {
                         if out.rows.is_empty() {
                             if *strict {
-                                return Err(exec_err(
+                                return Err(strict_row_error(
+                                    pb,
+                                    run,
+                                    inner,
                                     "P0002",
-                                    "query returned no rows".to_string(),
+                                    "query returned no rows",
                                 ));
                             }
                             plpgsql_assign_into(q, pb, run, targets, &out)?;
@@ -3119,9 +3797,12 @@ pub(crate) fn run_plpgsql_stmts(
                             // target (mod_stmt) errors on >1 returned
                             // row exactly like STRICT does.
                             if out.rows.len() > 1 {
-                                return Err(exec_err(
+                                return Err(strict_row_error(
+                                    pb,
+                                    run,
+                                    inner,
                                     "P0003",
-                                    "query returned more than one row".to_string(),
+                                    "query returned more than one row",
                                 ));
                             }
                             plpgsql_assign_into(q, pb, run, targets, &out)?;
@@ -3189,10 +3870,35 @@ pub(crate) fn run_plpgsql_stmts(
                 run.accum.push(row);
             }
             S::ReturnQuery(query) => {
+                // v2.45: PG19 SPI must_return_tuples: a SELECT INTO
+                // plan has no result descriptor -> 42601 at run time
+                // (spi.c), and the table is NOT created.
+                if matches!(**query, Stmt::CreateTableAs { .. }) {
+                    return Err(exec_err(
+                        "42601",
+                        "SELECT INTO query does not return tuples".to_string(),
+                    ));
+                }
                 let out = eval_plpgsql_query(q, scopes, query, pb, run)?;
                 append_next_rows(q, run, out, ret_type, true)?;
             }
             S::ReturnQueryExecute { expr, using } => {
+                // v2.45: same must-return-tuples check for the
+                // dynamic form: pre-parse the command string.
+                {
+                    let txt_out = eval_plpgsql_query(q, scopes, expr, pb, run)?;
+                    if let Some(Value::Text(s)) | Some(Value::BpChar(s)) =
+                        txt_out.rows.first().and_then(|r| r.first())
+                    {
+                        let cmd = s.trim().trim_end_matches(';').trim();
+                        if let Ok(Stmt::CreateTableAs { .. }) = crate::sql::parse_statement(cmd) {
+                            return Err(exec_err(
+                                "42601",
+                                "SELECT INTO query does not return tuples".to_string(),
+                            ));
+                        }
+                    }
+                }
                 let (out, _) = plpgsql_exec_dynamic(q, scopes, expr, using, pb, run)?;
                 append_next_rows(q, run, out, ret_type, true)?;
             }
@@ -3267,6 +3973,12 @@ pub(crate) fn run_plpgsql_stmts(
             }
             S::ForQuery { .. } | S::ForRange { .. } | S::ForCursor { .. } => {
                 match run_plpgsql_for(q, scopes, s, pb, run, ret_type, fname)? {
+                    PlFlow::Continue => {}
+                    other => return Ok(other),
+                }
+            }
+            S::Foreach { .. } => {
+                match run_plpgsql_foreach(q, scopes, s, pb, run, ret_type, fname)? {
                     PlFlow::Continue => {}
                     other => return Ok(other),
                 }
@@ -3353,7 +4065,10 @@ pub(crate) fn run_plpgsql_stmts(
                     if let Some(h) = plpgsql_find_handler(handlers, e.code) {
                         plpgsql_write_rollback(q, mark);
                         run.last_error = Some((e.code.to_string(), e.message.clone()));
+                        plpgsql_seed_errvars(pb, run);
+                        run.handler_depth += 1;
                         result = run_plpgsql_stmts(q, scopes, &h.stmts, pb, run, ret_type, fname);
+                        run.handler_depth -= 1;
                     }
                 }
                 run.scopes.pop();
@@ -3363,6 +4078,15 @@ pub(crate) fn run_plpgsql_stmts(
                 }
             }
             S::GetDiagnostics { stacked, assigns } => {
+                // v2.45: PG19 exec_stmt_getdiag: the STACKED form is
+                // only legal inside an exception handler (0Z002).
+                if *stacked && run.handler_depth == 0 {
+                    return Err(exec_err(
+                        "0Z002",
+                        "GET STACKED DIAGNOSTICS cannot be used outside an exception handler"
+                            .to_string(),
+                    ));
+                }
                 for (target, item) in assigns {
                     let v = if *stacked {
                         match item.as_str() {
@@ -3388,6 +4112,19 @@ pub(crate) fn run_plpgsql_stmts(
                     } else {
                         match item.as_str() {
                             "row_count" => Value::BigInt(run.row_count),
+                            // v2.45: PG19 GET DIAGNOSTICS
+                            // pg_routine_oid: the current function's
+                            // regprocedure identity (display text, as
+                            // regprocedure values ride); 0 in a DO
+                            // block ("no useful data", per the suite).
+                            "pg_routine_oid" => Value::Text(
+                                crate::exec::cast::regprocedure_display(
+                                    q,
+                                    crate::exec::cast::func_oid_by_name(&q.eng.db, fname)
+                                        .unwrap_or(0),
+                                )
+                                .into(),
+                            ),
                             _ => Value::Text(String::new().into()),
                         }
                     };
@@ -3463,6 +4200,167 @@ pub(crate) fn plpgsql_exec_dynamic(
 
 /// v2.11: run one FOR loop (range or query/dynamic source).
 #[allow(clippy::too_many_arguments)]
+/// v2.45: `FOREACH <var>[, ...] [SLICE n] IN ARRAY <expr> LOOP`
+/// (PG19 exec_stmt_foreach_a + array_create_iterator): slice 0
+/// iterates the flattened scalar elements row-major; slice n > 0
+/// iterates subarrays of dimension n, stepping over the leading
+/// dimensions. Errors are PG19's: null array 22004, non-array
+/// 42804, slice out of range 2202E, loop-variable array-ness 42804.
+pub(crate) fn run_plpgsql_foreach(
+    q: &mut Q,
+    scopes: &[Scope],
+    stmt: &crate::sql::PlpgsqlStmt,
+    pb: &crate::sql::PlpgsqlBody,
+    run: &mut PlpgsqlRun,
+    ret_type: &str,
+    fname: &str,
+) -> Result<PlFlow, ExecError> {
+    use crate::sql::PlpgsqlStmt as S;
+    let S::Foreach {
+        vars,
+        slice,
+        array,
+        body,
+    } = stmt
+    else {
+        return Ok(PlFlow::Continue);
+    };
+    let out = eval_plpgsql_query(q, scopes, array, pb, run)?;
+    let v = out
+        .rows
+        .first()
+        .and_then(|r| r.first().cloned())
+        .unwrap_or(Value::Null);
+    if matches!(v, Value::Null) {
+        return Err(exec_err(
+            "22004",
+            "FOREACH expression must not be null".to_string(),
+        ));
+    }
+    let Value::Array(av) = v else {
+        return Err(exec_err(
+            "42804",
+            format!(
+                "FOREACH expression must yield an array, not type {}",
+                v.type_name()
+            ),
+        ));
+    };
+    let ndim = av.ndim() as i64;
+    if *slice < 0 || *slice > ndim {
+        return Err(exec_err(
+            "2202E",
+            format!(
+                "slice dimension ({}) is out of the valid range 0..{}",
+                slice, ndim
+            ),
+        ));
+    }
+    // Loop-variable array-ness checks (single-var form; a record
+    // variable is exempt, mirroring PG's dtype check).
+    if vars.len() == 1 {
+        let decl = pb.decls.iter().find(|d| &d.name == &vars[0]);
+        let is_record = decl.is_some_and(plpgsql_is_record_decl);
+        let is_array = decl.is_some_and(|d| d.type_name.trim().ends_with("[]"));
+        if !is_record {
+            if *slice > 0 && !is_array {
+                return Err(exec_err(
+                    "42804",
+                    "FOREACH ... SLICE loop variable must be of an array type".to_string(),
+                ));
+            }
+            if *slice == 0 && is_array {
+                return Err(exec_err(
+                    "42804",
+                    "FOREACH loop variable must not be of an array type".to_string(),
+                ));
+            }
+        }
+    }
+    // Build the iteration items.
+    let items: Vec<Value> = if *slice == 0 {
+        av.elems.clone()
+    } else {
+        let s = *slice as usize;
+        let chunk: usize = av.dims[ndim as usize - s..]
+            .iter()
+            .map(|d| *d as usize)
+            .product();
+        let chunk = chunk.max(1);
+        av.elems
+            .chunks(chunk)
+            .map(|c| {
+                Value::Array(Box::new(crate::storage::ArrayVal {
+                    elem: av.elem.clone(),
+                    dims: av.dims[ndim as usize - s..].to_vec(),
+                    lower: av.lower[ndim as usize - s..].to_vec(),
+                    elems: c.to_vec(),
+                }))
+            })
+            .collect()
+    };
+    let mut seen = false;
+    for item in &items {
+        seen = true;
+        if vars.len() == 1 {
+            let var = &vars[0];
+            let decl = pb.decls.iter().find(|d| &d.name == var).cloned();
+            if decl.as_ref().is_some_and(plpgsql_is_record_decl) {
+                if let Value::Record(fields) = item {
+                    let cols: Vec<String> = fields.iter().map(|(n, _)| n.clone()).collect();
+                    let row =
+                        crate::storage::Row::new(fields.iter().map(|(_, fv)| fv.clone()).collect());
+                    plpgsql_bind_record(pb, run, var, &cols, Some(&row));
+                } else if let Some(s) = plpgsql_slot(pb, run, var) {
+                    if s < run.params.len() {
+                        run.params[s] = Some(item.clone());
+                    }
+                }
+            } else if let Some(s) = plpgsql_slot(pb, run, var) {
+                if s < run.params.len() {
+                    let cell = plpgsql_coerce_for_decl(q, item, decl.as_ref())?;
+                    run.params[s] = Some(cell);
+                }
+            }
+        } else {
+            // Row target: the element must be a record; its fields
+            // fill the vars positionally (PG exec_assign_value to a
+            // ROW datum).
+            let Value::Record(fields) = item else {
+                return Err(exec_err(
+                    "42804",
+                    "FOREACH loop variable must not be of an array type".to_string(),
+                ));
+            };
+            for (i, var) in vars.iter().enumerate() {
+                let cell = fields
+                    .get(i)
+                    .map(|(_, fv)| fv.clone())
+                    .unwrap_or(Value::Null);
+                let decl = pb.decls.iter().find(|d| &d.name == var).cloned();
+                if let Some(s) = plpgsql_slot(pb, run, var) {
+                    if s < run.params.len() {
+                        let cell = plpgsql_coerce_for_decl(q, &cell, decl.as_ref())?;
+                        run.params[s] = Some(cell);
+                    }
+                }
+            }
+        }
+        match loop_step(run_plpgsql_stmts(
+            q, scopes, body, pb, run, ret_type, fname,
+        )?)? {
+            LoopStep::Next => {}
+            LoopStep::Break => break,
+            LoopStep::Done(f) => {
+                plpgsql_set_diag(pb, run, true, 1);
+                return Ok(f);
+            }
+        }
+    }
+    plpgsql_set_diag(pb, run, seen, if seen { 1 } else { 0 });
+    Ok(PlFlow::Continue)
+}
+
 pub(crate) fn run_plpgsql_for(
     q: &mut Q,
     scopes: &[Scope],
@@ -3542,6 +4440,7 @@ pub(crate) fn run_plpgsql_for(
             query,
             body,
             dynamic,
+            using,
         } => {
             // v1.03: `FOR var IN <query> LOOP` (PG19
             // `exec_stmt_fors`, pl_exec.c). The query is a
@@ -3550,7 +4449,7 @@ pub(crate) fn run_plpgsql_for(
             // coerced to its declared type — or, v2.11, the whole
             // row when the variable is a record.
             let out = if *dynamic {
-                let (o, _) = plpgsql_exec_dynamic(q, scopes, query, &[], pb, run)?;
+                let (o, _) = plpgsql_exec_dynamic(q, scopes, query, using, pb, run)?;
                 o
             } else {
                 eval_plpgsql_query(q, scopes, query, pb, run)?
@@ -3838,6 +4737,7 @@ pub(crate) fn run_plpgsql_body(
         }
     }
     init_plpgsql_decls(&mut call_q, scopes, pb, &mut run)?;
+    plpgsql_conflict_check(pb)?;
     let mark = plpgsql_write_mark(&call_q);
     let flow = match run_plpgsql_stmts(
         &mut call_q,
@@ -3859,7 +4759,9 @@ pub(crate) fn run_plpgsql_body(
                 Some(h) => {
                     plpgsql_write_rollback(&mut call_q, mark);
                     run.last_error = Some((e.code.to_string(), e.message.clone()));
-                    run_plpgsql_stmts(
+                    plpgsql_seed_errvars(pb, &mut run);
+                    run.handler_depth += 1;
+                    let hr = run_plpgsql_stmts(
                         &mut call_q,
                         scopes,
                         &h.stmts,
@@ -3867,7 +4769,9 @@ pub(crate) fn run_plpgsql_body(
                         &mut run,
                         &fdef.ret_type,
                         &fdef.name,
-                    )?
+                    );
+                    run.handler_depth -= 1;
+                    hr?
                 }
                 None => return Err(e),
             }
@@ -4296,6 +5200,12 @@ pub(crate) fn call_user_function(
     // v2.22: call-site argument collations parallel to `args`.
     arg_colls: &[Option<String>],
 ) -> Result<Value, ExecError> {
+    // v2.45: PG19 stack-depth check analogue (check_stack_depth):
+    // unbounded function recursion must fail with 54001, never
+    // overflow the native stack and abort the server.
+    if q.depth > 500 {
+        return Err(exec_err("54001", "stack depth limit exceeded".to_string()));
+    }
     // v2.34: pg_stat function-call counting (track_functions GUC;
     // 'pl' counts plpgsql only, 'all' counts every user function).
     {
@@ -6326,6 +7236,42 @@ pub(crate) fn eval_func(
                         .and_then(|s| s.comment.clone())
                         .map(|c| Value::text(c))
                         .unwrap_or(Value::Null),
+                    _ => Value::Null,
+                });
+            }
+            // v2.45: function comments (COMMENT ON FUNCTION, read
+            // back by regprocedure identity or bare OID).
+            if cat.as_ref() == "pg_proc" {
+                let lookup = |db: &crate::storage::Database, fname: &str| {
+                    db.functions
+                        .get(fname)
+                        .or_else(|| {
+                            db.functions
+                                .iter()
+                                .find(|(k, _)| k.rsplit('.').next() == Some(fname))
+                                .map(|(_, v)| v)
+                        })
+                        .and_then(|defs| defs.first())
+                        .and_then(|d| d.comment.clone())
+                };
+                return Ok(match &v0 {
+                    Value::Int(oid) => {
+                        let mut names: Vec<&String> = q.eng.db.functions.keys().collect();
+                        names.sort();
+                        match names.get((*oid as usize).saturating_sub(40000)) {
+                            Some(n) if *oid >= 40000 => {
+                                lookup(&q.eng.db, n).map(Value::text).unwrap_or(Value::Null)
+                            }
+                            _ => Value::Null,
+                        }
+                    }
+                    Value::Text(s) | Value::BpChar(s) => {
+                        let fname = s.split('(').next().unwrap_or("").trim();
+                        let fname = fname.rsplit('.').next().unwrap_or(fname);
+                        lookup(&q.eng.db, fname)
+                            .map(Value::text)
+                            .unwrap_or(Value::Null)
+                    }
                     _ => Value::Null,
                 });
             }

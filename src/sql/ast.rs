@@ -5240,6 +5240,12 @@ pub enum PlpgsqlStmt {
         /// v2.11: `USING message = <expr>` override, stored as a
         /// parsed `SELECT <expr>`.
         using_message: Option<Box<Stmt>>,
+        /// v2.45: PG19 `exec_stmt_raise` rejects a RAISE option that
+        /// was already specified (by the format string, a condition
+        /// name, or an earlier USING item) with 42601 "RAISE option
+        /// already specified: <NAME>" — at RUN time, so the conflict
+        /// is recorded here and raised by the executor.
+        conflict: Option<String>,
     },
     /// v1.03: `var := <expr>` — scalar assignment to a DECLAREd variable.
     /// Stored as the parsed `SELECT <expr>` (always `Stmt::Select`,
@@ -5259,6 +5265,10 @@ pub enum PlpgsqlStmt {
         /// `query` then holds the `SELECT <expr>` yielding the
         /// command string instead of the query itself.
         dynamic: bool,
+        /// v2.45: `FOR ... IN EXECUTE <expr> USING <expr>, ...` —
+        /// USING values bind `$1..` in the dynamic command (PG19
+        /// pl_gram.y FOR loop over EXECUTE). Empty for plain queries.
+        using: Vec<Stmt>,
     },
     /// v1.03: `RETURN NEXT <expr>` — only valid in `RETURNS SETOF`
     /// functions (enforced at parse). Stored as the parsed
@@ -5409,6 +5419,17 @@ pub enum PlpgsqlStmt {
     },
     /// v2.12: `CLOSE <var>` (PG19 PLPGSQL_STMT_CLOSE).
     Close { var: String },
+    /// v2.45: `FOREACH <var>[, ...] [SLICE <n>] IN ARRAY <expr> LOOP
+    /// ... END LOOP` (PG19 PLPGSQL_STMT_FOREACH_A). The array
+    /// expression is stored as a parsed `SELECT <expr>`. With
+    /// several vars they form a row target: each iterated element
+    /// must be a record whose fields fill the vars in order.
+    Foreach {
+        vars: Vec<String>,
+        slice: i64,
+        array: Box<Stmt>,
+        body: Vec<PlpgsqlStmt>,
+    },
     /// v2.12: `FOR <var> IN <cursor>[(args)] LOOP ... END LOOP`
     /// (PG19 PLPGSQL_STMT_FORC over a cursor): opens the cursor,
     /// binds each fetched row to the record variable, and closes
@@ -5434,6 +5455,17 @@ pub enum PlpgsqlStmt {
     /// v2.11: `$n := <expr>` — assignment to a positional parameter
     /// (an OUT/INOUT argument in PG).
     AssignParam { index: u32, select: Stmt },
+    /// v2.45: `var[sub][...] := <expr>` and `rec.field[sub] := <expr>`
+    /// — subscript assignment into an array variable or an array
+    /// field of a record variable (PG19 PLPGSQL_STMT_ASSIGN with an
+    /// indirection on the target). Indices and the value are stored
+    /// as parsed `SELECT <expr>` statements.
+    AssignSubscript {
+        var: String,
+        field: Option<String>,
+        indices: Vec<Stmt>,
+        select: Stmt,
+    },
     /// v2.11: `GET [STACKED] DIAGNOSTICS <target> = <item> [, ...]`
     /// (PG19 PLPGSQL_STMT_GETDIAG). Items are lowercased item names
     /// (`row_count`, `returned_sqlstate`, ...).
@@ -5508,6 +5540,21 @@ pub struct PlpgsqlBody {
     /// v2.11: the body's `<<label>>`, if any (for label-qualified
     /// variable references like `outer.rec.field`).
     pub label: Option<String>,
+    /// v2.45: a leading `#variable_conflict <mode>` option line
+    /// (PG19 pl_comp.c): "error" | "use_variable" | "use_column".
+    /// Overrides the plpgsql.variable_conflict GUC for this body.
+    pub variable_conflict: Option<String>,
+    /// v2.45: a leading `#print_strict_params on|off` option line
+    /// (PG19 pl_comp.c). None = no directive; the executor falls
+    /// back to the plpgsql.print_strict_params GUC. When on, STRICT
+    /// row-count errors carry the query parameters in DETAIL.
+    pub print_strict_params: Option<bool>,
+    /// v2.45: set by the CREATE-time rewriter when the effective
+    /// variable-conflict mode is "error" and a body query references
+    /// a name that is both a variable and a column of one of the
+    /// query's tables (PG19 raises 42702 at first execution). The
+    /// executor raises it when the body starts running.
+    pub conflict_error: Option<String>,
     pub stmts: Vec<PlpgsqlStmt>,
     pub handlers: Vec<PlpgsqlHandler>,
     /// v1.96 finishing pass: the main statement list ends with the
@@ -5571,6 +5618,18 @@ pub struct PlpgsqlDecl {
     /// pl_gram.y decl_statement opt_collate). The executor seeds
     /// the variable's tracked collation from it.
     pub collation: Option<String>,
+    /// v2.45: the declaration carried NOT NULL (PG19
+    /// PLpgSQL_var.notnull): assigning NULL is 22004
+    /// (pl_exec.c exec_assign_value).
+    pub not_null: bool,
+    /// v2.45: the scalar typmod written on the declaration's type
+    /// (`numeric(4,2)` -> (4, 2); `numeric(4)` -> (4, 0)), retained
+    /// separately because `type_name` carries the bare name for
+    /// catalog resolution. PG19 enforces it on assignment —
+    /// including the element coercion of a subscript assignment
+    /// (bug #5717) — where the bare-name model previously dropped
+    /// it entirely.
+    pub typmod: Option<(u32, i32)>,
 }
 
 /// v1.01: sentinel for the OTHERS pseudo-condition (never a real
@@ -6124,6 +6183,9 @@ pub(crate) fn parse_plpgsql_raise(rest: &str) -> Result<PlpgsqlStmt, SqlError> {
     };
     let mut sqlstate: Option<RaiseCode> = None;
     let mut using_message: Option<Box<Stmt>> = None;
+    // v2.45: USING option display names in order, for the
+    // run-time "RAISE option already specified" check.
+    let mut using_names: Vec<&'static str> = Vec::new();
     if let Some(u) = using_text {
         for part in split_top_level_commas(u) {
             let part = part.trim();
@@ -6144,6 +6206,7 @@ pub(crate) fn parse_plpgsql_raise(rest: &str) -> Result<PlpgsqlStmt, SqlError> {
             };
             match name.as_str() {
                 "message" => {
+                    using_names.push("MESSAGE");
                     let st =
                         parse_statement(&format!("SELECT {}", value)).map_err(|e| SqlError {
                             message: format!("syntax error in RAISE USING message: {}", e.message),
@@ -6157,6 +6220,7 @@ pub(crate) fn parse_plpgsql_raise(rest: &str) -> Result<PlpgsqlStmt, SqlError> {
                     using_message = Some(Box::new(st));
                 }
                 "errcode" => {
+                    using_names.push("ERRCODE");
                     // Literal string or condition name resolve now;
                     // anything else evaluates at run time.
                     if let Some((lit, tail)) = plpgsql_parse_string_literal(value) {
@@ -6187,6 +6251,16 @@ pub(crate) fn parse_plpgsql_raise(rest: &str) -> Result<PlpgsqlStmt, SqlError> {
                 // table / schema: parsed for validity, not stored
                 // (the engine has no error-field model for them).
                 _ => {
+                    match name.as_str() {
+                        "detail" => using_names.push("DETAIL"),
+                        "hint" => using_names.push("HINT"),
+                        "column" => using_names.push("COLUMN"),
+                        "constraint" => using_names.push("CONSTRAINT"),
+                        "datatype" => using_names.push("DATATYPE"),
+                        "table" => using_names.push("TABLE"),
+                        "schema" => using_names.push("SCHEMA"),
+                        _ => {}
+                    }
                     let _ =
                         parse_statement(&format!("SELECT {}", value)).map_err(|e| SqlError {
                             message: format!("syntax error in RAISE USING {}: {}", name, e.message),
@@ -6196,10 +6270,30 @@ pub(crate) fn parse_plpgsql_raise(rest: &str) -> Result<PlpgsqlStmt, SqlError> {
             }
         }
     }
+    // v2.45: PG19 exec_stmt_raise option-conflict scan: the format
+    // string pre-sets MESSAGE, a condition name (or SQLSTATE)
+    // pre-sets ERRCODE; scanning the USING items in order, the
+    // first already-set option is the run-time 42601.
+    let raise_conflict = |preset_msg: bool, preset_code: bool| -> Option<String> {
+        let mut seen = std::collections::HashSet::new();
+        if preset_msg {
+            seen.insert("MESSAGE");
+        }
+        if preset_code {
+            seen.insert("ERRCODE");
+        }
+        for n in &using_names {
+            if !seen.insert(n) {
+                return Some((*n).to_string());
+            }
+        }
+        None
+    };
     // Level / condition / SQLSTATE / bare format string.
     let mut level = RaiseLevel::Exception;
     let mut rest2 = main;
     let mut default_msg: Option<String> = None;
+    let mut cond_named = false;
     let first_word: String = {
         let mut w = String::new();
         for c in main.chars() {
@@ -6253,12 +6347,14 @@ pub(crate) fn parse_plpgsql_raise(rest: &str) -> Result<PlpgsqlStmt, SqlError> {
                     args: Vec::new(),
                     sqlstate,
                     using_message,
+                    conflict: raise_conflict(false, true),
                 });
             }
             _ => {
                 if let Ok(codes) = plpgsql_condition_named(&first_word) {
                     // RAISE <condition name>: the level is EXCEPTION
                     // and the code is the condition's SQLSTATE.
+                    cond_named = true;
                     if sqlstate.is_none() {
                         if let Some(c) = codes.into_iter().next() {
                             sqlstate = Some(RaiseCode::Lit(c));
@@ -6274,12 +6370,14 @@ pub(crate) fn parse_plpgsql_raise(rest: &str) -> Result<PlpgsqlStmt, SqlError> {
     }
     // Format string + optional `, args`.
     let mut format = String::new();
+    let mut format_explicit = false;
     let mut args: Vec<Expr> = Vec::new();
     let r = rest2.trim();
     if !r.is_empty() {
         let (fmt, after_fmt) = plpgsql_parse_string_literal(r)
             .ok_or_else(|| syntax("RAISE requires a format string literal".to_string()))?;
         format = fmt;
+        format_explicit = true;
         let after_fmt = after_fmt.trim_start();
         if !after_fmt.is_empty() {
             let list = after_fmt
@@ -6318,6 +6416,44 @@ pub(crate) fn parse_plpgsql_raise(rest: &str) -> Result<PlpgsqlStmt, SqlError> {
     } else if let Some(m) = default_msg {
         format = m;
     }
+    // v2.45: PG19 validates the format's placeholder count against
+    // the argument list at compile time (pl_gram.y read_raise_stmt:
+    // each unescaped % consumes one argument).
+    if !format.is_empty() {
+        let mut placeholders = 0usize;
+        let mut chars = format.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '%' {
+                if chars.peek() == Some(&'%') {
+                    chars.next();
+                } else {
+                    placeholders += 1;
+                }
+            }
+        }
+        if args.len() > placeholders {
+            return Err(syntax(
+                "too many parameters specified for RAISE".to_string(),
+            ));
+        }
+        if args.len() < placeholders {
+            return Err(syntax("too few parameters specified for RAISE".to_string()));
+        }
+    }
+    // v2.45: `RAISE [level] USING <options>` with no format and no
+    // MESSAGE option is legal (PG19): the message defaults to the
+    // errcode's condition name (spaces for underscores), or
+    // "raise_exception" for the default P0001.
+    if format.is_empty() && using_text.is_some() && using_message.is_none() {
+        format = match &sqlstate {
+            Some(RaiseCode::Lit(code)) => PLPGSQL_CONDITIONS
+                .iter()
+                .find(|(_, c)| *c == code.as_str())
+                .map(|(n, _)| n.replace('_', " "))
+                .unwrap_or_else(|| "raise_exception".to_string()),
+            _ => "raise_exception".to_string(),
+        };
+    }
     // v1.02 compat: a bare level with no format, no condition, and
     // no USING message stays a 42601 (the engine's recorded bounded
     // behavior for `RAISE NOTICE;`).
@@ -6330,6 +6466,7 @@ pub(crate) fn parse_plpgsql_raise(rest: &str) -> Result<PlpgsqlStmt, SqlError> {
         args,
         sqlstate,
         using_message,
+        conflict: raise_conflict(format_explicit, cond_named),
     })
 }
 
@@ -6731,6 +6868,8 @@ pub(crate) fn parse_plpgsql_decl(text: &str) -> Result<PlpgsqlDecl, SqlError> {
             cursor_scroll: None,
             is_constant: false,
             collation: None,
+            not_null: false,
+            typmod: None,
         });
     }
     // CURSOR declaration (v2.12, full form): `name [SCROLL | NO
@@ -6804,6 +6943,8 @@ pub(crate) fn parse_plpgsql_decl(text: &str) -> Result<PlpgsqlDecl, SqlError> {
                 cursor_scroll: scroll,
                 is_constant,
                 collation: None,
+                not_null: false,
+                typmod: None,
             });
         }
     }
@@ -6855,7 +6996,9 @@ pub(crate) fn parse_plpgsql_decl(text: &str) -> Result<PlpgsqlDecl, SqlError> {
     // Clean the type text: drop NOT NULL / CONSTANT / COLLATE <name>.
     // v2.22: the COLLATE name is KEPT (decl_collation) — a declared
     // variable collation drives body collation propagation.
+    // v2.45: NOT NULL is kept too (decl_not_null).
     let mut decl_collation: Option<String> = None;
+    let mut decl_not_null = false;
     let mut ty = type_part.trim().to_string();
     loop {
         let before = ty.clone();
@@ -6869,6 +7012,9 @@ pub(crate) fn parse_plpgsql_decl(text: &str) -> Result<PlpgsqlDecl, SqlError> {
         }
         for kw in ["not null", "constant"] {
             if let Some(p) = find_top_level_phrase(&ty, kw) {
+                if kw == "not null" {
+                    decl_not_null = true;
+                }
                 ty = format!("{}{}", &ty[..p], &ty[p + kw.len()..])
                     .trim()
                     .to_string();
@@ -6879,11 +7025,32 @@ pub(crate) fn parse_plpgsql_decl(text: &str) -> Result<PlpgsqlDecl, SqlError> {
         }
     }
     let ty = ty.split_whitespace().collect::<Vec<_>>().join(" ");
+    // v2.45: trailing array-dimension groups (`[1]`, `[]`, `[2][3]`)
+    // come off first — the type is the element type's array either
+    // way (PG19 does not make dimensions part of the type), and a
+    // dimension after a typmod (`numeric(4,2)[1]`) previously left
+    // the whole text unresolvable (42704 at CREATE).
+    let mut ty = ty;
+    let mut is_array = false;
+    loop {
+        let t = ty.trim_end();
+        if !t.ends_with(']') {
+            break;
+        }
+        let Some(open) = t.rfind('[') else { break };
+        let inside = &t[open + 1..t.len() - 1];
+        if !inside.chars().all(|c| c.is_ascii_digit()) {
+            break;
+        }
+        is_array = true;
+        ty = t[..open].trim_end().to_string();
+    }
     // v2.11: a trailing typmod (`char(2)`, `numeric(10,2)`,
     // `varchar(10)`) is not part of the type name the catalog
-    // resolves; drop it (assignment-time length enforcement via
-    // typmod is out of scope, matching how function argument types
-    // carry no typmod either).
+    // resolves; drop it from `type_name` — but v2.45 retains it on
+    // the decl (decl_typmod) because PG19 enforces it when a value
+    // is assigned to the variable (element coercion included).
+    let mut decl_typmod: Option<(u32, i32)> = None;
     let ty = if ty.ends_with(')') {
         match ty.rfind('(') {
             Some(p)
@@ -6891,10 +7058,23 @@ pub(crate) fn parse_plpgsql_decl(text: &str) -> Result<PlpgsqlDecl, SqlError> {
                     .chars()
                     .all(|c| c.is_ascii_digit() || c == ',' || c == ' ') =>
             {
+                let parts: Vec<&str> = ty[p + 1..ty.len() - 1].split(',').collect();
+                if let Ok(prec) = parts[0].trim().parse::<u32>() {
+                    let scale = parts
+                        .get(1)
+                        .and_then(|s| s.trim().parse::<i32>().ok())
+                        .unwrap_or(0);
+                    decl_typmod = Some((prec, scale));
+                }
                 ty[..p].trim_end().to_string()
             }
             _ => ty,
         }
+    } else {
+        ty
+    };
+    let ty = if is_array && !ty.is_empty() {
+        format!("{}[]", ty)
     } else {
         ty
     };
@@ -6914,6 +7094,8 @@ pub(crate) fn parse_plpgsql_decl(text: &str) -> Result<PlpgsqlDecl, SqlError> {
         cursor_scroll: None,
         is_constant,
         collation: decl_collation,
+        not_null: decl_not_null,
+        typmod: decl_typmod,
     })
 }
 
@@ -7198,6 +7380,8 @@ pub(crate) fn ensure_loop_decl(decls: &mut Vec<PlpgsqlDecl>, var: &str, type_nam
         cursor_scroll: None,
         is_constant: false,
         collation: None,
+        not_null: false,
+        typmod: None,
     });
 }
 
@@ -7222,6 +7406,12 @@ pub(crate) fn parse_plpgsql_stmt_list(
             let e = gather_construct(&chunks, i, GatherKind::If);
             let raw = chunks[i..=e].join(";\n");
             let stmt = parse_plpgsql_if(&raw, decls)?;
+            plpgsql_push_stmt2(&mut out, stmt, "body")?;
+            i = e + 1;
+        } else if plpgsql_starts_with_kw(c, "foreach") {
+            let e = gather_construct(&chunks, i, GatherKind::Loop);
+            let raw = chunks[i..=e].join(";\n");
+            let stmt = parse_plpgsql_foreach(&raw, decls)?;
             plpgsql_push_stmt2(&mut out, stmt, "body")?;
             i = e + 1;
         } else if plpgsql_starts_with_kw(c, "for") {
@@ -7329,8 +7519,13 @@ pub(crate) fn parse_plpgsql_block_contents(
         } else {
             vec![first]
         };
+        // v2.45: a WHEN only opens a new handler group at construct
+        // depth 0 — a nested block inside a handler has its own
+        // EXCEPTION/WHEN chunks, which are handler-body content
+        // (excpt_test3's nested BEGIN..EXCEPTION inside a handler).
+        let mut hdepth: i64 = 0;
         for c in pending.drain(..).chain(handler_chunks[1..].iter().cloned()) {
-            if plpgsql_starts_with_kw(&c, "when") {
+            if hdepth == 0 && plpgsql_starts_with_kw(&c, "when") {
                 groups.push((Vec::new(), Vec::new()));
                 let (sqlstates, frag) = parse_plpgsql_when_header(&c)?;
                 groups.last_mut().unwrap().0 = sqlstates;
@@ -7339,9 +7534,18 @@ pub(crate) fn parse_plpgsql_block_contents(
                 }
             } else {
                 match groups.last_mut() {
-                    Some(g) => g.1.push(c),
+                    Some(g) => g.1.push(c.clone()),
                     None => return Err(syntax("expected WHEN after EXCEPTION".to_string())),
                 }
+            }
+            for kind in [
+                GatherKind::If,
+                GatherKind::Loop,
+                GatherKind::Block,
+                GatherKind::Case,
+            ] {
+                let (o, cl) = gather_delta(&c, kind);
+                hdepth += o as i64 - cl as i64;
             }
         }
         if groups.is_empty() {
@@ -7645,6 +7849,97 @@ pub(crate) fn plpgsql_top_level_dotdot(s: &str) -> Option<usize> {
 /// v2.11: parse a `FOR ... END LOOP` raw span: range form, EXECUTE
 /// form, or query form (PG19 PLPGSQL_STMT_FORC / DYNFORS / FORS).
 /// Undeclared loop variables are auto-declared (integer / record).
+/// v2.45: parse a FOREACH statement (the full raw span, PG19
+/// pl_gram.y `stmt_foreach_a`): `FOREACH <var>[, ...] [SLICE <n>]
+/// IN ARRAY <expr> LOOP <body> END LOOP`.
+pub(crate) fn parse_plpgsql_foreach(
+    text: &str,
+    decls: &mut Vec<PlpgsqlDecl>,
+) -> Result<PlpgsqlStmt, SqlError> {
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let t = text.trim();
+    let rest = plpgsql_strip_kw(t, "foreach")
+        .ok_or_else(|| syntax("expected FOREACH".to_string()))?
+        .trim()
+        .to_string();
+    // Find the LOOP that terminates the header: the first LOOP
+    // position whose head parses as `<vars> [SLICE n] IN ARRAY
+    // <expr>`.
+    let mut found: Option<(Vec<String>, i64, Stmt, String)> = None;
+    for lp in plpgsql_kw_positions(&rest, "loop") {
+        let head = rest[..lp].trim();
+        // Vars end at the SLICE or IN keyword.
+        let (vars_text, mut tail) = match plpgsql_top_level_kw(head, "slice") {
+            Some(sp) => (&head[..sp], &head[sp..]),
+            None => match plpgsql_top_level_kw(head, "in") {
+                Some(ip) => (&head[..ip], &head[ip..]),
+                None => continue,
+            },
+        };
+        let mut vars: Vec<String> = Vec::new();
+        let mut ok = true;
+        for part in vars_text.split(',') {
+            let part = part.trim();
+            match split_ident(part) {
+                Some((name, r)) if r.trim().is_empty() => vars.push(name),
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok || vars.is_empty() {
+            continue;
+        }
+        let mut slice: i64 = 0;
+        if let Some(after) = plpgsql_strip_kw(tail, "slice") {
+            let after = after.trim_start();
+            let digits: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '-')
+                .collect();
+            let Ok(n) = digits.parse::<i64>() else {
+                continue;
+            };
+            slice = n;
+            tail = after[digits.len()..].trim_start();
+        }
+        let Some(after_in) = plpgsql_strip_kw(tail, "in") else {
+            continue;
+        };
+        let Some(expr_text) = plpgsql_strip_kw(after_in.trim_start(), "array") else {
+            continue;
+        };
+        let expr_text = expr_text.trim();
+        let Ok(st) = parse_statement(&format!("SELECT {}", expr_text)) else {
+            continue;
+        };
+        if !matches!(st, Stmt::Select(_)) {
+            continue;
+        }
+        found = Some((vars, slice, st, rest[lp + 4..].trim().to_string()));
+        break;
+    }
+    let (vars, slice, array, body_after) = found.ok_or_else(|| {
+        syntax("FOREACH requires <vars> [SLICE n] IN ARRAY <expr> LOOP".to_string())
+    })?;
+    let inner = plpgsql_strip_end_loop(&body_after)
+        .ok_or_else(|| syntax("FOREACH loop without END LOOP".to_string()))?;
+    for v in &vars {
+        ensure_loop_decl(decls, v, "record");
+    }
+    let body = parse_plpgsql_stmt_list(inner, decls)?;
+    Ok(PlpgsqlStmt::Foreach {
+        vars,
+        slice,
+        array: Box::new(array),
+        body,
+    })
+}
+
 pub(crate) fn parse_plpgsql_for(
     text: &str,
     decls: &mut Vec<PlpgsqlDecl>,
@@ -7744,7 +8039,33 @@ pub(crate) fn parse_plpgsql_for(
     }
     // EXECUTE form.
     if plpgsql_starts_with_kw(&source, "execute") {
-        let expr_text = plpgsql_strip_kw(&source, "execute").unwrap_or("").trim();
+        let expr_full = plpgsql_strip_kw(&source, "execute").unwrap_or("").trim();
+        // v2.45: split an optional trailing USING list (PG19 allows
+        // `FOR v IN EXECUTE <expr> USING <expr>, ... LOOP`).
+        let (expr_text, using) = match plpgsql_top_level_kw(expr_full, "using") {
+            Some(up) => {
+                let mut using = Vec::new();
+                for part in split_top_level_commas(expr_full[up + 5..].trim()) {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        continue;
+                    }
+                    let ust =
+                        parse_statement(&format!("SELECT {}", part)).map_err(|e| SqlError {
+                            message: format!("syntax error in FOR EXECUTE USING: {}", e.message),
+                            code: "42601",
+                        })?;
+                    if !matches!(ust, Stmt::Select(_)) {
+                        return Err(syntax(
+                            "FOR EXECUTE USING item did not parse as an expression".to_string(),
+                        ));
+                    }
+                    using.push(ust);
+                }
+                (expr_full[..up].trim(), using)
+            }
+            None => (expr_full, Vec::new()),
+        };
         let st = parse_statement(&format!("SELECT {}", expr_text)).map_err(|e| SqlError {
             message: format!("syntax error in FOR EXECUTE: {}", e.message),
             code: "42601",
@@ -7761,6 +8082,7 @@ pub(crate) fn parse_plpgsql_for(
             query: st,
             body,
             dynamic: true,
+            using,
         });
     }
     // Query form.
@@ -7783,6 +8105,7 @@ pub(crate) fn parse_plpgsql_for(
         query,
         body,
         dynamic: false,
+        using: Vec::new(),
     })
 }
 
@@ -8263,6 +8586,120 @@ pub(crate) fn plpgsql_try_assign(t: &str) -> Option<(PlTarget, &str)> {
     Some((target, rhs))
 }
 
+/// v2.45: parse a subscript assignment target:
+/// `<var>[<idx>, ...] := <expr>` or `<var>.<field>[<idx>] := <expr>`.
+/// Returns None when the text is not of that shape (the caller's
+/// other assignment forms then apply).
+pub(crate) fn parse_plpgsql_subscript_assign(t: &str) -> Option<Result<PlpgsqlStmt, SqlError>> {
+    let syntax = |msg: String| SqlError {
+        message: msg,
+        code: "42601",
+    };
+    let t = t.trim();
+    let (name, r) = split_ident(t)?;
+    let r = r.trim_start();
+    let (field, r) = if let Some(f) = r.strip_prefix('.') {
+        let (field, r2) = split_ident(f)?;
+        (Some(field), r2.trim_start())
+    } else {
+        (None, r)
+    };
+    if !r.starts_with('[') {
+        return None;
+    }
+    // v2.45: chained bracket groups `a[i][j] := ...` — scan one
+    // group at a time (string-aware, bracket-depth aware) and
+    // collect every index before the assignment operator.
+    let mut indices = Vec::new();
+    let mut rest = r;
+    let rhs = loop {
+        let chars: Vec<char> = rest.chars().collect();
+        let mut depth = 0i32;
+        let mut close: Option<usize> = None;
+        let mut i = 0usize;
+        let mut byte_pos: Vec<usize> = rest.char_indices().map(|(b, _)| b).collect();
+        byte_pos.push(rest.len());
+        while i < chars.len() {
+            match chars[i] {
+                '\'' => {
+                    i += 1;
+                    while i < chars.len() {
+                        if chars[i] == '\'' {
+                            if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                                i += 2;
+                                continue;
+                            }
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                '[' => {
+                    depth += 1;
+                    i += 1;
+                }
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        let close = close?;
+        let idx_text = &rest[byte_pos[1]..byte_pos[close]];
+        for part in split_top_level_commas(idx_text) {
+            let part = part.trim();
+            if part.is_empty() {
+                return Some(Err(syntax("empty subscript in assignment".to_string())));
+            }
+            match parse_statement(&format!("SELECT {}", part)) {
+                Ok(st @ Stmt::Select(_)) => indices.push(st),
+                _ => {
+                    return Some(Err(syntax(format!(
+                        "syntax error in subscript: {}",
+                        part.chars().take(40).collect::<String>()
+                    ))));
+                }
+            }
+        }
+        let after = rest[byte_pos[close] + 1..].trim_start();
+        if after.starts_with('[') {
+            rest = after;
+            continue;
+        }
+        if let Some(x) = after.strip_prefix(":=") {
+            break x;
+        } else if after.starts_with('=') && !after.starts_with("==") && !after.starts_with("=>") {
+            break &after[1..];
+        } else {
+            return None;
+        }
+    };
+    let rhs = rhs.trim();
+    if rhs.is_empty() {
+        return None;
+    }
+    let stmt = match parse_statement(&format!("SELECT {}", rhs)) {
+        Ok(st @ Stmt::Select(_)) => st,
+        _ => {
+            return Some(Err(syntax(
+                "assignment expression did not parse as SELECT".to_string(),
+            )));
+        }
+    };
+    Some(Ok(PlpgsqlStmt::AssignSubscript {
+        var: name,
+        field,
+        indices,
+        select: stmt,
+    }))
+}
+
 /// v2.11: parse a SELECT-with-INTO statement text (`SELECT ...` or
 /// `WITH ... SELECT ...`). Returns None when the text has no
 /// top-level INTO (the caller then treats it as a bare query).
@@ -8415,36 +8852,35 @@ pub(crate) fn parse_plpgsql_execute(rest: &str) -> Result<PlpgsqlStmt, SqlError>
     }
     let mut targets: Option<Vec<PlTarget>> = None;
     let mut strict = false;
+    // v2.45: PG19's grammar allows INTO and USING in either order
+    // (pl_gram.y execstmt_execute: the INTO target list ends where
+    // USING begins and vice versa). Segment each clause by the
+    // other clause's keyword position.
     if let Some(ip) = into_pos {
-        let after = rest[ip + 4..].trim_start();
-        let (mut after, st) = if plpgsql_starts_with_kw(after, "strict") {
-            (
-                plpgsql_strip_kw(after, "strict").unwrap_or("").trim_start(),
-                true,
-            )
-        } else {
-            (after, false)
+        let seg_end = match using_pos {
+            Some(up) if up > ip => up,
+            _ => rest.len(),
         };
-        strict = st;
-        if let Some(up_rel) = plpgsql_top_level_kw(after, "using") {
-            after = after[..up_rel].trim_end();
-            let _ = &mut after;
-        }
-        let text = if let Some(up_rel) = plpgsql_top_level_kw(rest[ip + 4..].trim_start(), "using")
-        {
-            rest[ip + 4..].trim_start()[..up_rel].trim()
+        let after = rest[ip + 4..seg_end].trim();
+        let after = if plpgsql_starts_with_kw(after, "strict") {
+            strict = true;
+            plpgsql_strip_kw(after, "strict").unwrap_or("").trim()
         } else {
             after
         };
         let mut ts = Vec::new();
-        for part in split_top_level_commas(text) {
+        for part in split_top_level_commas(after) {
             ts.push(parse_pl_target(part)?);
         }
         targets = Some(ts);
     }
     let mut using: Vec<Stmt> = Vec::new();
     if let Some(up) = using_pos {
-        let list = rest[up + 5..].trim();
+        let seg_end = match into_pos {
+            Some(ip) if ip > up => ip,
+            _ => rest.len(),
+        };
+        let list = rest[up + 5..seg_end].trim();
         for part in split_top_level_commas(list) {
             let part = part.trim();
             if part.is_empty() {
@@ -8592,8 +9028,10 @@ pub(crate) fn parse_plpgsql_open(rest: &str) -> Result<PlpgsqlStmt, SqlError> {
         }
         return Ok(PlpgsqlStmt::OpenBound { var, args });
     }
-    // Optional [NO] SCROLL.
-    let mut scroll = false;
+    // Optional [NO] SCROLL. v2.45: unspecified is planner-decided
+    // in PG19 and materialized portals here can scan backward, so
+    // the default is scrollable; only NO SCROLL forbids it.
+    let mut scroll = true;
     if plpgsql_starts_with_kw(&r, "scroll") {
         scroll = true;
         r = plpgsql_strip_kw(&r, "scroll")
@@ -8603,6 +9041,7 @@ pub(crate) fn parse_plpgsql_open(rest: &str) -> Result<PlpgsqlStmt, SqlError> {
     } else if plpgsql_starts_with_kw(&r, "no") {
         let after = plpgsql_strip_kw(&r, "no").unwrap_or("").trim_start();
         if plpgsql_starts_with_kw(after, "scroll") {
+            scroll = false;
             r = plpgsql_strip_kw(after, "scroll")
                 .unwrap_or("")
                 .trim()
@@ -8896,6 +9335,10 @@ pub(crate) fn parse_plpgsql_stmt(text: &str) -> Result<PlpgsqlStmt, SqlError> {
             let st = parse_statement(q).map_err(|_| unsupported(t))?;
             return match st {
                 Stmt::Select(_) => Ok(PlpgsqlStmt::ReturnQuery(Box::new(st))),
+                // v2.45: `RETURN QUERY SELECT ... INTO t` parses
+                // (PG19 plans it as a SELECT INTO); the executor
+                // raises SPI's must-return-tuples error at run time.
+                Stmt::CreateTableAs { .. } => Ok(PlpgsqlStmt::ReturnQuery(Box::new(st))),
                 _ => Err(unsupported(t)),
             };
         } else {
@@ -9061,6 +9504,12 @@ pub(crate) fn parse_plpgsql_stmt(text: &str) -> Result<PlpgsqlStmt, SqlError> {
         }
         return Err(unsupported(t));
     }
+    // v2.45: subscript assignment `var[...] := expr` /
+    // `rec.field[...] := expr` (plpgsql_try_assign declines the
+    // bracket form).
+    if let Some(r) = parse_plpgsql_subscript_assign(t) {
+        return r;
+    }
     // Assignment: `target := expr` / `target = expr`.
     if let Some((target, rhs)) = plpgsql_try_assign(t) {
         // A statement keyword can never be an assignment target; the
@@ -9097,6 +9546,13 @@ pub(crate) fn parse_plpgsql_stmt(text: &str) -> Result<PlpgsqlStmt, SqlError> {
         | Stmt::Revoke { .. }
         | Stmt::GrantRole { .. }
         | Stmt::RevokeRole { .. } => Ok(PlpgsqlStmt::Utility(stmt)),
+        // v2.45: COMMENT ON inside a body (PG19 executes utility
+        // statements via SPI; the unreserved-keyword test pins a
+        // COMMENT ON FUNCTION in a body whose variable is also
+        // named `comment`).
+        Stmt::CommentOn { .. }
+        | Stmt::CommentOnTrigger { .. }
+        | Stmt::CommentOnConstraint { .. } => Ok(PlpgsqlStmt::Utility(stmt)),
         _ => Err(unsupported(t)),
     }
 }
@@ -9223,6 +9679,38 @@ pub fn parse_plpgsql_body(
         code: "42601",
     };
     let mut text = plpgsql_strip_comments(body).trim().to_string();
+    // v2.45: leading option lines (PG19 pl_comp.c reads them from
+    // the start of the body): `#variable_conflict <mode>` and
+    // `#print_strict_params <on|off>`, one per line.
+    let mut variable_conflict: Option<String> = None;
+    let mut print_strict_params: Option<bool> = None;
+    while text.starts_with('#') {
+        let (line, rest) = match text.find('\n') {
+            Some(p) => (
+                text[..p].trim().to_string(),
+                text[p + 1..].trim().to_string(),
+            ),
+            None => (text.clone(), String::new()),
+        };
+        let mut words = line[1..].split_whitespace();
+        match (words.next(), words.next()) {
+            (Some("variable_conflict"), Some(mode))
+                if matches!(mode, "error" | "use_variable" | "use_column") =>
+            {
+                variable_conflict = Some(mode.to_string());
+            }
+            (Some("print_strict_params"), Some(v)) => {
+                print_strict_params = Some(matches!(v, "on" | "true" | "yes" | "1"));
+            }
+            _ => {
+                return Err(syntax(format!(
+                    "unrecognized plpgsql option line: {}",
+                    line.chars().take(40).collect::<String>()
+                )));
+            }
+        }
+        text = rest;
+    }
     // Optional block label `<<name>>`.
     let mut label: Option<String> = None;
     if text.starts_with("<<") {
@@ -9272,7 +9760,35 @@ pub fn parse_plpgsql_body(
             cursor_scroll: None,
             is_constant: false,
             collation: None,
+            not_null: false,
+            typmod: None,
         });
+    }
+    // v2.45: SQLSTATE / SQLERRM — PG19 exposes them as special
+    // variables inside EXCEPTION handlers (pl_exec.c copies the
+    // current error's code and message text into them when a handler
+    // is entered). Modeled as implicit text decls seeded by the
+    // executor's handler paths; user declarations of the same names
+    // win (the names are not reserved in PG).
+    for special in ["sqlstate", "sqlerrm"] {
+        if !decls.iter().any(|d| d.name == special) {
+            decls.push(PlpgsqlDecl {
+                name: special.to_string(),
+                type_name: "text".to_string(),
+                default: None,
+                alias_for: None,
+                is_cursor: false,
+                implicit: true,
+                alias_slot: None,
+                cursor_query: None,
+                cursor_params: Vec::new(),
+                cursor_scroll: None,
+                is_constant: false,
+                collation: None,
+                not_null: false,
+                typmod: None,
+            });
+        }
     }
     plpgsql_validate_returns(&stmts, &handlers, returns_set, is_void, has_out)?;
     // v2.12: name validation also sees the function's argument
@@ -9295,6 +9811,8 @@ pub fn parse_plpgsql_body(
             cursor_scroll: None,
             is_constant: false,
             collation: None,
+            not_null: false,
+            typmod: None,
         });
     }
     plpgsql_validate_vars(&vdecls, &stmts, &handlers, label.as_deref())?;
@@ -9313,6 +9831,9 @@ pub fn parse_plpgsql_body(
     Ok(PlpgsqlBody {
         decls,
         label,
+        variable_conflict,
+        print_strict_params,
+        conflict_error: None,
         stmts,
         handlers,
         trailing_dummy,
@@ -9475,6 +9996,7 @@ pub fn parse_trigger_body(body: &str) -> Result<TriggerBody, SqlError> {
         unnamed_seq: 0,
         allow_similar_to: true,
         last_bit_typmod: None,
+        last_numeric_typmod: None,
         select_into: None,
     };
     p.parse_trigger_body_stmts()
@@ -10254,6 +10776,11 @@ pub enum Stmt {
         default: Option<DefaultExpr>,
         /// v1.92: bit(n)/bit varying(n) typmod of the base type.
         base_bit_typmod: Option<(i32, bool)>,
+        /// v2.45: numeric(p,s) typmod of the base type (or of its
+        /// element type when the base is an array) — the array
+        /// ColType drops it, so it travels beside the base like
+        /// the bit typmod does.
+        base_numeric_typmod: Option<(u32, i32)>,
         /// v2.21: the domain's declared `COLLATE name`, when written
         /// (PG19 DefineDomain: a domain carries a default collation
         /// for its columns).

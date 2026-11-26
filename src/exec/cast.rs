@@ -1948,6 +1948,38 @@ pub(crate) fn eval_cast_named(q: &mut Q, v: &Value, name: &str) -> Result<Value,
         }
         return Ok(Value::text(text.trim().to_string()));
     }
+    // v2.45: an array value cast to a named composite type is the
+    // `name[]` array cast (the parser keeps the bare composite
+    // marker for `t_rec[]`): cast each element through the
+    // composite path and retag the array's element kind as Record.
+    // PG19 array casts run the element cast per element; anonymous
+    // row elements take the target's field names/types positionally.
+    if let Value::Array(av) = v {
+        let is_composite_target = q
+            .eng
+            .db
+            .find_type(name)
+            .is_some_and(|st| st.composite.is_some())
+            || q.eng
+                .db
+                .find_table(name, q.snap, &q.all_xids, q.session)
+                .is_some();
+        if is_composite_target {
+            let mut elems = Vec::with_capacity(av.elems.len());
+            for e in &av.elems {
+                elems.push(match e {
+                    Value::Null => Value::Null,
+                    other => eval_cast_composite_inner(q, other, name)?,
+                });
+            }
+            return Ok(Value::Array(Box::new(crate::storage::ArrayVal {
+                elem: crate::storage::ArrayElem::Record,
+                dims: av.dims.clone(),
+                lower: av.lower.clone(),
+                elems,
+            })));
+        }
+    }
     eval_cast_composite_inner(q, v, name)
 }
 
@@ -2692,7 +2724,13 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
             }
         },
         // v0.73: no composite input function — nothing casts TO record.
-        ColType::Record => Err(cast_err(v, "record")),
+        // v2.45: record TEXT input parses through the anonymous
+        // record_in port (record[] element values round-trip through
+        // their text form; PG19 array_in/record_in accept it).
+        ColType::Record => match v {
+            Value::Text(s) | Value::BpChar(s) => parse_anonymous_record(s),
+            _ => Err(cast_err(v, "record")),
+        },
         // v0.73: PG19 has record->json and text->json casts.
         // v1.82: text input is validated like PG19's `json_in`
         // (utils/adt/json.c over common/jsonapi.c): malformed JSON is

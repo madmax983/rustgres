@@ -218,6 +218,23 @@ pub(crate) fn resolve_func_type_name(
     {
         return Ok(ColType::Regnamespace);
     }
+    // v2.45: the remaining OID-alias types in signature positions
+    // (coltype_by_name does not carry them; the type parser does).
+    // `RETURNS regprocedure` is pinned by the plpgsql suite's
+    // GET DIAGNOSTICS current_function test.
+    {
+        let bare = name
+            .rsplit_once('.')
+            .map(|(_, b)| b)
+            .unwrap_or(name)
+            .to_ascii_lowercase();
+        match bare.as_str() {
+            "regprocedure" => return Ok(ColType::Regprocedure),
+            "regproc" => return Ok(ColType::Regproc),
+            "regclass" => return Ok(ColType::Regclass),
+            _ => {}
+        }
+    }
     // v1.38: `cstring` is PG19's C-string pseudo-type (the argument
     // type of internal input functions like `int4in`). rustgres has no
     // Cstring value — internal functions receive the text directly —
@@ -278,6 +295,61 @@ pub(crate) fn resolve_func_type_name(
         if !elem.is_empty() {
             resolve_func_type_name(eng, snap, own, session, elem)?;
             return Ok(ColType::Composite);
+        }
+    }
+    // v2.45: `%TYPE` / `%ROWTYPE` in signature positions (PG19
+    // `parse_type.c` LookupTypeName with the pct_type suffix):
+    // `t.col%type` is the column's type; `t%rowtype` is t's
+    // composite rowtype. The table part may be schema-qualified.
+    // The suffix match is case-insensitive (decls write %TYPE).
+    let name_lower = name.to_ascii_lowercase();
+    if let Some(base) = name_lower
+        .ends_with("%rowtype")
+        .then(|| &name[..name.len() - 8])
+    {
+        let tname = base.rsplit('.').next().unwrap_or(base);
+        if eng.db.find_table(tname, snap, &[own], session).is_some()
+            || eng.db.find_view(tname, snap, own).is_some()
+            || eng.db.find_type(tname).is_some()
+        {
+            return Ok(ColType::Composite);
+        }
+        return Err(exec_err(
+            "42P01",
+            format!("relation \"{}\" does not exist", tname),
+        ));
+    }
+    if let Some(base) = name_lower
+        .ends_with("%type")
+        .then(|| &name[..name.len() - 5])
+    {
+        let parts: Vec<&str> = base.split('.').collect();
+        if parts.len() >= 2 {
+            let tname = parts[parts.len() - 2];
+            let col = parts[parts.len() - 1];
+            if let Some(t) = eng.db.find_table(tname, snap, &[own], session) {
+                if let Some((_, ct)) = t.columns.iter().find(|(cn, _)| cn == col) {
+                    return Ok(ct.clone());
+                }
+                return Err(exec_err(
+                    "42703",
+                    format!(
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        col, tname
+                    ),
+                ));
+            }
+            if let Some(st) = eng.db.find_type(tname) {
+                if let Some(fields) = &st.composite {
+                    if let Some((_, fty, _)) = fields.iter().find(|(f, _, _)| f == col) {
+                        return Ok(fty.clone());
+                    }
+                }
+            }
+            return Err(exec_err(
+                "42P01",
+                format!("relation \"{}\" does not exist", tname),
+            ));
         }
     }
     if let Some(st) = eng.db.find_type(name) {
@@ -660,7 +732,16 @@ pub(crate) fn parse_sql_func_body(
     // count is syntactically unambiguous (plain SELECT, no `*`,
     // no set operations; DML RETURNING list with no `*`); ambiguous
     // shapes defer to the existing call-time check.
-    if !returns_set && expected_fields.is_none() && !ret_type.eq_ignore_ascii_case("record") {
+    // v2.45: the whole scalar check is LANGUAGE sql only — PG19
+    // never applies check_sql_fn_retval to plpgsql, whose
+    // single-RETURN bodies flow through here via the desugar and
+    // must create even when the RETURN expression's type needs a
+    // call-time (possibly I/O) coercion (cast_invoker, compos).
+    if check_rowtype
+        && !returns_set
+        && expected_fields.is_none()
+        && !ret_type.eq_ignore_ascii_case("record")
+    {
         let unambiguous_count = match last {
             Stmt::Select(sel) => {
                 let unambiguous = sel.set_op.is_none()
@@ -1350,6 +1431,102 @@ fn check_getdiag_targets(
     Ok(())
 }
 
+/// v2.45: PG19's shadowed-variables extra check (pl_gram.y
+/// decl_varname): a non-implicit, non-alias declaration whose name
+/// is already visible from an enclosing scope raises 42P10
+/// "variable \"%s\" shadows a previously defined variable" when
+/// plpgsql.extra_errors includes shadowed_variables. `vis_names`
+/// is the outermost scope (argument + output-column names).
+pub(crate) fn plpgsql_shadow_check(
+    pb: &crate::sql::PlpgsqlBody,
+    vis_names: &[String],
+) -> Result<(), ExecError> {
+    use crate::sql::PlpgsqlStmt as S;
+    fn collect_nested(
+        stmts: &[crate::sql::PlpgsqlStmt],
+        acc: &mut std::collections::HashSet<usize>,
+    ) {
+        for s in stmts {
+            if let S::Block {
+                decl_idx,
+                stmts: inner,
+                handlers,
+                ..
+            } = s
+            {
+                for i in decl_idx {
+                    acc.insert(*i);
+                }
+                collect_nested(inner, acc);
+                for h in handlers {
+                    collect_nested(&h.stmts, acc);
+                }
+            }
+        }
+    }
+    fn check_one(
+        pb: &crate::sql::PlpgsqlBody,
+        idx: usize,
+        visible: &[String],
+    ) -> Result<(), ExecError> {
+        let d = &pb.decls[idx];
+        if d.implicit || d.alias_for.is_some() {
+            return Ok(());
+        }
+        if visible.iter().any(|v| v.eq_ignore_ascii_case(&d.name)) {
+            return Err(exec_err(
+                "42P10",
+                format!(
+                    "variable \"{}\" shadows a previously defined variable",
+                    d.name
+                ),
+            ));
+        }
+        Ok(())
+    }
+    fn walk(
+        pb: &crate::sql::PlpgsqlBody,
+        stmts: &[crate::sql::PlpgsqlStmt],
+        visible: &mut Vec<String>,
+    ) -> Result<(), ExecError> {
+        for s in stmts {
+            if let S::Block {
+                decl_idx,
+                stmts: inner,
+                handlers,
+                ..
+            } = s
+            {
+                let mark = visible.len();
+                for i in decl_idx {
+                    check_one(pb, *i, visible)?;
+                    visible.push(pb.decls[*i].name.clone());
+                }
+                walk(pb, inner, visible)?;
+                for h in handlers {
+                    walk(pb, &h.stmts, visible)?;
+                }
+                visible.truncate(mark);
+            }
+        }
+        Ok(())
+    }
+    let mut nested = std::collections::HashSet::new();
+    collect_nested(&pb.stmts, &mut nested);
+    let mut visible: Vec<String> = vis_names.to_vec();
+    for (i, d) in pb.decls.iter().enumerate() {
+        if nested.contains(&i) {
+            continue;
+        }
+        check_one(pb, i, &visible)?;
+        if !d.implicit && d.alias_for.is_none() {
+            visible.push(d.name.clone());
+        }
+    }
+    walk(pb, &pb.stmts, &mut visible)?;
+    Ok(())
+}
+
 pub(crate) fn exec_create_function(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -1369,6 +1546,43 @@ pub(crate) fn exec_create_function(
     // v1.32: PG19 resolves the language first (before return-type
     // resolution): unknown LANGUAGE is 42883, not a parse error.
     let lang = resolve_func_lang(lang_name)?;
+    // v2.45: PG19 resolves %TYPE / %ROWTYPE in the signature at
+    // CREATE (pg_proc records the resolved type), so canonicalize
+    // the stored type names: `t.col%type` becomes the column's
+    // type name, `t%rowtype` the table's own name. Everything
+    // downstream (call coercion, pg_proc display) then sees plain
+    // types. A failed resolution is the CREATE error, as in PG.
+    let canon_pct = |tn: &str| -> Result<String, ExecError> {
+        if !tn.contains('%') {
+            return Ok(tn.to_string());
+        }
+        let lower = tn.to_ascii_lowercase();
+        if lower.ends_with("%rowtype") {
+            let base = &tn[..tn.len() - 8];
+            return Ok(base.rsplit('.').next().unwrap_or(base).to_string());
+        }
+        if lower.ends_with("%type") {
+            let ct = resolve_func_type_name(eng, ctx.snap, ctx.own, ctx.session, tn)?;
+            return Ok(ct.pg_typname());
+        }
+        Ok(tn.to_string())
+    };
+    let args_owned: Vec<crate::sql::FuncArg> = args
+        .iter()
+        .map(|a| {
+            let mut a = a.clone();
+            a.type_name = canon_pct(&a.type_name)?;
+            Ok(a)
+        })
+        .collect::<Result<_, ExecError>>()?;
+    let args: &[crate::sql::FuncArg] = &args_owned;
+    let ret_owned: String = canon_pct(ret_type)?;
+    let ret_type: &str = &ret_owned;
+    let table_cols_owned: Vec<(String, String)> = table_cols
+        .iter()
+        .map(|(n, t)| Ok((n.clone(), canon_pct(t)?)))
+        .collect::<Result<_, ExecError>>()?;
+    let table_cols: &[(String, String)] = &table_cols_owned;
     // v2.12: PG19 VARIADIC rules (functioncmds.c): a VARIADIC
     // parameter must be the last input parameter and its declared
     // type must be an array type.
@@ -1690,6 +1904,14 @@ pub(crate) fn exec_create_function(
                     &vis_names,
                 )
                 .map_err(|e| exec_err(e.code, format!("plpgsql: {}", e.message)))?;
+                // v2.45: PG19 pl_gram.y decl_varname: with
+                // plpgsql.extra_errors = 'shadowed_variables', a
+                // declaration whose name is already visible from an
+                // enclosing scope (arguments, output columns, outer
+                // declarations) is a 42P10 error at compile time.
+                if crate::exec::plpgsql_extra_error("shadowed_variables") {
+                    plpgsql_shadow_check(&pb, &vis_names)?;
+                }
                 // v1.03: resolve DECLAREd variable types now (like PG's
                 // plpgsql validator at CREATE time).
                 // v2.11: ALIAS decls take the aliased argument's type;
@@ -1714,10 +1936,29 @@ pub(crate) fn exec_create_function(
                         continue;
                     }
                     if d.is_cursor
-                        || d.type_name.contains('%')
                         || d.type_name.eq_ignore_ascii_case("record")
                         || d.type_name.eq_ignore_ascii_case("refcursor")
                     {
+                        continue;
+                    }
+                    if d.type_name.contains('%') {
+                        // v2.45: canonicalize %TYPE decl types at
+                        // CREATE (PG resolves them in the validator);
+                        // the call path then sees plain types.
+                        // %ROWTYPE decls keep their written name:
+                        // the executor's record-decl detection keys
+                        // on the suffix (plpgsql_is_record_decl).
+                        // Unresolvable forms (e.g. %TYPE of another
+                        // variable) keep the written name.
+                        let tn = d.type_name.clone();
+                        let lower = tn.to_ascii_lowercase();
+                        if lower.ends_with("%type") && !lower.ends_with("%rowtype") {
+                            if let Ok(ct) =
+                                resolve_func_type_name(eng, ctx.snap, ctx.own, ctx.session, &tn)
+                            {
+                                d.type_name = ct.pg_typname();
+                            }
+                        }
                         continue;
                     }
                     resolve_func_type_name(eng, ctx.snap, ctx.own, ctx.session, &d.type_name)
@@ -1773,7 +2014,12 @@ pub(crate) fn exec_create_function(
                 let arg_names: Vec<Option<String>> = args.iter().map(|a| a.name.clone()).collect();
                 let arg_modes: Vec<u8> = args.iter().map(|a| a.mode.code()).collect();
                 inject_plpgsql_arg_vars(&mut pb, &arg_names, &arg_modes, table_cols);
-                rewrite_plpgsql_body_refs(&mut pb, &arg_names);
+                rewrite_plpgsql_body_refs(
+                    &mut pb,
+                    &arg_names,
+                    &|t| table_column_names(eng, t),
+                    Some(name),
+                );
                 plpgsql_body = Some(pb);
                 body
             }
@@ -1915,6 +2161,7 @@ pub(crate) fn exec_create_function(
         // v2.12: argument modes (IN/OUT/INOUT/VARIADIC), parallel
         // to arg_types.
         arg_modes: args.iter().map(|a| a.mode.code()).collect(),
+        comment: None,
     };
     // v1.96: record the function owner (DROP FUNCTION / GRANT checks).
     {
@@ -2374,7 +2621,7 @@ pub(crate) fn exec_do_block(
     let mut pb = crate::sql::parse_plpgsql_body(body, false, true, false, &[]).map_err(sql_err)?;
     // v2.11: DO blocks get the same name rewrite as function bodies
     // (no arguments; declared variables become $N slots).
-    rewrite_plpgsql_body_refs(&mut pb, &[]);
+    rewrite_plpgsql_body_refs(&mut pb, &[], &|t| table_column_names(eng, t), None);
     let mut lock_ids: Vec<(String, u64)> = Vec::new();
     let mut q = Q {
         eng,
@@ -2405,6 +2652,7 @@ pub(crate) fn exec_do_block(
     };
     let mut run = PlpgsqlRun::new(vec![None; pb.decls.len()], 0);
     init_plpgsql_decls(&mut q, &[], &pb, &mut run)?;
+    plpgsql_conflict_check(&pb)?;
     let mark = plpgsql_write_mark(&q);
     match run_plpgsql_stmts(
         &mut q,
@@ -2428,7 +2676,8 @@ pub(crate) fn exec_do_block(
                 Some(h) => {
                     plpgsql_write_rollback(&mut q, mark);
                     run.last_error = Some((e.code.to_string(), e.message.clone()));
-                    run_plpgsql_stmts(
+                    run.handler_depth += 1;
+                    let hr = run_plpgsql_stmts(
                         &mut q,
                         &[],
                         &h.stmts,
@@ -2436,7 +2685,9 @@ pub(crate) fn exec_do_block(
                         &mut run,
                         "void",
                         "<anonymous block>",
-                    )?;
+                    );
+                    run.handler_depth -= 1;
+                    hr?;
                     Ok(ExecResult::Command {
                         tag: "DO".to_string(),
                     })
@@ -2726,6 +2977,54 @@ pub(crate) fn exec_create_trigger(
                 "0A000",
                 "BEFORE trigger's WHEN condition cannot reference NEW system columns".to_string(),
             ));
+        }
+        // v2.45: PG19 trigger.c — a BEFORE trigger's WHEN condition
+        // cannot reference NEW generated columns (42P17): neither a
+        // generated column directly nor NEW whole-row when the
+        // table has any generated column (BEFORE triggers fire
+        // before generated values are computed).
+        if timing == crate::sql::TriggerTiming::Before && for_each_row {
+            let gen_names: Vec<&str> = prev
+                .columns
+                .iter()
+                .zip(prev.gen_cols.iter())
+                .filter(|(_, g)| g.is_some())
+                .map(|((n, _), _)| n.as_str())
+                .collect();
+            if !gen_names.is_empty() {
+                let mut whole_row = false;
+                let mut bad_col: Option<String> = None;
+                crate::exec::eval::walk_expr(w, &mut |x| match x {
+                    crate::sql::Expr::WholeRow { qual } if qual.eq_ignore_ascii_case("new") => {
+                        whole_row = true;
+                    }
+                    crate::sql::Expr::Column {
+                        table: Some(t),
+                        name,
+                    } if t.eq_ignore_ascii_case("new")
+                        && gen_names.iter().any(|g| g.eq_ignore_ascii_case(name)) =>
+                    {
+                        if bad_col.is_none() {
+                            bad_col = Some(name.clone());
+                        }
+                    }
+                    _ => {}
+                });
+                if whole_row {
+                    return Err(crate::exec::core::exec_err_detail(
+                        "42P17",
+                        "BEFORE trigger's WHEN condition cannot reference NEW generated columns",
+                        "A whole-row reference is used and the table contains generated columns.",
+                    ));
+                }
+                if let Some(c) = bad_col {
+                    return Err(crate::exec::core::exec_err_detail(
+                        "42P17",
+                        "BEFORE trigger's WHEN condition cannot reference NEW generated columns",
+                        format!("Column \"{}\" is a generated column.", c),
+                    ));
+                }
+            }
         }
     }
     // The function must exist and be a trigger function (PG19:
@@ -3527,6 +3826,7 @@ pub(crate) fn rewrite_expr_map(
     e: &mut Expr,
     map: &std::collections::HashMap<String, u32>,
     labels: &LabelScopes,
+    cols_of: &dyn Fn(&str) -> Vec<String>,
 ) {
     fn arg_pos(map: &std::collections::HashMap<String, u32>, name: &str) -> Option<u32> {
         map.get(name).copied()
@@ -3568,35 +3868,35 @@ pub(crate) fn rewrite_expr_map(
                 return;
             }
         }
-        Expr::FieldAccess { expr, .. } => rewrite_expr_map(expr, map, labels),
+        Expr::FieldAccess { expr, .. } => rewrite_expr_map(expr, map, labels, cols_of),
         Expr::Arith { left, right, .. } => {
-            rewrite_expr_map(left, map, labels);
-            rewrite_expr_map(right, map, labels);
+            rewrite_expr_map(left, map, labels, cols_of);
+            rewrite_expr_map(right, map, labels, cols_of);
         }
         Expr::Cmp { left, right, .. } => {
-            rewrite_expr_map(left, map, labels);
-            rewrite_expr_map(right, map, labels);
+            rewrite_expr_map(left, map, labels, cols_of);
+            rewrite_expr_map(right, map, labels, cols_of);
         }
         Expr::And(left, right) | Expr::Or(left, right) | Expr::Concat(left, right) => {
-            rewrite_expr_map(left, map, labels);
-            rewrite_expr_map(right, map, labels);
+            rewrite_expr_map(left, map, labels, cols_of);
+            rewrite_expr_map(right, map, labels, cols_of);
         }
         Expr::JsonOp { left, right, .. } => {
-            rewrite_expr_map(left, map, labels);
-            rewrite_expr_map(right, map, labels);
+            rewrite_expr_map(left, map, labels, cols_of);
+            rewrite_expr_map(right, map, labels, cols_of);
         }
         Expr::Not(inner) | Expr::Neg(inner) | Expr::BitNot(inner) => {
-            rewrite_expr_map(inner, map, labels);
+            rewrite_expr_map(inner, map, labels, cols_of);
         }
         Expr::IsNull { expr, .. } | Expr::IsBool { expr, .. } => {
-            rewrite_expr_map(expr, map, labels);
+            rewrite_expr_map(expr, map, labels, cols_of);
         }
         Expr::IsDistinctFrom { left, right, .. } => {
-            rewrite_expr_map(left, map, labels);
-            rewrite_expr_map(right, map, labels);
+            rewrite_expr_map(left, map, labels, cols_of);
+            rewrite_expr_map(right, map, labels, cols_of);
         }
         Expr::Cast { expr, .. } | Expr::CastNamed { expr, .. } => {
-            rewrite_expr_map(expr, map, labels);
+            rewrite_expr_map(expr, map, labels, cols_of);
         }
         Expr::Like {
             expr,
@@ -3604,87 +3904,107 @@ pub(crate) fn rewrite_expr_map(
             escape,
             ..
         } => {
-            rewrite_expr_map(expr, map, labels);
-            rewrite_expr_map(pattern, map, labels);
+            rewrite_expr_map(expr, map, labels, cols_of);
+            rewrite_expr_map(pattern, map, labels, cols_of);
             if let Some(esc) = escape {
-                rewrite_expr_map(esc, map, labels);
+                rewrite_expr_map(esc, map, labels, cols_of);
             }
         }
         Expr::Regex { expr, pattern, .. } => {
-            rewrite_expr_map(expr, map, labels);
-            rewrite_expr_map(pattern, map, labels);
+            rewrite_expr_map(expr, map, labels, cols_of);
+            rewrite_expr_map(pattern, map, labels, cols_of);
         }
         Expr::Between {
             expr, low, high, ..
         } => {
-            rewrite_expr_map(expr, map, labels);
-            rewrite_expr_map(low, map, labels);
-            rewrite_expr_map(high, map, labels);
+            rewrite_expr_map(expr, map, labels, cols_of);
+            rewrite_expr_map(low, map, labels, cols_of);
+            rewrite_expr_map(high, map, labels, cols_of);
         }
         Expr::Func { args, .. } => {
             for a in args {
-                rewrite_expr_map(a, map, labels);
+                rewrite_expr_map(a, map, labels, cols_of);
             }
         }
-        Expr::NamedArg { expr, .. } => rewrite_expr_map(expr, map, labels),
-        Expr::Extract { from, .. } => rewrite_expr_map(from, map, labels),
+        Expr::NamedArg { expr, .. } => rewrite_expr_map(expr, map, labels, cols_of),
+        Expr::Extract { from, .. } => rewrite_expr_map(from, map, labels, cols_of),
         Expr::Case {
             operand,
             whens,
             else_,
         } => {
             if let Some(op) = operand {
-                rewrite_expr_map(op, map, labels);
+                rewrite_expr_map(op, map, labels, cols_of);
             }
             for (k, v) in whens {
-                rewrite_expr_map(k, map, labels);
-                rewrite_expr_map(v, map, labels);
+                rewrite_expr_map(k, map, labels, cols_of);
+                rewrite_expr_map(v, map, labels, cols_of);
             }
             if let Some(el) = else_ {
-                rewrite_expr_map(el, map, labels);
+                rewrite_expr_map(el, map, labels, cols_of);
             }
         }
         Expr::Row(exprs) => {
             for x in exprs {
-                rewrite_expr_map(x, map, labels);
+                rewrite_expr_map(x, map, labels, cols_of);
             }
         }
         Expr::ArrayCtor { elems, .. } => {
             for x in elems {
-                rewrite_expr_map(x, map, labels);
+                rewrite_expr_map(x, map, labels, cols_of);
             }
         }
         Expr::Subscript { array, indices } => {
-            rewrite_expr_map(array, map, labels);
+            rewrite_expr_map(array, map, labels, cols_of);
             for i in indices {
-                rewrite_expr_map(i, map, labels);
+                rewrite_expr_map(i, map, labels, cols_of);
             }
         }
         Expr::Slice { array, bounds } => {
-            rewrite_expr_map(array, map, labels);
+            rewrite_expr_map(array, map, labels, cols_of);
             for (lo, hi) in bounds {
                 if let Some(l) = lo {
-                    rewrite_expr_map(l, map, labels);
+                    rewrite_expr_map(l, map, labels, cols_of);
                 }
                 if let Some(h) = hi {
-                    rewrite_expr_map(h, map, labels);
+                    rewrite_expr_map(h, map, labels, cols_of);
                 }
             }
         }
         Expr::UserOp { left, right, .. } => {
-            rewrite_expr_map(left, map, labels);
-            rewrite_expr_map(right, map, labels);
+            rewrite_expr_map(left, map, labels, cols_of);
+            rewrite_expr_map(right, map, labels, cols_of);
         }
-        // Subquery forms: rewrite the outer expression only, never
-        // the subquery (see the doc comment above).
-        Expr::InSub { expr, .. } => rewrite_expr_map(expr, map, labels),
-        Expr::Quantified { left, .. } => rewrite_expr_map(left, map, labels),
+        // Subquery forms: rewrite the outer expression with the
+        // full map; descend into the subquery with the map filtered
+        // by the subquery's own columns (v2.45: a name that is a
+        // column of the subquery's tables resolves locally in PG19;
+        // any other name is a correlated variable reference and
+        // substitutes — `(select c || 'abc')` in raise_exprs).
+        Expr::InSub { expr, sub, .. } => {
+            rewrite_expr_map(expr, map, labels, cols_of);
+            let inner = subquery_map(map, sub, cols_of);
+            rewrite_select_map(sub, &inner, labels, cols_of);
+        }
+        Expr::Quantified { left, sub, .. } => {
+            rewrite_expr_map(left, map, labels, cols_of);
+            let inner = subquery_map(map, sub, cols_of);
+            rewrite_select_map(sub, &inner, labels, cols_of);
+        }
+        Expr::ScalarSub(sel) => {
+            let inner = subquery_map(map, sel, cols_of);
+            rewrite_select_map(sel, &inner, labels, cols_of);
+        }
+        Expr::Exists { sub, .. } => {
+            let inner = subquery_map(map, sub, cols_of);
+            rewrite_select_map(sub, &inner, labels, cols_of);
+        }
         Expr::Agg { arg, arg2, .. } => {
             if let Some(a) = arg {
-                rewrite_expr_map(a, map, labels);
+                rewrite_expr_map(a, map, labels, cols_of);
             }
             if let Some(a) = arg2 {
-                rewrite_expr_map(a, map, labels);
+                rewrite_expr_map(a, map, labels, cols_of);
             }
         }
         Expr::Window {
@@ -3695,13 +4015,13 @@ pub(crate) fn rewrite_expr_map(
             ..
         } => {
             for a in args.iter_mut().chain(partition_by.iter_mut()) {
-                rewrite_expr_map(a, map, labels);
+                rewrite_expr_map(a, map, labels, cols_of);
             }
             for o in order_by {
-                rewrite_expr_map(&mut o.expr, map, labels);
+                rewrite_expr_map(&mut o.expr, map, labels, cols_of);
             }
             // v2.39: frame offsets, as in rewrite_func_arg_expr.
-            rewrite_frame_arg_exprs(frame, &mut |e| rewrite_expr_map(e, map, labels));
+            rewrite_frame_arg_exprs(frame, &mut |e| rewrite_expr_map(e, map, labels, cols_of));
         }
         // v1.30: ordered-set aggregate — rewrite named-arg refs in
         // direct args, the WITHIN GROUP sort keys, and the FILTER.
@@ -3712,13 +4032,13 @@ pub(crate) fn rewrite_expr_map(
             ..
         } => {
             for a in direct_args {
-                rewrite_expr_map(a, map, labels);
+                rewrite_expr_map(a, map, labels, cols_of);
             }
             for o in within_order_by {
-                rewrite_expr_map(&mut o.expr, map, labels);
+                rewrite_expr_map(&mut o.expr, map, labels, cols_of);
             }
             if let Some(f) = filter {
-                rewrite_expr_map(f, map, labels);
+                rewrite_expr_map(f, map, labels, cols_of);
             }
         }
         _ => {}
@@ -3961,11 +4281,12 @@ pub(crate) fn rewrite_stmt_map(
     stmt: &mut crate::sql::Stmt,
     map: &std::collections::HashMap<String, u32>,
     labels: &LabelScopes,
+    cols_of: &dyn Fn(&str) -> Vec<String>,
 ) {
     use crate::sql::Stmt as S;
     match stmt {
-        S::Select(sel) => rewrite_select_map(sel, map, labels),
-        S::Explain { stmt: inner, .. } => rewrite_stmt_map(inner, map, labels),
+        S::Select(sel) => rewrite_select_map(sel, map, labels, cols_of),
+        S::Explain { stmt: inner, .. } => rewrite_stmt_map(inner, map, labels, cols_of),
         S::Insert {
             rows,
             select,
@@ -3976,26 +4297,26 @@ pub(crate) fn rewrite_stmt_map(
             for row in rows {
                 for v in row {
                     if let crate::sql::InsertValue::Expr(e) = v {
-                        rewrite_expr_map(e, map, labels);
+                        rewrite_expr_map(e, map, labels, cols_of);
                     }
                 }
             }
             if let Some(sel) = select {
-                rewrite_select_map(sel, map, labels);
+                rewrite_select_map(sel, map, labels, cols_of);
             }
             if let Some(oc) = on_conflict {
                 if let crate::sql::ConflictAction::DoUpdate { sets, where_ } = &mut oc.action {
                     for (_, e) in sets.iter_mut() {
-                        rewrite_expr_map(e, map, labels);
+                        rewrite_expr_map(e, map, labels, cols_of);
                     }
                     if let Some(w) = where_ {
-                        rewrite_expr_map(w, map, labels);
+                        rewrite_expr_map(w, map, labels, cols_of);
                     }
                 }
             }
             for item in returning.iter_mut() {
                 if let crate::sql::SelectItem::Expr { expr, .. } = item {
-                    rewrite_expr_map(expr, map, labels);
+                    rewrite_expr_map(expr, map, labels, cols_of);
                 }
             }
         }
@@ -4007,15 +4328,15 @@ pub(crate) fn rewrite_stmt_map(
             ..
         } => {
             for (_, e) in sets.iter_mut() {
-                rewrite_expr_map(e, map, labels);
+                rewrite_expr_map(e, map, labels, cols_of);
             }
-            rewrite_from_map(from, map, labels);
+            rewrite_from_map(from, map, labels, cols_of);
             if let Some(w) = where_ {
-                rewrite_expr_map(w, map, labels);
+                rewrite_expr_map(w, map, labels, cols_of);
             }
             for item in returning.iter_mut() {
                 if let crate::sql::SelectItem::Expr { expr, .. } = item {
-                    rewrite_expr_map(expr, map, labels);
+                    rewrite_expr_map(expr, map, labels, cols_of);
                 }
             }
         }
@@ -4025,13 +4346,13 @@ pub(crate) fn rewrite_stmt_map(
             returning,
             ..
         } => {
-            rewrite_from_map(using, map, labels);
+            rewrite_from_map(using, map, labels, cols_of);
             if let Some(w) = where_ {
-                rewrite_expr_map(w, map, labels);
+                rewrite_expr_map(w, map, labels, cols_of);
             }
             for item in returning.iter_mut() {
                 if let crate::sql::SelectItem::Expr { expr, .. } = item {
-                    rewrite_expr_map(expr, map, labels);
+                    rewrite_expr_map(expr, map, labels, cols_of);
                 }
             }
         }
@@ -4042,22 +4363,22 @@ pub(crate) fn rewrite_stmt_map(
             returning,
             ..
         } => {
-            rewrite_from_map(source, map, labels);
-            rewrite_expr_map(on, map, labels);
+            rewrite_from_map(source, map, labels, cols_of);
+            rewrite_expr_map(on, map, labels, cols_of);
             for w in whens.iter_mut() {
                 if let Some(c) = &mut w.condition {
-                    rewrite_expr_map(c, map, labels);
+                    rewrite_expr_map(c, map, labels, cols_of);
                 }
                 match &mut w.action {
                     crate::sql::MergeAction::Update { sets } => {
                         for (_, e) in sets.iter_mut() {
-                            rewrite_expr_map(e, map, labels);
+                            rewrite_expr_map(e, map, labels, cols_of);
                         }
                     }
                     crate::sql::MergeAction::Insert { values, .. } => {
                         if let Some(vs) = values {
                             for e in vs.iter_mut() {
-                                rewrite_expr_map(e, map, labels);
+                                rewrite_expr_map(e, map, labels, cols_of);
                             }
                         }
                     }
@@ -4066,7 +4387,7 @@ pub(crate) fn rewrite_stmt_map(
             }
             for item in returning.iter_mut() {
                 if let crate::sql::SelectItem::Expr { expr, .. } = item {
-                    rewrite_expr_map(expr, map, labels);
+                    rewrite_expr_map(expr, map, labels, cols_of);
                 }
             }
         }
@@ -4079,16 +4400,47 @@ pub(crate) fn rewrite_select_map(
     sel: &mut crate::sql::SelectStmt,
     map: &std::collections::HashMap<String, u32>,
     labels: &LabelScopes,
+    cols_of: &dyn Fn(&str) -> Vec<String>,
 ) {
+    // v2.45: CTE bodies rewrite too (variables referenced inside a
+    // WITH query of a body statement were previously left bare).
+    for cte in &mut sel.with {
+        match &mut cte.body {
+            crate::sql::CteBody::Simple(s) => rewrite_select_map(s, map, labels, cols_of),
+            crate::sql::CteBody::Union { left, right, .. } => {
+                rewrite_select_map(left, map, labels, cols_of);
+                rewrite_select_map(right, map, labels, cols_of);
+            }
+            crate::sql::CteBody::Dml(stmt) => rewrite_stmt_map(stmt, map, labels, cols_of),
+        }
+    }
+    for e in &mut sel.distinct_on {
+        rewrite_expr_map(e, map, labels, cols_of);
+    }
     for item in &mut sel.items {
         if let crate::sql::SelectItem::Expr { expr, .. } = item {
-            rewrite_expr_map(expr, map, labels);
+            rewrite_expr_map(expr, map, labels, cols_of);
         }
     }
     if let Some(w) = &mut sel.where_ {
-        rewrite_expr_map(w, map, labels);
+        rewrite_expr_map(w, map, labels, cols_of);
     }
-    rewrite_from_map(&mut sel.from, map, labels);
+    // v2.45: GROUP BY / HAVING / ORDER BY expressions substitute
+    // variables exactly like the projection does (PG19's parser
+    // hook sees the whole query; multi_datum_use groups by
+    // `unique1/p1`).
+    for set in &mut sel.group_by {
+        for e in set {
+            rewrite_expr_map(e, map, labels, cols_of);
+        }
+    }
+    if let Some(h) = &mut sel.having {
+        rewrite_expr_map(h, map, labels, cols_of);
+    }
+    for o in &mut sel.order_by {
+        rewrite_expr_map(&mut o.expr, map, labels, cols_of);
+    }
+    rewrite_from_map(&mut sel.from, map, labels, cols_of);
 }
 
 /// v2.11: FROM-clause function-argument rewrite for `rewrite_stmt_map`.
@@ -4096,19 +4448,517 @@ pub(crate) fn rewrite_from_map(
     from: &mut [crate::sql::FromItem],
     map: &std::collections::HashMap<String, u32>,
     labels: &LabelScopes,
+    cols_of: &dyn Fn(&str) -> Vec<String>,
 ) {
     for f in from {
         match f {
             crate::sql::FromItem::Function { args, .. } => {
                 for a in args.iter_mut() {
-                    rewrite_expr_map(a, map, labels);
+                    rewrite_expr_map(a, map, labels, cols_of);
                 }
             }
             crate::sql::FromItem::Join { left, right, .. } => {
-                rewrite_from_map(std::slice::from_mut(left), map, labels);
-                rewrite_from_map(std::slice::from_mut(right), map, labels);
+                rewrite_from_map(std::slice::from_mut(left), map, labels, cols_of);
+                rewrite_from_map(std::slice::from_mut(right), map, labels, cols_of);
             }
             _ => {}
+        }
+    }
+}
+
+/// v2.45: plpgsql.variable_conflict resolution (PG19 plpgsql
+/// `variable_conflict` option / `#variable_conflict` directive):
+/// when a name in a body query matches both a plpgsql variable and
+/// a column of a table in that query, use_variable substitutes the
+/// variable (the historical behavior of this engine), use_column
+/// leaves the name a column reference, and error raises 42702 at
+/// body execution.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VarConflict {
+    UseVariable,
+    UseColumn,
+    Error,
+}
+
+/// v2.45: column names (lowercased) of a table for variable-conflict
+/// resolution; empty when the name is not a known table (views are
+/// not resolved — their column lists are not stored).
+pub(crate) fn table_column_names(eng: &Engine, name: &str) -> Vec<String> {
+    let base = name.rsplit('.').next().unwrap_or(name);
+    let t = eng
+        .db
+        .tables
+        .get(name)
+        .and_then(|vs| vs.last())
+        .or_else(|| eng.db.tables.get(base).and_then(|vs| vs.last()));
+    match t {
+        Some(t) => t
+            .columns
+            .iter()
+            .map(|(n, _)| n.to_ascii_lowercase())
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// v2.45: union of column names visible anywhere in a FROM list
+/// (tables, join branches, derived subqueries, CTE bodies).
+fn from_column_set(
+    from: &[crate::sql::FromItem],
+    cols_of: &dyn Fn(&str) -> Vec<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    use crate::sql::FromItem as F;
+    for f in from {
+        match f {
+            F::Table {
+                name, col_aliases, ..
+            } => {
+                out.extend(cols_of(name));
+                out.extend(col_aliases.iter().map(|c| c.to_ascii_lowercase()));
+            }
+            F::Derived {
+                sub, col_aliases, ..
+            } => {
+                out.extend(col_aliases.iter().map(|c| c.to_ascii_lowercase()));
+                select_column_set(sub, cols_of, out);
+            }
+            F::Values { col_aliases, .. } => {
+                out.extend(col_aliases.iter().map(|c| c.to_ascii_lowercase()));
+            }
+            F::Function {
+                col_aliases,
+                col_defs,
+                ..
+            } => {
+                out.extend(col_aliases.iter().map(|c| c.to_ascii_lowercase()));
+                out.extend(col_defs.iter().map(|(n, _, _)| n.to_ascii_lowercase()));
+            }
+            F::Join { left, right, .. } => {
+                from_column_set(std::slice::from_ref(left.as_ref()), cols_of, out);
+                from_column_set(std::slice::from_ref(right.as_ref()), cols_of, out);
+            }
+        }
+    }
+}
+
+fn select_column_set(
+    sel: &crate::sql::SelectStmt,
+    cols_of: &dyn Fn(&str) -> Vec<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    for cte in &sel.with {
+        match &cte.body {
+            crate::sql::CteBody::Simple(s) => select_column_set(s, cols_of, out),
+            crate::sql::CteBody::Union { left, right, .. } => {
+                select_column_set(left, cols_of, out);
+                select_column_set(right, cols_of, out);
+            }
+            crate::sql::CteBody::Dml(stmt) => stmt_column_set(stmt, cols_of, out),
+        }
+    }
+    from_column_set(&sel.from, cols_of, out);
+}
+
+fn stmt_column_set(
+    stmt: &crate::sql::Stmt,
+    cols_of: &dyn Fn(&str) -> Vec<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    use crate::sql::Stmt as S;
+    match stmt {
+        S::Select(sel) => select_column_set(sel, cols_of, out),
+        S::Insert { table, select, .. } => {
+            out.extend(cols_of(table));
+            if let Some(sel) = select {
+                select_column_set(sel, cols_of, out);
+            }
+        }
+        S::Update { table, from, .. } => {
+            out.extend(cols_of(table));
+            from_column_set(from, cols_of, out);
+        }
+        S::Delete { table, using, .. } => {
+            out.extend(cols_of(table));
+            from_column_set(using, cols_of, out);
+        }
+        S::Merge { table, source, .. } => {
+            out.extend(cols_of(table));
+            from_column_set(source, cols_of, out);
+        }
+        S::Explain { stmt: inner, .. } => stmt_column_set(inner, cols_of, out),
+        _ => {}
+    }
+}
+
+/// v2.45: collect unqualified column references in an expression
+/// (the only references a variable can shadow), in traversal order.
+fn collect_unqualified_refs(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::Column { table: None, name } => out.push(name.to_ascii_lowercase()),
+        Expr::Column { .. } | Expr::Param(_) | Expr::Literal(_) | Expr::ResolvedCol { .. } => {}
+        Expr::FieldAccess { expr, .. } => collect_unqualified_refs(expr, out),
+        Expr::Arith { left, right, .. }
+        | Expr::Cmp { left, right, .. }
+        | Expr::IsDistinctFrom { left, right, .. }
+        | Expr::UserOp { left, right, .. } => {
+            collect_unqualified_refs(left, out);
+            collect_unqualified_refs(right, out);
+        }
+        Expr::And(l, r) | Expr::Or(l, r) | Expr::Concat(l, r) => {
+            collect_unqualified_refs(l, out);
+            collect_unqualified_refs(r, out);
+        }
+        Expr::JsonOp { left, right, .. } => {
+            collect_unqualified_refs(left, out);
+            collect_unqualified_refs(right, out);
+        }
+        Expr::Not(i) | Expr::Neg(i) | Expr::BitNot(i) => collect_unqualified_refs(i, out),
+        Expr::IsNull { expr, .. } | Expr::IsBool { expr, .. } => {
+            collect_unqualified_refs(expr, out)
+        }
+        Expr::Cast { expr, .. } | Expr::CastNamed { expr, .. } => {
+            collect_unqualified_refs(expr, out)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_unqualified_refs(expr, out);
+            collect_unqualified_refs(pattern, out);
+            if let Some(esc) = escape {
+                collect_unqualified_refs(esc, out);
+            }
+        }
+        Expr::Regex { expr, pattern, .. } => {
+            collect_unqualified_refs(expr, out);
+            collect_unqualified_refs(pattern, out);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_unqualified_refs(expr, out);
+            collect_unqualified_refs(low, out);
+            collect_unqualified_refs(high, out);
+        }
+        Expr::Func { args, .. } => {
+            for a in args {
+                collect_unqualified_refs(a, out);
+            }
+        }
+        Expr::NamedArg { expr, .. } => collect_unqualified_refs(expr, out),
+        Expr::Extract { from, .. } => collect_unqualified_refs(from, out),
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
+            if let Some(o) = operand {
+                collect_unqualified_refs(o, out);
+            }
+            for (w, t) in whens {
+                collect_unqualified_refs(w, out);
+                collect_unqualified_refs(t, out);
+            }
+            if let Some(el) = else_ {
+                collect_unqualified_refs(el, out);
+            }
+        }
+        Expr::Row(exprs) | Expr::ArrayCtor { elems: exprs, .. } => {
+            for x in exprs {
+                collect_unqualified_refs(x, out);
+            }
+        }
+        Expr::Subscript { array, indices } => {
+            collect_unqualified_refs(array, out);
+            for i in indices {
+                collect_unqualified_refs(i, out);
+            }
+        }
+        Expr::Slice { array, bounds } => {
+            collect_unqualified_refs(array, out);
+            for (lo, hi) in bounds {
+                if let Some(b) = lo {
+                    collect_unqualified_refs(b, out);
+                }
+                if let Some(b) = hi {
+                    collect_unqualified_refs(b, out);
+                }
+            }
+        }
+        Expr::InSub { expr, sub, .. } => {
+            collect_unqualified_refs(expr, out);
+            select_unqualified_refs(sub, out);
+        }
+        Expr::Quantified { left, sub, .. } => {
+            collect_unqualified_refs(left, out);
+            select_unqualified_refs(sub, out);
+        }
+        Expr::ScalarSub(sel) => select_unqualified_refs(sel, out),
+        Expr::Exists { sub, .. } => select_unqualified_refs(sub, out),
+        Expr::Agg { arg, arg2, .. } => {
+            if let Some(a) = arg {
+                collect_unqualified_refs(a, out);
+            }
+            if let Some(a) = arg2 {
+                collect_unqualified_refs(a, out);
+            }
+        }
+        Expr::Window {
+            args,
+            partition_by,
+            order_by,
+            filter,
+            ..
+        } => {
+            for a in args {
+                collect_unqualified_refs(a, out);
+            }
+            for p in partition_by {
+                collect_unqualified_refs(p, out);
+            }
+            for o in order_by {
+                collect_unqualified_refs(&o.expr, out);
+            }
+            if let Some(f) = filter {
+                collect_unqualified_refs(f, out);
+            }
+        }
+        Expr::WithinGroup {
+            direct_args,
+            within_order_by,
+            filter,
+            ..
+        } => {
+            for a in direct_args {
+                collect_unqualified_refs(a, out);
+            }
+            for o in within_order_by {
+                collect_unqualified_refs(&o.expr, out);
+            }
+            if let Some(f) = filter {
+                collect_unqualified_refs(f, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn select_unqualified_refs(sel: &crate::sql::SelectStmt, out: &mut Vec<String>) {
+    for cte in &sel.with {
+        match &cte.body {
+            crate::sql::CteBody::Simple(s) => select_unqualified_refs(s, out),
+            crate::sql::CteBody::Union { left, right, .. } => {
+                select_unqualified_refs(left, out);
+                select_unqualified_refs(right, out);
+            }
+            crate::sql::CteBody::Dml(stmt) => stmt_unqualified_refs(stmt, out),
+        }
+    }
+    for item in &sel.items {
+        if let crate::sql::SelectItem::Expr { expr, .. } = item {
+            collect_unqualified_refs(expr, out);
+        }
+    }
+    if let Some(w) = &sel.where_ {
+        collect_unqualified_refs(w, out);
+    }
+    for set in &sel.group_by {
+        for e in set {
+            collect_unqualified_refs(e, out);
+        }
+    }
+    if let Some(h) = &sel.having {
+        collect_unqualified_refs(h, out);
+    }
+    for o in &sel.order_by {
+        collect_unqualified_refs(&o.expr, out);
+    }
+    for f in &sel.from {
+        from_unqualified_refs(f, out);
+    }
+}
+
+fn from_unqualified_refs(f: &crate::sql::FromItem, out: &mut Vec<String>) {
+    use crate::sql::FromItem as F;
+    match f {
+        F::Derived { sub, .. } => select_unqualified_refs(sub, out),
+        F::Values { rows, .. } => {
+            for row in rows {
+                for e in row {
+                    collect_unqualified_refs(e, out);
+                }
+            }
+        }
+        F::Function { args, .. } => {
+            for a in args {
+                collect_unqualified_refs(a, out);
+            }
+        }
+        F::Join {
+            left, right, on, ..
+        } => {
+            from_unqualified_refs(left, out);
+            from_unqualified_refs(right, out);
+            if let Some(on) = on {
+                collect_unqualified_refs(on, out);
+            }
+        }
+        F::Table { .. } => {}
+    }
+}
+
+fn stmt_unqualified_refs(stmt: &crate::sql::Stmt, out: &mut Vec<String>) {
+    use crate::sql::Stmt as S;
+    match stmt {
+        S::Select(sel) => select_unqualified_refs(sel, out),
+        S::Insert {
+            rows,
+            select,
+            on_conflict,
+            returning,
+            ..
+        } => {
+            for row in rows {
+                for v in row {
+                    if let crate::sql::InsertValue::Expr(e) = v {
+                        collect_unqualified_refs(e, out);
+                    }
+                }
+            }
+            if let Some(sel) = select {
+                select_unqualified_refs(sel, out);
+            }
+            if let Some(oc) = on_conflict {
+                if let crate::sql::ConflictAction::DoUpdate { sets, where_ } = &oc.action {
+                    for (_, e) in sets {
+                        collect_unqualified_refs(e, out);
+                    }
+                    if let Some(w) = where_ {
+                        collect_unqualified_refs(w, out);
+                    }
+                }
+            }
+            for item in returning {
+                if let crate::sql::SelectItem::Expr { expr, .. } = item {
+                    collect_unqualified_refs(expr, out);
+                }
+            }
+        }
+        S::Update {
+            sets,
+            from,
+            where_,
+            returning,
+            ..
+        } => {
+            for (_, e) in sets {
+                collect_unqualified_refs(e, out);
+            }
+            for f in from {
+                from_unqualified_refs(f, out);
+            }
+            if let Some(w) = where_ {
+                collect_unqualified_refs(w, out);
+            }
+            for item in returning {
+                if let crate::sql::SelectItem::Expr { expr, .. } = item {
+                    collect_unqualified_refs(expr, out);
+                }
+            }
+        }
+        S::Delete {
+            using,
+            where_,
+            returning,
+            ..
+        } => {
+            for f in using {
+                from_unqualified_refs(f, out);
+            }
+            if let Some(w) = where_ {
+                collect_unqualified_refs(w, out);
+            }
+            for item in returning {
+                if let crate::sql::SelectItem::Expr { expr, .. } = item {
+                    collect_unqualified_refs(expr, out);
+                }
+            }
+        }
+        S::Explain { stmt: inner, .. } => stmt_unqualified_refs(inner, out),
+        _ => {}
+    }
+}
+
+/// v2.45: the variable map for descending into a subquery: names
+/// that are columns of the subquery's own tables stay column
+/// references (PG19 resolves them at that query level); every other
+/// name still substitutes (correlated plpgsql variable references).
+fn subquery_map(
+    map: &std::collections::HashMap<String, u32>,
+    sel: &crate::sql::SelectStmt,
+    cols_of: &dyn Fn(&str) -> Vec<String>,
+) -> std::collections::HashMap<String, u32> {
+    let mut cols = std::collections::HashSet::new();
+    select_column_set(sel, cols_of, &mut cols);
+    if cols.is_empty() {
+        return map.clone();
+    }
+    map.iter()
+        .filter(|(k, _)| !cols.contains(k.as_str()))
+        .map(|(k, v)| (k.clone(), *v))
+        .collect()
+}
+
+/// v2.45: rewrite one embedded query/DML statement of a plpgsql body
+/// honoring the variable_conflict mode: use_column rewrites with the
+/// variables whose names collide with the statement's columns
+/// removed from the map (the name then stays a column reference);
+/// error records the first ambiguous referenced name (the executor
+/// raises 42702 when the body runs).
+#[allow(clippy::too_many_arguments)]
+fn rewrite_query_map(
+    stmt: &mut crate::sql::Stmt,
+    map: &std::collections::HashMap<String, u32>,
+    labels: &LabelScopes,
+    mode: VarConflict,
+    cols_of: &dyn Fn(&str) -> Vec<String>,
+    conflict: &mut Option<String>,
+) {
+    match mode {
+        VarConflict::UseVariable => rewrite_stmt_map(stmt, map, labels, cols_of),
+        VarConflict::UseColumn => {
+            let mut cols = std::collections::HashSet::new();
+            stmt_column_set(stmt, cols_of, &mut cols);
+            if cols.is_empty() {
+                rewrite_stmt_map(stmt, map, labels, cols_of);
+            } else {
+                let filtered: std::collections::HashMap<String, u32> = map
+                    .iter()
+                    .filter(|(k, _)| !cols.contains(k.as_str()))
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect();
+                rewrite_stmt_map(stmt, &filtered, labels, cols_of);
+            }
+        }
+        VarConflict::Error => {
+            if conflict.is_none() {
+                let mut cols = std::collections::HashSet::new();
+                stmt_column_set(stmt, cols_of, &mut cols);
+                if !cols.is_empty() {
+                    let mut refs = Vec::new();
+                    stmt_unqualified_refs(stmt, &mut refs);
+                    for r in refs {
+                        if cols.contains(&r) && map.contains_key(&r) {
+                            *conflict = Some(r);
+                            break;
+                        }
+                    }
+                }
+            }
+            rewrite_stmt_map(stmt, map, labels, cols_of);
         }
     }
 }
@@ -4126,9 +4976,25 @@ pub(crate) fn rewrite_from_map(
 pub(crate) fn rewrite_plpgsql_body_refs(
     pb: &mut crate::sql::PlpgsqlBody,
     arg_names: &[Option<String>],
+    cols_of: &dyn Fn(&str) -> Vec<String>,
+    fname: Option<&str>,
 ) {
     use std::collections::HashMap;
     let nargs = arg_names.len();
+    // v2.45: effective variable_conflict mode — the body's
+    // #variable_conflict directive wins, then the GUC in effect at
+    // CREATE/compile time, then PG's default (use_variable).
+    let mode = match pb.variable_conflict.as_deref() {
+        Some("use_column") => VarConflict::UseColumn,
+        Some("error") => VarConflict::Error,
+        Some(_) => VarConflict::UseVariable,
+        None => match installed_guc("plpgsql.variable_conflict").as_deref() {
+            Some("use_column") => VarConflict::UseColumn,
+            Some("error") => VarConflict::Error,
+            _ => VarConflict::UseVariable,
+        },
+    };
+    let mut conflict: Option<String> = None;
     // Label scopes for `label.var` resolution: the body label is
     // registered once the base map exists; block labels register
     // as the walk enters them.
@@ -4169,6 +5035,18 @@ pub(crate) fn rewrite_plpgsql_body_refs(
             base.entry(name.clone()).or_insert((i + 1) as u32);
         }
     }
+    // v2.45: the function's own name qualifies its ARGUMENTS
+    // (PG19: the function name acts as the label of the implicit
+    // outermost block, whose scope is the argument list — a DECLARE
+    // in an explicit outer block shadows the argument for bare and
+    // block-label references, but `fname.arg` still means the
+    // argument; pl_qual_names).
+    if let Some(f) = fname {
+        let bare = f.rsplit('.').next().unwrap_or(f).to_ascii_lowercase();
+        if !bare.is_empty() {
+            label_scopes.insert(bare, base.clone());
+        }
+    }
     if let Some(l) = &pb.label {
         label_scopes.insert(l.to_ascii_lowercase(), base.clone());
     }
@@ -4186,7 +5064,7 @@ pub(crate) fn rewrite_plpgsql_body_refs(
     let mut progressive = base.clone();
     for (idx, d) in pb.decls.iter_mut().enumerate() {
         if let Some(def) = &mut d.default {
-            rewrite_stmt_map(def, &progressive, &label_scopes);
+            rewrite_stmt_map(def, &progressive, &label_scopes, cols_of);
         }
         // v2.12: rewrite a bound cursor's query with its parameter
         // names mapped to the extra slots past the decl vector
@@ -4198,7 +5076,7 @@ pub(crate) fn rewrite_plpgsql_body_refs(
                 for (j, (pn, _)) in d.cursor_params.iter().enumerate() {
                     cmap.insert(pn.clone(), (nargs + ndecls + j + 1) as u32);
                 }
-                rewrite_stmt_map(q, &cmap, &label_scopes);
+                rewrite_query_map(q, &cmap, &label_scopes, mode, cols_of, &mut conflict);
             }
         }
         let slot = decl_slot(d, idx, nargs, &progressive);
@@ -4207,8 +5085,18 @@ pub(crate) fn rewrite_plpgsql_body_refs(
             // can resolve the alias without argument names.
             d.alias_slot = slot;
         }
+        // v2.45: the implicit SQLSTATE/SQLERRM decls keep their slots
+        // (the executor seeds them at handler entry) but stay OUT of
+        // the name maps: PG19 makes them visible only inside EXCEPTION
+        // handler statement lists. The Block walk adds them back for
+        // handler bodies (errvar_map below); a reference anywhere else
+        // stays an unresolved column reference (42703 at runtime),
+        // which is exactly PG's excpt_test1/excpt_test2 behavior.
+        let is_errvar = d.implicit && (d.name == "sqlstate" || d.name == "sqlerrm");
         if let Some(slot) = slot {
-            if d.implicit && base.contains_key(&d.name) {
+            if is_errvar {
+                // Slot reserved; not name-visible outside handlers.
+            } else if d.implicit && base.contains_key(&d.name) {
                 // An implicit FOR variable named like an argument:
                 // the argument keeps the name (PG resolves the loop
                 // variable to the argument in that case).
@@ -4231,23 +5119,52 @@ pub(crate) fn rewrite_plpgsql_body_refs(
         label_scopes.insert(l.to_ascii_lowercase(), base.clone());
     }
 
+    // v2.45: the name map for EXCEPTION handler statement lists:
+    // the enclosing block map plus the SQLSTATE/SQLERRM slots (PG19
+    // scopes those two names to handler bodies, including blocks
+    // nested inside them). A block-local user declaration of the
+    // same name already in `map` wins.
+    fn errvar_map(
+        map: &HashMap<String, u32>,
+        pb_decls: &[crate::sql::PlpgsqlDecl],
+        nargs: usize,
+    ) -> HashMap<String, u32> {
+        let mut m = map.clone();
+        for (idx, d) in pb_decls.iter().enumerate() {
+            if d.implicit && (d.name == "sqlstate" || d.name == "sqlerrm") {
+                if let Some(slot) = decl_slot(d, idx, nargs, &m) {
+                    m.entry(d.name.clone()).or_insert(slot);
+                }
+            }
+        }
+        m
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         stmts: &mut [crate::sql::PlpgsqlStmt],
         map: &HashMap<String, u32>,
         labels: &mut LabelScopes,
         pb_decls: &[crate::sql::PlpgsqlDecl],
         nargs: usize,
+        mode: VarConflict,
+        cols_of: &dyn Fn(&str) -> Vec<String>,
+        conflict: &mut Option<String>,
     ) {
         for s in stmts {
-            walk_stmt(s, map, labels, pb_decls, nargs);
+            walk_stmt(s, map, labels, pb_decls, nargs, mode, cols_of, conflict);
         }
     }
+    #[allow(clippy::too_many_arguments)]
     fn walk_stmt(
         s: &mut crate::sql::PlpgsqlStmt,
         map: &HashMap<String, u32>,
         labels: &mut LabelScopes,
         pb_decls: &[crate::sql::PlpgsqlDecl],
         nargs: usize,
+        mode: VarConflict,
+        cols_of: &dyn Fn(&str) -> Vec<String>,
+        conflict: &mut Option<String>,
     ) {
         use crate::sql::PlpgsqlStmt as P;
         // v2.11: `label.var := rhs` parses as a field assignment;
@@ -4273,16 +5190,16 @@ pub(crate) fn rewrite_plpgsql_body_refs(
         }
         match s {
             P::Return(sel) | P::ReturnNext(sel) | P::Perform(sel) => {
-                rewrite_stmt_map(sel, map, &*labels);
+                rewrite_stmt_map(sel, map, &*labels, cols_of);
             }
             P::ReturnNextBare => {}
             P::ReturnQuery(sel) => {
-                rewrite_stmt_map(sel.as_mut(), map, &*labels);
+                rewrite_query_map(sel.as_mut(), map, &*labels, mode, cols_of, conflict);
             }
             P::ReturnQueryExecute { expr, using } => {
-                rewrite_stmt_map(expr, map, &*labels);
+                rewrite_stmt_map(expr, map, &*labels, cols_of);
                 for u in using {
-                    rewrite_stmt_map(u, map, &*labels);
+                    rewrite_stmt_map(u, map, &*labels, cols_of);
                 }
             }
             // v2.12: cursor statements — the cursor VARIABLE resolves
@@ -4292,7 +5209,7 @@ pub(crate) fn rewrite_plpgsql_body_refs(
             P::OpenBound { var, args } => {
                 cursor_var_to_slot(var, map);
                 for (_, a) in args {
-                    rewrite_stmt_map(a, map, &*labels);
+                    rewrite_stmt_map(a, map, &*labels, cols_of);
                 }
             }
             P::OpenFor {
@@ -4304,19 +5221,19 @@ pub(crate) fn rewrite_plpgsql_body_refs(
             } => {
                 cursor_var_to_slot(var, map);
                 if let Some(q) = query {
-                    rewrite_stmt_map(q.as_mut(), map, &*labels);
+                    rewrite_query_map(q.as_mut(), map, &*labels, mode, cols_of, conflict);
                 }
                 if let Some(d) = dynamic {
-                    rewrite_stmt_map(d, map, &*labels);
+                    rewrite_stmt_map(d, map, &*labels, cols_of);
                 }
                 for u in using {
-                    rewrite_stmt_map(u, map, &*labels);
+                    rewrite_stmt_map(u, map, &*labels, cols_of);
                 }
             }
             P::Fetch { var, count, .. } | P::Move { var, count, .. } => {
                 cursor_var_to_slot(var, map);
                 if let Some(c) = count {
-                    rewrite_stmt_map(c, map, &*labels);
+                    rewrite_stmt_map(c, map, &*labels, cols_of);
                 }
             }
             P::Close { var } => {
@@ -4327,19 +5244,19 @@ pub(crate) fn rewrite_plpgsql_body_refs(
             } => {
                 cursor_var_to_slot(cursor, map);
                 for (_, a) in args {
-                    rewrite_stmt_map(a, map, &*labels);
+                    rewrite_stmt_map(a, map, &*labels, cols_of);
                 }
-                walk(body, map, labels, pb_decls, nargs);
+                walk(body, map, labels, pb_decls, nargs, mode, cols_of, conflict);
             }
             P::Assign { select, .. }
             | P::AssignField { select, .. }
             | P::AssignParam { select, .. } => {
-                rewrite_stmt_map(select, map, &*labels);
+                rewrite_stmt_map(select, map, &*labels, cols_of);
             }
             P::Assert { cond, message } => {
-                rewrite_stmt_map(cond, map, &*labels);
+                rewrite_stmt_map(cond, map, &*labels, cols_of);
                 if let Some(m) = message {
-                    rewrite_stmt_map(m, map, &*labels);
+                    rewrite_stmt_map(m, map, &*labels, cols_of);
                 }
             }
             P::Raise {
@@ -4349,13 +5266,13 @@ pub(crate) fn rewrite_plpgsql_body_refs(
                 ..
             } => {
                 for a in args {
-                    rewrite_expr_map(a, map, &*labels);
+                    rewrite_expr_map(a, map, &*labels, cols_of);
                 }
                 if let Some(crate::sql::RaiseCode::Expr(st)) = sqlstate {
-                    rewrite_stmt_map(st, map, &*labels);
+                    rewrite_stmt_map(st, map, &*labels, cols_of);
                 }
                 if let Some(m) = using_message {
-                    rewrite_stmt_map(m, map, &*labels);
+                    rewrite_stmt_map(m, map, &*labels, cols_of);
                 }
             }
             P::If {
@@ -4367,25 +5284,27 @@ pub(crate) fn rewrite_plpgsql_body_refs(
                 else_body,
             } => {
                 for (cond, body) in branches {
-                    rewrite_stmt_map(cond, map, &*labels);
-                    walk(body, map, labels, pb_decls, nargs);
+                    rewrite_stmt_map(cond, map, &*labels, cols_of);
+                    walk(body, map, labels, pb_decls, nargs, mode, cols_of, conflict);
                 }
-                walk(else_body, map, labels, pb_decls, nargs);
+                walk(
+                    else_body, map, labels, pb_decls, nargs, mode, cols_of, conflict,
+                );
             }
             P::SelectInto { query, .. } => {
-                rewrite_stmt_map(query, map, &*labels);
+                rewrite_query_map(query, map, &*labels, mode, cols_of, conflict);
             }
             P::Dml { stmt, .. } => {
-                rewrite_stmt_map(stmt, map, &*labels);
+                rewrite_query_map(stmt, map, &*labels, mode, cols_of, conflict);
             }
             P::ExecuteInto { expr, using, .. } => {
-                rewrite_stmt_map(expr, map, &*labels);
+                rewrite_stmt_map(expr, map, &*labels, cols_of);
                 for u in using {
-                    rewrite_stmt_map(u, map, &*labels);
+                    rewrite_stmt_map(u, map, &*labels, cols_of);
                 }
             }
             P::PerformQuery(q) => {
-                rewrite_stmt_map(q, map, &*labels);
+                rewrite_query_map(q, map, &*labels, mode, cols_of, conflict);
             }
             P::Block {
                 label,
@@ -4405,9 +5324,23 @@ pub(crate) fn rewrite_plpgsql_body_refs(
                 let saved = label
                     .as_ref()
                     .map(|l| labels.insert(l.to_ascii_lowercase(), inner.clone()));
-                walk(stmts, &inner, labels, pb_decls, nargs);
-                for h in handlers {
-                    walk(&mut h.stmts, &inner, labels, pb_decls, nargs);
+                walk(
+                    stmts, &inner, labels, pb_decls, nargs, mode, cols_of, conflict,
+                );
+                if !handlers.is_empty() {
+                    let hmap = errvar_map(&inner, pb_decls, nargs);
+                    for h in handlers {
+                        walk(
+                            &mut h.stmts,
+                            &hmap,
+                            labels,
+                            pb_decls,
+                            nargs,
+                            mode,
+                            cols_of,
+                            conflict,
+                        );
+                    }
                 }
                 if let Some(l) = label {
                     match saved {
@@ -4421,9 +5354,26 @@ pub(crate) fn rewrite_plpgsql_body_refs(
                     }
                 }
             }
-            P::ForQuery { query, body, .. } => {
-                rewrite_stmt_map(query, map, &*labels);
-                walk(body, map, labels, pb_decls, nargs);
+            P::ForQuery {
+                query, body, using, ..
+            } => {
+                rewrite_query_map(query, map, &*labels, mode, cols_of, conflict);
+                for u in using {
+                    rewrite_stmt_map(u, map, &*labels, cols_of);
+                }
+                walk(body, map, labels, pb_decls, nargs, mode, cols_of, conflict);
+            }
+            P::Foreach { array, body, .. } => {
+                rewrite_stmt_map(array, map, &*labels, cols_of);
+                walk(body, map, labels, pb_decls, nargs, mode, cols_of, conflict);
+            }
+            P::AssignSubscript {
+                indices, select, ..
+            } => {
+                for ix in indices {
+                    rewrite_stmt_map(ix, map, &*labels, cols_of);
+                }
+                rewrite_stmt_map(select, map, &*labels, cols_of);
             }
             P::ForRange {
                 low,
@@ -4432,23 +5382,23 @@ pub(crate) fn rewrite_plpgsql_body_refs(
                 body,
                 ..
             } => {
-                rewrite_stmt_map(low, map, &*labels);
-                rewrite_stmt_map(high, map, &*labels);
+                rewrite_stmt_map(low, map, &*labels, cols_of);
+                rewrite_stmt_map(high, map, &*labels, cols_of);
                 if let Some(st) = step {
-                    rewrite_stmt_map(st, map, &*labels);
+                    rewrite_stmt_map(st, map, &*labels, cols_of);
                 }
-                walk(body, map, labels, pb_decls, nargs);
+                walk(body, map, labels, pb_decls, nargs, mode, cols_of, conflict);
             }
             P::While { cond, body } => {
-                rewrite_stmt_map(cond, map, &*labels);
-                walk(body, map, labels, pb_decls, nargs);
+                rewrite_stmt_map(cond, map, &*labels, cols_of);
+                walk(body, map, labels, pb_decls, nargs, mode, cols_of, conflict);
             }
             P::Loop { body } => {
-                walk(body, map, labels, pb_decls, nargs);
+                walk(body, map, labels, pb_decls, nargs, mode, cols_of, conflict);
             }
             P::Exit { when } | P::Continue { when } => {
                 if let Some(w) = when {
-                    rewrite_stmt_map(w, map, &*labels);
+                    rewrite_stmt_map(w, map, &*labels, cols_of);
                 }
             }
             P::Utility(_) | P::ReturnBare | P::GetDiagnostics { .. } | P::Reraise => {}
@@ -4461,16 +5411,31 @@ pub(crate) fn rewrite_plpgsql_body_refs(
         &mut label_scopes,
         &pb.decls.clone(),
         nargs,
+        mode,
+        cols_of,
+        &mut conflict,
     );
     let decls_snapshot = pb.decls.clone();
-    for h in &mut pb.handlers {
-        walk(
-            &mut h.stmts,
-            &base,
-            &mut label_scopes,
-            &decls_snapshot,
-            nargs,
-        );
+    if !pb.handlers.is_empty() {
+        let hmap = errvar_map(&base, &decls_snapshot, nargs);
+        for h in &mut pb.handlers {
+            walk(
+                &mut h.stmts,
+                &hmap,
+                &mut label_scopes,
+                &decls_snapshot,
+                nargs,
+                mode,
+                cols_of,
+                &mut conflict,
+            );
+        }
+    }
+    // v2.45: variable_conflict = error — the executor raises 42702
+    // when the body starts (PG raises it when the ambiguous query is
+    // prepared, i.e. on first execution of the statement).
+    if mode == VarConflict::Error {
+        pb.conflict_error = conflict;
     }
 }
 
@@ -4508,6 +5473,8 @@ pub(crate) fn inject_plpgsql_arg_vars(
             cursor_scroll: None,
             is_constant: false,
             collation: None,
+            not_null: false,
+            typmod: None,
         });
     }
     for (cn, ct) in table_cols {
@@ -4527,6 +5494,8 @@ pub(crate) fn inject_plpgsql_arg_vars(
             cursor_scroll: None,
             is_constant: false,
             collation: None,
+            not_null: false,
+            typmod: None,
         });
     }
 }
@@ -4547,6 +5516,7 @@ pub(crate) fn func_arg_names(args: &[crate::sql::FuncArg]) -> Vec<String> {
 /// applied at CREATE time).
 pub(crate) fn rebuild_function_bodies(
     lang: crate::sql::FuncLang,
+    fname: &str,
     arg_names: &[Option<String>],
     arg_modes: &[u8],
     body: &str,
@@ -4582,7 +5552,12 @@ pub(crate) fn rebuild_function_bodies(
                 &rebuild_arg_names,
             ) {
                 inject_plpgsql_arg_vars(&mut pb, arg_names, arg_modes, table_cols);
-                rewrite_plpgsql_body_refs(&mut pb, arg_names);
+                // WAL/checkpoint rebuild has no catalog handle: the
+                // resolver is empty, so variable_conflict filtering
+                // degrades to use_variable there (PG recompiles per
+                // session with the then-current GUC; the directive
+                // case still resolves from the body text itself).
+                rewrite_plpgsql_body_refs(&mut pb, arg_names, &|_| Vec::new(), Some(fname));
                 return (None, Some(pb));
             }
         }

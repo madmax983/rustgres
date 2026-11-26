@@ -239,6 +239,8 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                         .map_err(|e| format!("corrupt domain default in WAL: {}", e))?,
                     // v1.92: not carried by the WAL domain record.
                     bit_typmod: None,
+                    // v2.45: not carried by the WAL domain record.
+                    numeric_typmod: None,
                     // v2.21: not carried by the WAL domain record.
                     collation: None,
                     // v2.40: not carried by the WAL domain record.
@@ -306,6 +308,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             };
             let (parsed, plpgsql) = crate::exec::rebuild_function_bodies(
                 lang,
+                name,
                 arg_names,
                 arg_modes,
                 body,
@@ -333,6 +336,7 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
                     is_procedure: *is_procedure,
                     table_cols: table_cols.clone(),
                     arg_modes: arg_modes.clone(),
+                    comment: None,
                 };
                 let overloads = eng.db.functions.entry(name.clone()).or_default();
                 if let Some(slot) = overloads.iter_mut().find(|f| f.arg_types == def.arg_types) {
@@ -922,9 +926,23 @@ pub fn apply_record(eng: &mut Engine, r: &WalRecord) -> Result<(), String> {
             // rewrites them via InsertRows records. v2.35: the rows come
             // from the immediate predecessor captured above (prev_idx),
             // never from a by-xmin search — see the comment there.
+            // v2.45: the rows MOVE out of the predecessor (mem::take),
+            // exactly as the live alter_swap does — cloning them left a
+            // full duplicate row set in the superseded version, and every
+            // by-id row lookup (find_row_version & friends scan versions
+            // oldest-first) then landed on the stale copy: its xmax is 0,
+            // so the commit-time family check read a phantom concurrent
+            // update (40001) for EVERY update of a pre-alter row after
+            // any restart that replayed an AlterTable record (the
+            // privileges suite's GRANT/REVOKE ON ALL TABLES made that
+            // every table in the database), and the error path's undo
+            // missed the live copy the same way, letting auto-vacuum
+            // reap live rows. Rebuild the predecessor's index after the
+            // take, as alter_swap does.
             if *copy_rows {
                 if let Some(i) = prev_idx {
-                    t.rows = versions[i].rows.clone();
+                    t.rows = std::mem::take(&mut versions[i].rows);
+                    versions[i].rebuild_row_index();
                     // v2.00: the bulk assignment bypasses push_version,
                     // the only maintainer of row_index; without a rebuild
                     // the new version's row_pos misses every copied id,

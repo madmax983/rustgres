@@ -7457,6 +7457,16 @@ pub(crate) fn exec_comment_on(
                     format!("function \"{}\" does not exist", name),
                 ));
             }
+            // v2.45: store the comment on the matching overloads
+            // (read back via obj_description(oid, 'pg_proc')).
+            let base = name.rsplit('.').next().unwrap_or(name);
+            for (k, defs) in eng.db.functions.iter_mut() {
+                if k == name || k.rsplit('.').next() == Some(base) {
+                    for d in defs.iter_mut() {
+                        d.comment = _comment.map(|c| c.to_string());
+                    }
+                }
+            }
         }
         "aggregate" => {
             let known = eng.db.aggregates.contains_key(name)

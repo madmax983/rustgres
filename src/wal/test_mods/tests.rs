@@ -517,6 +517,101 @@ fn apply_record_rebuilds_versions_and_counters() {
 }
 
 #[test]
+fn apply_record_metadata_alter_moves_rows_out_of_superseded_version() {
+    // v2.45 regression: replaying a pure-metadata AlterTable record
+    // used to CLONE the predecessor's rows into the new version,
+    // leaving full duplicate row sets in the superseded version. The
+    // live alter_swap MOVES them (mem::take). With duplicates in
+    // place, by-id row lookups (find_row_version scans versions
+    // oldest-first) landed on the stale copy — xmax 0 — so the
+    // commit-time family check reported a phantom concurrent update
+    // (40001) for every update of a pre-alter row after a restart,
+    // and the error path's undo missed the live copy, letting
+    // auto-vacuum reap live rows (the misc/portals_p2 collapse).
+    let mut eng = Engine::new();
+    let empty_constraints =
+        "(constraints (notnull) (defaults) (checks) (uniques) (pkey -) (fks))".to_string();
+    apply_record(
+        &mut eng,
+        &WalRecord::CreateTable {
+            name: "t".into(),
+            columns: vec![("a".into(), ColType::Int)],
+            constraints: empty_constraints.clone(),
+            owner: "postgres".into(),
+            acl: vec![],
+            col_acl: vec![],
+            oid: 16384,
+            toast_relid: 0,
+            col_compression: vec![0],
+            composite_types: vec![None],
+            domain_types: vec![None],
+            domain_elem: vec![false],
+            inherits: vec![],
+            attnums: vec![1],
+            next_attnum: 2,
+            fillfactor: 100,
+            partition: None,
+            bit_typmods: Vec::new(),
+            xmin: 4,
+        },
+    )
+    .unwrap();
+    apply_record(
+        &mut eng,
+        &WalRecord::InsertRows {
+            table: "t".into(),
+            rows: vec![WalRow {
+                id: 12,
+                xmin: 5,
+                values: Row::new(vec![Value::Int(1)]),
+                toast: vec![0; 1],
+                toast_meta: vec![],
+            }],
+        },
+    )
+    .unwrap();
+    apply_record(
+        &mut eng,
+        &WalRecord::AlterTable {
+            name: "t".into(),
+            columns: vec![("a".into(), ColType::Int)],
+            constraints: empty_constraints,
+            copy_rows: true,
+            owner: "postgres".into(),
+            acl: vec![],
+            col_acl: vec![],
+            oid: 16384,
+            toast_relid: 0,
+            toast_target: 0,
+            col_storage: vec![],
+            col_compression: vec![0],
+            composite_types: vec![None],
+            domain_types: vec![None],
+            domain_elem: vec![false],
+            inherits: vec![],
+            attnums: vec![1],
+            next_attnum: 2,
+            fillfactor: 100,
+            next_value_id: 0,
+            toast_info: vec![],
+            partition: None,
+            bit_typmods: Vec::new(),
+            xmin: 6,
+        },
+    )
+    .unwrap();
+    let vs = &eng.db.tables["t"];
+    assert_eq!(vs.len(), 2);
+    assert_eq!(vs[0].dropped_xmax, 6);
+    assert_eq!(vs[0].rows.len(), 0, "superseded version must be empty");
+    assert_eq!(vs[1].rows.len(), 1);
+    assert_eq!(vs[1].rows[0].id, 12);
+    // The by-id lookup must land on the LIVE version's copy.
+    let found = eng.db.find_row_version(12).expect("row found");
+    assert_eq!(found.xmin, 5);
+}
+
+#[test]
 fn apply_record_tolerates_missing_targets() {
     let mut eng = Engine::new();
     // No such table / row: warnings, not errors.
