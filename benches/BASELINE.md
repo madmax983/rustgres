@@ -2,6 +2,150 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `check_exclusion_batch` clones the whole table before checking whether it has any EXCLUDE constraints — fix — 2026-11-27
+
+### Workload
+
+`benches/profile_plpgsql_loop.py` (new): a PL/pgSQL stored function
+with `FOR i IN 1..N LOOP INSERT INTO t(a) VALUES (i); END LOOP;`,
+invoked through one `SELECT bench_loop_fn(N)` — the common
+batch-job/migration/ETL shape (row-at-a-time bulk load from inside a
+stored procedure), not a microbenchmark of one helper. `--variant
+assign` is a control with the identical loop but a plain `tot := tot
++ i;` body (no DML at all), isolating per-iteration loop overhead
+from per-INSERT cost.
+
+This round started by profiling a different, plausible-looking
+target first — `exec_plpgsql_stmt`'s per-iteration `stmt.clone()` +
+`bind_plpgsql_stmt` (rewrite_record_refs + subst_params) rebind
+machinery, run on every statement executed from a PL/pgSQL body.
+Summing the self-cost of every function in that chain
+(`exec_plpgsql_stmt`, `Stmt::clone`, `bind_plpgsql_stmt`,
+`rewrite_record_refs_stmt`/`_expr`, `subst_params`, and the
+`InsertValue` vec clone they drive) at `--rows 2000` gives ~2.39M of
+2.80B total `Ir` — **0.09%** of the per-iteration delta, far under
+the 5% floor. Negative result on that hypothesis; profiling
+continued into the actual INSERT cost instead.
+
+### Profile
+
+Baseline (Callgrind `Ir`, `--variant insert` minus the `--variant
+assign` control, isolating per-INSERT cost from fixed loop/call
+overhead):
+
+| rows (N) | insert Ir | assign Ir (control) | delta | delta/row |
+|---|---|---|---|---|
+| 500  | 251,630,613   | 36,557,196  | 215,073,417   | 430,147   |
+| 1000 | 798,513,749   | 66,354,292  | 732,159,457   | 732,159   |
+| 2000 | 2,802,491,468 | 125,945,250 | 2,676,546,218 | 1,338,273 |
+
+`delta/row` nearly doubles with each doubling of `rows` (×1.70,
+then ×1.83) instead of staying flat — the signature of O(n) work
+per INSERT, O(n²) total. `callgrind_annotate` on the 2000-row
+profile shows `<rustgres::storage::RowVersion as
+core::clone::Clone>::clone`'s self-cost scaling **4.00x per
+doubling** (4,740,500 → 18,981,000 → 75,962,000 at 500/1000/2000
+rows) — classic O(n²) — called a cumulative 2,001,000 times over
+2000 inserts, matching the triangular number `n(n+1)/2`: clone cost
+grows with however many rows already exist. dhat (`--rows 1000`,
+`--variant insert`) attributes **86.6%** of total bytes
+(44,512,524 / 51,381,604) and **85.2%** of total blocks (519,498 /
+610,021) to `check_exclusion_batch` / `Table::clone` call stacks —
+both well past the 5%-of-profile and 10%-of-allocations floors.
+
+### Hypothesis
+
+`check_exclusion_batch` (`src/exec/indexes.rs`), run from the plain
+INSERT path (`exec_insert_inner`, `src/exec/dml.rs:3963`) and the
+UPDATE/MERGE path (`src/exec/dml.rs:6119`) for **every** batch,
+regardless of whether the target table has any EXCLUDE constraint:
+
+```rust
+let t = match eng.db.find_table(table, ctx.snap, &ctx.all_xids, ctx.session) {
+    Some(t) => t.clone(),       // <-- clones the whole Table, incl. every RowVersion
+    None => return Ok(()),
+};
+if t.excls.is_empty() {
+    return Ok(());              // <-- ... only to immediately discard it here
+}
+```
+
+`find_table` returns a borrow; the function clones the entire
+`Table` (its full `Vec<RowVersion>`, one deep clone per existing
+row) unconditionally, and only *afterward* checks `t.excls.is_empty()`
+— true for the overwhelming majority of tables, which have no
+EXCLUDE constraint at all. Checking the cheap field on the borrow
+before cloning removes the clone (and its O(table size) cost)
+entirely on that path, with zero behavior change when an EXCLUDE
+constraint does exist (the clone still happens, in the same place,
+with the same contents).
+
+### Change
+
+`src/exec/indexes.rs::check_exclusion_batch`: reorder the lookup so
+`t.excls.is_empty()` is checked on the `&Table` borrow from
+`find_table` before cloning, and only clone once an EXCLUDE
+constraint is confirmed to exist:
+
+```rust
+let Some(t) = eng.db.find_table(table, ctx.snap, &ctx.all_xids, ctx.session) else {
+    return Ok(());
+};
+if t.excls.is_empty() {
+    return Ok(());
+}
+let t = t.clone();
+```
+
+`check_exclusion_table_rescan` (the deferred-constraint commit-time
+rescan, a few lines below) is untouched: it's only ever called for a
+constraint name already known to exist from a queued deferred
+EXCLUDE check, so it isn't on the common no-EXCLUDE-constraint hot
+path this round targets.
+
+### Measurement (after fix)
+
+Same harness, same three sizes, same machine, same session:
+
+| rows (N) | before Ir | after Ir | delta |
+|---|---|---|---|
+| 500  | 251,630,613   | 92,562,516  | **-63.2%** |
+| 1000 | 798,513,749   | 176,504,791 | **-77.9%** |
+| 2000 | 2,802,491,468 | 344,722,426 | **-87.7%** |
+
+All three clear the ≥5% floor by a wide margin, and the win *grows*
+with `n` — the asymptotic signature, not noise. Post-fix scaling is
+now near-linear: 500→1000 is ×1.91, 1000→2000 is ×1.95 (vs. pre-fix
+×3.17 and ×3.51), matching the O(n²)→O(n) argument.
+
+dhat (`--rows 1000`, `--variant insert`): total bytes 51,381,604 →
+6,869,080 (**-86.6%**), total blocks 610,021 → 90,523 (**-85.2%**),
+matching the attribution above almost exactly.
+
+`cargo build`: clean. `cargo fmt --all -- --check`: clean. `cargo
+clippy --all-targets --all-features -- -D warnings`: 1660
+pre-existing errors on both the parent and this commit (confirmed
+via `git stash`, compared by count) — the same toolchain/lint-version
+mismatch noted in every prior Bolt entry in this file; zero new
+errors from this diff. `cargo test --all-features`: 1544/1544
+passed, unchanged, including the v2.44 EXCLUDE-constraint suite
+(`exec::v244_tests::v244_btree_equality_exclusion_and_nulls`,
+`exec::v244_tests::v244_gist_range_exclusion_23p01_with_detail`).
+Manually verified end-to-end over the wire protocol: a `box`-typed
+GiST EXCLUDE constraint still rejects an overlapping INSERT with
+23P01 (and the correct `DETAIL`) and accepts a non-overlapping one.
+
+**Reproduce**:
+```bash
+cargo build
+python3 benches/profile_plpgsql_loop.py --tool callgrind --rows 2000 --variant insert
+python3 benches/profile_plpgsql_loop.py --tool callgrind --rows 2000 --variant assign
+python3 benches/profile_plpgsql_loop.py --tool dhat --rows 1000 --variant insert
+```
+Before numbers: check out the parent commit (the harness-only
+baseline) and repeat; after numbers: check out this commit and
+repeat.
+
 ## Bolt: jsonb subscript assignment's full parse+render round-trip is inherent, not a fixable bug — finding, no fix — 2026-11-23
 
 Full writeup with profile tables and reproduction commands: #87

@@ -1409,16 +1409,20 @@ pub(crate) fn check_exclusion_batch(
     if batch.is_empty() {
         return Ok(());
     }
-    let t = match eng
+    // v2.44 fix: check for the (common) no-EXCLUDE-constraints case on
+    // the borrow before cloning the whole table -- cloning unconditionally
+    // made every INSERT/UPDATE batch pay for an O(table size) deep clone
+    // of every row even when the table has no EXCLUDE constraint at all.
+    let Some(t) = eng
         .db
         .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
-    {
-        Some(t) => t.clone(),
-        None => return Ok(()),
+    else {
+        return Ok(());
     };
     if t.excls.is_empty() {
         return Ok(());
     }
+    let t = t.clone();
     let existing: Vec<Row> = t
         .rows
         .iter()
