@@ -2613,6 +2613,19 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
             Value::Timestamp(m) => Ok(Value::Time(crate::datetime::timestamp_time(*m))),
             Value::Timestamptz(m) => Ok(Value::Time(crate::datetime::timestamptz_time(*m))),
             Value::TimeTz(t, _) => Ok(Value::Time(*t)),
+            // v2.46: PG19 interval_time — the interval's time
+            // field wrapped into the day (months/days dropped).
+            // PG19 date.c interval_time: an infinite interval is
+            // 22008 "cannot convert infinite interval to time".
+            Value::Interval(iv) => {
+                if !iv.is_finite() {
+                    return Err(exec_err(
+                        "22008",
+                        "cannot convert infinite interval to time",
+                    ));
+                }
+                Ok(Value::Time(iv.micros.rem_euclid(86_400_000_000)))
+            }
             other => Err(cast_err(other, "time without time zone")),
         },
         // v1.86: time with time zone (PG timetzin / timetz casts).
@@ -2636,6 +2649,13 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
             Value::Text(s) | Value::BpChar(s) => crate::datetime::parse_interval(s)
                 .map(Value::Interval)
                 .map_err(|e| exec_err(crate::exec::eval::dt_sqlstate(&e), e)),
+            // v2.46: PG19 time_interval — the time-of-day as an
+            // interval's time field.
+            Value::Time(t) => Ok(Value::Interval(crate::datetime::Interval {
+                months: 0,
+                days: 0,
+                micros: *t,
+            })),
             other => Err(cast_err(other, "interval")),
         },
         ColType::Bytea => match v {

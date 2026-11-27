@@ -2613,7 +2613,13 @@ pub(crate) fn combine_arith_types(
                     ArithOp::Add => Ok(ColType::TimeTz),
                     _ => Err(op_err(&x, &y)),
                 },
-                (ColType::Date, ColType::Time) | (ColType::Time, ColType::Date) => match op {
+                // v2.46: PG19 also has date - time -> timestamp
+                // (time - date does not exist).
+                (ColType::Date, ColType::Time) => match op {
+                    ArithOp::Add | ArithOp::Sub => Ok(ColType::Timestamp),
+                    _ => Err(op_err(&x, &y)),
+                },
+                (ColType::Time, ColType::Date) => match op {
                     ArithOp::Add => Ok(ColType::Timestamp),
                     _ => Err(op_err(&x, &y)),
                 },

@@ -8807,6 +8807,12 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         // v1.13: pg_size_pretty(bigint) -> text (PG19 misc.c).
         "pg_size_pretty" => n == 1,
         "pg_overlaps" => n == 4,
+        // v2.46: hidden builtin for BETWEEN SYMMETRIC.
+        "pg_between_symmetric" => n == 3,
+        // v2.46: isfinite(date|timestamp|timestamptz|interval) and
+        // the timestamptz(date, time|timetz) constructors.
+        "isfinite" => n == 1,
+        "timestamptz" => n == 2,
         "similar_to" => (2..=3).contains(&n),
         "substring_similar" => (2..=3).contains(&n),
         "substring_from" => n == 2,
@@ -9485,7 +9491,11 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         // v1.15: quote_ident/quote_literal/quote_nullable (PG19 quote.c).
         | "parse_ident" | "quote_ident" | "quote_literal" | "quote_nullable"
         // v2.37: string_to_array returns text[] (see eval_str_func).
-        | "string_to_array" => {
+        | "string_to_array"
+        // v2.46: BETWEEN SYMMETRIC builtin, isfinite, and the
+        // timestamptz(date, time|timetz) constructors — their arms
+        // live in eval_str_func alongside pg_overlaps.
+        | "pg_between_symmetric" | "isfinite" | "timestamptz" => {
             eval_str_func(name, vals)
         }
         "abs" | "round" | "floor" | "ceil" | "ceiling" | "sqrt" | "power" | "mod" | "sign" => {
@@ -14227,6 +14237,69 @@ pub(crate) fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecErr
                 None => Ok(Value::Null),
             }
         }
+        "pg_between_symmetric" => {
+            // v2.46: BETWEEN SYMMETRIC — swap out-of-order bounds,
+            // then the ordinary BETWEEN test (PG19
+            // transformAExprBetween). NULL in -> NULL out.
+            let (v, lo, hi) = (&vals[0], &vals[1], &vals[2]);
+            if *v == Value::Null || *lo == Value::Null || *hi == Value::Null {
+                return Ok(Value::Null);
+            }
+            let (lo, hi) = match eval_cmp_vals(CmpOp::Gt, lo, hi)? {
+                Value::Bool(true) => (hi, lo),
+                _ => (lo, hi),
+            };
+            eval_between(v, lo, hi, false)
+        }
+        "isfinite" => {
+            // v2.46: PG19 isfinite for date/timestamp/timestamptz/
+            // interval (true unless the value is an infinity).
+            match &vals[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Date(d) => Ok(Value::Bool(
+                    *d != crate::datetime::DATE_INFINITY
+                        && *d != crate::datetime::DATE_NEG_INFINITY,
+                )),
+                Value::Timestamp(m) | Value::Timestamptz(m) => Ok(Value::Bool(
+                    *m != crate::datetime::TS_INFINITY && *m != crate::datetime::TS_NEG_INFINITY,
+                )),
+                Value::Interval(iv) => Ok(Value::Bool(iv.is_finite())),
+                other => Err(func_arg_err(name, other)),
+            }
+        }
+        "timestamptz" => {
+            // v2.46: PG19 timestamptz(date, time) interprets the
+            // wall time in the session zone; timestamptz(date,
+            // timetz) uses the timetz's own offset.
+            let d = match &vals[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Date(d) => *d,
+                other => return Err(func_arg_err(name, other)),
+            };
+            match &vals[1] {
+                Value::Null => Ok(Value::Null),
+                Value::Time(t) => {
+                    let local = (d as i64)
+                        .checked_mul(86_400_000_000)
+                        .and_then(|b| b.checked_add(*t))
+                        .filter(|m| crate::datetime::is_valid_ts_micros(*m))
+                        .ok_or_else(|| exec_err("22008", "timestamp out of range".to_string()))?;
+                    let utc = crate::datetime::timestamp_to_timestamptz(local)
+                        .map_err(|m| exec_err("22008", m))?;
+                    Ok(Value::Timestamptz(utc))
+                }
+                Value::TimeTz(t, off) => {
+                    let utc = (d as i64)
+                        .checked_mul(86_400_000_000)
+                        .and_then(|b| b.checked_add(*t))
+                        .and_then(|b| b.checked_sub(*off as i64 * 1_000_000))
+                        .filter(|m| crate::datetime::is_valid_ts_micros(*m))
+                        .ok_or_else(|| exec_err("22008", "timestamp out of range".to_string()))?;
+                    Ok(Value::Timestamptz(utc))
+                }
+                other => Err(func_arg_err(name, other)),
+            }
+        }
         "pg_overlaps" => {
             // v1.86: SQL OVERLAPS, following PG's overlaps_timestamp
             // algorithm (null-aware) over a common i128 key domain
@@ -14267,6 +14340,23 @@ pub(crate) fn eval_str_func(name: &str, vals: &[Value]) -> Result<Value, ExecErr
                             let end = crate::datetime::timestamptz_add_interval(*m, iv, 1)
                                 .map_err(|m| exec_err("22008", m))?;
                             Ok((Some(*m as i128), Some(end as i128)))
+                        }
+                        Value::Time(m) => {
+                            // v2.46: PG19 time_pl_interval — only
+                            // the interval's time field counts and
+                            // the sum wraps into the day.
+                            if !iv.is_finite() {
+                                return Err(exec_err(
+                                    "22008",
+                                    "cannot add infinite interval to time".to_string(),
+                                ));
+                            }
+                            let mut r = *m as i128 + iv.micros as i128;
+                            r -= r / 86_400_000_000 * 86_400_000_000;
+                            if r < 0 {
+                                r += 86_400_000_000;
+                            }
+                            Ok((Some(*m as i128), Some(r)))
                         }
                         other => Err(exec_err(
                             "42883",
@@ -17090,6 +17180,11 @@ pub(crate) fn eval_datetime_func(name: &str, vals: &[Value]) -> Result<Value, Ex
             if let Value::Interval(iv) = v {
                 return match crate::datetime::date_trunc_interval(&field, iv) {
                     Ok(r) => Ok(Value::Interval(r)),
+                    // PG19 interval_trunc: "not supported" is
+                    // 0A000, "not recognized" is 22023.
+                    Err(e) if e.contains("not supported for type interval") => {
+                        Err(exec_err("0A000", e))
+                    }
                     Err(e) => Err(exec_err("22023", e)),
                 };
             }
@@ -18129,6 +18224,10 @@ pub(crate) fn func_result_type(
         // v0.95: `parse_ident` returns `text[]` (PG19).
         "parse_ident" => Ok(ColType::Array(crate::storage::ArrayElem::Text)),
         "pg_overlaps" => Ok(ColType::Bool),
+        // v2.46.
+        "pg_between_symmetric" => Ok(ColType::Bool),
+        "isfinite" => Ok(ColType::Bool),
+        "timestamptz" => Ok(ColType::Timestamptz),
         "similar_to" => Ok(ColType::Bool),
         "substring_similar" => Ok(ColType::Text),
         // v1.94: text-search functions (PG19 pg_proc).

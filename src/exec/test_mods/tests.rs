@@ -907,11 +907,12 @@ fn v17_datetime_functions() {
         one(&mut eng, "SELECT to_date('2026/01/15', 'YYYY-MM-DD')"),
         "2026-01-15"
     );
-    // v1.86: Q is the quarter pattern element now (PG formatting.c);
-    // the unsupported-pattern pin moves to EE.
+    // v2.46: unknown pattern letters are literal CHAR nodes in
+    // PG19 (DCH_from_char), not errors — 'EE' consumes the two
+    // day digits and the day defaults to 1 (verified vs PG).
     assert_eq!(
-        err_code(&mut eng, "SELECT to_date('2026-01-15', 'YYYY-MM-EE')"),
-        "0A000"
+        one(&mut eng, "SELECT to_date('2026-01-15', 'YYYY-MM-EE')"),
+        "2026-01-01"
     );
     // to_timestamp with format strings.
     assert_eq!(
@@ -988,9 +989,10 @@ fn v17_datetime_functions() {
         "NULL"
     );
     assert_eq!(
-        // v1.86: 'QQ' is two quarter elements now; EE stays unsupported.
-        err_code(&mut eng, "SELECT to_char(DATE '2026-09-11', 'EE')"),
-        "0A000"
+        // v2.46: unknown pattern letters are literals in PG19 —
+        // to_char renders 'EE' verbatim (verified vs PG).
+        one(&mut eng, "SELECT to_char(DATE '2026-09-11', 'EE')"),
+        "EE"
     );
     // v0.42: PG19 supports to_char() on int4/int8/numeric (formatting.c
     // lists Timestamp, Numeric, int4, int8, float4, float8), and

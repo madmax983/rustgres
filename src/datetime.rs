@@ -98,6 +98,9 @@ pub fn parse_datestyle(value: &str) -> (DateStyleKind, DateOrder) {
                 order = DateOrder::Dmy;
             }
             "us" => order = DateOrder::Mdy,
+            // v2.46: PG19 synonyms — EURO* is DMY, NONEURO* is MDY.
+            _ if tok.trim().to_ascii_lowercase().starts_with("noneuro") => order = DateOrder::Mdy,
+            _ if tok.trim().to_ascii_lowercase().starts_with("euro") => order = DateOrder::Dmy,
             "european" | "europe" => order = DateOrder::Dmy,
             "mdy" => order = DateOrder::Mdy,
             "dmy" => order = DateOrder::Dmy,
@@ -661,6 +664,24 @@ fn resolve_dynamic_abbrev(name: &str, local_micros: i64) -> Option<(i32, String)
     let guess_utc = local_micros - def.std_off as i64 * 1_000_000;
     let (off, abbr) = zone_at_utc(&def, guess_utc);
     Some((off, abbr.to_string()))
+}
+
+/// v2.46: is `name` an abbreviation the *session zone* itself uses
+/// (its standard/daylight abbreviations, or LMT — the historical
+/// abbreviation every IANA zone carries)? PG's from_char TZ
+/// element resolves such dynamic abbreviations against the
+/// session zone's tzdata.
+fn is_session_zone_abbrev(name: &str) -> bool {
+    let up = name.to_ascii_uppercase();
+    if up == "LMT" {
+        return true;
+    }
+    match zone_def(&session_tz_name()) {
+        Some(def) => {
+            def.std_abbr.eq_ignore_ascii_case(&up) || def.dst_abbr.eq_ignore_ascii_case(&up)
+        }
+        None => false,
+    }
 }
 
 /// Parse a numeric zone offset string: `[+-]HH`, `[+-]HH:MM`,
@@ -1282,6 +1303,10 @@ struct Decoded {
     has_time: bool,
     /// Explicit zone text (abbrev or name) if one was present.
     zone: Option<String>,
+    /// v2.46: a `DST` modifier token followed the zone abbreviation
+    /// (PG's DTZMOD: the abbreviation's daylight offset, +1h over the
+    /// standard offset it names).
+    zone_dst: bool,
     /// Explicit numeric zone offset (seconds east) if present.
     zone_offset: Option<i32>,
 }
@@ -1296,18 +1321,25 @@ fn range_err(orig: &str) -> String {
 /// and returned as the second element.
 /// Compact time field: `HHMMSS[.frac][offset]` (PG accepts the
 /// six-digit form when a date precedes it). Returns (tod micros,
-/// zone offset seconds).
-fn parse_compact_time(f: &str) -> Option<(i64, Option<i32>)> {
+/// zone offset seconds). v2.46: the ISO 8601 four-digit `HHMM`
+/// form is also accepted when `allow_hhmm` (time/timetz literals
+/// and the `YYYYMMDD HHMM` datetime form; PG19 DecodeTimeOnly /
+/// DecodeNumberField).
+fn parse_compact_time_x(f: &str, allow_hhmm: bool) -> Option<(i64, Option<i32>)> {
     let b = f.as_bytes();
     let mut i = 0;
     while i < b.len() && b[i].is_ascii_digit() {
         i += 1;
     }
-    if i != 6 {
+    if i != 6 && !(allow_hhmm && i == 4) {
         return None;
     }
-    let v: i64 = f[..6].parse().ok()?;
-    let (hh, mm, ss) = (v / 10000, (v / 100) % 100, v % 100);
+    let v: i64 = f[..i].parse().ok()?;
+    let (hh, mm, ss) = if i == 6 {
+        (v / 10000, (v / 100) % 100, v % 100)
+    } else {
+        (v / 100, v % 100, 0)
+    };
     if hh > 24 || mm > 59 || ss > 59 || (hh == 24 && (mm != 0 || ss != 0)) {
         return None;
     }
@@ -1450,6 +1482,10 @@ fn decode_datetime(s: &str) -> Result<Decoded, String> {
     let mut bc = false;
     let mut meridian: Option<bool> = None; // Some(true) = PM
     let mut julian: Option<i64> = None;
+    // v2.46: a relative-day word (`today`/`tomorrow`/`yesterday`)
+    // combined with a separate time field (`today 10:30`,
+    // `16:00:00 tomorrow`).
+    let mut sp_days: Option<i64> = None;
     let mut doy_form: Option<(i64, i64)> = None; // (year, day-of-year)
 
     for field in cleaned.split_whitespace() {
@@ -1483,9 +1519,13 @@ fn decode_datetime(s: &str) -> Result<Decoded, String> {
             continue;
         }
         // Compact time field HHMMSS[.frac][offset], once a date is
-        // established (`20011227 040506+08`).
-        if !out.has_time && (compact_days.is_some() || !nums.is_empty() || month.is_some()) {
-            if let Some((tod, zoff)) = parse_compact_time(f) {
+        // established (`20011227 040506+08`). v2.46: a Julian day
+        // also establishes the date, and the HHMM form is accepted
+        // after a compact YYYYMMDD date.
+        if !out.has_time
+            && (compact_days.is_some() || !nums.is_empty() || month.is_some() || julian.is_some())
+        {
+            if let Some((tod, zoff)) = parse_compact_time_x(f, compact_days.is_some()) {
                 out.tod_micros = tod;
                 out.has_time = true;
                 if zoff.is_some() {
@@ -1529,18 +1569,52 @@ fn decode_datetime(s: &str) -> Result<Decoded, String> {
             }
             continue;
         }
-        // Julian day: `J2451187`.
-        if (lower.starts_with('j')
-            && lower.len() > 1
-            && lower[1..].chars().all(|c| c.is_ascii_digit()))
+        // Julian day: `J2451187`. v2.46: the field may carry a
+        // fractional part (`.5` = 12:00:00 of that Julian day) and a
+        // glued numeric zone offset (`J2452271.5+08`), per PG19
+        // DecodeDateTime's DTK_JULIAN case.
+        if (lower.starts_with('j') && lower.len() > 1 && lower.as_bytes()[1].is_ascii_digit())
             || (lower == "j")
         {
             if lower.len() > 1 {
+                let rest = &lower[1..];
+                let dend = rest
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(rest.len());
                 julian = Some(
-                    lower[1..]
+                    rest[..dend]
                         .parse::<i64>()
                         .map_err(|_| format!("invalid date {:?}", orig))?,
                 );
+                let mut tail = &rest[dend..];
+                if let Some(frac) = tail.strip_prefix('.') {
+                    let fend = frac
+                        .find(|c: char| !c.is_ascii_digit())
+                        .unwrap_or(frac.len());
+                    if fend == 0 || fend > 15 {
+                        return Err(format!("invalid date {:?}", orig));
+                    }
+                    let num: i128 = frac[..fend]
+                        .parse()
+                        .map_err(|_| format!("invalid date {:?}", orig))?;
+                    let denom = 10i128.pow(fend as u32);
+                    // Fraction of a day -> micros, rounded like PG's
+                    // double math in dt2time.
+                    let tod = (num * 86_400_000_000 + denom / 2) / denom;
+                    out.tod_micros = tod as i64;
+                    out.has_time = true;
+                    tail = &frac[fend..];
+                }
+                if !tail.is_empty() {
+                    if tail.starts_with('+') || tail.starts_with('-') {
+                        out.zone_offset = Some(
+                            parse_zone_offset(tail)
+                                .ok_or_else(|| format!("invalid date {:?}", orig))?,
+                        );
+                    } else {
+                        return Err(format!("invalid date {:?}", orig));
+                    }
+                }
                 continue;
             }
             // A bare "j" is consumed by the next numeric field in PG;
@@ -1548,6 +1622,37 @@ fn decode_datetime(s: &str) -> Result<Decoded, String> {
             // if a julian value follows (handled by caller order);
             // here: error like PG's bad format.
             return Err(format!("invalid date {:?}", orig));
+        }
+        // v2.46: relative-day words combined with a time field,
+        // `allballs` (PG's DTK_ZULU: 00:00:00 in zone Zulu), and the
+        // `DST` modifier after a zone abbreviation (DTZMOD).
+        match lower.as_str() {
+            "today" => {
+                sp_days = Some(special_days(&Special::Today));
+                continue;
+            }
+            "tomorrow" => {
+                sp_days = Some(special_days(&Special::Tomorrow));
+                continue;
+            }
+            "yesterday" => {
+                sp_days = Some(special_days(&Special::Yesterday));
+                continue;
+            }
+            "allballs" => {
+                out.tod_micros = 0;
+                out.has_time = true;
+                out.zone_offset = Some(0);
+                continue;
+            }
+            "dst" => {
+                if out.zone.is_none() && out.zone_offset.is_none() {
+                    return Err(format!("invalid date {:?}", orig));
+                }
+                out.zone_dst = true;
+                continue;
+            }
+            _ => {}
         }
         // Era / meridian / month / weekday words.
         match lower.as_str() {
@@ -1678,6 +1783,20 @@ fn decode_datetime(s: &str) -> Result<Decoded, String> {
         }
     }
 
+    if let Some(d) = sp_days {
+        // A relative-day word may only combine with a time field
+        // (and zone designators), never with explicit date fields.
+        if julian.is_some()
+            || compact_days.is_some()
+            || doy_form.is_some()
+            || month.is_some()
+            || !nums.is_empty()
+        {
+            return Err(format!("invalid date {:?}", orig));
+        }
+        out.days = Some(d);
+        return finish_decoded(out, meridian, orig);
+    }
     if let Some(j) = julian {
         out.days = Some(j - JULIAN_UNIX_EPOCH);
         return finish_decoded(out, meridian, orig);
@@ -1930,6 +2049,16 @@ fn split_special(s: &str) -> Option<(Special, Option<String>)> {
     Some((sp, rest.filter(|r| !r.is_empty())))
 }
 
+/// v2.46: does `z` look like a time-of-day field (`10:30`,
+/// `040506`, `allballs`)? Used to let `<special> <time>` inputs
+/// (`today 10:30`) fall through to the general decoder instead of
+/// the special+zone fast path.
+fn looks_like_time_field(z: &str) -> bool {
+    z.contains(':')
+        || z.eq_ignore_ascii_case("allballs")
+        || (z.len() >= 4 && z.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
+}
+
 /// May `z` follow a special value (`today EST`, `now +02`)? Only a
 /// real zone name/abbreviation or a *signed* numeric offset — a bare
 /// time field (`epoch 01:01:01`) or another special (`now epoch`)
@@ -2000,24 +2129,30 @@ pub fn parse_timestamp(s: &str) -> Result<i64, String> {
         None => {}
     }
     if let Some((sp, zone)) = split_special(t) {
-        // `today EST` / `tomorrow zulu` and friends.
-        if let Some(z) = &zone {
-            if !special_zone_ok(z) {
-                return Err(format!("invalid date {:?}", s));
+        // v2.46: `today 10:30` — a time field after the special is
+        // decoded by the general path, not the special+zone path.
+        if zone.as_deref().is_some_and(looks_like_time_field) {
+            // fall through to decode_datetime below
+        } else {
+            // `today EST` / `tomorrow zulu` and friends.
+            if let Some(z) = &zone {
+                if !special_zone_ok(z) {
+                    return Err(format!("invalid date {:?}", s));
+                }
             }
+            return match sp {
+                Special::Infinity => Ok(TS_INFINITY),
+                Special::NegInfinity => Ok(TS_NEG_INFINITY),
+                Special::Epoch => Ok(0),
+                Special::Now => Ok(txn_now_micros()),
+                _ => {
+                    let days = special_days(&sp);
+                    days.checked_mul(86_400_000_000)
+                        .filter(|m| is_valid_ts_micros(*m))
+                        .ok_or_else(|| range_err(s))
+                }
+            };
         }
-        return match sp {
-            Special::Infinity => Ok(TS_INFINITY),
-            Special::NegInfinity => Ok(TS_NEG_INFINITY),
-            Special::Epoch => Ok(0),
-            Special::Now => Ok(txn_now_micros()),
-            _ => {
-                let days = special_days(&sp);
-                days.checked_mul(86_400_000_000)
-                    .filter(|m| is_valid_ts_micros(*m))
-                    .ok_or_else(|| range_err(s))
-            }
-        };
     }
     let dec = decode_datetime(t)?;
     if let Some(z) = &dec.zone {
@@ -2077,37 +2212,43 @@ pub fn parse_timestamptz(s: &str) -> Result<i64, String> {
         None => {}
     }
     if let Some((sp, zone)) = split_special(t) {
-        // Validate the trailing zone BEFORE the early-return
-        // specials: `epoch 01:01:01` / `now epoch` are invalid.
-        if let Some(z) = &zone {
-            if !special_zone_ok(z) {
-                return Err(format!("invalid date {:?}", s));
-            }
-        }
-        let days = match sp {
-            Special::Infinity => return Ok(TS_INFINITY),
-            Special::NegInfinity => return Ok(TS_NEG_INFINITY),
-            Special::Epoch => return Ok(0),
-            Special::Now => return Ok(txn_now_micros()),
-            _ => special_days(&sp),
-        };
-        let local = days
-            .checked_mul(86_400_000_000)
-            .ok_or_else(|| range_err(s))?;
-        let off = match &zone {
-            Some(z) => tz_lookup_local(z, local)
-                .map(|(o, _)| o)
-                .ok_or_else(|| format!("time zone {:?} not recognized", z))?,
-            None => tz_lookup_local(&session_tz_name(), local)
-                .map(|(o, _)| o)
-                .unwrap_or(0),
-        };
-        let utc = local - off as i64 * 1_000_000;
-        return if is_valid_ts_micros(utc) {
-            Ok(utc)
+        // v2.46: `today 10:30` — a time field after the special is
+        // decoded by the general path, not the special+zone path.
+        if zone.as_deref().is_some_and(looks_like_time_field) {
+            // fall through to decode_datetime below
         } else {
-            Err(range_err(s))
-        };
+            // Validate the trailing zone BEFORE the early-return
+            // specials: `epoch 01:01:01` / `now epoch` are invalid.
+            if let Some(z) = &zone {
+                if !special_zone_ok(z) {
+                    return Err(format!("invalid date {:?}", s));
+                }
+            }
+            let days = match sp {
+                Special::Infinity => return Ok(TS_INFINITY),
+                Special::NegInfinity => return Ok(TS_NEG_INFINITY),
+                Special::Epoch => return Ok(0),
+                Special::Now => return Ok(txn_now_micros()),
+                _ => special_days(&sp),
+            };
+            let local = days
+                .checked_mul(86_400_000_000)
+                .ok_or_else(|| range_err(s))?;
+            let off = match &zone {
+                Some(z) => tz_lookup_local(z, local)
+                    .map(|(o, _)| o)
+                    .ok_or_else(|| format!("time zone {:?} not recognized", z))?,
+                None => tz_lookup_local(&session_tz_name(), local)
+                    .map(|(o, _)| o)
+                    .unwrap_or(0),
+            };
+            let utc = local - off as i64 * 1_000_000;
+            return if is_valid_ts_micros(utc) {
+                Ok(utc)
+            } else {
+                Err(range_err(s))
+            };
+        }
     }
     let dec = decode_datetime(t)?;
     let days = dec.days.ok_or_else(|| format!("invalid date {:?}", s))?;
@@ -2124,9 +2265,12 @@ pub fn parse_timestamptz(s: &str) -> Result<i64, String> {
     let off = if let Some(o) = dec.zone_offset {
         o
     } else if let Some(z) = &dec.zone {
-        tz_lookup_local(z, local)
+        let base = tz_lookup_local(z, local)
             .map(|(o, _)| o)
-            .ok_or_else(|| format!("time zone {:?} not recognized", z))?
+            .ok_or_else(|| format!("time zone {:?} not recognized", z))?;
+        // v2.46: `MET DST` — the DTZMOD marker shifts a zone
+        // abbreviation to its daylight offset (+1h, PG datetime.c).
+        if dec.zone_dst { base + 3600 } else { base }
     } else {
         tz_lookup_local(&session_tz_name(), local)
             .map(|(o, _)| o)
@@ -2186,6 +2330,9 @@ fn decode_time_only_full(
     let mut zoff: Option<i32> = None;
     let mut meridian: Option<bool> = None;
     let mut saw_date = false;
+    // v2.46: trailing `DST` marker (PG's DTZMOD) — shifts the
+    // resolved zone offset one hour toward daylight time.
+    let mut dst_marker = false;
     for field in s.split_whitespace() {
         let lower = field.to_ascii_lowercase();
         match lower.as_str() {
@@ -2197,7 +2344,35 @@ fn decode_time_only_full(
                 meridian = Some(true);
                 continue;
             }
+            // v2.46: `allballs` = 00:00:00 UTC (PG's DTK_ZULU).
+            "allballs" => {
+                tod = Some(0);
+                zoff = Some(0);
+                continue;
+            }
             _ => {}
+        }
+        // v2.46: an ISO `T` glued to the time field (`T040506`,
+        // `T04:05:06.07`) — PG's ParseDateTime treats a leading T
+        // before a digit as the time separator token.
+        let field = if field.len() > 1
+            && (field.as_bytes()[0] == b'T' || field.as_bytes()[0] == b't')
+            && field.as_bytes()[1].is_ascii_digit()
+        {
+            &field[1..]
+        } else {
+            field
+        };
+        // v2.46: compact ISO time (`040506`, `0405`, `040506.07`,
+        // with a glued numeric zone offset for timetz).
+        if tod.is_none() {
+            if let Some((t, zo)) = parse_compact_time_x(field, true) {
+                tod = Some(t);
+                if zo.is_some() {
+                    zoff = zo;
+                }
+                continue;
+            }
         }
         // PG time_in runs the full date/time decoder and discards
         // the date: an ISO date prefix (`2003-03-07 15:36:39`) or a
@@ -2210,7 +2385,12 @@ fn decode_time_only_full(
                     .iter()
                     .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
             let compact_date = field.len() == 8 && field.bytes().all(|b| b.is_ascii_digit());
-            if iso_date || compact_date {
+            // v2.46: a Julian-day date prefix (`J2452271 ...`) is
+            // skipped like any other date.
+            let julian_date = lower.len() > 1
+                && lower.as_bytes()[0] == b'j'
+                && lower[1..].bytes().all(|b| b.is_ascii_digit() || b == b'.');
+            if iso_date || compact_date || julian_date {
                 saw_date = true;
                 continue;
             }
@@ -2244,7 +2424,25 @@ fn decode_time_only_full(
             zone = Some(field.to_string());
             continue;
         }
+        // v2.46: `DST` after a zone/abbrev (e.g. `040506 MET DST`).
+        if lower == "dst" && (zone.is_some() || zoff.is_some()) {
+            dst_marker = true;
+            continue;
+        }
         return Err(format!("invalid time {:?}", orig));
+    }
+    if dst_marker {
+        if let Some(o) = zoff {
+            zoff = Some(o + 3600);
+        } else if let Some(z) = zone.take() {
+            let base = abbrev_def(&z)
+                .map(|(o, _)| o)
+                .or_else(|| zone_def(&z).map(|d| d.dst_off - 3600));
+            match base {
+                Some(b) => zoff = Some(b + 3600),
+                None => zone = Some(z),
+            }
+        }
     }
     let mut tod = tod.ok_or_else(|| format!("invalid time {:?}", orig))?;
     if let Some(pm) = meridian {
@@ -3010,6 +3208,14 @@ pub fn format_interval_pattern(iv: &Interval, fmt: &str) -> Result<String, FmtEr
             FmtTok::Lit(c) => out.push(*c),
             FmtTok::LitStr(s) => out.push_str(s),
             FmtTok::FxToggle => {}
+            FmtTok::Century => {
+                let cc = tm_year / 100;
+                if cc < 0 {
+                    out.push_str(&format!("-{:02}", -cc));
+                } else {
+                    out.push_str(&format!("{cc:02}"));
+                }
+            }
             FmtTok::Year4 => out.push_str(&pad(tm_year, 4, false)),
             FmtTok::Year3 => out.push_str(&pad(tm_year % 1000, 3, false)),
             FmtTok::Year2 => out.push_str(&pad(tm_year % 100, 2, false)),
@@ -3229,19 +3435,75 @@ fn unit_micros(u: &str) -> Option<f64> {
     }
 }
 
+/// v2.46: an interval time field `HH:MM[:SS[.frac]]` — unlike a
+/// time-of-day, the hour field is unbounded (`36:01`,
+/// `100000000:00`); minutes must be < 60, seconds <= 60 (PG19
+/// DecodeInterval via DecodeTimeOnly). Returns total micros as
+/// i128 so out-of-range magnitudes surface as range errors.
+fn parse_interval_time_field(body: &str) -> Option<i128> {
+    let parts: Vec<&str> = body.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return None;
+    }
+    if parts[0].is_empty() || parts[0].len() > 18 || !parts[0].bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let hh: i128 = parts[0].parse().ok()?;
+    if parts[1].len() > 9 || !parts[1].bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mm: i128 = parts[1].parse().ok()?;
+    if mm > 59 {
+        return None;
+    }
+    let (ss, us) = if parts.len() == 3 {
+        let (ss_s, frac_s) = match parts[2].find('.') {
+            Some(x) => (&parts[2][..x], &parts[2][x + 1..]),
+            None => (parts[2], ""),
+        };
+        if ss_s.len() > 9 || !ss_s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let ss: i128 = ss_s.parse().ok()?;
+        if ss > 60 {
+            return None;
+        }
+        let mut us: i128 = 0;
+        if !frac_s.is_empty() {
+            if !frac_s.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let digs: Vec<u8> = frac_s.bytes().map(|b| b - b'0').collect();
+            for k in 0..6 {
+                us = us * 10 + digs.get(k).copied().unwrap_or(0) as i128;
+            }
+            if digs.get(6).copied().unwrap_or(0) >= 5 {
+                us += 1;
+            }
+        }
+        (ss, us)
+    } else {
+        (0, 0)
+    };
+    Some(((hh * 60 + mm) * 60 + ss) * 1_000_000 + us)
+}
+
 /// Parse an interval literal (PG DecodeInterval subset).
 /// `qualifier` is the PG typmod-style field restriction from a typed
 /// literal (`INTERVAL 'x' YEAR`, `... MINUTE TO SECOND`): it decides
 /// how bare numbers/times are read.
 pub fn parse_interval(s: &str) -> Result<Interval, String> {
-    parse_interval_q(s, None)
+    parse_interval_q(s, None, None)
 }
 
 /// Field qualifier for interval literals: (start unit, end unit)
 /// with units "year","month","day","hour","minute","second".
+/// `precision` is the typmod fractional-seconds precision from a
+/// `SECOND(p)` qualifier (PG's AdjustIntervalForTypmod rounding).
 pub fn parse_interval_q(
     s: &str,
     qualifier: Option<(&str, Option<&str>)>,
+    precision: Option<i32>,
 ) -> Result<Interval, String> {
     let t = s.trim();
     // PG's traditional syntax allows a leading `@`: `@ 1 minute`.
@@ -3322,6 +3584,11 @@ pub fn parse_interval_q(
     let mut saw_any = false;
     let mut bare_count = 0usize;
     let mut saw_time_field = false;
+    // v2.46: a standalone sign field (`1 month - 1 second`,
+    // `2 days - 12:34:56`) applies to the next field, per PG19
+    // DecodeInterval's handling of a `-` token.
+    let mut pending_sign: i64 = 1;
+    let mut pending_sign_live = false;
     let fields: Vec<&str> = t.split_whitespace().collect();
     let mut i = 0usize;
     while i < fields.len() {
@@ -3332,6 +3599,12 @@ pub fn parse_interval_q(
                 return Err(syntax_err());
             }
             ago = true;
+            i += 1;
+            continue;
+        }
+        if f == "-" || f == "+" {
+            pending_sign *= if f == "-" { -1 } else { 1 };
+            pending_sign_live = true;
             i += 1;
             continue;
         }
@@ -3349,9 +3622,12 @@ pub fn parse_interval_q(
             } else {
                 (1i64, f)
             };
+            let sign = sign * pending_sign;
+            pending_sign = 1;
+            pending_sign_live = false;
             // MINUTE TO SECOND reads HH:MM as MM:SS.
             let mm_ss = matches!(qualifier, Some(("minute", Some("second"))));
-            let (tod, _) = if mm_ss {
+            let tod: i128 = if mm_ss {
                 let parts: Vec<&str> = body.split(':').collect();
                 if parts.len() != 2 {
                     return Err(syntax_err());
@@ -3375,11 +3651,11 @@ pub fn parse_interval_q(
                         us += 1;
                     }
                 }
-                ((mm * 60 + ss) * 1_000_000 + us, None)
+                ((mm * 60 + ss) * 1_000_000 + us) as i128
             } else {
-                parse_time_field(body, s)?
+                parse_interval_time_field(body).ok_or_else(syntax_err)?
             };
-            micros_i += sign as i128 * tod as i128;
+            micros_i += sign as i128 * tod;
             saw_any = true;
             i += 1;
             continue;
@@ -3389,7 +3665,7 @@ pub fn parse_interval_q(
         // integer part and an f64 fraction so huge magnitudes range-
         // error instead of rounding into range through f64.
         let (num_part, glued_unit) = split_num_unit(f);
-        let (int_part, frac_part): (i128, f64) = {
+        let (mut int_part, mut frac_part): (i128, f64) = {
             let digits = num_part.trim_start_matches(['-', '+']);
             if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
                 if digits.len() > 38 {
@@ -3409,6 +3685,13 @@ pub fn parse_interval_q(
                 }
             }
         };
+        // v2.46: a standalone sign field scales this field's value.
+        if pending_sign_live {
+            int_part *= pending_sign as i128;
+            frac_part *= pending_sign as f64;
+            pending_sign = 1;
+            pending_sign_live = false;
+        }
         let unit: Option<String> = if let Some(u) = glued_unit {
             Some(u.to_ascii_lowercase())
         } else if i + 1 < fields.len() {
@@ -3529,6 +3812,10 @@ pub fn parse_interval_q(
         saw_any = true;
         i += 1;
     }
+    if pending_sign_live {
+        // A trailing standalone sign with no field after it.
+        return Err(syntax_err());
+    }
     if !saw_any {
         return Err(syntax_err());
     }
@@ -3582,8 +3869,36 @@ pub fn parse_interval_q(
             "day" => iv.micros = 0,
             "hour" => iv.micros = (iv.micros / 3_600_000_000) * 3_600_000_000,
             "minute" => iv.micros = (iv.micros / 60_000_000) * 60_000_000,
-            "second" => iv.micros = (iv.micros / 1_000_000) * 1_000_000,
+            // PG: a SECOND range alone does not truncate the
+            // fractional part; the precision rounding below is
+            // the only adjustment (full precision = no-op).
+            "second" => {}
             _ => {}
+        }
+    }
+    // AdjustIntervalForTypmod fractional-seconds rounding for a
+    // `SECOND(p)` typmod: add (sign-aware) half the scale, with an
+    // overflow check — a value at the i64-micros extreme rounds out
+    // of range (22008 "interval out of range") — then truncate to
+    // the scale. Infinite intervals are exempt (PG returns early),
+    // and this parser never produces one from a qualified literal
+    // with a finite input string, but keep the guard for symmetry.
+    if let Some(p) = precision {
+        if !(0..=6).contains(&p) {
+            return Err(format!("interval({}) precision must be between 0 and 6", p));
+        }
+        if iv.is_finite() {
+            const SCALES: [i64; 7] = [1_000_000, 100_000, 10_000, 1_000, 100, 10, 1];
+            const OFFSETS: [i64; 7] = [500_000, 50_000, 5_000, 500, 50, 5, 0];
+            let scale = SCALES[p as usize];
+            let offset = OFFSETS[p as usize];
+            let adjusted = if iv.micros >= 0 {
+                iv.micros.checked_add(offset)
+            } else {
+                iv.micros.checked_sub(offset)
+            };
+            let adjusted = adjusted.ok_or_else(|| "interval out of range".to_string())?;
+            iv.micros = adjusted - adjusted % scale;
         }
     }
     Ok(iv)
@@ -4206,6 +4521,31 @@ pub fn extract_interval(field: &str, iv: &Interval) -> Result<f64, String> {
 
 /// date_trunc on an interval (PG `interval_trunc`).
 pub fn date_trunc_interval(field: &str, iv: &Interval) -> Result<Interval, String> {
+    // PG19 timestamp.c interval_trunc: the unit is decoded and
+    // validated BEFORE the infinite-interval passthrough, so an
+    // unsupported/unrecognized unit errors for finite and infinite
+    // inputs alike. Recognized-but-unsupported units (week) raise
+    // 0A000 `unit "%s" not supported for type interval`; anything
+    // DecodeUnits does not return as UNITS (e.g. "ago") raises
+    // 22023 `unit "%s" not recognized for type interval`. The exec
+    // layer maps the two messages to those SQLSTATEs.
+    match field {
+        "millennium" | "century" | "decade" | "year" | "quarter" | "month" | "day" | "hour"
+        | "minute" | "second" | "milliseconds" | "millisecond" | "microseconds" | "microsecond" => {
+        }
+        "week" => {
+            return Err(format!(
+                "unit \"{}\" not supported for type interval",
+                field
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "unit \"{}\" not recognized for type interval",
+                field
+            ));
+        }
+    }
     if !iv.is_finite() {
         return Ok(*iv);
     }
@@ -4242,11 +4582,6 @@ pub fn date_trunc_interval(field: &str, iv: &Interval) -> Result<Interval, Strin
             days: 0,
             micros: 0,
         },
-        "week" => Interval {
-            months: iv.months,
-            days: (iv.days / 7) * 7,
-            micros: 0,
-        },
         "day" => Interval {
             months: iv.months,
             days: iv.days,
@@ -4273,7 +4608,12 @@ pub fn date_trunc_interval(field: &str, iv: &Interval) -> Result<Interval, Strin
             micros: trunc_tz(1_000),
         },
         "microseconds" | "microsecond" => *iv,
-        _ => return Err(format!("unit {:?} not supported for date_trunc", field)),
+        _ => {
+            return Err(format!(
+                "unit \"{}\" not recognized for type interval",
+                field
+            ));
+        }
     })
 }
 
@@ -4327,6 +4667,9 @@ pub fn date_bin(stride: &Interval, source: i64, origin: i64) -> Result<i64, Stri
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FmtErr {
+    // No current constructor (v2.46 made quoted-literal handling
+    // total); the variant stays for the 0A000 mapping in funcs.rs.
+    #[allow(dead_code)]
     Unsupported(String),
     Invalid(String),
 }
@@ -4386,6 +4729,7 @@ enum FmtTok {
     YearComma, // Y,YYY
     FxToggle,  // FX: toggles strict matching for what follows
     MonthNum,
+    Century, // CC
     DayOfMonth,
     DayOfYear,
     DowNum,         // D: 1 (Sunday) .. 7
@@ -4457,11 +4801,13 @@ fn fmt_pattern(rest: &str) -> Option<(usize, FmtTok)> {
     }
     let m = |n: usize| &rest[..n];
     // Dotted meridian / era first (they contain literal dots).
-    if rest.len() >= 5 && rest.as_bytes()[..5].eq_ignore_ascii_case(b"b.c.") {
-        return Some((5, FmtTok::BcAd(name_case(m(5)), true)));
+    // v2.46: `B.C.`/`A.D.` are four characters (the length check
+    // previously demanded five, so the dotted era never matched).
+    if rest.len() >= 4 && rest.as_bytes()[..4].eq_ignore_ascii_case(b"b.c.") {
+        return Some((4, FmtTok::BcAd(name_case(m(4)), true)));
     }
-    if rest.len() >= 5 && rest.as_bytes()[..5].eq_ignore_ascii_case(b"a.d.") {
-        return Some((5, FmtTok::BcAd(name_case(m(5)), true)));
+    if rest.len() >= 4 && rest.as_bytes()[..4].eq_ignore_ascii_case(b"a.d.") {
+        return Some((4, FmtTok::BcAd(name_case(m(4)), true)));
     }
     if rest.len() >= 4 && rest.as_bytes()[..4].eq_ignore_ascii_case(b"a.m.") {
         return Some((4, FmtTok::AmPm(name_case(m(4)), true)));
@@ -4474,6 +4820,8 @@ fn fmt_pattern(rest: &str) -> Option<(usize, FmtTok)> {
     p!("YYYY", FmtTok::Year4);
     p!("HH24", FmtTok::Hour24);
     p!("HH12", FmtTok::Hour12);
+    // v2.46: SSSSS is its own keyword in PG (len 5, DCH_SSSS).
+    p!("SSSSS", FmtTok::SecondsPastMidnight);
     p!("SSSS", FmtTok::SecondsPastMidnight);
     p!("DAY", FmtTok::DayFull(name_case(m(3))));
     p!("MON", FmtTok::MonthAbbr(name_case(m(3))));
@@ -4495,6 +4843,8 @@ fn fmt_pattern(rest: &str) -> Option<(usize, FmtTok)> {
     }
     p!("YY", FmtTok::Year2);
     p!("IY", FmtTok::IsoYear2);
+    // v2.46: CC (century) — a real PG element for both directions.
+    p!("CC", FmtTok::Century);
     p!("MM", FmtTok::MonthNum);
     p!("DD", FmtTok::DayOfMonth);
     p!("HH", FmtTok::Hour12);
@@ -4529,14 +4879,47 @@ fn tokenize_format_uncached(fmt: &str) -> Result<Vec<FmtTok>, FmtErr> {
     let mut fill_next = false;
     while !rest.is_empty() {
         let c = rest.chars().next().unwrap();
+        // v2.46: outside quotes, a backslash is special only
+        // before a quote: `\"` is a literal quote CHAR node
+        // (PG19 parse_format).
+        if c == '\\' && rest[1..].starts_with('"') {
+            toks.push(FmtTok::Lit('"'));
+            rest = &rest[2..];
+            continue;
+        }
         if c == '"' {
-            // Double-quoted literal text (PG formatting.c).
-            let end = rest[1..].find('"').ok_or_else(|| {
-                FmtErr::Unsupported("unterminated quoted literal in format string".to_string())
-            })?;
-            let lit = rest[1..1 + end].to_string();
+            // Double-quoted literal text (PG formatting.c). v2.46:
+            // inside the quotes a backslash quotes the next
+            // character (so `\"` embeds a literal quote).
+            let body = &rest[1..];
+            let mut lit = String::new();
+            let mut consumed = 0usize; // bytes of `body` used, excl. closing quote
+            let mut closed = false;
+            let mut chars = body.char_indices();
+            while let Some((i, ch)) = chars.next() {
+                if ch == '\\' {
+                    match chars.next() {
+                        Some((_, nch)) => {
+                            lit.push(nch);
+                            consumed = i + ch.len_utf8() + nch.len_utf8();
+                        }
+                        None => {
+                            consumed = i + ch.len_utf8();
+                        }
+                    }
+                } else if ch == '"' {
+                    consumed = i;
+                    closed = true;
+                    break;
+                } else {
+                    lit.push(ch);
+                    consumed = i + ch.len_utf8();
+                }
+            }
+            // v2.46: an unterminated quote takes the rest of the
+            // format as literal text (PG19 parse_format).
             toks.push(FmtTok::LitStr(lit));
-            rest = &rest[end + 2..];
+            rest = if closed { &body[consumed + 1..] } else { "" };
             continue;
         }
         if c.is_ascii_alphabetic() {
@@ -4577,13 +4960,14 @@ fn tokenize_format_uncached(fmt: &str) -> Result<Vec<FmtTok>, FmtErr> {
                     }
                 }
                 None => {
-                    let run: String = rest
-                        .chars()
-                        .take_while(|ch| ch.is_ascii_alphabetic())
-                        .collect();
-                    return Err(FmtErr::Unsupported(format!(
-                        "pattern element {run:?} is not supported"
-                    )));
+                    // v2.46: PG's parse_format turns a character that
+                    // starts no known keyword into a literal CHAR node
+                    // (`YYYYxMMxDD`, the `FOO` in `TZFOOSS`) — it is
+                    // copied verbatim by to_char and consumes one
+                    // input character in from_char.
+                    fill_next = false;
+                    toks.push(FmtTok::Lit(c));
+                    rest = &rest[c.len_utf8()..];
                 }
             }
         } else {
@@ -4618,6 +5002,18 @@ pub struct ParsedDt {
     pub iso_week: Option<u32>,
     pub iso_dow: Option<u32>,
     pub iso_doy: Option<u32>,
+    /// v2.46: century from a `CC` element (may be negative).
+    pub century: Option<i64>,
+    /// v2.46: week-of-month from a `W` element (PG converts it to
+    /// a day-of-month `(W-1)*7+1` in do_to_timestamp).
+    pub week_of_month: Option<u32>,
+    /// v2.46: digit size of the year element that set `year`
+    /// (PG's yysz; CC only combines with yysz <= 2).
+    pub year_sz: Option<u32>,
+    /// v2.46: fractional precision from an `FFn` element (PG's
+    /// fprec): to_timestamp rounds the result to this many
+    /// fractional digits (AdjustTimestampForTypmod).
+    pub ff_prec: Option<u8>,
 }
 
 /// `Y,YYY` rendering: thousands-grouped year (`1,582`).
@@ -4669,7 +5065,74 @@ fn take_digits_g(
         let v: u32 = s[..n].parse().map_err(|_| fmt_mismatch(input, fmt))?;
         return Ok((v, n));
     }
-    take_digits(s, max, input, fmt)
+    // v2.46: PG19 from_char_parse_int_len fixed-width mode — too
+    // little input remaining ("source string too short") or a
+    // digit run shorter than the field width is an error.
+    if s.len() < max {
+        return Err(FmtErr::Invalid(format!(
+            "source string too short for formatting field in input {input:?} for format {fmt:?}"
+        )));
+    }
+    let (v, n) = take_digits(s, max, input, fmt)?;
+    if n < max {
+        return Err(FmtErr::Invalid(format!(
+            "invalid value in input {input:?} for format {fmt:?}: field requires {max} characters, but only {n} could be parsed"
+        )));
+    }
+    Ok((v, n))
+}
+
+/// v2.46: PG19 fractional-second fields (FFn / MS / US). Slurp
+/// mode reads the whole digit run and scales by the number of
+/// digits consumed (FF/US: micros = V * 10^(6-n), or V when
+/// n > 6; MS: micros = V * {100,10,1} * 1000 for n = 1, 2, >=3).
+/// Fixed-width mode reads exactly `max` digits. A scaled value
+/// of a second or more is PG's out-of-range error.
+fn take_frac_micros(
+    s: &str,
+    max: usize,
+    millis: bool,
+    greedy: bool,
+    input: &str,
+    fmt: &str,
+) -> Result<(u32, usize), FmtErr> {
+    let range_err = || FmtErr::Invalid(format!("date/time field value out of range: {input:?}"));
+    if greedy {
+        let run = s.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if run == 0 {
+            return Err(fmt_mismatch(input, fmt));
+        }
+        let n = run.min(10);
+        let v: u64 = s[..n].parse().map_err(|_| fmt_mismatch(input, fmt))?;
+        let us: u64 = if millis {
+            v * if run == 1 {
+                100_000
+            } else if run == 2 {
+                10_000
+            } else {
+                1_000
+            }
+        } else if run <= 6 {
+            v * 10u64.pow(6 - run as u32)
+        } else {
+            v
+        };
+        if us >= 1_000_000 {
+            return Err(range_err());
+        }
+        Ok((us as u32, run))
+    } else {
+        let (v, n) = take_digits_g(s, max, false, input, fmt)?;
+        let us: u64 = if millis {
+            v as u64 * 1_000
+        } else {
+            v as u64 * 10u64.pow(6 - max as u32)
+        };
+        if us >= 1_000_000 {
+            return Err(range_err());
+        }
+        Ok((us as u32, n))
+    }
 }
 
 fn take_ranged(
@@ -4712,6 +5175,7 @@ fn tok_display_name(tok: &FmtTok) -> Option<&'static str> {
         FmtTok::IsoYear2 => "IYY",
         FmtTok::IsoYear1 => "IY",
         FmtTok::MonthNum => "MM",
+        FmtTok::Century => "CC",
         FmtTok::MonthFull(_) => "Month",
         FmtTok::MonthAbbr(_) => "Mon",
         FmtTok::RomanMonth(_) => "RM",
@@ -4820,6 +5284,12 @@ fn parse_with_format_mode(input: &str, fmt: &str, strict_mode: bool) -> Result<P
                 | FmtTok::QuarterTok
                 | FmtTok::JulianTok
                 | FmtTok::SecondsPastMidnight
+                // v2.46: FF/MS/US are digit fields in PG (is_digit),
+                // so a preceding element must not slurp past them
+                // (`...MISSFF6`).
+                | FmtTok::Frac(_)
+                | FmtTok::Millis
+                | FmtTok::Micros
         )
     };
     let mut strict = strict_mode;
@@ -4827,17 +5297,60 @@ fn parse_with_format_mode(input: &str, fmt: &str, strict_mode: bool) -> Result<P
     // only; the FX prefix toggles `strict` (fixed width) but never
     // turns exact matching on.
     let exact = strict_mode;
+    // v2.46: PG19 DCH_from_char scanning rules (non-FX): whitespace
+    // before an element is skipped; a format space/separator node
+    // consumes at most one input space/separator character (after
+    // skipping whitespace when it directly follows an element);
+    // end of input silently ends the scan, and leftover input is
+    // ignored. Std mode keeps strict matching + both errors.
+    let mut run_start = true;
     for (ti, tok) in toks.iter().enumerate() {
         if matches!(tok, FmtTok::FxToggle) {
             strict = !strict;
             continue;
         }
-        let greedy = !strict
-            && (matches!(tok, FmtTok::Fill(_))
-                || toks
-                    .get(ti + 1)
-                    .map(|n| !consumes_digits(n))
-                    .unwrap_or(true));
+        if s.is_empty() && !strict_mode {
+            break;
+        }
+        let is_lit = matches!(tok, FmtTok::Lit(_) | FmtTok::LitStr(_));
+        if !strict && !s.is_empty() {
+            if let FmtTok::Lit(c) = tok {
+                let c = *c;
+                if c.is_whitespace() || c.is_ascii_punctuation() {
+                    // Format space/separator node.
+                    if run_start {
+                        s = s.trim_start();
+                    }
+                    if let Some(ch) = s.chars().next() {
+                        if ch.is_whitespace() || ch.is_ascii_punctuation() {
+                            s = &s[ch.len_utf8()..];
+                        }
+                    }
+                    run_start = false;
+                    continue;
+                }
+            } else if !is_lit {
+                // Element node: skip input whitespace first.
+                s = s.trim_start();
+            }
+        }
+        // v2.46 fix: PG19 from_char_parse_int_len's slurp decision
+        // (FM suffix, or the next format node is a non-digit
+        // separator — with end-of-format counting as a separator)
+        // does NOT depend on the std/strict mode: parse_datetime
+        // (std) still slurps a trailing TZH, so `"12:35 +1"` fits
+        // "HH24:MI TZH" with a 1-digit hour. Gating slurp on
+        // !strict made every strict-mode element fixed-width and,
+        // combined with the fixed-width length checks in
+        // take_digits_g, rejected that input — breaking jsonpath
+        // .datetime(template) in strict mode. Fixed-width errors
+        // still fire where PG has them: an element whose next node
+        // consumes digits (e.g. MM in 'YYYYMMDD').
+        let greedy = matches!(tok, FmtTok::Fill(_))
+            || toks
+                .get(ti + 1)
+                .map(|n| !consumes_digits(n))
+                .unwrap_or(true);
         // PG: setting the same field twice with *different* values is
         // "conflicting values for \"X\" field in formatting string".
         let before = (
@@ -4862,8 +5375,11 @@ fn parse_with_format_mode(input: &str, fmt: &str, strict_mode: bool) -> Result<P
                 )));
             }
         }
+        run_start = !is_lit;
     }
-    if !s.trim_start().is_empty() {
+    // v2.46: leftover input is an error only in std mode (PG19
+    // DCH_from_char checks trailing characters only when std).
+    if strict_mode && !s.trim_start().is_empty() {
         return Err(FmtErr::Invalid(format!(
             "trailing characters {:?} after input {:?} for format {:?}",
             s, input, fmt
@@ -4903,7 +5419,8 @@ fn parse_one_tok(
     match tok {
         FmtTok::FxToggle => Ok(()),
         FmtTok::Fill(inner) => {
-            parse_one_tok(inner, p, s, input, fmt, true && !strict, strict, exact)
+            // FM suffix: PG slurps regardless of std/strict mode.
+            parse_one_tok(inner, p, s, input, fmt, true, strict, exact)
         }
         FmtTok::Ordinal(inner, _) => {
             parse_one_tok(inner, p, s, input, fmt, greedy, strict, exact)?;
@@ -4937,24 +5454,41 @@ fn parse_one_tok(
             _ => Err(fmt_mismatch(input, fmt)),
         },
         FmtTok::LitStr(lit) => {
-            // Quoted literals: case-insensitive in the lenient
-            // to_date/to_timestamp modes, exact in std mode.
-            let matched = if exact {
-                s.len() >= lit.len() && &s[..lit.len()] == lit.as_str()
+            // Quoted literals: PG expands them to per-character
+            // CHAR nodes, so in the lenient modes each character
+            // consumes exactly one input character without
+            // comparing (like FmtTok::Lit); std mode matches the
+            // whole literal exactly.
+            if exact {
+                if s.len() >= lit.len() && &s[..lit.len()] == lit.as_str() {
+                    *s = &s[lit.len()..];
+                    Ok(())
+                } else {
+                    Err(fmt_mismatch(input, fmt))
+                }
             } else {
-                s.len() >= lit.len() && s[..lit.len()].eq_ignore_ascii_case(lit)
-            };
-            if matched {
-                *s = &s[lit.len()..];
+                let mut rest = *s;
+                for _ in lit.chars() {
+                    match rest.chars().next() {
+                        Some(c) => rest = &rest[c.len_utf8()..],
+                        None => break,
+                    }
+                }
+                *s = rest;
                 Ok(())
-            } else {
-                Err(fmt_mismatch(input, fmt))
             }
         }
         FmtTok::Year4 => {
-            let (v, n) = take_digits_g(s, 4, greedy, input, fmt)?;
-            p.year = Some(v as i32);
-            *s = &s[n..];
+            // v2.46: PG's from_char_parse_int is strtol-based, so a
+            // leading '-' is part of the value (`-44` = 44 BC).
+            let (neg, body) = match s.strip_prefix('-') {
+                Some(r) => (true, r),
+                None => (false, *s),
+            };
+            let (v, n) = take_digits_g(body, 4, greedy, input, fmt)?;
+            p.year = Some(if neg { -(v as i32) } else { v as i32 });
+            p.year_sz = Some(4);
+            *s = &body[n..];
             Ok(())
         }
         FmtTok::Year3 => {
@@ -4964,6 +5498,7 @@ fn parse_one_tok(
             } else {
                 v as i32
             });
+            p.year_sz = Some(3);
             *s = &s[n..];
             Ok(())
         }
@@ -4974,6 +5509,7 @@ fn parse_one_tok(
             } else {
                 1900 + v as i32
             });
+            p.year_sz = Some(2);
             *s = &s[n..];
             Ok(())
         }
@@ -4984,7 +5520,28 @@ fn parse_one_tok(
             } else {
                 v as i32
             });
+            p.year_sz = Some(1);
             *s = &s[n..];
+            Ok(())
+        }
+        FmtTok::Century => {
+            // v2.46: CC — strtol-based like YYYY (a leading '-' is
+            // part of the value); PG range-checks to int32.
+            let (neg, body) = match s.strip_prefix('-') {
+                Some(r) => (true, r),
+                None => (false, *s),
+            };
+            // PG reads CC via from_char_parse_int (keyword len 2);
+            // slurp mode still takes the whole digit run.
+            let (v, n) = take_digits_g(body, 2, greedy, input, fmt)?;
+            let val = if neg { -(v as i64) } else { v as i64 };
+            if val < i32::MIN as i64 || val > i32::MAX as i64 {
+                return Err(FmtErr::Invalid(
+                    "value for \"CC\" in source string is out of range".to_string(),
+                ));
+            }
+            p.century = Some(val);
+            *s = &body[n..];
             Ok(())
         }
         FmtTok::IsoYear4 | FmtTok::IsoYear3 | FmtTok::IsoYear2 | FmtTok::IsoYear1 => {
@@ -5115,7 +5672,10 @@ fn parse_one_tok(
             Ok(())
         }
         FmtTok::WeekOfMonthTok => {
-            let (_v, n) = take_ranged(s, 1, 1, 5, greedy, input, fmt)?;
+            // v2.46: PG stores W; do_to_timestamp turns it into a
+            // day-of-month `(W-1)*7+1` (see parsed_days).
+            let (v, n) = take_ranged(s, 1, 1, 5, greedy, input, fmt)?;
+            p.week_of_month = Some(v);
             *s = &s[n..];
             Ok(())
         }
@@ -5187,34 +5747,25 @@ fn parse_one_tok(
             Ok(())
         }
         FmtTok::Millis => {
-            let (v, n) = take_digits_g(s, 3, greedy, input, fmt)?;
-            p.micros = Some(v * 10u32.pow(6 - n as u32));
+            // v2.46: PG19 MS semantics via take_frac_micros.
+            let (us, n) = take_frac_micros(s, 3, true, greedy, input, fmt)?;
+            p.micros = Some(us);
             *s = &s[n..];
             Ok(())
         }
         FmtTok::Micros => {
-            let (v, n) = take_digits_g(s, 6, greedy, input, fmt)?;
-            let scale = 6i32 - n as i32;
-            let us = if scale >= 0 {
-                v * 10u32.pow(scale as u32)
-            } else {
-                v / 10u32.pow((-scale) as u32)
-            };
+            // v2.46: PG19 US semantics via take_frac_micros.
+            let (us, n) = take_frac_micros(s, 6, false, greedy, input, fmt)?;
             p.micros = Some(us);
             *s = &s[n..];
             Ok(())
         }
         FmtTok::Frac(digits) => {
-            // FF<n> always reads exactly n digits in PG (a longer
-            // fraction is trailing garbage, hence an error).
-            let (v, n) = take_digits(s, (*digits).min(9) as usize, input, fmt)?;
-            // FF consumes fractional digits; scale into micros.
-            let scale = 6i32 - n as i32;
-            let us = if scale >= 0 {
-                v * 10u32.pow(scale as u32)
-            } else {
-                v / 10u32.pow((-scale) as u32)
-            };
+            // v2.46: PG19 FFn — slurp/scale like US, and record
+            // the precision: to_timestamp rounds the result to it
+            // (AdjustTimestampForTypmod).
+            p.ff_prec = Some(*digits as u8);
+            let (us, n) = take_frac_micros(s, *digits as usize, false, greedy, input, fmt)?;
             p.micros = Some(us);
             *s = &s[n..];
             Ok(())
@@ -5238,7 +5789,8 @@ fn parse_one_tok(
             Err(fmt_mismatch(input, fmt))
         }
         FmtTok::BcAd(_, dotted) => {
-            let want = if *dotted { 5 } else { 2 };
+            // v2.46: dotted eras are 4 chars (`B.C.`), like A.M./P.M.
+            let want = if *dotted { 4 } else { 2 };
             if s.len() >= want {
                 let cand = &s[..want];
                 let plain: String = cand.chars().filter(|c| *c != '.').collect();
@@ -5260,18 +5812,55 @@ fn parse_one_tok(
             // ignores it (PG's to_timestamp records it for the
             // timestamptz variant only). PG validates the value:
             // an unrecognized abbreviation is an error.
+            // v2.46: PG's DecodeTimezoneAbbrevPrefix also accepts a
+            // numeric offset for TZ (it then behaves like OF), and
+            // dynamic abbreviations resolved through the session
+            // zone / a mapped zone (MSK, LMT).
+            if s.starts_with(['+', '-']) || s.bytes().next().is_some_and(|b| b.is_ascii_digit()) {
+                // Parse like OF: [+-]HH[:MM[:SS]].
+                let start = *s;
+                let body = if start.starts_with(['+', '-']) {
+                    &start[1..]
+                } else {
+                    start
+                };
+                let (_v, n) = take_digits_g(body, 2, greedy, input, fmt)?;
+                let mut rest = &body[n..];
+                if rest.starts_with(':') {
+                    let (_v2, n2) = take_digits_g(&rest[1..], 2, greedy, input, fmt)?;
+                    rest = &rest[1 + n2..];
+                }
+                *s = rest;
+                return Ok(());
+            }
             let (word, rest) = take_alpha(s);
             if word.is_empty() {
                 return Err(fmt_mismatch(input, fmt));
             }
-            if abbrev_def(&word).is_none() && zone_def(&word).is_none() {
-                return Err(FmtErr::Invalid(format!(
-                    "invalid value {:?} for \"TZ\"",
-                    word
-                )));
+            let known = |w: &str| {
+                abbrev_def(w).is_some()
+                    || zone_def(w).is_some()
+                    || abbrev_zone(w).is_some()
+                    || resolve_dynamic_abbrev(w, 0).is_some()
+                    || is_session_zone_abbrev(w)
+            };
+            if known(&word) {
+                *s = rest;
+                return Ok(());
             }
-            *s = rest;
-            Ok(())
+            // v2.46: PG's DecodeTimezoneAbbrevPrefix falls back to
+            // the longest prefix of the input that is a known
+            // abbreviation (`ESTFOO24` = EST + literals + SS).
+            for len in (1..word.len()).rev() {
+                if word.is_char_boundary(len) && known(&word[..len]) {
+                    *s = &s[len..];
+                    return Ok(());
+                }
+            }
+            Err(FmtErr::Invalid(format!(
+                "invalid value {:?} for \"TZ\"",
+                word
+            )))
         }
         FmtTok::TzHour => {
             // [+-]HH
@@ -5361,11 +5950,47 @@ fn parsed_days(p: &ParsedDt) -> Result<i32, FmtErr> {
         return i32::try_from(days)
             .map_err(|_| FmtErr::Invalid("date/time field value out of range".into()));
     }
-    let (ty, tm, td) = civil_from_days(i64::from(today_days()));
-    let mut y = p.year.unwrap_or(ty);
-    if p.bc {
-        y = 1 - y;
-    }
+    let (ty, _tm, _td) = civil_from_days(i64::from(today_days()));
+    // v2.46: PG's do_to_timestamp year resolution. The raw year is
+    // the value as parsed (a leading '-' in the input is part of
+    // it); BC negates it, and a negative result is corrected by +1
+    // (astronomical year numbering). A CC element combines with a
+    // <= 2-digit year (year-within-century), or supplies the first
+    // year of the century on its own. Missing month/day default to
+    // 1 (PG's ZERO_tm), not to today's.
+    let y: i32 = if let Some(cc) = p.century {
+        let cc_signed = if p.bc { -cc } else { cc };
+        let astro: i64 = if let Some(raw) = p.year {
+            if p.year_sz.is_some_and(|sz| sz <= 2) {
+                let yy = (raw % 100) as i64;
+                if yy != 0 {
+                    if cc_signed >= 0 {
+                        yy + (cc_signed - 1) * 100
+                    } else {
+                        (cc_signed + 1) * 100 - yy + 1
+                    }
+                } else {
+                    cc_signed * 100 + if cc_signed >= 0 { 0 } else { 1 }
+                }
+            } else {
+                // A 4-digit year ignores CC (PG).
+                let a = if p.bc { -(raw as i64) } else { raw as i64 };
+                if a < 0 { a + 1 } else { a }
+            }
+        } else if cc_signed >= 0 {
+            (cc_signed - 1) * 100 + 1
+        } else {
+            cc_signed * 100 + 1
+        };
+        i32::try_from(astro)
+            .map_err(|_| FmtErr::Invalid("date/time field value out of range: year".to_string()))?
+    } else {
+        let raw = p.year.unwrap_or(ty) as i64;
+        let a = if p.bc { -raw } else { raw };
+        let a = if a < 0 { a + 1 } else { a };
+        i32::try_from(a)
+            .map_err(|_| FmtErr::Invalid("date/time field value out of range: year".to_string()))?
+    };
     if let Some(doy) = p.doy {
         let jan1 = days_from_civil(y, 1, 1);
         let days = jan1 + doy as i64 - 1;
@@ -5400,8 +6025,13 @@ fn parsed_days(p: &ParsedDt) -> Result<i32, FmtErr> {
         return i32::try_from(days)
             .map_err(|_| FmtErr::Invalid("date/time field value out of range".into()));
     }
-    let m = p.month.unwrap_or(tm);
-    let d = p.day.unwrap_or(td);
+    // v2.46: PG defaults — month 1, day 1 (ZERO_tm); a W element
+    // converts to day-of-month `(W-1)*7+1`, overriding DD.
+    let m = p.month.unwrap_or(1);
+    let d = match p.week_of_month {
+        Some(w) => (w - 1) * 7 + 1,
+        None => p.day.unwrap_or(1),
+    };
     validate_ymd(i64::from(y), i64::from(m), i64::from(d))
 }
 
@@ -5430,6 +6060,21 @@ pub fn to_timestamp_parsed(input: &str, fmt: &str) -> Result<i64, FmtErr> {
             "date/time field value out of range: timestamp".into(),
         ));
     }
+    // v2.46: an FFn element makes to_timestamp round the result
+    // to that fractional precision (PG19 AdjustTimestampForTypmod:
+    // round half away from zero on the total micros).
+    let micros = match p.ff_prec {
+        Some(prec) if prec < 6 => {
+            let scale = 10i64.pow(6 - prec as u32);
+            let off = scale / 2;
+            if micros >= 0 {
+                (micros + off) / scale * scale
+            } else {
+                -((-micros + off) / scale * scale)
+            }
+        }
+        _ => micros,
+    };
     Ok(micros)
 }
 
@@ -5609,6 +6254,20 @@ fn render_tok(
         }
         FmtTok::Lit(c) => out.push(*c),
         FmtTok::LitStr(s) => out.push_str(s),
+        FmtTok::Century => {
+            // PG DCH_to_char CC: (y-1)/100+1 for AD years,
+            // y/100-1 for BC (astronomical) years, %02d with sign.
+            let cc = if y > 0 {
+                (y - 1) / 100 + 1
+            } else {
+                y / 100 - 1
+            };
+            if cc < 0 {
+                out.push_str(&format!("-{:02}", -cc));
+            } else {
+                out.push_str(&format!("{cc:02}"));
+            }
+        }
         FmtTok::Year4 => out.push_str(&pad(dy, 4, false)),
         FmtTok::Year3 => out.push_str(&pad(dy % 1000, 3, false)),
         FmtTok::Year2 => out.push_str(&pad(dy % 100, 2, false)),
@@ -5833,12 +6492,17 @@ mod tests {
     fn format_tokenizer() {
         let toks = tokenize_format("YYYY-MM-DD HH24:MI:SS").unwrap();
         assert_eq!(toks.len(), 11); // 6 patterns + 5 literal separators
-        // v1.86: Q is the quarter element now (PG formatting.c); an
-        // unknown run like EE stays Unsupported.
-        assert!(matches!(
-            tokenize_format("YYYY-EE"),
-            Err(FmtErr::Unsupported(_))
-        ));
+        // v2.46: unknown pattern letters tokenize as literal CHAR
+        // nodes (PG19 DCH), not errors.
+        assert_eq!(
+            *tokenize_format("YYYY-EE").unwrap(),
+            vec![
+                FmtTok::Year4,
+                FmtTok::Lit('-'),
+                FmtTok::Lit('E'),
+                FmtTok::Lit('E')
+            ]
+        );
         assert_eq!(*tokenize_format("HH24").unwrap(), vec![FmtTok::Hour24]);
         assert_eq!(tokenize_format("yyyy/mm/dd").unwrap()[0], FmtTok::Year4);
     }
@@ -5909,15 +6573,19 @@ mod tests {
             to_date_parsed("2026/01/15", "YYYY-MM-DD").unwrap(),
             parse_date("2026-01-15").unwrap()
         );
-        assert!(matches!(
-            to_date_parsed("2026-01-15 junk", "YYYY-MM-DD"),
-            Err(FmtErr::Invalid(_))
-        ));
-        // v1.86: DDD is the day-of-year element now; EE stays unsupported.
-        assert!(matches!(
-            to_date_parsed("2026-01-15", "YYYY-MM-EE"),
-            Err(FmtErr::Unsupported(_))
-        ));
+        // v2.46: PG19 DCH_from_char (std=false) ignores leftover
+        // input entirely — '2026-01-15 junk' parses fine.
+        assert_eq!(
+            to_date_parsed("2026-01-15 junk", "YYYY-MM-DD").unwrap(),
+            parse_date("2026-01-15").unwrap()
+        );
+        // v2.46: unknown pattern letters are literal CHAR nodes
+        // (one input char each), not errors — 'EE' consumes the
+        // day digits and the day defaults to 1, as in PG.
+        assert_eq!(
+            to_date_parsed("2026-01-15", "YYYY-MM-EE").unwrap(),
+            parse_date("2026-01-01").unwrap()
+        );
         // FX gives fixed-width fields but separators still consume
         // one arbitrary input character (PG formatting.c fx branch):
         // '97/Feb/16' satisfies 'FXYY:Mon:DD'.
@@ -6077,10 +6745,11 @@ mod tests {
             format_with_pattern(days_from_civil(2026, 9, 11), 0, "YYYY-MM-DD HH24:MI").unwrap(),
             "2026-09-11 00:00"
         );
-        assert!(matches!(
-            format_with_pattern(days, tod, "YYYY-EE"),
-            Err(FmtErr::Unsupported(_))
-        ));
+        // v2.46: unknown letters render literally (PG: '2026-EE').
+        assert_eq!(
+            format_with_pattern(days, tod, "YYYY-EE").unwrap(),
+            "2026-EE"
+        );
         assert_eq!(format_with_pattern(days, tod, "[YYYY]").unwrap(), "[2026]");
         // v1.86 format elements.
         assert_eq!(
@@ -6274,5 +6943,137 @@ mod tests {
         assert_eq!(tod, (4 * 3600 + 5 * 60 + 6) * 1_000_000);
         assert_eq!(off, -28800);
         assert_eq!(format_timetz(tod, off), "04:05:06-08");
+    }
+
+    #[test]
+    fn v246_compact_and_julian() {
+        // Cluster A: compact ISO times for time/timetz.
+        let t040506 = (4 * 3600 + 5 * 60 + 6) * 1_000_000i64;
+        assert_eq!(parse_time("040506").unwrap(), t040506);
+        assert_eq!(parse_time("0405").unwrap(), (4 * 3600 + 5 * 60) * 1_000_000);
+        assert_eq!(parse_time("040506.07").unwrap(), t040506 + 70_000);
+        assert_eq!(parse_time("T040506").unwrap(), t040506);
+        assert_eq!(parse_time("T04:05:06.07").unwrap(), t040506 + 70_000);
+        let (tod, off) = parse_timetz("040506+07").unwrap();
+        assert_eq!(tod, t040506);
+        assert_eq!(off, 7 * 3600);
+        // Cluster B: Julian-day input (J2452271 = unix day 11683).
+        assert_eq!(parse_date("J2452271").unwrap(), 11_683);
+        assert_eq!(
+            parse_timestamp("J2452271").unwrap(),
+            11_683 * 86_400_000_000
+        );
+        assert_eq!(
+            parse_timestamp("J2452271.5").unwrap(),
+            11_683 * 86_400_000_000 + 43_200_000_000
+        );
+        // Cluster C: allballs and special-date + time, both orders.
+        assert_eq!(parse_time("allballs").unwrap(), 0);
+        let (tod, off) = parse_timetz("allballs").unwrap();
+        assert_eq!((tod, off), (0, 0));
+        let today = today_days() as i64;
+        assert_eq!(
+            parse_timestamp("today 10:30").unwrap(),
+            today * 86_400_000_000 + (10 * 3600 + 30 * 60) * 1_000_000
+        );
+        assert_eq!(
+            parse_timestamp("16:00:00 tomorrow").unwrap(),
+            (today + 1) * 86_400_000_000 + 16 * 3600 * 1_000_000
+        );
+        assert_eq!(
+            parse_timestamp("yesterday 12:34:56").unwrap(),
+            (today - 1) * 86_400_000_000 + (12 * 3600 + 34 * 60 + 56) * 1_000_000
+        );
+        // MET is +01; the DST marker makes it +02.
+        let (_, off) = parse_timetz("040506 MET").unwrap();
+        assert_eq!(off, 3600);
+        let (_, off) = parse_timetz("040506 MET DST").unwrap();
+        assert_eq!(off, 7200);
+    }
+
+    #[test]
+    fn v246_interval_signs() {
+        // Cluster D: mixed-sign fields and time-only intervals.
+        assert_eq!(
+            parse_interval("1 month - 1 second").unwrap(),
+            Interval {
+                months: 1,
+                days: 0,
+                micros: -1_000_000
+            }
+        );
+        assert_eq!(
+            parse_interval("2 days - 12:34:56").unwrap(),
+            Interval {
+                months: 0,
+                days: 2,
+                micros: -((12 * 3600 + 34 * 60 + 56) * 1_000_000)
+            }
+        );
+        assert_eq!(
+            parse_interval("36:01").unwrap(),
+            Interval {
+                months: 0,
+                days: 0,
+                micros: (36 * 3600 + 60) * 1_000_000
+            }
+        );
+        assert!(parse_interval("00:90").is_err());
+        assert!(parse_interval("00:00:90").is_err());
+        assert!(parse_interval("1 day -").is_err());
+    }
+
+    #[test]
+    fn v246_format_corners() {
+        // Cluster L: SSSSS render, CC render, pattern literals,
+        // negative years, quarter, century combination.
+        let days = days_from_civil(2001, 1, 1);
+        let tod = (1 * 3600 + 2 * 60 + 3) * 1_000_000i64;
+        let out = format_with_pattern(days, tod, "SSSSS CC").unwrap();
+        assert_eq!(out, "3723 21");
+        let p = to_date_parsed("20161112", "YYYYMMDD").unwrap();
+        assert_eq!(p, days_from_civil(2016, 11, 12) as i32);
+        // Non-letter pattern chars are literals.
+        let p = to_date_parsed("2016x11x12", "YYYYxMMxDD").unwrap();
+        assert_eq!(p, days_from_civil(2016, 11, 12) as i32);
+        // Negative year is a BC year (astronomical correction).
+        let p = to_date_parsed("-44-02-01", "YYYY-MM-DD").unwrap();
+        assert_eq!(p, days_from_civil(-43, 2, 1) as i32);
+        // ...but an explicit BC flips it back to AD.
+        let p = to_date_parsed("-44-02-01 BC", "YYYY-MM-DD BC").unwrap();
+        assert_eq!(p, days_from_civil(44, 2, 1) as i32);
+        // Q picks the month from the quarter.
+        let p = to_date_parsed("1 4 1902", "Q MM YYYY").unwrap();
+        assert_eq!(p, days_from_civil(1902, 4, 1) as i32);
+        // CC + YY combine; W converts to a day-of-month.
+        let p = to_date_parsed("3 4 21 01", "W MM CC YY").unwrap();
+        assert_eq!(p, days_from_civil(2001, 4, 15) as i32);
+        // FF slurps the whole fraction and scales by digit count
+        // (PG19 from_char_parse_int_len); to_timestamp then rounds
+        // to the FF precision (AdjustTimestampForTypmod).
+        let p = parse_with_format("12:34:56.12345", "HH24:MI:SS.FF1").unwrap();
+        assert_eq!(p.micros, Some(123_450));
+        let ts =
+            to_timestamp_parsed("2018-11-02 12:34:56.12345", "YYYY-MM-DD HH24:MI:SS.FF4").unwrap();
+        assert_eq!(
+            ts,
+            days_from_civil(2018, 11, 2) * 86_400_000_000
+                + (12 * 3600 + 34 * 60 + 56) * 1_000_000
+                + 123_500
+        );
+        // A fraction slurping past micro precision is out of range.
+        assert!(
+            to_timestamp_parsed("2018-11-02 12:34:56.123456789", "YYYY-MM-DD HH24:MI:SS.FF6")
+                .is_err()
+        );
+        // Fixed-width fields error when the input runs short
+        // (PG19 "source string too short").
+        assert!(to_timestamp_parsed("19971", "YYYYMMDD").is_err());
+        // Whitespace flexibility: separators are optional.
+        let p = parse_with_format("2000JUN", "YYYY MON").unwrap();
+        assert_eq!(p.month, Some(6));
+        // Unknown pattern letters are literals, not errors.
+        let p = parse_with_format("2016-11-12", "YYYY-MM-DD").unwrap();
+        assert_eq!(p.year, Some(2016));
     }
 }

@@ -3534,6 +3534,10 @@ fn validate_datestyle(value: &str) -> Result<String, ExecError> {
     };
     let mut style: Option<&str> = None;
     let mut order: Option<&str> = None;
+    // v2.46: PG19 check_datestyle — GERMAN sets DMY implicitly
+    // (an explicit order token before it wins; one after it
+    // overrides without a conflict).
+    let mut order_implicit = false;
     let mut any = false;
     for tok in value.split(',') {
         let t = tok.trim().to_ascii_uppercase();
@@ -3541,14 +3545,20 @@ fn validate_datestyle(value: &str) -> Result<String, ExecError> {
             return Err(invalid());
         }
         any = true;
+        // v2.46: PG19 check_datestyle matches EURO as a 4-char
+        // prefix (EURO/EUROPE/EUROPEAN) for DMY and NONEURO as a
+        // 7-char prefix (NONEUROPEAN) for MDY; POSTGRES is an
+        // 8-char prefix match too.
         let (is_style, canon) = match t.as_str() {
             "ISO" => (true, "ISO"),
             "SQL" => (true, "SQL"),
-            "POSTGRES" => (true, "Postgres"),
+            _ if t.starts_with("POSTGRES") => (true, "Postgres"),
             "GERMAN" => (true, "German"),
             "YMD" => (false, "YMD"),
-            "DMY" | "EURO" => (false, "DMY"),
+            "DMY" => (false, "DMY"),
+            _ if t.starts_with("EURO") => (false, "DMY"),
             "MDY" | "US" => (false, "MDY"),
+            _ if t.starts_with("NONEURO") => (false, "MDY"),
             "DEFAULT" => continue,
             _ => return Err(invalid()),
         };
@@ -3557,10 +3567,17 @@ fn validate_datestyle(value: &str) -> Result<String, ExecError> {
                 Some(prev) if prev != canon => return Err(invalid()),
                 _ => style = Some(canon),
             }
+            if canon == "German" && order.is_none() {
+                order = Some("DMY");
+                order_implicit = true;
+            }
         } else {
             match order {
-                Some(prev) if prev != canon => return Err(invalid()),
-                _ => order = Some(canon),
+                Some(prev) if prev != canon && !order_implicit => return Err(invalid()),
+                _ => {
+                    order = Some(canon);
+                    order_implicit = false;
+                }
             }
         }
     }

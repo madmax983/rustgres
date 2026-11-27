@@ -1207,6 +1207,19 @@ pub(crate) fn eval_datetime_arith(
             _ => Err(op_err(op, a, b)),
         };
     }
+    // v2.46: date - time -> timestamp (PG19 timestamp.c:
+    // date minus time-of-day, borrowing into the previous day).
+    if op == ArithOp::Sub {
+        if let (Value::Date(d), Value::Time(t)) = (a, b) {
+            let m = (*d as i64)
+                .checked_mul(86_400_000_000)
+                .and_then(|base| base.checked_sub(*t));
+            return match m {
+                Some(m) if dt::is_valid_ts_micros(m) => Ok(Some(Value::Timestamp(m))),
+                _ => Err(exec_err("22008", "timestamp out of range")),
+            };
+        }
+    }
     if op == ArithOp::Add {
         let date_time = match (a, b) {
             (Value::Date(d), Value::Time(t)) | (Value::Time(t), Value::Date(d)) => {

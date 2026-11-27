@@ -1147,9 +1147,23 @@ impl Parser {
             },
             // --- v0.17: SET / SHOW / RESET
             "set" => self.parse_set(),
-            "show" => Ok(Stmt::Show {
-                name: self.expect_qualified_ident()?,
-            }),
+            "show" => {
+                // v2.46: SHOW TIME ZONE is the two-word spelling of
+                // SHOW timezone (PG19 gram.y VariableShowStmt).
+                if self.peek_ident() == Some("time") {
+                    let save = self.pos;
+                    self.next();
+                    if self.eat_keyword("zone") {
+                        return Ok(Stmt::Show {
+                            name: "timezone".to_string(),
+                        });
+                    }
+                    self.pos = save;
+                }
+                Ok(Stmt::Show {
+                    name: self.expect_qualified_ident()?,
+                })
+            }
             "reset" => {
                 // RESET name | RESET ALL
                 // v1.86: RESET TIME ZONE is the two-word spelling.
@@ -1323,7 +1337,7 @@ impl Parser {
     /// singular, as PG's lexer effectively does here.
     pub(crate) fn parse_interval_fields(
         &mut self,
-    ) -> Result<Option<(String, Option<String>)>, SqlError> {
+    ) -> Result<Option<(String, Option<String>, Option<i32>)>, SqlError> {
         let field = |p: &Parser| -> Option<String> {
             let name = p.peek_ident()?;
             let n = name.strip_suffix('s').unwrap_or(name);
@@ -1342,12 +1356,17 @@ impl Parser {
             };
             self.next();
             // v1.86: trailing precision, `... TO SECOND(2)`.
-            let _ = self.parse_opt_typmod()?;
-            return Ok(Some((f1, Some(f2))));
+            // v2.46 fix: the precision is RETURNED (it drives
+            // AdjustIntervalForTypmod rounding in the interval
+            // parser); it used to be parsed and discarded, so
+            // `interval '...' second(2)` never rounded — and never
+            // raised the rounding overflow error.
+            let prec = self.parse_opt_typmod()?;
+            return Ok(Some((f1, Some(f2), prec)));
         }
         // v1.86: trailing precision, `SECOND(2)`.
-        let _ = self.parse_opt_typmod()?;
-        Ok(Some((f1, None)))
+        let prec = self.parse_opt_typmod()?;
+        Ok(Some((f1, None, prec)))
     }
 
     pub(crate) fn parse_type_name_rest(
@@ -12058,10 +12077,11 @@ impl Parser {
                         // v1.86: INTERVAL 'x' QUALIFIER in VALUES —
                         // fold the qualifier into canonical text.
                         if matches!(&ty, Ok((ColType::Interval, _))) {
-                            if let Some((f1, f2)) = self.parse_interval_fields()? {
+                            if let Some((f1, f2, prec)) = self.parse_interval_fields()? {
                                 let iv = crate::datetime::parse_interval_q(
                                     &s,
                                     Some((&f1, f2.as_deref())),
+                                    prec,
                                 )
                                 .map_err(err_invalid_text)?;
                                 return Ok(InsertValue::Lit(Literal::Text(
@@ -12186,9 +12206,24 @@ impl Parser {
                 if s2 == "between" || s2 == "like" || s2 == "ilike" || s2 == "in" || s2 == "similar")
             && self.eat_keyword("not");
         if self.eat_keyword("between") {
+            // v2.46: BETWEEN SYMMETRIC swaps the bounds when they
+            // are out of order (PG19 transformAExprBetween); it
+            // desugars to the hidden pg_between_symmetric builtin,
+            // like OVERLAPS -> pg_overlaps.
+            let symmetric = self.eat_keyword("symmetric");
             let low = self.parse_bitor()?;
             self.expect_keyword("and")?;
             let high = self.parse_bitor()?;
+            if symmetric {
+                let e = Expr::Func {
+                    name: "pg_between_symmetric".to_string(),
+                    args: vec![left, low, high],
+                };
+                if neg {
+                    return Ok(Expr::Not(Box::new(e)));
+                }
+                return Ok(e);
+            }
             return Ok(Expr::Between {
                 expr: Box::new(left),
                 low: Box::new(low),
@@ -13495,10 +13530,11 @@ impl Parser {
                             // the interval parser, like PG does at
                             // parse analysis.
                             if to == ColType::Interval {
-                                if let Some((f1, f2)) = self.parse_interval_fields()? {
+                                if let Some((f1, f2, prec)) = self.parse_interval_fields()? {
                                     let iv = crate::datetime::parse_interval_q(
                                         &s,
                                         Some((&f1, f2.as_deref())),
+                                        prec,
                                     )
                                     .map_err(err_invalid_text)?;
                                     return Ok(Expr::Literal(Literal::Interval(iv)));
