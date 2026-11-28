@@ -192,6 +192,7 @@ pub(crate) fn expr_is_volatile(db: &Database, e: &Expr) -> bool {
         Expr::Column { .. }
         | Expr::Literal(_)
         | Expr::Param(_)
+        | Expr::CurrentOf(_)
         | Expr::WholeRow { .. }
         | Expr::ResolvedCol { .. } => false,
         Expr::Arith { left, right, .. }
@@ -431,7 +432,7 @@ pub(crate) fn collect_column_refs(e: &Expr, out: &mut Vec<(Option<String>, Strin
         Expr::WholeRow { qual } => out.push((Some(qual.clone()), "*".to_string())),
         // Already resolved (unambiguous by construction): nothing to collect.
         Expr::ResolvedCol { .. } => {}
-        Expr::Literal(_) | Expr::Param(_) => {}
+        Expr::Literal(_) | Expr::Param(_) | Expr::CurrentOf(_) => {}
         Expr::Arith { left, right, .. } => {
             collect_column_refs(left, out);
             collect_column_refs(right, out);

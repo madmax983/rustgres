@@ -1044,6 +1044,7 @@ pub(crate) fn sje_rewrite_qual(e: &Expr, from_q: &str, to_q: &str) -> Option<Exp
             table: rq(table),
             name: name.clone(),
         },
+        Expr::CurrentOf(_) => e.clone(),
         Expr::WholeRow { qual } => Expr::WholeRow {
             qual: if qual == from_q {
                 to_q.to_string()
@@ -1736,6 +1737,7 @@ pub(crate) fn plan_from_item(
                     | "pg_namespace"
                     | "pg_default_acl"
                     | "pg_shdepend"
+                    | "pg_depend"
                     | "pg_aios"
                     | "pg_backend_memory_contexts"
                     | "pg_shmem_allocations"
@@ -1748,6 +1750,7 @@ pub(crate) fn plan_from_item(
                     "pg_namespace" => pg_namespace_scan(&eng.db),
                     "pg_default_acl" => pg_default_acl_scan(&eng.db),
                     "pg_shdepend" => pg_shdepend_scan(&eng.db, snap, own, session),
+                    "pg_depend" => pg_depend_scan(&eng.db, snap, own, session),
                     _ => pg_empty_stub_scan(name),
                 };
                 return Ok(PlanNode::SeqScan {

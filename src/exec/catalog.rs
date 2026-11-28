@@ -244,6 +244,8 @@ pub(crate) fn pg_class_scan(
         ("pg_namespace", 2615),
         ("pg_default_acl", 2328),
         ("pg_shdepend", 1211),
+        // v2.47: pg_depend's own pg_class row (PG19 oid 2608).
+        ("pg_depend", 2608),
         ("pg_largeobject", 2613),
         ("pg_largeobject_metadata", 2995),
     ] {
@@ -1343,6 +1345,149 @@ pub(crate) fn pg_policy_scan(
     (schema, rows)
 }
 // ---------------------------------------------------------------------------
+// v2.47: pg_depend / pg_shdepend (virtual) — the POLICY dependency
+// edges only (PG19 commands/policy.c): a policy depends on its table
+// with DEPENDENCY_AUTO ('a', pg_depend), on every relation its
+// USING / WITH CHECK expressions reference with DEPENDENCY_NORMAL
+// ('n', pg_depend — relations found by the stored-qual FROM/JOIN
+// scanner, the same bounded model as the DROP dependency checks;
+// column-level refobjsubid edges are not materialized), and on each
+// role in its TO list with SHARED_DEPENDENCY_POLICY ('r',
+// pg_shdepend; PUBLIC records no dependency). Other object kinds'
+// dependency edges are not materialized — the engine does not keep
+// a general dependency graph (see the v2.37 census hold).
+// ---------------------------------------------------------------------------
+
+pub(crate) fn pg_depend_schema() -> Vec<QCol> {
+    [
+        ("classid", ColType::Int),
+        ("objid", ColType::Int),
+        ("objsubid", ColType::Int),
+        ("refclassid", ColType::Int),
+        ("refobjid", ColType::Int),
+        ("refobjsubid", ColType::Int),
+        ("deptype", ColType::SingleChar),
+    ]
+    .into_iter()
+    .map(|(n, ty)| qcol("pg_depend", n, ty))
+    .collect()
+}
+
+const PG_CLASS_OID: i64 = 1259;
+const PG_AUTHID_OID: i64 = 1260;
+const PG_POLICY_OID: i64 = 3256;
+
+/// v2.47: resolve a table OID back to its bare table name (any
+/// visible version), for cursor tableoid capture. Temp tables live
+/// in the per-session map; their OIDs come from the same global
+/// allocator, so the OID match is exact there too.
+pub(crate) fn table_name_by_oid(db: &Database, oid: u32) -> Option<String> {
+    if let Some(n) = db
+        .tables
+        .iter()
+        .find(|(_, vs)| vs.iter().any(|t| t.oid == oid))
+        .map(|(n, _)| n.clone())
+    {
+        return Some(n);
+    }
+    for m in db.temp_tables.values() {
+        if let Some(n) = m.iter().find(|(_, t)| t.oid == oid).map(|(n, _)| n.clone()) {
+            return Some(n);
+        }
+    }
+    None
+}
+
+pub(crate) fn pg_depend_scan(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> (Vec<QCol>, Vec<QRow>) {
+    let schema = pg_depend_schema();
+    let mut rows = Vec::new();
+    // All live table names (for expression-reference resolution).
+    let mut tnames: Vec<&String> = db.tables.keys().collect();
+    tnames.sort();
+    for (tname, t, p) in all_policies(db, snap, own, session) {
+        let pol_oid = name_oid(&format!("{}.{}", tname, p.name)) as i64;
+        let mut push = |refobjid: i64, deptype: u8| {
+            rows.push(QRow {
+                cells: Row::new(vec![
+                    Value::Int(PG_POLICY_OID),
+                    Value::Int(pol_oid),
+                    Value::Int(0),
+                    Value::Int(PG_CLASS_OID),
+                    Value::Int(refobjid),
+                    Value::Int(0),
+                    Value::SingleChar(deptype),
+                ]),
+                prov: Vec::new(),
+            });
+        };
+        // The policy's own table: DEPENDENCY_AUTO.
+        push(t.oid as i64, b'a');
+        // Relations referenced by the policy expressions:
+        // DEPENDENCY_NORMAL, one row per referenced relation.
+        let mut refs: Vec<i64> = Vec::new();
+        for sql in [&p.using_sql, &p.check_sql].into_iter().flatten() {
+            for other in &tnames {
+                if **other == tname {
+                    continue;
+                }
+                let bare = other.rsplit('.').next().unwrap_or(other);
+                if super::rls::qual_references_rel(sql, bare) {
+                    if let Some(ot) = db.find_table(other, snap, &[own], session) {
+                        if !refs.contains(&(ot.oid as i64)) {
+                            refs.push(ot.oid as i64);
+                        }
+                    }
+                }
+            }
+        }
+        for r in refs {
+            push(r, b'n');
+        }
+    }
+    (schema, rows)
+}
+
+/// v2.47: pg_shdepend rows for policy -> role shared dependencies
+/// (SHARED_DEPENDENCY_POLICY, 'r'), appended by pg_shdepend_scan.
+/// PUBLIC policies (empty role list) record no dependency (PG19).
+pub(crate) fn pg_shdepend_policy_rows(
+    db: &Database,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+) -> Vec<QRow> {
+    let mut rows = Vec::new();
+    for (tname, _t, p) in all_policies(db, snap, own, session) {
+        let pol_oid = name_oid(&format!("{}.{}", tname, p.name)) as i64;
+        let mut seen: Vec<&str> = Vec::new();
+        for r in &p.roles {
+            if seen.contains(&r.as_str()) {
+                continue;
+            }
+            seen.push(r.as_str());
+            rows.push(QRow {
+                cells: Row::new(vec![
+                    Value::Int(0),
+                    Value::Int(PG_POLICY_OID),
+                    Value::Int(pol_oid),
+                    Value::Int(0),
+                    Value::Int(PG_AUTHID_OID),
+                    Value::Int(crate::exec::role_oid(r) as i64),
+                    Value::SingleChar(b'r'),
+                ]),
+                prov: Vec::new(),
+            });
+        }
+    }
+    rows
+}
+
+// ---------------------------------------------------------------------------
 // v0.11: role catalogs (virtual). A real table by the same name takes
 // precedence, like pg_stats. `pg_authid` masks password verifiers from
 // non-superusers, like PostgreSQL.
@@ -1373,6 +1518,10 @@ pub(crate) fn pg_authid_schema() -> Vec<QCol> {
         qcol("pg_authid", "rolbypassrls", ColType::Bool),
         // v1.96 finishing pass: rolreplication (appended likewise).
         qcol("pg_authid", "rolreplication", ColType::Bool),
+        // v2.47: oid (PG19 has it first; appended per the bounded-
+        // subset convention — the pg_shdepend dependency queries
+        // select it by name).
+        qcol("pg_authid", "oid", ColType::Int),
     ]
 }
 
@@ -1536,6 +1685,8 @@ pub(crate) fn pg_auth_scan(
                 valid_until,
                 Value::Bool(r.bypassrls),
                 Value::Bool(r.replication),
+                // v2.47: oid (matches pg_roles / privfuncs::role_oid).
+                Value::Int(crate::exec::role_oid(&r.name) as i64),
             ],
         };
         rows.push(QRow {
@@ -1895,6 +2046,7 @@ pub struct QRow {
 pub(crate) fn stmt_uses_pg_column_compression(stmt: &SelectStmt) -> bool {
     fn expr_uses(e: &Expr) -> bool {
         match e {
+            Expr::CurrentOf(_) => false,
             Expr::Func { name, args } => {
                 if name == "pg_column_compression" {
                     return true;
@@ -2030,6 +2182,7 @@ pub(crate) fn stmt_uses_pg_column_compression(stmt: &SelectStmt) -> bool {
 pub(crate) fn stmt_uses_tableoid(stmt: &SelectStmt) -> bool {
     fn expr_uses(e: &Expr) -> bool {
         match e {
+            Expr::CurrentOf(_) => false,
             Expr::Column { name, .. } => name == "tableoid",
             Expr::Func { args, .. } => args.iter().any(expr_uses),
             Expr::NamedArg { expr, .. } => expr_uses(expr),
@@ -2146,6 +2299,7 @@ pub(crate) fn stmt_uses_tableoid(stmt: &SelectStmt) -> bool {
 pub(crate) fn stmt_uses_xmin_xmax(stmt: &SelectStmt) -> bool {
     fn expr_uses(e: &Expr) -> bool {
         match e {
+            Expr::CurrentOf(_) => false,
             Expr::Column { name, .. } => {
                 name == "xmin"
                     || name == "xmax"
@@ -2461,6 +2615,8 @@ pub(crate) fn resolve_predicate_columns_in(
 ) -> Result<Expr, ExecError> {
     let r = |e: &Expr| resolve_predicate_columns_in(e, scopes);
     match pred {
+        // v2.47: WHERE CURRENT OF has no columns to resolve.
+        Expr::CurrentOf(_) => Ok(pred.clone()),
         Expr::Column { table, name } => {
             match resolve_col(scopes, table.as_deref(), name) {
                 Ok((frame, idx)) => Ok(Expr::ResolvedCol { frame, idx }),
@@ -5227,6 +5383,8 @@ pub(crate) fn pg_shdepend_scan(
             prov: Vec::new(),
         });
     }
+    // v2.47: policy -> role shared dependencies ('r').
+    rows.extend(pg_shdepend_policy_rows(db, snap, own, session));
     (schema, rows)
 }
 

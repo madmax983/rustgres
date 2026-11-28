@@ -2953,6 +2953,12 @@ pub(crate) fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, 
         // yields the operand's collation name (or NULL).
         Expr::Collate { expr, .. } => eval_expr(q, scopes, expr),
         Expr::CollationFor { expr } => crate::exec::collate::eval_collation_for(q, scopes, expr),
+        // v2.47: the executor intercepts WHERE CURRENT OF before row
+        // evaluation; reaching eval means an unsupported context.
+        Expr::CurrentOf(_) => Err(exec_err(
+            "0A000",
+            "WHERE CURRENT OF is only valid as the WHERE clause of UPDATE or DELETE".to_string(),
+        )),
         Expr::Column { table, name } => {
             match resolve_col(scopes, table.as_deref(), name) {
                 Ok((si, ci)) => Ok(scopes[si].row[ci].clone()),
@@ -3749,6 +3755,7 @@ pub(crate) fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
         | Expr::ResolvedCol { .. }
         | Expr::Literal(_)
         | Expr::Param(_)
+        | Expr::CurrentOf(_)
         | Expr::WholeRow { .. } => {}
         Expr::Arith { left, right, .. }
         | Expr::Concat(left, right)

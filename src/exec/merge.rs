@@ -612,7 +612,16 @@ pub(crate) fn exec_merge(
         {
             let mut kept = Vec::with_capacity(vis.len());
             for entry in vis {
-                if rls_row_visible(&mut q, table, &tgt_schema, &entry.4, &groups)? {
+                // v2.47: provenance for system-column quals.
+                let prov = RowProv {
+                    qual: tgt_schema
+                        .first()
+                        .map(|c| c.qual.clone())
+                        .unwrap_or_else(|| table.to_string()),
+                    table: entry.0.clone(),
+                    row_id: entry.2,
+                };
+                if rls_row_visible(&mut q, table, &tgt_schema, &entry.4, &groups, Some(prov))? {
                     kept.push(entry);
                 }
             }
@@ -2036,6 +2045,18 @@ pub(crate) fn describe_merge_returning(
                 expanded.push(item.clone());
             }
             SelectItem::All => {
+                // v2.47: source range first, then target (see the
+                // execution-path expansion in
+                // describe_merge_returning_with_schemas).
+                for c in src_flat.iter().filter(|c| !c.hidden) {
+                    expanded.push(SelectItem::Expr {
+                        expr: Expr::Column {
+                            table: Some(c.qual.clone()),
+                            name: c.name.clone(),
+                        },
+                        alias: None,
+                    });
+                }
                 for (n, _) in &tgt_cols {
                     expanded.push(SelectItem::Expr {
                         expr: Expr::Column {
@@ -2274,21 +2295,24 @@ fn describe_merge_returning_with_schemas(
                 expanded.push(item.clone());
             }
             SelectItem::All => {
-                for c in tgt_schema {
+                // v2.47: PG19 MERGE RETURNING * covers the whole
+                // range table in rtable order — the SOURCE relation
+                // first, then the target (rowsecurity.out: the
+                // rls_test_tgt MERGE ... RETURNING * header is
+                // src a,b then tgt a,b,c). v2.37 had it backwards.
+                for c in src_schema.iter().filter(|c| !c.hidden) {
                     expanded.push(SelectItem::Expr {
                         expr: Expr::Column {
-                            table: Some(qual.to_string()),
+                            table: Some(c.qual.clone()),
                             name: c.name.clone(),
                         },
                         alias: None,
                     });
                 }
-                // v2.37: PG19 MERGE RETURNING * covers the source
-                // relation too (target first, then source).
-                for c in src_schema.iter().filter(|c| !c.hidden) {
+                for c in tgt_schema {
                     expanded.push(SelectItem::Expr {
                         expr: Expr::Column {
-                            table: Some(c.qual.clone()),
+                            table: Some(qual.to_string()),
                             name: c.name.clone(),
                         },
                         alias: None,

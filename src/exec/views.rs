@@ -262,6 +262,7 @@ pub(crate) fn exec_create_view(
                 | "pg_rules"
                 | "pg_sequences"
                 | "pg_shdepend"
+                | "pg_depend"
                 | "pg_shmem_allocations"
                 | "pg_stat_activity"
                 | "pg_statistic"

@@ -379,14 +379,32 @@ pub(crate) fn validate_generated_columns(
 ) -> Result<(), ExecError> {
     for g in def.gen_cols.iter() {
         let Some((expr, _)) = g else { continue };
-        gen_expr_walk(eng, def, expr)?;
+        gen_expr_walk(eng, &def.columns, &def.gen_cols, expr)?;
     }
     Ok(())
 }
 
+/// v2.47: validate one generation expression against an existing
+/// table's shape (ALTER TABLE ADD COLUMN ... GENERATED): the same
+/// rules as CREATE (own non-generated columns only, immutable
+/// functions only), with `gen_cols` describing the post-ADD shape.
+pub(crate) fn validate_generated_expr_for_add(
+    eng: &Engine,
+    columns: &[(String, crate::sql::ColType)],
+    gen_cols: &[Option<(Expr, bool)>],
+    expr: &Expr,
+) -> Result<(), ExecError> {
+    gen_expr_walk(eng, columns, gen_cols, expr)
+}
+
 const GEN_SYSTEM_COLS: [&str; 6] = ["ctid", "xmin", "xmax", "cmin", "cmax", "tableoid"];
 
-fn gen_expr_walk(eng: &Engine, def: &crate::sql::TableDef, e: &Expr) -> Result<(), ExecError> {
+fn gen_expr_walk(
+    eng: &Engine,
+    columns: &[(String, crate::sql::ColType)],
+    gen_cols: &[Option<(Expr, bool)>],
+    e: &Expr,
+) -> Result<(), ExecError> {
     match e {
         Expr::Column { table: qual, name } => {
             let lname = name.to_lowercase();
@@ -405,8 +423,7 @@ fn gen_expr_walk(eng: &Engine, def: &crate::sql::TableDef, e: &Expr) -> Result<(
                     format!("column \"{}\" does not exist", name),
                 ));
             }
-            match def
-                .columns
+            match columns
                 .iter()
                 .position(|(cn, _)| cn.eq_ignore_ascii_case(name))
             {
@@ -414,7 +431,7 @@ fn gen_expr_walk(eng: &Engine, def: &crate::sql::TableDef, e: &Expr) -> Result<(
                     "42703",
                     format!("column \"{}\" does not exist", name),
                 )),
-                Some(p) if def.gen_cols.get(p).is_some_and(|g| g.is_some()) => Err(exec_err(
+                Some(p) if gen_cols.get(p).is_some_and(|g| g.is_some()) => Err(exec_err(
                     "42P10",
                     format!(
                         "cannot use generated column \"{}\" in column generation expression",
@@ -455,7 +472,7 @@ fn gen_expr_walk(eng: &Engine, def: &crate::sql::TableDef, e: &Expr) -> Result<(
                 ));
             }
             for a in args {
-                gen_expr_walk(eng, def, a)?;
+                gen_expr_walk(eng, columns, gen_cols, a)?;
             }
             Ok(())
         }
@@ -464,16 +481,16 @@ fn gen_expr_walk(eng: &Engine, def: &crate::sql::TableDef, e: &Expr) -> Result<(
             "generation expression is not immutable".to_string(),
         )),
         Expr::Arith { left, right, .. } | Expr::Cmp { left, right, .. } => {
-            gen_expr_walk(eng, def, left)?;
-            gen_expr_walk(eng, def, right)
+            gen_expr_walk(eng, columns, gen_cols, left)?;
+            gen_expr_walk(eng, columns, gen_cols, right)
         }
         Expr::Concat(a, b) | Expr::And(a, b) | Expr::Or(a, b) => {
-            gen_expr_walk(eng, def, a)?;
-            gen_expr_walk(eng, def, b)
+            gen_expr_walk(eng, columns, gen_cols, a)?;
+            gen_expr_walk(eng, columns, gen_cols, b)
         }
         Expr::JsonOp { left, right, .. } | Expr::IsDistinctFrom { left, right, .. } => {
-            gen_expr_walk(eng, def, left)?;
-            gen_expr_walk(eng, def, right)
+            gen_expr_walk(eng, columns, gen_cols, left)?;
+            gen_expr_walk(eng, columns, gen_cols, right)
         }
         Expr::Like {
             expr,
@@ -481,23 +498,23 @@ fn gen_expr_walk(eng: &Engine, def: &crate::sql::TableDef, e: &Expr) -> Result<(
             escape,
             ..
         } => {
-            gen_expr_walk(eng, def, expr)?;
-            gen_expr_walk(eng, def, pattern)?;
+            gen_expr_walk(eng, columns, gen_cols, expr)?;
+            gen_expr_walk(eng, columns, gen_cols, pattern)?;
             if let Some(x) = escape {
-                gen_expr_walk(eng, def, x)?;
+                gen_expr_walk(eng, columns, gen_cols, x)?;
             }
             Ok(())
         }
         Expr::Regex { expr, pattern, .. } => {
-            gen_expr_walk(eng, def, expr)?;
-            gen_expr_walk(eng, def, pattern)
+            gen_expr_walk(eng, columns, gen_cols, expr)?;
+            gen_expr_walk(eng, columns, gen_cols, pattern)
         }
         Expr::Between {
             expr, low, high, ..
         } => {
-            gen_expr_walk(eng, def, expr)?;
-            gen_expr_walk(eng, def, low)?;
-            gen_expr_walk(eng, def, high)
+            gen_expr_walk(eng, columns, gen_cols, expr)?;
+            gen_expr_walk(eng, columns, gen_cols, low)?;
+            gen_expr_walk(eng, columns, gen_cols, high)
         }
         Expr::IsBool { expr, .. }
         | Expr::IsNull { expr, .. }
@@ -508,52 +525,52 @@ fn gen_expr_walk(eng: &Engine, def: &crate::sql::TableDef, e: &Expr) -> Result<(
         | Expr::CastNamed { expr, .. }
         | Expr::NamedArg { expr, .. }
         | Expr::FieldAccess { expr, .. }
-        | Expr::Extract { from: expr, .. } => gen_expr_walk(eng, def, expr),
+        | Expr::Extract { from: expr, .. } => gen_expr_walk(eng, columns, gen_cols, expr),
         Expr::Case {
             operand,
             whens,
             else_,
         } => {
             if let Some(o) = operand {
-                gen_expr_walk(eng, def, o)?;
+                gen_expr_walk(eng, columns, gen_cols, o)?;
             }
             for (k, r) in whens {
-                gen_expr_walk(eng, def, k)?;
-                gen_expr_walk(eng, def, r)?;
+                gen_expr_walk(eng, columns, gen_cols, k)?;
+                gen_expr_walk(eng, columns, gen_cols, r)?;
             }
             if let Some(x) = else_ {
-                gen_expr_walk(eng, def, x)?;
+                gen_expr_walk(eng, columns, gen_cols, x)?;
             }
             Ok(())
         }
         Expr::Row(elems) | Expr::ArrayCtor { elems, .. } => {
             for x in elems {
-                gen_expr_walk(eng, def, x)?;
+                gen_expr_walk(eng, columns, gen_cols, x)?;
             }
             Ok(())
         }
         Expr::AtTimeZone { expr, zone } => {
-            gen_expr_walk(eng, def, expr)?;
+            gen_expr_walk(eng, columns, gen_cols, expr)?;
             if let Some(z) = zone {
-                gen_expr_walk(eng, def, z)?;
+                gen_expr_walk(eng, columns, gen_cols, z)?;
             }
             Ok(())
         }
         Expr::Subscript { array, indices } => {
-            gen_expr_walk(eng, def, array)?;
+            gen_expr_walk(eng, columns, gen_cols, array)?;
             for x in indices {
-                gen_expr_walk(eng, def, x)?;
+                gen_expr_walk(eng, columns, gen_cols, x)?;
             }
             Ok(())
         }
         Expr::Slice { array, bounds } => {
-            gen_expr_walk(eng, def, array)?;
+            gen_expr_walk(eng, columns, gen_cols, array)?;
             for (l, u) in bounds {
                 if let Some(l) = l {
-                    gen_expr_walk(eng, def, l)?;
+                    gen_expr_walk(eng, columns, gen_cols, l)?;
                 }
                 if let Some(u) = u {
-                    gen_expr_walk(eng, def, u)?;
+                    gen_expr_walk(eng, columns, gen_cols, u)?;
                 }
             }
             Ok(())

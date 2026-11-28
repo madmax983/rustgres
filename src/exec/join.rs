@@ -3760,16 +3760,21 @@ pub(crate) fn build_source(
                 return Ok((apply_aliases(schema)?, rows));
             }
             // v1.95: pg_policies / pg_policy are virtual too.
-            if matches!(name.as_str(), "pg_policies" | "pg_policy")
-                && q.eng
-                    .db
-                    .find_table(name, q.snap, &q.all_xids, q.session)
-                    .is_none()
+            // v2.47: pg_depend / pg_shdepend likewise (policy edges).
+            if matches!(
+                name.as_str(),
+                "pg_policies" | "pg_policy" | "pg_depend" | "pg_shdepend"
+            ) && q
+                .eng
+                .db
+                .find_table(name, q.snap, &q.all_xids, q.session)
+                .is_none()
             {
-                let (schema, rows) = if name == "pg_policies" {
-                    pg_policies_scan(&q.eng.db, q.snap, q.own, q.session)
-                } else {
-                    pg_policy_scan(&q.eng.db, q.snap, q.own, q.session)
+                let (schema, rows) = match name.as_str() {
+                    "pg_policies" => pg_policies_scan(&q.eng.db, q.snap, q.own, q.session),
+                    "pg_depend" => pg_depend_scan(&q.eng.db, q.snap, q.own, q.session),
+                    "pg_shdepend" => pg_shdepend_scan(&q.eng.db, q.snap, q.own, q.session),
+                    _ => pg_policy_scan(&q.eng.db, q.snap, q.own, q.session),
                 };
                 let schema: Vec<QCol> = schema
                     .into_iter()
@@ -3826,6 +3831,7 @@ pub(crate) fn build_source(
                     | "pg_namespace"
                     | "pg_default_acl"
                     | "pg_shdepend"
+                    | "pg_depend"
                     | "pg_aios"
                     | "pg_backend_memory_contexts"
                     | "pg_shmem_allocations"
@@ -3847,6 +3853,7 @@ pub(crate) fn build_source(
                     "pg_namespace" => pg_namespace_scan(&q.eng.db),
                     "pg_default_acl" => pg_default_acl_scan(&q.eng.db),
                     "pg_shdepend" => pg_shdepend_scan(&q.eng.db, q.snap, q.own, q.session),
+                    "pg_depend" => pg_depend_scan(&q.eng.db, q.snap, q.own, q.session),
                     "pg_stat_activity" => pg_stat_activity_scan(&q.eng.db, q.role, q.session),
                     _ => pg_empty_stub_scan(&name),
                 };
@@ -3993,6 +4000,12 @@ pub(crate) fn build_source(
                 let own = q.own;
                 // v1.21: clone the xid family for visibility (small vec).
                 let all_xids = q.all_xids.clone();
+                // v2.47: when this table's policy quals reference
+                // system columns, the RLS filter below needs row
+                // provenance to evaluate them (PG19 quals see the
+                // full tuple) — populate it even when the statement
+                // itself does not reference a system column.
+                let need_prov = need_prov || (t.rls_enabled && table_policies_use_syscols(&t));
                 let rows: Vec<QRow> = if is_partitioned_parent {
                     // Collect all leaves recursively.
                     let leaves = collect_partition_leaves(db, name, snap, own, q.session);
@@ -4231,7 +4244,13 @@ pub(crate) fn build_source(
                 match t {
                     Some(t) if t.rls_enabled => {
                         let mut cmds = vec![PolicyCmd::Select];
-                        if need_prov {
+                        // v2.47: the UPDATE group applies to LOCKING
+                        // scans (FOR UPDATE / SHARE, rowsecurity.c),
+                        // not to every provenance-carrying scan — a
+                        // plain `SELECT ctid, * FROM t` must not be
+                        // filtered by UPDATE policies (the v1.96
+                        // need_prov/for_update distinction above).
+                        if for_update || any_lock {
                             cmds.push(PolicyCmd::Update);
                         }
                         // Order-hint early termination may have cut the

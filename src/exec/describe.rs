@@ -518,6 +518,7 @@ pub(crate) fn from_schema_item(
                     | "pg_namespace"
                     | "pg_default_acl"
                     | "pg_shdepend"
+                    | "pg_depend"
                     | "pg_aios"
                     | "pg_backend_memory_contexts"
                     | "pg_shmem_allocations"
@@ -536,6 +537,7 @@ pub(crate) fn from_schema_item(
                     "pg_namespace" => pg_namespace_scan(&eng.db),
                     "pg_default_acl" => pg_default_acl_scan(&eng.db),
                     "pg_shdepend" => pg_shdepend_scan(&eng.db, snap, own, session),
+                    "pg_depend" => pg_depend_scan(&eng.db, snap, own, session),
                     "pg_stat_activity" => (pg_stat_activity_schema(), Vec::new()),
                     _ => pg_empty_stub_scan(&name),
                 };
@@ -1678,6 +1680,8 @@ pub(crate) fn expr_type(
             expr_type(eng, snap, own, session, schemas, outer, ctes, expr)
         }
         Expr::CollationFor { .. } => Ok(ColType::Name),
+        // v2.47: WHERE CURRENT OF is a boolean clause.
+        Expr::CurrentOf(_) => Ok(ColType::Bool),
         Expr::Column { table, name } => {
             // v0.73: PG19 correlated references — a subquery's expressions
             // resolve against the enclosing query's ranges after its own

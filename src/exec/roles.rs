@@ -1259,6 +1259,24 @@ pub(crate) fn exec_drop_role(
                 }) {
                     blockers.push(format!("privileges on table {}", tn));
                 }
+                // v2.47: PG19 checkSharedDependencies — being the
+                // target of a row-security policy blocks DROP ROLE
+                // (the pg_shdepend SHARED_DEPENDENCY_POLICY edge).
+                if vs.iter().any(|t| {
+                    crate::storage::table_visible(t, ctx.snap, &ctx.all_xids)
+                        && t.policies
+                            .iter()
+                            .any(|p| p.roles.iter().any(|r| r == &role.name))
+                }) {
+                    for p in vs
+                        .iter()
+                        .filter(|t| crate::storage::table_visible(t, ctx.snap, &ctx.all_xids))
+                        .flat_map(|t| t.policies.iter())
+                        .filter(|p| p.roles.iter().any(|r| r == &role.name))
+                    {
+                        blockers.push(format!("target of policy {} on table {}", p.name, tn));
+                    }
+                }
             }
             for (sn, vs) in &eng.db.sequences {
                 if vs
@@ -3957,6 +3975,41 @@ pub(crate) fn exec_drop_owned(
         }
     }
     for role in roles {
+        // v2.47: DROP OWNED BY strips the role from every policy's TO
+        // list (PG19 DropOwnedObjects, SHARED_DEPENDENCY_RLS_POLICY):
+        // a policy left with no roles is dropped entirely; duplicate
+        // entries of the role collapse (all instances are removed).
+        // PUBLIC policies (empty role list) are untouched.
+        let pol_tables: Vec<String> = eng
+            .db
+            .tables
+            .keys()
+            .filter(|n| {
+                eng.db
+                    .find_table(n, ctx.snap, &ctx.all_xids, ctx.session)
+                    .map(|t| t.policies.iter().any(|p| p.roles.iter().any(|r| r == role)))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        for tname in pol_tables {
+            let t = eng
+                .db
+                .find_table(&tname, ctx.snap, &ctx.all_xids, ctx.session)
+                .expect("table checked above")
+                .clone();
+            let prev = t.clone();
+            let mut next = t;
+            next.policies.retain_mut(|p| {
+                if p.roles.iter().any(|r| r == role) {
+                    p.roles.retain(|r| r != role);
+                    !p.roles.is_empty()
+                } else {
+                    true
+                }
+            });
+            commit_table_version(eng, ctx, &tname, prev, next);
+        }
         // Drop owned tables/views/sequences/functions/types.
         let tables: Vec<String> = eng
             .db

@@ -4700,7 +4700,7 @@ pub(crate) fn exec_insert_inner(
                         }
                     }
                     // Store and index in conflict-target order.
-                    let store_values: Vec<Value> = if partitioned_upsert {
+                    let mut store_values: Vec<Value> = if partitioned_upsert {
                         let lu = &leaf_ctxs[&ctable];
                         remap_parent_to_leaf(&meta_for_upsert.columns, &lu.cols, &new_values)
                     } else {
@@ -4759,6 +4759,38 @@ pub(crate) fn exec_insert_inner(
                         &[],
                         Some(tid),
                     )?;
+                    // v2.47: BEFORE UPDATE FOR EACH ROW triggers fire
+                    // on the DO UPDATE image (PG19 ExecOnConflictUpdate
+                    // runs ExecBRUpdateTriggers like a plain UPDATE);
+                    // they never fired here before, so trigger-set
+                    // columns kept their pre-update values in the
+                    // stored row. A NULL return suppresses the update
+                    // for this row. Partitioned targets are held back,
+                    // mirroring the plain-UPDATE partitioned-parent
+                    // hold (the image here is parent-ordered; the
+                    // trigger path expects leaf order).
+                    let mut new_values = new_values;
+                    if !partitioned_upsert
+                        && leaf_has_before_triggers(eng, ctx, &ctable, trig_event::UPDATE)
+                    {
+                        let set_col_names: Vec<String> =
+                            sets.iter().map(|(n, _)| n.clone()).collect();
+                        match fire_before_update_triggers(
+                            eng,
+                            ctx,
+                            &ctable,
+                            &meta_for_upsert.columns,
+                            &target_parent[..],
+                            &new_values[..],
+                            &set_col_names,
+                        )? {
+                            Some(nv) => {
+                                new_values = nv;
+                                store_values = new_values.clone();
+                            }
+                            None => continue,
+                        }
+                    }
                     // v1.95: row-level security for the DO UPDATE path
                     // (PG19 rowsecurity.c ON CONFLICT block): the
                     // existing row must pass the UPDATE policies' USING
@@ -4792,13 +4824,31 @@ pub(crate) fn exec_insert_inner(
                                 &schema,
                                 &target_parent[..],
                             )?;
+                            // v2.47: PG19 rowsecurity.c — for ON
+                            // CONFLICT DO UPDATE the SELECT policies
+                            // join as WithCheckOptions whenever any
+                            // SELECT policy applies, not only with
+                            // RETURNING: the arbiter inference reads
+                            // the conflicting row under the SELECT
+                            // policies, so an updated row the user
+                            // could not see is a 42501 with or
+                            // without RETURNING. (The zero-policy
+                            // corner — PG19's false WCO would deny
+                            // outright when an arbiter marks SELECT
+                            // required — stays at the engine's
+                            // long-standing baseline; see the v2.47
+                            // scope notes.)
+                            let also_select = !returning.is_empty()
+                                || has_applicable_select_policy(
+                                    eng, ctx.snap, ctx.own, &tdef, ctx.role,
+                                );
                             rls_check_new_row_ctx(
                                 eng,
                                 ctx,
                                 &tdef,
                                 table,
                                 PolicyCmd::Update,
-                                !returning.is_empty(),
+                                also_select,
                                 false,
                                 &schema,
                                 &new_values[..],
@@ -5267,6 +5317,59 @@ pub(crate) fn exec_update(
     out
 }
 
+/// v2.47: resolve a WHERE CURRENT OF target to the storage row id
+/// of the LIVE version of the row at (cap_table, ctid offset). The
+/// captured version may have been updated since the cursor fetched
+/// it: follow the update chain (PG19's ctid chain / EvalPlanQual).
+/// This transaction's journal pairs old/new ids exactly
+/// (WriteOp::UpdateRow); a committed concurrent update is followed
+/// only when its successor is unambiguous (the unique row whose
+/// xmin is the captured version's xmax). A deleted row resolves to
+/// None (the DML then affects 0 rows, like PG).
+fn resolve_current_of_id(eng: &Engine, ctx: &StmtCtx, cap_table: &str, pos: u32) -> Option<u64> {
+    let lt = eng
+        .db
+        .find_table(cap_table, ctx.snap, &ctx.all_xids, ctx.session)?;
+    let first = lt.rows.get(pos as usize)?;
+    let mut id = first.id;
+    for _ in 0..10_000 {
+        let mut next = None;
+        let mut deleted = false;
+        for w in ctx.writes.iter() {
+            match w {
+                WriteOp::UpdateRow {
+                    table,
+                    old_id,
+                    new_id,
+                    ..
+                } if table == cap_table && *old_id == id => {
+                    next = Some(*new_id);
+                    break;
+                }
+                WriteOp::DeleteRow { table, row_id, .. } if table == cap_table && *row_id == id => {
+                    deleted = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if deleted {
+            return None;
+        }
+        match next {
+            Some(n) => id = n,
+            None => break,
+        }
+    }
+    if id == first.id && first.xmax != 0 && !row_visible(first, ctx.snap, &ctx.all_xids) {
+        let mut cands = lt.rows.iter().filter(|r| r.xmin == first.xmax);
+        if let (Some(s), None) = (cands.next(), cands.next()) {
+            id = s.id;
+        }
+    }
+    Some(id)
+}
+
 pub(crate) fn exec_update_inner(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -5317,6 +5420,21 @@ pub(crate) fn exec_update_inner(
     // when no row matches). Partitioned targets check their touched
     // leaves after planning, below.
     check_replica_identity_for(eng, ctx, table, true)?;
+    // v2.47: WHERE CURRENT OF — the server validated the cursor and
+    // installed its (table, ctid offset); resolve it to a row id once
+    // the scan leaves are known (below).
+    let current_of: Option<(String, u32)> = match where_ {
+        Some(Expr::CurrentOf(name)) => Some(current_of_row().ok_or_else(|| {
+            exec_err(
+                "0A000",
+                format!(
+                    "WHERE CURRENT OF cursor \"{}\" is not supported in this context",
+                    name
+                ),
+            )
+        })?),
+        _ => None,
+    };
     // v1.96: columns READ by SET expressions / WHERE need SELECT
     // (PG19 ExecCheckRTEPerms selectedCols on the target relation).
     {
@@ -5568,6 +5686,14 @@ pub(crate) fn exec_update_inner(
         };
         // Leaf column orders, for routing and remapping below.
         let leaf_cols_of = leaves.clone();
+        // v2.47: resolve WHERE CURRENT OF to the live row id (the
+        // captured version may have been updated since the fetch).
+        let current_of_id: Option<u64> = current_of.as_ref().and_then(|(cap_table, pos)| {
+            if !leaves.iter().any(|(leaf, _)| leaf == cap_table) {
+                return None;
+            }
+            resolve_current_of_id(eng, ctx, cap_table, *pos)
+        });
         for (leaf, leaf_cols) in &leaves {
             let lt = eng
                 .db
@@ -5639,7 +5765,16 @@ pub(crate) fn exec_update_inner(
                 if let Some(groups) = rls_visibility_groups(&mut q, &tdef, table, &cmds)? {
                     let mut kept = Vec::with_capacity(vis.len());
                     for entry in vis {
-                        if rls_row_visible(&mut q, table, &schema, &entry.4, &groups)? {
+                        // v2.47: provenance for system-column quals.
+                        let prov = RowProv {
+                            qual: schema
+                                .first()
+                                .map(|c| c.qual.clone())
+                                .unwrap_or_else(|| table.to_string()),
+                            table: entry.0.clone(),
+                            row_id: entry.2,
+                        };
+                        if rls_row_visible(&mut q, table, &schema, &entry.4, &groups, Some(prov))? {
                             kept.push(entry);
                         }
                     }
@@ -5720,6 +5855,9 @@ pub(crate) fn exec_update_inner(
                     // only). NULL or false skips the row, like SELECT's WHERE.
                     let m = match where_ {
                         None => true,
+                        // v2.47: WHERE CURRENT OF matches exactly the
+                        // cursor's row.
+                        Some(Expr::CurrentOf(_)) => current_of_id == Some(*id),
                         Some(pred) => {
                             let v = eval_update_expr(
                                 eng,
@@ -5750,6 +5888,9 @@ pub(crate) fn exec_update_inner(
                     for frow in frows {
                         let m = match where_ {
                             None => true,
+                            // v2.47: WHERE CURRENT OF ignores the
+                            // FROM row; the cursor's row decides.
+                            Some(Expr::CurrentOf(_)) => current_of_id == Some(*id),
                             Some(pred) => {
                                 // v0.76: combine FROM + target into a single
                                 // schema so unqualified refs resolve to
@@ -6191,7 +6332,7 @@ pub(crate) fn exec_update_inner(
     // final image in PG). A trigger returning NULL suppresses the
     // insert side of the move; the delete side — and its FK cascade,
     // already applied above — still happens, as in PG.
-    let (moves, ret_new, ret_from, ret_prov_ids) = if moves.is_empty() {
+    let (moves, mut ret_new, mut ret_from, mut ret_prov_ids) = if moves.is_empty() {
         (moves, ret_new, ret_from, ret_prov_ids)
     } else {
         // The ret_new slot of each move, in moves order: ret entries
@@ -6344,43 +6485,6 @@ pub(crate) fn exec_update_inner(
             }
         }
     }
-    // v1.95: row-level security WITH CHECK on every updated row's new
-    // version (WCO_RLS_UPDATE_CHECK; SELECT policies join as checks
-    // when RETURNING is present). ret_new is in target (parent)
-    // column order, matching the target schema built here.
-    {
-        let tdef = eng
-            .db
-            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
-            .expect("target still visible")
-            .clone();
-        if tdef.rls_enabled {
-            let schema: Vec<QCol> = tdef
-                .columns
-                .iter()
-                .map(|(n, ty)| QCol {
-                    qual: table.to_string(),
-                    name: n.clone(),
-                    ty: *ty,
-                    hidden: false,
-                    src_ord: 0,
-                })
-                .collect();
-            for row in &ret_new {
-                rls_check_new_row_ctx(
-                    eng,
-                    ctx,
-                    &tdef,
-                    table,
-                    PolicyCmd::Update,
-                    !returning.is_empty(),
-                    false,
-                    &schema,
-                    &row[..],
-                )?;
-            }
-        }
-    }
     // v2.10: BEFORE UPDATE FOR EACH ROW triggers run over the plan
     // before anything is applied (PG19 ExecBRUpdateTriggers): a body
     // returning NULL drops the row from the plan; RETURN NEW (with
@@ -6446,9 +6550,104 @@ pub(crate) fn exec_update_inner(
                     None => {}
                 }
             }
+            // v2.47: fold the trigger outcome back into the
+            // RETURNING images. ret_new was snapshotted from the
+            // pre-trigger plan, so a trigger-modified column (the
+            // classic `NEW.c = upper(NEW.b)`) rendered stale in
+            // RETURNING while the stored row was correct, and a
+            // trigger-dropped row kept a RETURNING slot (and an RLS
+            // check) it should never have had. Move slots (already
+            // folded by the v2.24 block above) are preserved as-is;
+            // kept-plan slots take the post-trigger image in parent
+            // column order; dropped-plan slots disappear from all
+            // three parallel vectors.
+            {
+                let parent_cols: Vec<(String, ColType)> = eng
+                    .db
+                    .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+                    .expect("target still visible")
+                    .columns
+                    .clone();
+                let move_keys: std::collections::HashSet<(u64, String)> =
+                    moves.iter().map(|m| (m.1, m.3.clone())).collect();
+                let mut kept_img: std::collections::HashMap<(u64, String), Row> =
+                    std::collections::HashMap::new();
+                for (dst, old_id, _, new_values) in &kept {
+                    let img = if *dst == table {
+                        new_values.clone()
+                    } else {
+                        let leaf_cols: Vec<(String, ColType)> = eng
+                            .db
+                            .find_table(dst, ctx.snap, &ctx.all_xids, ctx.session)
+                            .map(|t| t.columns.clone())
+                            .unwrap_or_else(|| parent_cols.clone());
+                        Row::new(reorder_row(&leaf_cols, &parent_cols, new_values))
+                    };
+                    kept_img.insert((*old_id, dst.clone()), img);
+                }
+                let mut n_ret: Vec<Row> = Vec::with_capacity(ret_new.len());
+                let mut n_from: Vec<Option<Row>> = Vec::with_capacity(ret_from.len());
+                let mut n_prov: Vec<(u64, String)> = Vec::with_capacity(ret_prov_ids.len());
+                for (i, (rid, rdst)) in ret_prov_ids.iter().enumerate() {
+                    let key = (*rid, rdst.clone());
+                    if let Some(img) = kept_img.get(&key) {
+                        n_ret.push(img.clone());
+                        n_from.push(ret_from.get(i).cloned().unwrap_or(None));
+                        n_prov.push(key);
+                    } else if move_keys.contains(&key) {
+                        n_ret.push(ret_new[i].clone());
+                        n_from.push(ret_from.get(i).cloned().unwrap_or(None));
+                        n_prov.push(key);
+                    }
+                }
+                ret_new = n_ret;
+                ret_from = n_from;
+                ret_prov_ids = n_prov;
+            }
             kept
         }
     };
+    // v1.95: row-level security WITH CHECK on every updated row's new
+    // version (WCO_RLS_UPDATE_CHECK; SELECT policies join as checks
+    // when RETURNING is present). ret_new is in target (parent)
+    // column order, matching the target schema built here.
+    // v2.47: this block now runs AFTER the BEFORE-trigger block
+    // above — PG19 judges the post-trigger image (the WCO is
+    // evaluated on the tuple the trigger finally produced), and
+    // ret_new now holds exactly those images.
+    {
+        let tdef = eng
+            .db
+            .find_table(table, ctx.snap, &ctx.all_xids, ctx.session)
+            .expect("target still visible")
+            .clone();
+        if tdef.rls_enabled {
+            let schema: Vec<QCol> = tdef
+                .columns
+                .iter()
+                .map(|(n, ty)| QCol {
+                    qual: table.to_string(),
+                    name: n.clone(),
+                    ty: *ty,
+                    hidden: false,
+                    src_ord: 0,
+                })
+                .collect();
+            for row in &ret_new {
+                rls_check_new_row_ctx(
+                    eng,
+                    ctx,
+                    &tdef,
+                    table,
+                    PolicyCmd::Update,
+                    !returning.is_empty(),
+                    false,
+                    &schema,
+                    &row[..],
+                )?;
+            }
+        }
+    }
     // Apply: UPDATE = delete old version + insert new version, per leaf.
     // v0.70: moved rows are deleted from their source leaf and inserted
     // into the routed destination leaf.
@@ -6807,6 +7006,19 @@ pub(crate) fn exec_delete_inner(
     // v2.02: replica-identity guard (see exec_update; partitioned
     // targets check their touched leaves after planning).
     check_replica_identity_for(eng, ctx, table, false)?;
+    // v2.47: WHERE CURRENT OF (see exec_update_inner).
+    let current_of: Option<(String, u32)> = match where_ {
+        Some(Expr::CurrentOf(name)) => Some(current_of_row().ok_or_else(|| {
+            exec_err(
+                "0A000",
+                format!(
+                    "WHERE CURRENT OF cursor \"{}\" is not supported in this context",
+                    name
+                ),
+            )
+        })?),
+        _ => None,
+    };
     // v1.96: columns READ by the WHERE clause need SELECT.
     if let Some(w) = where_ {
         check_dml_read_cols(eng, ctx, table, alias.as_deref(), &[w], &[])?;
@@ -6851,6 +7063,7 @@ pub(crate) fn exec_delete_inner(
                 src_ord: 0,
             })
             .collect();
+        let mut current_of_id: Option<u64> = None;
         let vis: Vec<(String, u64, u64, Row, Row, Vec<u32>)> = {
             // (leaf, id, xmax, values parent order, values leaf order, toast)
             let mut v = Vec::new();
@@ -6868,6 +7081,12 @@ pub(crate) fn exec_delete_inner(
                 // v2.43: plain inheritance expansion (PG19).
                 inheritance_targets(eng, ctx, table)
             };
+            // v2.47: resolve WHERE CURRENT OF to the live row id.
+            if let Some((cap_table, pos)) = &current_of {
+                if targets.iter().any(|(leaf, _)| leaf == cap_table) {
+                    current_of_id = resolve_current_of_id(eng, ctx, cap_table, *pos);
+                }
+            }
             for (leaf, leaf_cols) in &targets {
                 let lt = eng
                     .db
@@ -6945,7 +7164,23 @@ pub(crate) fn exec_delete_inner(
                     Some(groups) => {
                         let mut kept = Vec::with_capacity(vis.len());
                         for entry in vis {
-                            if rls_row_visible(&mut q, table, &schema, &entry.3, &groups)? {
+                            // v2.47: provenance for system-column quals.
+                            let prov = RowProv {
+                                qual: schema
+                                    .first()
+                                    .map(|c| c.qual.clone())
+                                    .unwrap_or_else(|| table.to_string()),
+                                table: entry.0.clone(),
+                                row_id: entry.1,
+                            };
+                            if rls_row_visible(
+                                &mut q,
+                                table,
+                                &schema,
+                                &entry.3,
+                                &groups,
+                                Some(prov),
+                            )? {
                                 kept.push(entry);
                             }
                         }
@@ -7009,6 +7244,9 @@ pub(crate) fn exec_delete_inner(
                     Some((_, urows)) => (true, urows.first().map(|u| u.cells.clone())),
                     None => (true, None),
                 },
+                // v2.47: WHERE CURRENT OF matches exactly the
+                // cursor's row.
+                Some(Expr::CurrentOf(_)) => (current_of_id == Some(*id), None),
                 Some(pred) => {
                     if let Some((uschema, urows)) = &using_data {
                         // Target frame last: unqualified refs resolve to

@@ -619,6 +619,8 @@ fn filter_walk(
         )
     };
     match e {
+        // v2.47: WHERE CURRENT OF cannot appear in a row filter.
+        Expr::CurrentOf(_) => Err(invalid("WHERE CURRENT OF is not allowed.")),
         Expr::Column { name, .. } => {
             let lc = name.to_lowercase();
             if SYSTEM_COLS.contains(&lc.as_str()) {

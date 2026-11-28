@@ -4546,6 +4546,9 @@ impl Parser {
             let mut pkey = None;
             let mut fks = Vec::new();
             let mut fdw_options: Vec<FdwOpt> = Vec::new();
+            // v2.47: ADD COLUMN ... GENERATED ALWAYS AS (expr)
+            // STORED|VIRTUAL (PG19 ATExecAddColumn).
+            let mut generated: Option<(Expr, bool)> = None;
             // v0.65: serial implies NOT NULL (an explicit NULL conflicts,
             // like PG's 42601).
             if col.serial.is_some() {
@@ -4612,12 +4615,19 @@ impl Parser {
                         not_null = true;
                     }
                     ColCon::Default(d) => default = Some(d),
-                    ColCon::Generated { .. } => {
-                        return Err(SqlError {
-                            message: "generated columns are not supported in ADD COLUMN"
-                                .to_string(),
-                            code: "0A000",
-                        });
+                    ColCon::Generated { expr, stored } => {
+                        // v2.47: PG19 — a column cannot have both a
+                        // default and a generation expression (42601).
+                        if default.is_some() {
+                            return Err(SqlError {
+                                message: format!(
+                                    "both default and generation expression specified for column \"{}\"",
+                                    col.name
+                                ),
+                                code: "42601",
+                            });
+                        }
+                        generated = Some((expr, stored));
                     }
                     // v2.28: identity on ADD COLUMN. DEFAULT +
                     // identity and serial + identity are PG's 42601
@@ -4684,6 +4694,7 @@ impl Parser {
                 pkey,
                 fks,
                 fdw_options,
+                generated,
             });
         }
         if self.eat_keyword("drop") {
@@ -16722,8 +16733,21 @@ impl Parser {
     /// v0.22: UPDATE/DELETE WHERE is a full predicate expression
     /// (previously only `col = literal` was accepted). Mirrors the
     /// ON CONFLICT DO UPDATE ... WHERE parsing.
-    pub(crate) fn parse_where_expr_opt(&mut self) -> Result<Option<Expr>, SqlError> {
+    /// v2.47: the WHERE clause of UPDATE / DELETE — PG19 also allows
+    /// the standalone `WHERE CURRENT OF <cursor>` form (gram.y
+    /// where_clause), which must be the entire clause.
+    pub(crate) fn parse_dml_where_opt(&mut self) -> Result<Option<Expr>, SqlError> {
         if self.eat_keyword("where") {
+            // CURRENT OF follows only when the next two tokens are
+            // exactly CURRENT OF (no expression begins that way).
+            let is_current_of = matches!(self.peek(), Token::Ident(w) if w == "current")
+                && matches!(self.peek2(), Token::Ident(w) if w == "of");
+            if is_current_of {
+                self.next();
+                self.next();
+                let name = self.expect_ident()?;
+                return Ok(Some(Expr::CurrentOf(name)));
+            }
             Ok(Some(self.parse_or()?))
         } else {
             Ok(None)
@@ -16880,7 +16904,7 @@ impl Parser {
         } else {
             Vec::new()
         };
-        let where_ = self.parse_where_expr_opt()?;
+        let where_ = self.parse_dml_where_opt()?;
         let returning = self.parse_returning()?;
         Ok(Stmt::Update {
             table,
@@ -17111,7 +17135,7 @@ impl Parser {
         } else {
             Vec::new()
         };
-        let where_ = self.parse_where_expr_opt()?;
+        let where_ = self.parse_dml_where_opt()?;
         let returning = self.parse_returning()?;
         Ok(Stmt::Delete {
             table,
@@ -22803,6 +22827,11 @@ pub fn validate_constraint_expr(e: &Expr, what: &str) -> Result<(), SqlError> {
             "cannot use named argument in {} constraint",
             what
         ))),
+        // v2.47: WHERE CURRENT OF is DML-only syntax.
+        Expr::CurrentOf(_) => Err(err(format!(
+            "cannot use WHERE CURRENT OF in {} constraint",
+            what
+        ))),
         Expr::Agg { .. } => Err(err(format!("cannot use aggregate in {} constraint", what))),
         // v1.30: ordered-set aggregates are aggregates too.
         Expr::WithinGroup { .. } => {
@@ -23048,6 +23077,12 @@ pub(crate) fn encode_expr_inner(e: &Expr, out: &mut String) {
     match e {
         // v0.95: named args encode transparently.
         Expr::NamedArg { expr, .. } => encode_expr_inner(expr, out),
+        // v2.47: WHERE CURRENT OF encodes by cursor name.
+        Expr::CurrentOf(name) => {
+            out.push_str("(currentof ");
+            sexpr_escape(name, out);
+            out.push(')');
+        }
         // v2.21: collation wrappers encode distinctly (the collation
         // is part of the expression's identity for index keys).
         Expr::Collate { expr, name } => {

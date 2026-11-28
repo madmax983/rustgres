@@ -606,7 +606,8 @@ fn map_children(
         | Expr::ScalarSub(_)
         | Expr::ArraySubquery(_)
         | Expr::JsonArraySubq { .. }
-        | Expr::Exists { .. } => e.clone(),
+        | Expr::Exists { .. }
+        | Expr::CurrentOf(_) => e.clone(),
         Expr::Arith { op, left, right } => Expr::Arith {
             op: *op,
             left: Box::new(f(left)?),

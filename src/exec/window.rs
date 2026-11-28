@@ -26,6 +26,8 @@ pub(crate) fn validate_windows(stmt: &SelectStmt) -> Result<(), ExecError> {
 /// aggregate arguments (windows are forbidden there).
 pub(crate) fn validate_window_expr(e: &Expr, in_agg: bool) -> Result<(), ExecError> {
     match e {
+        // v2.47: WHERE CURRENT OF carries nothing to validate.
+        Expr::CurrentOf(_) => Ok(()),
         Expr::Window {
             func,
             args,

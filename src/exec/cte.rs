@@ -1055,7 +1055,8 @@ pub(crate) fn contains_agg(e: &Expr) -> bool {
         | Expr::ResolvedCol { .. }
         | Expr::WholeRow { .. }
         | Expr::Literal(_)
-        | Expr::Param(_) => false,
+        | Expr::Param(_)
+        | Expr::CurrentOf(_) => false,
         Expr::Arith { left, right, .. }
         | Expr::And(left, right)
         | Expr::Or(left, right)
@@ -1145,6 +1146,8 @@ pub(crate) fn expr_walk<'a>(e: &'a Expr, visit: &mut impl FnMut(&'a Expr)) {
     while let Some(x) = stack.pop() {
         visit(x);
         match x {
+            // v2.47: WHERE CURRENT OF is a leaf.
+            Expr::CurrentOf(_) => {}
             Expr::Arith { left, right, .. }
             | Expr::Cmp { left, right, .. }
             | Expr::IsDistinctFrom { left, right, .. } => {
@@ -1471,7 +1474,8 @@ pub(crate) fn contains_window(e: &Expr) -> bool {
         | Expr::ResolvedCol { .. }
         | Expr::WholeRow { .. }
         | Expr::Literal(_)
-        | Expr::Param(_) => false,
+        | Expr::Param(_)
+        | Expr::CurrentOf(_) => false,
         Expr::Arith { left, right, .. }
         | Expr::And(left, right)
         | Expr::Or(left, right)

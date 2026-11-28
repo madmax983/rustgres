@@ -44,6 +44,23 @@ pub(crate) fn set_session_user(name: &str) {
 }
 
 thread_local! {
+    /// v2.47: WHERE CURRENT OF resolution for the UPDATE / DELETE
+    /// statement being executed: (table name, ctid page offset of the
+    /// cursor's current row). Installed by the server after it
+    /// validates the cursor (PG19 execCurrent.c semantics); the
+    /// executor matches exactly that row.
+    static CURRENT_OF_ROW: RefCell<Option<(String, u32)>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn set_current_of_row(v: Option<(String, u32)>) {
+    CURRENT_OF_ROW.with(|c| *c.borrow_mut() = v);
+}
+
+pub(crate) fn current_of_row() -> Option<(String, u32)> {
+    CURRENT_OF_ROW.with(|c| c.borrow().clone())
+}
+
+thread_local! {
     /// v2.37: tables whose policy expressions are currently being
     /// evaluated on this thread (PG19 rewriteHandler.c `activeRIRs`).
     /// A policy qual that (transitively, including through views)
@@ -212,6 +229,33 @@ fn policy_scope_augment<'a>(
     (std::borrow::Cow::Owned(s2), std::borrow::Cow::Owned(v2))
 }
 
+/// v2.47: does this policy expression reference a system column
+/// (ctid / tableoid / xmin / xmax / cmin / cmax)? Such quals can
+/// only be evaluated when the row's provenance is in scope.
+fn expr_uses_syscol(e: &Expr) -> bool {
+    let mut found = false;
+    expr_walk(e, &mut |x| {
+        if let Expr::Column { name, .. } = x {
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "ctid" | "tableoid" | "xmin" | "xmax" | "cmin" | "cmax"
+            ) {
+                found = true;
+            }
+        }
+    });
+    found
+}
+
+/// v2.47: any policy on `t` whose USING / WITH CHECK expression
+/// references a system column (see expr_uses_syscol).
+pub(crate) fn table_policies_use_syscols(t: &Table) -> bool {
+    t.policies.iter().any(|p| {
+        p.using_expr.as_ref().is_some_and(|e| expr_uses_syscol(e))
+            || p.check_expr.as_ref().is_some_and(|e| expr_uses_syscol(e))
+    })
+}
+
 fn eval_group(
     q: &mut Q,
     table_name: &str,
@@ -219,12 +263,15 @@ fn eval_group(
     cells: &[Value],
     policies: &[&PolicyDef],
     expr_of: impl Fn(&PolicyDef) -> Option<&Expr>,
+    prov: Option<&[RowProv]>,
 ) -> Result<bool, ExecError> {
     let (schema2, cells2) = policy_scope_augment(table_name, schema, cells);
     let frame = Scope {
         schema: &schema2,
         row: &cells2,
-        prov: None,
+        // v2.47: provenance in scope so policy quals may reference
+        // system columns (PG19 evaluates quals on the full tuple).
+        prov,
     };
     let scopes = [frame];
     let mut any_permissive = false;
@@ -278,9 +325,22 @@ pub(crate) fn rls_filter_qrows(
     for row in rows {
         let mut keep = true;
         for g in &groups {
-            if !eval_group(q, table_name, schema, &row.cells, g, |p| {
-                p.using_expr.as_ref()
-            })? {
+            // v2.47: hand the row's provenance to the qual
+            // evaluation (system-column references in policies).
+            let prov = if row.prov.is_empty() {
+                None
+            } else {
+                Some(row.prov.as_slice())
+            };
+            if !eval_group(
+                q,
+                table_name,
+                schema,
+                &row.cells,
+                g,
+                |p| p.using_expr.as_ref(),
+                prov,
+            )? {
                 keep = false;
                 break;
             }
@@ -325,10 +385,28 @@ pub(crate) fn rls_row_visible(
     schema: &[QCol],
     cells: &[Value],
     groups: &[Vec<&PolicyDef>],
+    prov: Option<RowProv>,
 ) -> Result<bool, ExecError> {
     let _policy_guard = enter_policy_eval(table_name)?;
+    let prov_slice: &[RowProv] = match &prov {
+        Some(p) => std::slice::from_ref(p),
+        None => &[],
+    };
+    let prov_opt = if prov.is_some() {
+        Some(prov_slice)
+    } else {
+        None
+    };
     for g in groups {
-        if !eval_group(q, table_name, schema, cells, g, |p| p.using_expr.as_ref())? {
+        if !eval_group(
+            q,
+            table_name,
+            schema,
+            cells,
+            g,
+            |p| p.using_expr.as_ref(),
+            prov_opt,
+        )? {
             return Ok(false);
         }
     }
@@ -477,6 +555,19 @@ fn check_one_group(
         }
     }
     Ok(())
+}
+
+/// v2.47: does any SELECT policy apply to this role on this table?
+/// Used by the ON CONFLICT DO UPDATE new-row check to decide
+/// whether the SELECT-policy WCO group participates at all.
+pub(crate) fn has_applicable_select_policy(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    t: &Table,
+    role: &str,
+) -> bool {
+    !applicable_policies(eng, snap, own, t, PolicyCmd::Select, role).is_empty()
 }
 
 /// rls_check_using_as_check for callers holding a StmtCtx.
@@ -944,7 +1035,7 @@ pub(crate) fn exec_drop_policy(
 /// FROM/JOIN target? Token-level scan of the stored qual text —
 /// PG19 records the same fact in pg_depend at parse-analysis time
 /// (find_expr_references_walker over the qual's range table).
-fn qual_references_rel(sql: &str, bare: &str) -> bool {
+pub(crate) fn qual_references_rel(sql: &str, bare: &str) -> bool {
     let Ok(toks) = crate::sql::tokenize(sql) else {
         return false;
     };

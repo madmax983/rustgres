@@ -517,6 +517,22 @@ pub(crate) struct SqlCursor {
     query: Option<sql::SelectStmt>,
     cols: Vec<(String, ColType)>,
     rows: Vec<Row>,
+    /// v2.47: per-row (table name, ctid offset) captured at
+    /// materialization when the DECLARE query is a simply updatable
+    /// scan of one plain table (PG19 CurrentOfExpr support); empty
+    /// when the scan shape does not qualify. Parallel to `rows`.
+    tids: Vec<Option<(String, u32)>>,
+    /// v2.47: the cursor survived a COMMIT via WITH HOLD — PG19
+    /// rejects WHERE CURRENT OF against it (24000).
+    held: bool,
+    /// v2.47: the WHERE CURRENT OF capture target of the DECLARE
+    /// query — (qualifier, table) of the single plain-table scan, or
+    /// of the single locked table when a locking clause names one —
+    /// plus the resolved locked table names (with multiplicity) for
+    /// PG19 execCurrent.c's FOR UPDATE/SHARE reference checks.
+    current_of_target: Option<(String, String)>,
+    lock_clause: bool,
+    lock_refs: Vec<String>,
     /// Current row index: -1 = before the first row, rows.len() = after
     /// the last row (Postgres positions the cursor on the last row
     /// retrieved).
@@ -2399,7 +2415,16 @@ pub(crate) fn cursor_window(dir: &FetchDir, pos: i64, len: usize) -> (usize, usi
         // otherwise a following BACKWARD ALL would miss the last row.
         Kind::Fwd => {
             if e == n {
-                n
+                // v2.47: a counted fetch that received its FULL
+                // count stops ON the last returned row even when
+                // that row is the result's final one (PG19 portal
+                // semantics — WHERE CURRENT OF must find the cursor
+                // positioned there). Only a fetch that ran out of
+                // rows, or FORWARD ALL, parks after the last row.
+                match dir {
+                    FetchDir::Forward(Some(c)) if *c >= 0 && (e - s) >= *c => e - 1,
+                    _ => n,
+                }
             } else {
                 e - 1
             }
@@ -2455,12 +2480,20 @@ fn cursor_declare(
     // v0.89: PG19 does not execute the query at DECLARE — the portal is
     // created lazily and query errors (e.g. division by zero) surface
     // at the first FETCH, not here.
+    // v2.47: the WHERE CURRENT OF shape is an AST property — compute
+    // it at DECLARE like PG19's portal plan.
+    let shape = cursor_current_of_shape(query);
     session.cursors.insert(
         name.to_string(),
         SqlCursor {
             query: Some(query.clone()),
             cols: Vec::new(),
             rows: Vec::new(),
+            tids: Vec::new(),
+            held: false,
+            current_of_target: shape.0,
+            lock_clause: query.lock_clause,
+            lock_refs: shape.1,
             pos: -1,
             with_hold,
             dead: false,
@@ -2551,6 +2584,8 @@ fn cursor_fetch(
     // error (e.g. division by zero) marks the portal dead and aborts
     // the transaction (via txn_execute), like PG19.
     if let Some(query) = query {
+        // v2.47: keep the AST for the WHERE CURRENT OF tid capture.
+        let orig_query = query.clone();
         let sel = Stmt::Select(query);
         let result: Result<ExecResult, ExecError> = if session.txn.is_some() {
             txn_execute(engine, session, &sel)
@@ -2571,13 +2606,18 @@ fn cursor_fetch(
                 Err(e) => Err(e),
             }
         };
-        let cur = session.cursors.get_mut(name).expect("cursor checked above");
         match result {
             Ok(ExecResult::Select { columns, rows }) => {
+                // v2.47: capture (table, ctid) per row for WHERE
+                // CURRENT OF before storing the materialized rows.
+                let tids = cursor_capture_tids(engine, wal, session, &orig_query, rows.len());
+                let cur = session.cursors.get_mut(name).expect("cursor checked above");
                 cur.cols = columns;
                 cur.rows = rows;
+                cur.tids = tids;
             }
             Ok(_) => {
+                let cur = session.cursors.get_mut(name).expect("cursor checked above");
                 cur.dead = true;
                 return Err(ExecError {
                     detail: None,
@@ -2587,6 +2627,7 @@ fn cursor_fetch(
                 });
             }
             Err(e) => {
+                let cur = session.cursors.get_mut(name).expect("cursor checked above");
                 cur.dead = true;
                 return Err(e);
             }
@@ -2616,6 +2657,281 @@ fn cursor_fetch(
         columns: cols,
         rows,
     })
+}
+
+/// v2.47: the WHERE CURRENT OF shape of a DECLARE query (PG19
+/// execCurrent.c's discipline, at AST level). Returns
+/// (capture_target, lock_refs):
+/// - capture_target: (qualifier, table) whose (ctid, tableoid) the
+///   companion capture reads — the single plain-table scan, or, for
+///   a locking clause resolving to exactly one table, that table's
+///   range entry (a self-join FOR SHARE OF a qualifies). None when
+///   the shape cannot identify one row source: CTEs, DISTINCT,
+///   grouping, HAVING, set operations, or an unresolved lock set.
+/// - lock_refs: the locking clause's resolved table names, one per
+///   FROM occurrence / OF entry (empty without a locking clause).
+fn cursor_current_of_shape(q: &sql::SelectStmt) -> (Option<(String, String)>, Vec<String>) {
+    // All plain-table range entries, descending into join trees
+    // (the parser folds comma-separated FROM items into one Join).
+    fn collect_tables(item: &sql::FromItem, out: &mut Vec<(String, String)>) {
+        match item {
+            sql::FromItem::Table { name, alias, .. } => {
+                out.push((alias.clone().unwrap_or_else(|| name.clone()), name.clone()));
+            }
+            sql::FromItem::Join { left, right, .. } => {
+                collect_tables(left, out);
+                collect_tables(right, out);
+            }
+            _ => {}
+        }
+    }
+    let mut all_tables: Vec<(String, String)> = Vec::new();
+    for item in &q.from {
+        collect_tables(item, &mut all_tables);
+    }
+    // Resolve a range-table reference (alias or table name) to its
+    // (qualifier, table) FROM entry.
+    let resolve = |r: &str| -> Option<(String, String)> {
+        all_tables
+            .iter()
+            .find(|(qual, name)| qual == r || name == r)
+            .cloned()
+    };
+    let mut lock_pairs: Vec<(String, String)> = Vec::new();
+    if q.lock_clause {
+        if q.for_update_of.is_empty() {
+            lock_pairs = all_tables.clone();
+        } else {
+            for r in &q.for_update_of {
+                if let Some(p) = resolve(r) {
+                    lock_pairs.push(p);
+                }
+            }
+        }
+    }
+    let lock_refs: Vec<String> = lock_pairs.iter().map(|(_, t)| t.clone()).collect();
+    if !q.with.is_empty()
+        || q.distinct
+        || !q.distinct_on.is_empty()
+        || !q.group_by.is_empty()
+        || q.having.is_some()
+        || q.set_op.is_some()
+    {
+        return (None, lock_refs);
+    }
+    if q.lock_clause {
+        // Exactly one locked range entry (counting multiplicity)
+        // can supply the current row.
+        if lock_pairs.len() == 1 {
+            return (Some(lock_pairs[0].clone()), lock_refs);
+        }
+        return (None, lock_refs);
+    }
+    if q.from.len() != 1 {
+        return (None, lock_refs);
+    }
+    match &q.from[0] {
+        sql::FromItem::Table { name, alias, .. } => (
+            Some((alias.clone().unwrap_or_else(|| name.clone()), name.clone())),
+            lock_refs,
+        ),
+        _ => (None, lock_refs),
+    }
+}
+
+/// v2.47: capture per-row (table, ctid offset) for a freshly
+/// materialized cursor by running a companion query — the same
+/// FROM/WHERE/ORDER/LIMIT with `ctid, tableoid` as the select list.
+/// Best-effort: any shape or execution mismatch yields an empty
+/// vector (WHERE CURRENT OF then fails PG19's simply-updatable
+/// check, exactly as a non-qualifying scan should).
+fn cursor_capture_tids(
+    engine: &Arc<Mutex<Engine>>,
+    wal: &Arc<Mutex<Wal>>,
+    session: &mut Session,
+    query: &sql::SelectStmt,
+    expect_rows: usize,
+) -> Vec<Option<(String, u32)>> {
+    let empty: Vec<Option<(String, u32)>> = Vec::new();
+    let Some((qual, _)) = cursor_current_of_shape(query).0 else {
+        return empty;
+    };
+    // Aggregates / window functions / SRFs in the select list break
+    // the 1:1 row correspondence the companion relies on.
+    let mut bad = false;
+    for item in &query.items {
+        if let sql::SelectItem::Expr { expr, .. } = item {
+            if exec::contains_agg(expr) || exec::contains_window(expr) {
+                bad = true;
+            }
+            exec::expr_walk(expr, &mut |e| {
+                if let sql::Expr::Func { name, .. } = e {
+                    if matches!(
+                        name.as_str(),
+                        "generate_series" | "generate_subscripts" | "unnest"
+                    ) {
+                        bad = true;
+                    }
+                }
+            });
+        }
+    }
+    if bad {
+        return empty;
+    }
+    let mut companion = query.clone();
+    companion.items = vec![
+        sql::SelectItem::Expr {
+            expr: sql::Expr::Column {
+                table: Some(qual.clone()),
+                name: "ctid".to_string(),
+            },
+            alias: None,
+        },
+        sql::SelectItem::Expr {
+            expr: sql::Expr::Column {
+                table: Some(qual),
+                name: "tableoid".to_string(),
+            },
+            alias: None,
+        },
+    ];
+    companion.for_update = false;
+    companion.lock_clause = false;
+    companion.for_update_of = Vec::new();
+    let sel = Stmt::Select(companion);
+    let result = if session.txn.is_some() {
+        txn_execute(engine, session, &sel)
+    } else {
+        match autocommit_execute(
+            engine,
+            wal,
+            session.sid,
+            &session.role,
+            session.default_txn_read_only == Some(true),
+            session.default_toast_compression,
+            &sel,
+        ) {
+            Ok((r, notices)) => {
+                session.pending_notices.extend(notices);
+                Ok(r)
+            }
+            Err(e) => Err(e),
+        }
+    };
+    let rows = match result {
+        Ok(ExecResult::Select { rows, .. }) => rows,
+        _ => return empty,
+    };
+    if rows.len() != expect_rows {
+        return empty;
+    }
+    let guard = lock_engine(engine);
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let entry = match (r.first(), r.get(1)) {
+            (Some(Value::Tid(_, off)), Some(Value::Int(oid))) => {
+                exec::table_name_by_oid(&guard.db, *oid as u32).map(|t| (t, *off))
+            }
+            _ => None,
+        };
+        match entry {
+            Some(e) => out.push(Some(e)),
+            None => return empty,
+        }
+    }
+    out
+}
+
+/// v2.47: WHERE CURRENT OF validation + install (PG19
+/// execCurrent.c). On success the executor's thread-local holds the
+/// cursor row's (table, ctid offset); the checks and messages mirror
+/// execCurrent.c's order: existence, held, FOR UPDATE reference,
+/// simply-updatable shape / positioning (their relative order swaps
+/// with the presence of a locking clause, as in PG).
+fn install_current_of(session: &Session, stmt: &Stmt) -> Result<(), ExecError> {
+    let (table, where_) = match stmt {
+        Stmt::Update { table, where_, .. } => (table, where_),
+        Stmt::Delete { table, where_, .. } => (table, where_),
+        _ => return Ok(()),
+    };
+    let Some(sql::Expr::CurrentOf(name)) = where_ else {
+        return Ok(());
+    };
+    let err = |code: &'static str, message: String| ExecError {
+        detail: None,
+        hint: None,
+        code,
+        message,
+    };
+    let Some(cur) = session.cursors.get(name) else {
+        return Err(err("34000", format!("cursor \"{}\" does not exist", name)));
+    };
+    if cur.held || (session.txn.is_none() && cur.with_hold) {
+        return Err(err(
+            "24000",
+            format!("cursor \"{}\" is held from a previous transaction", name),
+        ));
+    }
+    let positioned = cur.pos >= 0 && (cur.pos as usize) < cur.rows.len();
+    let not_positioned = || {
+        err(
+            "24000",
+            format!("cursor \"{}\" is not positioned on a row", name),
+        )
+    };
+    let not_updatable = || {
+        err(
+            "24000",
+            format!(
+                "cursor \"{}\" is not a simply updatable scan of table \"{}\"",
+                name, table
+            ),
+        )
+    };
+    if cur.lock_clause {
+        // PG19 execCurrent.c: the locking clause's references to
+        // the target table are checked before positioning.
+        let refs = cur.lock_refs.iter().filter(|t| *t == table).count();
+        if refs == 0 {
+            return Err(err(
+                "24000",
+                format!(
+                    "cursor \"{}\" does not have a FOR UPDATE/SHARE reference to table \"{}\"",
+                    name, table
+                ),
+            ));
+        }
+        if refs > 1 {
+            return Err(err(
+                "24000",
+                format!(
+                    "cursor \"{}\" has multiple FOR UPDATE/SHARE references to table \"{}\"",
+                    name, table
+                ),
+            ));
+        }
+        if !positioned {
+            return Err(not_positioned());
+        }
+    } else {
+        // Without a locking clause, PG19 establishes the
+        // simply-updatable scan before testing positioning.
+        if cur.current_of_target.is_none() {
+            return Err(not_updatable());
+        }
+        if !positioned {
+            return Err(not_positioned());
+        }
+    }
+    let Some(Some((cap_table, off))) = cur.tids.get(cur.pos as usize) else {
+        return Err(not_updatable());
+    };
+    if cap_table != table {
+        return Err(not_updatable());
+    }
+    crate::exec::set_current_of_row(Some((cap_table.clone(), *off)));
+    Ok(())
 }
 
 fn cursor_close(session: &mut Session, name: Option<&str>) -> Result<ExecResult, ExecError> {
@@ -4778,6 +5094,9 @@ fn install_statement_context(session: &mut Session) {
         .unwrap_or(false);
     crate::exec::set_session_replica(repl);
     crate::exec::set_session_user(&session.session_user);
+    // v2.47: WHERE CURRENT OF target is per-statement; clear any
+    // stale value before install_current_of runs for this statement.
+    crate::exec::set_current_of_row(None);
     // v1.96: current_setting() snapshot: the session's GUC map
     // plus computed values.
     {
@@ -4943,6 +5262,16 @@ fn run_statement(
                 message: format!("cannot execute {} in a read-only transaction", cmd),
             });
         }
+    }
+    // v2.47: WHERE CURRENT OF — validate the cursor (PG19
+    // execCurrent.c) and install its row target for the executor.
+    // Like any statement error, a validation failure aborts the
+    // transaction.
+    if let Err(e) = install_current_of(session, stmt) {
+        if let Some(t) = session.txn.as_mut() {
+            t.failed = true;
+        }
+        return Err(e);
     }
     // v0.81: capture the dispatch result so successful DDL can bump
     // the catalog epoch (invalidates sessions' parsed-AST caches).
@@ -5823,6 +6152,11 @@ fn commit_taken_txn(
     drop(guard);
     // v0.16: plain cursors die at COMMIT; WITH HOLD cursors survive.
     session.cursors.retain(|_, c| c.with_hold);
+    // v2.47: survivors are now held cursors (PG19: WHERE CURRENT OF
+    // against them is 24000).
+    for c in session.cursors.values_mut() {
+        c.held = true;
+    }
     // v2.12: plpgsql portals have no WITH HOLD form; all die at COMMIT.
     crate::exec::pl_portals_clear();
     // v0.66: SET LOCAL effects end with the transaction (commit or

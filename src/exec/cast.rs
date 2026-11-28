@@ -1210,6 +1210,8 @@ pub(crate) fn catalog_name_oid(name: &str) -> Option<u32> {
         "pg_shdepend" => 1214,
         "pg_cast" => 2605,
         "pg_constraint" => 2606,
+        // v2.47: pg_depend (PG19 RelationId 2608).
+        "pg_depend" => 2608,
         "pg_conversion" => 2607,
         "pg_description" => 2609,
         "pg_index" => 2610,

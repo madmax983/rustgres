@@ -1597,6 +1597,12 @@ pub enum Expr {
     },
     Literal(Literal),
     Param(u32), // 1-based $N; substituted with a Literal before execution
+    /// v2.47: `WHERE CURRENT OF <cursor>` (PG19 CurrentOfExpr) — only
+    /// ever the entire WHERE clause of an UPDATE / DELETE. The server
+    /// resolves the cursor to a (table, ctid position) pair installed
+    /// in a statement-scoped thread-local; the executor matches
+    /// exactly that row. Never valid anywhere else.
+    CurrentOf(String),
     /// v0.7: `+ - * / %` with Postgres-ish numeric promotion.
     Arith {
         op: ArithOp,
@@ -3007,6 +3013,9 @@ pub enum AlterAction {
         /// v2.36: foreign-table column OPTIONS on ADD COLUMN
         /// (empty for ordinary tables).
         fdw_options: Vec<FdwOpt>,
+        /// v2.47: `GENERATED ALWAYS AS (expr) STORED|VIRTUAL` on the
+        /// added column: (generation expression, stored flag).
+        generated: Option<(Expr, bool)>,
     },
     DropColumn {
         name: String,
@@ -4561,6 +4570,8 @@ pub(crate) fn collect_col_refs(e: &Expr, out: &mut Vec<(Option<String>, String)>
     match e {
         // v0.95: named args are transparent to inspection.
         Expr::NamedArg { expr, .. } => collect_col_refs(expr, out),
+        // v2.47: a cursor name is not a column reference.
+        Expr::CurrentOf(_) => {}
         Expr::Column { table, name } => out.push((table.clone(), name.clone())),
         // v0.73: a whole-row ref depends on every column of the range.
         Expr::WholeRow { qual } => out.push((Some(qual.clone()), "*".to_string())),
@@ -4713,6 +4724,7 @@ pub(crate) fn collect_cast_type_names(e: &Expr, out: &mut Vec<String>) {
     match e {
         // v0.95: named args are transparent to inspection.
         Expr::NamedArg { expr, .. } => collect_cast_type_names(expr, out),
+        Expr::CurrentOf(_) => {}
         Expr::Column { .. } => {}
         // v0.73: a whole-row ref depends on every column of the range.
         Expr::WholeRow { .. } => {}
@@ -12216,6 +12228,7 @@ pub(crate) fn max_param_expr(e: &Expr) -> usize {
         Expr::Column { .. }
         | Expr::ResolvedCol { .. }
         | Expr::WholeRow { .. }
+        | Expr::CurrentOf(_)
         | Expr::Literal(_) => 0,
         Expr::Arith { left, right, .. } | Expr::And(left, right) | Expr::Or(left, right) => {
             max_param_expr(left).max(max_param_expr(right))

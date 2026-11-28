@@ -338,6 +338,7 @@ pub(crate) fn is_catalog_relation(name: &str) -> bool {
             | "pg_settings"
             | "pg_shadow"
             | "pg_shdepend"
+            | "pg_depend"
             | "pg_shdescription"
             | "pg_shmem_allocations"
             | "pg_shmem_allocations_numa"

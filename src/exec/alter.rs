@@ -751,6 +751,8 @@ pub(crate) fn rename_col_in_expr(e: &mut Expr, old: &str, new: &str) {
         Expr::Collate { expr, .. } | Expr::CollationFor { expr } => {
             rename_col_in_expr(expr, old, new)
         }
+        // v2.47: a cursor name is not a column reference.
+        Expr::CurrentOf(_) => {}
         Expr::Column { table, name } => {
             if table.is_none() && name == old {
                 *name = new.to_string();
@@ -1145,6 +1147,7 @@ pub(crate) fn exec_alter_one(
             pkey,
             fks,
             fdw_options,
+            generated,
         } => {
             // v2.36: PG19 ATExecAddColumn — a column cannot be
             // added directly to a partition (42809); parent-driven
@@ -1229,6 +1232,7 @@ pub(crate) fn exec_alter_one(
                 fks,
                 collate.as_deref(),
                 identity.clone(),
+                generated.clone(),
             );
             // v0.69: propagate ADD COLUMN to partitions (PG does this).
             // v2.27: PG19 ATExecAddColumn recurses to ALL children,
@@ -1333,6 +1337,7 @@ pub(crate) fn exec_alter_one(
                             Vec::new()
                         },
                         fdw_options: fdw_options.clone(),
+                        generated: generated.clone(),
                     };
                     if let Err(e) = exec_alter(eng, ctx, child, std::slice::from_ref(&child_action))
                     {
@@ -3510,6 +3515,8 @@ pub(crate) fn alter_add_column(
     collate: Option<&str>,
     // v2.28: GENERATED ... AS IDENTITY on the new column.
     identity: Option<(bool, crate::sql::SequenceOpts)>,
+    // v2.47: GENERATED ALWAYS AS (expr) STORED|VIRTUAL.
+    generated: Option<(crate::sql::Expr, bool)>,
 ) -> Result<ExecResult, ExecError> {
     alter_add_column_ext(
         eng,
@@ -3530,6 +3537,7 @@ pub(crate) fn alter_add_column(
         collate,
         identity,
         None,
+        generated,
     )
 }
 
@@ -3557,6 +3565,11 @@ pub(crate) fn alter_add_column_ext(
     // name for partition propagation (None = create a fresh one).
     identity: Option<(bool, crate::sql::SequenceOpts)>,
     identity_seq: Option<String>,
+    // v2.47: GENERATED ALWAYS AS (expr) STORED|VIRTUAL on the new
+    // column. Existing rows are backfilled by evaluating the
+    // generation expression (this engine materializes both kinds on
+    // write, so ADD COLUMN is a rewrite like PG's STORED case).
+    generated: Option<(crate::sql::Expr, bool)>,
 ) -> Result<ExecResult, ExecError> {
     let t = eng
         .db
@@ -3621,7 +3634,7 @@ pub(crate) fn alter_add_column_ext(
         .rows
         .iter()
         .any(|r| row_visible(r, ctx.snap, &ctx.all_xids));
-    if not_null && default.is_none() && has_rows && identity.is_none() {
+    if not_null && default.is_none() && has_rows && identity.is_none() && generated.is_none() {
         return Err(exec_err(
             "23502",
             format!("column \"{}\" contains null values", col),
@@ -3648,6 +3661,19 @@ pub(crate) fn alter_add_column_ext(
     // v2.03: keep generated-column metadata parallel to `columns`.
     if next.gen_cols.len() < next.columns.len() {
         next.gen_cols.push(None);
+    }
+    // v2.47: record the new column's generation expression (the
+    // fill loop below evaluates it for existing rows via
+    // compute_generated_columns over `next_meta`).
+    if let Some(g) = &generated {
+        let idx = next.columns.len() - 1;
+        if next.gen_cols.len() <= idx {
+            next.gen_cols.resize(idx + 1, None);
+        }
+        next.gen_cols[idx] = Some(g.clone());
+        // Same expression rules as CREATE TABLE (immutable, own
+        // non-generated columns only).
+        validate_generated_expr_for_add(eng, &next.columns, &next.gen_cols, &g.0)?;
     }
     // v2.28: keep identity metadata parallel to `columns`.
     while next.identity.len() < next.columns.len() - 1 {
@@ -3813,6 +3839,20 @@ pub(crate) fn alter_add_column_ext(
             nv.push(Value::Null);
         }
         nv.push(dv);
+        // v2.47: a generated column's fill is its generation
+        // expression over the row's other columns (both STORED and
+        // VIRTUAL — this engine materializes both on write).
+        if generated.is_some() {
+            compute_generated_columns(
+                eng,
+                ctx.snap,
+                ctx.own,
+                ctx.session,
+                ctx.role,
+                &next_meta,
+                &mut nv,
+            )?;
+        }
         // New CHECK constraints must hold for existing rows.
         check_row_constraints(
             eng,

@@ -1133,6 +1133,8 @@ pub(crate) fn collect_target_srfs(
         | Expr::InSub { .. }
         | Expr::Quantified { .. }
         | Expr::Exists { .. } => {}
+        // v2.47: WHERE CURRENT OF is a leaf for SRF collection.
+        Expr::CurrentOf(_) => {}
         Expr::Func { name, args } if is_srf(eng, name) => {
             if !group_keys.iter().any(|g| g == e) {
                 out.push(SrfSlot {
@@ -1860,6 +1862,11 @@ pub(crate) fn eval_grouped(
         Expr::NamedArg { expr, .. } => eval_grouped(
             q, outer, gscope, schema, rows, idxs, key_vals, group_by, expr,
         ),
+        // v2.47: WHERE CURRENT OF never reaches grouped evaluation.
+        Expr::CurrentOf(_) => Err(exec_err(
+            "0A000",
+            "WHERE CURRENT OF is only valid as the WHERE clause of UPDATE or DELETE".to_string(),
+        )),
         // v2.21: COLLATE evaluates its operand (the derivation rules
         // were enforced by the statement pre-pass); COLLATION FOR
         // yields the operand's collation name.

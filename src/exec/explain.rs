@@ -4979,6 +4979,8 @@ pub(crate) fn vx_expr(
 ) -> Result<(), ExecError> {
     // Subqueries first (their own query levels).
     match e {
+        // v2.47: WHERE CURRENT OF has nothing to validate.
+        Expr::CurrentOf(_) => {}
         Expr::ScalarSub(sub) | Expr::ArraySubquery(sub) => {
             let mut sub_outer: Vec<&[QCol]> = Vec::new();
             sub_outer.extend_from_slice(schemas);
@@ -5075,6 +5077,8 @@ pub(crate) fn vx_expr(
     }
     // Recurse into every child expression / subquery.
     match e {
+        // v2.47: WHERE CURRENT OF is a leaf.
+        Expr::CurrentOf(_) => {}
         Expr::Arith { left, right, .. }
         | Expr::Concat(left, right)
         | Expr::Cmp { left, right, .. }
