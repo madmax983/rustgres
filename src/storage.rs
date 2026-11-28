@@ -162,9 +162,10 @@ pub enum ColType {
     // high corner first, `<(x,y),r>`), parsed and canonicalized at
     // input (assignment coercion / casts) in exec::geometry, exactly
     // like Inet's canonical-text discipline.
-    Point,  // OID 600
-    BoxGeo, // OID 603 (named BoxGeo: `Box` is taken by the prelude)
-    Circle, // OID 718
+    Point,   // OID 600
+    Polygon, // OID 604 (v2.49)
+    BoxGeo,  // OID 603 (named BoxGeo: `Box` is taken by the prelude)
+    Circle,  // OID 718
     // v0.78: PG's array type — carries the element type. Arrays only
     // flow through expression evaluation (like Record/Json); table
     // columns cannot be arrays (no DDL support). Values are carried as
@@ -466,7 +467,9 @@ impl ArrayElem {
             ColType::Oid => ArrayElem::Int,
             ColType::Inet => ArrayElem::Text,
             // v2.44: geometric arrays degrade to the text element kind.
-            ColType::Point | ColType::BoxGeo | ColType::Circle => ArrayElem::Text,
+            ColType::Point | ColType::BoxGeo | ColType::Circle | ColType::Polygon => {
+                ArrayElem::Text
+            }
             ColType::Json => ArrayElem::Json,
             // v1.83: jsonb[] (PG _jsonb, OID 3807) is not supported;
             // array-of-jsonb degrades to the json element kind.
@@ -730,6 +733,7 @@ impl ColType {
             ColType::Jsonb => 3802,    // JSONB (v1.83)
             ColType::Xml => 142,       // XML (v2.42)
             ColType::Point => 600,     // POINT (v2.44)
+            ColType::Polygon => 604,   // POLYGON (v2.49)
             ColType::BoxGeo => 603,    // BOX (v2.44)
             ColType::Circle => 718,    // CIRCLE (v2.44)
             ColType::Jsonpath => 4072, // JSONPATH (v1.85)
@@ -809,6 +813,7 @@ impl ColType {
             ColType::Jsonb => "jsonb",       // v1.83
             ColType::Xml => "xml",           // v2.42
             ColType::Point => "point",       // v2.44
+            ColType::Polygon => "polygon",   // v2.49
             ColType::BoxGeo => "box",        // v2.44
             ColType::Circle => "circle",     // v2.44
             ColType::Jsonpath => "jsonpath", // v1.85
@@ -885,6 +890,7 @@ impl ColType {
             ColType::Point => "point",       // v2.44
             ColType::BoxGeo => "box",        // v2.44
             ColType::Circle => "circle",     // v2.44
+            ColType::Polygon => "polygon",   // v2.49
             ColType::Jsonpath => "jsonpath", // v1.85
             ColType::Range(e) => {
                 return e
@@ -6367,6 +6373,11 @@ pub struct Database {
     /// DDL on them is still statement-atomic via the txn undo log
     /// (`WriteOp::CreateTempTable` / `WriteOp::DropTempTable`).
     pub temp_tables: HashMap<u64, HashMap<String, Table, FxBuildHasher>, FxBuildHasher>,
+    /// v2.49: ON COMMIT actions for temp tables, by session then
+    /// table name: 2 = DELETE ROWS, 3 = DROP (PRESERVE ROWS and no
+    /// clause are not recorded). Temp tables are session-local and
+    /// never WAL-logged, so a side map is the whole state.
+    pub temp_on_commit: HashMap<u64, HashMap<String, u8, FxBuildHasher>, FxBuildHasher>,
     /// v0.87: session-local temporary indexes, keyed by session id then
     /// index name. Like temp tables, these shadow nothing (index names
     /// are session-scoped for temp tables) and are dropped when the
@@ -6954,6 +6965,7 @@ impl Database {
             lo_acls: std::collections::HashMap::default(),
             // v0.22: session-local TEMP tables live here, keyed by session id.
             temp_tables: HashMap::default(),
+            temp_on_commit: HashMap::default(),
             temp_indexes: HashMap::default(),
             temp_schema_sessions: std::collections::HashSet::new(),
             // v0.22: bounded shell-type registry.
@@ -7268,6 +7280,7 @@ impl Database {
     /// `def.table` equals a temp table's name belongs to a same-named
     /// permanent table, and deleting it would corrupt that table.
     pub fn drop_session_temps(&mut self, session: u64) {
+        self.temp_on_commit.remove(&session);
         self.temp_schema_sessions.remove(&session);
         self.temp_tables.remove(&session);
         // v0.87: drop the session's temp indexes too.
@@ -7276,6 +7289,76 @@ impl Database {
         // keyed "pg_temp:<sid>:<name>" in the rule registry).
         let prefix = format!("pg_temp:{}:", session);
         self.rules.retain(|k, _| !k.starts_with(&prefix));
+    }
+
+    /// v2.49: fire this session's temp-table ON COMMIT actions
+    /// (PG19 heap.c CommitSubCommand / PreCommit_on_commit_actions
+    /// semantics, top-level commit only): DELETE ROWS truncates,
+    /// DROP removes the table and its temp indexes.
+    pub fn apply_temp_on_commit(&mut self, session: u64) {
+        let actions: Vec<(String, u8)> = match self.temp_on_commit.get(&session) {
+            Some(m) => m.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            None => return,
+        };
+        for (name, action) in actions {
+            match action {
+                2 => {
+                    if let Some(t) = self
+                        .temp_tables
+                        .get_mut(&session)
+                        .and_then(|m| m.get_mut(&name))
+                    {
+                        t.rows.clear();
+                        t.rebuild_row_index();
+                    }
+                }
+                3 => {
+                    // v2.49: PG drops the whole temp subtree — a
+                    // partitioned/inherited temp table's children go
+                    // with the root at commit (the temp suite's
+                    // temp_parted/temp_inh ON COMMIT DROP pg_class
+                    // probes count the descendants too).
+                    let mut drop_set: Vec<String> = vec![name.clone()];
+                    if let Some(m) = self.temp_tables.get(&session) {
+                        let mut grew = true;
+                        while grew {
+                            grew = false;
+                            for (tname, t) in m.iter() {
+                                if drop_set.contains(tname) {
+                                    continue;
+                                }
+                                let parent_hit = t
+                                    .partition
+                                    .as_ref()
+                                    .and_then(|p| p.parent.as_ref())
+                                    .map(|p| drop_set.iter().any(|d| d == p))
+                                    .unwrap_or(false);
+                                let inherit_hit =
+                                    t.inherits.iter().any(|p| drop_set.iter().any(|d| d == p));
+                                if parent_hit || inherit_hit {
+                                    drop_set.push(tname.clone());
+                                    grew = true;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(m) = self.temp_tables.get_mut(&session) {
+                        for d in &drop_set {
+                            m.remove(d);
+                        }
+                    }
+                    if let Some(m) = self.temp_indexes.get_mut(&session) {
+                        m.retain(|_, ix| !drop_set.contains(&ix.def.table));
+                    }
+                    if let Some(m) = self.temp_on_commit.get_mut(&session) {
+                        for d in &drop_set {
+                            m.remove(d);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// The table version created by `own` (for WAL logging of DDL).

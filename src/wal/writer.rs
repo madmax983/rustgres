@@ -56,7 +56,7 @@ pub(crate) const CHKPT_MAGIC: &[u8; 8] = b"RGSCHK16";
 /// v2.44: version 36 adds the per-index exclusion flag +
 /// exclusion operators to index images. v35 checkpoints are
 /// refused; remove the data directory to start fresh.
-pub(crate) const CHKPT_VERSION: u32 = 36;
+pub(crate) const CHKPT_VERSION: u32 = 37;
 /// WAL file header: magic + base_lsn (u64, big-endian). Every frame's
 /// logical sequence number is base_lsn + (physical offset - HEADER_LEN).
 /// v0.13: `RGSWAL07` — DeleteRows now carries old row values, plus new
@@ -126,7 +126,7 @@ pub(crate) const CHKPT_VERSION: u32 = 36;
 /// the field decodes as false.
 /// v2.12: `RGSWAL31` — CreateFunction records carry `arg_modes`
 /// (trailing list). Older logs still read; modes decode as all-IN.
-pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL38";
+pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL39";
 /// v1.80: the format version number in [`WAL_MAGIC`].
 /// v2.14: version 33 — CreateView records carry view triggers
 /// (trailing string). Older logs still read; triggers decode empty.
@@ -139,7 +139,7 @@ pub(crate) const WAL_MAGIC: &[u8; 8] = b"RGSWAL38";
 /// v2.44: version 38 — CreateIndex records carry the exclusion
 /// flag + per-key exclusion operators (trailing). Older logs still
 /// read; they decode as a plain index.
-pub(crate) const WAL_VERSION: u32 = 38;
+pub(crate) const WAL_VERSION: u32 = 39;
 /// v1.80: oldest WAL format this build can replay.
 pub(crate) const MIN_READABLE_WAL_VERSION: u32 = 20;
 pub(crate) const WAL_HEADER_LEN: u64 = 16;

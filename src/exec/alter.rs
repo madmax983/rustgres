@@ -2829,13 +2829,15 @@ pub(crate) fn exec_alter_one(
             res
         }
         // v2.06: ADD PRIMARY KEY USING INDEX.
-        AlterAction::AddPrimaryKeyUsingIndex { index } => {
-            alter_add_primary_key_using_index(eng, ctx, name, index)
-        }
+        AlterAction::AddPrimaryKeyUsingIndex {
+            index,
+            name: con_name,
+        } => alter_add_primary_key_using_index(eng, ctx, name, index, con_name.as_deref()),
         // v2.07: ADD UNIQUE USING INDEX.
-        AlterAction::AddUniqueUsingIndex { index } => {
-            alter_add_unique_using_index(eng, ctx, name, index)
-        }
+        AlterAction::AddUniqueUsingIndex {
+            index,
+            name: con_name,
+        } => alter_add_unique_using_index(eng, ctx, name, index, con_name.as_deref()),
         // v0.96: table inheritance (PG19).
         AlterAction::Inherit { parent } => alter_inherit(eng, ctx, name, parent, true),
         AlterAction::NoInherit { parent } => alter_inherit(eng, ctx, name, parent, false),
@@ -8766,6 +8768,7 @@ pub(crate) fn alter_add_primary_key_using_index(
     ctx: &mut StmtCtx,
     name: &str,
     index_name: &str,
+    con_name: Option<&str>,
 ) -> Result<ExecResult, ExecError> {
     let t = eng
         .db
@@ -8779,6 +8782,16 @@ pub(crate) fn alter_add_primary_key_using_index(
                 "multiple primary keys for table \"{}\" are not allowed",
                 name
             ),
+        ));
+    }
+    // v2.49: PG19 ATExecAddConstraint — ADD CONSTRAINT USING INDEX
+    // is not supported on partitioned tables (0A000; create_index's
+    // partitioned cwi_test case).
+    if t.partition.as_ref().is_some_and(|p| p.is_partitioned) {
+        return Err(exec_err(
+            "0A000",
+            "ALTER TABLE / ADD CONSTRAINT USING INDEX is not supported on partitioned tables"
+                .to_string(),
         ));
     }
     let def = eng
@@ -8837,26 +8850,25 @@ pub(crate) fn alter_add_primary_key_using_index(
         ));
     }
     check_using_index_sorting(&t, &def)?;
-    if def
-        .cols
-        .iter()
-        .any(|&ci| !t.not_null.get(ci).copied().unwrap_or(false))
-    {
-        // PG19: USING INDEX requires the columns to be NOT NULL
-        // (it does not set them, unlike ADD PRIMARY KEY (cols)).
-        return Err(exec_err(
-            "42809",
-            format!(
-                "columns of index \"{}\" are not marked NOT NULL",
-                index_name
-            ),
-        ));
+    // v2.49: PG19 ATExecAddConstraint over an index constraint
+    // (tablecmds.c, index_check_primary_key via ATAddConstraint's
+    // PK path): adding a PRIMARY KEY marks the index's key columns
+    // NOT NULL — it does not require them to be so already (the
+    // create_index cwi_test section proves it: plain nullable
+    // columns become NOT NULL in \d output). The constraint takes
+    // the index's name unless ADD CONSTRAINT named it, in which
+    // case PG renames the index to the constraint name.
+    let final_name = con_name.unwrap_or(&def.name).to_string();
+    if final_name != def.name {
+        rename_index_internal(eng, ctx, &def.name, &final_name)?;
     }
     let mut next = t.clone();
-    next.pkey = Some(UniqueDef::plain(
-        format!("{}_pkey", base_name(name)),
-        def.col_names.clone(),
-    ));
+    for &ci in def.cols.iter() {
+        if let Some(slot) = next.not_null.get_mut(ci) {
+            *slot = true;
+        }
+    }
+    next.pkey = Some(UniqueDef::plain(final_name, def.col_names.clone()));
     alter_swap(eng, ctx, name, None, next, None)?;
     Ok(ExecResult::Command {
         tag: "ALTER TABLE".to_string(),
@@ -8875,12 +8887,21 @@ pub(crate) fn alter_add_unique_using_index(
     ctx: &mut StmtCtx,
     name: &str,
     index_name: &str,
+    con_name: Option<&str>,
 ) -> Result<ExecResult, ExecError> {
     let t = eng
         .db
         .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
         .ok_or_else(|| exec_err("42P01", format!("relation \"{}\" does not exist", name)))?
         .clone();
+    // v2.49: partitioned-root rejection, as in the PK variant.
+    if t.partition.as_ref().is_some_and(|p| p.is_partitioned) {
+        return Err(exec_err(
+            "0A000",
+            "ALTER TABLE / ADD CONSTRAINT USING INDEX is not supported on partitioned tables"
+                .to_string(),
+        ));
+    }
     let def = eng
         .db
         .visible_indexes_for(name, ctx.snap, &ctx.all_xids, ctx.session)
@@ -8924,25 +8945,30 @@ pub(crate) fn alter_add_unique_using_index(
         ));
     }
     check_using_index_sorting(&t, &def)?;
-    // PG19: the constraint takes the index's name; a name collision
-    // with an existing constraint is 42710.
-    if t.uniques.iter().any(|u| u.name == def.name)
-        || t.pkey.as_ref().is_some_and(|p| p.name == def.name)
-        || t.checks.iter().any(|c| c.name == def.name)
-        || t.fks.iter().any(|f| f.name == def.name)
+    // v2.49: the constraint takes the index's name unless ADD
+    // CONSTRAINT named it (PG then renames the index); a name
+    // collision with an existing constraint is 42710.
+    let final_name = con_name.unwrap_or(&def.name).to_string();
+    if t.uniques.iter().any(|u| u.name == final_name)
+        || t.pkey.as_ref().is_some_and(|p| p.name == final_name)
+        || t.checks.iter().any(|c| c.name == final_name)
+        || t.fks.iter().any(|f| f.name == final_name)
     {
         return Err(exec_err(
             "42710",
             format!(
                 "constraint \"{}\" for relation \"{}\" already exists",
-                def.name, name
+                final_name, name
             ),
         ));
+    }
+    if final_name != def.name {
+        rename_index_internal(eng, ctx, &def.name, &final_name)?;
     }
     let mut next = t.clone();
     // v2.08: the new constraint adopts the index's null treatment
     // (PG19: the constraint's index IS this index).
-    let mut udef = UniqueDef::plain(def.name.clone(), def.col_names.clone());
+    let mut udef = UniqueDef::plain(final_name, def.col_names.clone());
     udef.nulls_not_distinct = def.nulls_not_distinct;
     next.uniques.push(udef);
     alter_swap(eng, ctx, name, None, next, None)?;

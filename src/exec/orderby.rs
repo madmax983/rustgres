@@ -74,6 +74,7 @@ pub(crate) fn apply_order(
             };
             let geo_name = match &qc.ty {
                 ColType::Point => Some("point"),
+                ColType::Polygon => Some("polygon"),
                 ColType::BoxGeo => Some("box"),
                 ColType::Circle => Some("circle"),
                 _ => None,

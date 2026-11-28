@@ -763,7 +763,7 @@ pub(crate) fn parse_param_value(bytes: &[u8], t: &ColType, n: usize) -> Result<V
         }
         // v2.44: geometric parameters validate + canonicalize at
         // bind time (PG input function over the text form).
-        ColType::Point | ColType::BoxGeo | ColType::Circle => {
+        ColType::Point | ColType::BoxGeo | ColType::Circle | ColType::Polygon => {
             let s = std::str::from_utf8(bytes)
                 .map_err(|_| exec_err("22021", "invalid byte sequence for encoding \"UTF8\""))?;
             super::geometry::geo_input(*t, s).map(Value::text)
@@ -1579,6 +1579,7 @@ pub(crate) fn dummy_value(t: &ColType) -> Value {
         ColType::Text => Value::text(""),
         ColType::Xml => Value::xml("<x/>"),            // v2.42
         ColType::Point => Value::text("(0,0)"),        // v2.44
+        ColType::Polygon => Value::text("((0,0))"),    // v2.49
         ColType::BoxGeo => Value::text("(0,0),(0,0)"), // v2.44
         ColType::Circle => Value::text("<(0,0),0>"),   // v2.44
         ColType::Char(_) => Value::bpchar(""),         // v0.35

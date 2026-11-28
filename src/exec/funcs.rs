@@ -8214,6 +8214,7 @@ pub(crate) fn pg_typlen_align(ty: &ColType) -> (i32, usize) {
         ColType::Point => (16, 8),       // point: 16/'d' (v2.44)
         ColType::BoxGeo => (32, 8),      // box: 32/'d' (v2.44)
         ColType::Circle => (24, 8),      // circle: 24/'d' (v2.44)
+        ColType::Polygon => (-1, 4),     // polygon: varlena/'i' (v2.49)
         ColType::Jsonpath => (-1, 4),    // jsonpath: -1/'i' (v1.85)
         ColType::Array(_) => (-1, 4),    // array types: 'i'
         ColType::Date => (4, 4),         // date: 4/'i'
@@ -9540,7 +9541,7 @@ pub(crate) fn eval_func_vals(name: &str, vals: &[Value]) -> Result<Value, ExecEr
         // eval_func_vals measurably slowed every function call
         // (~+60% on a function-heavy join query — codegen cliff in
         // this dispatcher), while a match arm is free.
-        "circle_center" | "center" | "point" | "box" | "circle" => {
+        "circle_center" | "center" | "point" | "box" | "circle" | "polygon" => {
             match super::geometry::try_eval_geo_func(name, &vals) {
                 Some(r) => r,
                 None => Err(exec_err(
@@ -18401,6 +18402,8 @@ pub(crate) fn func_result_type(
         "point" | "circle_center" | "center" => Ok(ColType::Point),
         "box" => Ok(ColType::BoxGeo),
         "circle" => Ok(ColType::Circle),
+        // v2.49: polygon(box) / polygon(circle) constructors.
+        "polygon" => Ok(ColType::Polygon),
         // v2.40: slice assignment returns the base array's type.
         "__array_slice_assign" => match args.first() {
             Some(a) => Ok(super::describe::expr_type(eng, snap, own, session, schemas, outer, ctes, a)

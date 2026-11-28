@@ -223,6 +223,115 @@ pub(crate) fn canonical_circle(s: &str) -> Option<String> {
 
 /// Validate + canonicalize a text input for a geometric column /
 /// cast target (PG's *_in functions). Error text follows geo_ops.c.
+/// v2.49: polygon points from any PG polygon_in surface form —
+/// `((x,y),...)`, `(x,y),(x,y)`, or the flat `x,y,x,y` sequence
+/// (geo_ops.c poly_in accepts all three; the flat form is how the
+/// create_index suite writes its two-point polygons).
+pub(crate) fn parse_polygon(s: &str) -> Option<Vec<(f64, f64)>> {
+    // PG poly_in rejects unbalanced parentheses outright (the
+    // polygon suite's '(0,1,2,3' must be 22P02, not a 2-point
+    // polygon); the number scan below is paren-blind, so gate it.
+    {
+        let t = s.trim();
+        let opens = t.matches('(').count();
+        let closes = t.matches(')').count();
+        if opens != closes || (opens > 0 && !t.ends_with(')')) {
+            return None;
+        }
+    }
+    let mut nums: Vec<f64> = Vec::new();
+    let mut cur = String::new();
+    let mut chars = s.chars().peekable();
+    let flush = |cur: &mut String, nums: &mut Vec<f64>| -> Option<()> {
+        if !cur.is_empty() {
+            nums.push(cur.parse::<f64>().ok()?);
+            cur.clear();
+        }
+        Some(())
+    };
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' {
+            cur.push(c);
+        } else if (c == '-' || c == '+') && (cur.is_empty() || cur.ends_with(['e', 'E'])) {
+            cur.push(c);
+        } else if c == '(' || c == ')' || c == ',' || c.is_whitespace() {
+            flush(&mut cur, &mut nums)?;
+        } else {
+            return None;
+        }
+    }
+    flush(&mut cur, &mut nums)?;
+    if nums.len() < 4 || nums.len() % 2 != 0 {
+        return None;
+    }
+    Some(nums.chunks(2).map(|p| (p[0], p[1])).collect())
+}
+
+pub(crate) fn polygon_to_text(pts: &[(f64, f64)]) -> String {
+    let inner: Vec<String> = pts
+        .iter()
+        .map(|(x, y)| format!("({},{})", geo_f64(*x), geo_f64(*y)))
+        .collect();
+    format!("({})", inner.join(","))
+}
+
+pub(crate) fn canonical_polygon(s: &str) -> Option<String> {
+    parse_polygon(s).map(|pts| polygon_to_text(&pts))
+}
+
+/// The polygon's bounding box (PG stores it as boundbox).
+pub(crate) fn polygon_bbox(pts: &[(f64, f64)]) -> GeoBox {
+    let mut b = GeoBox {
+        hx: f64::NEG_INFINITY,
+        hy: f64::NEG_INFINITY,
+        lx: f64::INFINITY,
+        ly: f64::INFINITY,
+    };
+    for (x, y) in pts {
+        b.hx = b.hx.max(*x);
+        b.hy = b.hy.max(*y);
+        b.lx = b.lx.min(*x);
+        b.ly = b.ly.min(*y);
+    }
+    b
+}
+
+/// PG19 point-in-polygon (geo_ops.c point_inside / poly_contain_pt):
+/// ray casting with PG's exact on-boundary convention (a point on
+/// an edge counts as inside via the lseg on-point tests).
+pub(crate) fn point_in_polygon(pt: (f64, f64), poly: &[(f64, f64)]) -> bool {
+    // Even-odd ray cast to +infinity in x, PG poly_contain_pt style.
+    let (px, py) = pt;
+    let n = poly.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    for i in 0..n {
+        let (x1, y1) = poly[i];
+        let (x2, y2) = poly[(i + 1) % n];
+        // On-segment (collinear and within the edge's bbox) is IN.
+        let cross = (px - x1) * (y2 - y1) - (py - y1) * (x2 - x1);
+        if cross == 0.0
+            && px >= x1.min(x2)
+            && px <= x1.max(x2)
+            && py >= y1.min(y2)
+            && py <= y1.max(y2)
+        {
+            return true;
+        }
+        if (y1 > py) != (y2 > py) {
+            let xint = x1 + (py - y1) * (x2 - x1) / (y2 - y1);
+            if px < xint {
+                inside = !inside;
+            } else if px == xint {
+                return true;
+            }
+        }
+    }
+    inside
+}
+
 pub(crate) fn geo_input(ty: ColType, s: &str) -> Result<String, ExecError> {
     // PG19 float8in: a numeric token that overflows float8 is
     // 22003 ("<tok>" is out of range for type double precision),
@@ -250,6 +359,7 @@ pub(crate) fn geo_input(ty: ColType, s: &str) -> Result<String, ExecError> {
         ColType::Point => ("point", canonical_point(s)),
         ColType::BoxGeo => ("box", canonical_box(s)),
         ColType::Circle => ("circle", canonical_circle(s)),
+        ColType::Polygon => ("polygon", canonical_polygon(s)),
         _ => return Ok(s.to_string()),
     };
     canon.ok_or_else(|| {
@@ -330,6 +440,53 @@ pub(crate) fn try_eval_geo_func(name: &str, vals: &[Value]) -> Option<Result<Val
             };
             Some(Ok(Value::text(box_to_text(&bx))))
         }
+        // v2.49: PG19 polygon(box) (geo_ops.c box_poly): the four
+        // corners in (low,low)-(low,high)-(high,high)-(high,low)
+        // order. Also polygon(polygon) identity via re-canonicalize.
+        "polygon" if vals.len() == 1 => {
+            if matches!(vals[0], Value::Null) {
+                return Some(Ok(Value::Null));
+            }
+            let s = text_of(&vals[0])?;
+            // Box reading only for the two-pair box surface shape;
+            // a flat/nested polygon literal reads as a polygon.
+            let box_shaped =
+                s.matches("),(").count() == 1 && s.starts_with('(') && s.ends_with(')');
+            if box_shaped {
+                if let Some(b) = parse_box(&s) {
+                    let pts = vec![(b.lx, b.ly), (b.lx, b.hy), (b.hx, b.hy), (b.hx, b.ly)];
+                    return Some(Ok(Value::text(polygon_to_text(&pts))));
+                }
+            }
+            Some(match canonical_polygon(&s) {
+                Some(c) => Ok(Value::text(c)),
+                None => Err(geo_input(ColType::Polygon, &s).unwrap_err()),
+            })
+        }
+        // v2.49: PG19 circle(box) (geo_ops.c box_circle): center is
+        // the box center, radius the center-to-corner distance.
+        // (The 1-arg circle form previously fed box text to the
+        // circle input parser and raised 22P02.)
+        "circle" if vals.len() == 1 => {
+            if matches!(vals[0], Value::Null) {
+                return Some(Ok(Value::Null));
+            }
+            let s = text_of(&vals[0])?;
+            let box_shaped =
+                s.matches("),(").count() == 1 && s.starts_with('(') && s.ends_with(')');
+            if box_shaped {
+                if let Some(b) = parse_box(&s) {
+                    let cx = (b.hx + b.lx) / 2.0;
+                    let cy = (b.hy + b.ly) / 2.0;
+                    let r = ((b.hx - cx).powi(2) + (b.hy - cy).powi(2)).sqrt();
+                    return Some(Ok(Value::text(circle_to_text(&GeoCircle { cx, cy, r }))));
+                }
+            }
+            Some(match canonical_circle(&s) {
+                Some(c) => Ok(Value::text(c)),
+                None => Err(geo_input(ColType::Circle, &s).unwrap_err()),
+            })
+        }
         // PG19 circle(point, float8) constructor (geo_ops.c
         // circle_construct): a negative radius is 22023.
         "circle" if vals.len() == 2 => {
@@ -350,6 +507,101 @@ pub(crate) fn try_eval_geo_func(name: &str, vals: &[Value]) -> Option<Result<Val
                 r,
             }))))
         }
+        _ => None,
+    }
+}
+
+/// v2.49: the geometric containment/overlap operators behind the
+/// JsonOp expression node (`<@`, `@>`, `&&`), dispatched on the
+/// operands' STATIC types (values are canonical text for every geo
+/// type, so value-level dispatch cannot see them). `lt`/`rt` are
+/// PG type names; either may be None for an untyped literal, in
+/// which case the pair table infers it from the known side.
+/// Returns None when the (type, op, type) triple is not geometric.
+pub(crate) fn eval_geo_containment(
+    op: crate::sql::JsonOp,
+    lt: Option<&str>,
+    rt: Option<&str>,
+    a: &Value,
+    b: &Value,
+) -> Option<Result<Value, ExecError>> {
+    use crate::sql::JsonOp;
+    let text_of = |v: &Value| -> Option<String> {
+        match v {
+            Value::Text(s) | Value::BpChar(s) => Some(s.to_string()),
+            _ => None,
+        }
+    };
+    if matches!(a, Value::Null) || matches!(b, Value::Null) {
+        // PG: any NULL operand makes the operator NULL — but only
+        // claim the triple if it is geometric at all.
+        let geo = matches!(lt, Some("point" | "box" | "circle" | "polygon"))
+            || matches!(rt, Some("point" | "box" | "circle" | "polygon"));
+        return if geo { Some(Ok(Value::Null)) } else { None };
+    }
+    let (ta, tb) = (text_of(a)?, text_of(b)?);
+    let bool_of = |x: bool| Some(Ok(Value::Bool(x)));
+    match (lt, op, rt) {
+        (Some("point"), JsonOp::ContainedBy, Some("box")) => {
+            let p = parse_point(&ta)?;
+            let bx = parse_box(&tb)?;
+            bool_of(p.0 >= bx.lx && p.0 <= bx.hx && p.1 >= bx.ly && p.1 <= bx.hy)
+        }
+        (Some("box"), JsonOp::Contains, Some("point")) => {
+            let bx = parse_box(&ta)?;
+            let p = parse_point(&tb)?;
+            bool_of(p.0 >= bx.lx && p.0 <= bx.hx && p.1 >= bx.ly && p.1 <= bx.hy)
+        }
+        (Some("point"), JsonOp::ContainedBy, Some("circle")) => {
+            let p = parse_point(&ta)?;
+            let c = parse_circle(&tb)?;
+            bool_of((p.0 - c.cx).powi(2) + (p.1 - c.cy).powi(2) <= c.r * c.r)
+        }
+        (Some("circle"), JsonOp::Contains, Some("point")) => {
+            let c = parse_circle(&ta)?;
+            let p = parse_point(&tb)?;
+            bool_of((p.0 - c.cx).powi(2) + (p.1 - c.cy).powi(2) <= c.r * c.r)
+        }
+        (Some("point"), JsonOp::ContainedBy, Some("polygon")) => {
+            let p = parse_point(&ta)?;
+            let poly = parse_polygon(&tb)?;
+            bool_of(point_in_polygon(p, &poly))
+        }
+        (Some("polygon"), JsonOp::Contains, Some("point")) => {
+            let poly = parse_polygon(&ta)?;
+            let p = parse_point(&tb)?;
+            bool_of(point_in_polygon(p, &poly))
+        }
+        (Some("point"), JsonOp::ContainedBy, None) => {
+            // Untyped right literal against a point: try box, then
+            // circle, then polygon (the shapes are mutually
+            // exclusive enough for the suite's forms).
+            let p = parse_point(&ta)?;
+            if let Some(bx) = parse_box(&tb) {
+                bool_of(p.0 >= bx.lx && p.0 <= bx.hx && p.1 >= bx.ly && p.1 <= bx.hy)
+            } else if let Some(c) = parse_circle(&tb) {
+                bool_of((p.0 - c.cx).powi(2) + (p.1 - c.cy).powi(2) <= c.r * c.r)
+            } else {
+                let poly = parse_polygon(&tb)?;
+                bool_of(point_in_polygon(p, &poly))
+            }
+        }
+        (Some("box"), JsonOp::ContainedBy, Some("box")) => {
+            bool_of(box_contained(&parse_box(&ta)?, &parse_box(&tb)?))
+        }
+        (Some("box"), JsonOp::Contains, Some("box")) => {
+            bool_of(box_contained(&parse_box(&tb)?, &parse_box(&ta)?))
+        }
+        (Some("box"), JsonOp::Overlaps, Some("box")) => {
+            bool_of(boxes_overlap(&parse_box(&ta)?, &parse_box(&tb)?))
+        }
+        (Some("circle"), JsonOp::Overlaps, Some("circle")) => {
+            bool_of(circles_overlap(&parse_circle(&ta)?, &parse_circle(&tb)?))
+        }
+        (Some("polygon"), JsonOp::Overlaps, Some("polygon")) => bool_of(boxes_overlap(
+            &polygon_bbox(&parse_polygon(&ta)?),
+            &polygon_bbox(&parse_polygon(&tb)?),
+        )),
         _ => None,
     }
 }

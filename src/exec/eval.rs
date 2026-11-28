@@ -3187,6 +3187,28 @@ pub(crate) fn eval_expr(q: &mut Q, scopes: &[Scope], e: &Expr) -> Result<Value, 
         Expr::JsonOp { op, left, right } => {
             let va = eval_expr(q, scopes, left)?;
             let vb = eval_expr(q, scopes, right)?;
+            // v2.49: geometric containment/overlap (`<@`, `@>`, `&&`
+            // over point/box/circle/polygon) — the values are all
+            // canonical text, so dispatch on the static types, as
+            // check_cmp_static does for comparisons.
+            if matches!(
+                op,
+                crate::sql::JsonOp::Contains
+                    | crate::sql::JsonOp::ContainedBy
+                    | crate::sql::JsonOp::Overlaps
+            ) {
+                let geo_name = |t: &Option<StaticTy>| match t {
+                    Some(StaticTy::Geo(n)) => Some(*n),
+                    _ => None,
+                };
+                let lt = geo_name(&static_ty(q, scopes, left));
+                let rt = geo_name(&static_ty(q, scopes, right));
+                if lt.is_some() || rt.is_some() {
+                    if let Some(r) = super::geometry::eval_geo_containment(*op, lt, rt, &va, &vb) {
+                        return r;
+                    }
+                }
+            }
             eval_json_op(*op, &va, &vb)
         }
         // v0.79: real array expressions.
@@ -6256,6 +6278,7 @@ pub(crate) fn static_ty(q: &Q, scopes: &[Scope], e: &Expr) -> Option<StaticTy> {
     match e {
         Expr::Cast { to, .. } => match to {
             ColType::Point => Some(StaticTy::Geo("point")),
+            ColType::Polygon => Some(StaticTy::Geo("polygon")),
             ColType::BoxGeo => Some(StaticTy::Geo("box")),
             ColType::Circle => Some(StaticTy::Geo("circle")),
             ColType::Composite => None,
@@ -6263,6 +6286,7 @@ pub(crate) fn static_ty(q: &Q, scopes: &[Scope], e: &Expr) -> Option<StaticTy> {
         },
         Expr::CastNamed { name, .. } => match name.as_str() {
             "point" => Some(StaticTy::Geo("point")),
+            "polygon" => Some(StaticTy::Geo("polygon")),
             "box" => Some(StaticTy::Geo("box")),
             "circle" => Some(StaticTy::Geo("circle")),
             _ => {
@@ -6283,6 +6307,7 @@ pub(crate) fn static_ty(q: &Q, scopes: &[Scope], e: &Expr) -> Option<StaticTy> {
         },
         Expr::Func { name, .. } => match name.as_str() {
             "point" => Some(StaticTy::Geo("point")),
+            "polygon" => Some(StaticTy::Geo("polygon")),
             "box" => Some(StaticTy::Geo("box")),
             "circle" => Some(StaticTy::Geo("circle")),
             "circle_center" | "center" => Some(StaticTy::Geo("point")),
@@ -6299,6 +6324,7 @@ pub(crate) fn static_ty(q: &Q, scopes: &[Scope], e: &Expr) -> Option<StaticTy> {
             })?;
             match &qc.ty {
                 ColType::Point => Some(StaticTy::Geo("point")),
+                ColType::Polygon => Some(StaticTy::Geo("polygon")),
                 ColType::BoxGeo => Some(StaticTy::Geo("box")),
                 ColType::Circle => Some(StaticTy::Geo("circle")),
                 ColType::Composite => {
@@ -6356,6 +6382,11 @@ pub(crate) fn composite_blocker(
     for (ct, nested) in fields {
         match ct {
             ColType::Point => return Some("point"),
+            ColType::Polygon => {
+                if !eq {
+                    return Some("polygon");
+                }
+            }
             ColType::Circle => return Some("circle"),
             ColType::BoxGeo => {
                 if !eq {
@@ -6469,7 +6500,9 @@ pub(crate) fn check_cmp_static(
                 || ln == "circle"
                 || rn == "circle"
                 || (ln == "box" && rn == "box" && !eq)
-                || ((ln == "box") != (rn == "box"));
+                || ((ln == "box") != (rn == "box"))
+                || (ln == "polygon" && rn == "polygon" && !eq)
+                || ((ln == "polygon") != (rn == "polygon"));
             if blocked {
                 return Err(exec_err(
                     "42883",

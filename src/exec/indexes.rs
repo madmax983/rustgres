@@ -1160,7 +1160,10 @@ pub(crate) fn excl_op_holds(
     // Geometric family (values are canonical text; elem_ty picks
     // the reading).
     if let Some(ty) = elem_ty {
-        if matches!(ty, ColType::Circle | ColType::BoxGeo | ColType::Point) {
+        if matches!(
+            ty,
+            ColType::Circle | ColType::BoxGeo | ColType::Point | ColType::Polygon
+        ) {
             let (Value::Text(ta), Value::Text(tb)) = (a, b) else {
                 return Ok(false);
             };
@@ -1186,6 +1189,20 @@ pub(crate) fn excl_op_holds(
                     let bb = super::geometry::parse_box(tb);
                     return Ok(match (ba, bb) {
                         (Some(x), Some(y)) => super::geometry::box_contained(&x, &y),
+                        _ => false,
+                    });
+                }
+                (ColType::Polygon, "&&") => {
+                    // PG polygon && is exact; the boundbox test is
+                    // the gist-consistent approximation this engine
+                    // uses for catalog-only gist semantics.
+                    let pa = super::geometry::parse_polygon(ta);
+                    let pb = super::geometry::parse_polygon(tb);
+                    return Ok(match (pa, pb) {
+                        (Some(x), Some(y)) => super::geometry::boxes_overlap(
+                            &super::geometry::polygon_bbox(&x),
+                            &super::geometry::polygon_bbox(&y),
+                        ),
                         _ => false,
                     });
                 }
@@ -2237,12 +2254,12 @@ pub(crate) fn exec_create_index(
                             format!("column \"{}\" of relation \"{}\" does not exist", n, table),
                         )
                     })?;
-                    if seen.contains(&pos) {
-                        return Err(exec_err(
-                            "42701",
-                            format!("column \"{}\" specified more than once", n),
-                        ));
-                    }
+                    // v2.49: PG19 ComputeIndexAttrs has no
+                    // duplicate-column check for CREATE INDEX — a
+                    // column may appear twice with different
+                    // opclasses (create_index dupindexcols: (f1, id,
+                    // f1 text_pattern_ops)); the 42701 check that
+                    // used to live here was invented, not PG's.
                     seen.push(pos);
                     cols.push(pos);
                     col_names.push(n.clone());
@@ -2984,6 +3001,35 @@ pub(crate) fn exec_drop_index(
                 "42P01",
                 format!("index \"{}\" does not exist", name),
             ));
+        }
+        // v2.49: an index backing a PRIMARY KEY / UNIQUE constraint
+        // (the USING INDEX linkage: constraint and index share the
+        // name in this engine) cannot be dropped directly — PG19
+        // reports the dependency (2BP01) with a drop-the-constraint
+        // hint (create_index cwi_test: DROP INDEX cwi_replaced_pkey).
+        if let Some(f) = &found {
+            let tbl = eng
+                .db
+                .find_table(&f.def.table, ctx.snap, &ctx.all_xids, ctx.session)
+                .cloned();
+            if let Some(t) = tbl {
+                let backs = t.pkey.as_ref().is_some_and(|p| p.name == *name)
+                    || t.uniques.iter().any(|u| u.name == *name);
+                if backs {
+                    let mut e = exec_err(
+                        "2BP01",
+                        format!(
+                            "cannot drop index {} because constraint {} on table {} requires it",
+                            name, name, f.def.table
+                        ),
+                    );
+                    e.hint = Some(format!(
+                        "You can drop constraint {} on table {} instead.",
+                        name, f.def.table
+                    ));
+                    return Err(e);
+                }
+            }
         }
         // v2.29: a physical child index cannot be dropped directly
         // (PG19 dependency check, 2BP01); drop its parent instead.

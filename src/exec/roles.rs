@@ -1866,7 +1866,15 @@ pub(crate) fn exec_grant_revoke(
         // USAGE/CREATE are not enforced per-schema).
         GrantObject::Schema(snames) => {
             for sname in snames {
-                if !eng.db.schemas.iter().any(|s| s == sname) {
+                // v2.49: the built-in schemas exist in PG19 whether
+                // or not CREATE SCHEMA ever recorded them (pg_toast
+                // oid 99, pg_catalog 11, information_schema) —
+                // GRANT USAGE ON SCHEMA pg_toast must not 3F000.
+                if !matches!(
+                    sname.as_str(),
+                    "pg_catalog" | "pg_toast" | "information_schema"
+                ) && !eng.db.schemas.iter().any(|s| s == sname)
+                {
                     return Err(exec_err(
                         "3F000",
                         format!("schema \"{}\" does not exist", sname),
@@ -3735,6 +3743,20 @@ pub(crate) fn exec_cluster(
                 return Err(exec_err(
                     "0A000",
                     format!("cannot cluster on partial index \"{}\"", ix),
+                ));
+            }
+            // v2.49: PG19 repack.c check_clusterable — only btree
+            // indexes are clusterable; a non-btree (gist/hash/...)
+            // index is catalog-only here (def.gist) and errors 0A000
+            // (the cluster suite's CLUSTER ... USING clstr_hash_idx
+            // case, unmasked when hash indexes became creatable).
+            if idef.gist {
+                return Err(exec_err(
+                    "0A000",
+                    format!(
+                        "cannot cluster on index \"{}\" because access method does not support clustering",
+                        ix
+                    ),
                 ));
             }
             // v2.29: PG19 repack.c — an invalid index (a partitioned

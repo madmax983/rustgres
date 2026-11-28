@@ -5013,13 +5013,14 @@ fn resolve_ctas_execute(
     session: &mut Session,
     stmt: &Stmt,
 ) -> Result<Stmt, ExecError> {
-    let (name, col_aliases, temp, if_not_exists, with_data, pname, args) = match stmt {
+    let (name, col_aliases, temp, if_not_exists, with_data, on_commit, pname, args) = match stmt {
         Stmt::CreateTableAs {
             name,
             col_aliases,
             temp,
             if_not_exists,
             with_data,
+            on_commit,
             execute: Some((pname, args)),
             ..
         } => (
@@ -5028,6 +5029,7 @@ fn resolve_ctas_execute(
             *temp,
             *if_not_exists,
             *with_data,
+            *on_commit,
             pname.clone(),
             args.clone(),
         ),
@@ -5042,6 +5044,7 @@ fn resolve_ctas_execute(
             temp,
             if_not_exists,
             with_data,
+            on_commit,
             execute: None,
         }),
         _ => Err(ExecError {
@@ -6160,6 +6163,10 @@ fn commit_taken_txn(
     exec::pgstat_commit(&mut guard, session.sid, t.xid);
     retire_txn_family_sid(&mut guard, &t, session.sid);
     auto_vacuum(&mut guard, &t.writes);
+    // v2.49: temp-table ON COMMIT actions fire at top-level commit
+    // (PG19 PreCommit_on_commit_actions), after the commit itself
+    // is durable and the xid retired.
+    guard.db.apply_temp_on_commit(session.sid);
     drop(guard);
     // v0.16: plain cursors die at COMMIT; WITH HOLD cursors survive.
     session.cursors.retain(|_, c| c.with_hold);

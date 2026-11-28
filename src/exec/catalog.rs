@@ -40,6 +40,12 @@ pub(crate) fn pg_class_schema() -> Vec<QCol> {
         ("reltuples", ColType::Float4),
         ("relallvisible", ColType::Int),
         ("relallfrozen", ColType::Int),
+        // v2.49: relfilenode (appended; PG19 pg_class) — the
+        // create_index reindex_before/after CTAS family selects it.
+        // Value: the relation's OID (this engine has no separate
+        // filenode numbering; REINDEX generation changes are not
+        // modeled, so before/after comparisons see it unchanged).
+        ("relfilenode", ColType::Int),
     ]
     .into_iter()
     .map(|(n, ty)| QCol {
@@ -165,6 +171,7 @@ pub(crate) fn pg_class_scan(
             Value::Int(2),
         ];
         cells.extend(rel_stats_cells(db, name, kind_byte));
+        cells.push(Value::Int(t.oid as i64));
         rows.push(QRow {
             cells: Row::new(cells),
             prov: Vec::new(),
@@ -190,6 +197,7 @@ pub(crate) fn pg_class_scan(
                 Value::Int(2),
             ];
             cells.extend(rel_stats_cells(db, name, b'r'));
+            cells.push(Value::Int(t.oid as i64));
             rows.push(QRow {
                 cells: Row::new(cells),
                 prov: Vec::new(),
@@ -229,6 +237,7 @@ pub(crate) fn pg_class_scan(
                 }),
             ];
             cells.extend(rel_stats_cells(db, &d.name, kind_byte));
+            cells.push(Value::Int(oids.get(&d.name).copied().unwrap_or(0)));
             rows.push(QRow {
                 cells: Row::new(cells),
                 prov: Vec::new(),
@@ -265,6 +274,7 @@ pub(crate) fn pg_class_scan(
                 Value::Int(2),
             ];
             cells.extend(rel_stats_cells(db, cname, b'r'));
+            cells.push(Value::Int(coid));
             rows.push(QRow {
                 cells: Row::new(cells),
                 prov: Vec::new(),
@@ -291,6 +301,7 @@ pub(crate) fn pg_class_scan(
             Value::Int(2),
         ];
         cells.extend(rel_stats_cells(db, "pg_class", b'r'));
+        cells.push(Value::Int(1259));
         rows.push(QRow {
             cells: Row::new(cells),
             prov: Vec::new(),

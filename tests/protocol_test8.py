@@ -321,8 +321,14 @@ def t_ddl_basics():
         _, _, codes = c.q("CREATE INDEX idx_x ON t(nope)")
         check("index on missing column -> 42703", codes == ["42703"], f"{codes}")
 
-        _, _, codes = c.q("CREATE INDEX idx_x ON t(a, a)")
-        check("duplicate column -> 42701", codes == ["42701"], f"{codes}")
+        # v2.49 correction: PG19 has no duplicate-column error for
+        # CREATE INDEX (ComputeIndexAttrs does not check; the
+        # create_index suite's dupindexcols index is (f1, id, f1
+        # text_pattern_ops)). The old 42701 expectation encoded an
+        # invented rule.
+        tags, _, codes = c.q("CREATE INDEX idx_x ON t(a, a)")
+        check("duplicate column accepted (PG19)", tags == ["CREATE INDEX"] and codes == [], f"{tags} {codes}")
+        c.q("DROP INDEX idx_x")
 
         tags, _, codes = c.q("CREATE UNIQUE INDEX uq_a ON t(a)")
         check("create unique index", tags == ["CREATE INDEX"] and codes == [], f"{tags} {codes}")

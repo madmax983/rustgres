@@ -280,7 +280,10 @@ pub(crate) fn coerce_value(
     // v2.44: geometric columns carry canonical text; a text input
     // validates + canonicalizes through the type's input function
     // (PG assignment cast via the input function).
-    if matches!(col_type, ColType::Point | ColType::BoxGeo | ColType::Circle) {
+    if matches!(
+        col_type,
+        ColType::Point | ColType::BoxGeo | ColType::Circle | ColType::Polygon
+    ) {
         return match &v {
             Value::Text(s) | Value::BpChar(s) => {
                 super::geometry::geo_input(*col_type, s).map(Value::text)
@@ -1937,12 +1940,19 @@ pub(crate) fn exec_create_table_as(
     // v1.96: USAGE on cast targets in the query (PG19 parse-time).
     check_select_cast_usages(eng, ctx, select)?;
     // Existence check first, like CREATE TABLE (42P07).
-    if eng
-        .db
-        .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
-        .is_some()
-        || eng.db.find_view(name, ctx.snap, ctx.own).is_some()
-    {
+    // v2.49: a TEMP CTAS checks only the temp namespace — PG temp
+    // tables shadow permanent ones, so CREATE TEMP TABLE point_tbl
+    // AS SELECT * FROM public.point_tbl is legal even though a
+    // permanent point_tbl exists (create_index geometry section).
+    let exists = if temp {
+        eng.db.is_temp_table(ctx.session, name)
+    } else {
+        eng.db
+            .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+            .is_some()
+            || eng.db.find_view(name, ctx.snap, ctx.own).is_some()
+    };
+    if exists {
         if if_not_exists {
             // PG: NOTICE "relation already exists, skipping", tag SELECT 0.
             return Ok(ExecResult::Command {
@@ -5291,8 +5301,17 @@ pub(crate) fn exec_update(
                 // instead (same idiom as storage.rs's per-table index
                 // scans) so this hook's cost depends on the updated
                 // table's own index count, not the schema's.
+                // v2.49: only indexes the engine actually builds
+                // and maintains (planner_usable btrees) can block a
+                // HOT update. Catalog-only indexes (brin/gist/gin/
+                // hash/spgist) never receive entries here, so they
+                // cannot block HOT — PG agrees for BRIN, its
+                // summarizing index (the stats suite's brin_hot
+                // case: CREATE INDEX ... USING brin must not stop
+                // pg_stat_get_tuples_hot_updated from counting).
                 for ix in eng.db.indexes.values() {
                     if ix.def.table == table
+                        && ix.def.planner_usable
                         && crate::storage::index_visible(&ix.def, ctx.snap, &[ctx.own])
                     {
                         indexed.extend(ix.def.col_names.iter().cloned());
@@ -5300,7 +5319,7 @@ pub(crate) fn exec_update(
                 }
                 if let Some(tm) = eng.db.temp_indexes.get(&ctx.session) {
                     for ix in tm.values() {
-                        if ix.def.table == table {
+                        if ix.def.table == table && ix.def.planner_usable {
                             indexed.extend(ix.def.col_names.iter().cloned());
                         }
                     }

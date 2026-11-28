@@ -148,7 +148,32 @@ pub(crate) fn execute_inner(
             "XX000",
             "internal error: PREPARE/EXECUTE/DEALLOCATE reached the executor",
         )),
-        Stmt::CreateTable { name, def, temp } => exec_create(eng, ctx, name, def, *temp),
+        Stmt::CreateTable {
+            name,
+            def,
+            temp,
+            on_commit,
+        } => {
+            // v2.49: PG19 DefineRelation (tablecmds.c) — 42P16 when
+            // ON COMMIT is given for a non-temp table.
+            if *on_commit != 0 && !*temp {
+                return Err(exec_err(
+                    "42P16",
+                    "ON COMMIT can only be used on temporary tables".to_string(),
+                ));
+            }
+            let r = exec_create(eng, ctx, name, def, *temp);
+            // v2.49: record the temp table's ON COMMIT action
+            // (DELETE ROWS / DROP) for the commit hook in server.rs.
+            if r.is_ok() && *temp && *on_commit >= 2 {
+                eng.db
+                    .temp_on_commit
+                    .entry(ctx.session)
+                    .or_default()
+                    .insert(name.clone(), *on_commit);
+            }
+            r
+        }
         // v0.48: CREATE TABLE ... AS <query>.
         Stmt::CreateTableAs {
             name,
@@ -157,6 +182,7 @@ pub(crate) fn execute_inner(
             temp,
             if_not_exists,
             with_data,
+            on_commit,
             execute,
         } => {
             // v1.99: server.rs resolves AS EXECUTE before dispatch; an
@@ -167,7 +193,14 @@ pub(crate) fn execute_inner(
                     "prepared statement for CREATE TABLE AS EXECUTE was not resolved".to_string(),
                 ));
             }
-            exec_create_table_as(
+            // v2.49: same 42P16 guard for CTAS.
+            if *on_commit != 0 && !*temp {
+                return Err(exec_err(
+                    "42P16",
+                    "ON COMMIT can only be used on temporary tables".to_string(),
+                ));
+            }
+            let r = exec_create_table_as(
                 eng,
                 ctx,
                 name,
@@ -176,7 +209,16 @@ pub(crate) fn execute_inner(
                 *temp,
                 *if_not_exists,
                 *with_data,
-            )
+            );
+            // v2.49: ON COMMIT action for a temp CTAS, as above.
+            if r.is_ok() && *temp && *on_commit >= 2 {
+                eng.db
+                    .temp_on_commit
+                    .entry(ctx.session)
+                    .or_default()
+                    .insert(name.clone(), *on_commit);
+            }
+            r
         }
         Stmt::Insert {
             table,

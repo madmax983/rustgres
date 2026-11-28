@@ -5255,10 +5255,13 @@ fn v088_drop_index_multi_name() {
     run(&mut eng, "CREATE TABLE t88d (a int)").unwrap();
     // v0.89: `USING btree` is accepted (and ignored — rustgres only
     // implements btree); any other access method is 0A000.
+    // v2.49 correction: that rule was invented — PG19 supports hash
+    // indexes (create_index creates them on tenk1), so USING hash is
+    // accepted as a catalog-only index like gin/gist.
     run(&mut eng, "CREATE UNIQUE INDEX u88 ON t88d USING btree (a)").unwrap();
     assert!(eng.db.indexes["u88"].def.planner_usable);
-    let err = run(&mut eng, "CREATE INDEX u88h ON t88d USING hash (a)").unwrap_err();
-    assert_eq!(err.code, "0A000");
+    run(&mut eng, "CREATE INDEX u88h ON t88d USING hash (a)").unwrap();
+    assert!(!eng.db.indexes["u88h"].def.planner_usable);
     run(&mut eng, "CREATE INDEX d1 ON t88d (a)").unwrap();
     run(&mut eng, "CREATE INDEX d2 ON t88d (a)").unwrap();
     run(&mut eng, "DROP INDEX d1, d2").unwrap();

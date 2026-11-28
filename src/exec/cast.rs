@@ -2209,12 +2209,39 @@ pub(crate) fn eval_cast(v: &Value, to: ColType) -> Result<Value, ExecError> {
     match to {
         // v2.44: casts to the geometric types validate + canonicalize
         // the source's text form (PG *_in over the cast input).
-        ColType::Point | ColType::BoxGeo | ColType::Circle => match v {
+        ColType::Point | ColType::BoxGeo | ColType::Circle | ColType::Polygon => match v {
             Value::Null => Ok(Value::Null),
             _ => {
                 let t = text_value_of(&[v]);
                 match t {
                     Value::Text(s) | Value::BpChar(s) => {
+                        // v2.49: PG has real casts box -> polygon
+                        // (box_poly) and box -> circle (box_circle);
+                        // a single-argument circle(box)/polygon(box)
+                        // function call may arrive here as a cast.
+                        // The box reading requires the box surface
+                        // shape — two parenthesized point pairs —
+                        // so a flat polygon literal ('(1000,0,0,
+                        // 1000)') still reads as a polygon.
+                        let box_shaped =
+                            s.matches("),(").count() == 1 && s.starts_with('(') && s.ends_with(')');
+                        if to == ColType::Polygon && box_shaped {
+                            if let Some(b) = super::geometry::parse_box(&s) {
+                                let pts =
+                                    vec![(b.lx, b.ly), (b.lx, b.hy), (b.hx, b.hy), (b.hx, b.ly)];
+                                return Ok(Value::text(super::geometry::polygon_to_text(&pts)));
+                            }
+                        }
+                        if to == ColType::Circle && box_shaped {
+                            if let Some(b) = super::geometry::parse_box(&s) {
+                                let cx = (b.hx + b.lx) / 2.0;
+                                let cy = (b.hy + b.ly) / 2.0;
+                                let r = ((b.hx - cx).powi(2) + (b.hy - cy).powi(2)).sqrt();
+                                return Ok(Value::text(super::geometry::circle_to_text(
+                                    &super::geometry::GeoCircle { cx, cy, r },
+                                )));
+                            }
+                        }
                         super::geometry::geo_input(to, &s).map(Value::text)
                     }
                     _ => Err(cast_err(v, &to.sql_name())),

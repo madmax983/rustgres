@@ -527,6 +527,7 @@ impl Parser {
                         temp,
                         if_not_exists: false,
                         with_data: true,
+                        on_commit: 0,
                         execute: None,
                     });
                 }
@@ -1622,6 +1623,7 @@ impl Parser {
             "oid" => Ok(ColType::Oid),                   // v2.15
             "inet" => Ok(ColType::Inet),                 // v2.15
             "point" => Ok(ColType::Point),               // v2.44
+            "polygon" => Ok(ColType::Polygon),           // v2.49
             "box" => Ok(ColType::BoxGeo),                // v2.44
             "circle" => Ok(ColType::Circle),             // v2.44
             // v2.13: PG's internal array type names (`_int4` is the
@@ -1782,6 +1784,7 @@ impl Parser {
                 | "point" // v2.44
                 | "box" // v2.44
                 | "circle" // v2.44
+                | "polygon" // v2.49
                 | "int4range" // v1.88
                 | "int8range"
                 | "numrange"
@@ -2041,13 +2044,22 @@ impl Parser {
             if self.eat_keyword("using") {
                 let method = self.expect_ident()?;
                 method_name = method.clone();
-                if method == "gist" || method == "gin" || method == "spgist" {
+                if method == "gist"
+                    || method == "gin"
+                    || method == "spgist"
+                    || method == "hash"
+                    || method == "brin"
+                {
                     // v2.31: GiST indexes are catalog-only here
                     // (they back WITHOUT OVERLAPS rendering and the
                     // USING INDEX rejection paths).
                     // v2.38: GIN likewise catalog-only (jsonb/tsvector
                     // containment indexes; scans stay sequential and
                     // return identical rows).
+                    // v2.49: hash and brin likewise catalog-only —
+                    // PG19 supports both (create_index creates hash
+                    // indexes on tenk1/unlogged tables); scans stay
+                    // sequential and return identical rows.
                     gist = true;
                 } else if method != "btree" {
                     return Err(SqlError {
@@ -2166,6 +2178,88 @@ impl Parser {
             // sits after the column list (and INCLUDE), before
             // reloptions/WHERE.
             let nulls_not_distinct = self.parse_nulls_not_distinct()?;
+            // v2.49: gram.y IndexStmt — opt_reloptions
+            // `WITH (name [= value], ...)` sits between the key
+            // list and the WHERE clause (fillfactor, FASTUPDATE,
+            // GIN_PENDING_LIST_LIMIT, ...). Storage parameters are
+            // not modeled (indexes are catalog/planner structures
+            // here), so the list is parsed and discarded; unknown
+            // parameter names keep the generic path.
+            if self.eat_keyword("with") {
+                self.expect(Token::LParen, "'('")?;
+                loop {
+                    let pname = self.expect_ident()?;
+                    let mut pval: Option<String> = None;
+                    if matches!(self.peek(), Token::Eq) {
+                        self.next();
+                        match self.next() {
+                            Token::Str(v) | Token::Number(v) | Token::Ident(v) => {
+                                pval = Some(v);
+                            }
+                            Token::Minus => match self.next() {
+                                Token::Number(v) => {
+                                    pval = Some(format!("-{v}"));
+                                }
+                                other => {
+                                    return Err(err(format!(
+                                        "syntax error: expected reloption value, found {:?}",
+                                        other
+                                    )));
+                                }
+                            },
+                            other => {
+                                return Err(err(format!(
+                                    "syntax error: expected reloption value, found {:?}",
+                                    other
+                                )));
+                            }
+                        }
+                    }
+                    // v2.49: PG validates the well-known index
+                    // reloptions (reloptions.c — 22023 out-of-bounds /
+                    // invalid values); the hash/gist/spgist suites'
+                    // fillfactor=9 and buffering=invalid_value cases
+                    // depend on it. Unknown names keep the generic
+                    // parse-and-discard path.
+                    if let Some(v) = &pval {
+                        let pl = pname.to_ascii_lowercase();
+                        if pl == "fillfactor" {
+                            let n: i64 = v.parse().unwrap_or(-1);
+                            if !(10..=100).contains(&n) {
+                                return Err(SqlError {
+                                    message: format!(
+                                        "value {v} out of bounds for option \"fillfactor\""
+                                    ),
+                                    code: "22023",
+                                });
+                            }
+                        } else if pl == "buffering" {
+                            let vl = v.to_ascii_lowercase();
+                            if !matches!(
+                                vl.as_str(),
+                                "on" | "off" | "auto" | "true" | "false" | "yes" | "no" | "1" | "0"
+                            ) {
+                                return Err(SqlError {
+                                    message: format!(
+                                        "invalid value for option \"buffering\": \"{v}\""
+                                    ),
+                                    code: "22023",
+                                });
+                            }
+                        }
+                    }
+                    match self.next() {
+                        Token::Comma => continue,
+                        Token::RParen => break,
+                        other => {
+                            return Err(err(format!(
+                                "syntax error: expected ',' or ')' in reloptions, found {:?}",
+                                other
+                            )));
+                        }
+                    }
+                }
+            }
             // v0.88: partial index predicate.
             let predicate = if self.eat_keyword("where") {
                 let start = self.pos;
@@ -2463,7 +2557,13 @@ impl Parser {
             def.of_type = Some(base);
             def.typed_elements = typed_elements;
             def.unlogged = unlogged;
-            return Ok(Stmt::CreateTable { name, def, temp });
+            let on_commit = self.parse_on_commit_opt()?;
+            return Ok(Stmt::CreateTable {
+                name,
+                def,
+                temp,
+                on_commit,
+            });
         }
         // v0.48: `CREATE TABLE name AS <query>` (CTAS) versus the
         // column-definition list. A parenthesized group after the name
@@ -2564,12 +2664,44 @@ impl Parser {
                 });
             }
         }
-        Ok(Stmt::CreateTable { name, def, temp })
+        {
+            let on_commit = self.parse_on_commit_opt()?;
+            Ok(Stmt::CreateTable {
+                name,
+                def,
+                temp,
+                on_commit,
+            })
+        }
     }
 
     /// v0.69: `CREATE TABLE name PARTITION OF parent FOR VALUES ...`
     /// (no column list). Called from `parse_create` when `PARTITION`
     /// follows the table name.
+    /// v2.49: PG19 CreateStmt trailing `ON COMMIT {PRESERVE ROWS |
+    /// DELETE ROWS | DROP}` (also valid on CREATE TABLE AS). Returns
+    /// 0 = absent, 1 = PRESERVE ROWS, 2 = DELETE ROWS, 3 = DROP.
+    pub(crate) fn parse_on_commit_opt(&mut self) -> Result<u8, SqlError> {
+        if !self.eat_keyword("on") {
+            return Ok(0);
+        }
+        self.expect_keyword("commit")?;
+        if self.eat_keyword("preserve") {
+            self.expect_keyword("rows")?;
+            Ok(1)
+        } else if self.eat_keyword("delete") {
+            self.expect_keyword("rows")?;
+            Ok(2)
+        } else if self.eat_keyword("drop") {
+            Ok(3)
+        } else {
+            Err(err(
+                "syntax error: expected PRESERVE ROWS, DELETE ROWS or DROP after ON COMMIT"
+                    .to_string(),
+            ))
+        }
+    }
+
     pub(crate) fn parse_create_partition_of(
         &mut self,
         name: String,
@@ -2654,7 +2786,15 @@ impl Parser {
             partition_overrides: overrides,
             typed_elements: Vec::new(),
         };
-        Ok(Stmt::CreateTable { name, def, temp })
+        {
+            let on_commit = self.parse_on_commit_opt()?;
+            Ok(Stmt::CreateTable {
+                name,
+                def,
+                temp,
+                on_commit,
+            })
+        }
     }
 
     /// v2.26: `( TypedTableElement [, ...] )` after `PARTITION OF
@@ -2821,6 +2961,7 @@ impl Parser {
                 temp,
                 if_not_exists,
                 with_data,
+                on_commit: 0,
                 execute: Some((pname, args)),
             });
         }
@@ -2864,6 +3005,7 @@ impl Parser {
         } else {
             true
         };
+        let on_commit = self.parse_on_commit_opt()?;
         Ok(Stmt::CreateTableAs {
             name,
             col_aliases,
@@ -2871,6 +3013,7 @@ impl Parser {
             temp,
             if_not_exists,
             with_data,
+            on_commit,
             execute: None,
         })
     }
@@ -5117,11 +5260,11 @@ impl Parser {
     /// FOREIGN KEY ...` (table-constraint form).
     pub(crate) fn parse_alter_add_constraint(&mut self) -> Result<AlterAction, SqlError> {
         match self.parse_table_constraint()? {
-            ParsedTableCon::PKeyUsingIndex(_name, idx) => {
-                Ok(AlterAction::AddPrimaryKeyUsingIndex { index: idx })
+            ParsedTableCon::PKeyUsingIndex(name, idx) => {
+                Ok(AlterAction::AddPrimaryKeyUsingIndex { index: idx, name })
             }
-            ParsedTableCon::UniqueUsingIndex(_name, idx) => {
-                Ok(AlterAction::AddUniqueUsingIndex { index: idx })
+            ParsedTableCon::UniqueUsingIndex(name, idx) => {
+                Ok(AlterAction::AddUniqueUsingIndex { index: idx, name })
             }
             ParsedTableCon::PKey(name, cols, df, idf, inc, wo) => Ok(AlterAction::AddConstraint {
                 pkey: Some(UniqueDef {
@@ -11242,13 +11385,82 @@ impl Parser {
                 name = self.expect_ident()?;
             }
             if matches!(self.peek(), Token::LParen) {
-                // Operator-class parameters: no operator class in
-                // this engine defines an options procedure, so PG19's
-                // verdict applies universally (indexam.c): 22023.
-                return Err(SqlError {
-                    message: format!("operator class {} has no options", name),
-                    code: "22023",
-                });
+                // v2.49: PG19 gist tsvector_ops DOES define an
+                // options procedure (gist_ts_ops siglen, gtsvector
+                // options in ts gist code): `(siglen='1000')` is
+                // accepted there. Consume name=value pairs for that
+                // one class; every other class keeps PG19's
+                // indexam.c verdict (22023, no options procedure).
+                if name == "tsvector_ops" {
+                    self.next(); // '('
+                    let mut siglen_seen = false;
+                    loop {
+                        let pname = self.expect_ident()?;
+                        // PG19 gist_ts options know exactly one
+                        // parameter; anything else is 22023 (the
+                        // tsearch suite's tsvector_ops(foo=1) case).
+                        if pname != "siglen" {
+                            return Err(SqlError {
+                                message: format!(
+                                    "operator class tsvector_ops has no option \"{pname}\""
+                                ),
+                                code: "22023",
+                            });
+                        }
+                        if matches!(self.next(), Token::Eq) {
+                            match self.next() {
+                                Token::Str(v) | Token::Number(v) | Token::Ident(v) => {
+                                    // PG19 tsgistidx.c registers siglen
+                                    // as a local int reloption, range
+                                    // 1..2024 (SIGLEN_MAX per the
+                                    // suite's expected DETAIL text) —
+                                    // siglen=0 and siglen=2048 are both
+                                    // 22023; a repeated siglen is
+                                    // "specified more than once".
+                                    if siglen_seen {
+                                        return Err(SqlError {
+                                            message:
+                                                "parameter \"siglen\" specified more than once"
+                                                    .to_string(),
+                                            code: "22023",
+                                        });
+                                    }
+                                    siglen_seen = true;
+                                    let n: i64 = v.parse().unwrap_or(-1);
+                                    if !(1..=2024).contains(&n) {
+                                        return Err(SqlError {
+                                            message: format!(
+                                                "value {v} out of bounds for option \"siglen\""
+                                            ),
+                                            code: "22023",
+                                        });
+                                    }
+                                }
+                                other => {
+                                    return Err(err(format!(
+                                        "syntax error: expected opclass option value, found {:?}",
+                                        other
+                                    )));
+                                }
+                            }
+                        }
+                        match self.next() {
+                            Token::Comma => continue,
+                            Token::RParen => break,
+                            other => {
+                                return Err(err(format!(
+                                    "syntax error: expected ',' or ')' in opclass options, found {:?}",
+                                    other
+                                )));
+                            }
+                        }
+                    }
+                } else {
+                    return Err(SqlError {
+                        message: format!("operator class {} has no options", name),
+                        code: "22023",
+                    });
+                }
             }
             opclass = Some(name);
         }
@@ -11538,6 +11750,7 @@ impl Parser {
                         temp,
                         if_not_exists: false,
                         with_data: true,
+                        on_commit: 0,
                         execute: None,
                     });
                 }
@@ -17698,9 +17911,26 @@ impl Parser {
         // verbose) are honored; others are accepted and ignored.
         let mut verbose = self.eat_keyword("verbose");
         let mut analyze = self.eat_keyword("analyze");
+        let mut bul_full = false;
+        // v2.49: PG19's legacy unparenthesized VACUUM options
+        // (VacuumStmt: FULL / FREEZE / VERBOSE / ANALYZE in any
+        // order before the table list) — `VACUUM FULL t` used to
+        // take FULL as a table name and choke on the real one.
+        loop {
+            if self.eat_keyword("full") {
+                bul_full = true;
+            } else if self.eat_keyword("freeze") {
+                // accepted, not modeled
+            } else if self.eat_keyword("verbose") {
+                verbose = true;
+            } else if self.eat_keyword("analyze") {
+                analyze = true;
+            } else {
+                break;
+            }
+        }
         let mut bul_kb: Option<i64> = None;
         let mut bul_overflow = false;
-        let mut bul_full = false;
         let mut vac_parallel: Option<Option<i64>> = None;
         let mut last_oname = String::new();
         if *self.peek() == Token::LParen {
@@ -21886,8 +22116,20 @@ impl Parser {
         let mut concurrently = false;
         if matches!(self.peek(), Token::LParen) {
             self.next();
-            if self.eat_keyword("concurrently") {
-                concurrently = true;
+            // v2.49: PG19 ReindexStmt options are CONCURRENTLY and
+            // VERBOSE (either order, comma- or space-separated in
+            // the option list); VERBOSE is accepted and ignored.
+            loop {
+                if self.eat_keyword("concurrently") {
+                    concurrently = true;
+                } else if self.eat_keyword("verbose") {
+                    // accepted, not modeled
+                } else {
+                    break;
+                }
+                if matches!(self.peek(), Token::Comma) {
+                    self.next();
+                }
             }
             self.expect(Token::RParen, "')'")?;
         }
@@ -24329,9 +24571,10 @@ pub(crate) fn coltype_by_name(name: &str) -> Result<ColType, String> {
         "uuid" => ColType::Uuid,
         "oid" => ColType::Oid,
         "inet" => ColType::Inet,
-        "point" => ColType::Point,   // v2.44
-        "box" => ColType::BoxGeo,    // v2.44
-        "circle" => ColType::Circle, // v2.44
+        "point" => ColType::Point,     // v2.44
+        "polygon" => ColType::Polygon, // v2.49
+        "box" => ColType::BoxGeo,      // v2.44
+        "circle" => ColType::Circle,   // v2.44
         o => return Err(format!("bad column type {}", o)),
     })
 }

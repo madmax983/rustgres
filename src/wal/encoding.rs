@@ -656,6 +656,11 @@ impl Enc {
                 self.u8(44);
                 return;
             }
+            // v2.49: polygon; tag appends after circle's.
+            ColType::Polygon => {
+                self.u8(45);
+                return;
+            }
             // v1.94: tsvector / tsquery; tags append after v1.88's.
             ColType::TsVector => {
                 self.u8(34);
@@ -2029,6 +2034,8 @@ impl<'a> Dec<'a> {
             42 => Ok(ColType::Point),
             43 => Ok(ColType::BoxGeo),
             44 => Ok(ColType::Circle),
+            // v2.49: polygon.
+            45 => Ok(ColType::Polygon),
             // v0.78: array, then the PG array OID identifying the
             // element type.
             22 => {

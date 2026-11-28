@@ -3244,12 +3244,18 @@ pub enum AlterAction {
     /// transformIndexConstraints): the unique index becomes the PK.
     AddPrimaryKeyUsingIndex {
         index: String,
+        /// v2.49: the ADD CONSTRAINT name, if given (PG19 renames
+        /// the index to it); None = the constraint takes the
+        /// index's name.
+        name: Option<String>,
     },
     /// v2.07: `ALTER TABLE t ADD UNIQUE USING INDEX idx` (PG19
     /// transformIndexConstraints): the unique index becomes a UNIQUE
     /// constraint named after the index.
     AddUniqueUsingIndex {
         index: String,
+        /// v2.49: the ADD CONSTRAINT name, if given.
+        name: Option<String>,
     },
     /// v0.96: `ALTER TABLE child INHERIT parent` (PG19 table inheritance).
     /// The parent must exist; every parent column must already exist in
@@ -10660,6 +10666,9 @@ pub enum Stmt {
         /// if it already exists (session-local semantics approximation
         /// for pg_regress conformance).
         temp: bool,
+        /// v2.49: ON COMMIT action (PG19 CreateStmt oncommit):
+        /// 0 = none, 1 = PRESERVE ROWS, 2 = DELETE ROWS, 3 = DROP.
+        on_commit: u8,
     },
     /// v0.48: `CREATE TABLE ... AS <query>` (CTAS, PG19 createas.c):
     /// the table's columns are inferred from the query's output names
@@ -10672,6 +10681,8 @@ pub enum Stmt {
         if_not_exists: bool,
         /// `WITH NO DATA` creates the table without populating it.
         with_data: bool,
+        /// v2.49: ON COMMIT action, as on CreateTable.
+        on_commit: u8,
         /// v1.99: `CREATE TABLE ... AS EXECUTE name [(args)]` (PG19
         /// CreateAsStmt with an ExecuteStmt query). The parser cannot
         /// resolve the prepared statement (session state), so the spec
