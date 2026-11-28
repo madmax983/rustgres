@@ -4686,6 +4686,27 @@ impl OpClassDef {
     }
 }
 
+/// v2.48: a user-defined operator family (PG19 pg_opfamily +
+/// pg_amop/pg_amproc membership). Items added via ALTER OPERATOR
+/// FAMILY are recorded so duplicate ADDs and DROP existence checks
+/// validate like PG19's AlterOpFamilyStmt.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpFamilyDef {
+    /// Family name as written at CREATE (possibly schema-qualified).
+    pub name: String,
+    /// Access method (lowercase, as written).
+    pub method: String,
+    /// Creating role.
+    pub owner: String,
+    /// (strategy, left type, right type) as written, lowercased.
+    pub operators: Vec<(u32, String, String)>,
+    /// (support number, function name, arg types) as written.
+    pub functions: Vec<(u32, String, Vec<String>)>,
+    /// Operator classes created with `FAMILY <this name>` (DROP
+    /// dependency tracking).
+    pub classes: Vec<String>,
+}
+
 /// Partition metadata for a table. A partitioned parent has `method` +
 /// `key` + `children` and `bound: None`; a leaf partition has `parent` +
 /// `bound`; an intermediate (sub-partitioned) table has both.
@@ -6428,6 +6449,13 @@ pub struct Database {
     /// checkpointed at CHKPT_VERSION 32 and WAL-logged (record
     /// tag 35) — routing-critical state, see the WriteOp docs.
     pub opclasses: Vec<OpClassDef>,
+    /// v2.48: user-defined operator families (PG19 pg_opfamily).
+    /// Transactional via the statement undo log
+    /// (`WriteOp::OpFamilySet` carries the previous entry).
+    /// KNOWN GAP: not WAL-logged and not checkpointed (the `casts`
+    /// precedent) — families only gate operator-family DDL
+    /// validation, so a restart loses them without affecting data.
+    pub opfamilies: Vec<OpFamilyDef>,
     /// v1.38: user-defined casts by (source, target) canonical type
     /// name. Only the binary (`WITHOUT FUNCTION`) method is supported.
     /// Transactional via the statement undo log (`WriteOp::CreateCast`).
@@ -6935,6 +6963,8 @@ impl Database {
             operators: HashMap::default(),
             // v2.23: no user-defined operator classes at bootstrap.
             opclasses: Vec::new(),
+            // v2.48: no user-defined operator families at bootstrap.
+            opfamilies: Vec::new(),
             // v1.38: user-defined casts (in-memory; see the field docs).
             casts: HashMap::default(),
             // v0.37: table OIDs for pg_class.
@@ -9598,6 +9628,17 @@ pub enum WriteOp {
         method: String,
         prev: Option<OpClassDef>,
     },
+    // --- v2.48: operator-family registry mutation (CREATE/DROP
+    // OPERATOR FAMILY, ALTER ... ADD/DROP, class-driven family
+    // creation). Carries the previous entry for the (name, method)
+    // identity so undo restores it exactly. Like `casts`, the
+    // registry is not WAL-logged or checkpointed (documented gap,
+    // same precedent) — families only gate DDL validation.
+    OpFamilySet {
+        name: String,
+        method: String,
+        prev: Option<OpFamilyDef>,
+    },
     // --- v1.38: CREATE CAST. Casts live in `Database::casts` (not the
     // versioned catalog and not WAL-logged — see the field docs); the
     // op carries the previous entry so statement-undo / ROLLBACK
@@ -10019,6 +10060,15 @@ pub fn undo_write_op(eng: &mut Engine, owns: &[u64], op: &WriteOp) {
                 .retain(|c| !(c.name == *name && c.method == *method));
             if let Some(def) = prev {
                 eng.db.opclasses.push(def.clone());
+            }
+        }
+        // --- v2.48: operator-family DDL undo (OpClassSet pattern).
+        WriteOp::OpFamilySet { name, method, prev } => {
+            eng.db
+                .opfamilies
+                .retain(|f| !(f.name == *name && f.method == *method));
+            if let Some(def) = prev {
+                eng.db.opfamilies.push(def.clone());
             }
         }
         // --- v1.38: cast DDL undo. Restore the previous entry, or

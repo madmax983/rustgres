@@ -1321,6 +1321,38 @@ pub(crate) fn regclass_display(q: &Q, oid: u32) -> String {
 /// directly (no existence check); anything else must name a visible
 /// relation (42P01 otherwise). A regclass value is represented by its
 /// display text (see [`regclass_display`]).
+/// v2.48: like `eval_regclass_cast` but yields the OID itself as an
+/// Int (set-op branch coercion regclass -> oid needs the numeric
+/// form, not the display text).
+pub(crate) fn eval_regclass_oid(q: &mut Q, v: &Value) -> Result<Value, ExecError> {
+    if matches!(v, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let text = match eval_regclass_cast(q, v)? {
+        Value::Text(s) => s.to_string(),
+        other => return Ok(other),
+    };
+    // The display form of a resolved regclass is the (possibly
+    // schema-qualified) name; resolve it once more to its OID. A
+    // numeric display (unknown OID) parses directly.
+    if let Ok(n) = text.parse::<u32>() {
+        return Ok(Value::Int(n as i64));
+    }
+    if let Some(t) = q.eng.db.find_table(&text, q.snap, &q.all_xids, q.session) {
+        return Ok(Value::Int(t.oid as i64));
+    }
+    if let Some(oid) = catalog_name_oid(&text) {
+        return Ok(Value::Int(oid as i64));
+    }
+    if let Some((_, o)) = crate::exec::catalog::index_oid_map(&q.eng.db, q.snap, q.own, q.session)
+        .iter()
+        .find(|(n, _)| n.as_str() == text || n.rsplit('.').next() == Some(text.as_str()))
+    {
+        return Ok(Value::Int(*o));
+    }
+    Ok(Value::Int(crate::exec::catalog::name_oid(&text) as i64))
+}
+
 pub(crate) fn eval_regclass_cast(q: &mut Q, v: &Value) -> Result<Value, ExecError> {
     let oid: u32 = match v {
         Value::Null => return Ok(Value::Null),

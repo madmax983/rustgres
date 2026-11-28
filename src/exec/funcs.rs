@@ -8795,6 +8795,9 @@ pub(crate) fn check_builtin_arity(name: &str, vals: &[Value]) -> Result<(), Exec
         // v0.43: pg_input_error_info(input, type) -> record (table
         // function in FROM; PG19 misc.c).
         "pg_input_error_info" => n == 2,
+        // v2.48: pg_partition_tree(regclass) — FROM-clause SRF handled
+        // in join.rs; arity registered so misuse reports 42883 cleanly.
+        "pg_partition_tree" => n == 1,
         // v0.37: TOAST introspection functions.
         "pg_column_compression" => n == 1,
         "pg_column_size" => n == 1,

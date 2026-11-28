@@ -922,6 +922,27 @@ pub(crate) fn attach_partition(
             }
         }
     }
+    // v2.48: PG19 tablecmds.c CloneForeignKeyConstraints — a table
+    // referenced by a foreign key OF the parent cannot be attached
+    // as its partition (0A000; foreign_key.sql fk_partitioned_fk_6).
+    {
+        let parent_t = eng
+            .db
+            .find_table(parent_name, ctx.snap, &ctx.all_xids, ctx.session)
+            .expect("parent resolved above");
+        for pfk in &parent_t.fks {
+            if pfk.ref_table == child_name {
+                return Err(exec_err(
+                    "0A000",
+                    format!(
+                        "cannot attach table \"{}\" as a partition because it is referenced by foreign key \"{}\"",
+                        child_name.rsplit('.').next().unwrap_or(child_name),
+                        pfk.name
+                    ),
+                ));
+            }
+        }
+    }
     // v1.97: PG19 rejects circular partition attachment
     // ("circular inheritance not allowed", 42P16): the table being
     // attached must not be an ancestor of the parent in the
@@ -1269,6 +1290,22 @@ pub(crate) fn attach_partition(
                 };
                 match tt.fks.iter().find(|cf| same_fk(cf, pfk)) {
                     Some(cfk) => {
+                        // v2.48: PG19 tablecmds.c — a shape-matching
+                        // partition constraint whose enforceability
+                        // differs from the parent's cannot merge;
+                        // the attach fails 42P16 so the user can fix
+                        // it first (foreign_key.sql fk_part_con).
+                        if cfk.enforced != pfk.enforced {
+                            return Err(exec_err(
+                                "42P16",
+                                format!(
+                                    "constraint \"{}\" enforceability conflicts with constraint \"{}\" on relation \"{}\"",
+                                    pfk.name,
+                                    cfk.name,
+                                    tname.rsplit('.').next().unwrap_or(tname)
+                                ),
+                            ));
+                        }
                         if cfk.not_valid && !pfk.not_valid {
                             // Validate this table's rows against
                             // the clone, then mark it validated.
@@ -7419,6 +7456,118 @@ pub(crate) fn create_exclusion_index(
 /// transaction-block restriction for CONCURRENTLY is enforced by
 /// PG's utility hook; this engine's executor cannot see the block
 /// state, so it is not reproduced (see v206 scope.md).
+/// v2.48: PG19 ATExecDetachPartition + ri_triggers.c (partgone
+/// path) — detaching a partition of a referenced partitioned table
+/// fails 23503 when any row of a referencing table still references
+/// a key living in the detached subtree: "removing partition %s
+/// violates foreign key constraint %s". Returns the blocking FK's
+/// (table, def) if any.
+fn detach_fk_blocker(
+    eng: &Engine,
+    ctx: &StmtCtx,
+    parent_name: &str,
+    child_name: &str,
+) -> Option<(String, crate::sql::FkDef)> {
+    // The detached subtree (child + its partition descendants).
+    let mut subtree: Vec<String> = vec![child_name.to_string()];
+    subtree.extend(partition_descendants(eng, ctx, child_name));
+    // Referenced roots that cover the subtree: the child itself and
+    // every partition ancestor of the child.
+    let mut roots: Vec<String> = vec![child_name.to_string()];
+    let mut cur = parent_name.to_string();
+    loop {
+        roots.push(cur.clone());
+        match eng
+            .db
+            .find_table(&cur, ctx.snap, &ctx.all_xids, ctx.session)
+            .and_then(|t| t.partition.as_ref())
+            .and_then(|p| p.parent.clone())
+        {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+    let all_names: Vec<String> = eng.db.tables.keys().cloned().collect();
+    for ft_name in &all_names {
+        let Some(ft) = eng
+            .db
+            .find_table(ft_name, ctx.snap, &ctx.all_xids, ctx.session)
+        else {
+            continue;
+        };
+        for f in &ft.fks {
+            if !roots.contains(&f.ref_table) && !subtree.contains(&f.ref_table) {
+                continue;
+            }
+            // Referencing rows: the FK table plus its own partition
+            // descendants (rows live in the leaves).
+            let mut src_tables: Vec<String> = vec![ft_name.clone()];
+            src_tables.extend(partition_descendants(eng, ctx, ft_name));
+            for st_name in &src_tables {
+                let Some(st) = eng
+                    .db
+                    .find_table(st_name, ctx.snap, &ctx.all_xids, ctx.session)
+                else {
+                    continue;
+                };
+                let fpos: Vec<usize> = match f
+                    .cols
+                    .iter()
+                    .map(|c| st.column_index(c))
+                    .collect::<Option<Vec<_>>>()
+                {
+                    Some(v) => v,
+                    None => continue,
+                };
+                for rv in st
+                    .rows
+                    .iter()
+                    .filter(|r| row_visible(r, ctx.snap, &ctx.all_xids))
+                {
+                    let key: Vec<Value> = fpos.iter().map(|&i| rv.values[i].clone()).collect();
+                    if key.iter().any(|v| matches!(v, Value::Null)) {
+                        continue;
+                    }
+                    // Does the key live in the detached subtree?
+                    for s_name in &subtree {
+                        let Some(s) =
+                            eng.db
+                                .find_table(s_name, ctx.snap, &ctx.all_xids, ctx.session)
+                        else {
+                            continue;
+                        };
+                        let meta = TableMeta::of(s);
+                        let Ok(ref_cols) = fk_ref_cols(&meta, f) else {
+                            continue;
+                        };
+                        let pos: Vec<usize> = match ref_cols
+                            .iter()
+                            .map(|c| s.column_index(c))
+                            .collect::<Option<Vec<_>>>()
+                        {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let hit = s
+                            .rows
+                            .iter()
+                            .filter(|r| row_visible(r, ctx.snap, &ctx.all_xids))
+                            .any(|r| {
+                                pos.iter()
+                                    .zip(key.iter())
+                                    .all(|(&pi, kv)| fk_key_eq(&r.values[pi], kv))
+                            });
+                        if hit {
+                            return Some((ft_name.clone(), f.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn detach_partition(
     eng: &mut Engine,
     ctx: &mut StmtCtx,
@@ -7461,6 +7610,18 @@ pub(crate) fn detach_partition(
             )
         })?
         .clone();
+    // v2.48: PG19 — DETACH is blocked while referencing rows still
+    // point into the detached subtree (23503, ri_triggers partgone).
+    if let Some((_ft, f)) = detach_fk_blocker(eng, ctx, parent_name, child_name) {
+        return Err(exec_err(
+            "23503",
+            format!(
+                "removing partition \"{}\" violates foreign key constraint \"{}\"",
+                child_name.rsplit('.').next().unwrap_or(child_name),
+                f.name
+            ),
+        ));
+    }
     // Unlink on the parent side (transactional version swap).
     parent_link_child(eng, ctx, parent_name, child_name, false);
     // Child side: clear the parent link and bound. A leaf becomes a

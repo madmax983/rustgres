@@ -3460,8 +3460,17 @@ pub(crate) fn exec_create_operator(
             .flatten()
             .map(|s| s.to_string())
             .collect();
+        // v2.48: pg_proc's cross-type comparison functions
+        // (int48eq & family) are valid operator procedures in PG19
+        // but are not SQL-level builtins in this engine's registry.
+        const PG_PROC_XTYPE_CMPS: &[&str] = &[
+            "int48eq", "int48ne", "int48lt", "int48le", "int48gt", "int48ge", "int84eq", "int84ne",
+            "int84lt", "int84le", "int84gt", "int84ge", "int24eq", "int24ne", "int24lt", "int24le",
+            "int24gt", "int24ge", "int42eq", "int42ne", "int42lt", "int42le", "int42gt", "int42ge",
+        ];
         if find_function_by_signature(eng, procedure, &proc_args).is_none()
             && !crate::sql::is_builtin_fn(procedure)
+            && !PG_PROC_XTYPE_CMPS.contains(&procedure)
         {
             return Err(exec_err(
                 "42883",

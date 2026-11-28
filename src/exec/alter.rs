@@ -1740,7 +1740,93 @@ pub(crate) fn exec_alter_one(
             // kind); the pre-v2.15 arm only searched CHECKs, so a
             // NOT VALID FK could never become valid (42704).
             if let Some(fk) = t.fks.iter().find(|f| &f.name == con).cloned() {
+                // v2.48: PG19 ATExecValidateConstraint — a NOT ENFORCED
+                // constraint can never be validated (55000), FK arm
+                // included (the CHECK arm below has the same rule).
+                if !fk.enforced {
+                    return Err(exec_err(
+                        "55000",
+                        "cannot validate NOT ENFORCED constraint".to_string(),
+                    ));
+                }
                 if fk.not_valid {
+                    // v2.48: PG19 FK validation privilege semantics
+                    // (foreign_key.sql SET ROLE section): the bulk
+                    // validation query runs as the current role and
+                    // needs SELECT on the referenced columns of the
+                    // referenced table; when the role lacks SELECT on
+                    // the FK table itself, validation falls back to a
+                    // per-row check that instead requires UPDATE
+                    // privilege (any column) on the referenced table.
+                    // Both failures are 42501 "permission denied for
+                    // table <referenced>".
+                    {
+                        let closure =
+                            crate::storage::role_closure(&eng.db, ctx.role, ctx.snap, ctx.own);
+                        // PG19 ri_triggers.c RI_Initial_Check + the
+                        // per-row RI_FKey_check_ins fallback: the bulk
+                        // LEFT JOIN needs SELECT (table-level, or on
+                        // every key column) on both tables; failing
+                        // that, the per-row FOR KEY SHARE lookup still
+                        // needs SELECT on every referenced key column
+                        // plus UPDATE on any one referenced-table
+                        // column. Net denial rule below.
+                        let fk_sel = crate::storage::table_privs_in(
+                            &eng.db, ctx.role, &t, &closure, ctx.snap, ctx.own,
+                        ) & crate::storage::PRIV_SELECT
+                            == crate::storage::PRIV_SELECT
+                            || fk.cols.iter().all(|cn| {
+                                crate::storage::column_privs_in(
+                                    &eng.db, ctx.role, &t, cn, &closure, ctx.snap, ctx.own,
+                                ) & crate::storage::PRIV_SELECT
+                                    == crate::storage::PRIV_SELECT
+                            });
+                        if let Some(rt) = eng
+                            .db
+                            .find_table(&fk.ref_table, ctx.snap, &ctx.all_xids, ctx.session)
+                            .cloned()
+                        {
+                            let ref_cols: Vec<String> = if fk.ref_cols.is_empty() {
+                                TableMeta::of(&rt)
+                                    .pkey
+                                    .as_ref()
+                                    .map(|pk| pk.cols.clone())
+                                    .unwrap_or_default()
+                            } else {
+                                fk.ref_cols.clone()
+                            };
+                            let pk_key_sel = crate::storage::table_privs_in(
+                                &eng.db, ctx.role, &rt, &closure, ctx.snap, ctx.own,
+                            ) & crate::storage::PRIV_SELECT
+                                == crate::storage::PRIV_SELECT
+                                || ref_cols.iter().all(|cn| {
+                                    crate::storage::column_privs_in(
+                                        &eng.db, ctx.role, &rt, cn, &closure, ctx.snap, ctx.own,
+                                    ) & crate::storage::PRIV_SELECT
+                                        == crate::storage::PRIV_SELECT
+                                });
+                            let pk_upd_any = crate::storage::table_privs_in(
+                                &eng.db, ctx.role, &rt, &closure, ctx.snap, ctx.own,
+                            ) & crate::storage::PRIV_UPDATE
+                                == crate::storage::PRIV_UPDATE
+                                || rt.columns.iter().any(|(cn, _)| {
+                                    crate::storage::column_privs_in(
+                                        &eng.db, ctx.role, &rt, cn, &closure, ctx.snap, ctx.own,
+                                    ) & crate::storage::PRIV_UPDATE
+                                        == crate::storage::PRIV_UPDATE
+                                });
+                            let denied = !pk_key_sel || (!fk_sel && !pk_upd_any);
+                            if denied {
+                                return Err(exec_err(
+                                    "42501",
+                                    format!(
+                                        "permission denied for table \"{}\"",
+                                        fk.ref_table.rsplit('.').next().unwrap_or(&fk.ref_table)
+                                    ),
+                                ));
+                            }
+                        }
+                    }
                     validate_fk_rows(eng, ctx, &t, name, &fk)?;
                     let mut next = t.clone();
                     for f in next.fks.iter_mut() {
@@ -8533,9 +8619,16 @@ pub(crate) fn alter_alter_constraint(
                 let mut fk_now = fk.clone();
                 fk_now.enforced = true;
                 validate_fk_rows(eng, ctx, &t, name, &fk_now)?;
-                fk.not_valid = false;
             }
             fk.enforced = e;
+            // v2.48: PG19 ATExecAlterConstraint phase 2 — any
+            // enforceability alteration sets convalidated :=
+            // is_enforced (tablecmds.c: "the convalidated status is
+            // irrelevant when NOT ENFORCED, but for consistency it
+            // is set appropriately"; becoming ENFORCED revalidates
+            // in phase 3). foreign_key.sql fk_con sequence:
+            // (t,t,t,t) -> NOT ENFORCED NOT DEFERRABLE -> (f,f,f,f).
+            fk.not_valid = !e;
         }
     } else if next
         .checks

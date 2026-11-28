@@ -820,6 +820,11 @@ pub(crate) fn table_function_col_names(name: &str) -> Result<Vec<String>, ExecEr
             .iter()
             .map(|s| s.to_string())
             .collect()),
+        // v2.48: pg_partition_tree OUT columns (PG19 partitionfuncs.c).
+        "pg_partition_tree" => Ok(["relid", "parentrelid", "isleaf", "level"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()),
         // v2.34: pg_stat_get_backend_* SRFs (pgstat.rs IO_SPEC /
         // backend_wal shapes).
         "pg_stat_get_backend_idset" => Ok(vec!["pg_stat_get_backend_idset".to_string()]),
@@ -902,6 +907,13 @@ pub(crate) fn table_function_col_types(
             Ok(vec![ColType::Text])
         }
         "regexp_split_to_table" => Ok(vec![ColType::Text]),
+        // v2.48: pg_partition_tree (oid, oid, bool, int4).
+        "pg_partition_tree" => Ok(vec![
+            ColType::Oid,
+            ColType::Oid,
+            ColType::Bool,
+            ColType::Int,
+        ]),
         "repeat" => Ok(vec![ColType::Text]),
         "pg_input_error_info" => Ok(vec![ColType::Text; 4]),
         // v2.30: pg_mcv_list_items (int4, text[], bool[], float8, float8).
@@ -1242,6 +1254,76 @@ pub(crate) fn eval_srf_call(
                 table_function_col_names(name)?,
                 table_function_col_types(name, &arg_vals)?,
             )
+        } else {
+            (
+                col_defs.iter().map(|(n, _, _)| n.clone()).collect(),
+                col_defs.iter().map(|(_, t, _)| *t).collect(),
+            )
+        };
+        return Ok((names, types, rows, true));
+    }
+    // v2.48: pg_partition_tree(regclass) — SETOF (relid oid,
+    // parentrelid oid, isleaf bool, level int), PG19 partitionfuncs.c:
+    // the root row first (parentrelid NULL, level 0), then descendants
+    // depth-first. Rows depend on the live partition catalog, like
+    // pg_get_publication_tables below. A NULL argument yields no rows;
+    // an unknown relation is 42P01 via the regclass argument itself.
+    if name == "pg_partition_tree" {
+        validate_coldef_for_builtin(name, col_defs)?;
+        let names = vec![
+            "relid".to_string(),
+            "parentrelid".to_string(),
+            "isleaf".to_string(),
+            "level".to_string(),
+        ];
+        let types = vec![ColType::Oid, ColType::Oid, ColType::Bool, ColType::Int];
+        let mut rows: Vec<Row> = Vec::new();
+        let root_name: Option<String> = match arg_vals.first() {
+            Some(Value::Text(s)) => Some(
+                s.rsplit('.')
+                    .next()
+                    .unwrap_or(s)
+                    .trim_matches('"')
+                    .to_string(),
+            ),
+            Some(Value::Int(i)) => q
+                .eng
+                .db
+                .tables
+                .keys()
+                .find(|n| {
+                    q.eng
+                        .db
+                        .find_table(n, q.snap, &q.all_xids, q.session)
+                        .is_some_and(|t| t.oid as i64 == *i)
+                })
+                .cloned(),
+            _ => None,
+        };
+        if let Some(root) = root_name {
+            fn walk(q: &Q, name: &str, parent: Option<i64>, level: i64, rows: &mut Vec<Row>) {
+                let Some(t) = q.eng.db.find_table(name, q.snap, &q.all_xids, q.session) else {
+                    return;
+                };
+                let children: Vec<String> = t
+                    .partition
+                    .as_ref()
+                    .map(|p| p.children.clone())
+                    .unwrap_or_default();
+                rows.push(Row::new(vec![
+                    Value::Int(t.oid as i64),
+                    parent.map(Value::Int).unwrap_or(Value::Null),
+                    Value::Bool(children.is_empty()),
+                    Value::Int(level),
+                ]));
+                for c in &children {
+                    walk(q, c, Some(t.oid as i64), level + 1, rows);
+                }
+            }
+            walk(q, &root, None, 0, &mut rows);
+        }
+        let (names, types) = if col_defs.is_empty() {
+            (names, types)
         } else {
             (
                 col_defs.iter().map(|(n, _, _)| n.clone()).collect(),
@@ -3000,6 +3082,9 @@ pub(crate) fn srf_static_schema(
     } else if name == "generate_subscripts" {
         // v2.40: generate_subscripts yields integer subscripts.
         vec![ColType::Int]
+    } else if name == "pg_partition_tree" {
+        // v2.48: pg_partition_tree (oid, oid, bool, int4).
+        vec![ColType::Oid, ColType::Oid, ColType::Bool, ColType::Int]
     } else if is_json_expansion_srf(name) {
         json_srf_col_types(name)
     } else if crate::exec::is_pgstat_srf(name) {
@@ -3020,6 +3105,7 @@ pub(crate) fn srf_static_schema(
     };
     let authoritative = is_json_expansion_srf(name)
         || name == "pg_input_error_info"
+        || name == "pg_partition_tree"
         || crate::exec::is_pgstat_srf(name);
     Ok((out_names, col_types, authoritative))
 }

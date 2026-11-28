@@ -1962,6 +1962,12 @@ impl Parser {
         {
             return self.parse_create_operator_class();
         }
+        // v2.48: CREATE OPERATOR FAMILY name USING method.
+        if matches!(self.peek(), Token::Ident(s) if s == "operator")
+            && matches!(self.peek2(), Token::Ident(s) if s == "family")
+        {
+            return self.parse_create_operator_family();
+        }
         if matches!(self.peek(), Token::Ident(s) if s == "operator") {
             return self.parse_create_operator();
         }
@@ -3629,7 +3635,19 @@ impl Parser {
                 if self.eat_keyword("delete") {
                     let (a, c, na) = self.parse_fk_action()?;
                     on_delete = a;
-                    on_delete_cols = c;
+                    // v2.48: PG19 stores confdelsetcols as a set —
+                    // duplicate column names collapse (foreign_key
+                    // .sql declares the same column twice and
+                    // pg_get_constraintdef renders it once).
+                    on_delete_cols = c.map(|cols| {
+                        let mut out: Vec<String> = Vec::new();
+                        for col in cols {
+                            if !out.contains(&col) {
+                                out.push(col);
+                            }
+                        }
+                        out
+                    });
                     on_delete_no_action = na;
                 } else if self.eat_keyword("update") {
                     let (a, c, na) = self.parse_fk_action()?;
@@ -4739,12 +4757,26 @@ impl Parser {
                 let mut initially: Option<bool> = None;
                 let mut enforced: Option<bool> = None;
                 let mut inherit: Option<bool> = None;
+                // v2.48: PG19 parse_utilcmd.c — contradictory pairs in
+                // one ALTER CONSTRAINT spec (ENFORCED + NOT ENFORCED,
+                // DEFERRABLE + NOT DEFERRABLE) are 42601 "conflicting
+                // constraint properties"; NOT VALID can never be set by
+                // ALTER CONSTRAINT (42601 "constraints cannot be
+                // altered to be NOT VALID"). foreign_key.sql pins both.
+                let mut seen_deferrable: Vec<bool> = Vec::new();
+                let mut seen_enforced: Vec<bool> = Vec::new();
                 loop {
                     if self.eat_keyword("not") {
                         if self.eat_keyword("deferrable") {
+                            seen_deferrable.push(false);
                             deferrable = Some(false);
                         } else if self.eat_keyword("enforced") {
+                            seen_enforced.push(false);
                             enforced = Some(false);
+                        } else if self.eat_keyword("valid") {
+                            return Err(err(
+                                "constraints cannot be altered to be NOT VALID".to_string()
+                            ));
                         } else {
                             return Err(err(
                                 "syntax error: expected DEFERRABLE or ENFORCED after NOT"
@@ -4752,8 +4784,10 @@ impl Parser {
                             ));
                         }
                     } else if self.eat_keyword("deferrable") {
+                        seen_deferrable.push(true);
                         deferrable = Some(true);
                     } else if self.eat_keyword("enforced") {
+                        seen_enforced.push(true);
                         enforced = Some(true);
                     } else if self.eat_keyword("inherit") {
                         // v2.43: PG19 AT_AlterConstraint INHERIT.
@@ -4775,6 +4809,11 @@ impl Parser {
                     } else {
                         break;
                     }
+                }
+                if (seen_enforced.contains(&true) && seen_enforced.contains(&false))
+                    || (seen_deferrable.contains(&true) && seen_deferrable.contains(&false))
+                {
+                    return Err(err("conflicting constraint properties".to_string()));
                 }
                 // PG19 gram.y: INITIALLY DEFERRED requires
                 // DEFERRABLE within the same attribute spec.
@@ -6539,7 +6578,9 @@ impl Parser {
                 "syntax error: expected FUNCTION or PROCEDURE".to_string()
             ));
         }
-        let function = self.expect_ident()?;
+        // v2.48: the trigger function name may be schema-qualified
+        // (fkpart11.print_trigger() in foreign_key.sql).
+        let function = self.expect_qualified_ident()?;
         self.expect(Token::LParen, "'('")?;
         let mut args = Vec::new();
         if !matches!(self.peek(), Token::RParen) {
@@ -9061,13 +9102,53 @@ impl Parser {
         match self.next() {
             // v2.23: consecutive Eq tokens form multi-= operators
             // (`==`, `===` — the lexer emits one Eq per '=').
+            // v2.48: PG operator characters may follow (`=#=`, `=~=`
+            // in foreign_key.sql's opfamily sections).
             Token::Eq => {
                 let mut name = "=".to_string();
-                while matches!(self.peek(), Token::Eq) {
-                    self.next();
-                    name.push('=');
+                loop {
+                    match self.peek() {
+                        Token::Eq => {
+                            self.next();
+                            name.push('=');
+                        }
+                        Token::Hash => {
+                            self.next();
+                            name.push('#');
+                        }
+                        Token::Tilde => {
+                            self.next();
+                            name.push('~');
+                        }
+                        _ => break,
+                    }
                 }
                 Ok(name)
+            }
+            // v2.48: bare comparison operators (`<`, `<=`, `<>`, `>`,
+            // `>=`) — opclass items spell them bare (OPERATOR 1 <).
+            // The match scrutinee already consumed the token. The
+            // lexer also emits combined LtEq/GtEq tokens for `<=`/`>=`.
+            Token::LtEq => Ok("<=".to_string()),
+            Token::GtEq => Ok(">=".to_string()),
+            Token::Lt => {
+                if matches!(self.peek(), Token::Eq) {
+                    self.next();
+                    Ok("<=".to_string())
+                } else if matches!(self.peek(), Token::Gt) {
+                    self.next();
+                    Ok("<>".to_string())
+                } else {
+                    Ok("<".to_string())
+                }
+            }
+            Token::Gt => {
+                if matches!(self.peek(), Token::Eq) {
+                    self.next();
+                    Ok(">=".to_string())
+                } else {
+                    Ok(">".to_string())
+                }
             }
             // v1.96: symbolic operator tokens beyond Op (e.g. `!!`).
             Token::BangBang => Ok("!!".to_string()),
@@ -9424,6 +9505,10 @@ impl Parser {
                 self.expect(Token::Eq, "'='")?;
                 match opt.as_str() {
                     "procedure" => procedure = Some(self.expect_ident()?),
+                    // v2.48: PG19 gram.y accepts FUNCTION as a synonym
+                    // for PROCEDURE in CREATE OPERATOR (foreign_key.sql
+                    // opfamily + regress_ri sections).
+                    "function" => procedure = Some(self.expect_qualified_ident()?),
                     "leftarg" => leftarg = Some(self.parse_func_type_name()?),
                     "rightarg" => rightarg = Some(self.parse_func_type_name()?),
                     "commutator" => commutator = Some(self.parse_oper_name()?),
@@ -9541,6 +9626,12 @@ impl Parser {
         };
         self.expect_keyword("using")?;
         let method = self.expect_ident()?;
+        // v2.48: optional FAMILY name between USING method and AS
+        // (PG19 DefineOpClassStmt; foreign_key.sql fk_opfamily).
+        let mut family = None;
+        if self.eat_keyword("family") {
+            family = Some(self.expect_qualified_ident()?);
+        }
         self.expect_keyword("as")?;
         let mut eq_operator = None;
         let mut eq_leftarg = None;
@@ -9610,6 +9701,7 @@ impl Parser {
             is_default,
             for_type,
             method,
+            family,
             eq_operator,
             eq_leftarg,
             eq_rightarg,
@@ -9641,19 +9733,197 @@ impl Parser {
         })
     }
 
+    /// v2.48: `CREATE OPERATOR FAMILY name USING method` (PG19
+    /// DefineOpFamilyStmt). Families are not modeled; the statement
+    /// is a catalog no-op (see ast.rs).
+    pub(crate) fn parse_create_operator_family(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("operator")?;
+        self.expect_keyword("family")?;
+        let name = self.expect_qualified_ident()?;
+        self.expect_keyword("using")?;
+        let method = self.expect_ident()?;
+        Ok(Stmt::CreateOperatorFamily { name, method })
+    }
+
+    /// v2.48: `DROP OPERATOR FAMILY [IF EXISTS] name USING method
+    /// [CASCADE|RESTRICT]` (PG19 DropOpFamilyStmt).
+    pub(crate) fn parse_drop_operator_family(&mut self) -> Result<Stmt, SqlError> {
+        self.expect_keyword("operator")?;
+        self.expect_keyword("family")?;
+        let if_exists = if self.eat_keyword("if") {
+            self.expect_keyword("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.expect_qualified_ident()?;
+        self.expect_keyword("using")?;
+        let method = self.expect_ident()?;
+        let cascade = if self.eat_keyword("cascade") {
+            true
+        } else {
+            self.eat_keyword("restrict");
+            false
+        };
+        Ok(Stmt::DropOperatorFamily {
+            name,
+            method,
+            if_exists,
+            cascade,
+        })
+    }
+
+    /// v2.48: capture a parenthesized type-name list (peek must be
+    /// '(') as written type names.
+    fn parse_paren_type_list(&mut self) -> Result<Vec<String>, SqlError> {
+        self.expect(Token::LParen, "'('")?;
+        let mut out = Vec::new();
+        loop {
+            if matches!(self.peek(), Token::Ident(s) if s == "none") {
+                self.next();
+                out.push("none".to_string());
+            } else {
+                out.push(self.parse_func_type_name()?);
+            }
+            match self.next() {
+                Token::Comma => continue,
+                Token::RParen => break,
+                other => {
+                    return Err(err(format!(
+                        "syntax error: expected ',' or ')' in type list, found {:?}",
+                        other
+                    )));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// v2.48: the item list of ALTER OPERATOR FAMILY ... ADD|DROP:
+    /// `OPERATOR n opref[(types)]` / `FUNCTION n [(types)] fname
+    /// (types)`, comma-separated. Items are captured for the
+    /// executor's PG19 validation (AlterOpFamilyStmt).
+    fn parse_opfamily_items(
+        &mut self,
+        drop: bool,
+    ) -> Result<Vec<crate::sql::OpFamilyItem>, SqlError> {
+        let mut items = Vec::new();
+        loop {
+            if self.eat_keyword("operator") {
+                let strategy = self.expect_u32()?;
+                if drop && *self.peek() == Token::LParen {
+                    // PG19 OpFamilyDropItem: OPERATOR n (types) —
+                    // no operator name in the DROP form.
+                    let types = self.parse_paren_type_list()?;
+                    items.push(crate::sql::OpFamilyItem::Operator {
+                        strategy,
+                        name: None,
+                        types,
+                        purpose: None,
+                    });
+                } else {
+                    let (name, la, ra) = self.parse_opclass_operator_ref()?;
+                    let mut types = Vec::new();
+                    if let Some(l) = la {
+                        types.push(l);
+                    }
+                    if let Some(r) = ra {
+                        types.push(r);
+                    }
+                    // Optional FOR ORDER BY <family> / FOR SEARCH.
+                    let mut purpose = None;
+                    if self.eat_keyword("for") {
+                        if self.eat_keyword("order") {
+                            self.expect_keyword("by")?;
+                            purpose = Some(self.expect_qualified_ident()?);
+                        } else if self.eat_keyword("search") {
+                            purpose = Some("search".to_string());
+                        } else {
+                            return Err(err(
+                                "syntax error: expected ORDER BY or SEARCH after FOR".to_string()
+                            ));
+                        }
+                    }
+                    items.push(crate::sql::OpFamilyItem::Operator {
+                        strategy,
+                        name: Some(name),
+                        types,
+                        purpose,
+                    });
+                }
+            } else if self.eat_keyword("function") {
+                let number = self.expect_u32()?;
+                // PG19 AlterOpFamilyStmt FUNCTION item: an optional
+                // (argtypes) list precedes the function name in ADD
+                // for cross-type support functions; in DROP the
+                // (types) list follows the number with no name.
+                if drop && *self.peek() == Token::LParen {
+                    let types = self.parse_paren_type_list()?;
+                    items.push(crate::sql::OpFamilyItem::Function {
+                        number,
+                        lead_types: None,
+                        name: None,
+                        types,
+                    });
+                } else {
+                    let lead_types = if *self.peek() == Token::LParen {
+                        Some(self.parse_paren_type_list()?)
+                    } else {
+                        None
+                    };
+                    let fname = self.expect_qualified_ident()?;
+                    let types = self.parse_paren_type_list()?;
+                    items.push(crate::sql::OpFamilyItem::Function {
+                        number,
+                        lead_types,
+                        name: Some(fname),
+                        types,
+                    });
+                }
+            } else {
+                return Err(err(format!(
+                    "syntax error: expected OPERATOR or FUNCTION in operator family item list, found {:?}",
+                    self.peek()
+                )));
+            }
+            if *self.peek() == Token::Comma {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        Ok(items)
+    }
+
     /// v2.23: `ALTER OPERATOR CLASS|FAMILY name USING method SET
     /// SCHEMA schema` (PG19 AlterOpFamilyStmt's schema form — the
     /// only form in the regress corpus). Other ALTER OPERATOR
     /// forms (RENAME TO / OWNER TO) parse to the same statement
     /// shape only for SET SCHEMA; the rest stay 42601.
+    /// v2.48: ALTER OPERATOR FAMILY ... ADD|DROP item-list form
+    /// (foreign_key.sql fk_opfamily) parses to a no-op statement.
     pub(crate) fn parse_alter_operator_class(&mut self) -> Result<Stmt, SqlError> {
         self.expect_keyword("operator")?;
-        if !self.eat_keyword("class") {
+        let is_family = if self.eat_keyword("class") {
+            false
+        } else {
             self.expect_keyword("family")?;
-        }
+            true
+        };
         let name = self.expect_qualified_ident()?;
         self.expect_keyword("using")?;
         let method = self.expect_ident()?;
+        let is_add = is_family && self.eat_keyword("add");
+        let is_drop = is_family && !is_add && self.eat_keyword("drop");
+        if is_add || is_drop {
+            let items = self.parse_opfamily_items(is_drop)?;
+            return Ok(Stmt::AlterOperatorFamilyItems {
+                name,
+                method,
+                drop: is_drop,
+                items,
+            });
+        }
         self.expect_keyword("set")?;
         self.expect_keyword("schema")?;
         let new_schema = self.expect_ident()?;
@@ -17121,7 +17391,10 @@ impl Parser {
         if paren {
             self.next();
         }
-        let table = self.expect_ident()?;
+        // v2.48: schema-qualified target (DELETE FROM fkpart10.tbl1),
+        // like UPDATE (v2.15) — the bare-name registry resolves the
+        // qualified spelling the same way.
+        let table = self.parse_table_name()?;
         if paren {
             self.expect(Token::RParen, "')'")?;
         }
@@ -20627,6 +20900,12 @@ impl Parser {
             && matches!(self.peek2(), Token::Ident(s) if s == "class")
         {
             return self.parse_drop_operator_class();
+        }
+        // v2.48: DROP OPERATOR FAMILY [IF EXISTS] name USING method.
+        if matches!(self.peek(), Token::Ident(s) if s == "operator")
+            && matches!(self.peek2(), Token::Ident(s) if s == "family")
+        {
+            return self.parse_drop_operator_family();
         }
         // v0.86: DROP OPERATOR [IF EXISTS] name (lefttype, righttype)
         // (PG19; use NONE for a missing side).

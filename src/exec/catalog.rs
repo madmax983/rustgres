@@ -4134,13 +4134,14 @@ pub(crate) fn eval_set_op(
     let mut acc = run_select(q, &root.left, outer)?;
     for b in &root.chain {
         let right = run_select(q, &b.right, outer)?;
-        acc = combine_set_branches(b.op, b.all, acc, right)?;
+        acc = combine_set_branches(q, b.op, b.all, acc, right)?;
     }
     apply_setop_tail(outer, root, acc)
 }
 
 /// v0.44: combine two branch results with one set operator.
 pub(crate) fn combine_set_branches(
+    q: &mut Q,
     op: SetOpKind,
     all: bool,
     left: SelectOut,
@@ -4188,8 +4189,39 @@ pub(crate) fn combine_set_branches(
         };
         out_cols.push((lname.clone(), common));
     }
-    let left_rows = coerce_set_rows(left.rows, &out_cols)?;
-    let right_rows = coerce_set_rows(right.rows, &out_cols)?;
+    // v2.48: a reg*-typed branch unified to oid carries its values
+    // in TEXT form (the named casts produce Text); resolve the names
+    // to OIDs through the catalog before the generic coercion, which
+    // would otherwise try a numeric parse (foreign_key.sql's
+    // pg_partition_tree(...) UNION ALL SELECT 'fk_notpartitioned_pk'
+    // ::regclass inside the pg_trigger IN-subquery).
+    let resolve_reg: Vec<bool> = out_cols
+        .iter()
+        .enumerate()
+        .map(|(ci, (_, ty))| {
+            *ty == ColType::Oid
+                && (left.columns[ci].1 == ColType::Regclass
+                    || right.columns[ci].1 == ColType::Regclass)
+        })
+        .collect();
+    let resolve_rows = |q: &mut Q, rows: Vec<Row>| -> Result<Vec<Row>, ExecError> {
+        if !resolve_reg.iter().any(|b| *b) {
+            return Ok(rows);
+        }
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut cells = row.into_cells();
+            for (ci, cell) in cells.iter_mut().enumerate() {
+                if resolve_reg[ci] && matches!(cell, Value::Text(_) | Value::BpChar(_)) {
+                    *cell = super::cast::eval_regclass_oid(q, cell)?;
+                }
+            }
+            out.push(Row::new(cells));
+        }
+        Ok(out)
+    };
+    let left_rows = coerce_set_rows(resolve_rows(q, left.rows)?, &out_cols)?;
+    let right_rows = coerce_set_rows(resolve_rows(q, right.rows)?, &out_cols)?;
     let rows = match op {
         SetOpKind::Union => {
             if all {
@@ -4306,6 +4338,16 @@ pub(crate) fn common_supertype(
     if setop_is_char_family(*a) && setop_is_char_family(*b) {
         // PG resolves varchar/bpchar unions to text (typmod is dropped).
         return Ok(ColType::Text);
+    }
+    // v2.48: oid and regclass are the same underlying type in PG
+    // (regclass is an alias rendering of oid); their common type is
+    // oid (foreign_key.sql: pg_partition_tree relid UNION ALL a
+    // regclass literal).
+    if matches!(
+        (a, b),
+        (ColType::Oid, ColType::Regclass) | (ColType::Regclass, ColType::Oid)
+    ) {
+        return Ok(ColType::Oid);
     }
     Err(exec_err(
         "42804",
@@ -6407,31 +6449,113 @@ pub(crate) fn pg_constraint_scan(
             }
             let r = super::locality::ConRef::Fk(f.cols.clone(), f.ref_table.clone());
             let lc = loc(&r, None);
-            rows.push(mk(vec![
-                Value::text(f.name.clone()),
-                Value::Int(2200),
-                Value::SingleChar(b'f'),
-                Value::Bool(f.deferrable),
-                Value::Bool(f.initially_deferred),
-                Value::Bool(f.enforced),
-                Value::Bool(!f.not_valid),
-                relid.clone(),
-                Value::Int(0),
-                Value::Int(confrelid),
-                Value::Int(0),
-                Value::Int(0),
-                Value::SingleChar(fk_action_char(f.on_update)),
-                Value::SingleChar(fk_action_char(f.on_delete)),
-                Value::SingleChar(if f.match_full { b'f' } else { b's' }),
-                int_array(attnums(t, &conkey_cols)),
-                confkey,
-                Value::Bool(lc.0),
-                Value::Int(lc.1),
-                Value::Bool(false),
-                Value::Null,
-                Value::Bool(f.period_col.is_some()),
-            ]));
-            meta.push((name.to_string(), r));
+            let fk_cells =
+                |cname: &str, confrelid_v: i64, confkey_v: Value, parent_v: i64| -> Vec<Value> {
+                    vec![
+                        Value::text(cname.to_string()),
+                        Value::Int(2200),
+                        Value::SingleChar(b'f'),
+                        Value::Bool(f.deferrable),
+                        Value::Bool(f.initially_deferred),
+                        Value::Bool(f.enforced),
+                        // v2.48: PG19 invariant — a NOT ENFORCED
+                        // constraint is never convalidated (created with
+                        // skip_validation = !is_enforced, tablecmds.c;
+                        // enforceability ALTERs set convalidated :=
+                        // is_enforced).
+                        Value::Bool(f.enforced && !f.not_valid),
+                        relid.clone(),
+                        Value::Int(0),
+                        Value::Int(confrelid_v),
+                        Value::Int(0),
+                        Value::Int(parent_v),
+                        Value::SingleChar(fk_action_char(f.on_update)),
+                        Value::SingleChar(fk_action_char(f.on_delete)),
+                        Value::SingleChar(if f.match_full { b'f' } else { b's' }),
+                        int_array(attnums(t, &conkey_cols)),
+                        confkey_v,
+                        Value::Bool(lc.0),
+                        Value::Int(lc.1),
+                        Value::Bool(false),
+                        Value::Null,
+                        Value::Bool(f.period_col.is_some()),
+                    ]
+                };
+            rows.push(mk(fk_cells(&f.name, confrelid, confkey.clone(), 0)));
+            let root_oid = match rows.last().map(|r| &r.cells[0]) {
+                Some(Value::Int(o)) => *o,
+                _ => 0,
+            };
+            meta.push((name.to_string(), r.clone()));
+            // v2.48: PG19 models an FK referencing a PARTITIONED
+            // table as the root row plus one clone row per referenced
+            // partition (conrelid stays the FK table, confrelid names
+            // the partition, conparentid points at the root row, and
+            // the clone name is the root name plus the partition's
+            // own name suffix, e.g. selffk_3_1 for partition pk_3_1).
+            // The clones are catalog-only (they back the per-partition
+            // action triggers); enforced/validated mirror the root.
+            if f.is_local
+                && let Some(rt) = db.find_table(&f.ref_table, snap, &[own], session)
+            {
+                let ref_is_partitioned = rt.partition.as_ref().is_some_and(|p| p.is_partitioned);
+                if ref_is_partitioned {
+                    let mut parts: Vec<String> = Vec::new();
+                    fn collect_parts(
+                        db: &Database,
+                        snap: &Snapshot,
+                        own: u64,
+                        session: u64,
+                        tname: &str,
+                        out: &mut Vec<String>,
+                    ) {
+                        if let Some(pt) = db.find_table(tname, snap, &[own], session) {
+                            if let Some(p) = &pt.partition {
+                                for c in &p.children {
+                                    out.push(c.clone());
+                                    collect_parts(db, snap, own, session, c, out);
+                                }
+                            }
+                        }
+                    }
+                    collect_parts(db, snap, own, session, &f.ref_table, &mut parts);
+                    let root_bare = f
+                        .ref_table
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(&f.ref_table)
+                        .to_string();
+                    for (i, part) in parts.iter().enumerate() {
+                        let Some(pt) = db.find_table(part, snap, &[own], session) else {
+                            continue;
+                        };
+                        let part_bare = part.rsplit('.').next().unwrap_or(part);
+                        let suffix = match part_bare.strip_prefix(&root_bare) {
+                            Some(rest) if rest.starts_with('_') => rest.to_string(),
+                            _ => format!("_{}", i + 1),
+                        };
+                        let clone_name = format!("{}{}", f.name, suffix);
+                        let mut ref_cols = if f.ref_cols.is_empty() {
+                            pt.pkey.as_ref().map(|p| p.cols.clone()).unwrap_or_default()
+                        } else {
+                            f.ref_cols.clone()
+                        };
+                        if let Some(rpc) = &f.ref_period_col {
+                            if !ref_cols.contains(rpc) {
+                                ref_cols.push(rpc.clone());
+                            }
+                        }
+                        let clone_confkey = int_array(attnums(pt, &ref_cols));
+                        rows.push(mk(fk_cells(
+                            &clone_name,
+                            pt.oid as i64,
+                            clone_confkey,
+                            root_oid,
+                        )));
+                        meta.push((name.to_string(), r.clone()));
+                    }
+                }
+            }
         }
     }
     // v2.27: conparentid second pass — a partition child's row points
@@ -7009,7 +7133,14 @@ pub(crate) fn pg_trigger_scan(
                     rt.oid as i64,
                 );
                 // Parent side on each referenced table/leaf.
+                // v2.48: only the LOCAL (root) FK row owns the
+                // action triggers — PG19 creates them once per
+                // constraint, not per FK-side partition clone
+                // (foreign_key.sql expects 2, not 2 per clone).
                 for (pname, poid) in &parent_tables {
+                    if !fk.is_local {
+                        break;
+                    }
                     let _ = pname;
                     emit(
                         &mut rows,

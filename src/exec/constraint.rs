@@ -892,6 +892,59 @@ pub(crate) fn value_to_multi(v: &Value) -> Option<crate::storage::MultiVal> {
     }
 }
 
+/// v2.48: count rows in the referenced table's partition tree whose
+/// key equals `key`, skipping rows whose (table, id) is in `exclude`
+/// — the statement-final-image count for rows being deleted/updated
+/// by the current statement (their old images must not count).
+pub(crate) fn fk_parent_key_count_excluding(
+    eng: &Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    fk: &FkDef,
+    key: &[Value],
+    exclude: &[(String, u64)],
+) -> Result<usize, ExecError> {
+    let mut tables: Vec<(String, &Table)> = Vec::new();
+    let mut stack = vec![fk.ref_table.clone()];
+    let mut seen: HashSet<String> = HashSet::new();
+    while let Some(name) = stack.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let Some(t) = eng.db.find_table(&name, snap, &[own], session) else {
+            continue;
+        };
+        if let Some(p) = &t.partition {
+            for c in &p.children {
+                stack.push(c.clone());
+            }
+        }
+        tables.push((name, t));
+    }
+    let mut count = 0usize;
+    for (name, t) in &tables {
+        let meta = TableMeta::of(t);
+        let ref_cols = fk_ref_cols(&meta, fk)?;
+        let pos: Vec<usize> = ref_cols
+            .iter()
+            .map(|c| t.column_index(c).expect("fk ref cols validated at DDL"))
+            .collect();
+        count += t
+            .rows
+            .iter()
+            .filter(|r| row_visible(r, snap, &[own]))
+            .filter(|r| !exclude.iter().any(|(tn, id)| tn == name && r.id == *id))
+            .filter(|r| {
+                pos.iter()
+                    .zip(key.iter())
+                    .all(|(&pi, kv)| fk_key_eq(&r.values[pi], kv))
+            })
+            .count();
+    }
+    Ok(count)
+}
+
 /// v2.31: is `period_value` contained in the union of the PERIOD
 /// ranges of every referenced-table row (whole partition tree)
 /// whose scalar key equals `key`? PG19 ri_triggers.c semantics:
@@ -1188,6 +1241,44 @@ pub(crate) fn check_fk_child_row_pv(
             .expect("fk parent validated at DDL time");
         let parent_meta = TableMeta::of(parent);
         let ref_cols = fk_ref_cols(&parent_meta, fk)?;
+        // v2.48: PG19 ri_triggers.c — the per-row check runs AS THE
+        // REFERENCED TABLE'S OWNER (SetUserIdAndSecContext to
+        // pk_rel->relowner + ri_CheckPermissions): the owner needs
+        // SELECT on every key column and UPDATE on at least one
+        // column of the referenced table (the FOR KEY SHARE lock
+        // fallback), else 42501 "permission denied for table"
+        // (foreign_key.sql's GRANT/REVOKE section around PKTABLE,
+        // whose owner is regress_foreign_key_user).
+        {
+            let pk_owner = parent.owner.clone();
+            if !crate::storage::is_superuser_snap(&eng.db, &pk_owner, snap, own) {
+                let closure = crate::storage::role_closure(&eng.db, &pk_owner, snap, own);
+                let tprivs =
+                    crate::storage::table_privs_in(&eng.db, &pk_owner, parent, &closure, snap, own);
+                let sel_ok = ref_cols.iter().all(|c| {
+                    crate::storage::column_privs_in(
+                        &eng.db, &pk_owner, parent, c, &closure, snap, own,
+                    ) & crate::storage::PRIV_SELECT
+                        != 0
+                });
+                let upd_ok = tprivs & crate::storage::PRIV_UPDATE != 0
+                    || parent.columns.iter().any(|(c, _)| {
+                        crate::storage::column_privs_in(
+                            &eng.db, &pk_owner, parent, c, &closure, snap, own,
+                        ) & crate::storage::PRIV_UPDATE
+                            != 0
+                    });
+                if !sel_ok || !upd_ok {
+                    return Err(exec_err(
+                        "42501",
+                        format!(
+                            "permission denied for table \"{}\"",
+                            fk.ref_table.rsplit('.').next().unwrap_or(&fk.ref_table)
+                        ),
+                    ));
+                }
+            }
+        }
         let parent_pos: Vec<usize> = ref_cols
             .iter()
             .map(|c| {
@@ -1737,6 +1828,32 @@ pub(crate) fn plan_fk_cascade(
                 let base_row = Row::new(base.clone());
                 match act {
                     FkAction::Restrict => {
+                        // v2.48: NO ACTION (the *_no_action flag)
+                        // checks against the statement's FINAL image
+                        // (PG19 RI_FKey_noaction is an AFTER check):
+                        // if another row changed by this statement
+                        // lands ON the old key, the key still exists
+                        // and nothing is violated (foreign_key.sql
+                        // pp/cc: UPDATE pp SET f1=f1+1 over {11,12}
+                        // with cc referencing 13 after {12,13}).
+                        let is_no_action = if new_values.is_some() {
+                            fk.on_update_no_action
+                        } else {
+                            fk.on_delete_no_action
+                        };
+                        if is_no_action
+                            && changed.iter().any(|(_, _, nv)| {
+                                nv.as_ref().is_some_and(|nv| {
+                                    parent_pos
+                                        .iter()
+                                        .map(|&i| &nv[i])
+                                        .zip(old_key.iter())
+                                        .all(|(a, b)| fk_key_eq(a, b))
+                                })
+                            })
+                        {
+                            continue;
+                        }
                         // If a planned action already moved this
                         // row off the old key, it no longer restricts.
                         let still_refs = child_pos
@@ -1916,7 +2033,47 @@ pub(crate) fn plan_fk_cascade(
                                 ),
                             ));
                         }
-                        check_fk_child_row(
+                        // v2.48: ON DELETE SET DEFAULT — the
+                        // rewritten key must exist in the parent's
+                        // FINAL image too: the rows this statement
+                        // deletes must not count (foreign_key.sql
+                        // defp/defc: DELETE defp f1=0 with defc
+                        // defaulting to 0 fails 23503 in PG19).
+                        if act == FkAction::SetDefault && new_values.is_none() {
+                            let nkey: Vec<Value> =
+                                child_pos.iter().map(|&ci| nv[ci].clone()).collect();
+                            if nkey.iter().all(|v| !matches!(v, Value::Null)) {
+                                let exclude: Vec<(String, u64)> = changed
+                                    .iter()
+                                    .map(|(id, _, _)| (parent_table.to_string(), *id))
+                                    .collect();
+                                let cnt = fk_parent_key_count_excluding(
+                                    eng, snap, own, session, &fk, &nkey, &exclude,
+                                )?;
+                                if cnt == 0 {
+                                    return Err(exec_err_detail(
+                                        "23503",
+                                        format!(
+                                            "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
+                                            child_table, fk.name
+                                        ),
+                                        format!(
+                                            "{} is not present in table \"{}\".",
+                                            fk_key_text(&fk.cols, &nkey),
+                                            fk.ref_table
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
+                        // v2.48: ON UPDATE SET DEFAULT — the
+                        // rewritten key must exist in the parent's
+                        // FINAL image; the parent row's pending new
+                        // key prevalidates exactly like the CASCADE
+                        // arm (foreign_key.sql constrname3 section:
+                        // the defaults equal the updated PK row's
+                        // new key).
+                        check_fk_child_row_pv(
                             eng,
                             snap,
                             own,
@@ -1926,6 +2083,9 @@ pub(crate) fn plan_fk_cascade(
                             &nv,
                             &[],
                             Some(cid),
+                            new_key
+                                .as_ref()
+                                .map(|k| (fk.ref_table.as_str(), k.as_slice())),
                         )?;
                         let nv = Row::new(nv);
                         out.upsert_update(&child_table, cid, cxmax, nv.clone());

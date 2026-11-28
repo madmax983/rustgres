@@ -8195,6 +8195,28 @@ pub(crate) fn drop_one_table(
         for fk in &ot.fks {
             if fk.ref_table == name {
                 dep_fks.push((tname.clone(), fk.name.clone()));
+            } else if !stmt_set.contains(&fk.ref_table) {
+                // v2.48: an FK referencing a partitioned table has a
+                // per-partition dependency on every partition of that
+                // table (PG19's cloned pg_constraint rows), so
+                // dropping any partition of the referenced root is
+                // blocked too (foreign_key.sql droppk section).
+                let mut anc = eng
+                    .db
+                    .find_table(name, ctx.snap, &ctx.all_xids, ctx.session)
+                    .and_then(|t| t.partition.as_ref())
+                    .and_then(|p| p.parent.clone());
+                while let Some(a) = anc {
+                    if a == fk.ref_table {
+                        dep_fks.push((tname.clone(), fk.name.clone()));
+                        break;
+                    }
+                    anc = eng
+                        .db
+                        .find_table(&a, ctx.snap, &ctx.all_xids, ctx.session)
+                        .and_then(|t| t.partition.as_ref())
+                        .and_then(|p| p.parent.clone());
+                }
             }
         }
     }

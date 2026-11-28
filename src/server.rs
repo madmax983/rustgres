@@ -3397,7 +3397,13 @@ fn stmt_set_session_authorization(
             let name = name.to_ascii_lowercase();
             let guard = lock_engine(engine);
             let snap = guard.take_snapshot();
-            if guard.db.find_role(&name, &snap, u64::MAX).is_none() {
+            // v2.48: a role created by THIS transaction must be
+            // visible to SET ROLE (PG sees its own uncommitted
+            // catalog changes); pass the open transaction's xid as
+            // `own` instead of u64::MAX (alter_generic.sql's
+            // BEGIN; CREATE ROLE ...; SET ROLE ... sections).
+            let own = session.txn.as_ref().map(|t| t.xid).unwrap_or(u64::MAX);
+            if guard.db.find_role(&name, &snap, own).is_none() {
                 return Err(ExecError {
                     detail: None,
                     hint: None,
@@ -3455,7 +3461,13 @@ fn stmt_set_role(
             let name = name.to_ascii_lowercase();
             let guard = lock_engine(engine);
             let snap = guard.take_snapshot();
-            if guard.db.find_role(&name, &snap, u64::MAX).is_none() {
+            // v2.48: a role created by THIS transaction must be
+            // visible to SET ROLE (PG sees its own uncommitted
+            // catalog changes); pass the open transaction's xid as
+            // `own` instead of u64::MAX (alter_generic.sql's
+            // BEGIN; CREATE ROLE ...; SET ROLE ... sections).
+            let own = session.txn.as_ref().map(|t| t.xid).unwrap_or(u64::MAX);
+            if guard.db.find_role(&name, &snap, own).is_none() {
                 return Err(ExecError {
                     detail: None,
                     hint: None,
@@ -3467,19 +3479,16 @@ fn stmt_set_role(
             // IsMemberOfRoleWithOption SET): a superuser, or the
             // session user reaches the target role through membership
             // edges that all carry SET OPTION (v1.96).
-            let allowed = crate::storage::is_superuser_snap(
-                &guard.db,
-                &session.session_user,
-                &snap,
-                u64::MAX,
-            ) || name == session.session_user
-                || crate::storage::member_can_set_role(
-                    &guard.db,
-                    &session.session_user,
-                    &name,
-                    &snap,
-                    u64::MAX,
-                );
+            let allowed =
+                crate::storage::is_superuser_snap(&guard.db, &session.session_user, &snap, own)
+                    || name == session.session_user
+                    || crate::storage::member_can_set_role(
+                        &guard.db,
+                        &session.session_user,
+                        &name,
+                        &snap,
+                        own,
+                    );
             if !allowed {
                 return Err(ExecError {
                     detail: None,
@@ -5914,6 +5923,8 @@ fn auto_vacuum(engine: &mut Engine, writes: &[WriteOp]) {
             | WriteOp::RulesSet { .. }
             // v2.23: operator-class DDL likewise.
             | WriteOp::OpClassSet { .. }
+            // v2.48: operator-family DDL likewise.
+            | WriteOp::OpFamilySet { .. }
             // v0.22: temp tables are single-version; their DDL leaves
             // no dead versions to reap. Shell types likewise.
             | WriteOp::CreateTempTable { .. }

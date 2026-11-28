@@ -949,6 +949,7 @@ pub(crate) fn execute_inner(
             is_default,
             for_type,
             method,
+            family,
             eq_operator,
             eq_leftarg,
             eq_rightarg,
@@ -961,6 +962,7 @@ pub(crate) fn execute_inner(
             *is_default,
             for_type,
             method,
+            family.as_deref(),
             eq_operator.as_deref(),
             eq_leftarg.as_deref(),
             eq_rightarg.as_deref(),
@@ -978,6 +980,22 @@ pub(crate) fn execute_inner(
             method,
             new_schema,
         } => exec_alter_operator_class_schema(eng, ctx, name, method, new_schema),
+        // --- v2.48: operator families (registry + PG19 validation) ---
+        Stmt::CreateOperatorFamily { name, method } => {
+            exec_create_operator_family(eng, ctx, name, method)
+        }
+        Stmt::DropOperatorFamily {
+            name,
+            method,
+            if_exists,
+            cascade,
+        } => exec_drop_operator_family(eng, ctx, name, method, *if_exists, *cascade),
+        Stmt::AlterOperatorFamilyItems {
+            name,
+            method,
+            drop,
+            items,
+        } => exec_alter_operator_family_items(eng, ctx, name, method, *drop, items),
         // --- v1.00: triggers (bounded) ---
         Stmt::CreateTrigger {
             name,

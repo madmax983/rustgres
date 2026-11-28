@@ -10497,6 +10497,30 @@ pub enum MappingUser {
     SessionUser,
 }
 
+/// v2.48: one item of an ALTER OPERATOR FAMILY ADD/DROP list
+/// (PG19 AlterOpFamilyStmt). Types are as written (lowercased idents).
+#[derive(Clone, Debug, PartialEq)]
+pub enum OpFamilyItem {
+    Operator {
+        strategy: u32,
+        /// Operator name for ADD; None for DROP (PG's DROP form
+        /// carries no operator name).
+        name: Option<String>,
+        types: Vec<String>,
+        /// `FOR ORDER BY <family>` / `FOR SEARCH` suffix (ADD only).
+        purpose: Option<String>,
+    },
+    Function {
+        number: u32,
+        /// Leading (types) list spelled before the function name
+        /// (cross-type support functions).
+        lead_types: Option<Vec<String>>,
+        /// Function name for ADD; None for DROP.
+        name: Option<String>,
+        types: Vec<String>,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub enum Stmt {
     /// v2.36: CREATE FOREIGN DATA WRAPPER name [HANDLER f |
@@ -11077,6 +11101,8 @@ pub enum Stmt {
         is_default: bool,
         for_type: String,
         method: String,
+        /// v2.48: the FAMILY name clause, when spelled.
+        family: Option<String>,
         eq_operator: Option<String>,
         eq_leftarg: Option<String>,
         eq_rightarg: Option<String>,
@@ -11097,6 +11123,27 @@ pub enum Stmt {
         name: String,
         method: String,
         new_schema: String,
+    },
+    // --- v2.48: OPERATOR FAMILY statements. Families are not
+    // modeled (opclasses record no family; FK/index equality is
+    // type-driven), so these are catalog no-ops with PG command
+    // tags — they exist so the opfamily DDL in foreign_key.sql /
+    // alter_generic.sql parses and completes.
+    CreateOperatorFamily {
+        name: String,
+        method: String,
+    },
+    DropOperatorFamily {
+        name: String,
+        method: String,
+        if_exists: bool,
+        cascade: bool,
+    },
+    AlterOperatorFamilyItems {
+        name: String,
+        method: String,
+        drop: bool,
+        items: Vec<OpFamilyItem>,
     },
     // --- v0.11: roles and privileges ---
     CreateRole {
@@ -11816,6 +11863,9 @@ impl Stmt {
                 | Stmt::CreateOperatorClass { .. }
                 | Stmt::DropOperatorClass { .. }
                 | Stmt::AlterOperatorClassSchema { .. }
+                | Stmt::CreateOperatorFamily { .. }
+                | Stmt::DropOperatorFamily { .. }
+                | Stmt::AlterOperatorFamilyItems { .. }
                 | Stmt::AlterFunction { .. }
                 | Stmt::CreateIndex { .. }
                 | Stmt::DropIndex { .. }

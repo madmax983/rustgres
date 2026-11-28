@@ -2047,6 +2047,9 @@ pub fn records_for_commit(
             WriteOp::CreateCast { .. } => {
                 // v1.91: no local increment (see CreateType arm note).
             }
+            // v2.48: operator-family DDL is likewise NOT WAL-logged
+            // (documented known gap on `Database::opfamilies`).
+            WriteOp::OpFamilySet { .. } => {}
             // v2.04: publication DDL IS WAL-logged (it was not in
             // v2.02/v2.03 — a restart forgot every publication). The
             // new image is read from the catalog map, which the
