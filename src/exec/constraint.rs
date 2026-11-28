@@ -579,6 +579,25 @@ fn gen_expr_walk(
     }
 }
 
+// v2.47 Bolt: the per-column projection `compute_generated_columns` needs
+// as its eval `Scope` depends only on `meta`, which is invariant across
+// every row of one INSERT statement. Batch call sites that already loop
+// over many rows for the same `meta` build it once via this helper and
+// reuse it through `compute_generated_columns_with_schema` instead of
+// paying `compute_generated_columns`'s per-row rebuild.
+pub(crate) fn generated_columns_schema(meta: &TableMeta) -> Vec<QCol> {
+    meta.columns
+        .iter()
+        .map(|(n, ty)| QCol {
+            qual: String::new(),
+            name: n.clone(),
+            ty: ty.clone(),
+            hidden: false,
+            src_ord: 0,
+        })
+        .collect()
+}
+
 pub(crate) fn compute_generated_columns(
     eng: &mut Engine,
     snap: &Snapshot,
@@ -591,24 +610,31 @@ pub(crate) fn compute_generated_columns(
     if meta.gen_cols.iter().all(|g| g.is_none()) {
         return Ok(());
     }
-    let schema: Vec<QCol> = meta
-        .columns
-        .iter()
-        .map(|(n, ty)| QCol {
-            qual: String::new(),
-            name: n.clone(),
-            ty: ty.clone(),
-            hidden: false,
-            src_ord: 0,
-        })
-        .collect();
+    let schema = generated_columns_schema(meta);
+    compute_generated_columns_with_schema(eng, snap, own, session, role, meta, &schema, values)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_generated_columns_with_schema(
+    eng: &mut Engine,
+    snap: &Snapshot,
+    own: u64,
+    session: u64,
+    role: &str,
+    meta: &TableMeta,
+    schema: &[QCol],
+    values: &mut [Value],
+) -> Result<(), ExecError> {
+    if meta.gen_cols.iter().all(|g| g.is_none()) {
+        return Ok(());
+    }
     let n = meta
         .gen_cols
         .len()
         .min(meta.columns.len())
         .min(values.len());
     for i in 0..n {
-        let Some((expr, _stored)) = meta.gen_cols.get(i).cloned().flatten() else {
+        let Some((expr, _stored)) = meta.gen_cols.get(i).and_then(|o| o.as_ref()) else {
             continue;
         };
         let mut lock_ids = Vec::new();
@@ -635,11 +661,11 @@ pub(crate) fn compute_generated_columns(
             write: None,
         };
         let frame = Scope {
-            schema: &schema,
+            schema,
             row: values,
             prov: None,
         };
-        let v = eval_expr(&mut q, &[frame], &expr)?;
+        let v = eval_expr(&mut q, &[frame], expr)?;
         let (_, ctype) = &meta.columns[i];
         values[i] = coerce_value(v, ctype, &meta.columns[i].0)?;
     }

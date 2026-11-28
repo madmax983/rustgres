@@ -2,6 +2,160 @@
 
 Measured with `benches/bench.py` (raw-socket wire-protocol driver, stdlib only).
 
+## Bolt: `compute_generated_columns` rebuilds its eval schema and clones the generation expression on every row of a batch INSERT — fix — 2026-11-28
+
+### Workload
+
+New harness, `benches/profile_generated_insert.py` (self-contained
+launch-under-valgrind pattern, same as `profile_serial_insert.py`):
+a 20,000-row `INSERT INTO t(id, a) SELECT g, g FROM
+generate_series(1, N) g` into a table with a third column `b int
+GENERATED ALWAYS AS (a + 1) STORED` (`--variant generated`, default).
+`--variant plain` creates the identical table shape with `b` as an
+ordinary column and an explicit value on every row — a control with
+zero `compute_generated_columns` work (its `meta.gen_cols.iter().all
+(|g| g.is_none())` fast path fires), isolating the generated-column
+materialization cost by subtraction. `compute_generated_columns`
+(`src/exec/constraint.rs`, introduced in v2.03) runs once per row on
+every INSERT/UPDATE/MERGE/partition-route/view-rule write to a table
+with any generated column — a common schema pattern for derived
+columns (totals, slugs, search vectors) — but no prior Bolt round had
+profiled it; v2.47 just added a second call site for it (`ALTER TABLE
+... ADD COLUMN ... GENERATED ALWAYS AS (expr) STORED` backfill),
+which is what drew attention to it this round.
+
+### Profile
+
+Callgrind (valgrind 3.22.0, `--collect-jumps=yes --cache-sim=yes
+--branch-sim=yes`), 20,000 rows, kept log
+`benches/profiles/callgrind.out.geninsert-base-n20000-2026-11-28`:
+`compute_generated_columns` is **10.49%** of total `Ir` (inclusive,
+226,601,065 / 2,159,581,918) for a table with a single trivial `a +
+1` generated column — comfortably over the 5%-of-profile relevance
+bar, and this is the *lower* bound: cost scales with however many
+generated columns a table has, and this harness's table has only
+one. `callgrind_annotate --inclusive=yes` breaks that down into: the
+`let schema: Vec<QCol> = meta.columns.iter().map(...).collect()`
+line and its full iterator/collect/`extend_trusted` call chain,
+28,460,532 Ir (1.32%); `eval_expr` (evaluating `a + 1` itself --
+inherent, not optimizable here), 49,900,000 Ir (2.31%) from this call
+site; `coerce_value`, 3,500,000 Ir (0.16%); the rest is the
+function's own frame/dispatch overhead. dhat (`--rows 20000
+--variant generated`, summed `tb`/`tbk` over `pps`) attributes
+102,618,406 total bytes and 867,499 total blocks to the whole
+workload; the `Rc::new(RefCell::new(HashMap::new()))` cache fields on
+`Q` turned out *not* to be a cost here (`HashMap::new()` doesn't
+allocate until first insert, but `Rc::new` itself always boxes --
+confirmed negligible per-call in the annotated line costs, so left
+alone this round).
+
+### Hypothesis
+
+Two things `compute_generated_columns` rebuilds from scratch on
+*every row* are actually invariant for every row of one INSERT
+statement, since both derive solely from `meta` (the table's schema),
+which doesn't change mid-statement:
+
+1. `schema: Vec<QCol>` -- a fresh `Vec` holding a `String` clone of
+   every column's name and a clone of its `ColType`, rebuilt by
+   `.collect()` on every call just to hand `eval_expr` a `Scope` to
+   resolve `a` against.
+2. `meta.gen_cols.get(i).cloned().flatten()` -- clones the whole
+   generation-expression `Expr` AST (and its `bool` STORED/VIRTUAL
+   flag) out of `meta` on every row, when `eval_expr` only ever needs
+   `&Expr` (it takes the expression by reference, not by value).
+
+Both can be eliminated: (1) by computing `schema` once per statement
+at the call site and passing it in by reference instead of rebuilding
+it inside the per-row function, the same "hoist the statement-wide
+invariant out of the per-row loop" pattern as the `ScopeCtx` fix for
+`eval_scoped` (2026-11-04, this file); (2) by borrowing the tuple out
+of `meta.gen_cols` instead of cloning it, since nothing after that
+point needs ownership.
+
+### Change
+
+`src/exec/constraint.rs`: split `compute_generated_columns` into a
+new `generated_columns_schema(meta) -> Vec<QCol>` (the extracted
+schema builder) and `compute_generated_columns_with_schema(..., schema:
+&[QCol], values)` (the per-row logic, now taking the schema by
+reference instead of building it); `compute_generated_columns` itself
+becomes a thin wrapper that builds the schema once and delegates, so
+every call site that doesn't need the hoist keeps working unchanged.
+Also replaced `meta.gen_cols.get(i).cloned().flatten()` with
+`meta.gen_cols.get(i).and_then(|o| o.as_ref())` in the shared logic,
+dropping the per-row `Expr` clone entirely (`eval_expr` takes `&Expr`,
+so no owned copy was ever needed). `src/exec/dml.rs`: at
+`exec_insert_inner`'s two batch-row loops (`for cells in srows` --
+INSERT...SELECT, and `for row in &rows` -- multi-row VALUES), hoisted
+a `let gen_schema = generated_columns_schema(&meta);` above the loop
+and changed their `compute_generated_columns` calls to
+`compute_generated_columns_with_schema(..., &gen_schema, ...)`. The
+other 9 call sites (`merge.rs`, `partition.rs`, `rules.rs`,
+`alter.rs`'s single-row-at-a-time paths, the UPDATE path) are
+untouched, still going through the unchanged `compute_generated_columns`
+wrapper -- same behavior, same cost, out of scope for this round.
+Behavior is identical everywhere: same schema contents, same
+generation expression, just built/borrowed instead of rebuilt/cloned.
+
+### Measurement
+
+Same harness, same machine, same session. Callgrind (`Ir`),
+`benches/profile_generated_insert.py --tool callgrind`:
+
+| rows | variant | before `Ir` | after `Ir` | delta |
+|---|---|---|---|---|
+| 10000 | generated | 1,059,027,999 | 1,018,415,139 | -3.83% |
+| 20000 | generated | 2,159,581,918 | 2,075,905,456 | -3.88% |
+| 10000 | plain (control) | 985,820,897 | 986,141,168 | +0.03% (noise) |
+| 20000 | plain (control) | 2,012,836,448 | 2,013,550,665 | +0.04% (noise) |
+
+The `plain` control is unchanged within noise at both sizes,
+confirming the fix is isolated to the generated-column path. The
+`generated` variant's Ir delta (-3.83%..-3.88%) is consistent across
+both sizes but falls just short of the 5% floor, so -- same situation
+as the `eval_scoped`/`ScopeCtx` round (2026-11-04) -- this round
+leans on the DHAT allocation-count floor instead. dhat
+(`--rows 20000 --variant generated`, summed `tb`/`tbk` over `pps`,
+kept logs `benches/profiles/dhat.out.geninsert-{base,after}-n20000-2026-11-28`):
+
+| counter | before | after | delta |
+|---|---|---|---|
+| total bytes | 102,618,406 | 90,518,626 | **-11.79%** |
+| total blocks | 867,499 | 727,503 | **-16.15%** |
+
+139,996 fewer allocations over 20,000 rows is ~7 per row -- consistent
+with removing the schema build (1 `Vec<QCol>` + 1 `String` clone per
+column, 3 columns here) and the `Expr` clone (a `BinaryOp` with two
+boxed operands) together. Both comfortably clear the 10%-of-blocks
+floor.
+
+`cargo build`: clean. `cargo fmt --all`: clean. `cargo test
+--all-features`: 1557/1557 passed, unchanged (no test expectations
+changed -- behavior is identical, only the schema/expr construction
+moved or changed from clone to borrow). `cargo clippy --all-targets
+--all-features -- -D warnings`: 1720 pre-existing errors on both the
+parent and this commit (confirmed via `git stash`, compared by exact
+file:line location set, not just count, since the line-count lint
+total is noisy run-to-run) -- the same toolchain/lint-version mismatch
+noted in every prior Bolt entry in this file; the one genuinely new
+lint this diff would have introduced (`too_many_arguments` on the new
+8-parameter `compute_generated_columns_with_schema`) is suppressed
+with the same `#[allow(clippy::too_many_arguments)]` already used on
+83 other functions in this codebase, so the net new-lint count is
+zero.
+
+### Reproduce
+
+```bash
+cargo build
+python3 benches/profile_generated_insert.py --tool callgrind --rows 20000 --both
+python3 benches/profile_generated_insert.py --tool dhat --rows 20000 --variant generated
+```
+Before numbers: check out the parent commit (the harness-only
+baseline) and repeat; after numbers: check out this commit and
+repeat.
+
 ## Bolt: `check_exclusion_batch` clones the whole table before checking whether it has any EXCLUDE constraints — fix — 2026-11-27
 
 ### Workload

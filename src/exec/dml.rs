@@ -3585,6 +3585,10 @@ pub(crate) fn exec_insert_inner(
                 } else {
                     targets.iter().map(|_| Vec::new()).collect()
                 };
+            // v2.47 Bolt: `meta` is invariant across every row of this
+            // INSERT, so the generated-column eval schema is built once
+            // here instead of once per row inside the loop.
+            let gen_schema = generated_columns_schema(&meta);
             for cells in srows {
                 if cells.len() != targets.len() {
                     // v0.65: same width rule as VALUES above.
@@ -3695,13 +3699,14 @@ pub(crate) fn exec_insert_inner(
                     }
                 }
                 // v2.03: generated columns materialize on write.
-                compute_generated_columns(
+                compute_generated_columns_with_schema(
                     eng,
                     ctx.snap,
                     ctx.own,
                     ctx.session,
                     ctx.role,
                     &meta,
+                    &gen_schema,
                     &mut values,
                 )?;
                 check_row_constraints(
@@ -3753,6 +3758,10 @@ pub(crate) fn exec_insert_inner(
             // rows). Width is unchanged by expansion, so the
             // targets/width checks above still apply.
             let rows = expand_insert_srf_rows(&mut q, rows)?;
+            // v2.47 Bolt: `meta` is invariant across every row of this
+            // INSERT, so the generated-column eval schema is built once
+            // here instead of once per row inside the loop.
+            let gen_schema = generated_columns_schema(&meta);
             for row in &rows {
                 if row.len() != targets.len() {
                     // v0.65: explicit lists need the exact count; with no
@@ -3916,13 +3925,14 @@ pub(crate) fn exec_insert_inner(
                     }
                 }
                 // v2.03: generated columns materialize on write.
-                compute_generated_columns(
+                compute_generated_columns_with_schema(
                     q.eng,
                     ctx.snap,
                     ctx.own,
                     ctx.session,
                     ctx.role,
                     &meta,
+                    &gen_schema,
                     &mut values,
                 )?;
                 // v0.9: NOT NULL + CHECK.
